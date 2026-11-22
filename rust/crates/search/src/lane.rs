@@ -11,7 +11,7 @@ use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{Anomaly, Result, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchRow, file::write_group_search_file, definitions::SearchDefinition};
+use crate::{SearchRow, file::{artefact_identity, write_versioned_group}, definitions::SearchDefinition};
 use rtdb_maintenance::input::{download, open_input, read_page};
 
 pub const KIND: &str = "search";
@@ -118,14 +118,14 @@ impl ArtefactBuilder for SearchBuilder {
             self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned().ok_or_else(|| Anomaly::incorrect("rtdb.search/definition-dropped", "The search index definition is no longer in force"))?
         } };
         let entry = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| Anomaly::fault("rtdb.search/unknown-table", "Search job targets a table the catalog does not hold"))?;
-        let identity = format!("{}/{}/{}-v{}", entry.slug.as_str(), job.owner, definition.id, definition.version);
+        let identity = artefact_identity(entry.slug.as_str(), &job.owner, &definition.id, definition.version);
         let key = ObjectKey::new(entry.slug.owner_artefact_key(&job.owner, KIND, &definition.id, definition.version)?)?;
         if repairing {
             // Often only this node's cached copy was bad, so the object is read afresh before anything is rebuilt.
             self.runtime.forget_file(&self.database, &key);
             self.storage.invalidate(&key).await?;
             match self.runtime.file(&self.database, &self.storage, &key, &columns).await {
-                Ok(file) => {
+                Ok(file) if file.matches_artefact(&identity, definition.version) => {
                     let size = self.store.head_fresh(&key).await?.size;
                     let record = record(file.sections(), size)?;
                     self.runtime.clear(&suspect);
@@ -133,7 +133,7 @@ impl ArtefactBuilder for SearchBuilder {
                 }
                 Err(crate::runtime::FileError::Unavailable(error)) => return Err(error),
                 Err(crate::runtime::FileError::Missing) => {}
-                Err(crate::runtime::FileError::Corrupt(_)) => {
+                Ok(_) | Err(crate::runtime::FileError::Corrupt(_)) => {
                     self.runtime.forget_file(&self.database, &key);
                     self.storage.invalidate(&key).await?;
                     // The store refuses different bytes under an existing key; a reader treats the missing file as absent meanwhile.
@@ -169,6 +169,7 @@ impl ArtefactBuilder for SearchBuilder {
             ArtefactOwner::Group(group) => group.recency(),
         };
         let ceiling = crate::file::ceiling_of(recency);
+        let version = definition.version;
         let sections = tokio::task::spawn_blocking(move || -> Result<Vec<crate::file::Section>> {
             let _indexing = indexing;
             let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
@@ -177,7 +178,7 @@ impl ArtefactBuilder for SearchBuilder {
             let directory = tantivy::directory::MmapDirectory::open(&segment).map_err(fault)?;
             let output = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
             let members = readers.into_iter().map(|reader| PageRows::new(reader, &columns, &memory, &token));
-            write_group_search_file(&columns, members, &identity, ceiling, directory, output)
+            write_versioned_group(&columns, members, &identity, version, ceiling, directory, output)
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         let size = tokio::fs::metadata(&bundle).await.map_err(fault)?.len();

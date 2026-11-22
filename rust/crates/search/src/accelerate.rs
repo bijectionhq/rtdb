@@ -7,11 +7,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_format::{data::StoredOperation, keys::ArtefactOwner};
 use rtdb_index::{Snapshot, TrieState};
-use rtdb_plan::{BinaryOp, Expr};
-use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
+use rtdb_plan::{BinaryOp, Catalog, Expr};
+use rtdb_query::{MatchAnswers, QueryContext, ScanAccelerator, ScanRequest};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Anomaly, Iid, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, runtime::{Suspect, TrieFile}};
 
@@ -234,7 +234,8 @@ impl SearchAccelerator {
         let artefact_id = definition.artefact_id();
         let (Some(entry), Some(record)) = (snapshot.table_entry(table), trie.artefact(KIND, &artefact_id, definition.version)) else { return Ok(None) };
         let owner = ArtefactOwner::of(&trie.key, record)?;
-        let member = owner.tries().iter().position(|key| key == &trie.key).unwrap_or_default() as u32;
+        let member = owner.tries().iter().position(|key| key == &trie.key)
+            .ok_or_else(|| Anomaly::fault("rtdb.search/artefact-owner", "Search artefact does not contain its recorded trie"))? as u32;
         Ok(Some(Recorded { key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?, owner, member }))
     }
 
@@ -335,6 +336,101 @@ fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<'_>> {
         selected.members.insert(trie.member, index);
     }
     grouped.into_values()
+}
+
+fn uncovered_owned_search() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-uncovered", "Published search artefacts do not cover the held cut")
+}
+
+/// Computes exact statistics for the admitted owned relation at the held point.
+/// Opens only artefacts recorded on that cut and never builds a replacement.
+pub async fn owned_corpus(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
+) -> Result<rtdb_text::Corpus> {
+    let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
+        .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
+    let database = context.catalog.default_database();
+    let captured = context.catalog.database(database)?;
+    let [snapshot] = captured.partitions.as_slice() else { return Err(uncovered_owned_search()); };
+    let present = context.current_time.as_micros()?;
+    if snapshot.system_time_cap() != Some(present)
+        || snapshot.iter_segments(&definition.table).any(|segment| segment.row_count() != 0)
+    {
+        return Err(uncovered_owned_search());
+    }
+    let [column] = definition.columns.as_slice() else { return Err(uncovered_owned_search()); };
+    let types = snapshot.column_types_for(&definition.table, [column.clone()]);
+    if !types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text) {
+        return Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"));
+    }
+    let point = Interval::new(present, present.next()?)?;
+    let bounds = TemporalBounds { valid_time: point, system_time: point };
+    let runtime = crate::SearchRuntime::new(0);
+    let mut files = Vec::new();
+    let mut opened = BTreeMap::<ObjectKey, Arc<SearchFile>>::new();
+    let entry = snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
+    let artefact_id = definition.artefact_id();
+    for trie in snapshot.trie_catalog().current_tries(&definition.table) {
+        context.check_cancelled()?;
+        let recorded = SearchAccelerator::recorded_key(snapshot, &definition.table, trie, &definition)?
+            .ok_or_else(uncovered_owned_search)?;
+        let file = if let Some(file) = opened.get(&recorded.key) {
+            Arc::clone(file)
+        } else {
+            let file = runtime.file(database, &captured.storage, &recorded.key, &definition.columns).await
+                .map_err(|_| uncovered_owned_search())?;
+            let identity = crate::file::artefact_identity(entry.slug.as_str(), &recorded.owner, &artefact_id, definition.version);
+            if !file.matches_artefact(&identity, definition.version) {
+                return Err(uncovered_owned_search());
+            }
+            opened.insert(recorded.key.clone(), Arc::clone(&file));
+            file
+        };
+        let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
+        files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_owned(), file, member: recorded.member });
+    }
+
+    let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime, database, bounds };
+    let query = Query::parse(text);
+    let mut corpus = rtdb_text::Corpus {
+        frequencies: query.terms().iter().cloned().map(|term| (term, 0)).collect(),
+        ..rtdb_text::Corpus::default()
+    };
+    let mut seen = BTreeSet::new();
+    let scratch = context.memory.reserve(4096)?;
+    for selected in by_file(&files) {
+        let mut visible = BTreeSet::new();
+        for (&member, &own) in &selected.members {
+            for doc in selected.file.single_column_member_runs(member)? {
+                if doc.doc % 128 == 0 { context.check_cancelled()?; }
+                if !selected.file.visible(doc.doc, bounds) { continue; }
+                match cutter.judge(own, doc)? {
+                    Judged::Hidden => (),
+                    Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
+                    Judged::Visible { exact: true } => {
+                        scratch.grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(128)))?;
+                        if !seen.insert(doc.iid) { return Err(uncovered_owned_search()); }
+                        visible.insert(doc.doc);
+                        corpus.documents += 1;
+                        corpus.tokens += u64::from(selected.file.token_length(doc.doc)?);
+                    }
+                }
+            }
+        }
+        for term in query.terms() {
+            use tantivy::DocSet;
+            let Some(mut postings) = selected.file.postings(column, term)? else { continue; };
+            let mut frequency = 0u64;
+            for &doc in &visible {
+                if postings.doc() < doc { postings.seek(doc); }
+                if postings.doc() == doc { frequency += 1; }
+                if postings.doc() == tantivy::TERMINATED { break; }
+            }
+            *corpus.frequencies.entry(term.clone()).or_default() += frequency;
+        }
+    }
+    context.check_cancelled()?;
+    Ok(corpus)
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {

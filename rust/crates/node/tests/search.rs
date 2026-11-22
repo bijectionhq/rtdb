@@ -170,6 +170,15 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
     assert!(!rejected.committed());
     let accepted = session.state_mut().execute_tx(vec![declare("body")], AutonomousTxOptions::default()).await.unwrap();
     assert!(accepted.committed(), "{:?}", accepted.error());
+    let changed = rtdb_tx::Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(0)),
+        ("body".into(), Value::Utf8("paid".into())),
+    ])], node.memory()).unwrap();
+    let replace = TxOp::OwnedReplaceDocs { relation: relation.clone(), documents: changed, valid_from: Some(Timestamp(0)), valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![replace], AutonomousTxOptions::default()).await.unwrap().committed());
+    let uncovered = session.open_owned_read().await.unwrap();
+    assert_eq!(uncovered.search_corpus(&relation, &path, "invoice paid").await.unwrap_err().code, "rtdb.owned/search-uncovered");
+    drop(uncovered);
     let private_catalog = OwnedRelation::search_catalog("xtdb");
     let direct = format!("SELECT _id FROM {}.\"{}\"", private_catalog.schema, private_catalog.table);
     assert!(session.query_sql(&direct, vec![]).await.is_err());
@@ -187,6 +196,13 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
         record.kind() == "search" && record.definition_id().starts_with("owned-body~a")
             && record.definition_version() == accepted.tx_key().tx_id.0
     })));
+    let held = session.open_owned_read().await.unwrap();
+    let corpus = held.search_corpus(&relation, &path, "invoice paid").await.unwrap();
+    assert_eq!(corpus.documents, 20);
+    assert_eq!(corpus.tokens, 39);
+    assert_eq!(corpus.frequencies["invoice"], 19);
+    assert_eq!(corpus.frequencies["paid"], 1);
+    drop(held);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

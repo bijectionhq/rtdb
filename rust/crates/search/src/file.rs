@@ -26,9 +26,9 @@ use crate::rectangle::merge_adjacent_valid_time;
 #[cfg(feature = "experiments")]
 pub(crate) mod experiment;
 
-const MAGIC: &[u8; 8] = b"RTSRCH01";
+const MAGIC: &[u8; 8] = b"RTSRCH02";
 /// Identifies the bundle bytes produced by the builder, including visibility encoding.
-pub const FORMAT_VERSION: i32 = 7;
+pub const FORMAT_VERSION: i32 = 8;
 const WRITER_MEMORY: usize = 32 << 20;
 /// The bundle entry holding what tantivy's segment does not: rows, runs, rectangles, nulls, every row's key, and term impacts.
 const SIDECAR: &str = "rtdb.sidecar";
@@ -140,7 +140,7 @@ pub fn build_search_file(columns: &[String], rows: &[SearchRow], identity: &str)
 }
 
 /// What the writer accumulates beside tantivy's segment, to become the sidecar.
-struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
+struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 
 /// One entity's rows while they arrive: each row's position and header, and per column, its value as an index into the column's distinct values.
 #[derive(Default)]
@@ -172,10 +172,35 @@ where
     W: std::io::Write,
     P: IntoIterator<Item = Result<Vec<SearchRow>>>,
 {
+    write_group(columns, members, identity, None, ceiling, directory, output)
+}
+
+/// Builds a catalog-published file bound to an ordered definition version.
+pub(crate) fn write_versioned_group<D, W, P>(
+    columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: i64,
+    ceiling: Option<i64>, directory: D, output: W,
+) -> Result<Vec<Section>>
+where
+    D: Directory + Clone + 'static,
+    W: std::io::Write,
+    P: IntoIterator<Item = Result<Vec<SearchRow>>>,
+{
+    write_group(columns, members, identity, Some(version), ceiling, directory, output)
+}
+
+fn write_group<D, W, P>(
+    columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: Option<i64>,
+    ceiling: Option<i64>, directory: D, output: W,
+) -> Result<Vec<Section>>
+where
+    D: Directory + Clone + 'static,
+    W: std::io::Write,
+    P: IntoIterator<Item = Result<Vec<SearchRow>>>,
+{
     let (schema, fields) = schema(columns);
     let settings = IndexSettings { docstore_compression: Compressor::None, ..IndexSettings::default() };
     let mut writer = Index::builder().schema(schema).settings(settings).single_segment_index_writer(directory.clone(), WRITER_MEMORY).map_err(fault)?;
-    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
+    let mut sidecar = Accumulated { ceiling: ceiling.unwrap_or(i64::MAX), member_starts: Vec::new(), page_starts: Vec::new(), row_docs: vec![Vec::new(); columns.len()], column_docs: vec![0; columns.len()], keys: Vec::new(), doc_iids: Vec::new(), token_lengths: Vec::new(), doc_classes: Vec::new(), sections: BTreeMap::new(), rectangle_starts: vec![0], rectangles: Vec::new() };
     let mut rows = 0u32;
     let mut previous_member_iid = None;
     for pages in members {
@@ -207,7 +232,7 @@ where
     }
     if sidecar.member_starts.is_empty() { return Err(fault("A search file holds at least one member")); }
     writer.finalize().map_err(fault)?;
-    let bytes = encode(&Index::open(directory.clone()).map_err(fault)?, &fields, rows, &sidecar)?;
+    let bytes = encode(&Index::open(directory.clone()).map_err(fault)?, &fields, rows, &sidecar, version, identity)?;
     directory.atomic_write(Path::new(SIDECAR), &bytes).map_err(fault)?;
     bundle(&directory, &segment_uuid(identity), output)?;
     Ok(sidecar.sections.into_values().collect())
@@ -246,6 +271,7 @@ fn runs(writer: &mut tantivy::SingleSegmentIndexWriter, fields: &[Field], sideca
         for (tokens, members) in distinct.into_iter().zip(members) {
             if members.is_empty() { continue; }
             let doc = u32::try_from(sidecar.doc_iids.len()).map_err(fault)?;
+            sidecar.token_lengths.push(u32::try_from(tokens.len()).map_err(fault)?);
             let mut document = TantivyDocument::new();
             if !tokens.is_empty() {
                 let mut offset = 0;
@@ -293,9 +319,14 @@ fn impacts_of(postings: &mut tantivy::postings::SegmentPostings, lengths: &tanti
     impacts
 }
 
-/// The sidecar, in order: row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
-fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated) -> Result<Vec<u8>> {
+/// The sidecar, in order: format, analyzer and definition versions, artefact identity, row, document, page and member counts, each member's page and document starts, page starts, each column's document count, each row's run in each column, each document's IID, exact token length and lifespan class, the sections, each document's rectangles, every row's key, the impacts of every term in at least STORED_IMPACTS documents by column and term, and a checksum of the rest.
+fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated, version: Option<i64>, identity: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&rtdb_text::ANALYZER_VERSION.to_le_bytes());
+    bytes.push(u8::from(version.is_some()));
+    bytes.extend_from_slice(&version.unwrap_or_default().to_le_bytes());
+    bytes.extend_from_slice(&identity_digest(identity));
     let documents = sidecar.doc_iids.len() as u32;
     for count in [rows, documents, sidecar.page_starts.len() as u32, u32::try_from(sidecar.member_starts.len()).map_err(fault)?] {
         bytes.extend_from_slice(&count.to_le_bytes());
@@ -306,6 +337,7 @@ fn encode(index: &Index, fields: &[Field], rows: u32, sidecar: &Accumulated) -> 
     }
     for value in sidecar.page_starts.iter().chain(&sidecar.column_docs).chain(sidecar.row_docs.iter().flatten()) { bytes.extend_from_slice(&value.to_le_bytes()); }
     for iid in &sidecar.doc_iids { bytes.extend_from_slice(iid); }
+    for length in &sidecar.token_lengths { bytes.extend_from_slice(&length.to_le_bytes()); }
     bytes.extend_from_slice(&sidecar.doc_classes);
     bytes.extend_from_slice(&encode_sections(&sidecar.sections.values().copied().collect::<Vec<_>>()));
     for start in &sidecar.rectangle_starts { bytes.extend_from_slice(&start.to_le_bytes()); }
@@ -344,11 +376,18 @@ fn checksum(bytes: &[u8]) -> [u8; 8] {
     Sha256::digest(bytes)[..8].try_into().unwrap_or_default()
 }
 
+pub(crate) fn artefact_identity(table_slug: &str, owner: &rtdb_format::keys::ArtefactOwner, id: &str, version: i64) -> String {
+    format!("{table_slug}/{owner}/{id}-v{version}")
+}
+
+fn identity_digest(identity: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(identity.as_bytes()).into()
+}
+
 /// A uuid-shaped name derived from the job's identity, standing in for tantivy's random segment id.
 fn segment_uuid(identity: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(identity.as_bytes());
-    digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+    identity_digest(identity)[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn bundle(directory: &dyn Directory, uuid: &str, mut output: impl std::io::Write) -> Result<()> {
@@ -483,7 +522,7 @@ impl Directory for BundleDirectory {
 }
 
 /// What the sidecar holds, located within the bundle's bytes.
-struct Sidecar { bytes: OwnedBytes, rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
+struct Sidecar { bytes: OwnedBytes, version: Option<i64>, identity: [u8; 32], rows: u32, documents: u32, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, column_docs: Vec<u32>, row_docs: usize, doc_iids: usize, token_lengths: usize, doc_classes: usize, sections: Vec<Section>, rectangle_starts: usize, rectangles: usize, keys: usize, impacts: BTreeMap<(u32, Vec<u8>), Range<usize>> }
 
 impl Sidecar {
     fn parse(bytes: OwnedBytes, columns: usize, documents: u32) -> Result<Self> {
@@ -498,6 +537,19 @@ impl Sidecar {
             Ok(range)
         };
         let u32_at = |range: Range<usize>| u32::from_le_bytes(data[range].try_into().unwrap_or_default());
+        let format = i32::from_le_bytes(data[take(4)?].try_into().map_err(fault)?);
+        let analyzer = i32::from_le_bytes(data[take(4)?].try_into().map_err(fault)?);
+        if format != FORMAT_VERSION || analyzer != rtdb_text::ANALYZER_VERSION {
+            return Err(corrupt("Search file format or analyzer version does not match the reader"));
+        }
+        let version_tag = data[take(1)?.start];
+        let version_value = i64::from_le_bytes(data[take(8)?].try_into().map_err(fault)?);
+        let version = match version_tag {
+            0 if version_value == 0 => None,
+            1 => Some(version_value),
+            _ => return Err(corrupt("Search file has invalid definition version metadata")),
+        };
+        let identity = data[take(32)?].try_into().map_err(fault)?;
         let (rows, counted, pages) = (u32_at(take(4)?), u32_at(take(4)?), u32_at(take(4)?) as usize);
         if counted != documents { return Err(corrupt("Search file sidecar counts other documents than its segment")); }
         let members = u32_at(take(4)?) as usize;
@@ -521,6 +573,7 @@ impl Sidecar {
             return Err(corrupt("Search file row names no document"));
         }
         let doc_iids = take(documents as usize * 16)?.start;
+        let token_lengths = take(documents as usize * 4)?.start;
         let doc_classes = take(documents as usize)?.start;
         let counted = take(1)?;
         let body = take(data[counted.start] as usize * 49)?;
@@ -544,7 +597,7 @@ impl Sidecar {
             impacts.insert((column, term), range);
         }
         if position != data.len() { return Err(corrupt("Search file sidecar has trailing bytes")); }
-        Ok(Self { bytes, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
+        Ok(Self { bytes, version, identity, rows, documents, member_starts, page_starts, column_docs, row_docs: row_docs.start, doc_iids, token_lengths, doc_classes, sections, rectangle_starts: starts.start, rectangles, keys, impacts })
     }
     fn data(&self) -> &[u8] { self.bytes.as_slice() }
     fn u32_at(&self, offset: usize) -> u32 { u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap_or_default()) }
@@ -652,6 +705,25 @@ impl SearchFile {
     /// A row's run in a column: `None` where the row is visible nowhere within the file, `Some(None)` where it is visible with the column null or absent.
     pub fn run_of(&self, column: &str, row: u32) -> Option<Option<u32>> {
         match self.column(column).map(|index| self.sidecar.row_doc(index, row)) { Some(RowDoc::Run(doc)) => Some(Some(doc)), Some(RowDoc::Null) => Some(None), _ => None }
+    }
+
+    /// The text runs belonging to one member of a single-column artefact.
+    pub(crate) fn single_column_member_runs(&self, member: u32) -> Result<impl Iterator<Item = DocMatch> + '_> {
+        if self.columns.len() != 1 { return Err(corrupt("Owned search must cover exactly one column")); }
+        let member = member as usize;
+        let first = self.sidecar.member_starts.get(member).ok_or_else(|| corrupt("Search file has no such member"))?.doc;
+        let end = self.sidecar.member_starts.get(member + 1).map_or(self.sidecar.documents, |start| start.doc);
+        Ok((first..end).map(|doc| self.sidecar.doc_match(doc)))
+    }
+
+    pub(crate) fn matches_artefact(&self, identity: &str, version: i64) -> bool {
+        self.sidecar.version == Some(version) && self.sidecar.identity == identity_digest(identity)
+    }
+
+    /// Counts analyzer tokens before the ranker's field-norm quantization.
+    pub fn token_length(&self, doc: u32) -> Result<u32> {
+        if doc >= self.sidecar.documents { return Err(corrupt("Search file has no such run")); }
+        Ok(self.sidecar.u32_at(self.sidecar.token_lengths + doc as usize * 4))
     }
 
     /// A document's length as the index stores it.
@@ -977,6 +1049,22 @@ mod tests {
         let reads = tracked.reads.lock().unwrap();
         assert!(reads.contains(&(tracked.len() - 16..tracked.len())));
         assert!(reads.iter().all(|range| range.len() < tracked.len()));
+    }
+
+    #[test]
+    fn published_runs_keep_exact_lengths_and_definition_identity() {
+        let columns = vec!["body".to_string()];
+        let tokens = vec!["term".to_string(); 79];
+        let row = SearchRow { iid: [1; 16], system_from: 1, valid_from: 1, valid_to: 10, op: EventOp::Put, values: vec![Some(tokens)] };
+        let mut bytes = Vec::new();
+        write_versioned_group(&columns, [[Ok(vec![row])]], "owned-file", 13, None, RamDirectory::create(), &mut bytes).unwrap();
+        let file = SearchFile::open(bytes, &columns).unwrap();
+        assert!(file.matches_artefact("owned-file", 13));
+        assert!(!file.matches_artefact("other-file", 13));
+        assert!(!file.matches_artefact("owned-file", 14));
+        assert_eq!(file.token_length(0).unwrap(), 79);
+        assert_eq!(file.stored_length("body", 0).unwrap(), 76);
+        assert!(file.token_length(1).is_err());
     }
 
     #[test]

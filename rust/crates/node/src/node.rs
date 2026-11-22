@@ -887,6 +887,18 @@ impl OwnedReadSession {
         rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
     }
 
+    /// Computes the visible corpus of one covered clear-text path at this read's cut.
+    #[cfg(feature = "search")]
+    pub async fn search_corpus(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation, query: &str,
+    ) -> Result<rtdb_text::Corpus> {
+        self.admit_read().await?;
+        let work = rtdb_search::owned_corpus(Arc::clone(&self.context), &self.owner, relation, path, query);
+        let corpus = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
+        self.check()?;
+        Ok(corpus)
+    }
+
     /// Reads one covered page from the named ordered path at this held cut.
     pub async fn range(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
