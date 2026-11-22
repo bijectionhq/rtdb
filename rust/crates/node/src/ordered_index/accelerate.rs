@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Definition, checkpoint, definitions,
+    Definition, OwnedProjection, checkpoint, definitions,
     key::{Atom, AtomRef, Bucket, Family, family},
     maintenance::{cancelled, read_root, source_frontier, source_rows},
     postings::Tuple,
@@ -720,26 +720,6 @@ async fn use_index(
     }))
 }
 
-fn owned_fields(snapshot: &rtdb_index::Snapshot, definition: &Definition) -> Vec<Field> {
-    let types = snapshot.column_types_for(&definition.table, definition.columns.clone());
-    definition
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(id, name)| Field {
-            id: ColumnId(id as u32),
-            name: name.clone(),
-            qualifier: None,
-            qualified_only: false,
-            unnamed: false,
-            data_type: types
-                .get(name.as_str())
-                .cloned()
-                .unwrap_or(LogicalType::Null),
-        })
-        .collect()
-}
-
 async fn covered_root(
     context: &rtdb_query::QueryContext,
     snapshot: &rtdb_index::Snapshot,
@@ -778,10 +758,11 @@ pub(super) async fn owned_page(
     snapshot: &rtdb_index::Snapshot,
     storage: &Arc<rtdb_storage::cache::BufferPool>,
     definition: &Definition,
+    projection: OwnedProjection,
     bounds: RowBounds<'_>,
     valid_at: Option<Timestamp>,
 ) -> Result<super::OwnedRangePage> {
-    let fields = owned_fields(snapshot, definition);
+    let OwnedProjection { fields, empty } = projection;
     let positions: Vec<_> = (0..fields.len()).collect();
     let covered =
         Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
@@ -794,8 +775,13 @@ pub(super) async fn owned_page(
     }
 
     let present = context.current_time.as_micros()?;
+    let valid_at = valid_at.unwrap_or(present);
+    valid_at.next()?;
+    if empty {
+        return Ok(super::OwnedRangePage { schema: covered.schema, batch: None });
+    }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
-    let buckets: Vec<_> = Bucket::at(valid_at.unwrap_or(present)).collect();
+    let buckets: Vec<_> = Bucket::at(valid_at).collect();
     let scratch = context
         .memory
         .reserve(limit.saturating_mul(64).saturating_add(16_384))?;
@@ -843,9 +829,10 @@ pub(super) async fn owned_count(
     snapshot: &rtdb_index::Snapshot,
     storage: &Arc<rtdb_storage::cache::BufferPool>,
     definition: &Definition,
+    projection: OwnedProjection,
     request: super::OwnedCountRequest<'_>,
 ) -> Result<super::OwnedRangeCount> {
-    let fields = owned_fields(snapshot, definition);
+    let OwnedProjection { fields, empty } = projection;
     let positions: Vec<_> = (0..fields.len()).collect();
     Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
     let mut range = Range::default();
@@ -853,6 +840,9 @@ pub(super) async fn owned_count(
     compound_bound(&mut range, &fields, request.upper, false, true)?;
     request.valid_at.next()?;
     let present = context.current_time.as_micros()?;
+    if empty {
+        return Ok(super::OwnedRangeCount { count: 0, present, valid_at: request.valid_at });
+    }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
     let mut count = 0u64;
     for bucket in Bucket::at(request.valid_at) {
@@ -943,7 +933,17 @@ fn compound_bound(
     Ok(())
 }
 
-impl RowBounds<'_> {
+impl<'a> RowBounds<'a> {
+    pub(super) fn identity_bound(&self) -> Option<&'a rtdb_types::Value> {
+        match self {
+            Self::Leading { .. } => None,
+            Self::Compound(request) => [request.lower, request.upper, request.after]
+                .into_iter()
+                .flatten()
+                .find_map(|key| key.get("_id")),
+        }
+    }
+
     fn bind(self, fields: &[Field]) -> Result<(Range, bool, usize)> {
         let mut range = Range::default();
         match self {

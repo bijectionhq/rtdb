@@ -752,22 +752,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?
             .with_accelerators(Arc::from([]));
-        let Some(mut cursor) = rtdb_query::open_owned_relation_schema(context, owner, relation).await? else { return Ok(None); };
-        let mut schema = None;
-        while let Some(batch) = cursor.next_batch().await? {
-            let batch = batch.batch();
-            for row in 0..batch.num_rows() {
-                let malformed = || Anomaly::fault("rtdb.owned/schema-catalog", "Invalid stored owned declaration");
-                if schema.is_some() { return Err(malformed()); }
-                let (index, field) = batch.schema_ref().column_with_name("schema").ok_or_else(malformed)?;
-                let values = batch.column(index).as_ref();
-                let bound = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
-                let decoded = self.context.memory.reserve(bound.checked_mul(8).and_then(|bound| bound.checked_add(4096)).ok_or_else(overflow)?)?;
-                let Value::Binary(bytes) = rtdb_columnar::read_value(field, values, row)? else { return Err(malformed()); };
-                schema = Some((rtdb_types::OwnedSchema::from_json(&bytes).map_err(|_| malformed())?, decoded));
-            }
-        }
-        Ok(schema)
+        rtdb_query::read_owned_relation_schema(context, owner, relation).await
     }
 
     async fn declare_owned_path(

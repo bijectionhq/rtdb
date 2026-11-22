@@ -553,6 +553,7 @@ Historical pages and counts carry no commit witness.
 
 Held range and count actions can cover a cut by replaying up to 4096 uncheckpointed events from the captured relation, including up to eight flushed source files.
 This also covers relations that have no checkpoint yet when the retained sources supply the complete history.
+Before the first fact, the held declaration supplies the path field types and the exact empty result.
 An incomplete or over-limit replay yields no rows, count, or witness.
 The relation-frontier check still applies to moving-valid reads, continuation reads, and reads whose exact witness or intervening coverage is unavailable.
 

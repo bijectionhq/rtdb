@@ -17,7 +17,7 @@ use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, Instant, Result, TableRef, Value};
+use rtdb_types::{Anomaly, Instant, LogicalType, Result, ScalarType, TableRef, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -192,6 +192,11 @@ pub struct OwnedRangeCount {
     pub valid_at: rtdb_types::Timestamp,
 }
 
+struct OwnedProjection {
+    fields: Vec<Field>,
+    empty: bool,
+}
+
 fn uncovered_owned_range() -> Anomaly {
     Anomaly::new(
         rtdb_types::AnomalyCategory::Unavailable,
@@ -215,7 +220,18 @@ pub(crate) async fn owned_range(
     let [snapshot] = database.partitions.as_slice() else {
         return Err(uncovered_owned_range());
     };
-    let work = accelerate::owned_page(&context, snapshot, &database.storage, &definition, bounds, valid_at);
+    let projection = owned_projection(
+        &context,
+        snapshot,
+        &definition,
+        owner,
+        relation,
+        bounds.identity_bound(),
+    )
+    .await?;
+    let work = accelerate::owned_page(
+        &context, snapshot, &database.storage, &definition, projection, bounds, valid_at,
+    );
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }
 
@@ -233,8 +249,64 @@ pub(crate) async fn owned_count(
     let [snapshot] = database.partitions.as_slice() else {
         return Err(uncovered_owned_range());
     };
-    let work = accelerate::owned_count(&context, snapshot, &database.storage, &definition, request);
+    let identity = [request.lower, request.upper]
+        .into_iter()
+        .flatten()
+        .find_map(|key| key.get("_id"));
+    let projection = owned_projection(&context, snapshot, &definition, owner, relation, identity).await?;
+    let work = accelerate::owned_count(
+        &context, snapshot, &database.storage, &definition, projection, request,
+    );
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
+}
+
+async fn owned_projection(
+    context: &Arc<QueryContext>,
+    snapshot: &Snapshot,
+    definition: &Definition,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    identity: Option<&Value>,
+) -> Result<OwnedProjection> {
+    let empty = snapshot.relation_event_frontier(&definition.table)? == 0;
+    let mut types = snapshot.column_types_for(&definition.table, definition.columns.clone());
+    if empty {
+        let (declaration, _charge) =
+            rtdb_query::read_owned_relation_schema(Arc::clone(context), owner, relation)
+                .await?
+                .ok_or_else(uncovered_owned_range)?;
+        let identity = match identity {
+            Some(identity) => {
+                identity.entity_id()?;
+                identity.logical_type()
+            }
+            None => LogicalType::Scalar(ScalarType::Utf8),
+        };
+        for name in &definition.columns {
+            let ty = if name == "_id" {
+                // Identity has no declaration until the first fact. Its bound
+                // supplies a concrete type for an empty compound page.
+                identity.clone()
+            } else {
+                declaration.column_logical_type(name).ok_or_else(uncovered_owned_range)?
+            };
+            types.insert(name.clone(), ty);
+        }
+    }
+    let fields = definition
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(id, name)| Field {
+            id: ColumnId(id as u32),
+            name: name.clone(),
+            qualifier: None,
+            qualified_only: false,
+            unnamed: false,
+            data_type: types.get(name.as_str()).cloned().unwrap_or(LogicalType::Null),
+        })
+        .collect();
+    Ok(OwnedProjection { fields, empty })
 }
 
 async fn owned_definition(

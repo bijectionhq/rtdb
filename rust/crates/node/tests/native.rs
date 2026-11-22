@@ -777,7 +777,7 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
 }
 
 #[tokio::test]
-async fn held_owned_range_covers_live_flushed_and_checkpointed_events() {
+async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     use rtdb_types::OwnedRelation;
 
     let mut settings = options();
@@ -787,6 +787,45 @@ async fn held_owned_range_covers_live_flushed_and_checkpointed_events() {
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
     let relation = OwnedRelation::new("held-range").unwrap();
     let path = OwnedRelation::new("by-priority").unwrap();
+    let schema = rtdb_types::OwnedSchema::from_json(
+        br#"{"fields":[{"name":"priority","type":{"kind":"i64"},"optional":false,"nullable":false}]}"#,
+    ).unwrap();
+    let write = writer.state_mut().execute_tx(
+        vec![TxOp::OwnedDeclareRelation { relation: relation.clone(), schema }],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
+    let declaration = TxOp::OwnedDeclarePath {
+        relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()],
+    };
+    let write = writer.state_mut().execute_tx(vec![declaration], AutonomousTxOptions::default()).await.unwrap();
+    assert!(write.committed(), "{:?}", write.error());
+    let empty = writer.open_owned_read().await.unwrap();
+    let key = |priority, id| StructFields::from([
+        ("priority".into(), Value::I64(priority)),
+        ("_id".into(), Value::I64(id)),
+    ]);
+    let lower = key(10, 1);
+    let upper = key(20, 3);
+    let empty_count = || rtdb_node::OwnedCountRequest {
+        lower: Some(&lower), upper: Some(&upper), valid_at: Timestamp(10),
+    };
+    let request = rtdb_node::OwnedRangeRequest {
+        lower: Some(&lower), upper: Some(&upper), after: None, descending: false, limit: 1,
+    };
+    let page = empty.range_page_by_key(&relation, &path, request).await.unwrap();
+    assert!(page.batch.is_none());
+    assert_eq!(page.schema.field(0).data_type(), &arrow_schema::DataType::Int64);
+    assert_eq!(page.schema.field(1).data_type(), &arrow_schema::DataType::Int64);
+    assert_eq!(empty.count_range(&relation, &path, empty_count()).await.unwrap().count, 0);
+    let malformed = StructFields::from([
+        ("priority".into(), Value::Utf8("10".into())),
+        ("_id".into(), Value::I64(1)),
+    ]);
+    let request = rtdb_node::OwnedCountRequest {
+        lower: Some(&malformed), upper: Some(&upper), valid_at: Timestamp(10),
+    };
+    assert_eq!(empty.count_range(&relation, &path, request).await.err().unwrap().code, "rtdb.owned/range-bound");
     let documents = Documents::new(
         [(3, 20), (2, 10), (1, 10)].into_iter().map(|(id, priority)| StructFields::from([
             ("_id".into(), Value::I64(id)),
@@ -799,9 +838,8 @@ async fn held_owned_range_covers_live_flushed_and_checkpointed_events() {
     };
     let write = writer.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap();
     assert!(write.committed(), "{:?}", write.error());
-    let declaration = TxOp::OwnedDeclarePath {
-        relation: relation.clone(), name: path.clone(), columns: vec!["priority".into(), "_id".into()],
-    };
+    assert_eq!(empty.count_range(&relation, &path, empty_count()).await.unwrap().count, 0);
+    drop(empty);
     let publications = OwnedRelation::new("publications").unwrap();
     let marker = EntityId::String("head".into());
     let publish = TxOp::OwnedInsertDocs {
@@ -812,7 +850,7 @@ async fn held_owned_range_covers_live_flushed_and_checkpointed_events() {
         valid_from: Some(Timestamp::MIN),
         valid_to: None,
     };
-    let write = writer.state_mut().execute_tx(vec![declaration, publish], AutonomousTxOptions::default()).await.unwrap();
+    let write = writer.state_mut().execute_tx(vec![publish], AutonomousTxOptions::default()).await.unwrap();
     assert!(write.committed(), "{:?}", write.error());
     let selected = write.tx_key().system_time;
     let correction = TxOp::OwnedReplaceDocs {
@@ -855,10 +893,6 @@ async fn held_owned_range_covers_live_flushed_and_checkpointed_events() {
     }).collect::<Vec<_>>();
     assert_eq!(ids, [Value::I64(1), Value::I64(2)]);
 
-    let key = |priority, id| StructFields::from([
-        ("priority".into(), Value::I64(priority)),
-        ("_id".into(), Value::I64(id)),
-    ]);
     let lower = key(10, 1);
     let upper = key(20, 3);
     for (valid_at, expected) in [(9, 2), (10, 1), (19, 1), (20, 2)] {

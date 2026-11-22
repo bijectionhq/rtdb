@@ -209,16 +209,39 @@ pub async fn open_owned_capacity_point(
     open_owned_table_point(context, relation.capacity_table(owner), id.iid(), Some(id), None, Some(columns), false).await
 }
 
-pub async fn open_owned_relation_schema(
+/// Reads the exact declared schema at the caller's admitted cut.
+pub async fn read_owned_relation_schema(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-) -> Result<Option<QueryCursor>> {
+) -> Result<Option<(rtdb_types::OwnedSchema, Arc<rtdb_columnar::MemoryReservation>)>> {
     if owner.is_empty() {
         return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
     }
     let id = EntityId::String(relation.name().into());
-    open_owned_table_point(
-        context, OwnedRelation::relation_catalog(owner), id.iid(), Some(&id), None, Some(&["schema"]), false,
-    ).await
+    let memory = Arc::clone(&context.memory);
+    let Some(mut cursor) = open_owned_table_point(
+        context, OwnedRelation::relation_catalog(owner), id.iid(), Some(&id), None,
+        Some(&["schema"]), false,
+    ).await? else { return Ok(None); };
+    let malformed = || Anomaly::fault("rtdb.owned/schema-catalog", "Invalid stored owned declaration");
+    let mut declaration = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        if batch.num_rows() == 0 { continue; }
+        let (index, field) = batch.schema_ref().column_with_name("schema").ok_or_else(malformed)?;
+        let values = batch.column(index).as_ref();
+        for row in 0..batch.num_rows() {
+            if declaration.is_some() { return Err(malformed()); }
+            let bytes = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
+            let decoded = memory.reserve(bytes.checked_mul(8).and_then(|n| n.checked_add(4096))
+                .ok_or_else(malformed)?)?;
+            let Value::Binary(body) = rtdb_columnar::read_value(field, values, row)? else {
+                return Err(malformed());
+            };
+            let schema = rtdb_types::OwnedSchema::from_json(&body).map_err(|_| malformed())?;
+            declaration = Some((schema, decoded));
+        }
+    }
+    Ok(declaration)
 }
 
 pub(crate) async fn open_owned_table_point(

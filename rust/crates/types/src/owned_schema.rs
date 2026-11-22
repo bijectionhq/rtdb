@@ -179,7 +179,22 @@ impl OwnedSchema {
     }
 
     pub fn column_type(&self, name: &str) -> Option<ScalarType> {
-        self.0.fields.iter().find(|field| field.name == name).map(|field| field.kind.scalar())
+        self.field(name).map(|field| field.kind.scalar())
+    }
+
+    pub fn column_logical_type(&self, name: &str) -> Option<LogicalType> {
+        self.field(name).map(|field| {
+            let ty = LogicalType::Scalar(field.kind.scalar());
+            if field.optional || field.nullable {
+                ty.maybe()
+            } else {
+                ty
+            }
+        })
+    }
+
+    fn field(&self, name: &str) -> Option<&Field> {
+        self.0.fields.iter().find(|field| field.name == name)
     }
 
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
