@@ -76,7 +76,7 @@ pub use stage::stage_checkpoint;
 pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod replica_suffix;
-pub(crate) use replica_suffix::{MAX_SUFFIX_ENTRIES, capture as capture_replica_suffix};
+pub(crate) use replica_suffix::{MAX_SUFFIX_BYTES, MAX_SUFFIX_ENTRIES, capture as capture_replica_suffix, find_held_publication};
 mod read_world;
 mod writable_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
