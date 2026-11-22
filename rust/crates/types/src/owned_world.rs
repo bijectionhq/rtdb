@@ -68,6 +68,7 @@ pub enum WorldClockMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedWorld {
     pub id: Iid,
+    pub pin: Iid,
     pub capture: Iid,
     pub suffix: Option<Iid>,
     pub manifest: String,
@@ -102,6 +103,7 @@ impl OwnedWorld {
         };
         let mut row = StructFields::from([
             ("_id".into(), Value::Uuid(self.id.0)),
+            ("pin".into(), Value::Uuid(self.pin.0)),
             ("capture".into(), Value::Uuid(self.capture.0)),
             ("manifest".into(), Value::Utf8(self.manifest.clone())),
             ("basis_id".into(), Value::I64(self.basis.tx_id.0)),
@@ -125,6 +127,7 @@ impl OwnedWorld {
     pub fn from_record(row: &StructFields<Value>) -> Result<Self> {
         let (
             Some(Value::Uuid(id)),
+            Some(Value::Uuid(pin)),
             Some(Value::Uuid(capture)),
             Some(Value::Utf8(manifest)),
             Some(Value::I64(tx_id)),
@@ -133,6 +136,7 @@ impl OwnedWorld {
             Some(Value::Binary(schemas)),
         ) = (
             row.get("_id"),
+            row.get("pin"),
             row.get("capture"),
             row.get("manifest"),
             row.get("basis_id"),
@@ -161,8 +165,8 @@ impl OwnedWorld {
             Some(Value::Uuid(id)) if *id != [0; 16] => Some(Iid(*id)),
             _ => return Err(Self::unavailable()),
         };
-        if row.len() != 11 + usize::from(row.contains_key("suffix"))
-            || *id == [0; 16]
+        if row.len() != 12 + usize::from(row.contains_key("suffix"))
+            || *id == [0; 16] || *pin == [0; 16]
             || *capture == [0; 16]
             || *until <= *time
             || manifest.len() != 43
@@ -174,6 +178,7 @@ impl OwnedWorld {
         }
         Ok(Self {
             id: Iid(*id),
+            pin: Iid(*pin),
             capture: Iid(*capture),
             suffix,
             manifest: manifest.clone(),
@@ -189,8 +194,19 @@ impl OwnedWorld {
         })
     }
 
+    pub fn can_move_to(&self, next: &Self) -> bool {
+        self.id == next.id
+            && self.pin != next.pin
+            && !self.dropped && !next.dropped
+            && !self.is_held() && !next.is_held()
+            && self.until == next.until
+            && self.basis.system_time < next.basis.system_time
+            && self.basis.tx_id < next.basis.tx_id
+    }
+
     pub fn same_fork(&self, other: &Self) -> bool {
         self.id == other.id
+            && self.pin == other.pin
             && self.capture == other.capture
             && self.suffix == other.suffix
             && self.manifest == other.manifest

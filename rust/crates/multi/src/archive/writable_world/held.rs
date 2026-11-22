@@ -69,6 +69,9 @@ impl HeldCheckpointWorld {
     pub fn is_held(&self) -> bool { self.open.record.is_held() }
 
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
+    pub fn parent_pin(&self) -> Iid { self.open.record.pin }
+    pub fn until(&self) -> Timestamp { self.open.retained.until }
+    pub fn evidence_until(&self) -> Timestamp { self.open.snapshot.evidence_until().min(self.until()) }
 
     pub fn check(&self) -> Result<()> {
         self.open.check()?;

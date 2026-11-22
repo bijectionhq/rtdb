@@ -550,6 +550,7 @@ impl OrderedIndexStorage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointWorldRetention {
+    pub world: uuid::Uuid,
     pub owner: String,
     pub capture: uuid::Uuid,
     pub manifest_sha256: String,

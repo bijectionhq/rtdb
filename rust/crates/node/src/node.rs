@@ -994,6 +994,8 @@ pub struct OwnedReadSession {
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
 
+    pub fn evidence_until(&self) -> Timestamp { self.witness_until }
+
     pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {
         self.admit_access().await?;
         let attached_scope = self.attachment.upgrade()
@@ -1057,12 +1059,16 @@ impl OwnedReadSession {
         }
         context.check_cancelled()?;
         let witness = if let Some(scope) = self.witness_scope.filter(|_| observed) {
+            let (registered, _charge) = self.world_registration(world).await?
+                .filter(|(record, _)| !record.dropped && record.until > self.present.system_time)
+                .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
             let root = relation.root_relation().ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
             let database = self.context.catalog.database(&self.database)?;
             let [snapshot] = database.partitions.as_slice() else { return Err(rtdb_types::OwnedWorld::unavailable()); };
             let purge_frontier = snapshot.relation_event_frontier(&root.purge_table(&self.owner))?;
             Some(OwnedWorldPointWitness {
-                world, relation, id: id.clone(), valid_at, local_revision, purge_frontier, scope, until: self.witness_until,
+                world, pin: registered.pin, relation, id: id.clone(), valid_at, local_revision, purge_frontier, scope,
+                until: self.witness_until.min(registered.until),
             })
         } else {
             None
@@ -1464,6 +1470,7 @@ pub struct OwnedWorldShadowRead {
 #[derive(Clone)]
 pub struct OwnedWorldPointWitness {
     world: rtdb_types::Iid,
+    pin: rtdb_types::Iid,
     relation: rtdb_types::OwnedRelation,
     id: rtdb_types::EntityId,
     valid_at: Timestamp,
@@ -1507,6 +1514,8 @@ pub enum WorldClockRequest {
 
 pub struct OwnedWorldFork {
     pub world: rtdb_types::Iid,
+    pub pin: rtdb_types::Iid,
+    pub previous: Option<rtdb_types::Iid>,
     pub cut: OwnedForkCut,
     pub requested: WorldClockRequest,
     pub deadline: Timestamp,
@@ -1528,6 +1537,7 @@ pub struct OwnedRootPublication {
 
 pub struct OwnedWorldSection {
     pub world: rtdb_types::Iid,
+    pub parent_pin: rtdb_types::Iid,
     pub parent_basis: TransactionKey,
     pub checks: Vec<OwnedWorldPointWitness>,
     pub attempt: String,
@@ -1570,7 +1580,9 @@ impl NativeSession {
             WorldClockRequest::Held { start } => rtdb_types::WorldClockMode::Held { start: start.unwrap_or(inherited) },
         };
         let advances = record.initial_clock() > inherited;
-        if record.id != fork.world || record.basis.system_time != fork.cut.basis || fork.controls.is_empty()
+        if record.id != fork.world || record.pin != fork.pin || record.basis.system_time != fork.cut.basis
+            || (fork.previous.is_none() != (record.pin == record.id)) || fork.controls.is_empty()
+            || fork.previous.is_some_and(|pin| pin == record.pin || record.is_held())
             || fork.cut.live.is_some_and(|live| live != record.basis) || record.mode != requested
             || (advances && fork.cut.live.is_none())
             || fork.controls.len() > 4092 || fork.controls.iter().any(|control| !control.is_check())
@@ -1589,7 +1601,8 @@ impl NativeSession {
                 expected: record.parent_publication,
             });
         }
-        ops.push(TxOp::OwnedForkWorld { record: record.record(), attempt: fork.attempt, fingerprint: fork.fingerprint });
+        ops.push(TxOp::OwnedForkWorld { record: record.record(), previous: fork.previous,
+            attempt: fork.attempt, fingerprint: fork.fingerprint });
         self.state.execute_tx(ops, Default::default()).await
     }
 
@@ -1608,8 +1621,8 @@ impl NativeSession {
         let now = self.service.node.now();
         let mut until = deadline.min(record.until);
         for check in &checks {
-            if check.world != record.id || check.relation.world() != Some(record.id)
-                || scope != check.scope || now >= check.until
+            if check.world != record.id || check.pin != record.pin
+                || check.relation.world() != Some(record.id) || scope != check.scope || now >= check.until
             {
                 return Err(unavailable());
             }
@@ -1672,8 +1685,8 @@ impl NativeSession {
                 .saturating_add(section.checks.len().saturating_mul(2)).saturating_add(2);
             until = until.min(*retained_until);
             for check in &section.checks {
-                if check.world != section.world || check.relation.world() != Some(section.world)
-                    || check.scope != scope || now >= check.until
+                if check.world != section.world || check.pin != section.parent_pin
+                    || check.relation.world() != Some(section.world) || check.scope != scope || now >= check.until
                 {
                     return Err(unavailable());
                 }
@@ -1709,7 +1722,7 @@ impl NativeSession {
 
     fn append_world_checks(ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldPointWitness>) {
         for check in checks {
-            ops.push(TxOp::OwnedCheckWorldPurge { relation: check.relation.clone(), frontier: check.purge_frontier });
+            ops.push(TxOp::OwnedCheckWorldPurge { relation: check.relation.clone(), pin: check.pin, frontier: check.purge_frontier });
             ops.push(TxOp::OwnedCheck {
                 relation: check.relation, id: check.id, valid_at: check.valid_at, expected: check.local_revision,
             });

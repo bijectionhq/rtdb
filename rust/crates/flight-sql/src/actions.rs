@@ -59,7 +59,7 @@ impl Service {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::FORK_HELD_WORLD_V2 => Ok(vec![Ok(self.fork_held_world_action(&call, &action.body).await?)]),
+                crate::owned_actions::PUBLISH_WORLD_CUT_V1 => Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V3 => Ok(vec![Ok(self.validate_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HELD_WORLDS_V4 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),

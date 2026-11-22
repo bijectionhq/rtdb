@@ -11,7 +11,7 @@ use super::invalid;
 pub(crate) const WORLD_EFFECTS: &str = "owned_world_effects";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { Root, Overlay, Clock, Fork, Drop }
+enum Kind { Root, Overlay, Clock, Fork, Advance, Drop }
 
 const ROOT: Iid = Iid([0; 16]);
 
@@ -26,6 +26,7 @@ impl Kind {
             Self::Overlay => "overlay",
             Self::Clock => "clock",
             Self::Fork => "fork",
+            Self::Advance => "advance",
             Self::Drop => "drop",
         }
     }
@@ -36,6 +37,7 @@ impl Kind {
             "overlay" => Ok(Self::Overlay),
             "clock" => Ok(Self::Clock),
             "fork" => Ok(Self::Fork),
+            "advance" => Ok(Self::Advance),
             "drop" => Ok(Self::Drop),
             _ => Err(mismatch()),
         }
@@ -57,9 +59,9 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         }
     }
     operations.iter().filter_map(|operation| match operation {
-        Operation::Public(TxOp::OwnedForkWorld { record, attempt, fingerprint }) => Some(
+        Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint }) => Some(
             match record.get("_id") {
-                Some(Value::Uuid(world)) => Ok((Iid(*world), Kind::Fork, attempt, fingerprint)),
+                Some(Value::Uuid(world)) => Ok((Iid(*world), if previous.is_some() { Kind::Advance } else { Kind::Fork }, attempt, fingerprint)),
                 _ => Err(mismatch()),
             }),
         Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) =>
@@ -102,7 +104,7 @@ pub(super) fn verify(
         if fields.len() != 5 || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (effects.len() > 1 && kind == Kind::Fork)
+            || (effects.len() > 1 && matches!(kind, Kind::Fork | Kind::Advance))
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
             || attempts.insert(attempt.as_str(), fingerprint.as_slice()).is_some()
@@ -162,9 +164,14 @@ pub(super) fn verify(
         } else if table.owned_world_scope().0 {
             records(batch, key, memory, |row| {
                 let record = OwnedWorld::from_record(row).map_err(|_| mismatch())?;
+                let matches_kind = match worlds.get(&record.id) {
+                    Some(Kind::Drop) => record.dropped,
+                    Some(Kind::Fork) => !record.dropped && record.id == record.pin,
+                    Some(Kind::Advance) => !record.dropped && !record.is_held() && record.id != record.pin,
+                    _ => false,
+                };
                 if record.basis.system_time >= key.system_time || record.until <= key.system_time
-                    || worlds.get(&record.id) != Some(&if record.dropped { Kind::Drop } else { Kind::Fork })
-                    || !registrations.insert(record.id)
+                    || !matches_kind || !registrations.insert(record.id)
                 {
                     return Err(mismatch());
                 }
@@ -210,7 +217,7 @@ pub(super) fn verify(
             Kind::Root => false,
             Kind::Overlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),
-            Kind::Fork | Kind::Drop => !registrations.contains(world),
+            Kind::Fork | Kind::Advance | Kind::Drop => !registrations.contains(world),
         })
     {
         return Err(mismatch());

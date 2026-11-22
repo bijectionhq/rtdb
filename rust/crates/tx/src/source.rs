@@ -483,11 +483,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
                 "rtdb-owned-check-range-v1"
             }
         }
-        Operation::Public(TxOp::OwnedForkWorld { record, attempt, fingerprint }) => {
+        Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint }) => {
             body.insert("registration".into(), Value::Struct(record.clone()));
+            body.insert("previous".into(), previous.map_or(Value::Null, |pin| Value::Uuid(pin.0)));
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
             body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
-            "rtdb-owned-fork-world-v1"
+            "rtdb-owned-fork-world-v2"
         }
         Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) => {
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
@@ -508,10 +509,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
                 "rtdb-owned-publish-world-v1"
             }
         }
-        Operation::Public(TxOp::OwnedCheckWorldPurge { relation, frontier }) => {
+        Operation::Public(TxOp::OwnedCheckWorldPurge { relation, pin, frontier }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("pin".into(), Value::Uuid(pin.0));
             body.insert("frontier".into(), Value::I64(*frontier));
-            "rtdb-owned-check-world-purge-v1"
+            "rtdb-owned-check-world-purge-v2"
         }
         Operation::Public(TxOp::OwnedCheckWorldScope { scope }) => {
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
@@ -1142,11 +1144,11 @@ impl SourceOperationReader<'_> {
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
-            "rtdb-owned-fork-world-v1" => &["registration", "attempt", "fingerprint"],
+            "rtdb-owned-fork-world-v2" => &["registration", "previous", "attempt", "fingerprint"],
             "rtdb-owned-publish-root-v1" => &["attempt", "fingerprint"],
             "rtdb-owned-publish-world-v1" | "rtdb-owned-drop-world-v1" => &["world", "attempt", "fingerprint", "expected"],
             "rtdb-owned-publish-world-v2" => &["world", "attempt", "fingerprint", "expected", "advance_to"],
-            "rtdb-owned-check-world-purge-v1" => &["relation", "frontier"],
+            "rtdb-owned-check-world-purge-v2" => &["relation", "pin", "frontier"],
             "rtdb-owned-check-world-scope-v1" => &["scope"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
@@ -1164,13 +1166,18 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
-            "rtdb-owned-fork-world-v1" => {
+            "rtdb-owned-fork-world-v2" => {
                 let (Value::Struct(record), Value::Utf8(attempt), Value::Binary(fingerprint)) =
                     (value("registration")?, value("attempt")?, value("fingerprint")?) else {
                     return Err(invalid("Owned world fork has invalid fields"));
                 };
                 let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid world fork fingerprint"))?;
-                TxOp::OwnedForkWorld { record, attempt, fingerprint }
+                let previous = match value("previous")? {
+                    Value::Uuid(pin) => Some(Iid(pin)),
+                    Value::Null => None,
+                    _ => return Err(invalid("Invalid world predecessor pin")),
+                };
+                TxOp::OwnedForkWorld { record, previous, attempt, fingerprint }
             }
             "rtdb-owned-publish-root-v1" => {
                 let (Value::Utf8(attempt), Value::Binary(fingerprint)) =
@@ -1202,11 +1209,12 @@ impl SourceOperationReader<'_> {
                     },
                 }
             }
-            "rtdb-owned-check-world-purge-v1" => {
-                let (Value::Utf8(relation), Value::I64(frontier)) = (value("relation")?, value("frontier")?) else {
+            "rtdb-owned-check-world-purge-v2" => {
+                let (Value::Utf8(relation), Value::Uuid(pin), Value::I64(frontier)) =
+                    (value("relation")?, value("pin")?, value("frontier")?) else {
                     return Err(invalid("Owned world purge witness has invalid fields"));
                 };
-                TxOp::OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation::from_source(relation)?, frontier }
+                TxOp::OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation::from_source(relation)?, pin: Iid(pin), frontier }
             }
             "rtdb-owned-check-capacity-v1" => {
                 let (Value::Utf8(relation), Value::Utf8(column), Value::Binary(prefix), Value::I64(at_most)) =
