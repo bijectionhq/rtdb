@@ -6,14 +6,14 @@ use zeroize::Zeroizing;
 
 use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
 #[derive(Clone, Debug)]
 pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub allocation_limit_bytes: usize, pub pgwire_port: i32, pub flight_sql_port: i32, pub object_sort: rtdb_types::ObjectSort }
 #[derive(Clone, Debug)]
-pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
+pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize }, HashPassword { bcrypt: bool, password: Option<Secret> } }
 
 pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(&str) -> Option<String>) -> Result<Command> {
     let mut arguments = arguments.into_iter().peekable();
@@ -27,6 +27,31 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         arguments.next();
         if arguments.next().is_some() { return Err(invalid("--build-info accepts no arguments")); }
         return Ok(Command::BuildInfo);
+    }
+    if arguments.peek().is_some_and(|argument| argument == "repair-checkpoint") {
+        arguments.next();
+        if matches!(arguments.peek().map(String::as_str), Some("-h" | "--help")) { return Ok(Command::Help); }
+        let mut positional = Vec::new();
+        let mut base_storage = None;
+        let mut memory_bytes = environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024);
+        while let Some(argument) = arguments.next() {
+            if argument == "--memory-limit" {
+                memory_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?;
+            } else if argument == "--base-storage" {
+                base_storage = Some(PathBuf::from(arguments.next().ok_or_else(|| invalid("--base-storage requires a path"))?));
+            } else if argument.starts_with('-') {
+                return Err(invalid(format!("Unknown repair option '{argument}'")));
+            } else {
+                positional.push(argument);
+            }
+        }
+        let [source, replica, output, base, through]: [String; 5] = positional.try_into()
+            .map_err(|_| invalid("repair-checkpoint requires storage, a replica log, an output parent, and two checkpoint receipts"))?;
+        let request = rtdb_node::LocalRepair {
+            source_storage: source.into(), base_storage, replica_log: replica.into(), output_parent: output.into(),
+            base: repair_checkpoint(&base)?, through: repair_checkpoint(&through)?,
+        };
+        return Ok(Command::RepairCheckpoint { request, memory_bytes });
     }
     let inspection = match arguments.peek().map(String::as_str) {
         Some("read-arrow-file") => Some(crate::inspect::FileKind::ArrowFile),
@@ -113,6 +138,19 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         }
     }
     Ok(Command::Start(options))
+}
+
+fn repair_checkpoint(value: &str) -> Result<rtdb_node::RepairCheckpoint> {
+    let (index, sha256) = value.split_once('@').ok_or_else(|| invalid("A repair checkpoint has the form BLOCK@SHA256"))?;
+    let block = index.parse::<i64>().ok().filter(|index| *index >= 0).ok_or_else(|| invalid("Checkpoint block must be nonnegative"))?;
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("Checkpoint SHA-256 must have 64 hexadecimal digits"));
+    }
+    let mut digest = [0; 32];
+    for (offset, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&sha256[2 * offset..2 * offset + 2], 16).map_err(|_| invalid("Invalid checkpoint SHA-256"))?;
+    }
+    Ok(rtdb_node::RepairCheckpoint { block: rtdb_types::BlockIndex(block), sha256: digest })
 }
 
 impl StartOptions {

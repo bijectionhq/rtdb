@@ -198,6 +198,7 @@ impl TableBlock {
         Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns }), charge: None })
     }
 
+    pub fn encoded_len(&self) -> usize { self.wire.encoded_len() }
     pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }
     pub fn as_proto(&self) -> &pb::TableBlock { &self.wire }
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
@@ -206,6 +207,18 @@ impl TableBlock {
     pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
         self.wire.partitions.iter().flat_map(|partition| &partition.tries)
             .chain(self.wire.tries.iter().filter(|_| self.wire.partitions.is_empty()))
+    }
+
+    /// Detaches the serving trie inventory from retired files and derived artefacts.
+    pub fn for_primary_repair(&self) -> Self {
+        fn retain_primary(tries: &mut Vec<TrieDetails>) {
+            tries.retain(|try_| try_.trie_state != Some(TrieState::Garbage as i32));
+            for try_ in tries { try_.artefacts.clear(); }
+        }
+        let mut wire = self.wire.as_ref().clone();
+        retain_primary(&mut wire.tries);
+        for partition in &mut wire.partitions { retain_primary(&mut partition.tries); }
+        Self { wire: Arc::new(wire), charge: self.charge.clone() }
     }
 
     pub fn checkpoint_trie_files(&self, slug: &TableSlug, contents: CheckpointContents) -> Result<BTreeSet<String>> {

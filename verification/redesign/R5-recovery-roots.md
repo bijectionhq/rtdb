@@ -60,7 +60,11 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.
 - Compactor reset names outputs in a new epoch (R3, `ae7b66e10`), so rebuilding from a root cannot collide with pre-reset names.
   Reset loads the installed checkpoint's bound table inventories and checks each named L0 pair before preparing publication.
-  Rebuilding from retained journal input after L0 retirement remains open.
+- The offline native `repair-checkpoint` command takes a known-good checkpoint digest and an exact later target digest from the same stopped local journal.
+  It verifies the checkpoint publications and base table inventories, replays resolved writes into independent primary storage, and publishes a detached checkpoint with a new digest.
+  The native regression takes the base from a snapshot export and removes its original primary inventory and the source's L0 files.
+  It restarts from the rebuilt checkpoint and resumes writes in a fresh log epoch.
+  The online reset and automatic L0 collection still need an independently held known-good root and journal suffix available through replacement and activation.
 
 ## Handoff notes
 

@@ -1996,6 +1996,149 @@ async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_a
 }
 
 #[tokio::test]
+async fn a_trusted_checkpoint_and_replica_journal_rebuild_after_l0_is_removed() {
+    use rtdb_format::keys::TrieKey;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_storage = directory.path().join("source");
+    let source_log = directory.path().join("log");
+    let primary = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog { path: Some(source_log.display().to_string()), epoch: Some(0) })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(source_storage.display().to_string()), epoch: Some(0) })),
+        ..Default::default()
+    };
+    let mut settings = options();
+    settings.membership = Membership::Durable { primary: primary.clone(), skipped: BTreeSet::new() };
+    let runtime = services();
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let cancellation = CancellationToken::new();
+    let flush = async |database: &Database| {
+        let mut status = database.watch_status();
+        let position = database.flush().await.unwrap();
+        let adopted = tokio::time::timeout(Duration::from_secs(10), status.wait_for(|status| {
+            status.adopted_block.as_ref().and_then(|block| block.latest_source_position()).is_some_and(|source| source >= position)
+        })).await.unwrap().unwrap();
+        adopted.adopted_block.clone().unwrap()
+    };
+    session.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap();
+    let first = flush(&database).await;
+    database.compaction().unwrap().compact_all().await.unwrap();
+    let base = flush(&database).await;
+    assert!(base.block_index() > first.block_index());
+    let table = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let slug = snapshot.table_catalog().entry(&table).unwrap().slug.clone();
+    assert!(snapshot.trie_catalog().current_tries(&table).iter().all(|try_| try_.key.level() > 0));
+    drop(snapshot);
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    let mut offline = settings.clone();
+    offline.replication.enabled = false;
+    offline.compaction_threads = 0;
+    let (exporter, driver) = running(offline, fresh_local_services(&runtime)).await;
+    let export = exporter.snapshot_export("xtdb", Timestamp(0)).await.unwrap().unwrap();
+    assert_eq!(export.block_index(), base.block_index());
+    export.copy(&cancellation).await.unwrap();
+    let original_base_files = export.files().to_vec();
+    let trusted_base = directory.path().join("known-good");
+    std::fs::rename(source_storage.join("v06").join(export.directory().as_str()), &trusted_base).unwrap();
+    drop(export);
+    stop(&exporter, driver).await;
+    drop(exporter);
+
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    session.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap();
+    session.state_mut().execute_operation(put(&node, 2, 30)).await.unwrap();
+    let middle = flush(&database).await;
+    session.state_mut().execute_operation(put(&node, 3, 40)).await.unwrap();
+    let through = flush(&database).await;
+    let sql = "SELECT _id, value FROM docs FOR ALL SYSTEM_TIME ORDER BY _id, value";
+    let before = rows(session.query_sql(sql, vec![]).await.unwrap()).await;
+    let mut repair = LocalRepair {
+        source_storage: source_storage.clone(), base_storage: Some(trusted_base), replica_log: source_log.join("REPLICA_LOG"), output_parent: directory.path().to_owned(),
+        base: RepairCheckpoint { block: base.block_index(), sha256: base.publication_sha256().unwrap() },
+        through: RepairCheckpoint { block: through.block_index(), sha256: through.publication_sha256().unwrap() },
+    };
+    let memory = rtdb_columnar::MemoryBudget::new(512 << 20);
+    let refusal = repair.rebuild(memory.clone(), &cancellation).await.unwrap_err();
+    assert_eq!(refusal.code, "rtdb.repair/source-unavailable");
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    for file in original_base_files {
+        std::fs::remove_file(source_storage.join("v06").join(file.as_str())).unwrap();
+    }
+    for block in [first.block_index(), middle.block_index(), through.block_index()] {
+        let key = TrieKey::l0(block).unwrap();
+        std::fs::remove_file(source_storage.join("v06").join(slug.data_key(&key))).unwrap();
+        std::fs::remove_file(source_storage.join("v06").join(slug.metadata_key(&key))).unwrap();
+    }
+    let receipt = repair.base;
+    repair.base.sha256[0] ^= 1;
+    let refusal = repair.rebuild(memory.clone(), &cancellation).await.unwrap_err();
+    assert_eq!(refusal.code, "rtdb.repair/invalid-checkpoint");
+    repair.base = receipt;
+    let receipt = repair.through;
+    repair.through.sha256[0] ^= 1;
+    let refusal = repair.rebuild(memory.clone(), &cancellation).await.unwrap_err();
+    assert_eq!(refusal.code, "rtdb.repair/invalid-checkpoint");
+    repair.through = receipt;
+
+    let original_journal = repair.replica_log.clone();
+    repair.replica_log = directory.path().join("truncated");
+    let target_offset = through.boundary_replica_position().unwrap().after_offset(rtdb_types::StorageEpoch(0));
+    let mut replica = std::fs::File::open(&original_journal).unwrap();
+    let mut truncated = std::fs::File::create(&repair.replica_log).unwrap();
+    let copied = std::io::copy(&mut std::io::Read::take(&mut replica, target_offset.try_into().unwrap()), &mut truncated).unwrap();
+    assert_eq!(i64::try_from(copied).unwrap(), target_offset);
+    drop(truncated);
+    let refusal = repair.rebuild(memory.clone(), &cancellation).await.unwrap_err();
+    assert_eq!(refusal.code, "rtdb.repair/source-unavailable");
+    repair.replica_log = original_journal;
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let refusal = repair.rebuild(memory.clone(), &cancelled).await.unwrap_err();
+    assert_eq!(refusal.code, "rtdb.repair/cancelled");
+    assert!(!directory.path().read_dir().unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("repair-")));
+
+    let rebuilt = repair.rebuild(memory, &cancellation).await.unwrap();
+    assert_eq!(rebuilt.latest_transaction, through.latest_completed_tx().unwrap());
+    assert_eq!(rebuilt.checkpoint.block, through.block_index());
+    let latest_root = rebuilt.path.join("v06").join(rtdb_format::keys::block_key(rebuilt.checkpoint.block).unwrap());
+    assert_eq!(rtdb_format::catalog::publication_digest(&std::fs::read(latest_root).unwrap()), rebuilt.checkpoint.sha256);
+    for block in [base.block_index(), middle.block_index()] {
+        assert!(!rebuilt.path.join("v06").join(rtdb_format::keys::block_key(block).unwrap()).exists());
+        assert!(!rebuilt.path.join("v06").join(slug.block_key(block).unwrap()).exists());
+    }
+
+    let reopened = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog {
+            path: Some(directory.path().join("new-log").display().to_string()), epoch: Some(1),
+        })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(rebuilt.path.display().to_string()), epoch: Some(0) })),
+        ..primary
+    };
+    settings.membership = Membership::Durable { primary: reopened, skipped: BTreeSet::new() };
+    let (replacement, driver) = running(settings, fresh_local_services(&runtime)).await;
+    replacement.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+    let mut session = replacement.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
+    let transaction = session.state_mut().execute_operation(put(&replacement, 3, 50)).await.unwrap().unwrap();
+    assert!(transaction.tx_key().tx_id > rebuilt.latest_transaction.tx_id);
+    assert_eq!(rows(session.query_sql("SELECT value FROM docs WHERE _id = 3", vec![]).await.unwrap()).await, vec![vec![Value::I64(50)]]);
+    drop(session);
+    stop(&replacement, driver).await;
+}
+
+#[tokio::test]
 async fn compactor_reset_requires_a_completed_transaction() {
     let mut settings = options();
     settings.compaction_threads = 0;

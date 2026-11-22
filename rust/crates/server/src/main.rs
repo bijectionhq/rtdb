@@ -28,6 +28,22 @@ async fn run() -> Result<()> {
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
         Command::CompactorReset { options, database, dry_run } => reset_compactor(options, database, dry_run).await,
+        Command::RepairCheckpoint { request, memory_bytes } => {
+            let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let repair = request.rebuild(memory, &cancellation);
+            tokio::pin!(repair);
+            let store = tokio::select! {
+                result = &mut repair => result?,
+                _ = shutdown_signal() => { cancellation.cancel(); repair.await? }
+            };
+            write_report(std::io::stdout().lock(), |output| {
+                let digest: String = store.checkpoint.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+                writeln!(output, "Rebuilt checkpoint {}@{digest} through transaction {}", store.checkpoint.block.0, store.latest_transaction.tx_id.0)?;
+                writeln!(output, "Storage: {}", store.path.display())?;
+                writeln!(output, "Source replica epoch: {}", store.source_replica_epoch.0)
+            })
+        },
         Command::Start(options) => {
             let (config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
             let (handle, driver) = if options.mode == cli::NodeMode::Compactor {

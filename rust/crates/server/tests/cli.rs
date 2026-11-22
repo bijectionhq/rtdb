@@ -115,6 +115,29 @@ fn compactor_reset_requires_database_and_preserves_dry_run_configuration() {
 }
 
 #[test]
+fn checkpoint_repair_requires_exact_publication_receipts() {
+    let base = format!("9@{}", "a1".repeat(32));
+    let through = format!("23@{}", "C4".repeat(32));
+    let Command::RepairCheckpoint { request, memory_bytes } = parse(&[
+        "repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &base, &through,
+        "--base-storage", "known-good", "--memory-limit", "104857600",
+    ]) else { panic!("expected checkpoint repair") };
+    assert_eq!(request.source_storage.to_str(), Some("source"));
+    assert_eq!(request.base_storage.unwrap().to_str(), Some("known-good"));
+    assert_eq!(request.replica_log.to_str(), Some("logs/REPLICA_LOG"));
+    assert_eq!(request.output_parent.to_str(), Some("repairs"));
+    assert_eq!(request.base.block.0, 9);
+    assert_eq!(request.base.sha256, [0xa1; 32]);
+    assert_eq!(request.through.block.0, 23);
+    assert_eq!(request.through.sha256, [0xc4; 32]);
+    assert_eq!(memory_bytes, 104857600);
+    for invalid in ["9", "9@abcd", &format!("-9@{}", "ab".repeat(32)), &format!("9@{}", "zz".repeat(32))] {
+        let arguments = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", invalid, &through];
+        assert!(cli::parse(arguments.map(str::to_owned), &|_| None).is_err());
+    }
+}
+
+#[test]
 fn inspection_commands_require_a_path_and_accept_memory_limits() {
     for command in ["read-arrow-file", "read-arrow-stream-file", "read-hash-trie-file", "read-table-block-file", "read-block-file"] {
         let Command::Inspect { path, allocation_limit_bytes, .. } = parse(&[command, "input.bin", "--memory-limit", "1000000"]) else { panic!("expected inspection") };

@@ -356,7 +356,7 @@ impl BlockStore {
         self.decode_catalog(index, lease.as_slice())
     }
 
-    async fn load_fresh_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
+    pub(crate) async fn load_fresh_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let key = ObjectKey::new(block_key(index)?)?;
         let size = usize::try_from(self.store.head_fresh(&key).await?.size)
             .map_err(|_| invalid("Checkpoint root exceeds addressable memory"))?;

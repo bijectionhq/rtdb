@@ -1787,6 +1787,24 @@ contract CompactorReset {
         -- Its plan leaves the catalog and files as they stood after that catch-up.
 }
 
+contract LocalCheckpointRepair {
+    @invariant ExactLocalAnchor
+        -- The operator selects a known-good base and a later target by block number and root SHA-256.
+        -- The base binds all its table blocks and has its live and nascent primary data and metadata available, including when retained as a separate snapshot export.
+        -- The same stopped local replica journal covers both checkpoint boundaries.
+        -- Repair holds the journal's writer lock throughout the rebuild.
+
+    @invariant ReplayThroughSelectedCut
+        -- The rebuild copies the base primary inventory and replays admitted resolved transactions through the exact target boundary.
+        -- The rebuilt checkpoint has the selected target's transaction head and table registry.
+        -- A missing or incompatible boundary, missing source dependency or unsupported database effect prevents publication.
+
+    @invariant DetachedPublication
+        -- Repair stages a separate local store with its own primary inventory and reads back the completed checkpoint and bound table blocks.
+        -- Publication exposes that store with the rebuilt checkpoint's digest after the rebuild and read-back succeed.
+        -- Activating the rebuilt store uses a fresh log at a higher epoch.
+}
+
 contract StandaloneCompactor {
     @invariant FollowerCompaction
         -- A compactor-only node follows admitted replica progress and compacts the available catalog using the ordinary deterministic job selection.
@@ -1814,6 +1832,7 @@ surface MaintenanceCommands {
     contracts:
         fulfils OfflineSnapshotExport
         fulfils CompactorReset
+        fulfils LocalCheckpointRepair
         fulfils StandaloneCompactor
 }
 

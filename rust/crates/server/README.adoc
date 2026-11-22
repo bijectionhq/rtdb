@@ -73,8 +73,19 @@ The manifest contains one block catalog, its table blocks and the live/nascent t
 Copies preserve object bytes, and identical retries are accepted.
 `reset-compactor DATABASE` runs an exclusive maintenance node with compaction, automatic GC and listeners disabled.
 Every other node, client and upstream writer must remain stopped until it finishes.
-The command catches up, enumerates surviving L0 pairs, publishes their replacement catalog and waits for its block adoption before deleting compacted files.
+The command catches up, verifies the L0 pairs named by the installed checkpoint, publishes their replacement catalog and waits for its block adoption before deleting compacted files.
 `--dry-run` reports the replacement tries and deletion list after the catch-up flush.
+`rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256` rebuilds a stopped single local database in a separate directory.
+Supply the original storage parent containing `v06`, the file named `REPLICA_LOG`, an existing output parent outside `v06`, and decimal block numbers with the SHA-256 digests of their exact published block files.
+Stop the original database and keep its journal and storage stable for the duration of the command.
+Select a known-good base whose bound table blocks and live and nascent primary trie files are intact.
+Use `--base-storage PATH` to open the base from a separately retained `export-snapshot` directory, even if its original files have been removed from the serving store.
+The target can have missing primary files if the original journal still contains the full interval from the base boundary through the target boundary, including any oversized payload objects referenced by the interval.
+The command trusts the original local journal and the base's immutable primary trie contents.
+This path applies to epoch-zero local storage with both checkpoints in the same replica journal and with all writes coming from RTDB.
+The command publishes a separate `repair-…/storage` directory and reports its checkpoint digest, last transaction and original replica epoch.
+Use that storage with a new empty local log configured at an epoch higher than the one reported.
+The rebuilt catalog contains primary data, so derived indexes can be rebuilt by their normal maintenance paths.
 `compactor` opens the database catalog, follows replica progress, performs deterministic compaction and publishes results through the source log.
 It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
 A separate writer must apply its source-log notifications before jobs are acknowledged.
