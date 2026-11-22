@@ -500,6 +500,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_exact_reaper_resumes_an_installed_trie_release_after_its_reader_drains() {
+        use rtdb_directory::MemberId;
+        use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
+        use rtdb_storage::IoRegion;
+        use rtdb_types::TableRef;
+        use std::sync::{Arc, atomic::AtomicBool};
+        use tokio::sync::oneshot;
+        use tokio_util::task::TaskTracker;
+
+        struct Inventory {
+            bucket: Arc<VersionedReleaseStore>,
+            lose_reply: AtomicBool,
+        }
+
+        #[async_trait]
+        impl RetirementProvider for Inventory {
+            async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
+                Ok(self.bucket.retirement_version(key).await?.as_ref() == Some(version))
+            }
+
+            async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
+                Ok(!self.available(key, version).await?)
+            }
+
+            async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+                assert_eq!(&self.bucket.version(key), version);
+                self.bucket.delete(key).await?;
+                if self.lose_reply.swap(false, Ordering::Relaxed) {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "fixture/reply-lost", "Provider reply lost"));
+                }
+                Ok(())
+            }
+        }
+
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let region = Uuid::new_v4();
+        record.holder = Some(MemberId::fresh());
+        record.storage_namespaces = Some(namespaces);
+        record.storage_regions.insert(region, StorageRegion::Local {
+            archive: None, repair_archive: None, tracks_ordered_index_pages: true,
+            checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        });
+        record.checkpoint = Some(rtdb_directory::Checkpoint {
+            block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([1; 32]),
+        });
+        record.recovery_manifest_sha256 = Some([1; 32]);
+        let record = directory.create_deployment(record).await.unwrap();
+        let epoch = StorageEpoch(0);
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
+        let scope = format!("{}/{root}", record.storage_prefix());
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
+        let bucket = Arc::new(VersionedReleaseStore::default());
+        let inventory = Inventory { bucket: bucket.clone(), lose_reply: AtomicBool::new(true) };
+        let mut serving = super::super::open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, Arc::new(|| 0)).await.unwrap();
+        let tracker = TaskTracker::new();
+        Arc::get_mut(&mut serving).unwrap().catalog_readers = Some(crate::catalog_readers::CatalogReaders::new(
+            directory.clone(), tracker.clone(), &record, root, namespaces, region, Some(record.epoch),
+        ));
+        let serving = super::super::EncryptingStore::new(serving, &[7; 32]).unwrap();
+        let relative = ObjectKey::new("tables/orders/data/l01-rc-b00.arrow").unwrap();
+        let target = ObjectKey::new(format!("{scope}/{relative}")).unwrap();
+        bucket.versions.lock().insert(target.clone(), "trie-1".into());
+        serving.put(&relative, Bytes::from_static(b"retained trie")).await.unwrap();
+        let version = serving.retirement_version(&relative).await.unwrap().unwrap();
+        let hold = serving.retain_catalog(Some(cut)).await.unwrap().unwrap();
+        let io = IoRegion::new();
+        let work = io.child();
+        let (entered, running) = oneshot::channel();
+        let (release_work, finish_work) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(IoRegion::retaining(hold, async move {
+            work.run_blocking(move || {
+                entered.send(()).unwrap();
+                finish_work.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            }).await
+        }));
+        tokio::time::timeout(Duration::from_secs(5), running).await.unwrap().unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        let plan = RetirementIntent {
+            selected: cut, table: TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
+            files: vec![RetirementFile {
+                key: relative.to_string(), version: Some(version), matches_publication: true, terminal_publication: None,
+            }],
+        };
+        let installed = ReplicaPosition(1);
+        let floor = plan.installed_cut(installed).unwrap();
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        let receipt = ObjectKey::new(format!("{}/installed/{}", journal_directory(cut), intent_digest(&encoded))).unwrap();
+        let contents = Bytes::from([installed.0.to_be_bytes().as_slice(), &encoded].concat());
+        serving.put(&receipt, contents.clone()).await.unwrap();
+        assert!(!serving.advance_catalog_floor(floor).await.unwrap());
+        let held = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert_eq!(held.catalog_readers.len(), 1);
+        reap(directory.as_ref(), bucket.as_ref(), &inventory, &held, i64::MAX, None, None).await.unwrap();
+        assert_eq!(serving.get(&relative).await.unwrap(), Bytes::from_static(b"retained trie"));
+
+        release_work.send(()).unwrap();
+        io.close_and_wait().await;
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await.unwrap();
+        assert!(serving.advance_catalog_floor(floor).await.unwrap());
+        serving.release_trie_files(&receipt, contents).await.unwrap();
+        let markers = ObjectKey::new(format!("{scope}/{GARBAGE_DIRECTORY}")).unwrap();
+        let queued = bucket.list(Some(&markers)).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        let error = reap(directory.as_ref(), bucket.as_ref(), &inventory, &current, i64::MAX, None, None).await.unwrap_err();
+        assert_eq!(error.code, "fixture/reply-lost");
+        assert!(matches!(bucket.head(&target).await, Err(Error::MissingObject(_))));
+        assert!(bucket.head(&queued[0].key).await.is_ok());
+        assert!(directory.lineage_state(&record.lineage).await.unwrap().exact_erasure_authorized());
+
+        reap(directory.as_ref(), bucket.as_ref(), &inventory, &current, i64::MAX, None, None).await.unwrap();
+        assert!(bucket.list(Some(&markers)).await.unwrap().is_empty());
+        assert!(directory.lineage_state(&record.lineage).await.unwrap().retirement().is_none());
+    }
+
+    #[tokio::test]
     async fn exact_retirement_waits_for_forks_and_reads_and_resumes_the_same_version() {
         let directory = MemoryDirectory::new();
         let bucket: crate::reference::Bucket = std::sync::Arc::new(VersionedReleaseStore::default());

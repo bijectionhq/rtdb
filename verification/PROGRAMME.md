@@ -63,6 +63,9 @@ The native query fixture also checks that offline admission needs no replica lea
 The [collector turnover study](tla/CollectorTurnover.tla) checks fresh observation and conditional reclamation in a successor term.
 The corresponding native fixture replaces the trie collector with another clock origin and observes reclamation after the fresh lease interval.
 The local receipt fixture reopens the collector before the earlier filesystem hold drains and observes that the installed retirement remains pending until that hold ends.
+A shared-journal replay elects a successor while the predecessor's query is open, installs retirement under the new term, and observes the idle leader finish after the query drops its hold.
+The remote adapter replay retains the catalog owner until the response stream drains after cancellation.
+The hosted replay sends an installed release from the directory floor to the exact reaper and checks recovery after a lost provider response.
 Source and external transaction resolution request a store catalog hold before evaluation.
 The local ledger fixture verifies that the transaction and its cursor retain the hold, then observes the floor advance after cursor drop and a subsequent stale capture refused.
 
@@ -72,10 +75,10 @@ The local ledger fixture verifies that the transaction and its cursor retain the
 
 1. Audit every other read path: leader transaction snapshots on stores without a catalog ledger, spill and materialization, export, administrative collection, compactor reset, and ordered-index reads.
 2. Audit every other deletion path against the same contract: block GC, artefact removal and repair, ordered-index storage reaping, and Multi region release, deployment removal and forks.
-3. Leadership turnover: replay a real term handoff with in-flight snapshots and extend receipt resumption to deferred physical deletion in Multi.
+3. Leadership turnover: extend the shared-journal handoff to hosted term placement and cover the provider-drain and reaper contracts across the same deployment.
 4. Compose the currency, caller admission and provider drain with the collector under the model's clock and I/O premises. The [currency model](tla/ReadCurrencyAnchor.tla) checks competing tip samples, and [Verus](verus/read_currency/proof.rs) proves the production observation and confirmation steps.
 5. Connect the peer study `ResidenceReaderRetention` (generation cutoff vs exact dependencies) to the Multi reaper's actual release records.
-6. LIVE-2: extend the fresh-selection expiry witness and its progress control to actual term scheduling, renewed residence holds and deferred reaper settlement.
+6. LIVE-2: extend the idle-successor retry and deferred-settlement checks to renewed residence holds and providers under qualification.
 
 **Done when:** each path above has either a native replay that fails under the matching mutation or a recorded reason it cannot strand a reader.
 
