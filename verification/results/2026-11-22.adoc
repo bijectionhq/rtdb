@@ -440,3 +440,22 @@ Proof logs and commands are in `read-currency-lean-ac4jaa85/`, `read-currency-tl
 The package test log is `read-currency-full-node-aa0c65dd19.log`.
 The post-rebase TLC run reproduced the currency results at `aa0c65dd19` and passed the added recovery custody and repair-anchor model cases and their Lean controls.
 Its commands are in `currency-rebase-recovery-aa0c65dd19-gw4uu07w/`.
+
+The single combined formal run at `ef7ef49df1` passed 480 TLC cases, 70 Apalache cases, 68 Lean proof cases with 197 controls, and 42 Verus areas with 231 controls.
+It also completed Alloy, Maude, mCRL2, AutoHyper, SMT and OpenJML.
+The later runtime rebase changed neither currency proof source nor the production currency steps.
+The combined proof receipt under `read-currency-combined-ef7ef49df1/` names that exact source revision. The targeted runs above supply evidence for the later revision.
+
+== W1 · Query admission requires current catalog currency
+
+Production change `6465fb63ae`.
+Replicated query capture refuses an unconfirmed or expired catalog lease before handing its captured snapshot to the evaluator.
+Delegated fragments and membership queries use the same guard.
+Offline query capture continues to admit reads without a replica lease.
+Provider operations still check the lease at their own admission boundary.
+
+All 23 Node library tests and 121 native Node integration tests passed.
+The new native test exercises the actual query context call with an unusable replica lease and checks its unavailable outcome. The same fixture checks offline acceptance.
+The native control omits the query capture guard and fails at the snapshot-admission assertion.
+The Node suite log is `current-query-catalog-node.log` and the replay receipt and control outputs are in `current-query-catalog-control-khk9w37b/` under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+The full Gradle suite and live hosted-provider qualification were outside these runs.
