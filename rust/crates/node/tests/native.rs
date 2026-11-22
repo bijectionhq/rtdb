@@ -4501,3 +4501,52 @@ async fn merged_held_changes_resume_only_after_whole_visible_commits() {
     drop(session);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
+    use rtdb_types::{EntityId, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let publications = OwnedRelation::new("publications").unwrap();
+    let facts = OwnedRelation::new("facts").unwrap();
+    let other = OwnedRelation::new("other").unwrap();
+    let marker = EntityId::String("head".into());
+    let fact = EntityId::String("key".into());
+    let put = |relation: &OwnedRelation, id: &EntityId, value| TxOp::OwnedReplaceDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), id.as_value()), ("payload".into(), Value::I64(value)),
+        ])], node.memory()).unwrap(),
+        valid_from: (relation == &publications).then_some(Timestamp::MIN), valid_to: None,
+    };
+    let first = session.state_mut().execute_tx(vec![put(&publications, &marker, 1), put(&facts, &fact, 1)],
+        AutonomousTxOptions::default()).await.unwrap();
+    let intermediate = session.reserve_ordered_present().await.unwrap();
+    let second = session.state_mut().execute_tx(vec![put(&publications, &marker, 2), put(&facts, &fact, 2)],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert!(first.committed() && second.committed());
+
+    let fresh = session.open_owned_read().await.unwrap();
+    let scope = vec![publications.clone(), facts.clone()];
+    assert!(fresh.derive_as_of(Timestamp::MIN, &publications, &marker, scope.clone()).await.unwrap().is_none());
+    assert!(fresh.derive_as_of(intermediate.system_time, &publications, &marker, vec![facts.clone()]).await.is_err());
+    let old = fresh.derive_as_of(intermediate.system_time, &publications, &marker, scope)
+        .await.unwrap().unwrap();
+    assert_eq!(old.system_time(), first.tx_key().system_time);
+    drop(fresh);
+    assert!(old.open_point(&other, &fact).await.is_err());
+    assert!(old.changes(&facts, Timestamp::MIN, 1).await.is_err());
+
+    let mut cursor = old.open_point(&facts, &fact).await.unwrap().unwrap();
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    let index = batch.batch().schema_ref().index_of("payload").unwrap();
+    let field = batch.batch().schema_ref().field(index);
+    assert_eq!(rtdb_columnar::read_value(field, batch.batch().column(index).as_ref(), 0).unwrap(), Value::I64(1));
+    drop(cursor);
+    drop(old);
+    drop(session);
+    stop(&node, driver).await;
+}

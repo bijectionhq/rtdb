@@ -95,6 +95,7 @@ fn owned_groups(body: &[u8], require_writes: bool) -> Result<Vec<(OwnedRelation,
 }
 
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
+pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
@@ -503,13 +504,51 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
+        let snapshot = native.open_owned_read().await.map_err(status)?;
+        self.retain_owned_read(call, snapshot, permit)
+    }
+
+    pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical read requires an existing held handle"))?;
+        let (requested, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical read requires a requested system time"))?;
+        let (publication, body) = split_relation(body)?;
+        let (length, body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Historical read requires a publication marker"))?;
+        let length = usize::from(u16::from_be_bytes(*length));
+        if !(1..=4096).contains(&length) { return Err(invalid("Invalid historical marker length")); }
+        let (marker, body) = body.split_at_checked(length).ok_or_else(|| invalid("Incomplete historical marker"))?;
+        let marker = std::str::from_utf8(marker).map_err(|_| invalid("Historical marker is not UTF-8"))?;
+        let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Historical read requires a relation count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=32).contains(&count) { return Err(invalid("Historical reads require one to 32 owner relations")); }
+        let _request = call.reserve(count * 512 + marker.len() + 512)?;
+        let mut relations = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (relation, tail) = split_relation(body)?;
+            relations.push(relation);
+            body = tail;
+        }
+        if !body.is_empty() { return Err(invalid("Historical read has trailing bytes")); }
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
+        let marker = EntityId::String(marker.to_owned());
+        let snapshot = held.snapshot.derive_as_of(Timestamp(i64::from_be_bytes(*requested)), &publication, &marker, relations)
+            .await.map_err(status)?;
+        held.snapshot.check().map_err(status)?;
+        match snapshot {
+            Some(snapshot) => self.retain_owned_read(call, snapshot, permit),
+            None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
+        }
+    }
+
+    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: OwnedSemaphorePermit) -> Result<ActionResult, Status> {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
-        let snapshot = native.open_owned_read().await.map_err(status)?;
         let handle = Uuid::new_v4();
         let mut reply = Vec::with_capacity(24);
         reply.extend_from_slice(handle.as_bytes());
-        reply.extend_from_slice(&snapshot.present().system_time.0.to_be_bytes());
+        reply.extend_from_slice(&snapshot.system_time().0.to_be_bytes());
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             witnesses: Mutex::default(), _permit: permit, _reservation: reservation,
@@ -1150,7 +1189,7 @@ impl Service {
     async fn execute_owned_point(
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
     ) -> Result<ActionResult, Status> {
-        let present = snapshot.present().system_time;
+        let present = snapshot.system_time();
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(present, valid.unwrap_or(present), id, cursor).await?;
         snapshot.check().map_err(status)?;

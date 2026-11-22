@@ -949,11 +949,17 @@ pub struct OwnedReadSession {
     witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     witness_until: Timestamp,
     cancellation: CancellationToken,
+    session_cancellation: CancellationToken,
+    historical: Option<historical_owned_read::Scope>,
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
+
+    pub fn system_time(&self) -> Timestamp {
+        self.historical.as_ref().map_or(self.present.system_time, |scope| scope.system_time)
+    }
 
     pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
         self.admit_read().await?;
@@ -973,7 +979,10 @@ impl OwnedReadSession {
     pub async fn open_point_at(
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid_at: Option<Timestamp>,
     ) -> Result<Option<QueryCursor>> {
-        self.admit_read().await?;
+        self.admit_access().await?;
+        if self.historical.as_ref().is_some_and(|scope| !scope.relations.contains(relation)) {
+            return Err(historical_owned_read::unavailable());
+        }
         let valid = valid_at.map(|at| rtdb_types::Interval::new(at, at.next()?)).transpose()?;
         rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
     }
@@ -984,7 +993,7 @@ impl OwnedReadSession {
         system: Timestamp, valid: Timestamp,
     ) -> Result<Option<QueryCursor>> {
         self.admit_read().await?;
-        self.certify_historical_cut(relation, system).await?;
+        let _ = self.certify_historical_cut(relation, system).await?;
         self.check()?;
         let valid = rtdb_types::Interval::new(valid, valid.next()?)?;
         rtdb_query::open_owned_point_at_system(Arc::clone(&self.context), &self.owner, relation, id, valid, system).await
@@ -1195,6 +1204,11 @@ impl OwnedReadSession {
     }
 
     async fn admit_read(&self) -> Result<()> {
+        if self.historical.is_some() { return Err(historical_owned_read::unavailable()); }
+        self.admit_access().await
+    }
+
+    async fn admit_access(&self) -> Result<()> {
         self.check()?;
         self.node.admit(&self.database, DatabaseAccess::Read, self.identity.as_ref(), &self.cancellation).await?;
         if self.identity.user() != Some(self.owner.as_str()) {
@@ -1286,7 +1300,8 @@ impl NativeSession {
             current_time: present.system_time.into(),
             timezone: self.state.session_timezone().to_owned(),
         };
-        let cancellation = self.state.cancellation().child_token();
+        let session_cancellation = self.state.cancellation().clone();
+        let cancellation = session_cancellation.child_token();
         let context = node.query_context_in_placement(
             &database, &basis, identity.as_ref(), Some(&attached), Some(present), &cancellation,
         ).await?;
@@ -1313,7 +1328,10 @@ impl NativeSession {
             Ok(())
         }));
         context.check_cancelled()?;
-        Ok(OwnedReadSession { context, node, identity, database, owner, present, witness_scope, witness_until, cancellation, _reservation: charge })
+        Ok(OwnedReadSession {
+            context, node, identity, database, owner, present, witness_scope, witness_until,
+            cancellation, session_cancellation, historical: None, _reservation: charge,
+        })
     }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;

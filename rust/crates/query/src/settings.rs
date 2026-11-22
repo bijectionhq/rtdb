@@ -42,6 +42,37 @@ impl QueryContext {
         Ok(context)
     }
 
+    /// Reuses the captured store generation and lease while lowering one owned read's system cap.
+    pub fn with_owned_system_cut(
+        &self, system_time: Timestamp, cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<Self>> {
+        self.check_cancelled()?;
+        let original = self.catalog.database(&self.catalog.default_database)?;
+        let [snapshot] = original.partitions.as_slice() else {
+            return Err(invalid("owned-system-cut", "An owned historical read requires one partition"));
+        };
+        if snapshot.system_time_cap().is_none_or(|present| system_time > present) {
+            return Err(invalid("owned-system-cut", "An owned historical read cannot raise the system cap"));
+        }
+        let times = TimeBasis { databases: BTreeMap::from([
+            (self.catalog.default_database.clone(), vec![Some(system_time.into())]),
+        ]) };
+        let charge = self.memory.reserve(basis_bound(&times)?.checked_add(catalog_bound(&self.catalog)?)
+            .ok_or_else(size_error)?)?;
+        let mut context = (*self).clone();
+        let database = context.catalog.databases.get_mut(&context.catalog.default_database)
+            .ok_or_else(|| invalid("owned-system-cut", "An owned historical read requires its captured database"))?;
+        database.partitions[0] = snapshot.clone().with_system_time_cap(Some(system_time))?;
+        context.current_time = system_time.into();
+        context.cancellation = cancellation.child_token();
+        context.read_basis = Some(Arc::new(ReadBasis {
+            token: Some(rtdb_format::basis::encode_time_basis(&times)),
+            times: Some(times), snapshot_time: Some(system_time), clock_fallback: system_time.into(),
+            _reservation: charge,
+        }));
+        Ok(Arc::new(context))
+    }
+
     pub(crate) fn apply_settings(self: Arc<Self>, settings: &QuerySettings, parameters: rtdb_expr::Parameters<'_>) -> Result<Arc<Self>> {
         self.check_cancelled()?;
         let mut bytes = catalog_bound(&self.catalog)?;

@@ -80,6 +80,9 @@
 -- An empty owned root relation may declare an immutable cap for each distinct fixed-length prefix of its binary fact key.
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
 -- World writes to a governed root refuse without inherited capacity accounting.
+-- A fresh held read can derive a scoped point hold at the actual last visible publication marker.
+-- Each declared relation's retained floor covers both the requested and selected system coordinates.
+-- The derived hold shares the original generation and lease and admits point reads only in its fixed root scope.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- Fully covered range counts and completed valid windows can issue relation-frontier evidence under the same placed lease as range pages.

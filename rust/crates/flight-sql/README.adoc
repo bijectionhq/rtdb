@@ -450,3 +450,19 @@ Writes to the governed root must start at ordered present and have an unbounded 
 The resolver applies same-transaction releases and claims together, then commits the facts and counters atomically.
 A capacity conflict or uncovered counter frontier aborts the commit.
 World writes to a governed relation refuse until the world can account for inherited occupancy.
+
+=== Holding a historical root publication
+
+`rtdb.owned.OpenReadAsOf.v1` takes the 16-byte fresh held read handle and a signed 64-bit big-endian requested system instant in microseconds.
+Next come the publication relation prefix, a big-endian unsigned 16-bit marker byte length followed by that UTF-8 marker, and a big-endian unsigned 16-bit scope count followed by that many relation prefixes.
+The scope comprises one to 32 distinct preadmitted root relations, including the publication relation.
+Each selected relation needs a covered journal floor and head or a proven empty history.
+The marker is read at the requested system cut and business-valid instant.
+Its visible row must cover all valid time.
+The derived handle uses the marker's actual commit time, which must also be inside every selected relation's certified history.
+
+The response is one byte zero for a covered absent marker, or the new 16-byte handle followed by its signed 64-bit big-endian system time.
+Use the handle with ReadHeldPoint.v1 or ReadHeldPoint.v2 for points in the declared scope and CloseRead.v1 to release it.
+The default business-valid time is the selected marker time.
+The derived handle shares the original generation, lease and expiry and may serve requests after the fresh handle is closed.
+It carries no commit evidence.
