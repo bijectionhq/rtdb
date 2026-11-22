@@ -66,7 +66,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                 let encoded = batch.view().entity_key(index)?.ok_or_else(|| invalid("Owned event has no complete key"))?;
                 let _key = memory.reserve(encoded.len().saturating_mul(2))?;
                 let id = rtdb_types::EntityId::from_handle_bytes(encoded)?;
-                if id.iid() != batch.header(index)?.iid || id.handle_bytes() != encoded {
+                if id.iid() != batch.header(index)?.iid || id.handle_bytes().as_slice() != encoded {
                     return Err(invalid("Resolved owned event locality differs from its complete key"));
                 }
             }
