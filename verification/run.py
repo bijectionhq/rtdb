@@ -2739,6 +2739,65 @@ def verify_tla(args, scratch):
             print(f"{case}: {states[1]} distinct states, no violation")
 
 
+def verify_residence_trace(args, scratch):
+    fixture = Path("verification/traces/residence-composition.json")
+    events = json.loads((ROOT / fixture).read_text())
+    baseline = {event[0]: event for event in events}
+    reorder = {
+        "provider-read-undrained": ("drain-provider-read", "authorize-version"),
+        "recovery-trimmed": ("finish-recovery", "trim"),
+        "fork-copy-missing": ("copy-fork", "erase-residence"),
+    }
+    cases = {"baseline": events, "wrong-publication": [
+        [kind, cut, "new" if kind == "remove-version" else publication]
+        for kind, cut, publication in events
+    ]}
+    for name, (first, second) in reorder.items():
+        swapped = {first: baseline[second], second: baseline[first]}
+        cases[name] = [swapped.get(event[0], event) for event in events]
+    cases["no-settlement"] = events[:-1]
+    for name, trace in cases.items():
+        case = f"tlc-residence-trace-{name}"
+        directory = scratch / case
+        for module in ("ResidenceComposition", "ResidenceCompositionReplay"):
+            clone_file(Path(f"verification/tla/{module}.tla"), directory)
+        source = directory / "verification/tla/ResidenceCompositionReplay.tla"
+        encoded = ", ".join(f"<<{json.dumps(kind)}, {cut}, {json.dumps(publication)}>>" for kind, cut, publication in trace)
+        source.with_name("ResidenceCompositionEvents.tla").write_text(
+            "---- MODULE ResidenceCompositionEvents ----\nEXTENDS Integers\n"
+            f"Events == <<{encoded}>>\n====\n"
+        )
+        config = source.with_suffix(".cfg")
+        config.write_text("SPECIFICATION TraceSpec\nCONSTANT Mutation = \"none\"\nINVARIANT Safe\nPROPERTY ReplayTerminates\n")
+        checked = run_case(
+            [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
+             "-workers", "1", "-metadir", str(directory / "states"), "-noGenerateSpecTE",
+             "-config", config.name, source.name],
+            source.parent, args.evidence, case,
+        )
+        if name == "baseline":
+            if checked.returncode or "No error has been found." not in checked.stdout:
+                raise ValueError(f"{case}: accepted trace did not settle")
+            print(f"{case}: fixture actions match the composed transition system")
+        else:
+            if not checked.returncode or "Deadlock reached" not in checked.stdout:
+                raise ValueError(f"{case}: expected an unmatched trace action")
+            if name == "no-settlement":
+                expected_cursor = len(trace)
+            else:
+                expected_step = {
+                    "wrong-publication": "remove-version",
+                    "provider-read-undrained": "authorize-version",
+                    "recovery-trimmed": "trim",
+                    "fork-copy-missing": "erase-residence",
+                }[name]
+                expected_cursor = next(index for index, event in enumerate(trace) if event[0] == expected_step)
+            cursors = re.findall(r"^/\\ cursor = (\d+)$", checked.stdout, re.M)
+            if not cursors or int(cursors[-1]) != expected_cursor:
+                raise ValueError(f"{case}: expected first refusal at cursor {expected_cursor}")
+            print(f"{case}: trace refused at action {expected_cursor + 1}")
+
+
 def verify_alloy(args, scratch):
     path = Path("verification/alloy/Reclamation.als")
     source = clone_file(path, scratch)
@@ -4985,6 +5044,7 @@ def main():
         directory = Path(scratch)
         verify_lean(args, directory)
         verify_tla(args, directory)
+        verify_residence_trace(args, directory)
         verify_verus(args, directory)
         if args.openjml:
             verify_jvm_leaf_merge(args, directory)

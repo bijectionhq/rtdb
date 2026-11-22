@@ -1,0 +1,21 @@
+[
+  ["open-query", 0, ""],
+  ["begin-provider-read", 0, ""],
+  ["close-query", 0, ""],
+  ["admit-recovery", 0, ""],
+  ["install", 1, ""],
+  ["publish-checkpoint", 1, ""],
+  ["advance-floor", 1, ""],
+  ["finish-recovery", 0, ""],
+  ["drain-provider-read", 0, ""],
+  ["authorize-version", -1, "old"],
+  ["remove-version", -1, "old"],
+  ["settle-version", -1, "old"],
+  ["trim", 2, ""],
+  ["prepare-fork", 1, ""],
+  ["publish-fork", 1, ""],
+  ["authorize-disposal", -1, ""],
+  ["copy-fork", 1, ""],
+  ["erase-residence", -1, ""],
+  ["settle-disposal", -1, ""]
+]

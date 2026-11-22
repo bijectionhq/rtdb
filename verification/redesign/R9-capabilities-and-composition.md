@@ -46,6 +46,11 @@ See the [runner](../README.adoc#_run_the_studies) for reproduction.
 In this slice, directory changes are atomic and publication identity remains stable across retries.
 The model abstracts the network, staging retries, multiple simultaneous holds per kind, bitemporal resolution, key revocation and application-level receipt publication.
 A native event trace must supply the actual cut, provider identity and directory permit used at each decision.
+[ResidenceCompositionReplay](../tla/ResidenceCompositionReplay.tla) checks an ordered trace against the shared transition relation.
+Its [authored fixture](../traces/residence-composition.json) projects catalog cuts and publication identities into the model.
+A trace must reach the disposal receipt with the expected replica floor and fork copy.
+Controls refuse a different physical publication, retirement before read drain, trimming an admitted recovery, erasing an uncopied fork dependency and a trace that ends before settlement.
+The checker currently runs against model fixtures. Native emission and projection of actual provider and directory outcomes remain open.
 A model counterexample to a weakened rule shows why the rule matters for the modeled system.
 
 ## Handoff notes
