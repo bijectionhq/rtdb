@@ -42,6 +42,21 @@ pub struct PhysicalObjectVersion {
     pub version: String,
 }
 
+/// A conditional write at one physical S3 key in a bucket that has never been versioned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3TombstoneTarget {
+    pub namespace: S3ObjectNamespace,
+    pub key: String,
+    pub condition: S3TombstoneCondition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3TombstoneCondition {
+    Absent,
+    Matches(String),
+}
+
 const OFFSET_LIMIT: i64 = 1_i64 << 48;
 const EPOCH_LIMIT: i32 = 1_i32 << 15;
 

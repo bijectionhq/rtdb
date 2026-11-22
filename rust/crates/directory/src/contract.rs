@@ -65,7 +65,8 @@ pub async fn run(directory: &dyn Directory) {
     assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 2, "an independent fork does not change the source's reference inventory");
     assert_eq!(directory.shared_reference_revision(&external.lineage).await.unwrap(), 0);
     local_retirement(directory, &applied, &name).await;
-    exact_retirement(directory, &applied).await;
+    exact_retirement(directory, &applied, false).await;
+    exact_retirement(directory, &applied, true).await;
     let applied = directory.deployment(&applied.id).await.unwrap().unwrap();
 
     let reserved = format!("{}{id}", super::REFERENCE_REVISION_PREFIX, id = applied.lineage);
@@ -187,22 +188,34 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     directory.publish_fork(late, parent.version, Some(crate::ForkPublication::Local(current))).await.unwrap();
 }
 
-async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord) {
-    use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
+async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, tombstones: bool) {
+    use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace, S3TombstoneCondition, S3TombstoneTarget};
 
     let lineage = &parent.lineage;
     let state = directory.lineage_state(lineage).await.unwrap();
     let scope = parent.storage_prefix();
     let target = format!("{scope}/v06/payload");
-    let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope.clone(), work: crate::RetirementWork::S3 {
-        deployment: parent.id.clone(), target: target.clone(), release: format!("{scope}/v06/~garbage/release"), legacy_receipt: None,
-        version: PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
-            key: format!("cell/{target}"), version: "original".into() },
-        release_version: Some(PhysicalObjectVersion {
-            namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
-            key: format!("cell/{scope}/v06/%7Egarbage/release"), version: "record".into(),
-        }),
-    } };
+    let release = format!("{scope}/v06/~garbage/release");
+    let namespace = S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None };
+    let physical_key = |logical: &str| format!("cell/{}", logical.replace('~', "%7E"));
+    let version = |key: &str, version: &str| PhysicalObjectVersion {
+        namespace: namespace.clone(), key: physical_key(key), version: version.to_owned(),
+    };
+    let tombstone = |key: &str, tag: &str| S3TombstoneTarget {
+        namespace: namespace.clone(), key: physical_key(key), condition: S3TombstoneCondition::Matches(tag.to_owned()),
+    };
+    let work = if tombstones {
+        crate::RetirementWork::Tombstones {
+            deployment: parent.id.clone(), target: target.clone(), release: release.clone(),
+            data_tombstone: tombstone(&target, "\"original\""), release_tombstone: tombstone(&release, "\"record\""),
+        }
+    } else {
+        crate::RetirementWork::S3 {
+            deployment: parent.id.clone(), target: target.clone(), release: release.clone(), legacy_receipt: None,
+            version: version(&target, "original"), release_version: Some(version(&release, "record")),
+        }
+    };
+    let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope, work };
     let reserve = LineageChange::ReserveRetirement {
         retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
     };
@@ -223,7 +236,7 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord) 
     let owner = directory.deployment(&parent.id).await.unwrap().unwrap();
     assert!(directory.settle_owned_version(&owner.id, owner.version, retirement.clone()).await.is_err(), "the exact fence is required");
     let mut fenced = owner.clone();
-    fenced.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target, release: Some(format!("{scope}/v06/~garbage/release")) });
+    fenced.storage_regions.insert(retirement.token, crate::StorageRegion::ExactRetirement { object: target, release: Some(release) });
     let fenced = directory.replace_deployment(fenced, owner.version).await.unwrap().applied().unwrap();
     let wrong = directory.settle_owned_version(&owner.id, owner.version, retirement.clone()).await.unwrap();
     assert!(matches!(wrong, Cas::Conflict(Some(_))));

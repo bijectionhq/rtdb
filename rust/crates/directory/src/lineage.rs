@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3TombstoneTarget};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,6 +27,13 @@ pub enum RetirementWork {
         release_version: Option<PhysicalObjectVersion>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         legacy_receipt: Option<String>,
+    },
+    Tombstones {
+        deployment: String,
+        target: String,
+        release: String,
+        data_tombstone: S3TombstoneTarget,
+        release_tombstone: S3TombstoneTarget,
     },
 }
 
@@ -182,11 +189,17 @@ impl LineageState {
     pub fn exact_erasure_authorized(&self) -> bool { matches!(self.admission, Admission::Erasing(_)) }
 
     pub(crate) fn settle_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<(DeploymentRecord, Self)> {
-        let RetirementWork::S3 { deployment, target, release, release_version, .. } = &retirement.work else { return Err(lineage_busy()); };
+        let (deployment, target, release) = match &retirement.work {
+            RetirementWork::S3 { deployment, target, release, release_version, .. } => {
+                (deployment, target, release_version.as_ref().map(|_| release))
+            }
+            RetirementWork::Tombstones { deployment, target, release, .. } => (deployment, target, Some(release)),
+            RetirementWork::Local { .. } => return Err(lineage_busy()),
+        };
         let fence = owner.storage_regions.get(&retirement.token);
         let matching_fence = matches!(fence, Some(StorageRegion::ExactRetirement { object, release: fenced_release })
-            if object == target && (release_version.is_none() || fenced_release.as_ref() == Some(release)))
-            || fence.is_none() && release_version.is_none(); // A legacy attempt may already have cleared its fence.
+            if object == target && release.is_none_or(|release| fenced_release.as_ref() == Some(release)))
+            || fence.is_none() && release.is_none(); // A legacy attempt may already have cleared its fence.
         if !reference_revision::may_settle_exact_owned(
             matches!(&self.admission, Admission::Erasing(current) if current == retirement),
             owner.id == *deployment && owner.storage_prefix() == retirement.source,
@@ -244,14 +257,14 @@ impl LineageState {
                 next.admission = Admission::Retiring(retirement);
             }
             LineageChange::AuthorizeExactErasure { retirement } => {
-                if self.retirement() != Some(&retirement) || !matches!(retirement.work, RetirementWork::S3 { .. }) {
+                if self.retirement() != Some(&retirement) || matches!(retirement.work, RetirementWork::Local { .. }) {
                     return Err(lineage_busy());
                 }
                 if self.exact_erasure_authorized() { return Ok(next); }
                 next.admission = Admission::Erasing(retirement);
             }
             LineageChange::AbandonExactRetirement { retirement } => {
-                if !matches!(retirement.work, RetirementWork::S3 { .. })
+                if matches!(retirement.work, RetirementWork::Local { .. })
                     || !matches!(&self.admission, Admission::Retiring(current) if *current == retirement)
                 {
                     return Err(lineage_busy());

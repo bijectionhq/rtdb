@@ -210,7 +210,7 @@ A versioning change between the preflight read and the conditional write could r
 Enabling versioning on an existing bucket also leaves pre-existing objects with `null` version IDs.
 [AWS versioning semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
 
-The proposed runtime requires an identity bound to the physical key and retirement evidence, a reaper-only conditional replacement grant, and reads and listings that treat authenticated tombstones as retired.
+Retirement requires an identity bound to the physical key and retirement evidence, a reaper-only conditional replacement grant, and reads and listings that treat authenticated tombstones as retired.
 Path-based collectors must share that authority before a namespace is enrolled, so an ordinary delete cannot clear a tombstone or allow an ETag to be reused.
 The bounded model covers one key, one held read, a previously admitted create and two outstanding conditional replacement requests.
 TLC explored 62 states, rejected six unsafe changes, and reached settlement with an outstanding create and, in a separate witness, an outstanding retirement request.
@@ -227,9 +227,15 @@ With a terminal physical key, the successor publishes under a fresh key, and a t
 A provider that compares immutable publication identity atomically can instead allow a second publication at the same physical key.
 A tag-only comparison combined with physical key reuse admits a counterexample even when the source checked the original publication before sending the request.
 The supported never-versioned design therefore needs end-to-end evidence that physical keys cannot be reused once admitted, including outstanding uploads and old writers.
-A clean enrollment can establish that contract for its fresh namespace. Historical keys need independent evidence of the same contract before they can be enrolled.
+A clean enrollment can establish that contract for its fresh namespace.
+Historical keys need independent evidence of the same contract before they can be enrolled.
 [Publication identity comparison](../tla/PublicationTagIdentity.tla)
 
+The native S3 adapter validates the exact physical namespace and key, executes a conditional zero-byte replacement, and requires fresh evidence of the same retirement token and never-versioned bucket status.
+Cell-store reads and listings treat these tombstones as absent, and a conditional create conflict refuses to adopt the tombstone as a published object.
+The production reaper can resume an authorized data-and-marker pair from the directory after restart and settles its owner fence and lineage together.
+New retirements remain gated on clean namespace enrollment or independent proof of a historical namespace's publication identities.
+The serving bucket policy must grant conditional replacement to the reaper and keep terminal tombstones outside path collection until residence disposal.
 
 ### Shared fork publication and referrer inventories
 

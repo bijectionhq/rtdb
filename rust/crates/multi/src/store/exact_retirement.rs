@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion};
 use rtdb_format::keys::block_key;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget};
 use uuid::Uuid;
 
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release};
@@ -56,14 +56,18 @@ async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Optio
 
 
 #[async_trait]
-pub(super) trait ExactVersions: Send + Sync {
+pub(super) trait RetirementProvider: Send + Sync {
     async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool>;
     async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool>;
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()>;
+
+    async fn retire_tombstones(&self, _: Uuid, _: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.multi/tombstone-provider", "The provider cannot retire never-versioned objects"))
+    }
 }
 
 #[async_trait]
-impl ExactVersions for rtdb_s3::VersionedInventory {
+impl RetirementProvider for rtdb_s3::VersionedInventory {
     async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
         self.exact_retirement_available(key, version).await
     }
@@ -75,15 +79,32 @@ impl ExactVersions for rtdb_s3::VersionedInventory {
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
         self.retire_observed_version(key, version).await
     }
+
+    async fn retire_tombstones(&self, token: Uuid, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+        let provider = self.never_versioned_retirement().await?;
+        for (key, target) in objects { provider.retire(key, target, token).await?; }
+        Ok(())
+    }
 }
 
-pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
+pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn RetirementProvider,
     candidate: &DeploymentRecord, threshold: i64, advisory: Option<&References>, keys: Option<&dyn KeyService>) -> Result<()> {
     let lineage = &candidate.lineage;
     let mut state = super::recover_hosted_lineage(directory, lineage).await?;
     if let Some(retirement) = state.retirement() {
-        if let RetirementWork::S3 { deployment, .. } = &retirement.work && *deployment == candidate.id {
-            finish(directory, bucket, provider, lineage, &state, retirement, keys, threshold).await?;
+        match &retirement.work {
+            RetirementWork::S3 { deployment, .. } if *deployment == candidate.id => {
+                finish(directory, bucket, provider, lineage, &state, retirement, keys, threshold).await?;
+            }
+            RetirementWork::Tombstones { deployment, target, release, data_tombstone, release_tombstone }
+                if *deployment == candidate.id && state.exact_erasure_authorized() =>
+            {
+                let target = ObjectKey::new(target)?;
+                let release = ObjectKey::new(release)?;
+                provider.retire_tombstones(retirement.token, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
+                settle(directory, lineage, deployment, retirement).await?;
+            }
+            _ => {},
         }
         return Ok(());
     }
@@ -139,7 +160,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
     Ok(())
 }
 
-async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
+async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn RetirementProvider,
     lineage: &str, state: &LineageState, retirement: &LineageRetirement, keys: Option<&dyn KeyService>, threshold: i64) -> Result<bool> {
     let RetirementWork::S3 { deployment, target, release, version, release_version, .. } = &retirement.work else { return Err(changed()); };
     let target = ObjectKey::new(target)?;
@@ -194,7 +215,7 @@ async fn settle(directory: &dyn Directory, lineage: &str, deployment: &str, reti
 
 // The pack index fixes the set of members. Only evidence for the same immutable
 // publication can cover a member, and each member must be checkpoint metadata.
-async fn pack_release_bound(bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
+async fn pack_release_bound(bucket: &dyn ObjectStore, provider: &dyn RetirementProvider,
     target: &ObjectKey, witness: &ReleaseWitness, markers: &ObjectKey, threshold: i64) -> Result<Option<PackReadiness>> {
     let Some(version) = witness.version.as_ref() else { return Err(changed()); };
     let index = match observe_pack_index(bucket, target).await {
@@ -235,7 +256,7 @@ enum PackReadiness {
     Covered { block: i64, youngest: i64 },
 }
 
-async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions, lineage: &str, retirement: &LineageRetirement,
+async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, lineage: &str, retirement: &LineageRetirement,
     target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>, threshold: i64) -> Result<bool> {
     let RetirementWork::S3 { deployment, version, release_version, legacy_receipt, .. } = &retirement.work else { return Err(changed()); };
     let root = ObjectKey::new(&retirement.source)?;
@@ -421,7 +442,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ExactVersions for Provider {
+    impl RetirementProvider for Provider {
         async fn available(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
             assert_eq!(version.key, format!("cell/{}", key.as_str().replace('~', "%7E")));
             Ok(true)
@@ -515,7 +536,7 @@ mod tests {
         assert_eq!(bucket.get(&target).await.unwrap(), Bytes::from_static(b"replacement"));
     }
     #[async_trait]
-    impl ExactVersions for VersionedReleaseStore {
+    impl RetirementProvider for VersionedReleaseStore {
         async fn available(&self, _key: &ObjectKey, _version: &PhysicalObjectVersion) -> Result<bool> { Ok(true) }
 
         async fn absent(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<bool> {
@@ -783,4 +804,72 @@ mod tests {
         assert!(bucket.head(&marker).await.is_ok());
         assert_eq!(bucket.get(&target).await.unwrap().as_ref(), b"replacement");
     }
+    #[tokio::test]
+    async fn a_restarted_reaper_keeps_the_tombstone_fence_until_both_effects_settle() {
+        use rtdb_types::S3TombstoneCondition;
+
+        struct Provider {
+            token: Uuid,
+            calls: parking_lot::Mutex<Vec<(ObjectKey, S3TombstoneTarget)>>,
+        }
+        #[async_trait]
+        impl RetirementProvider for Provider {
+            async fn available(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<bool> { unreachable!() }
+            async fn absent(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<bool> { unreachable!() }
+            async fn erase(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<()> { unreachable!() }
+            async fn retire_tombstones(&self, token: Uuid, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+                assert_eq!(token, self.token);
+                let mut calls = self.calls.lock();
+                let first = calls.is_empty();
+                calls.extend(objects.map(|(key, target)| (key.clone(), target.clone())));
+                if first { return Err(Anomaly::fault("fixture/lost-marker-reply", "The release marker is still pending")); }
+                Ok(())
+            }
+        }
+
+        let data_path = tempfile::tempdir().unwrap();
+        MemoryDirectory::initialize(data_path.path()).unwrap();
+        let directory = MemoryDirectory::open(data_path.path()).unwrap();
+        let owner = directory.create_deployment(DeploymentRecord::new("shop", "org", Vec::new(), 0)).await.unwrap();
+        let root = owner.storage_prefix();
+        let object = ObjectKey::new(format!("{root}/v06/tables/t/data/l01-rc-b00.arrow")).unwrap();
+        let marker = ObjectKey::new(format!("{root}/v06/~garbage/release")).unwrap();
+        let namespace = S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None };
+        let observed = |key: &ObjectKey, tag: &str| S3TombstoneTarget {
+            namespace: namespace.clone(), key: format!("cell/{}", key.as_str().replace('~', "%7E")),
+            condition: S3TombstoneCondition::Matches(tag.to_owned()),
+        };
+        let data = observed(&object, "\"original\"");
+        let release = observed(&marker, "\"release\"");
+        let retirement = LineageRetirement { token: Uuid::new_v4(), source: root, work: RetirementWork::Tombstones {
+            deployment: owner.id.clone(), target: object.to_string(), release: marker.to_string(),
+            data_tombstone: data.clone(), release_tombstone: release.clone(),
+        } };
+        directory.change_lineage(&owner.lineage, LineageChange::ReserveRetirement {
+            retirement: retirement.clone(), observed_references: 0, generation: 0,
+        }).await.unwrap();
+        let mut owner_fenced = owner.clone();
+        owner_fenced.storage_regions.insert(retirement.token, StorageRegion::ExactRetirement {
+            object: object.to_string(), release: Some(marker.to_string()),
+        });
+        let owner_fenced = directory.replace_deployment(owner_fenced, owner.version).await.unwrap().applied().unwrap();
+        directory.change_lineage(&owner.lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await.unwrap();
+
+        let provider = Provider { token: retirement.token, calls: parking_lot::Mutex::new(Vec::new()) };
+        let bucket = MemoryStore::default();
+        let error = reap(directory.as_ref(), &bucket, &provider, &owner_fenced, 0, None, None).await.unwrap_err();
+        assert_eq!(error.code, "fixture/lost-marker-reply");
+        assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), owner_fenced);
+        let state = directory.lineage_state(&owner.lineage).await.unwrap();
+        assert!(state.exact_erasure_authorized());
+        assert_eq!(state.retirement(), Some(&retirement));
+        drop(directory);
+
+        let directory = MemoryDirectory::open(data_path.path()).unwrap();
+        reap(directory.as_ref(), &bucket, &provider, &owner_fenced, 0, None, None).await.unwrap();
+        assert_eq!(*provider.calls.lock(), [(object.clone(), data.clone()), (marker.clone(), release.clone()), (object, data), (marker, release)]);
+        assert_eq!(directory.lineage_state(&owner.lineage).await.unwrap().open_generation(), Some(1));
+        assert!(directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.is_empty());
+    }
+
 }

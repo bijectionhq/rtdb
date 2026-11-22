@@ -5,7 +5,7 @@ pub use scoped::{SCOPED_S3_CLOCK_ALLOWANCE, SCOPED_S3_WRITE_TTL, ScopedS3Writes,
 mod versions;
 
 #[cfg(feature = "versioning")]
-pub use versions::VersionedInventory;
+pub use versions::{NeverVersionedObject, NeverVersionedRetirement, VersionedInventory};
 
 use std::sync::Arc;
 use aws_credential_types::provider::SharedCredentialsProvider;

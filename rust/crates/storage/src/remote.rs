@@ -2,7 +2,7 @@ use crate::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadRese
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{Attribute, GetOptions, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use object_store::{Attribute, GetOptions, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -10,6 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 #[path = "remote_version_step.rs"]
 mod version_step;
 pub use version_step::valid_object_version;
+
+pub const S3_RETIREMENT_ATTRIBUTE: &str = "rtdb-retirement";
 
 /// A provider may still be copying when its completion can no longer be established.
 #[derive(Debug, thiserror::Error)]
@@ -69,13 +71,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None }), io, single_put: false, version_namespace: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix, uploads: None, hide_tombstones: false }), io, single_put: false, version_namespace: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None }), io, single_put: true, version_namespace: None }
+        Self { objects: Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, single_put: true, version_namespace: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -85,7 +87,7 @@ impl RemoteStore {
         io: Arc<IoRegion>,
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
-        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads) });
+        let objects = Arc::new(RemoteObjects { client, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
         Self { objects, io, single_put: true, version_namespace: None }
     }
 
@@ -133,7 +135,7 @@ impl ObjectStore for RemoteStore {
         let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
         self.io.run_async(async move {
             let path = objects.path(&key);
-            let metadata = objects.client.head(&path).await.map_err(|error| provider_error(&key, error))?;
+            let metadata = objects.metadata(&key).await?;
             Ok(ObjectObservation {
                 version: physical_version(namespace.as_deref(), &path, metadata.version),
                 value: StoredObject { key, size: metadata.size },
@@ -146,10 +148,10 @@ impl ObjectStore for RemoteStore {
         let key = key.clone();
         self.io.run_async(async move {
             let path = objects.path(&key);
-            let metadata = match objects.client.head(&path).await {
+            let metadata = match objects.metadata(&key).await {
                 Ok(metadata) => metadata,
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                Err(error) => return Err(provider_error(&key, error)),
+                Err(Error::MissingObject(_)) => return Ok(None),
+                Err(error) => return Err(error),
             };
             Ok(physical_version(Some(namespace.as_ref()), &path, metadata.version))
         }).await
@@ -183,8 +185,16 @@ impl ObjectStore for RemoteStore {
         let (objects, key) = (self.objects.clone(), key.clone());
         self.io.run_async(async move {
             let path = objects.path(&key);
-            let response = objects.client.get_opts(&path, GetOptions::new().with_range(Some(range.clone())))
-                .await.map_err(|error| provider_error(&key, error))?;
+            let response = match objects.read(&key, GetOptions::new().with_range(Some(range.clone()))).await {
+                Ok(response) => response,
+                Err(error @ Error::MissingObject(_)) => return Err(error),
+                Err(error) => {
+                    if objects.hide_tombstones && matches!(objects.metadata(&key).await, Err(Error::MissingObject(_))) {
+                        return Err(Error::MissingObject(key.to_string()));
+                    }
+                    return Err(error);
+                }
+            };
             if response.range != range || response.meta.size < range.end {
                 return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
             }
@@ -238,6 +248,7 @@ struct RemoteObjects {
     client: Arc<dyn ProviderStore>,
     prefix: Option<ObjectKey>,
     uploads: Option<Arc<dyn PublicationUploads>>,
+    hide_tombstones: bool,
 }
 
 impl RemoteObjects {
@@ -307,19 +318,39 @@ fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
 }
 
 impl RemoteObjects {
+    async fn read(&self, key: &ObjectKey, options: GetOptions) -> Result<GetResult> {
+        let response = self.client.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
+        if self.is_tombstone(&response) {
+            return Err(Error::MissingObject(key.to_string()));
+        }
+        Ok(response)
+    }
+
+    fn is_tombstone(&self, response: &GetResult) -> bool {
+        self.hide_tombstones && response.meta.size == 0
+            && response.attributes.get(&Attribute::Metadata(S3_RETIREMENT_ATTRIBUTE.into()))
+                .and_then(|value| uuid::Uuid::parse_str(value.as_ref()).ok()).is_some_and(|token| !token.is_nil())
+    }
+
+    async fn metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
+        if self.hide_tombstones {
+            return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }).await?.meta);
+        }
+        self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let metadata = self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
+        let metadata = self.metadata(key).await?;
         Ok(StoredObject { key: key.clone(), size: metadata.size })
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?
-            .bytes().await.map_err(|error| provider_error(key, error))
+        self.read(key, GetOptions::default()).await?.bytes().await.map_err(|error| provider_error(key, error))
     }
 
     async fn observe_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
         let path = self.path(key);
-        let object = self.client.get(&path).await.map_err(|error| provider_error(key, error))?;
+        let object = self.read(key, GetOptions::default()).await?;
         let wrong_size = || crate::object_store::wrong_size(key, length);
         if object.meta.size != length as u64 || object.range != (0..length as u64) {
             return Err(wrong_size());
@@ -407,7 +438,7 @@ impl RemoteObjects {
     async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<String>> {
         let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
         let version = object.meta.version.clone();
-        if object.bytes().await.map_err(|error| provider_error(key, error))? != bytes {
+        if self.is_tombstone(&object) || object.bytes().await.map_err(|error| provider_error(key, error))? != bytes {
             return Err(Error::ConflictingObject(key.to_string()));
         }
         Ok(version)
@@ -492,9 +523,18 @@ impl RemoteObjects {
             };
             if relative.split('/').any(|part| part == ".tmp") { continue; }
             let key = Self::key(relative)?;
-            if directory.is_none_or(|directory| key.is_under(directory)) {
-                result.push(StoredObject { key, size: metadata.size });
+            if directory.is_some_and(|directory| !key.is_under(directory)) { continue; }
+            if self.hide_tombstones && metadata.size == 0 {
+                match self.metadata(&key).await {
+                    Err(Error::MissingObject(_)) => continue,
+                    Err(error) => return Err(error),
+                    Ok(current) => {
+                        result.push(StoredObject { key, size: current.size });
+                        continue;
+                    }
+                }
             }
+            result.push(StoredObject { key, size: metadata.size });
         }
         result.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(result)
@@ -548,4 +588,29 @@ mod tests {
         for name in &listed { store.get(&ObjectKey::new(name.clone()).unwrap()).await.unwrap(); }
         assert_eq!(store.list(Some(&ObjectKey::new("~packs").unwrap())).await.unwrap().len(), 1, "and a listing under one finds it");
     }
+    #[tokio::test]
+    async fn only_serving_reads_hide_retirement_tombstones() {
+        let provider = Arc::new(object_store::memory::InMemory::new());
+        let root = ObjectKey::new("cell").unwrap();
+        let serving = RemoteStore::new_single_put(provider.clone(), root.clone(), IoRegion::new())
+            .with_s3_versioning(S3ObjectNamespace { bucket: "bucket".into(), endpoint: None, region: None });
+        let ordinary = RemoteStore::new(provider.clone(), Some(root));
+        let retired = ObjectKey::new("~packs/b01.pack").unwrap();
+        let empty = ObjectKey::new("data/empty").unwrap();
+        let mut attrs = object_store::Attributes::new();
+        attrs.insert(Attribute::Metadata(S3_RETIREMENT_ATTRIBUTE.into()), uuid::Uuid::new_v4().simple().to_string().into());
+        provider.put_opts(&Path::from(format!("cell/{retired}")), Bytes::new().into(),
+            PutOptions { attributes: attrs, ..PutOptions::default() }).await.unwrap();
+        serving.put(&empty, Bytes::new()).await.unwrap();
+        assert!(matches!(serving.head(&retired).await, Err(Error::MissingObject(_))));
+        assert!(matches!(serving.get(&retired).await, Err(Error::MissingObject(_))));
+        assert!(matches!(serving.get_fresh_exact(&retired, 0).await, Err(Error::MissingObject(_))));
+        assert!(matches!(serving.observe_range(&retired, 0..1).await, Err(Error::MissingObject(_))));
+        assert_eq!(serving.list(None).await.unwrap(), [StoredObject { key: empty, size: 0 }]);
+        assert_eq!(ordinary.head(&retired).await.unwrap().size, 0);
+        for bytes in [Bytes::from_static(b"late write"), Bytes::new()] {
+            assert!(matches!(serving.put(&retired, bytes).await, Err(Error::ConflictingObject(_))));
+        }
+    }
+
 }

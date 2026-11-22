@@ -2376,6 +2376,24 @@ rule SettleObservedS3Version {
                 ExactVersionRetirementSettled(retirement)
 }
 
+rule SettleNeverVersionedRetirement {
+    -- A prepared retirement carries the conditional write and physical namespace for each key.
+    -- The reaper resumes the same data and release marker operations after interruption.
+    -- Serving reads treat a tombstone as an absent object, and the provider retains the key against create-if-absent writes.
+    when: NeverVersionedRetirementContinued(retirement)
+
+    requires: ExactVersionRetirementAuthorized(retirement)
+    requires: ServingBucketVersioningProhibited(retirement.namespace)
+    requires: PhysicalOwnerFencedForObject(retirement.data_key)
+    requires: PhysicalOwnerFencedForObject(retirement.release_key)
+
+    ensures:
+        ApplyConditionalRetirementTombstone(retirement.data_key, retirement.data_condition, retirement.token)
+        ApplyConditionalRetirementTombstone(retirement.release_key, retirement.release_condition, retirement.token)
+        if FreshTombstoneObservationsMatch(retirement) and ServingBucketNeverVersioned(retirement.namespace):
+            SettleOwnerFenceAndReopenLineage(retirement)
+}
+
 rule AuthorizeHostedVersionErasure {
     -- The retirement reservation binds the physical version, release marker and source residence together.
     -- The reservation closes fork preparation and publication while the reaper scans the current manifests of the lineage.
