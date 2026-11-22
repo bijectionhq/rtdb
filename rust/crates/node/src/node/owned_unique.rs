@@ -40,16 +40,18 @@ impl OwnedReadSession {
         }
         let frontier = snapshot.relation_event_frontier(&relation.table(&self.owner))?;
         let context = self.relation_context(relation)?;
-        let rule =
-            rtdb_query::read_owned_unique_rule(Arc::clone(&context), &self.owner, relation).await?;
-        if &rule.path != path || rule.through_events != frontier {
+        let policy =
+            rtdb_query::read_owned_unique_policy(Arc::clone(&context), &self.owner, relation).await?;
+        if policy.through_events != frontier {
             return Err(unavailable());
         }
+        let column = policy.paths.get(path).ok_or_else(unavailable)?;
         let hit = rtdb_query::lookup_owned_unique(
             Arc::clone(&context),
             &self.owner,
             relation,
-            &rule,
+            path,
+            column,
             key,
             valid,
         )

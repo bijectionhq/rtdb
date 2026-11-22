@@ -806,7 +806,8 @@ impl<'a> OpenTransaction<'a> {
         if snapshot.contains_table(&relation.table(owner)) {
             return Err(conflict());
         }
-        self.check_capacity_schema(snapshot, owner, relation, schema).await?;
+        self.check_capacity_schema(snapshot.clone(), owner, relation, schema).await?;
+        self.check_unique_schema(snapshot, owner, relation, schema).await?;
         let _encoded = self.context.memory.reserve(schema.retained_bytes() * 8 + 4096)?;
         let document = StructFields::from([
             ("_id".into(), Value::Utf8(relation.name().into())),
