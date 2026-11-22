@@ -4,14 +4,14 @@
 //! is left to the evaluator so that the evaluator raises its own error.
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr, expressions as df};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
-use rtdb_types::{LogicalType, ScalarType, Value};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
 use crate::columnar::{Column, ColumnBatch};
 
@@ -29,19 +29,42 @@ fn arrow_type(logical: &LogicalType) -> Option<(ScalarType, DataType)> {
 fn integer(data_type: &DataType) -> bool { matches!(data_type, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) }
 
 /// The input columns an expression reads, in the order the lowered expression addresses them.
-struct Inputs<'a> { schema: &'a Schema, batch: &'a ColumnBatch, positions: Vec<usize>, fields: Vec<ArrowField> }
+struct Inputs<'a> {
+    schema: &'a Schema,
+    columns: &'a [Column],
+    arguments: Option<&'a [Column]>,
+    positions: Vec<InputPosition>,
+    fields: Vec<ArrowField>,
+    arrays: Vec<ArrayRef>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputPosition { Column(usize), Argument(usize) }
 
 impl Inputs<'_> {
     fn column(&mut self, id: rtdb_plan::ColumnId, expected: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
-        let position = self.schema.position(id)?;
-        let Column::Arrow { array, field, logical } = &self.batch.columns[position] else { return None };
+        self.bind(InputPosition::Column(self.schema.position(id)?), expected)
+    }
+
+    fn bind(&mut self, position: InputPosition, expected: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
+        let column = match position {
+            InputPosition::Column(index) => self.columns.get(index)?,
+            InputPosition::Argument(index) => self.arguments?.get(index)?,
+        };
+        let Column::Arrow { array, field, logical } = column else { return None };
         let plain = match logical { Some(logical) => arrow_type(logical).is_some_and(|(_, data_type)| &data_type == expected), None => field.metadata().is_empty() };
         if !plain || array.data_type() != expected { return None; }
         let index = match self.positions.iter().position(|known| *known == position) {
             Some(index) => index,
-            None => { self.positions.push(position); self.fields.push(ArrowField::new(format!("c{position}"), expected.clone(), true)); self.positions.len() - 1 }
+            None => {
+                let index = self.positions.len();
+                self.positions.push(position);
+                self.fields.push(ArrowField::new(format!("c{index}"), expected.clone(), true));
+                self.arrays.push(Arc::clone(array));
+                index
+            }
         };
-        Some(Arc::new(df::Column::new(&format!("c{position}"), index)))
+        Some(Arc::new(df::Column::new(self.fields[index].name(), index)))
     }
 }
 
@@ -65,7 +88,10 @@ impl Lowering<'_> {
         let lowered: Arc<dyn PhysicalExpr> = match expr {
             Expr::Column { id, .. } => self.inputs.column(*id, &data_type)?,
             Expr::Literal(value) => Arc::new(df::Literal::new(literal(value, &data_type)?)),
-            Expr::Parameter { index, .. } => Arc::new(df::Literal::new(literal(self.parameters.get(*index)?, &data_type)?)),
+            Expr::Parameter { index, .. } => match self.inputs.arguments {
+                Some(_) => self.inputs.bind(InputPosition::Argument(*index), &data_type)?,
+                None => Arc::new(df::Literal::new(literal(self.parameters.get(*index)?, &data_type)?)),
+            },
             Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide), left, right } => {
                 if !(integer(&data_type) || data_type == DataType::Float64) { return None; }
                 let left = self.cast_to(left, &data_type)?;
@@ -167,14 +193,31 @@ fn widens(from: &DataType, to: &DataType) -> bool {
 
 /// Whether the shape of `expr` could be lowered; its inputs' layouts decide per batch.
 pub(crate) fn lowerable(expr: &Expr) -> bool {
+    lowerable_at(expr, None)
+}
+
+pub(crate) fn bound_lowerable(expr: &Expr) -> bool {
+    lowerable_at(expr, Some(32))
+}
+
+fn lowerable_at(expr: &Expr, remaining: Option<usize>) -> bool {
+    if remaining == Some(0) { return false; }
+    let lower = |expr: &Expr| lowerable_at(expr, remaining.map(|depth| depth - 1));
     match expr {
+        Expr::Parameter { .. } if remaining.is_some() => true,
         Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => arrow_type(&expr.data_type()).is_some(),
         Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
-            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lowerable(left) && lowerable(right),
-        Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lowerable(expr),
-        Expr::Cast { expr, target: CastTarget::Fixed(_) } => lowerable(expr),
-        Expr::Case { branches, otherwise } => branches.iter().all(|(condition, value)| lowerable(condition) && lowerable(value)) && lowerable(otherwise),
-        Expr::Call { name, args, .. } => args.len() == 1 && matches!(name.to_ascii_lowercase().as_str(), "upper" | "lower" | "length" | "character_length" | "char_length" | "abs") && lowerable(&args[0]),
+            | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lower(left) && lower(right),
+        Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lower(expr),
+        Expr::Cast { expr, target: CastTarget::Fixed(_) } => lower(expr),
+        Expr::Case { branches, otherwise } => branches.iter().all(|(condition, value)| lower(condition) && lower(value)) && lower(otherwise),
+        Expr::Call { name, args, .. } => match (name.to_ascii_lowercase().as_str(), args.as_slice()) {
+            ("upper" | "lower", [arg]) if remaining.is_some() => {
+                matches!(arg, Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_)) && lower(arg)
+            }
+            ("upper" | "lower" | "length" | "character_length" | "char_length" | "abs", [arg]) => lower(arg),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -182,17 +225,21 @@ pub(crate) fn lowerable(expr: &Expr) -> bool {
 /// Evaluates `expr` over a batch's columns, or `None` where the evaluator must compute this batch.
 pub(crate) fn evaluate(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<ArrayRef> {
     if !lowerable(expr) { return None; }
-    let mut lowering = Lowering { inputs: Inputs { schema, batch, positions: Vec::new(), fields: Vec::new() }, parameters, divisors: Vec::new(), functions: Vec::new() };
+    evaluate_at(expr, schema, &batch.columns, batch.len, parameters, None)
+}
+
+fn evaluate_at(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: &[Value], arguments: Option<&[Column]>) -> Option<ArrayRef> {
+    let inputs = Inputs { schema, columns, arguments, positions: Vec::new(), fields: Vec::new(), arrays: Vec::new() };
+    let mut lowering = Lowering { inputs, parameters, divisors: Vec::new(), functions: Vec::new() };
     let (lowered, data_type) = lowering.lower(expr)?;
-    let columns: Vec<ArrayRef> = lowering.inputs.positions.iter().map(|position| match &batch.columns[*position] { Column::Arrow { array, .. } => Some(Arc::clone(array)), _ => None }).collect::<Option<_>>()?;
-    let input = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(lowering.inputs.fields.clone())), columns,
-        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.len))).ok()?;
+    let input = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(lowering.inputs.fields)), lowering.inputs.arrays,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(len))).ok()?;
     for divisor in &lowering.divisors {
-        let divisor = divisor.evaluate(&input).ok()?.into_array(batch.len).ok()?;
+        let divisor = divisor.evaluate(&input).ok()?.into_array(len).ok()?;
         if zero_present(&divisor) { return None; }
     }
-    let result = match lowered.evaluate(&input).ok()? { ColumnarValue::Array(array) => array, scalar => scalar.into_array(batch.len).ok()? };
-    (result.data_type() == &data_type && result.len() == batch.len).then_some(result)
+    let result = match lowered.evaluate(&input).ok()? { ColumnarValue::Array(array) => array, scalar => scalar.into_array(len).ok()? };
+    (result.data_type() == &data_type && result.len() == len).then_some(result)
 }
 
 /// Whether any non-null cell of a divisor is zero, which the evaluator rejects even for doubles.
@@ -211,7 +258,48 @@ fn zero_present(array: &ArrayRef) -> bool {
 
 /// The column `evaluate` computed, typed as the expression's declared scalar.
 pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<Column> {
-    let array = evaluate(expr, schema, batch, parameters)?;
+    computed_column(expr, evaluate(expr, schema, batch, parameters)?)
+}
+
+pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arguments: &[Column],
+    memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Option<Column>> {
+    if !bound_lowerable(expr) { return Ok(None); }
+    let mut bytes = crate::runtime_schema::expression_bound(expr)?.checked_mul(4).ok_or_else(bound_size)?;
+    let mut referenced: Result<()> = Ok(());
+    expr.visit(&mut |node| {
+        if referenced.is_err() { return; }
+        let column = match node {
+            Expr::Column { id, .. } => schema.position(*id).and_then(|index| columns.get(index)),
+            Expr::Parameter { index, .. } => arguments.get(*index),
+            _ => None,
+        };
+        if let Some(column) = column {
+            referenced = (|| {
+                // DataFusion's case conversion can allocate from UTF-8 offsets even for a masked cell.
+                let span = match column {
+                    Column::Arrow { array, .. } => array.as_any().downcast_ref::<StringArray>()
+                        .map_or(0, |strings| (strings.value_offsets()[1] - strings.value_offsets()[0]) as usize),
+                    _ => 0,
+                };
+                let extra = column.bound(0)?.max(span).checked_mul(64).ok_or_else(bound_size)?;
+                bytes = bytes.checked_add(extra).ok_or_else(bound_size)?;
+                Ok(())
+            })();
+        }
+    });
+    referenced?;
+    let mut reservation = memory.reserve(bytes)?;
+    let Some(array) = evaluate_at(expr, schema, columns, 1, &[], Some(arguments)) else { return Ok(None); };
+    let retained = array.get_array_memory_size();
+    if retained > bytes { return Ok(None); }
+    Arc::get_mut(&mut reservation).expect("bound expression owns its reservation").shrink_to(retained)?;
+    let array = rtdb_columnar::retain_array(array, &reservation)?;
+    Ok(computed_column(expr, array))
+}
+
+fn bound_size() -> rtdb_types::Anomaly { crate::invalid("parameter-size", "Arrow expression inputs exceed addressable memory") }
+
+fn computed_column(expr: &Expr, array: ArrayRef) -> Option<Column> {
     let (scalar, _) = arrow_type(&expr.data_type())?;
     let field = Arc::new(ArrowField::new("value", array.data_type().clone(), true));
     Some(Column::Arrow { array, field, logical: Some(LogicalType::Scalar(scalar)) })
