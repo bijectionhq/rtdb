@@ -366,7 +366,10 @@ impl BatchKeyIndex {
         if picks.is_empty() {
             return Ok(());
         }
-        let compact = batch.select_keys(&picks, &context.memory)?;
+        let compact = match self.hashing {
+            KeyHash::Set => batch.select_keys(&picks, &context.memory)?,
+            KeyHash::Vector => batch.compact_group_keys(&picks, &context.memory)?,
+        };
         self.append(compact, projected, &hashes)
     }
 }

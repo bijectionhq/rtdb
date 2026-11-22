@@ -247,7 +247,7 @@ async fn build_batches_at(
         RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Inner,condition: Some(condition) } if execution.analysis.is_none() && execution.context.tracer.is_none() => {
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, BatchOutput::Pages)?,batch_shape(&runtime.child(1)?, BatchOutput::Pages)?) else { return Ok(None) };
             if build_projected != probe_projected || !crate::join::build_left(left,right,rtdb_plan::JoinKind::Inner,&execution)? { return Ok(None); }
-            // Page-based projections already swap to avoid a spill. The standalone join follows page join order.
+            // Preserve the page join's left-first order for a standalone inner join.
             let threshold = execution.context.options.join_build_rows;
             let swapped = output == BatchOutput::Pages
                 && crate::join::rows_at_most(left,&execution)? > threshold && crate::join::rows_at_most(right,&execution)? <= threshold;

@@ -367,7 +367,6 @@ fn int_value(value: &Value) -> Option<i64> {
     match value { Value::I8(v) => Some(i64::from(*v)), Value::I16(v) => Some(i64::from(*v)), Value::I32(v) => Some(i64::from(*v)), Value::I64(v) => Some(*v), _ => None }
 }
 
-/// Borrows a probe key from its integer, integer-union, or string column.
 enum ProbeKey<'a> { IntArrow(&'a dyn Array), IntValues(&'a [Value]), Utf8(&'a arrow_array::StringArray) }
 impl<'a> ProbeKey<'a> {
     fn of(column: &'a Column, kind: KeyKind) -> Option<Self> {

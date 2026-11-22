@@ -466,6 +466,17 @@ impl ColumnBatch {
     }
 
     pub(crate) fn key_projection(&self, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        self.project_keys(positions, false, memory)
+    }
+
+    pub(crate) fn compact_group_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let _positions = memory.reserve(self.columns.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(size_error)?)?;
+        let positions: Vec<_> = (0..self.columns.len()).collect();
+        let picked = Self::take_rows_with_custody(&[self], rows, &positions, true, memory)?;
+        picked.project_keys(&positions, true, memory)
+    }
+
+    fn project_keys(&self, positions: &[usize], detach: bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let base = positions.len().checked_mul(std::mem::size_of::<Column>())
             .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
         let mut reservation = memory.reserve(base)?;
@@ -473,7 +484,7 @@ impl ColumnBatch {
         for &position in positions {
             let column = &self.columns[position];
             let lease = Arc::get_mut(&mut reservation).expect("The key projection owns its reservation");
-            if let Column::Selected(selection) = column {
+            if detach && let Column::Selected(selection) = column {
                 let layout = |source: usize| selection.sources[source].as_ref().map(|(_, field, logical, _)| (field, logical));
                 let first = selection.cells.first().and_then(|&(source, _)| layout(source));
                 if selection.cells.iter().all(|&(source, _)| layout(source) == first) {
@@ -644,11 +655,27 @@ fn projected_partition_keys_release_unrelated_source_buffers() {
     let logical = rtdb_columnar::from_field(&field).unwrap();
     let selected = SelectedColumn::new(vec![Some((array, field, Some(logical), Some(custody)))], Arc::new(vec![(0, 1)]));
     let input = ColumnBatch::settled(vec![Column::Selected(selected)], 1, memory.reserve(1024).unwrap()).unwrap();
-    let keys = input.key_projection(&[0], &memory).unwrap();
+    let keys = input.compact_group_keys(&[(0, 0)], &memory).unwrap();
     drop(input);
     assert!(memory.used_bytes() < 64 * 1024);
     assert!(matches!(keys.columns[0], Column::Arrow { .. }));
     assert_eq!(keys.columns[0].value(0).unwrap(), Value::List(vec![Value::I64(20)]));
+}
+
+#[test]
+fn dense_partition_keys_release_an_attached_page_reservation() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::Schema;
+
+    let memory = MemoryBudget::new(3 << 20);
+    let schema = Arc::new(Schema::new(vec![ArrowField::new("key", DataType::Int64, false)]));
+    let record = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10, 20]))]).unwrap();
+    let custody = memory.reserve(2 << 20).unwrap();
+    let input = ColumnBatch::from_owned(rtdb_columnar::OwnedBatch::with_reservation(record, custody).unwrap()).unwrap();
+    let keys = input.compact_group_keys(&[(0, 1)], &memory).unwrap();
+    drop(input);
+    assert!(memory.used_bytes() < 64 * 1024);
+    assert_eq!(keys.columns[0].value(0).unwrap(), Value::I64(20));
 }
 
 fn gather_column_cells<'a>(
