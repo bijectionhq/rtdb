@@ -147,6 +147,26 @@ This relies on the provider honoring exact deletion, supplying complete version 
 The retry model reaches settlement while a redundant exact request remains outstanding. Its later effect preserves other versions.
 An integration proof must account for how deleting the current version affects the current-name view, how inherited references remain protected, and how each physical owner orders authorization and admission.
 
+### Shared fork publication and referrer inventories
+
+Shared forks publish their child record, name and an advanced lineage revision in one directory transaction.
+A descendant sharing an inherited object advances the same cell-local revision.
+A separately copied fork or a refused publication leaves that revision unchanged.
+The revision has its own directory entry so a materialized residence can support local forks when its original ancestor lives in another cell.
+Existing shared deployments are part of the initial manifest inventory. The revision witnesses subsequent publications.
+Readers that compare revisions must read the directory strongly and include every actual manifest that predates their scan.
+The reaper still needs to bind this observed revision to a durable effect authorization that preserves the referrer inventory until the action settles.
+Manifest-only writes need a separate monotonicity argument.
+`reap_as_of` computes its manifest edit from an earlier `Base::load`, while `Base::save` selects a new sequence just before publication.
+The effect proof must establish that such edits cannot make a previously withdrawn reference visible again, including when a local copy that shadowed the reference is collected.
+
+The revision covers publication. A shared fork must also carry a retirement generation from before it starts reading providers through the directory transaction that publishes its prepared manifest.
+Checking that the lineage currently admits publication cannot distinguish a preparation that preceded an intervening retirement.
+The candidate model admits retirement after active readers drain, advances the preparation generation, and closes admission to further readers.
+It transfers existing references and confirms provider removal before reopening.
+It covers one source version, one direct reader, and one shared fork.
+The production authority, resumable intent, and per-owner read handoff remain to be implemented. [Retirement admission model](../tla/LineageRetirementAdmission.tla)
+
 ### Serving and archive removal entry points
 
 | Effect path | Current admission and evidence | Remaining composition obligation |

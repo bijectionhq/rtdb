@@ -84,6 +84,7 @@ A model compares exact physical and whole-residence source holds and records the
 Archive and independent fork preparation now carry each planned provider version through the exact copy read, including for inherited packs and repairs.
 Durable repair archive admission now covers serving, recapture and transfer. Local copies keep the existing maintenance witness through provider completion.
 The S3 adapter now executes and settles a removal addressed to an exact immutable object version.
+Same-lineage fork publication now advances a cell-local shared-reference revision atomically with the child and name, including forks of a fork.
 Durable authorization, admission across physical owners, and use of the adapter by the ordinary remote serving reaper remain open.
 
 **Start from:** `replication/src/{checkpoint_discovery,replay_floor,blocks}.rs`, `multi/src/{archive,recovery_holds,replica_retention}.rs`; models `tla/{RecoveryReplay,InstalledCheckpoint,Checkpoint,ResidenceRetirement}.tla`, `mcrl2/CheckpointDiscovery.mcrl2`.

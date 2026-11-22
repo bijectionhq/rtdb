@@ -231,6 +231,12 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `tla/ExactRetirementRetry.tla` checks settlement with two outstanding requests for one version and up to two replacement versions.
   `lean/ExactRetirementRetry.lean` proves idempotence and preservation of other versions for arbitrary keys and versions.
   A loopback S3 replay checks the version-qualified request, verifies continued listing, and requires an exact negative observation before reporting success.
+* `tla/SharedReferenceRevision.tla` checks whether a referrer inventory can be authorized at its starting revision when a fork or descendant publishes during the scan.
+  `lean/SharedReferenceRevision.lean` proves cut preservation for arbitrary finite publication histories.
+  `verus/shared_reference_revision` checks the parent guard and revision arithmetic used by the directory implementations.
+  The directory contract exercises the observable revision in memory, over TCP and against a configured DynamoDB Local fixture.
+* `tla/LineageRetirementAdmission.tla` checks the next authority's preparation generation, provider-read admission, referrer transfer and settlement.
+  It separates stale fork preparation from whether the lineage currently admits publication.
 * `tla/CheckpointCopyEvidence.tla` checks the predicate admitting a body to a checkpoint copy plan.
   `lean/CheckpointCopyEvidence.lean` proves inventory agreement and budget conservation for arbitrary finite lists.
   `verus/checkpoint_copy_budget` checks exact sealed-byte admission and accounting in production.

@@ -1481,6 +1481,21 @@ def verify_exact_retirement_retry(args, scratch):
     verify_lean_model(args, scratch, path, "exact-retirement-retry", controls, 4)
 
 
+def verify_shared_reference_revision(args, scratch):
+    path = Path("verification/lean/SharedReferenceRevision.lean")
+    controls = {
+        "publish-without-advance": (
+            "⟨state.revision + 1, child :: state.referrers⟩", "⟨state.revision, child :: state.referrers⟩",
+            ["shared_publication_advances_with_its_reference", "an_unchanged_cut_preserves_the_reference_inventory"],
+        ),
+        "trust-any-cut": (
+            "  snapshot = state.revision", "  True",
+            ["an_unchanged_cut_preserves_the_reference_inventory"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "shared-reference-revision", controls, 4)
+
+
 def verify_checkpoint_source_handoff(args, scratch):
     path = Path("verification/lean/CheckpointSourceHandoff.lean")
     controls = {
@@ -1764,6 +1779,7 @@ def verify_lean(args, scratch):
             verify_checkpoint_copy_evidence(args, scratch)
             verify_repair_archive_custody(args, scratch)
             verify_exact_retirement_retry(args, scratch)
+            verify_shared_reference_revision(args, scratch)
             verify_published_checkpoint(args, scratch)
             verify_checkpoint_table_manifest(args, scratch)
             verify_pack_publication_lean(args, scratch)
@@ -2087,6 +2103,32 @@ TLA_CASES = (
      ('Mutation = "none"\nINVARIANT Safety', 'Mutation = "accept_unfinished_inventory"\nINVARIANT SettlementRequiresExactAbsence'), "SettlementRequiresExactAbsence"),
     ("ExactRetirementRetry", "exact-retirement-late-retry-witness",
      ("INVARIANT Safety", "INVARIANT NeverCompletesAfterSettlement"), "NeverCompletesAfterSettlement"),
+    ("SharedReferenceRevision", "shared-reference-revision", None, None),
+    ("SharedReferenceRevision", "shared-reference-parent-only",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "parent_only"\nINVARIANT AuthorizationUsesCompleteInventory'), "AuthorizationUsesCompleteInventory"),
+    ("SharedReferenceRevision", "shared-reference-ignore-cut",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_recheck"\nINVARIANT AuthorizationUsesCompleteInventory'), "AuthorizationUsesCompleteInventory"),
+    ("SharedReferenceRevision", "shared-reference-count-independent",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "count_independent"\nINVARIANT RevisionCountsSharedPublications'), "RevisionCountsSharedPublications"),
+    ("SharedReferenceRevision", "shared-reference-count-refused",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "count_refused"\nINVARIANT RevisionCountsSharedPublications'), "RevisionCountsSharedPublications"),
+    ("SharedReferenceRevision", "shared-reference-grandchild-witness",
+     ("INVARIANT Safe", "INVARIANT NeverAcceptsGrandchildInventory"), "NeverAcceptsGrandchildInventory"),
+    ("SharedReferenceRevision", "shared-reference-obsolete-inventory-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSeesObsoleteInventory"), "NeverSeesObsoleteInventory"),
+    ("LineageRetirementAdmission", "lineage-retirement-admission", None, None),
+    ("LineageRetirementAdmission", "lineage-retirement-open-gate-alone",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "check_only_open_gate"\nINVARIANT PublishedForkHasBytes'), "PublishedForkHasBytes"),
+    ("LineageRetirementAdmission", "lineage-retirement-ignore-active-reader",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "ignore_active_reader"\nINVARIANT ReadersKeepTheirSource'), "ReadersKeepTheirSource"),
+    ("LineageRetirementAdmission", "lineage-retirement-admit-during-retirement",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "admit_during_retirement"\nINVARIANT ReadersKeepTheirSource'), "ReadersKeepTheirSource"),
+    ("LineageRetirementAdmission", "lineage-retirement-skip-transfer",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_transfer"\nINVARIANT PublishedForkHasBytes'), "PublishedForkHasBytes"),
+    ("LineageRetirementAdmission", "lineage-retirement-refuses-stale-after-settlement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverRefusesOldPreparationAfterSettlement"), "NeverRefusesOldPreparationAfterSettlement"),
+    ("LineageRetirementAdmission", "lineage-retirement-transfers-and-settles-witness",
+     ("INVARIANT Safe", "INVARIANT NeverTransfersAndSettles"), "NeverTransfersAndSettles"),
     ("CheckpointCopyEvidence", "checkpoint-copy-evidence", None, None),
     ("CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_version_token"\nINVARIANT PlanMatchesBody'), "PlanMatchesBody"),
@@ -2598,6 +2640,14 @@ def verify_apalache(args, scratch):
     check_apalache(args, scratch, "ExactRetirementRetry", "exact-retirement-trust-partial-inventory",
                    "SettlementRequiresExactAbsence", 10, ('Mutation = "none"', 'Mutation = "accept_unfinished_inventory"'),
                    "an incomplete inventory settles an object version that still exists")
+    check_apalache(args, scratch, "SharedReferenceRevision", "shared-reference-revision", "Safe", 9)
+    check_apalache(args, scratch, "SharedReferenceRevision", "shared-reference-parent-only",
+                   "AuthorizationUsesCompleteInventory", 9, ('Mutation = "none"', 'Mutation = "parent_only"'),
+                   "a descendant publishes without invalidating the earlier lineage scan")
+    check_apalache(args, scratch, "LineageRetirementAdmission", "lineage-retirement-admission", "Safe", 10)
+    check_apalache(args, scratch, "LineageRetirementAdmission", "lineage-retirement-open-gate-alone",
+                   "PublishedForkHasBytes", 10, ('Mutation = "none"', 'Mutation = "check_only_open_gate"'),
+                   "publication would accept an old preparation after retirement reopens admission")
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-evidence", "Safe", 5)
     check_apalache(args, scratch, "CheckpointCopyEvidence", "checkpoint-copy-trust-only-version-token",
                    "PlanMatchesBody", 5, ('Mutation = "none"', 'Mutation = "trust_version_token"'),
@@ -3438,6 +3488,48 @@ def verify_s3_exact_retirement(args, source):
         finally:
             adapter.write_bytes(original)
     print("rust-s3-exact-retirement: loopback replay passed and four controls failed as expected")
+
+
+def verify_native_reference_revision(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    command = ["cargo", "test", "--locked", "-p", "rtdb-directory", "--features", "dynamodb", "--lib"]
+    cases = [(
+        "memory", "tests::memory_directory_meets_the_contract", "lib.rs",
+        "*revision = next_reference_revision(*revision)?;", "let _ = revision;",
+        "publishing a shared fork advances its lineage cut",
+    )]
+    endpoint = env.get("RTDB_DYNAMODB_ENDPOINT")
+    if endpoint:
+        from urllib.parse import urlsplit
+        if urlsplit(endpoint).hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("the fork publication control requires a loopback DynamoDB fixture")
+        cases.append((
+            "dynamodb", "dynamo::tests::a_stale_lineage_revision_cancels_the_entire_fork_publication", "dynamo.rs",
+            'put.condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME)\n',
+            "put\n", "a stale reference revision cannot publish a child",
+        ))
+    else:
+        print("rust-lineage-reference-dynamodb: RTDB_DYNAMODB_ENDPOINT was unset; the provider replay was omitted")
+    for name, test, file, before, after, diagnostic in cases:
+        command_for_test = [*command, test, "--", "--exact", "--nocapture"]
+        baseline = run_case(command_for_test, source / "rust", args.evidence, f"rust-lineage-reference-{name}", env)
+        if (baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout
+            or "skipped: set RTDB_DYNAMODB_ENDPOINT" in (baseline.stdout + baseline.stderr)):
+            raise ValueError(f"{name}: the lineage revision replay did not execute successfully")
+        path = source / "rust/crates/directory/src" / file
+        original = path.read_bytes()
+        try:
+            replace_once(path, before, after)
+            checked = run_case(command_for_test, source / "rust", args.evidence, f"rust-lineage-reference-{name}-control", env)
+            if (checked.returncode != 101 or f"{test} ... FAILED" not in checked.stdout
+                or diagnostic not in (checked.stdout + checked.stderr) or "0 passed; 1 failed" not in checked.stdout):
+                raise ValueError(f"{name}: the lineage revision control did not fail at its declared assertion")
+        finally:
+            path.write_bytes(original)
+        print(f"rust-lineage-reference-{name}: atomic publication passed and its control failed as expected")
 
 
 def verify_replay_prefix(args, source):
@@ -4439,6 +4531,7 @@ def main():
             verify_trie_naming_epoch(args, source)
             verify_s3_object_version(args, source)
             verify_s3_exact_retirement(args, source)
+            verify_native_reference_revision(args, source)
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)

@@ -23,7 +23,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{check_fork_parent, exists, fork_conflict, fork_parent_id, Cas, ChangeFeed, DeploymentRecord, Directory, HostedTask, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, HostedTask, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, next_reference_revision, require_deployment_name, shared_fork_lineage};
 
 mod parked;
 mod streams;
@@ -306,20 +306,18 @@ fn member_item(record: &MemberRecord) -> Result<Item> {
 }
 
 impl DynamoDirectory {
-    async fn insert_deployment(&self, mut record: DeploymentRecord, parent: Option<ConditionCheck>) -> Result<DeploymentRecord> {
+    async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>) -> Result<DeploymentRecord> {
+        require_deployment_name(&record.name)?;
         record.version = 1;
         let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?))
             .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).build().map_err(build_fault)?;
         let name_item = Item::from([(NAME.to_owned(), AttributeValue::S(record.name.clone())), (ID.to_owned(), AttributeValue::S(record.id.clone()))]);
         let name = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(name_item))
             .condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME).build().map_err(build_fault)?;
-        let transaction = self.client.transact_write_items()
-            .transact_items(TransactWriteItem::builder().put(deployment).build())
-            .transact_items(TransactWriteItem::builder().put(name).build());
-        let transaction = match parent {
-            Some(parent) => transaction.transact_items(TransactWriteItem::builder().condition_check(parent).build()),
-            None => transaction,
-        };
+        let publishing_fork = !fork.is_empty();
+        let mut items = vec![TransactWriteItem::builder().put(deployment).build(), TransactWriteItem::builder().put(name).build()];
+        items.extend(fork);
+        let transaction = self.client.transact_write_items().set_transact_items(Some(items));
         match transaction.send().await {
             Ok(_) => Ok(record),
             Err(error) => {
@@ -328,31 +326,61 @@ impl DynamoDirectory {
                     let reasons = cancelled.cancellation_reasons();
                     if refused(0, reasons) { return Err(exists("Deployment", &record.id)); }
                     if refused(1, reasons) { return Err(exists("Deployment name", &record.name)); }
-                    if refused(2, reasons) { return Err(fork_conflict()); }
+                    if refused(2, reasons) || refused(3, reasons)
+                        || (publishing_fork && reasons.iter().any(|reason| reason.code() == Some("TransactionConflict")))
+                    {
+                        return Err(fork_conflict());
+                    }
                 }
                 Err(sdk_anomaly("TransactWriteItems", error))
             }
         }
+    }
+
+    fn advance_shared_reference(&self, lineage: &str, expected: Version) -> Result<TransactWriteItem> {
+        // A separate item survives cell-local forks of a moved deployment even when its original ancestor lives elsewhere.
+        let item = Item::from([
+            (NAME.to_owned(), AttributeValue::S(format!("{REFERENCE_REVISION_PREFIX}{lineage}"))),
+            (VERSION.to_owned(), number(next_reference_revision(expected)?)),
+        ]);
+        let put = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(item));
+        let put = if expected == 0 {
+            put.condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME)
+        } else {
+            put.condition_expression("#v = :expected").expression_attribute_names("#v", VERSION)
+                .expression_attribute_values(":expected", number(expected))
+        };
+        Ok(TransactWriteItem::builder().put(put.build().map_err(build_fault)?).build())
     }
 }
 
 #[async_trait]
 impl Directory for DynamoDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
-        self.insert_deployment(record, None).await
+        self.insert_deployment(record, Vec::new()).await
     }
 
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         let id = fork_parent_id(&child)?;
         let parent = self.deployment(id).await?;
-        check_fork_parent(&child, parent.as_ref(), expected_parent)?;
+        let lineage = shared_fork_lineage(&child, parent.as_ref(), expected_parent)?;
         let condition = ConditionCheck::builder().table_name(&self.tables.deployments)
             .key(ID, AttributeValue::S(id.to_owned()))
             .condition_expression("#v = :expected")
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected_parent))
             .build().map_err(build_fault)?;
-        self.insert_deployment(child, Some(condition)).await
+        let mut checks = vec![TransactWriteItem::builder().condition_check(condition).build()];
+        if let Some(lineage) = lineage {
+            checks.push(self.advance_shared_reference(lineage, self.shared_reference_revision(lineage).await?)?);
+        }
+        self.insert_deployment(child, checks).await
+    }
+
+    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
+        let key = format!("{REFERENCE_REVISION_PREFIX}{lineage}");
+        self.get(&self.tables.deployment_names, NAME, &key).await?
+            .map_or(Ok(0), |item| number_attribute(&item, VERSION))
     }
 
     async fn hosted_task_stopped(&self, task: &HostedTask) -> Result<bool> {
@@ -370,6 +398,7 @@ impl Directory for DynamoDirectory {
     }
 
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
+        if name.starts_with(REFERENCE_REVISION_PREFIX) { return Ok(None); }
         let Some(named) = self.get(&self.tables.deployment_names, NAME, name).await? else { return Ok(None) };
         self.deployment(string_attribute(&named, ID)?).await
     }
@@ -486,6 +515,30 @@ mod tests {
     async fn dynamodb_directory_meets_the_contract() {
         let Some(directory) = local().await else { return };
         contract::run(&directory).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_lineage_revision_cancels_the_entire_fork_publication() {
+        let Some(directory) = local().await else { return };
+        let parent = directory.create_deployment(DeploymentRecord::new("parent", "acme", Vec::new(), 0)).await.unwrap();
+        let child = |name| {
+            let mut child = DeploymentRecord::new(name, &parent.org, Vec::new(), 0);
+            child.parent = Some(parent.id.clone());
+            child.lineage.clone_from(&parent.lineage);
+            child
+        };
+        let stale = directory.advance_shared_reference(&parent.lineage, 0).unwrap();
+        directory.create_fork(child("first"), parent.version).await.unwrap();
+
+        let second = child("second");
+        let error = directory.insert_deployment(second.clone(), vec![stale]).await.expect_err("a stale reference revision cannot publish a child");
+        assert_eq!(error.code, "rtdb.directory/fork-parent-changed");
+        assert!(directory.deployment(&second.id).await.unwrap().is_none());
+        assert!(directory.deployment_by_name(&second.name).await.unwrap().is_none());
+        assert_eq!(directory.shared_reference_revision(&parent.lineage).await.unwrap(), 1);
+
+        directory.create_fork(second, parent.version).await.unwrap();
+        assert_eq!(directory.shared_reference_revision(&parent.lineage).await.unwrap(), 2);
     }
 
     fn parked_record() -> DeploymentRecord {

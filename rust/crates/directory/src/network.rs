@@ -29,6 +29,7 @@ const MAX_LINE: u64 = 64 << 20;
 enum Op {
     CreateDeployment { record: DeploymentRecord },
     CreateFork { child: DeploymentRecord, expected_parent: Version },
+    SharedReferenceRevision { lineage: String },
     Deployment { id: String },
     DeploymentByName { name: String },
     Deployments,
@@ -43,7 +44,7 @@ enum Op {
 impl Op {
     /// A read may be resent after a lost connection; a write may already have applied.
     fn is_read(&self) -> bool {
-        matches!(self, Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members)
+        matches!(self, Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. })
     }
 }
 
@@ -54,6 +55,7 @@ enum Reply {
     OptionalDeployment(Option<DeploymentRecord>),
     Deployments(Vec<DeploymentRecord>),
     DeploymentCas(Cas<DeploymentRecord>),
+    SharedReferenceRevision(Version),
     Member(MemberRecord),
     OptionalMember(Option<MemberRecord>),
     Members(Vec<MemberRecord>),
@@ -92,6 +94,7 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
     Ok(match op {
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
         Op::CreateFork { child, expected_parent } => Reply::Deployment(directory.create_fork(child, expected_parent).await?),
+        Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
         Op::Deployment { id } => Reply::OptionalDeployment(directory.deployment(&id).await?),
         Op::DeploymentByName { name } => Reply::OptionalDeployment(directory.deployment_by_name(&name).await?),
         Op::Deployments => Reply::Deployments(directory.deployments().await?),
@@ -422,6 +425,9 @@ impl Directory for RemoteDirectory {
     }
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         match self.call(Op::CreateFork { child, expected_parent }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
+    }
+    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
+        match self.call(Op::SharedReferenceRevision { lineage: lineage.to_owned() }).await? { Reply::SharedReferenceRevision(version) => Ok(version), other => Err(protocol(other)) }
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         match self.call(Op::Deployment { id: id.to_owned() }).await? { Reply::OptionalDeployment(record) => Ok(record), other => Err(protocol(other)) }

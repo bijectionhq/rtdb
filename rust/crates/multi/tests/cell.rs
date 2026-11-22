@@ -152,6 +152,7 @@ impl ObservedDirectory {
 impl Directory for ObservedDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
     async fn create_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version) -> Result<DeploymentRecord> { self.inner.create_fork(child, expected).await }
+    async fn shared_reference_revision(&self, lineage: &str) -> Result<rtdb_directory::Version> { self.inner.shared_reference_revision(lineage).await }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.deployment(id).await

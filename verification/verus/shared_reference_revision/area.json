@@ -1,0 +1,177 @@
+{
+  "summary": "Shared fork parent admission and monotone lineage revision arithmetic.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 6,
+  "controls": {
+    "ignore_parent_revision": {
+      "defect": "A stale parent revision can publish a fork.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    parent == expected && can_fork && lineage_matches\n",
+          "replace": "    can_fork && lineage_matches\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_publish_fork",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_parent_revision_and_contract": {
+      "defect": "A stale parent revision can publish a fork.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    parent == expected && can_fork && lineage_matches\n",
+          "replace": "    can_fork && lineage_matches\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    ensures accepted <==> parent == expected && can_fork && lineage_matches,",
+          "replace": "    ensures accepted <==> can_fork && lineage_matches,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "stale_parent_cannot_publish",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_lineage": {
+      "defect": "A fork can publish under a different lineage.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    parent == expected && can_fork && lineage_matches\n",
+          "replace": "    parent == expected && can_fork\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_publish_fork",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_lineage_and_contract": {
+      "defect": "A fork can publish under a different lineage.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    parent == expected && can_fork && lineage_matches\n",
+          "replace": "    parent == expected && can_fork\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    ensures accepted <==> parent == expected && can_fork && lineage_matches,",
+          "replace": "    ensures accepted <==> parent == expected && can_fork,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "foreign_lineage_cannot_publish",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_lifecycle": {
+      "defect": "A closed parent can publish a fork.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    parent == expected && can_fork && lineage_matches\n",
+          "replace": "    parent == expected && lineage_matches\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "may_publish_fork",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "ignore_lifecycle_and_contract": {
+      "defect": "A closed parent can publish a fork.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    parent == expected && can_fork && lineage_matches\n",
+          "replace": "    parent == expected && lineage_matches\n"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "    ensures accepted <==> parent == expected && can_fork && lineage_matches,",
+          "replace": "    ensures accepted <==> parent == expected && lineage_matches,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "refused_parent_cannot_publish",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "unchanged_revision": {
+      "defect": "A shared publication keeps the same reference revision.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "Some(current + 1)",
+          "replace": "Some(current)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "function": "advance_revision",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "unchanged_revision_and_contract": {
+      "defect": "A shared publication keeps the same reference revision.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "Some(current + 1)",
+          "replace": "Some(current)"
+        },
+        {
+          "file": "rust/crates/directory/src/reference_revision.rs",
+          "find": "current < u64::MAX ==> next == Some((current + 1) as u64),",
+          "replace": "current < u64::MAX ==> next == Some(current),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/shared_reference_revision/laws.rs",
+          "function": "an_advance_is_strict_and_does_not_wrap",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    }
+  }
+}

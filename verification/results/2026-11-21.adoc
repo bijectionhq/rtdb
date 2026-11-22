@@ -2763,3 +2763,56 @@ The log is `/private/tmp/rtdb-formal.QMjPSJsX/s3-exact-retirement-jvm.log`.
 
 The ordinary remote collector still needs durable per-version authorization, physical-owner admission and integration of the provider settlement operation.
 The closed-prefix purge retains its existing authority and settlement rules.
+
+=== Shared reference publication and the retirement generation
+
+Shared forks publish their child record, name and an advanced cell-local lineage revision in one transaction.
+The revision persists with the in-process directory snapshot or in a reserved item in the DynamoDB names table.
+A descendant advances the same revision. An independent publication or a refused transaction leaves it unchanged.
+The revision does not require the original lineage root to reside in the same cell as the fork.
+The DynamoDB implementation relies on same-region atomic writes and serializable point reads. A scan may observe several committed states across its pages. link:https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html[DynamoDB transaction isolation]
+
+TLC revision `bc1b506` explored all 68 states of the publication and inventory model.
+The four controls weaken descendant tracking, authorization against the observed revision, or accounting for independent and refused publications.
+The model reached both an inventory overtaken by a descendant and a complete inventory accepted with that descendant included.
+Apalache 0.63.0 checked safety through nine transitions and reproduced the descendant counterexample for parent-only tracking.
+Lean 4.36.0 proved four laws over arbitrary finite publication histories. Both controls failed the declared laws.
+Verus checked six functions in the new directory area. Its eight production and joint controls matched their declared diagnostics.
+All 39 Verus areas passed and matched 201 controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-formal-v7i5_30v/`. link:../tla/SharedReferenceRevision.tla[Publication and inventory model] link:../lean/SharedReferenceRevision.lean[Shared revision laws]
+
+The separate authority model checks one immutable source version, one direct reader, and one shared fork through preparation, transfer, removal and settlement.
+TLC explored all 19 states and rejected four controls.
+The model reached transfer and settlement with an existing child and refusal of stale preparation after settlement.
+Apalache checked the model through ten transitions and rejected checking the open gate alone at fork publication.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/lineage-fence-formal-2jknc1br/`. link:../tla/LineageRetirementAdmission.tla[Retirement admission model]
+
+The directory, Multi and simulation suites passed 297 cases with 11 opt-in cases ignored.
+The MemoryDirectory replay rejected publishing without advancing the revision.
+The DynamoDB replay verified that a stale revision prevents publication of both the child and the name. Removing the provider condition failed the declared control.
+The primary suite also exercised the directory contract over TCP and against DynamoDB Local 3.3.2 with a loopback client and an in-memory instance.
+The downloaded server archive matched AWS's published SHA-256 `7a94eb65f81aee270738751a4e5e3e6a7ad02a5d25194f55b83e08ec2ba6342b`. link:https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html[DynamoDB Local distribution]
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-native-d7t145hl/`.
+
+On parent `ad130398c`, the complete Lean runner and all 334 TLC cases passed.
+The Alloy, Maude, mCRL2, AutoHyper and Apalache suites also passed with their declared control outcomes.
+The model-suite records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-combined-models-6o9liroe/` and `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-other-engines-8tx40gw2/`.
+The combined JVM run on that parent passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+The property suite recorded 100 iterations each for 33 core simulation methods.
+The unchanged FFI artifact had SHA-256 `70e40dcaa6a140da5215d9d9fc82ca7c6d33d10213ff48c73efa5cb52d4feca2`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-jvm.log`.
+
+The combined tree on `65d0a3d9f` passed 366 exercised Rust cases across directory, Multi, logkeeper and simulation with 12 ignored cases.
+The two native fork controls matched on that tree with DynamoDB Local running, then the local instance was stopped.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-native-5ib3r6u6/`.
+The complete Lean runner, all 338 TLC cases, all 39 Verus areas and 201 Verus controls, and the Alloy, Maude, mCRL2, AutoHyper and Apalache suites passed on that tree.
+The journal-quorum model explored all 4,500 states, rejected both controls and reached the rebound witness.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-formal-u4e6qzn7/`.
+OpenJML 21.0.29 checked the existing JVM leaf-merge contract and matched its three controls.
+The records are under `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-openjml-vfpb3hdv/`.
+The rebased JVM run passed 3,198 standard tests and 3,348 property cases with no failures, errors or skips.
+It recorded 100 iterations each for 33 core simulation methods, using the rebuilt FFI library with SHA-256 `61b0e492d985e6e49ca28a8dccb8220e77e4c3fef7afc633df54b701b7ce6cdc`.
+The log is `/private/tmp/rtdb-formal.QMjPSJsX/shared-reference-65d-jvm.log`.
+
+The live reaper still needs a durable authorization that checks the revision and prevents stale fork preparation from publishing after retirement.
+The retirement admission model checks the proposed authority in isolation. Composition with the running reaper remains open.

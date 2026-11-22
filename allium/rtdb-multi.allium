@@ -2112,6 +2112,8 @@ rule Fork {
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
     -- The shared key grants are in the same erasure custody domain.
     -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.
+    -- The child, its name and the cell-local shared-reference revision publish atomically.
+    -- A fork of a fork advances the same revision as the original lineage.
     when: ForkRequested(parent, basis, org)
 
     -- The child and its name publish at a version that still admits forks.
@@ -2142,6 +2144,7 @@ rule Fork {
 
 rule ForkAcrossOrganisations {
     -- A fork into another organisation creates its own lineage and key.
+    -- Its independent copy leaves the original lineage's shared-reference revision unchanged.
     -- Its checkpoint closure and its selected tail are copied under the child's key before the directory publishes the child.
     -- The destination root follows the required data, metadata, retained level-zero sources and recorded usable artefacts.
     -- The copy checks the table bytes used to discover those dependencies against the root manifest when present.

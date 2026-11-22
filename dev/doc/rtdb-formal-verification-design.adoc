@@ -698,6 +698,12 @@ After authorization a new fork cannot depend on a location that the existing ope
 Before removal the reaper must copy the object into every referrer admitted by the authority and wait for completion.
 This can be implemented with a lineage-scoped fence, because a child's manifest can name an ancestor as the physical owner.
 
+Shared fork publication now advances a cell-local lineage revision in the directory transaction that creates the deployment and its name.
+That revision also advances when a fork of a fork inherits physical references from its ancestors.
+An independent copy or a refused publication preserves the revision.
+The bounded model rejects authorization of a scan overtaken by a descendant publication, and the Lean model proves that an unchanged revision preserves the reference inventory over a finite publication history.
+This evidence covers the publication mechanism. The reaper still needs to compare the revision in its authorization transaction and preserve the resulting obligations through settlement. link:../../verification/tla/SharedReferenceRevision.tla[Shared reference revision model]
+
 The Rust reference reaper scans the deployment inventory before reaching the provider delete.
 The existing local maintenance lock serializes local fork preparation with that sweep.
 On S3 the local lock helper returns without acquiring a distributed fence.

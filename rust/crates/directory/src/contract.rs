@@ -36,12 +36,23 @@ pub async fn run(directory: &dyn Directory) {
     let mut child = DeploymentRecord::new(format!("{name}-child"), &applied.org, vec![], 0);
     child.parent = Some(applied.id.clone());
     child.lineage = applied.lineage.clone();
+    assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 0);
     let error = directory.create_fork(child.clone(), created.version).await.unwrap_err();
     assert_eq!(error.code, "rtdb.directory/fork-parent-changed");
     assert!(directory.deployment(&child.id).await.unwrap().is_none());
     assert!(directory.deployment_by_name(&child.name).await.unwrap().is_none());
     let child = directory.create_fork(child, applied.version).await.unwrap();
     assert_eq!(directory.deployment_by_name(&child.name).await.unwrap().as_ref(), Some(&child));
+    assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 1, "publishing a shared fork advances its lineage cut");
+    assert!(directory.create_fork(child.clone(), applied.version).await.is_err());
+    assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 1, "a failed publication must leave the lineage cut unchanged");
+
+    let mut grandchild = DeploymentRecord::new(format!("{name}-grandchild"), &applied.org, vec![], 0);
+    grandchild.parent = Some(child.id.clone());
+    grandchild.lineage.clone_from(&child.lineage);
+    let grandchild = directory.create_fork(grandchild, child.version).await.unwrap();
+    assert_eq!(directory.deployment_by_name(&grandchild.name).await.unwrap().as_ref(), Some(&grandchild));
+    assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 2, "a fork of a fork must advance the physical lineage cut");
 
     let mut external = DeploymentRecord::new(format!("{name}-external"), "other-org", vec![], 0);
     external.parent = Some(applied.id.clone());
@@ -51,6 +62,24 @@ pub async fn run(directory: &dyn Directory) {
     let external = directory.create_fork(external, applied.version).await.unwrap();
     assert_eq!(external.lineage, external.id);
     assert_eq!(directory.deployment_by_name(&external.name).await.unwrap().as_ref(), Some(&external));
+    assert_eq!(directory.shared_reference_revision(&applied.lineage).await.unwrap(), 2, "an independent fork does not change the source's reference inventory");
+    assert_eq!(directory.shared_reference_revision(&external.lineage).await.unwrap(), 0);
+
+    let reserved = format!("{}{id}", super::REFERENCE_REVISION_PREFIX, id = applied.lineage);
+    let fake = DeploymentRecord::new(&reserved, &applied.org, vec![], 0);
+    assert_eq!(directory.create_deployment(fake).await.unwrap_err().code, "rtdb.directory/name");
+    assert!(directory.deployment_by_name(&reserved).await.unwrap().is_none());
+
+    let mut moved = DeploymentRecord::new(format!("{name}-moved"), &applied.org, vec![], 0);
+    moved.incarnation = 2;
+    moved.lineage = uuid::Uuid::new_v4().to_string();
+    let moved = directory.create_deployment(moved).await.unwrap();
+    assert!(directory.deployment(&moved.lineage).await.unwrap().is_none());
+    let mut here = DeploymentRecord::new(format!("{name}-moved-child"), &moved.org, vec![], 0);
+    here.parent = Some(moved.id.clone());
+    here.lineage.clone_from(&moved.lineage);
+    directory.create_fork(here, moved.version).await.unwrap();
+    assert_eq!(directory.shared_reference_revision(&moved.lineage).await.unwrap(), 1, "a moved lineage can publish in a cell without its original root");
 
     let mut deleting = applied.clone();
     deleting.lifecycle = Lifecycle::Deleting;

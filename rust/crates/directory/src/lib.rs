@@ -803,8 +803,10 @@ impl<T> Cas<T> {
 pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
-    /// Creates the child and its name atomically with checking that its parent can still be forked at this version.
+    /// Creates the child and its name with the parent version check and, for a shared fork, advances the lineage's reference revision in the same transaction.
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord>;
+    /// Monotone revision of shared fork publications in this cell. An untouched lineage starts at zero.
+    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version>;
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>>;
@@ -848,16 +850,31 @@ fn fork_conflict() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/fork-parent-changed", "The fork's parent changed before the child could be published")
 }
 
-fn check_fork_parent(child: &DeploymentRecord, parent: Option<&DeploymentRecord>, expected: Version) -> Result<()> {
-    if parent.is_some_and(|parent| {
-        let lineage = if parent.org == child.org { &parent.lineage } else { &child.id };
-        parent.version == expected && parent.can_fork() && child.lineage == *lineage
-    })
-    {
-        Ok(())
-    } else {
-        Err(fork_conflict())
+mod reference_revision;
+
+const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
+
+fn require_deployment_name(name: &str) -> Result<()> {
+    if name.starts_with(REFERENCE_REVISION_PREFIX) {
+        return Err(Anomaly::incorrect("rtdb.directory/name", "The name is reserved for the directory"));
     }
+    Ok(())
+}
+
+fn shared_fork_lineage<'a>(child: &'a DeploymentRecord, parent: Option<&DeploymentRecord>, expected: Version) -> Result<Option<&'a str>> {
+    let parent = parent.ok_or_else(fork_conflict)?;
+    let shared = parent.org == child.org;
+    let lineage = if shared { &parent.lineage } else { &child.id };
+    if !reference_revision::may_publish_fork(parent.version, expected, parent.can_fork(), child.lineage == *lineage) {
+        return Err(fork_conflict());
+    }
+    Ok(shared.then_some(child.lineage.as_str()))
+}
+
+fn next_reference_revision(current: Version) -> Result<Version> {
+    reference_revision::advance_revision(current).ok_or_else(|| {
+        Anomaly::fault("rtdb.directory/reference-revision-exhausted", "The lineage has no remaining shared reference revisions")
+    })
 }
 
 /// A single-process directory with an optional durable local state file.
@@ -873,6 +890,8 @@ pub struct MemoryDirectory {
 struct MemoryState {
     deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    reference_revisions: BTreeMap<String, Version>,
     #[serde(skip)]
     held: BTreeMap<MemberId, BTreeSet<String>>,
     members: BTreeMap<MemberId, MemberRecord>,
@@ -917,9 +936,14 @@ impl MemoryDirectory {
         }
         Ok(())
     }
-    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord) -> Result<DeploymentRecord> {
+    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord, shared_lineage: Option<String>) -> Result<DeploymentRecord> {
+        require_deployment_name(&record.name)?;
         if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
         if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
+        if let Some(lineage) = shared_lineage {
+            let revision = state.reference_revisions.entry(lineage).or_default();
+            *revision = next_reference_revision(*revision)?;
+        }
         record.version = 1;
         state.names.insert(record.name.clone(), record.id.clone());
         if let Some(holder) = &record.holder {
@@ -936,15 +960,20 @@ impl MemoryDirectory {
 impl Directory for MemoryDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
-        self.insert_deployment(&mut state, record)
+        self.insert_deployment(&mut state, record, None)
     }
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
-        check_fork_parent(&child, state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref), expected_parent)?;
-        self.insert_deployment(&mut state, child)
+        let lineage = shared_fork_lineage(&child, state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref), expected_parent)?;
+        let lineage = lineage.map(str::to_owned);
+        self.insert_deployment(&mut state, child, lineage)
+    }
+    async fn shared_reference_revision(&self, lineage: &str) -> Result<Version> {
+        Ok(self.state()?.reference_revisions.get(lineage).copied().unwrap_or_default())
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
+        if name.starts_with(REFERENCE_REVISION_PREFIX) { return Ok(None); }
         let state = self.state()?;
         Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).map(Box::as_ref).cloned())
     }
