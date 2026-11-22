@@ -11,17 +11,17 @@ use super::invalid;
 pub(crate) const WORLD_EFFECTS: &str = "owned_world_effects";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { Root, Overlay, ProposalOverlay, ProposalSettlement, Clock, Fork, RootRetainedFork, RootRetainedAdvance, RootRetainedRenewal, RootRetainedSibling, ControlsRetainedFork, ProposalControlsFork, ProposalRootFork, ProposalRootHold, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
+enum Kind { Root, Overlay, ProposalOverlay, ProposalSettlement, ProposalLanding, Clock, Fork, RootRetainedFork, RootRetainedAdvance, RootRetainedRenewal, RootRetainedSibling, ControlsRetainedFork, ProposalControlsFork, ProposalRootFork, ProposalRootHold, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
 
 const ROOT: Iid = Iid([0; 16]);
 
 impl Kind {
     fn writes_data(self) -> bool {
-        matches!(self, Self::Root | Self::Overlay | Self::ProposalOverlay | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold)
+        matches!(self, Self::Root | Self::Overlay | Self::ProposalOverlay | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalLanding)
     }
 
     fn relation_world(self, registered_world: Iid) -> Iid {
-        if matches!(self, Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold) { ROOT } else { registered_world }
+        if matches!(self, Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalLanding) { ROOT } else { registered_world }
     }
 
     fn name(self) -> &'static str {
@@ -30,6 +30,7 @@ impl Kind {
             Self::Overlay => "overlay",
             Self::ProposalOverlay => "proposal-overlay",
             Self::ProposalSettlement => "proposal-settlement",
+            Self::ProposalLanding => "proposal-landing",
             Self::Clock => "clock",
             Self::Fork => "fork",
             Self::RootRetainedFork => "root-retained-fork",
@@ -53,6 +54,7 @@ impl Kind {
             "overlay" => Ok(Self::Overlay),
             "proposal-overlay" => Ok(Self::ProposalOverlay),
             "proposal-settlement" => Ok(Self::ProposalSettlement),
+            "proposal-landing" => Ok(Self::ProposalLanding),
             "clock" => Ok(Self::Clock),
             "fork" => Ok(Self::Fork),
             "root-retained-fork" => Ok(Self::RootRetainedFork),
@@ -87,6 +89,7 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         }
     }
     let retained_release = crate::hosted_control::retained_release_world(operations);
+    let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
     let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
     operations.iter().filter_map(|operation| match operation {
         Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, root, .. }) => Some(
@@ -111,7 +114,8 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         Operation::Public(TxOp::OwnedPublishRoot { attempt, fingerprint }) =>
             Some(Ok((ROOT, Kind::Root, attempt, fingerprint))),
         Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, advance_to, drop_world, settlement_pin, delete_root, .. }) => {
-            let kind = if delete_root.is_some() { Kind::RootRetainedDrop }
+            let kind = if proposal_land.is_some_and(|(landed, _)| landed == *world) { Kind::ProposalLanding }
+                else if delete_root.is_some() { Kind::RootRetainedDrop }
                 else if retained_release == Some(*world) { Kind::ControlsRetainedDrop }
                 else if proposal_overlay == Some(*world) {
                     if settlement_pin.is_some() { Kind::ProposalSettlement } else { Kind::ProposalOverlay }
@@ -158,8 +162,8 @@ pub(super) fn verify(
         if fields.len() != 5 || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop))
-            || (matches!(kind, Kind::RootRetainedDrop | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ProposalRootHold) && relations.len() != 1)
+            || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding))
+            || (matches!(kind, Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ProposalRootHold) && relations.len() != 1)
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
             || attempts.insert(attempt.as_str(), fingerprint.as_slice()).is_some()
@@ -186,6 +190,8 @@ pub(super) fn verify(
             hosted = HostedEffects::ProposalOverlay;
         } else if kind == Kind::ControlsRetainedDrop {
             hosted = HostedEffects::RetainedRelease;
+        } else if kind == Kind::ProposalLanding {
+            hosted = HostedEffects::ProposalLanding;
         } else if kind == Kind::RootRetainedDrop {
             hosted = HostedEffects::RetainedWrite;
         }
@@ -206,7 +212,8 @@ pub(super) fn verify(
         return Err(mismatch());
     }
     let delete_root = worlds.values().any(|kind| *kind == Kind::RootRetainedDrop);
-    let has_root = separate_root || root_retained_fork || delete_root;
+    let landed = matches!(hosted, HostedEffects::ProposalLanding);
+    let has_root = separate_root || root_retained_fork || delete_root || landed;
     if has_root {
         expected_data.insert(OWNED_ROOT_PUBLICATION_RELATION);
     }
@@ -246,6 +253,9 @@ pub(super) fn verify(
                 let record = OwnedWorld::from_record(row).map_err(|_| mismatch())?;
                 let matches_kind = match worlds.get(&record.id) {
                     Some(Kind::Drop) => record.dropped,
+                    Some(Kind::ProposalLanding) => record.dropped
+                        && record.mode == rtdb_types::WorldClockMode::Proposal
+                        && record.parent_publication == Some(record.basis.system_time),
                     Some(Kind::ControlsRetainedDrop | Kind::RootRetainedDrop) => record.dropped
                         && record.mode == rtdb_types::WorldClockMode::Retained,
                     Some(Kind::Fork) => !record.dropped && record.id == record.pin,
@@ -307,10 +317,10 @@ pub(super) fn verify(
             if delete_root && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Delete) {
                 return Err(mismatch());
             }
-            if root_holder_replace && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Put) {
+            if (root_holder_replace || landed) && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Put) {
                 return Err(mismatch());
             }
-            event_headers(batch, key, allows_delete && !root_holder_replace)?;
+            event_headers(batch, key, allows_delete && !root_holder_replace && !landed)?;
         }
     }
     if !attempts.is_empty() || root_head != has_root || data != expected_data
@@ -319,7 +329,7 @@ pub(super) fn verify(
             Kind::Root | Kind::ProposalSettlement => false,
             Kind::Overlay | Kind::ProposalOverlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),
-            Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
+            Kind::ProposalLanding | Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
         })
     {
         return Err(mismatch());
@@ -333,6 +343,7 @@ pub(super) enum HostedEffects {
     RequiredReplacements,
     RetainedRelease,
     ProposalOverlay,
+    ProposalLanding,
     RetainedWrite,
     ProposalHold,
 }
