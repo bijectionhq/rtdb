@@ -1022,6 +1022,11 @@ impl<'a> OpenTransaction<'a> {
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        if (from.is_some() || to.is_some())
+            && let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await?
+        {
+            schema.require_write_validity(true)?;
+        }
         let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
         let locator = self.assign_owned_address(owner, relation, id).await?;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
@@ -1096,10 +1101,16 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         if let Some((schema, _retained)) = self.read_owned_schema(owner, relation).await? {
+            schema.require_write_validity(from.is_some() || to.is_some())?;
             if !documents.has_exact_presence() {
                 return Err(Anomaly::incorrect("rtdb.owned/field-presence", "Declared owned writes require exact field presence"));
             }
-            for row in documents.rows() { validate_owned_schema(&schema, row)?; }
+            for row in documents.rows() {
+                schema.require_write_validity(
+                    row.get("_valid_from").is_some() || row.get("_valid_to").is_some(),
+                )?;
+                validate_owned_schema(&schema, row)?;
+            }
         }
         self.put_documents(&table, documents, iids, from, to, DocumentWrite::Owned { relation, owner, create_only }).await
     }

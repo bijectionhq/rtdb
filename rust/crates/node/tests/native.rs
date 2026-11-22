@@ -777,6 +777,63 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
 }
 
 #[tokio::test]
+async fn owned_acceptance_validity_rejects_scheduled_writes_at_ordering() {
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("at-acceptance").unwrap();
+    let schema = OwnedSchema::from_json(br#"{"fields":[],"validity":"acceptance"}"#).unwrap();
+    let declared = writer.state_mut().execute_tx(
+        vec![TxOp::OwnedDeclareRelation { relation: relation.clone(), schema }],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(declared.committed(), "{:?}", declared.error());
+
+    let id = EntityId::String("item".into());
+    let replace = |override_from, valid_from| {
+        let mut row = StructFields::from([("_id".into(), id.as_value())]);
+        if override_from {
+            row.insert("_valid_from".into(), Value::Timestamp {
+                value: 15,
+                unit: rtdb_types::TimeUnit::Microsecond,
+                timezone: Some("UTC".into()),
+            });
+        }
+        TxOp::OwnedReplaceDocs {
+            relation: relation.clone(),
+            documents: Documents::new(vec![row], node.memory()).unwrap(),
+            valid_from,
+            valid_to: None,
+        }
+    };
+    let delete = |valid_to| TxOp::OwnedDelete {
+        relation: relation.clone(), id: id.clone(), valid_from: None, valid_to,
+    };
+    for op in [replace(false, Some(Timestamp(15))), replace(true, None), delete(Some(Timestamp(15)))] {
+        let rejected = writer.state_mut().execute_tx(vec![op], AutonomousTxOptions::default()).await.unwrap();
+        assert_eq!(rejected.error().unwrap().code, "rtdb.owned/validity-policy");
+    }
+    let put = writer.state_mut().execute_tx(vec![replace(false, None)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(put.committed(), "{:?}", put.error());
+    let removed = writer.state_mut().execute_tx(vec![delete(None)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(removed.committed(), "{:?}", removed.error());
+    let held = writer.open_owned_read().await.unwrap();
+    let changes = held.changes(&relation, Timestamp::MIN, 2).await.unwrap();
+    assert_eq!(changes.groups.len(), 2);
+    for (group, accepted) in changes.groups.iter().zip([put.tx_key(), removed.tx_key()]) {
+        assert_eq!(group.system_time, accepted.system_time);
+        assert_eq!(group.touches[0].valid.lower(), accepted.system_time);
+        assert_eq!(group.touches[0].valid.upper(), Timestamp::MAX);
+    }
+    drop(held);
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     use rtdb_types::OwnedRelation;
 

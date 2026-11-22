@@ -234,7 +234,7 @@ A legacy nonempty relation without a complete registry refuses owned reads and w
 === Declaring a private relation schema
 
 Send `rtdb.owned.DeclareRelation.v1` with the relation prefix followed by a UTF-8 JSON object of at most 64 KiB.
-The object has one `fields` array with up to 128 distinct entries.
+The object has one `fields` array with up to 128 distinct entries and an optional `validity` policy.
 Each entry has `name`, `type`, `optional`, and `nullable`, for example `{"name":"amount","type":{"kind":"i64"},"optional":false,"nullable":false}`.
 Field names are nonempty UTF-8 strings of at most 128 bytes, without control characters or a leading underscore.
 Supported scalar kinds are `bool`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f16`, `f32`, `f64`, `utf8`, `binary`, `date_day`, `instant`, `uuid`, and `decimal`.
@@ -248,8 +248,9 @@ A field may be omitted only when optional, and an explicit null requires nullabl
 A nullable Arrow column can carry both states across rows by including optional `_absent: List<Utf8>` with the names of that row's omitted payload cells.
 Each listed cell must be null or undefined in the incoming batch.
 Unknown payload fields are refused.
-`_id` and the mutation validity metadata retain their existing rules.
-Relations without an explicit declaration continue to infer their schema.
+The `explicit` validity policy is the default and accepts supported mutation validity metadata.
+The `acceptance` policy begins every Root put or delete at its ordered system time with an open valid end and rejects explicit endpoints.
+Relations without a declaration continue to infer their schema.
 
 === Holding one owned read cut
 

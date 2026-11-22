@@ -59,6 +59,8 @@
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
 -- The owner can declare a closed scalar schema before an owned relation has stored data.
 -- An owned create or replacement enforces that schema at the ordering cut.
+-- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its ordered system time and have no valid end.
+-- The declaration is immutable and must precede the first fact.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
 -- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
 -- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.

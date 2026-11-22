@@ -11,6 +11,22 @@ pub struct OwnedSchema(OwnedSchemaWire);
 #[serde(deny_unknown_fields)]
 struct OwnedSchemaWire {
     fields: Vec<Field>,
+    #[serde(default, skip_serializing_if = "Validity::is_explicit")]
+    validity: Validity,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Validity {
+    #[default]
+    Explicit,
+    Acceptance,
+}
+
+impl Validity {
+    fn is_explicit(&self) -> bool {
+        *self == Self::Explicit
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -191,6 +207,16 @@ impl OwnedSchema {
                 ty
             }
         })
+    }
+
+    pub fn require_write_validity(&self, explicit: bool) -> Result<()> {
+        if explicit && self.0.validity == Validity::Acceptance {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/validity-policy",
+                "This root relation requires validity from acceptance with an open end",
+            ));
+        }
+        Ok(())
     }
 
     fn field(&self, name: &str) -> Option<&Field> {
