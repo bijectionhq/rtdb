@@ -98,7 +98,7 @@ fn validate_ingest(command: &CommandStatementIngest, database: &str) -> Result<(
     if command.table.contains('.') { return Err(invalid("Bulk ingest table name must not contain '.'; use the schema field")); }
     Ok(())
 }
-fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
+pub(crate) fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
     let schema = batch.schema(); let mut bound = 8192;
     for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = wire::add(bound, wire::add(field.name().len(), estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?)?; } }
     let scratch = service.memory().reserve(bound).map_err(status)?;
