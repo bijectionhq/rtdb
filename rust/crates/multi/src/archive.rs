@@ -273,7 +273,7 @@ pub(crate) async fn materialize_completed_repair(
             {
                 return Err(inconsistent("The source no longer admits its repair for transfer"));
             }
-            Ok(())
+            Ok(None)
         },
         |record, owner, io| async move {
             let repair = ArchivedCheckpoint::load(&record, keys, owner, io).await?
@@ -635,7 +635,7 @@ pub(crate) async fn verify_checkpoint_capture(
             {
                 return Err(inconsistent("The capture no longer admits archive access"));
             }
-            Ok(())
+            Ok(None)
         },
         |_, _, region| async {
             let bucket = archive.bucket(region).await?;

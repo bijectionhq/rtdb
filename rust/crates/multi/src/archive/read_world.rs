@@ -184,7 +184,7 @@ where
         hosted_task,
         Some(selected.capture),
         None,
-        |record| admit(record).map(|_| ()),
+        |record| admit(record).map(|_| None),
         |record, _, region| async {
             resources.cancellation.run_until_cancelled(async {
                 let (capture, suffix) = admit(&record)?;

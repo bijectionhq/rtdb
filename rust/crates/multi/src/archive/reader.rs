@@ -194,7 +194,7 @@ async fn serve_stage(
         hosted_task.as_ref(),
         None,
         None,
-        |current| authority.require_held(current),
+        |current| authority.require_held(current).map(|_| None),
         |_, _, region| {
             let authority = &authority;
             let record = &record;

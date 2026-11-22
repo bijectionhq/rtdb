@@ -201,7 +201,7 @@ pub async fn stage_checkpoint(
                     "The capture lost its retained archive admission",
                 ));
             }
-            Ok(())
+            Ok(None)
         },
         |_, _, archive_io| {
             let (directory, target_id, intent) = (&directory, &target_id, &intent);
@@ -224,7 +224,7 @@ pub async fn stage_checkpoint(
                                 "The target no longer admits this checkpoint stage",
                             ));
                         }
-                        Ok(())
+                        Ok(None)
                     },
                     |_, _, target_io| {
                         copy_checkpoint(
@@ -305,7 +305,7 @@ pub(super) async fn with_region<T, F, Fut>(
     hosted_task: Option<&HostedTask>,
     capture: Option<Uuid>,
     publication: Option<RegionPublication>,
-    admit: impl Fn(&DeploymentRecord) -> Result<()>,
+    admit: impl Fn(&DeploymentRecord) -> Result<Option<i64>>,
     run: F,
 ) -> Result<T>
 where
@@ -340,8 +340,14 @@ where
         }
     }
     let admitted = update_installation(directory, deployment, |record| {
-        admit(record)?;
-        record.storage_regions.insert(region, state.clone());
+        let first_required = admit(record)?;
+        let mut state = state.clone();
+        if let rtdb_directory::StorageRegion::Local { checkpoint_replay_from, .. }
+            | rtdb_directory::StorageRegion::Remote { checkpoint_replay_from, .. } = &mut state
+        {
+            *checkpoint_replay_from = first_required;
+        }
+        record.storage_regions.insert(region, state);
         Ok(())
     })
     .await;

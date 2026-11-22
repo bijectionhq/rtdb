@@ -122,6 +122,7 @@ Startup, live replay and archived suffix preparation check the same replica anch
 The trim grant names the exact journal and a prefix covered by its persisted directory anchor.
 An authenticated archive publication releases its suffix's hold on the live journal.
 The archive continues to protect its own capture.
+An admitted archive copy retains the original journal range through provider drain, including when the pin expires or the archive publishes while work is outstanding.
 [ReplicaTrimArchive](../tla/ReplicaTrimArchive.tla) checks both sides of the handoff and reaches physical trim while a verified archive still serves the capture.
 
 ### Admission across physical owners

@@ -41,7 +41,7 @@ pub(crate) async fn capture(
         directory.as_ref(), keys, &id, archive, hosted_task, Some(selected.capture),
         Some(RegionPublication::Capture(Arc::clone(&directory))),
         |record| {
-            admit(record, archive, deployment, pin_id, &selected).map(|_| ())
+            admit_copy(record, archive, deployment, pin_id, &selected)
         },
         |record, region, io| {
             let (directory, selected, id) = (&directory, &selected, &id);
@@ -151,6 +151,18 @@ pub(super) async fn apply_archived(
     Ok(())
 }
 
+fn admit_copy(
+    record: &DeploymentRecord, archive: &CellStorage, deployment: Uuid,
+    pin_id: Uuid, selected: &CheckpointSuffixPin,
+) -> Result<Option<i64>> {
+    let (_, pin) = admit(record, archive, deployment, pin_id, selected)?;
+    if pin.archive_sha256.is_some() { return Ok(None); }
+    if record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != pin.incarnation) {
+        return Err(suffix_unavailable());
+    }
+    Ok(Some(crate::hosted_recovery::replay_start(record, pin.checkpoint.boundary)?))
+}
+
 fn admit<'a>(
     record: &'a DeploymentRecord, archive: &CellStorage, deployment: Uuid,
     pin_id: Uuid, selected: &CheckpointSuffixPin,
@@ -249,4 +261,85 @@ fn validate_records(
     }
     if tx != pin.basis || source != pin.source_through { return Err(suffix_unavailable()); }
     Ok(())
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use rtdb_directory::{Checkpoint, CheckpointCapture, JournalAnchor, MemberId, MemoryDirectory};
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_suffix_copy_keeps_journal_custody_through_provider_drain() -> Result<()> {
+        let location = tempfile::tempdir().unwrap();
+        let archive = CellStorage::Local { root: location.path().join("archive") };
+        let keys = crate::keys::LocalKeyService::new(&location.path().join("keys"))?;
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("captured", "acme", Vec::new(), now_ms());
+        record.holder = Some(MemberId("writer".into()));
+        let deployment = record.id.parse().unwrap();
+        let id = record.id.clone();
+        let capture = Uuid::new_v4();
+        let lease = Uuid::new_v4();
+        let checkpoint = Checkpoint {
+            block: 1, boundary: 4, source: 2, system_time: 10, root_sha256: Some([1; 32]),
+        };
+        let pin = CheckpointSuffixPin {
+            capture, manifest_sha256: "manifest".into(), checkpoint,
+            incarnation: record.incarnation, log_epoch: record.log_epoch, writer_epoch: record.epoch,
+            basis: TransactionKey { tx_id: TxId(3), system_time: Timestamp(20) },
+            replica_through: 6, source_through: 3, journal_interval: [5, 6], journal_sha256: [2; 32],
+            expires_at_ms: now_ms() + 60_000, archive_sha256: None,
+        };
+        record.checkpoint_captures.insert(capture, CheckpointCapture {
+            archive: super::super::archive_binding(&archive)?,
+            incarnation: record.incarnation, log_epoch: record.log_epoch, checkpoint,
+            media_bound: true, manifest_sha256: Some(pin.manifest_sha256.clone()), remote_disposal: None,
+        });
+        record.checkpoint_suffix_pins.insert(lease, pin.clone());
+        let registered = directory.create_deployment(record).await?;
+        let mut trimmed = registered.clone();
+        trimmed.replica_anchor = Some(Box::new(JournalAnchor {
+            root_incarnation: registered.incarnation, interval: [0, 5], digest: [3; 32],
+        }));
+        assert!(admit_copy(&trimmed, &archive, deployment, lease, &pin).is_err());
+
+        let admitted = Notify::new();
+        let started = Arc::new(Notify::new());
+        let (drain, provider) = std::sync::mpsc::channel();
+        let copy = with_region(
+            directory.as_ref(), &keys, &id, &archive, None, Some(capture), None,
+            |record| admit_copy(record, &archive, deployment, lease, &pin),
+            |_, _, io| async {
+                let provider_started = Arc::clone(&started);
+                tokio::spawn(async move {
+                    io.run_blocking(move || {
+                        provider_started.notify_one();
+                        let _ = provider.recv();
+                        Ok(())
+                    }).await
+                });
+                started.notified().await;
+                admitted.notify_one();
+                Ok(())
+            },
+        );
+        let observe = async {
+            admitted.notified().await;
+            let updated = update_installation(directory.as_ref(), &id, |record| {
+                record.checkpoint_suffix_pins.get_mut(&lease).unwrap().archive_sha256 = Some("verified".into());
+                Ok(())
+            }).await?;
+            assert_eq!(updated.required_replica_offsets(pin.expires_at_ms).collect::<Vec<_>>(), [5]);
+            assert_eq!(admit_copy(&updated, &archive, deployment, lease, &pin)?, None);
+            drain.send(()).unwrap();
+            Ok::<(), Anomaly>(())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::try_join!(copy, observe) })
+            .await.expect("archive region drains")?;
+        let released = directory.deployment(&id).await?.unwrap();
+        assert!(released.required_replica_offsets(pin.expires_at_ms).next().is_none());
+        Ok(())
+    }
 }

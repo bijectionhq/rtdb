@@ -1473,6 +1473,7 @@ rule TrimCertifiedReplicaPrefix {
     -- The checkpoint's boundary record supplies the intake position on reopen.
     -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
     -- The archived suffix retains its capture through its own custody.
+    -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
     when: ReplicaPrefixCertified(holding, through, digest)
 
     requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
