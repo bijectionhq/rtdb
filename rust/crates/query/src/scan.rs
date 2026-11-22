@@ -1800,6 +1800,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stacked_filters_and_limit_keep_cold_scan_vectors() {
+        use rtdb_plan::{BinaryOp, NamedExpr, Relation};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut output = scan.columns[0].clone();
+        let expression = output.expression();
+        output.id = ColumnId(10);
+        output.name = "payload".into();
+        let relation = Arc::new(Relation::scan(scan).unwrap());
+        let relation = Arc::new(relation.project(vec![NamedExpr { field: output.clone(), expr: expression }]).unwrap());
+        let integer = |n| Expr::Literal(Value::I64(n));
+        let relation = Arc::new(relation.filter(Expr::binary(BinaryOp::Gt, output.expression(), integer(0))).unwrap());
+        let relation = Arc::new(relation.filter(Expr::binary(BinaryOp::Lt, output.expression(), integer(4))).unwrap());
+        let relation = Arc::new(relation.limit(Some(integer(1)), Some(integer(1))).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected a batch cursor");
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [crate::columnar::Column::Arrow { array, .. }] = page.columns.as_slice() else {
+            panic!("Expected the cold scan payload to stay in Arrow");
+        };
+        let values = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[2]);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn a_data_page_outside_its_metadata_path_fails_every_scan_that_reads_it() {
         let (state, table, _, store, _) = persisted_pages(true).await;
         let storage = Arc::new(BufferPool::new(store, 1 << 20));

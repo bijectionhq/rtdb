@@ -3,7 +3,7 @@ mod columns;
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
+use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, StructArray, TimestampMicrosecondArray, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
@@ -83,19 +83,70 @@ pub struct PageEvent {
 }
 
 #[derive(Debug)]
-struct EventPage { put: Option<(arrow_array::StructArray, arrow_schema::Fields, StructFields<LogicalType>)> }
+struct EventPage { put: Option<(StructArray, Vec<LogicalType>)> }
+
+#[derive(Clone, Copy)]
+struct PutRef<'a> {
+    array: &'a StructArray,
+    types: &'a [LogicalType],
+    offset: usize,
+}
+
+impl<'a> PutRef<'a> {
+    fn column(self, name: &str) -> PutColumn<'a> {
+        match self.position(name) {
+            Some(index) => PutColumn::Stored(&self.array.fields()[index], self.array.column(index).as_ref(), self.offset),
+            None => PutColumn::Absent,
+        }
+    }
+    fn value(self, name: &str, ty: &LogicalType) -> Result<Value> {
+        match self.position(name) {
+            Some(index) => match self.types.get(index).ok_or_else(|| invalid("Put column has no logical type"))? {
+                LogicalType::Nothing => Ok(Value::Undefined),
+                stored => rtdb_columnar::read_value_as(stored, &self.array.fields()[index], self.array.column(index).as_ref(), self.offset),
+            },
+            None => Ok(match ty { LogicalType::Nothing => Value::Undefined, _ => Value::Null }),
+        }
+    }
+    fn position(self, name: &str) -> Option<usize> { self.array.fields().iter().position(|field| field.name() == name) }
+    fn within(self, fields: &StructFields<LogicalType>) -> bool {
+        self.array.fields().iter().all(|column| fields.contains_key(column.name()))
+    }
+}
+
+/// A borrowed event with its document addressed within an Arrow batch.
+pub struct EventRef<'a> {
+    header: EventHeader,
+    recency: Option<Timestamp>,
+    put: Option<PutRef<'a>>,
+}
+
+impl EncodedEvent for EventRef<'_> {
+    fn header(&self) -> EventHeader { self.header }
+    fn recency(&self) -> Option<Timestamp> { self.recency }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool { self.put.is_none_or(|put| put.within(fields)) }
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
+        let put = self.put.ok_or_else(|| invalid("Only a put event has document cells"))?;
+        put.value(name, ty).map(std::borrow::Cow::Owned)
+    }
+    fn put_column(&self, name: &str) -> Option<PutColumn<'_>> { self.put.map(|put| put.column(name)) }
+}
 
 impl PageEvent {
     /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
     pub fn document_bytes(&self) -> Result<usize> {
         if let Some(bytes) = self.bytes.get() { return Ok(*bytes); }
         let bytes = match (&self.page.put, self.op) {
-            (Some((array, fields, _)), EventOp::Put) => fields.iter().enumerate().try_fold(0usize, |bytes, (index, field)| {
+            (Some((array, _)), EventOp::Put) => array.fields().iter().enumerate().try_fold(0usize, |bytes, (index, field)| {
                 bytes.checked_add(rtdb_columnar::estimate_read_cell_bytes(field, array.column(index).as_ref(), self.offset)?).ok_or_else(event_size)
             })?,
             _ => 0,
         };
         Ok(*self.bytes.get_or_init(|| bytes))
+    }
+    fn put_ref(&self) -> Option<PutRef<'_>> {
+        let (Some((array, types)), EventOp::Put) = (&self.page.put, self.op) else { return None; };
+        Some(PutRef { array, types, offset: self.offset })
     }
 }
 
@@ -103,26 +154,14 @@ impl EncodedEvent for PageEvent {
     fn header(&self) -> EventHeader { EventHeader { iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: self.op } }
     fn recency(&self) -> Option<Timestamp> { self.recency }
     fn put_within(&self, fields: &StructFields<LogicalType>) -> bool {
-        match (&self.page.put, self.op) { (Some((_, columns, _)), EventOp::Put) => columns.iter().all(|column| fields.contains_key(column.name())), _ => true }
+        self.put_ref().is_none_or(|put| put.within(fields))
     }
     fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> {
-        let (Some((array, fields, types)), EventOp::Put) = (&self.page.put, self.op) else { return Err(invalid("Only a put event has document cells")) };
-        // As reading the document struct does: a column it stores reads under its own type, and one it lacks falls back
-        // as `struct_field_cell` falls back for a key the document has no value for.
-        Ok(std::borrow::Cow::Owned(match fields.iter().position(|field| field.name() == name) {
-            Some(index) => match types.get(name).ok_or_else(|| invalid("Put column has no logical type"))? {
-                LogicalType::Nothing => Value::Undefined,
-                stored => rtdb_columnar::read_value_as(stored, &fields[index], array.column(index).as_ref(), self.offset)?,
-            },
-            None => match ty { LogicalType::Nothing => Value::Undefined, _ => Value::Null },
-        }))
+        let put = self.put_ref().ok_or_else(|| invalid("Only a put event has document cells"))?;
+        put.value(name, ty).map(std::borrow::Cow::Owned)
     }
     fn put_column(&self, name: &str) -> Option<PutColumn<'_>> {
-        let (Some((array, fields, _)), EventOp::Put) = (&self.page.put, self.op) else { return None };
-        Some(match fields.iter().position(|field| field.name() == name) {
-            Some(index) => PutColumn::Stored(&fields[index], array.column(index).as_ref(), self.offset),
-            None => PutColumn::Absent,
-        })
+        self.put_ref().map(|put| put.column(name))
     }
 }
 
@@ -179,10 +218,9 @@ impl EventBatch {
         let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
         let put = match legs.iter().find(|(_, leg)| leg.name() == "put") {
             Some((id, leg)) => {
-                let array = union.child(id).as_any().downcast_ref::<arrow_array::StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))?.clone();
-                let DataType::Struct(fields) = leg.data_type() else { return Err(invalid("Put operations must contain document structs")) };
+                let array = union.child(id).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))?.clone();
                 let LogicalType::Struct(types) = rtdb_columnar::from_field(leg)? else { return Err(invalid("A put operation must contain a document struct")) };
-                Some((array, fields.clone(), types))
+                Some((array, types.into_iter().map(|(_, ty)| ty).collect()))
             }
             None => None,
         };
@@ -226,6 +264,19 @@ impl EventBatch {
             valid_time: Interval::new(self.timestamp(self.valid_from, row)?, self.timestamp(self.valid_to, row)?)?,
             op,
         })
+    }
+
+    /// Borrows a row and the logical types of its batch's put fields.
+    pub fn event_ref<'a>(&'a self, row: usize, put_types: &'a [LogicalType]) -> Result<EventRef<'a>> {
+        let header = self.header(row)?;
+        let put = if header.op == EventOp::Put {
+            let (_, array, offset) = self.operation(row)?;
+            let array = array.as_any().downcast_ref::<StructArray>().filter(|array| array.is_valid(offset))
+                .ok_or_else(|| invalid("A put operation must contain a document struct"))?;
+            Some(PutRef { array, types: put_types, offset })
+        } else { None };
+        let recency = self.recency.map(|index| self.timestamp(index, row)).transpose()?;
+        Ok(EventRef { header, recency, put })
     }
 
     pub fn read_event(&self, row: usize) -> Result<StoredEvent> {
