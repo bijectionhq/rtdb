@@ -52,7 +52,7 @@ impl Service {
                     self.close_owned_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::OPEN_WORLD_READ_V2 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_WORLD_READ_V3 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_POINT_V2 => Ok(vec![Ok(self.held_world_point_action(&call, &action.body).await?)]),
                 crate::owned_actions::CLOSE_WORLD_READ_V1 => {
                     self.close_world_read_action(&call, &action.body)?;
@@ -64,6 +64,7 @@ impl Service {
                 crate::owned_actions::COMMIT_WORLD_V1 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Overlay).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V2 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::ConditionedOverlay).await?)]),
                 crate::owned_actions::COMMIT_WORLD_V3 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Validation).await?)]),
+                crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.commit_world_action(&call, &action.body, crate::owned_actions::WorldCommitFormat::Publication).await?)]),
                 crate::owned_actions::DROP_WORLD_V1 => {
                     self.drop_world_action(&call, &action.body).await?;
                     Ok(Vec::new())

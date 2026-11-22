@@ -89,10 +89,10 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Option<Timestamp>) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Option<Timestamp>, publication: Option<rtdb_node::OwnedWorldPublication>) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks, controls, deadline).await
+            commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks, controls, deadline, publication).await
         })
     }
 
@@ -106,6 +106,8 @@ impl OwnedWorldHost for PlacedWorldHost {
 
 impl OwnedWorldRead for HeldCheckpointWorld {
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
+
+    fn application_clock(&self) -> Option<Timestamp> { HeldCheckpointWorld::application_clock(self) }
 
     fn parent_basis(&self) -> TransactionKey { HeldCheckpointWorld::parent_basis(self) }
 

@@ -1005,6 +1005,13 @@ impl OwnedReadSession {
     }
 
     /// Reads the exact local shadow, retaining its revision even when that shadow is a tombstone.
+    pub async fn world_application_clock(&self, world: rtdb_types::Iid) -> Result<Option<Timestamp>> {
+        self.admit_read().await?;
+        let clock = rtdb_query::read_owned_world_clock(Arc::clone(&self.context), &self.owner, world).await?;
+        self.check()?;
+        Ok(clock)
+    }
+
     pub async fn read_world_shadow(
         &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         valid_at: Timestamp, observed: bool,
@@ -1424,6 +1431,12 @@ pub struct OwnedWorldShadowRead {
     pub witness: Option<OwnedWorldPointWitness>,
 }
 
+pub struct OwnedWorldPublication {
+    pub attempt: String,
+    pub fingerprint: [u8; 32],
+    pub expected_clock: Option<Timestamp>,
+}
+
 #[derive(Clone)]
 pub struct OwnedWorldPointWitness {
     world: rtdb_types::Iid,
@@ -1486,7 +1499,7 @@ impl NativeSession {
     pub async fn commit_owned_world(
         &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
     ) -> Result<TransactionResult> {
-        self.commit_owned_world_checked(record, writes, Vec::new(), Vec::new(), None).await
+        self.commit_owned_world_checked(record, writes, Vec::new(), Vec::new(), None, None).await
     }
 
     pub async fn commit_owned_world_checked(
@@ -1494,11 +1507,16 @@ impl NativeSession {
         checks: Vec<OwnedWorldPointWitness>,
         controls: Vec<rtdb_tx::HostedControlWrite>,
         deadline: Option<Timestamp>,
+        publication: Option<OwnedWorldPublication>,
     ) -> Result<TransactionResult> {
         if writes.len() > 4096 || checks.len() > 128 || (writes.is_empty() && (checks.is_empty() || controls.is_empty())) { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        if !controls.is_empty() && (!writes.is_empty() || deadline.is_none() || controls.len().saturating_add(checks.len()) > 4096
+        if !controls.is_empty() && (deadline.is_none() || controls.len().saturating_add(checks.len()).saturating_add(writes.len()) > 4096
+            || (!writes.is_empty() && publication.is_none())
             || controls.iter().any(|control| !control.is_check()))
         {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        if publication.is_some() && (writes.is_empty() || checks.is_empty() || controls.is_empty() || deadline.is_none()) {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let scope = self.placed_history()?;
@@ -1512,7 +1530,7 @@ impl NativeSession {
             }
             until = until.min(check.until);
         }
-        let count = writes.len() + checks.len() * 2 + controls.len() + 2;
+        let count = writes.len() + checks.len() * 2 + controls.len() + 3;
         let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(count);
         ops.push(TxOp::OwnedDeadline { until });
@@ -1532,6 +1550,9 @@ impl NativeSession {
             ops.push(TxOp::OwnedReplaceDocs { relation, documents, valid_from: Some(valid.lower()), valid_to: Some(valid.upper()) });
         }
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
+        if let Some(OwnedWorldPublication { attempt, fingerprint, expected_clock }) = publication {
+            ops.push(TxOp::OwnedPublishWorld { world: record.id, attempt, fingerprint, expected: expected_clock });
+        }
         self.state.execute_tx(ops, Default::default()).await
     }
     /// Reserves a fresh system time by awaiting an ordered, fact-free source transaction.

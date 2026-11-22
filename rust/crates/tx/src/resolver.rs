@@ -675,6 +675,8 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
+            Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected }) =>
+                self.publish_owned_world(*world, attempt, *fingerprint, *expected).await,
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id).await,
@@ -869,6 +871,30 @@ impl<'a> OpenTransaction<'a> {
         if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
+        let mut publications = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedPublishWorld { world, .. }) => Some(*world),
+            _ => None,
+        });
+        if let Some(world) = publications.next() {
+            let scoped_check = operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })));
+            let mut point_checks = operations.iter().enumerate().filter_map(|(index, operation)| {
+                let Operation::Public(TxOp::OwnedCheck { relation, .. }) = operation else { return None; };
+                Some(relation.world() == Some(world) && index.checked_sub(1).is_some_and(|previous|
+                    matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation)))
+            });
+            let guarded_points = point_checks.next() == Some(true) && point_checks.all(|paired| paired);
+            let writes = operations.iter().any(|operation| match operation {
+                Operation::Public(TxOp::OwnedReplaceDocs { documents, .. }) | Operation::OwnedWriteIids { documents, .. } =>
+                    !documents.rows().is_empty(),
+                _ => false,
+            });
+            let hosted = operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::HostedControl(control)) if control.is_check()));
+            if publications.next().is_some() || !writes || !scoped_check || !guarded_points || !hosted
+                || self.owned_world.as_ref().is_none_or(|(record, _)| record.id != world)
+            {
+                return Err(unavailable());
+            }
+        }
         self.check_hosted_controls(operations, source_scope).await?;
         self.check_capacity_source(operations).await?;
         for operation in operations {
@@ -958,8 +984,44 @@ impl<'a> OpenTransaction<'a> {
         }
     }
 
+    async fn publish_owned_world(
+        &mut self, world: Iid, attempt: &str, fingerprint: [u8; 32], expected: Option<Timestamp>,
+    ) -> Result<()> {
+        use rtdb_types::{EntityId, OWNED_ATTEMPT_RELATION, OwnedRelation, OwnedWorld};
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let basis = self.owned_world.as_ref().filter(|(record, _)| record.id == world)
+            .ok_or_else(OwnedWorld::unavailable)?.0.basis.system_time;
+        if attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+            return Err(OwnedWorld::unavailable());
+        }
+        let snapshot = self.buffer.base_snapshot();
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let previous = rtdb_query::read_owned_world_clock(context, owner, world).await?;
+        if previous != expected || previous.is_some_and(|at| at <= basis) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/stale-clock", "The hosted world application clock changed"));
+        }
+        let next = previous.unwrap_or(basis).next()?;
+        if next > self.tx_key().system_time { return Err(OwnedWorld::unavailable()); }
+
+        let relation = OwnedRelation::new(OWNED_ATTEMPT_RELATION)?;
+        let id = EntityId::String(attempt.to_owned());
+        if self.read_owned_revision(owner, &relation, &id, Interval::ALL).await?.is_some() {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/context-used", "The attempt context has already published"));
+        }
+        let docs = crate::Documents::new(vec![StructFields::from([
+            ("_id".into(), id.as_value()), ("fingerprint".into(), Value::Binary(fingerprint.to_vec())),
+        ])], &self.context.memory)?;
+        self.write_owned(&relation, &docs, None, Some(Timestamp::MIN), Some(Timestamp::MAX), true).await?;
+        self.buffer.put(OwnedRelation::world_clock_table(owner), StructFields::from([
+            ("_id".into(), Value::Uuid(world.0)), ("clock".into(), Value::I64(next.0)),
+        ]), Interval::ALL)
+    }
+
     async fn erase_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<()> {
         use rtdb_types::{EntityId, OwnedChangeKind, OwnedRelation};
+        if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION {
+            return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations are immutable"));
+        }
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() {
@@ -1021,6 +1083,9 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION {
+            return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations are immutable"));
+        }
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
@@ -1042,6 +1107,14 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn write_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool) -> Result<()> {
+        if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION
+            && (!create_only || from != Some(Timestamp::MIN) || to.is_some_and(|to| to != Timestamp::MAX)
+                || documents.rows().iter().any(|row| row.len() != 2
+                    || !matches!(row.get("_id"), Some(Value::Utf8(_)))
+                    || !matches!(row.get("fingerprint"), Some(Value::Binary(bytes)) if bytes.len() == 32)))
+        {
+            return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations require complete immutable fingerprints"));
+        }
         let options = self.options;
         let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let table = relation.table(owner);
@@ -1093,6 +1166,7 @@ impl<'a> OpenTransaction<'a> {
             if Some(record.id) != relation.world() { return Err(unavailable()); }
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
+            schema.require_write_validity(true)?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(rtdb_types::WorldShadow::decode_bound(row)?)?;
                 if let rtdb_types::WorldShadow::Present(fact) = rtdb_types::WorldShadow::from_record(row)? {

@@ -60,6 +60,8 @@ pub(crate) struct WorldIdentityPage {
 impl HeldCheckpointWorld {
     pub fn present(&self) -> TransactionKey { self.open.snapshot.present() }
 
+    pub fn application_clock(&self) -> Option<Timestamp> { self.open.clock }
+
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
 
     pub fn check(&self) -> Result<()> {

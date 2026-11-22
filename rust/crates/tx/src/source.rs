@@ -82,6 +82,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
                 Operation::Public(TxOp::HostedControl(control)) => (control.retained_bytes()?, None, 0),
+                Operation::Public(TxOp::OwnedPublishWorld { attempt, .. }) => (attempt.len(), None, 128),
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
@@ -312,6 +313,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     owned_path_bytes(relation, name, columns)?,
                 Operation::Public(TxOp::HostedControl(control)) => control.retained_bytes()?,
+                Operation::Public(TxOp::OwnedPublishWorld { attempt, .. }) => attempt.len() + 128,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.name().len(),
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
@@ -478,6 +480,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             } else {
                 "rtdb-owned-check-range-v1"
             }
+        }
+        Operation::Public(TxOp::OwnedPublishWorld { world, attempt, fingerprint, expected }) => {
+            body.insert("world".into(), Value::Uuid(world.0));
+            body.insert("attempt".into(), Value::Utf8(attempt.clone()));
+            body.insert("fingerprint".into(), Value::Binary(fingerprint.to_vec()));
+            body.insert("expected".into(), expected.map_or(Value::Null, |time| Value::I64(time.0)));
+            "rtdb-owned-publish-world-v1"
         }
         Operation::Public(TxOp::OwnedCheckWorldPurge { relation, frontier }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1113,6 +1122,21 @@ impl SourceOperationReader<'_> {
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
+            "rtdb-owned-publish-world-v1" => {
+                let (Value::Uuid(world), Value::Utf8(attempt), Value::Binary(fingerprint)) =
+                    (value("world")?, value("attempt")?, value("fingerprint")?) else {
+                    return Err(invalid("Owned world publication has invalid fields"));
+                };
+                let fingerprint = fingerprint.try_into().map_err(|_| invalid("Invalid world publication fingerprint"))?;
+                TxOp::OwnedPublishWorld {
+                    world: rtdb_types::Iid(world), attempt, fingerprint,
+                    expected: match value("expected")? {
+                        Value::Null | Value::Undefined => None,
+                        Value::I64(time) => Some(Timestamp(time)),
+                        _ => return Err(invalid("Invalid expected world application clock")),
+                    },
+                }
+            }
             "rtdb-owned-check-world-purge-v1" => {
                 let (Value::Utf8(relation), Value::I64(frontier)) = (value("relation")?, value("frontier")?) else {
                     return Err(invalid("Owned world purge witness has invalid fields"));
