@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::deployment::LogkeeperLogConfig;
 use crate::keys::KeyService;
-use crate::replica_retention::excluded_replay_start;
+use crate::hosted_recovery::replay_start;
 
 pub(crate) struct RecoveryHolds {
     pub directory: Arc<dyn Directory>,
@@ -84,25 +84,19 @@ impl RecoveryAdmission {
         self.checked_record(after).await.map(|_| ())
     }
 
-    async fn checked_record(&self, after: LogOffset) -> Result<DeploymentRecord> {
+    async fn checked_record(&self, after: LogOffset) -> Result<(DeploymentRecord, i64)> {
         let record = self.holds.directory.deployment(&self.deployment).await.map_err(|error| self.directory_error(error))?;
         let record = record.filter(|record| {
             record.log_epoch == self.log_epoch && record.stream("replica") == self.stream
                 && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         }).ok_or_else(|| Error::Closed(self.stream.clone()))?;
-        if let Some(anchor) = &record.replica_anchor
-            && let Some((requested, first_retained)) = excluded_replay_start(after.0, anchor.interval[1])
-        {
-            return Err(Error::UnavailableLogRange { requested, first_retained });
-        }
-        Ok(record)
+        let first_required = replay_start(&record, after.0)?;
+        Ok((record, first_required))
     }
 
     async fn register(&self, id: Uuid, after: LogOffset, attempted: &mut bool) -> Result<()> {
-        let first_required = after.0.checked_add(1).filter(|first| *first >= 0)
-            .ok_or_else(|| Error::Task("Invalid first required replica offset".into()))?;
         for _ in 0..8 {
-            let mut record = self.checked_record(after).await?;
+            let (mut record, first_required) = self.checked_record(after).await?;
             let version = record.version;
             record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, custody: self.holds.custody.clone() });
             *attempted = true;

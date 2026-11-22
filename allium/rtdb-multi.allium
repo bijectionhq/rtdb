@@ -1469,11 +1469,14 @@ rule PublishCheckpoint {
 
 rule TrimCertifiedReplicaPrefix {
     -- The checkpoint's boundary record supplies the intake position on reopen.
+    -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
+    -- The archived suffix retains its capture through its own custody.
     when: ReplicaPrefixCertified(holding, through, digest)
 
     requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
     requires: through < Directory.read(holding.deployment.id).checkpoint.lsn
     requires: not exists replay in Directory.read(holding.deployment.id).replica_replays: replay.first_required <= through
+    requires: ArchivedAndPendingSuffixesCoverTrim(holding.deployment, through)
 
     ensures:
         Directory.cas(holding.deployment.id, holding.epoch, change: {

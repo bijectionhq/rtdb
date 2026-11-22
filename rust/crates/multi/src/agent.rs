@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixPin, DeploymentRecord, Directory, JournalAnchor, Lifecycle, MemberId, MemberRecord, MemberState, StorageRegion, Version, claim, effective_holder, now_ms, park, suspend_holding};
+use rtdb_directory::{Cas, Checkpoint, CheckpointSuffixPin, DeploymentRecord, Directory, Lifecycle, MemberId, MemberRecord, MemberState, Version, claim, effective_holder, now_ms, park, suspend_holding};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_node::{Database, Node};
 use rtdb_replication::Role as DriverRole;
@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
-use crate::replica_retention::replica_trim_through;
+use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
 
 #[derive(Clone, Debug)]
 pub struct AgentOptions {
@@ -590,9 +590,8 @@ impl NodeAgent {
             ).ok_or_else(unavailable)?;
             let checkpoint = archived.checkpoint;
             if checkpoint.boundary < 0 || basis.system_time.0 <= checkpoint.system_time
-                || record.replica_anchor.as_ref().is_some_and(|anchor|
-                    anchor.root_incarnation != record.incarnation || anchor.interval[0] < 0
-                    || anchor.interval[1] < anchor.interval[0] || anchor.interval[1] > checkpoint.boundary)
+                || record.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != record.incarnation)
+                || replay_start(record, checkpoint.boundary).is_err()
             {
                 return Err(unavailable());
             }
@@ -1038,41 +1037,11 @@ impl NodeAgent {
         let needs_publication = current.checkpoint.is_none_or(|published| published.block < checkpoint.block
             || (published.block == checkpoint.block && current.recovery_manifest_sha256.is_none()));
         if !needs_publication && !needs_trim { return; }
-        let Ok(Some((mut record, _))) = self.publish_checkpoint(&current.id, epoch, &database, &block).await else { return; };
-        if !needs_trim || record.recovery_manifest_sha256.is_none() { return; }
-        let Some(published) = record.checkpoint else { return; };
-        let boundary = published.boundary.min(checkpoint.boundary);
-        let now = now_ms();
-        let pinned = record.checkpoint_suffix_pins.values()
-            .filter(|pin| pin.expires_at_ms > now)
-            .map(|pin| {
-                if pin.incarnation == record.incarnation && pin.log_epoch == record.log_epoch {
-                    pin.checkpoint.boundary.checked_add(1).unwrap_or(0)
-                } else {
-                    0
-                }
-            });
-        let oldest_replay = record.storage_regions.values().filter_map(StorageRegion::first_required_replica)
-            .chain(pinned).min().unwrap_or(boundary);
-        let Some(through) = replica_trim_through(boundary, oldest_replay).filter(|through| *through > trimmed_through) else { return; };
+        let Ok(Some((record, _))) = self.publish_checkpoint(&current.id, epoch, &database, &block).await else { return; };
+        let Some(plan) = ReplicaTrimPlan::new(record, checkpoint.boundary, trimmed_through, now_ms()) else { return; };
         let Ok(members) = self.members().await else { return };
-        let Ok(servers) = ensemble_servers(&record, &members) else { return };
-        let stream = rtdb_logkeeper::StreamConfig { write_quorum: crate::deployment::write_quorum(servers.len()), servers, stream: record.stream("replica"), maximum_message_bytes: 4 << 20 };
-        if record.replica_anchor.as_ref().is_none_or(|anchor| anchor.interval[1] < through) {
-            let prefix = record.replica_anchor.as_ref().map(|anchor| rtdb_logkeeper::JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
-            let Ok(proof) = rtdb_logkeeper::certify_committed_prefix(&stream, through, prefix.as_ref()).await else { return; };
-            let Some(digest) = proof.digest_bytes() else { return; };
-            let root_incarnation = record.replica_anchor.as_ref().map_or(record.incarnation, |anchor| anchor.root_incarnation);
-            let version = record.version;
-            record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation, interval: proof.interval, digest }));
-            // The CAS also validates the observed recovery holds.
-            if !matches!(self.directory.replace_deployment(record, version).await, Ok(Cas::Applied(_))) {
-                return;
-            }
-        }
-        // If an anchor already authorized this trim, new pins must start after it.
-        // Otherwise the anchor CAS above and pin admission contend on the same record.
-        if rtdb_logkeeper::trim(&stream, rtdb_storage::log::LogOffset(through)).await.is_ok()
+        let Ok(Some(grant)) = plan.authorize(self.directory.as_ref(), &members).await else { return; };
+        if let Ok(through) = grant.apply().await
             && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)
         {
             holding.trimmed_through = Some(through);

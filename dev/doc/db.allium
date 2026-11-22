@@ -672,6 +672,9 @@ config {
 -- Its digest covers the root, replica epoch and first required replica offset.
 -- The admitted store recomputes the inventory commitment from fresh storage observations before opening the cut.
 -- A hosted prefix trim requires a checkpoint with this commitment.
+-- Startup, cursor recovery and checkpoint suffix admission check the same persisted prefix authorization.
+-- An unpublished archived suffix retains its journal interval while its pin is active.
+-- Publishing its verified archive transfers that interval to archive custody.
 -- Opening a directory receipt verifies fresh root bytes before loading table metadata.
 -- An ordinary startup admits the root metadata and first required replica offset in one directory update.
 -- The startup grant lasts through cursor admission and the drain of the provider reads it owns.

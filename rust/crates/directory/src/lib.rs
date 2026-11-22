@@ -841,6 +841,23 @@ impl DeploymentRecord {
     /// The name of a physical log stream on this residence's ensemble.
     pub fn stream(&self, kind: &str) -> String { format!("{}/{}/{kind}", self.id, self.incarnation) }
 
+    /// First replica offsets retained by open regions and captures that still need the journal.
+    pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
+        self.storage_regions.values().filter_map(StorageRegion::first_required_replica)
+            .chain(self.checkpoint_suffix_pins.values()
+                .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
+                .map(|pin| {
+                    if pin.incarnation == self.incarnation && pin.log_epoch == self.log_epoch {
+                        match pin.checkpoint.boundary.checked_add(1) {
+                            Some(first) if first >= 0 && first == pin.journal_interval[0] => first,
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    }
+                }))
+    }
+
     /// The ciphertext binds to the logical deployment. A transfer copies
     /// the records into the destination journal at their original offsets.
     pub fn replica_seal_scope(&self) -> String { format!("{}/1/replica", self.id) }

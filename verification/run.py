@@ -2761,6 +2761,14 @@ TLA_CASES = (
     ("ReplicaTrimAdmission", "replica-trim-replacement-witness",
      ("INVARIANTS PublishedCheckpointCovered ActiveRecoveryCovered PublishedManifestComplete AuthorizedTrimHasManifest",
       "INVARIANT NeverRecoveredAfterTrim"), "NeverRecoveredAfterTrim"),
+    ("ReplicaTrimArchive", "replica-trim-archive", None, None),
+    ("ReplicaTrimArchive", "replica-trim-ignore-pending-archive",
+     ('Mutation = "none"', 'Mutation = "ignore_pending_archive"'), "PendingPinRetainsJournal"),
+    ("ReplicaTrimArchive", "replica-trim-publish-unverified-archive",
+     ('Mutation = "none"', 'Mutation = "publish_unverified"'), "PublishedArchiveVerified"),
+    ("ReplicaTrimArchive", "replica-trim-archive-handoff-witness",
+     ("INVARIANTS PendingPinRetainsJournal PublishedArchiveVerified", "INVARIANT JournalReleasedDuringCapture"),
+     "JournalReleasedDuringCapture"),
     ("ExternalConfirmation", "external-confirmation", None, None),
     ("ExternalConfirmation", "external-confirmation-volatile-apply",
      ('Mutation = "none"', 'Mutation = "trust_applied"'), "ConfirmedRecoverable"),
@@ -4176,7 +4184,7 @@ def verify_multi_trim_admission(args, source):
     if baseline.returncode or f"{test} ... ok" not in baseline.stdout or "1 passed; 0 failed" not in baseline.stdout:
         raise ValueError("native Multi recovery admission did not enforce the authorized trim")
 
-    holds = source / "rust/crates/multi/src/recovery_holds.rs"
+    holds = source / "rust/crates/multi/src/hosted_recovery.rs"
     original = holds.read_bytes()
     try:
         replace_once(holds, "if let Some(anchor) = &record.replica_anchor", "if false && let Some(anchor) = &record.replica_anchor")

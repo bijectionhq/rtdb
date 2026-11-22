@@ -338,14 +338,8 @@ fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentR
 
 fn checkpoint_startup_replay(record: &DeploymentRecord) -> Result<Option<i64>> {
     let Some(checkpoint) = record.checkpoint.filter(|checkpoint| checkpoint.root_sha256.is_some()) else { return Ok(None); };
-    let first_required = checkpoint.boundary.checked_add(1).filter(|first| *first > 0)
-        .ok_or_else(|| storage_region_error("The published checkpoint has an invalid replay boundary"))?;
-    if let Some(anchor) = &record.replica_anchor
-        && let Some((requested, first_retained)) = crate::replica_retention::excluded_replay_start(checkpoint.boundary, anchor.interval[1])
-    {
-        return Err(rtdb_storage::Error::UnavailableLogRange { requested, first_retained }.into());
-    }
-    Ok(Some(first_required))
+    if checkpoint.boundary < 0 { return Err(storage_region_error("The published checkpoint has an invalid replay boundary")); }
+    Ok(Some(crate::hosted_recovery::replay_start(record, checkpoint.boundary)?))
 }
 
 impl CellStoreFactory {

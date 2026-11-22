@@ -118,6 +118,11 @@ Startup verifies the same commitment under its existing metadata and replay admi
 Flush, park and idle suspension share the writer's publication path.
 Prefix trim requires the commitment, and a holder can certify a previously published cut in place.
 A transfer or repair verifies its own copy and clears the commitment made against the previous storage view.
+Startup, live replay and archived suffix preparation check the same replica anchor.
+The trim grant names the exact journal and a prefix covered by its persisted directory anchor.
+An authenticated archive publication releases its suffix's hold on the live journal.
+The archive continues to protect its own capture.
+[ReplicaTrimArchive](../tla/ReplicaTrimArchive.tla) checks both sides of the handoff and reaches physical trim while a verified archive still serves the capture.
 
 ### Admission across physical owners
 
