@@ -199,6 +199,35 @@ pub(crate) struct ColumnBatch {
 }
 
 impl ColumnBatch {
+    pub(crate) fn supports_literal_rows(rows: &[Vec<rtdb_plan::Expr>]) -> bool {
+        let Some(first) = rows.first() else { return true; };
+        rows.iter().all(|row| row.len() == first.len() && row.iter().all(|expression| literal_cell(expression).is_some()))
+            && (0..first.len()).all(|position| scalar_result_type(rows.iter().map(|row| {
+                literal_cell(&row[position]).expect("The row contains only literal cells")
+            })).is_some())
+    }
+
+    pub(crate) fn from_literal_rows(rows: &[Vec<rtdb_plan::Expr>], context: &crate::QueryContext) -> Result<Option<Self>> {
+        let Some(first) = rows.first() else { return Ok(None); };
+        let memory = &context.memory;
+        let mut batch = Self::settled(vec![], rows.len(), memory.reserve(256)?)?;
+        for position in 0..first.len() {
+            context.check_cancelled()?;
+            let cells = rows.iter().map(|row| literal_cell(&row[position]).expect("The row contains only literal cells"));
+            let bytes = rows.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
+            let bytes = cells.clone().try_fold(bytes, |bytes, value| {
+                bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)
+            })?;
+            let scratch = memory.reserve(bytes)?;
+            let values = cells.cloned().collect::<Vec<_>>();
+            let ty = scalar_result_type(values.iter()).ok_or_else(|| invalid("column-literal", "An admitted literal column has mixed types"))?;
+            let (column, charge) = pack_scalar_values(&values, ty, memory)?;
+            drop((values, scratch));
+            batch.append_column(column, charge, memory)?;
+        }
+        Ok(Some(batch))
+    }
+
     pub(crate) fn cross(left: &Self, right: &Self, rows: usize, context: &crate::QueryContext) -> Result<Self> {
         let memory = &context.memory;
         let width = left.columns.len().checked_add(right.columns.len()).ok_or_else(size_error)?;
@@ -1795,6 +1824,20 @@ pub(crate) trait BatchCursor: Send {
 }
 pub(crate) type BoxBatchCursor = Box<dyn BatchCursor>;
 
+pub(crate) fn single_batch(batch: Option<ColumnBatch>, context: Arc<crate::QueryContext>) -> BoxBatchCursor {
+    Box::new(SingleBatch { batch, context })
+}
+
+struct SingleBatch { batch: Option<ColumnBatch>, context: Arc<crate::QueryContext> }
+
+#[async_trait::async_trait]
+impl BatchCursor for SingleBatch {
+    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
+        self.context.check_cancelled()?;
+        Ok(self.batch.take())
+    }
+}
+
 pub(crate) async fn poll_nested_batch(input: &mut dyn BatchCursor) -> Result<Option<ColumnBatch>> {
     let mut pull = input.next_batch();
     std::future::poll_fn(|context| stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || pull.as_mut().poll(context))).await
@@ -2721,9 +2764,13 @@ impl BatchCursor for BatchExpressions {
             }
             if let Some(bound) = projection::bound(kernel, &self.schema, &batch)? {
                 let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
+                let retained = lease.bytes();
                 let next = lease.bytes().checked_add(bound).ok_or_else(size_error)?;
                 match lease.grow_to(next) {
-                    Ok(()) => if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? { columns.push(column); continue; },
+                    Ok(()) => {
+                        if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+                        lease.shrink_to(retained)?;
+                    }
                     Err(error) if matches!(kernel, rtdb_plan::Expr::List(_)) && error.code == "rtdb/memory-budget-exceeded" => {},
                     Err(error) => return Err(error),
                 }
@@ -2742,7 +2789,8 @@ impl BatchCursor for BatchExpressions {
             let fields = expression_columns(expression, &self.schema)?;
             let mut inputs = vec![Value::Null; batch.columns.len()];
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-            lease.grow_to(lease.bytes().checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
+            let retained = lease.bytes();
+            lease.grow_to(retained.checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
             let mut values = Vec::with_capacity(batch.len);
             for row in 0..batch.len {
                 let _row = batch.load_expression_inputs(row, &fields, &mut inputs, &self.execution.context.memory)?;
@@ -2753,12 +2801,71 @@ impl BatchCursor for BatchExpressions {
                 for &column in &fields { inputs[column] = Value::Null; }
                 scope.reset()?;
             }
-            columns.push(Column::Values(values));
+            if self.validate_input && let Some((column, scratch)) = scalar_result(&values, &self.execution.context.memory)? {
+                let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
+                let admission = if bytes <= lease.bytes() { Ok(()) } else { lease.grow_to(bytes) };
+                match admission {
+                    Ok(()) => {
+                        drop(values);
+                        lease.shrink_to(bytes)?;
+                        drop(scratch);
+                        columns.push(column);
+                    }
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => columns.push(Column::Values(values)),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                columns.push(Column::Values(values));
+            }
         }
         ColumnBatch::settled(columns, batch.len, reservation).map(Some)
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+/// Packs scalar results whose Arrow cells read back as the same values and exact execution types.
+fn scalar_result(values: &[Value], memory: &Arc<MemoryBudget>) -> Result<Option<(Column, Arc<MemoryReservation>)>> {
+    let Some(ty) = scalar_result_type(values.iter()) else { return Ok(None); };
+    match pack_scalar_values(values, ty, memory) {
+        Ok(column) => Ok(Some(column)),
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn pack_scalar_values(values: &[Value], ty: LogicalType, memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
+    let bound = rtdb_columnar::estimate_builder_bytes(&ty, values)?;
+    let scratch = memory.reserve(bound)?;
+    let array = rtdb_columnar::copy_array(&ty, values)?;
+    let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
+    Ok((Column::Arrow { array, field, logical: Some(ty) }, scratch))
+}
+
+fn literal_cell(expression: &rtdb_plan::Expr) -> Option<&Value> {
+    match expression { rtdb_plan::Expr::Literal(value) => Some(value), _ => None }
+}
+
+fn scalar_result_type<'a>(values: impl Iterator<Item = &'a Value>) -> Option<LogicalType> {
+    let mut ty = None;
+    let mut nullable = false;
+    for value in values {
+        match value {
+            Value::Null => nullable = true,
+            Value::Bool(_) | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_)
+            | Value::F32(_) | Value::F64(_) | Value::Utf8(_) | Value::Binary(_)
+            | Value::Uuid(_) | Value::FixedSizeBinary(_) | Value::Timestamp { .. } => {
+                let next = value.logical_type();
+                match &ty {
+                    Some(ty) if *ty != next => return None,
+                    None => ty = Some(next),
+                    _ => {}
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(ty.map_or(LogicalType::Null, |ty: LogicalType| if nullable { ty.maybe() } else { ty }))
 }
 
 /// Column-at-a-time projection for input columns, scalar constants, `+ - *` over 64-bit integers and floats, records of

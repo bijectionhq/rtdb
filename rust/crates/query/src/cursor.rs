@@ -543,7 +543,7 @@ fn uses_row_batch_limit(relation: &Relation) -> bool {
     use rtdb_plan::{Expr, JoinKind, RelationNode};
     stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
         let row_batched = match relation.node() {
-            RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. }
+            RelationNode::Values { .. } | RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. }
             | RelationNode::Join { kind: JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Single | JoinKind::Semi | JoinKind::Anti, .. } => true,
             RelationNode::Aggregate { groups, .. } => !groups.is_empty(),
             RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } => {

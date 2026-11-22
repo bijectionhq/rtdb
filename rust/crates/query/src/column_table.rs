@@ -1,10 +1,8 @@
 use crate::{
-    QueryContext,
-    columnar::{BatchCursor, BoxBatchCursor, ColumnBatch},
+    columnar::{BoxBatchCursor, ColumnBatch, single_batch},
     context::Execution,
     pages::{BoxPageCursor, PageBuilder, PageCursor, single_page},
 };
-use async_trait::async_trait;
 use rtdb_plan::Expr;
 use rtdb_types::Result;
 use std::sync::Arc;
@@ -28,17 +26,5 @@ pub(crate) fn open_arrow(execution: &Execution, position: usize) -> Result<Optio
     let output = ColumnBatch::from_list_parameter(
         input, position, row, &execution.parameters.types()[position], &execution.context.memory,
     )?;
-    Ok(output.map(|output| Box::new(ArrowParameterTable {
-        output: Some(output), context: Arc::clone(&execution.context),
-    }) as BoxBatchCursor))
-}
-
-struct ArrowParameterTable { output: Option<ColumnBatch>, context: Arc<QueryContext> }
-
-#[async_trait]
-impl BatchCursor for ArrowParameterTable {
-    async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        self.context.check_cancelled()?;
-        Ok(self.output.take())
-    }
+    Ok(output.map(|output| single_batch(Some(output), Arc::clone(&execution.context))))
 }

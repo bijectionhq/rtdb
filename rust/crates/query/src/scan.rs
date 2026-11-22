@@ -2179,6 +2179,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computed_scan_and_literal_rows_feed_a_struct_mutation_projection_as_vectors() {
+        use rtdb_plan::{NamedExpr, Relation, RelationNode, Schema};
+
+        let (state, table, _, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let source = scan.columns[0].clone();
+        let named = |id, name: &str, expr: Expr| NamedExpr {
+            field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..source.clone() },
+            expr,
+        };
+        let remainder = Expr::Call {
+            name: "mod".into(), args: vec![source.expression(), Expr::Literal(Value::I64(2))],
+            return_type: LogicalType::Scalar(ScalarType::I64),
+        };
+        let literal = Relation::new(Schema::new(vec![source.clone()]).unwrap(), RelationNode::Values {
+            rows: (1..=3).map(|value| vec![Expr::Literal(Value::I64(value))]).collect(),
+        }).unwrap();
+        for input in [Relation::scan(scan).unwrap(), literal] {
+            let projected = Arc::new(Arc::new(input).project(vec![
+                named(1, "source", source.expression()), named(2, "remainder", remainder.clone()),
+            ]).unwrap());
+            let iid = Expr::Call {
+                name: "_iid".into(), args: vec![projected.schema().fields()[0].expression()],
+                return_type: LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+            };
+            let document = Expr::RowCopy(projected.schema().fields().to_vec());
+            let relation = Arc::new(projected.project(vec![named(3, "_iid", iid), named(4, "doc", document)]).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+            let mut baseline = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a columnar document projection");
+            let mut seen = 0;
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
+                let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow document"); };
+                let document = array.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+                assert_eq!(document.num_columns(), 2);
+                assert!(document.columns().iter().all(|column| column.as_any().is::<arrow_array::Int64Array>()));
+                let page = baseline.next_page().await.unwrap().unwrap();
+                assert_eq!(page.len(), batch.len);
+                for (row, expected) in page.rows().iter().enumerate() {
+                    let actual = batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>();
+                    assert_eq!(actual, expected.values);
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, 3);
+            assert!(baseline.next_page().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn columnar_outer_joins_preserve_null_keys_unmatched_positions_and_empty_inputs() {
         use rtdb_plan::{BinaryOp, JoinKind, Relation};
 

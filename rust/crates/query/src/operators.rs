@@ -65,10 +65,17 @@ fn build_batch_input(
 async fn build_batches_at(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
 ) -> Result<Option<(crate::columnar::BoxBatchCursor, bool)>> {
-    use crate::{columnar::BoxBatchCursor, sort::batches::BatchSort};
+    use crate::{columnar::{BoxBatchCursor, ColumnBatch, single_batch}, sort::batches::BatchSort};
 
     let relation = Arc::clone(runtime.relation());
     match relation.node() {
+        RelationNode::Values { rows } if output == BatchOutput::Arrow && ColumnBatch::supports_literal_rows(rows) => {
+            match ColumnBatch::from_literal_rows(rows, &execution.context) {
+                Ok(batch) => Ok(Some((single_batch(batch, execution.context), false))),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
         RelationNode::Scan(scan) if !crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none() => {
             let batches: crate::columnar::BoxBatchCursor = Box::new(crate::scan::ScanCursor::new(scan.clone(),execution.clone(),pushdowns).await?);
             let batches = match scan.predicates.iter().cloned().reduce(|left,right|Expr::binary(rtdb_plan::BinaryOp::And,left,right)) {
@@ -482,13 +489,21 @@ fn batch_ordered_type(ty: &LogicalType) -> bool {
 }
 
 fn allows_scalar_projection(child: &EmittedRelation, output: BatchOutput) -> bool {
-    output == BatchOutput::Arrow && matches!(child.relation().node(), RelationNode::Scan(_))
+    if output != BatchOutput::Arrow { return false; }
+    let mut relation = child.relation().as_ref();
+    loop {
+        relation = match relation.node() {
+            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Extend { input, .. } => input,
+            node => return matches!(node, RelationNode::Scan(_) | RelationNode::Values { .. }),
+        };
+    }
 }
 
 fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
     Ok(match relation.node() {
         RelationNode::Scan(scan) => (!crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none()).then_some(false),
+        RelationNode::Values { rows } if output == BatchOutput::Arrow => crate::columnar::ColumnBatch::supports_literal_rows(rows).then_some(false),
         RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. } if output == BatchOutput::Arrow => Some(false),
         RelationNode::Filter { .. } => {
             let mut child = runtime.child(0)?;
