@@ -104,6 +104,7 @@ impl ServerDriver {
 
     async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
+        options.owned_relations = config.flight_sql.as_ref().is_some_and(|flight| flight.port >= 0 && flight.owned_native_actions);
         if let Some(placed) = &placed {
             options.membership = rtdb_node::Membership::Placed;
             options.replication.claim_wait = Some(placed.claim_wait);
@@ -165,7 +166,7 @@ impl ServerDriver {
                 let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                     transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
                     session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
-                    forwarded_peer: flight_peer, ..Default::default() };
+                    forwarded_peer: flight_peer, owned_native_actions: settings.owned_native_actions, ..Default::default() };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 addresses.flight_sql = Some(handle.address());
                 Some((handle, driver))

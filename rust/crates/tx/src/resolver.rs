@@ -179,8 +179,10 @@ impl TxResolver {
             .filter(|(time, previous)| !crate::system_time::advances(Some(previous.system_time.0), time.0));
         let ahead_of_log = request.options.system_time
             .filter(|time| invalid_time.is_none() && !crate::system_time::admits_client_time(self.previous_system_time(), time.0, log_time.0));
+        let has_owned_operations = request.operations.iter().any(Operation::is_owned);
         let behind_log = request.options.system_time.filter(|time| {
-            *time < log_time && request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time)
+            *time < log_time && (has_owned_operations
+                || request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time))
         });
         let key = TransactionKey {
             tx_id: TxId(position.0),
@@ -196,7 +198,11 @@ impl TxResolver {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
         };
-        let outcome = if let Some((requested, previous)) = invalid_time {
+        let outcome = if has_owned_operations
+            && !request.operations.iter().all(Operation::is_owned)
+        {
+            Err(Anomaly::incorrect("rtdb.owned/mixed-transaction", "Owned and ordinary writes require separate transactions"))
+        } else if let Some((requested, previous)) = invalid_time {
             Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("latest-completed-tx", tx_key_context(previous)?))
@@ -226,7 +232,7 @@ impl TxResolver {
             } else { (None, Ok(())) };
             for (index, operation) in request.operations.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
-                if let Err(error) = validate_document_operation(operation) {
+                if let Err(error) = validate_document_operation(operation, request.options.user.as_deref()) {
                     outcome = Err(error);
                     break;
                 }
@@ -482,6 +488,7 @@ impl<'a> OpenTransaction<'a> {
             },
             Mutation::CreateSearchIndex { name, table, columns, history, if_not_exists } => {
                 if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "A search index cannot cover another database's table")); }
+                if TableRef::owned_schema(&table.table.schema) { check_table(&table.table)?; }
                 check_search_index_name(&name)?;
                 if if_not_exists && self.index_exists("search_indexes", &name).await? { return Ok(()); }
                 let document = rtdb_types::StructFields::from([
@@ -600,6 +607,10 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
+                self.insert_owned(relation, documents, None, *valid_from, *valid_to).await,
+            Operation::OwnedInsertIids { relation, documents, iids, valid_from, valid_to } =>
+                self.insert_owned(relation, documents, Some(iids), *valid_from, *valid_to).await,
             Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Insert).await,
             Operation::InsertIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to, DocumentWrite::Insert).await,
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to, DocumentWrite::Put).await,
@@ -638,6 +649,23 @@ impl<'a> OpenTransaction<'a> {
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None, None).await
     }
+    async fn insert_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        let options = self.options;
+        let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let table = relation.table(owner);
+        if let Some(iids) = iids {
+            if iids.len() != documents.rows().len() {
+                return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
+            }
+            for (document, iid) in documents.rows().iter().zip(iids) {
+                if crate::source::document_id(document, &self.context.memory)?.iid() != *iid {
+                    return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
+                }
+            }
+        }
+        self.put_documents(&table, documents, iids, from, to, DocumentWrite::OwnedInsert { relation, owner }).await
+    }
+
     async fn require_absent(&self, table: &TableRef, iid: Iid, valid: Interval) -> Result<()> {
         use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 
@@ -658,16 +686,10 @@ impl<'a> OpenTransaction<'a> {
             iids: Some([iid].into()), predicates: Vec::new(), top_k: None, ordered_top_k: None, matches: Vec::new(),
         })?;
         let query = PreparedQuery::new_in(Arc::new(scan), &context.memory)?;
-        let mut cursor = query.execute(context, Vec::new()).await?;
-        while let Some(batch) = cursor.next_batch().await? {
-            if batch.batch().num_rows() != 0 {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document"));
-            }
-        }
-        Ok(())
+        require_empty_insert(query.execute(context, Vec::new()).await?).await
     }
 
-    async fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, write: DocumentWrite) -> Result<()> {
+    async fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, write: DocumentWrite<'_>) -> Result<()> {
 
         if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
@@ -678,8 +700,18 @@ impl<'a> OpenTransaction<'a> {
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let valid_time = interval(row_from, row_to)?;
-            if matches!(write, DocumentWrite::Insert) {
-                self.require_absent(table, iid, valid_time).await?;
+            match write {
+                DocumentWrite::Put => (),
+                DocumentWrite::Insert => self.require_absent(table, iid, valid_time).await?,
+                DocumentWrite::OwnedInsert { relation, owner } => {
+                    let snapshot = self.snapshot()?;
+                    if snapshot.contains_table(table) {
+                        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                        if let Some(cursor) = rtdb_query::open_owned_point(context, owner, relation, iid, Some(valid_time), Some(&["_iid"])).await? {
+                            require_empty_insert(cursor).await?;
+                        }
+                    }
+                }
             }
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
             self.buffer.append_to(table, StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
@@ -805,8 +837,25 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
     drop(syntax);
     query.execute_columns(context, arguments.to_vec()).await
 }
-fn validate_document_operation(operation: &Operation) -> Result<()> {
+async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
+    while let Some(batch) = cursor.next_batch().await? {
+        if batch.batch().num_rows() != 0 {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document"));
+        }
+    }
+    Ok(())
+}
+
+fn no_owned_principal() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal")
+}
+
+fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Result<()> {
     let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
+    if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. }) | Operation::OwnedInsertIids { relation, documents, .. } = operation {
+        let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        return validate_document_columns(&relation.table(owner), documents.columns(), "insert", put_columns);
+    }
     let (table, columns, verb, permitted) = match operation {
         Operation::Public(TxOp::InsertDocs { table, documents, .. }) | Operation::InsertIids { table, documents, .. } =>
             (table, documents.columns(), "insert", put_columns),
@@ -819,6 +868,10 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
         _ => return Ok(()),
     };
     check_table(table)?;
+    validate_document_columns(table, columns, verb, permitted)
+}
+
+fn validate_document_columns(table: &TableRef, columns: &[String], verb: &str, permitted: &[&str]) -> Result<()> {
     let forbidden: Vec<_> = columns.iter().map(String::as_str)
         .filter(|name| name.starts_with('_') && !permitted.contains(name)).collect();
     if forbidden.is_empty() { return Ok(()); }
@@ -853,7 +906,7 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
     Interval::new(from, to)
 }
 #[derive(Clone, Copy)]
-enum DocumentWrite { Insert, Put }
+enum DocumentWrite<'a> { Insert, Put, OwnedInsert { relation: &'a rtdb_types::OwnedRelation, owner: &'a str } }
 
 #[derive(Clone, Copy)]
 enum MutationKind { Put, Delete, Erase }

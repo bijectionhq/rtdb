@@ -142,6 +142,49 @@ impl TableRef {
     pub fn schema_and_table(&self) -> String { format!("{}/{}", self.schema, self.table) }
 }
 
+const OWNED_SCHEMA_PREFIX: &str = "rtdb_owned_";
+const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
+
+/// A native relation provisioned in the authenticated principal's namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedRelation(String);
+
+impl OwnedRelation {
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        if name.is_empty() || name.len() > 96 || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')) {
+            return Err(Anomaly::incorrect("rtdb.owned/invalid-relation", "Owned relation must be a nonempty lower-case name of at most 96 bytes"));
+        }
+        Ok(Self(name))
+    }
+
+    pub fn name(&self) -> &str { &self.0 }
+
+    pub fn table(&self, owner: &str) -> TableRef {
+        let owner = Sha256::digest(owner.as_bytes());
+        let mut name = String::with_capacity(65 + self.0.len());
+        for byte in owner {
+            use fmt::Write;
+            write!(&mut name, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        name.push('-');
+        name.push_str(&self.0);
+        TableRef::new(OWNED_SCHEMA_V1, name)
+    }
+}
+
+impl TableRef {
+    pub fn owned_schema(schema: &str) -> bool { schema.starts_with(OWNED_SCHEMA_PREFIX) }
+
+    pub fn supported_owned_name(&self) -> bool {
+        self.schema == OWNED_SCHEMA_V1
+            && self.table.split_once('-').is_some_and(|(owner, name)| {
+                owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && OwnedRelation::new(name).is_ok()
+            })
+    }
+}
+
 impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}.{}", self.schema, self.table) }
 }

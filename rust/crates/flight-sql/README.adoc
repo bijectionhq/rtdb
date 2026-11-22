@@ -172,3 +172,31 @@ An empty message remains empty.
 Bounded anomaly metadata and custom commit-result errors omit an absent message field.
 Authentication uses its separate policy: faults hide their message, unsupported errors have no description when absent, and other absent messages use `authentication failed`.
 Raw host failures still require their source-specific conversion before entering these anomaly adapters.
+
+== Native owned relations
+
+`flightSql.ownedNativeActions: true` enables the owned-relation actions for a compatible installation.
+Both actions use the authenticated Flight session on an idle autocommit connection and require database write access.
+An embedded server enables `FlightConfig::owned_native_actions` and `NodeOptions::owned_relations`.
+
+Send `rtdb.owned.Create.v1` or `rtdb.owned.ReadPoint.v1` as the Flight `Action.type`.
+The body contains a big-endian unsigned 16-bit relation-name length, the logical relation name as ASCII bytes, and one terminated Arrow IPC stream containing exactly one nonempty record batch.
+The relation name contains 1–96 lowercase ASCII letters, digits, hyphens or underscores.
+The create batch contains unique column names, an `_id` column, and the document fields.
+Nullable `_valid_from` and `_valid_to` timestamp fields can supply row validity bounds.
+The point batch contains just one non-null `_id` cell.
+The connection's authenticated principal and attached database select the owned storage namespace.
+
+Success returns one Flight `Result` whose body is a terminated Arrow IPC stream.
+Create success contains one row with non-null signed 64-bit `tx_id` and `system_time_micros` fields.
+Point success contains the document columns and at most one row.
+Every point response Arrow schema contains `rtdb.owned.present_micros` as a signed decimal microsecond timestamp assigned by the store.
+A point result with no rows contains the schema and terminator, with zero record batches.
+An unknown relation uses a zero-field schema, and a missing entity in an existing relation uses its current schema.
+The Flight limit applies to the complete encoded Action and Result protobuf messages, with a default of 64 MiB.
+Failures use the Flight gRPC status and the existing anomaly metadata.
+
+Use `x-xtdb-database` for the initial Multi gateway connection and retain the resulting session cookie or bearer token.
+The gateway forwards these actions to the session's attached holder and fences that route at holder movement.
+A new holder requires a new authenticated session.
+A disconnected create has an unknown outcome and is not automatically retried.

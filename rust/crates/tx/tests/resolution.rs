@@ -322,6 +322,47 @@ async fn create_only_insert_checks_staged_intervals_and_replays_atomic_outcomes(
 }
 
 #[tokio::test]
+async fn owned_insert_owner_and_policy_survive_source_and_replica_decoding() {
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+    use rtdb_types::OwnedRelation;
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let relation = OwnedRelation::new("orders").unwrap();
+    let operation = TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: None,
+        valid_to: None,
+    };
+    let source = SourceTransaction::new(
+        vec![operation],
+        SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() },
+        &context.memory,
+    ).unwrap();
+    let bytes = source.encode().unwrap();
+    let message = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap();
+    let request = SourceTransaction::decode(&message, &context.memory).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let snapshot = state.snapshot();
+    let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(0), Timestamp(100), request, &context).await.unwrap();
+    assert!(resolved.result().committed());
+    let physical = relation.table("owner");
+    assert!(resolved.writes().tables().contains_key(&physical));
+    assert!(!resolved.writes().tables().contains_key(&relation.table("another-owner")));
+
+    let encoded = resolved.to_replica_body(&context.memory).unwrap();
+    let ReplicaBody::ResolvedTx(body) = encoded.body() else { panic!("expected resolved payload"); };
+    let decoded = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
+    assert!(decoded.writes.tables().contains_key(&physical));
+    let mut unknown = body.clone();
+    let data = unknown.table_data.remove(&physical.schema_and_table()).unwrap();
+    unknown.table_data.insert(format!("rtdb_owned_v2/{}", physical.table), data);
+    let error = decode_replica(&unknown, None, snapshot.block_index(), &context.memory).err().unwrap();
+    assert_eq!(error.code, "rtdb.tx/invalid-replica-transaction");
+}
+
+#[tokio::test]
 async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let captured = state.value().snapshot();

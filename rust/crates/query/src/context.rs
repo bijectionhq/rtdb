@@ -42,6 +42,7 @@ pub struct CatalogSnapshot {
     pub(crate) default_database: String,
     pub(crate) databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
+    owned_relation: Option<QualifiedTable>,
     pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
     pub(crate) ordered_indexes: Option<Arc<dyn OrderedIndexInventory>>,
     pub(crate) fragmenter: Option<Arc<dyn crate::fragment::ScanFragmenter>>,
@@ -57,7 +58,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
+        Ok(Self { default_database, databases, transaction_scoped, owned_relation: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
@@ -90,7 +91,15 @@ impl CatalogSnapshot {
         if crate::system_schema::definition(&table.name.table).is_some() && !table.columns.contains_key(&field.name) { LogicalType::Null }
         else { rtdb_columnar::execution_type(&field.data_type) }
     }
+    pub(crate) fn permits_table(&self, name: &QualifiedTable) -> bool {
+        match &self.owned_relation {
+            Some(admitted) => admitted == name,
+            None => !TableRef::owned_schema(&name.table.schema),
+        }
+    }
     fn binding(&self, database: &str, table: &TableRef) -> Result<Option<TableBinding>> {
+        let name = QualifiedTable { database: database.to_owned(), table: table.clone() };
+        if !self.permits_table(&name) { return Ok(None); }
         let snapshots = &self.database(database)?.partitions;
         if let Some(definition) = crate::system_schema::definition(table) { return Ok(Some(definition.binding(database))); }
         if !snapshots.iter().any(|snapshot| snapshot.contains_table(table)) { return Ok(None); }
@@ -106,7 +115,7 @@ impl CatalogSnapshot {
             let next = snapshot.column_types(table);
             columns = Some(match columns { Some(previous) => rtdb_index::merge_column_types(&previous, &next), None => next });
         }
-        Ok(Some(TableBinding { name: QualifiedTable { database: database.to_owned(), table: table.clone() }, oid, columns: columns.unwrap_or_default() }))
+        Ok(Some(TableBinding { name, oid, columns: columns.unwrap_or_default() }))
     }
 }
 
@@ -115,7 +124,14 @@ impl Catalog for CatalogSnapshot {
     fn databases(&self) -> BTreeSet<String> { self.databases.keys().cloned().collect() }
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> { self.binding(&name.database, &name.table) }
     fn tables(&self, database: &str) -> Result<Vec<TableBinding>> {
-        let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).collect();
+        if let Some(admitted) = &self.owned_relation {
+            return if admitted.database == database {
+                Ok(self.table(admitted)?.into_iter().collect())
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).filter(|table| !TableRef::owned_schema(&table.schema)).collect();
         let names: BTreeSet<_> = names.into_iter().chain(crate::system_schema::DEFINITIONS.iter().map(|definition| TableRef::new(definition.schema, definition.name))).collect();
         names.iter().map(|table| self.binding(database, table)?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))).collect()
     }
@@ -209,6 +225,15 @@ impl QueryContext {
 
     pub fn with_query_cpu(mut self: Arc<Self>, counter: Option<Arc<crate::QueryCpu>>) -> Arc<Self> {
         if let Some(counter) = counter { Arc::make_mut(&mut self).query_cpu = Some(counter); }
+        self
+    }
+
+    pub(crate) fn for_owned_relation(mut self: Arc<Self>, table: QualifiedTable) -> Arc<Self> {
+        let context = Arc::make_mut(&mut self);
+        context.catalog.owned_relation = Some(table);
+        context.catalog.runtime = None;
+        context.catalog.fragmenter = None;
+        context.accelerators = Default::default();
         self
     }
 
