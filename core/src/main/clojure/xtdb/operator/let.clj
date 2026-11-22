@@ -15,19 +15,22 @@
          :bound-relation ::lp/ra-expression
          :relation ::lp/ra-expression))
 
+(def ^:dynamic *spill-threshold-rows* 100000)
+
 (defmethod lp/emit-expr :let [{{:keys [binding-sym]} :opts, :keys [bound-relation relation]} emit-opts]
-  (let [{->bound-cursor :->cursor, :as emitted-bound-rel} (lp/emit-expr bound-relation emit-opts)
+  (let [{->bound-cursor :->cursor, bound-vec-types :vec-types, :as emitted-bound-rel} (lp/emit-expr bound-relation emit-opts)
         {->body-cursor :->cursor, body-vec-types :vec-types, :as emitted-body-rel} (lp/emit-expr relation (assoc-in emit-opts [:let-bindings binding-sym] emitted-bound-rel))]
     {:op :let
      :children [emitted-bound-rel emitted-body-rel]
      :vec-types body-vec-types
      :stats (:stats emitted-body-rel)
-     :->cursor (fn [{:keys [allocator explain-analyze? tracer query-span] :as opts}]
-                 (cond-> (util/with-close-on-catch [bound-cursor (ICursor/wrapInterruptible (->bound-cursor opts))
-                                                    factory (LetCursorFactory. allocator bound-cursor)
-                                                    body-cursor (->body-cursor (assoc-in opts [:let-bindings binding-sym] factory))]
-                           (.wrapBodyCursor factory body-cursor))
-                   (or explain-analyze? (and tracer query-span)) (ICursor/wrapTracing tracer query-span)))}))
+     :->cursor (fn [opts]
+                 (lp/with-tracing :let opts
+                   (fn [{:keys [allocator] :as opts}]
+                     (util/with-close-on-catch [bound-cursor (ICursor/wrapInterruptible (->bound-cursor opts))
+                                                factory (LetCursorFactory. allocator bound-cursor (update-keys bound-vec-types str) *spill-threshold-rows*)
+                                                body-cursor (->body-cursor (assoc-in opts [:let-bindings binding-sym] factory))]
+                       (.wrapBodyCursor factory body-cursor)))))}))
 
 (s/def ::cte-id simple-symbol?)
 (s/def ::col-names (s/coll-of ::lp/column :kind vector?))
@@ -49,7 +52,7 @@
      :children []
      :vec-types vec-types
      :stats stats
-     :->cursor (fn [{:keys [explain-analyze? tracer query-span] :as opts}]
+     :->cursor (fn [opts]
                  (let [^ICursor$Factory cursor-factory (or (get-in opts [:let-bindings cte-id])
                                                            (let [available (set (keys (:let-bindings opts)))]
                                                              (throw (err/fault ::missing-relation
@@ -58,5 +61,6 @@
                                                                                {:cte-id cte-id
                                                                                 :available available}))))]
 
-                   (cond-> (.open cursor-factory)
-                     (or explain-analyze? (and tracer query-span)) (ICursor/wrapTracing tracer query-span))))}))
+                   (lp/with-tracing :relation opts
+                     (fn [_]
+                       (.open cursor-factory)))))}))

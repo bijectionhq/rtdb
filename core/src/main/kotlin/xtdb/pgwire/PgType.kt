@@ -198,9 +198,9 @@ sealed class PgType(
         override fun readText(data: ByteArray): Long = readUtf8(data).toLong()
 
         override fun writeBinary(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray =
-            ByteBuffer.allocate(typlen).putLong(rdr.getLong(idx)).array()
+            ByteBuffer.allocate(typlen).putLong(rdr.getAsLong(idx)).array()
 
-        override fun writeText(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray = utf8(rdr.getLong(idx))
+        override fun writeText(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray = utf8(rdr.getAsLong(idx))
     }
 
     data object Int4 : PgType(
@@ -275,9 +275,9 @@ sealed class PgType(
         override fun readText(data: ByteArray): Double = readUtf8(data).toDouble()
 
         override fun writeBinary(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray =
-            ByteBuffer.allocate(typlen).putDouble(rdr.getDouble(idx)).array()
+            ByteBuffer.allocate(typlen).putDouble(rdr.getAsDouble(idx)).array()
 
-        override fun writeText(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray = utf8(rdr.getDouble(idx))
+        override fun writeText(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray = utf8(rdr.getAsDouble(idx))
     }
 
     data object Bool : PgType(
@@ -456,7 +456,8 @@ sealed class PgType(
         override fun readText(data: ByteArray): LocalDate = LocalDate.parse(readUtf8(data))
 
         override fun writeBinary(env: PgSessionEnv, rdr: VectorReader, idx: Int): ByteArray {
-            val days = rdr.getInt(idx) - UNIX_PG_EPOCH_DIFF_DAYS
+            val date = rdr.getObject(idx) as LocalDate
+            val days = Math.toIntExact(date.toEpochDay() - UNIX_PG_EPOCH_DIFF_DAYS)
             return ByteBuffer.allocate(4).putInt(days).array()
         }
 

@@ -19,7 +19,10 @@ export default defineConfig({
                 default: '103',
                 dark: '200'
             },
-            sketch: true
+            sketch: true,
+            experimental: {
+                useD2js: true
+            }
         }),
 
         starlight({
@@ -116,6 +119,7 @@ export default defineConfig({
                         'about/txs-in-xtdb',
                         'about/time-in-xtdb',
                         'about/types-in-xtdb',
+                        'about/data-modeling-in-xtdb',
                         { label: 'Community', link: '/intro/community'}
                     ]
                 },
