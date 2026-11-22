@@ -93,7 +93,7 @@ fn owned_count_condition<'a>(call: &Call, body: &'a [u8]) -> Result<(TxOp, &'a [
     let (prefix, body) = count_component(body, 4096)?;
     let (maximum, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing owned count maximum"))?;
     let at_most = i64::from_be_bytes(*maximum);
-    if at_most < 0 || column.starts_with('_') {
+    if at_most < 0 || column.is_empty() || column.starts_with('_') {
         return Err(invalid("Invalid owned count maximum or column"));
     }
     let reservation = call.reserve(prefix.len() + column.len() + 1024)?;
@@ -398,7 +398,7 @@ fn owned_rank_scope(domain: &[u8], frame: &[u8], query: &str) -> String {
 fn count_component(body: &[u8], maximum: usize) -> Result<(&[u8], &[u8]), Status> {
     let (length, body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing owned count component length"))?;
     let length = usize::from(u16::from_be_bytes(*length));
-    if !(1..=maximum).contains(&length) {
+    if length > maximum {
         return Err(invalid("Owned count component exceeds its bound"));
     }
     body.split_at_checked(length).ok_or_else(|| invalid("Incomplete owned count component"))

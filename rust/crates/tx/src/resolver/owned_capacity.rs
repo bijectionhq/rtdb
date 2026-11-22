@@ -57,7 +57,7 @@ impl CapacityRule {
     }
 
     fn bucket<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
-        if !(1..=MAX_KEY_BYTES).contains(&key.len()) {
+        if key.len() > MAX_KEY_BYTES {
             return None;
         }
         key.get(..self.prefix_bytes.map_or(key.len(), NonZeroUsize::get))
