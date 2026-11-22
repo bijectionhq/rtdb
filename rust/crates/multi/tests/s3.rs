@@ -103,6 +103,7 @@ async fn exercise_cell(storage: CellStorage) {
     let parent = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     eprintln!("S3 phase: fork parent");
     let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    prove_rejected_fork_disposal(&cell, &child).await;
     let copied = rtdb_multi::reference::stores(bucket.as_ref(), &child.storage_prefix()).await.unwrap();
     for store in &copied {
         assert!(rtdb_multi::reference::physical_objects(bucket.as_ref(), store).await.unwrap().is_empty(), "a fork on S3 references its parent's objects rather than copying them");
@@ -145,6 +146,46 @@ async fn exercise_cell(storage: CellStorage) {
     }
     eprintln!("S3 phase: stop cell");
     cell.stop().await;
+}
+
+async fn prove_rejected_fork_disposal(cell: &Cell, published: &rtdb_directory::DeploymentRecord) {
+    use rtdb_directory::{DeletionObservation, Lifecycle, ServingInventory, now_ms};
+    use rtdb_multi::keys::KeyService;
+    use rtdb_storage::{IoRegion, ObjectKey};
+
+    let directory = cell.directory.as_ref();
+    let storage = cell.storage();
+    let keys = cell.keys();
+    assert_eq!(admin::fork(directory, &storage, &keys, "shop", &published.name, &control()).await.unwrap_err().code, "rtdb.directory/exists");
+    let rejected = directory.deployments().await.unwrap().into_iter().find(|record| {
+        record.name == published.name && record.hosted_fork_stage.is_some()
+    }).unwrap();
+    let id = &rejected.id;
+    let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+    let prefix = ObjectKey::new(rejected.storage_prefix()).unwrap();
+    assert_eq!(rejected.lifecycle, Lifecycle::Deleting);
+    assert!(!bucket.list(Some(&prefix)).await.unwrap().is_empty());
+    assert!(keys.existing_key(&rejected.key_id()).await.unwrap().is_some());
+    assert_eq!(directory.deployment_by_name(&published.name).await.unwrap().unwrap().id, published.id);
+
+    let finish = || admin::finish_disposal(directory, &storage, &keys, id, 4 << 20);
+    let replace_observation = |observation| async move {
+        let mut current = directory.deployment(id).await.unwrap().unwrap();
+        current.deletion_observation = Some(observation);
+        let version = current.version;
+        assert!(directory.replace_deployment(current, version).await.unwrap().applied().is_some());
+    };
+    assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/storage-lease-active");
+    replace_observation(DeletionObservation::Fenced { leases_expire_at_ms: 0 }).await;
+    assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/deletion-verification-pending");
+    let age = (rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).as_millis() as i64;
+    replace_observation(DeletionObservation::Empty { observed_at_ms: now_ms() - age }).await;
+    let receipt = finish().await.unwrap();
+    assert_eq!(receipt.deployment, *id);
+    assert_eq!(receipt.serving_inventory, ServingInventory::S3VersionsAndUploads);
+    assert!(bucket.list(Some(&prefix)).await.unwrap().is_empty());
+    assert_eq!(keys.existing_key(&rejected.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");
+    assert_eq!(directory.deployment_by_name(&published.name).await.unwrap().unwrap().id, published.id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

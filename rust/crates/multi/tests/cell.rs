@@ -151,6 +151,9 @@ impl ObservedDirectory {
 #[async_trait::async_trait]
 impl Directory for ObservedDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
+    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: rtdb_directory::ForkPreparation) -> Result<DeploymentRecord> {
+        self.inner.stage_hosted_fork(child, preparation).await
+    }
     async fn publish_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version, preparation: Option<rtdb_directory::ForkPublication>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected, preparation).await }
     async fn lineage_state(&self, lineage: &str) -> Result<rtdb_directory::LineageState> { self.inner.lineage_state(lineage).await }
     async fn change_lineage(&self, lineage: &str, change: rtdb_directory::LineageChange) -> Result<rtdb_directory::LineageState> { self.inner.change_lineage(lineage, change).await }

@@ -1402,6 +1402,15 @@ pub async fn run_reaper(
                     }
                     drop(maintenance);
                     if let Some(keys) = keys.as_deref() {
+                        if matches!(storage, CellStorage::S3 { .. }) {
+                            for record in &deployments {
+                                match cancellation.run_until_cancelled(crate::admin::close_abandoned_hosted_fork(directory.as_ref(), record)).await {
+                                    None => return,
+                                    Some(Err(error)) => eprintln!("Hosted fork {} is retained: {}", record.id, error.code),
+                                    Some(Ok(())) => {},
+                                }
+                            }
+                        }
                         for record in &deployments {
                             for (&capture, release) in &record.checkpoint_capture_retirements {
                                 if release.observed_empty_at_ms.is_some() { continue; }

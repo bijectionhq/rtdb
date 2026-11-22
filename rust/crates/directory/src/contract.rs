@@ -73,6 +73,7 @@ pub async fn run(directory: &dyn Directory) {
     let fake = DeploymentRecord::new(&reserved, &applied.org, vec![], 0);
     assert_eq!(directory.create_deployment(fake).await.unwrap_err().code, "rtdb.directory/name");
     assert!(directory.deployment_by_name(&reserved).await.unwrap().is_none());
+    hosted_fork_staging(directory, &applied, &name).await;
 
     let mut moved = DeploymentRecord::new(format!("{name}-moved"), &applied.org, vec![], 0);
     moved.incarnation = 2;
@@ -146,6 +147,50 @@ pub async fn run(directory: &dyn Directory) {
 
     let missing = DeploymentRecord::new(format!("missing-{suffix}"), "acme", vec![], 0);
     assert!(matches!(directory.replace_deployment(missing, 1).await.unwrap(), Cas::Conflict(None)), "replacing an absent record conflicts");
+}
+
+async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecord, name: &str) {
+    let mut child = DeploymentRecord::new(format!("{name}-hosted"), &parent.org, vec![], 0);
+    child.parent = Some(parent.id.clone());
+    child.lineage.clone_from(&parent.lineage);
+    child.storage_namespaces = parent.storage_namespaces;
+    let mut rejected = child.clone();
+    rejected.id = uuid::Uuid::new_v4().to_string();
+    let lineage = directory.lineage_state(&parent.lineage).await.unwrap();
+    let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation: lineage.retirement_generation() };
+    let abandoned = ForkPreparation { token: uuid::Uuid::new_v4(), ..preparation };
+    let publication = |preparation| Some(ForkPublication::Hosted(preparation));
+    for preparation in [preparation, abandoned] {
+        directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
+    }
+    assert_eq!(directory.publish_fork(child.clone(), parent.version, publication(preparation)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
+    let staged = directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
+    let abandoned_stage = directory.stage_hosted_fork(rejected.clone(), abandoned).await.unwrap();
+    assert_eq!(directory.deployment(&staged.id).await.unwrap().as_ref(), Some(&staged));
+    assert!(directory.deployment_by_name(&staged.name).await.unwrap().is_none());
+    assert_eq!(directory.create_deployment(child.clone()).await.unwrap_err().code, "rtdb.directory/exists");
+    assert_eq!(directory.replace_deployment(child.clone(), staged.version).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
+    let mut altered = child.clone();
+    altered.incarnation += 1;
+    assert_eq!(directory.publish_fork(altered, parent.version, publication(preparation)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
+
+    let published = directory.publish_fork(child, parent.version, publication(preparation)).await.unwrap();
+    assert_eq!(published.version, staged.version + 1);
+    assert_eq!(published.hosted_fork_stage, None);
+    assert_eq!(directory.deployment_by_name(&published.name).await.unwrap(), Some(published.clone()));
+    let mut stale_close = staged.clone();
+    stale_close.lifecycle = Lifecycle::Deleting;
+    stale_close.epoch += 1;
+    assert_eq!(directory.replace_deployment(stale_close, staged.version).await.unwrap(), Cas::Conflict(Some(published.clone())));
+    assert_eq!(directory.publish_fork(rejected.clone(), parent.version, publication(abandoned)).await.unwrap_err().code, "rtdb.directory/exists");
+    let mut closed = abandoned_stage.clone();
+    closed.epoch += 1;
+    closed.lifecycle = Lifecycle::Deleting;
+    let closed = directory.replace_deployment(closed, abandoned_stage.version).await.unwrap().applied().unwrap();
+    assert_eq!(directory.publish_fork(rejected, parent.version, publication(abandoned)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
+    assert_eq!(directory.deployment_by_name(&closed.name).await.unwrap(), Some(published));
+    directory.change_lineage(&parent.lineage, LineageChange::ReleaseFork { preparation: abandoned }).await.unwrap();
+    assert_eq!(directory.shared_reference_revision(&parent.lineage).await.unwrap(), lineage.reference_revision() + 1);
 }
 
 async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, name: &str) {

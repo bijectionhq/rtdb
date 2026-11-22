@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, Version};
+use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPreparation, ForkPublication, ReferenceDisposal, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, Version};
 
 /// A longer line closes the connection rather than growing the buffer without bound.
 const MAX_LINE: u64 = 64 << 20;
@@ -28,6 +28,7 @@ const MAX_LINE: u64 = 64 << 20;
 #[serde(rename_all = "snake_case")]
 enum Op {
     CreateDeployment { record: DeploymentRecord },
+    StageHostedFork { child: DeploymentRecord, preparation: ForkPreparation },
     CreateFork { child: DeploymentRecord, expected_parent: Version, #[serde(default)] preparation: Option<ForkPublication> },
     SharedReferenceRevision { lineage: String },
     LineageState { lineage: String },
@@ -101,6 +102,7 @@ struct Response { id: u64, result: std::result::Result<Reply, Anomaly> }
 async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
     Ok(match op {
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
+        Op::StageHostedFork { child, preparation } => Reply::Deployment(directory.stage_hosted_fork(child, preparation).await?),
         Op::CreateFork { child, expected_parent, preparation } => Reply::Deployment(directory.publish_fork(child, expected_parent, preparation).await?),
         Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
         Op::LineageState { lineage } => Reply::LineageState(directory.lineage_state(&lineage).await?),
@@ -436,6 +438,9 @@ fn protocol(reply: Reply) -> Anomaly {
 impl Directory for RemoteDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         match self.call(Op::CreateDeployment { record }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
+    }
+    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
+        match self.call(Op::StageHostedFork { child, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
     async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         match self.call(Op::CreateFork { child, expected_parent, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }

@@ -574,6 +574,10 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access
         child.replica_journals.extend(servers.iter().cloned());
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
+    let stage = match preparation {
+        ForkPublication::Hosted(preparation) => Some(directory.stage_hosted_fork(child.clone(), preparation).await?),
+        _ => None,
+    };
     let prepared = async {
         let key = if same_organisation {
             crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
@@ -602,13 +606,17 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access
         Ok(stored) => Ok(stored),
         Err(ForkPublicationError::Uncertain(error)) => Err(error),
         Err(ForkPublicationError::Rejected(error)) => {
-            let cleanup = async {
-                let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
-                let bucket = storage.bucket(Arc::clone(&io)).await?;
-                let result = discard_fork(bucket.as_ref(), keys, &child, child_stream.as_ref()).await;
-                io.close_and_wait().await;
-                result
-            }.await;
+            let cleanup = if let Some(stage) = stage {
+                close_hosted_fork(directory, stage).await
+            } else {
+                async {
+                    let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
+                    let bucket = storage.bucket(Arc::clone(&io)).await?;
+                    let result = discard_local_fork(bucket.as_ref(), keys, &child, child_stream.as_ref()).await;
+                    io.close_and_wait().await;
+                    result
+                }.await
+            };
             if let Err(cleanup) = cleanup {
                 eprintln!("RTDB fork cleanup failed for {}: {cleanup}", child.id);
             }
@@ -629,18 +637,37 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
         match directory.publish_fork(child.clone(), current.version, Some(preparation)).await {
             Ok(stored) => return Ok(stored),
             Err(error) if error.code == "rtdb.directory/fork-parent-changed" => continue,
-            Err(error) if error.code == "rtdb.directory/lineage-changed" => return Err(ForkPublicationError::Rejected(error)),
             Err(error) => {
                 // Once the write is sent, a transport failure can hide successful publication.
                 match directory.deployment(&child.id).await {
-                    Ok(Some(stored)) if stored.parent == child.parent && stored.name == child.name => return Ok(stored),
-                    Ok(None) if error.code == "rtdb.directory/exists" => return Err(ForkPublicationError::Rejected(error)),
+                    Ok(Some(stored)) if stored.parent == child.parent && stored.name == child.name && stored.hosted_fork_stage.is_none() => return Ok(stored),
+                    Ok(_) if matches!(error.code.as_str(), "rtdb.directory/exists" | "rtdb.directory/lineage-changed" | "rtdb.directory/fork-stage-changed") => {
+                        return Err(ForkPublicationError::Rejected(error));
+                    }
                     _ => return Err(ForkPublicationError::Uncertain(error)),
                 }
             }
         }
     }
     Err(ForkPublicationError::Rejected(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/update-contended", format!("{} kept changing while its fork was published", source.name))))
+}
+
+async fn close_hosted_fork(directory: &dyn Directory, mut stage: DeploymentRecord) -> Result<()> {
+    let version = stage.version;
+    stage.lifecycle = Lifecycle::Deleting;
+    stage.epoch = stage.epoch.checked_add(1).ok_or_else(|| {
+        Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", stage.id))
+    })?;
+    directory.replace_deployment(stage, version).await?;
+    Ok(())
+}
+
+pub(crate) async fn close_abandoned_hosted_fork(directory: &dyn Directory, record: &DeploymentRecord) -> Result<()> {
+    let Some(stage) = &record.hosted_fork_stage else { return Ok(()); };
+    if record.lifecycle != Lifecycle::Restoring { return Ok(()); }
+    let lineage = crate::store::recover_hosted_lineage(directory, &stage.source_lineage).await?;
+    if lineage.preparations().any(|(preparation, _)| preparation == stage.preparation) { return Ok(()); }
+    close_hosted_fork(directory, record.clone()).await
 }
 
 pub(crate) struct ResidenceErasure<'a>(ErasureAuthority<'a>);
@@ -659,7 +686,7 @@ impl ResidenceErasure<'_> {
     }
 }
 
-async fn discard_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
+async fn discard_local_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn KeyService, child: &DeploymentRecord, stream: Option<&StreamConfig>) -> Result<()> {
     let key_removed = keys.destroy(&child.key_id()).await;
     let erase_objects = async {
         let prefix = child.storage_prefix();
@@ -1504,7 +1531,7 @@ async fn finish_disposal_with_lock(
     if let Some(deadline) = wait_until.filter(|&deadline| now_ms() < deadline) {
         return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/storage-lease-active", format!("The storage write lease expires at Unix milliseconds {deadline}")));
     }
-    let mut stream = if fenced.moved_at_ms.is_some() {
+    let mut stream = if fenced.moved_at_ms.is_some() || fenced.hosted_fork_stage.is_some() {
         StreamConfig {
             write_quorum: write_quorum(fenced.replica_journals.len()),
             servers: Vec::new(),
@@ -2218,6 +2245,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hosted_fork_survives_restart_until_its_preparation_has_drained() {
+        use rtdb_directory::{ForkPreparation, LineageChange};
+
+        let root = tempfile::tempdir().unwrap();
+        MemoryDirectory::initialize(root.path()).unwrap();
+        let directory = MemoryDirectory::open(root.path()).unwrap();
+        let parent = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let mut child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        child.parent = Some(parent.id.clone());
+        child.lineage.clone_from(&parent.lineage);
+        let preparation = ForkPreparation { token: uuid::Uuid::new_v4(), generation: 0 };
+        directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
+        let stage = directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
+        drop(directory);
+
+        let directory = MemoryDirectory::open(root.path()).unwrap();
+        let stage = directory.deployment(&stage.id).await.unwrap().unwrap();
+        super::close_abandoned_hosted_fork(directory.as_ref(), &stage).await.unwrap();
+        assert_eq!(directory.deployment(&stage.id).await.unwrap().as_ref(), Some(&stage));
+        directory.change_lineage(&parent.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
+        super::close_abandoned_hosted_fork(directory.as_ref(), &stage).await.unwrap();
+
+        let closed = directory.deployment(&stage.id).await.unwrap().unwrap();
+        assert_eq!(closed.lifecycle, Lifecycle::Deleting);
+        assert_eq!(closed.storage_prefix(), child.storage_prefix());
+        assert_eq!(closed.hosted_fork_stage, stage.hosted_fork_stage);
+        assert!(directory.deployment_by_name(&child.name).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn hosted_disposal_materializes_inherited_objects_before_provider_erasure() {
         use crate::reference::{fork, preserve_residence};
 
@@ -2391,7 +2448,7 @@ mod tests {
         assert!(matches!(stale, Err(super::ForkPublicationError::Rejected(ref error)) if error.code == "rtdb.directory/lineage-changed"),
             "a stale preparation cannot publish after disposal");
         assert!(directory.deployment_by_name(&staged.name).await.unwrap().is_none());
-        super::discard_fork(bucket.as_ref(), &keys, &staged, None).await.unwrap();
+        super::discard_local_fork(bucket.as_ref(), &keys, &staged, None).await.unwrap();
         assert!(matches!(bucket.get(&object).await, Err(rtdb_storage::Error::MissingObject(_))));
         let copied = ObjectKey::new(format!("{}/v06/rows", child.storage_prefix())).unwrap();
         assert_eq!(bucket.get(&copied).await.unwrap(), bytes);

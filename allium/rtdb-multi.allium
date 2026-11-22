@@ -1581,7 +1581,7 @@ rule ReapUnreachable {
     -- A local sweep reserves the lineage against its current shared-reference revision after draining local preparation.
     -- Local path erasure is internal to the admitted maintenance task.
     -- Whole-residence erasure uses the prefix admitted by the directory's disposal permit.
-    -- Cleanup of a definitively rejected fork uses the unpublished fork's own prefix.
+    -- Local cleanup of a definitively rejected fork uses the unpublished fork's own prefix.
     -- The reservation advances the preparation generation and holds until the sweep's provider work drains.
     -- The sweep scans published referrers after reserving the lineage and copies retained objects before removing the source copies.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.
@@ -2144,8 +2144,9 @@ rule Fork {
     -- The child, its name and the cell-local shared-reference revision publish atomically.
     -- A fork of a fork advances the same revision as the original lineage.
     -- A local fork acquires a preparation in the current lineage generation before reading storage and consumes it when the child publishes.
-    -- A remote fork observes the open lineage generation before reading storage.
-    -- The publication transaction requires that generation and an open lineage.
+    -- A hosted fork holds a preparation in the current lineage generation through provider I/O.
+    -- Its child identity and physical custody are recorded before it writes objects, keys or journals.
+    -- Publication checks the exact staged child and the current preparation.
     -- An intervening retirement therefore requires fresh preparation.
     -- Local preparation, publication and reclamation hold the same volume maintenance lock through their admitted provider work.
     when: ForkRequested(parent, basis, org)
@@ -2194,6 +2195,22 @@ rule ForkAcrossOrganisations {
     ensures:
         let child = CreateDeployment(org)
         CopiedAndReencrypted(from: ForkCheckpoint(parent, basis), to: child)
+}
+
+rule RecoverUnpublishedHostedFork {
+    -- A staged child reserves its identity and can acquire its serving name only during publication.
+    -- A holder's definitive rejection follows the drain of its preparation I/O.
+    -- A reaper can close an abandoned stage after the source preparation has been released.
+    -- Attested task stoppage can release an abandoned preparation.
+    -- The stage version orders reaper recovery against publication.
+    -- An unpublished stage contributes no references to the served lineage.
+    when: HostedForkCleanupRequested(stage)
+
+    requires: DefinitiveRejectionAfterDrain(stage) or SourcePreparationReleased(stage)
+
+    ensures:
+        if Directory.cas(stage.id, stage.version, change: { lifecycle: deleting, epoch: Next(stage.epoch) }):
+            DisposeStagedResidence(stage)
 }
 
 rule ForkReadsAreCapped {

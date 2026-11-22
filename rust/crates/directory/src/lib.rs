@@ -329,6 +329,8 @@ pub struct DeploymentRecord {
     /// A historical checkpoint staged under this fresh, held installation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_stage: Option<Box<CheckpointStage>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_fork_stage: Option<HostedForkStage>,
     /// Terminal same-history repair receipts survive later repairs and moves.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkpoint_repair_receipts: BTreeMap<uuid::Uuid, CheckpointRecovery>,
@@ -703,6 +705,12 @@ pub struct CheckpointStage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedForkStage {
+    pub source_lineage: String,
+    pub preparation: ForkPreparation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRecovery {
     pub operation: uuid::Uuid,
     pub checkpoint: Checkpoint,
@@ -718,7 +726,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
-            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_repair_receipts: BTreeMap::new(),
+            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(),
             checkpoint_captures: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
     }
 
@@ -815,6 +823,8 @@ impl<T> Cas<T> {
 pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
+    /// Reserves the child ID before hosted fork preparation can write its objects or logs.
+    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord>;
     /// Creates the child and its name with the parent version check and, for a shared fork, advances the lineage's reference revision in the same transaction.
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         self.publish_fork(child, expected_parent, None).await
@@ -899,6 +909,53 @@ fn shared_fork_lineage<'a>(child: &'a DeploymentRecord, parent: Option<&Deployme
     Ok(shared.then_some(child.lineage.as_str()))
 }
 
+fn fork_stage_changed() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/fork-stage-changed", "The hosted fork's staged residence has changed")
+}
+
+fn stage_hosted_fork_record(mut child: DeploymentRecord, parent: &DeploymentRecord, lineage: &LineageState,
+    preparation: ForkPreparation) -> Result<DeploymentRecord> {
+    shared_fork_lineage(&child, Some(parent), parent.version)?;
+    if child.lifecycle != Lifecycle::Live || child.holder.is_some() || child.hosted_fork_stage.is_some()
+        || child.checkpoint_stage.is_some() || child.incarnation != 1 || child.epoch > 1
+        || child.storage_namespaces != parent.storage_namespaces
+        || !lineage.preparations().any(|(held, owner)| held == preparation && matches!(owner, PreparationOwner::Hosted { .. }))
+    {
+        return Err(fork_stage_changed());
+    }
+    child.lifecycle = Lifecycle::Restoring;
+    child.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
+    Ok(child)
+}
+
+fn fork_stage_version(child: &DeploymentRecord, staged: Option<&DeploymentRecord>, parent: &DeploymentRecord,
+    preparation: Option<ForkPublication>) -> Result<Option<Version>> {
+    if child.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
+    let Some(ForkPublication::Hosted(preparation)) = preparation else { return Ok(None); };
+    let staged = staged.ok_or_else(fork_stage_changed)?;
+    let mut expected = child.clone();
+    expected.lifecycle = Lifecycle::Restoring;
+    expected.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
+    expected.version = staged.version;
+    if child.lifecycle != Lifecycle::Live || *staged != expected { return Err(fork_stage_changed()); }
+    Ok(Some(staged.version))
+}
+
+fn require_fork_stage_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
+    if current.hosted_fork_stage.is_none() && next.hosted_fork_stage.is_none() { return Ok(()); }
+    if current.hosted_fork_stage != next.hosted_fork_stage || next.holder.is_some()
+        || current.parent != next.parent || current.storage_prefix() != next.storage_prefix()
+        || current.storage_namespaces != next.storage_namespaces || current.replica_journals != next.replica_journals
+        || !matches!((current.lifecycle, next.lifecycle),
+            (Lifecycle::Restoring, Lifecycle::Restoring | Lifecycle::Deleting)
+            | (Lifecycle::Deleting, Lifecycle::Deleting | Lifecycle::Deleted)
+            | (Lifecycle::Deleted, Lifecycle::Deleted))
+    {
+        return Err(fork_stage_changed());
+    }
+    Ok(())
+}
+
 fn next_reference_revision(current: Version) -> Result<Version> {
     reference_revision::advance_revision(current).ok_or_else(|| {
         Anomaly::fault("rtdb.directory/reference-revision-exhausted", "The lineage has no remaining shared reference revisions")
@@ -970,6 +1027,7 @@ impl MemoryDirectory {
         let Some(current) = deployments.get_mut(&record.id) else { return Ok(Cas::Conflict(None)); };
         if current.version != expected { return Ok(Cas::Conflict(Some(current.as_ref().clone()))); }
         if current.name != record.name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
+        require_fork_stage_update(current, &record)?;
         if let Some(permit) = disposal {
             let references = reference_revisions.get(&permit.lineage).map(StoredLineage::state).unwrap_or_default();
             let next = references.finish_disposal(permit, current, &record)?;
@@ -993,16 +1051,17 @@ impl MemoryDirectory {
         Ok(Cas::Applied(record))
     }
 
-    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord, lineage: Option<(String, LineageState)>) -> Result<DeploymentRecord> {
+    fn insert_deployment(&self, state: &mut MemoryState, mut record: DeploymentRecord,
+        lineage: Option<(String, LineageState)>, stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        if state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
-        if state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
+        if stage_version.is_none() && state.deployments.contains_key(&record.id) { return Err(exists("Deployment", &record.id)); }
+        if record.hosted_fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         if let Some((lineage, next)) = lineage {
             let stored = next.legacy_revision().map_or_else(|| StoredLineage::Current(next), StoredLineage::Legacy);
             state.reference_revisions.insert(lineage, stored);
         }
-        record.version = 1;
-        state.names.insert(record.name.clone(), record.id.clone());
+        record.version = stage_version.unwrap_or(0) + 1;
+        if record.hosted_fork_stage.is_none() { state.names.insert(record.name.clone(), record.id.clone()); }
         if let Some(holder) = &record.holder {
             state.held.entry(holder.clone()).or_default().insert(record.id.clone());
         }
@@ -1016,19 +1075,28 @@ impl MemoryDirectory {
 #[async_trait]
 impl Directory for MemoryDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
+        if record.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
         let mut state = self.state()?;
-        self.insert_deployment(&mut state, record, None)
+        self.insert_deployment(&mut state, record, None, None)
+    }
+    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
+        let mut state = self.state()?;
+        let parent = state.deployments.get(fork_parent_id(&child)?).ok_or_else(fork_conflict)?;
+        let lineage = state.reference_revisions.get(&parent.lineage).map(StoredLineage::state).unwrap_or_default();
+        let stage = stage_hosted_fork_record(child, parent, &lineage, preparation)?;
+        self.insert_deployment(&mut state, stage, None, None)
     }
     async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
         let parent = state.deployments.get(fork_parent_id(&child)?).map(Box::as_ref).ok_or_else(fork_conflict)?;
         let shared = shared_fork_lineage(&child, Some(parent), expected_parent)?.is_some();
+        let stage_version = fork_stage_version(&child, state.deployments.get(&child.id).map(Box::as_ref), parent, preparation)?;
         let update = if shared || preparation.is_some() {
             let lineage = parent.lineage.clone();
             let current = state.reference_revisions.get(&lineage).map(StoredLineage::state).unwrap_or_default();
             Some((lineage, current.published(preparation, shared)?))
         } else { None };
-        self.insert_deployment(&mut state, child, update)
+        self.insert_deployment(&mut state, child, update, stage_version)
     }
     async fn lineage_state(&self, lineage: &str) -> Result<LineageState> {
         Ok(self.state()?.reference_revisions.get(lineage).map(StoredLineage::state).unwrap_or_default())

@@ -25,6 +25,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, HostedTask, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
 use crate::lineage::{disposal_changed, lineage_busy};
+use crate::{ForkPreparation, fork_stage_changed, fork_stage_version, require_fork_stage_update, stage_hosted_fork_record};
 
 mod parked;
 mod streams;
@@ -39,6 +40,7 @@ const EPOCH: &str = "epoch";
 const HOLDER: &str = "holder";
 const RECORD: &str = "record";
 const LINEAGE_VERSION: &str = "lineage_version";
+const HOSTED_FORK_STAGE: &str = "hosted_fork_stage";
 /// The index on the deployments table answering `deployments_held_by`; it projects only keys, since every hit is re-read strongly.
 pub const HOLDER_INDEX: &str = "holder";
 
@@ -178,12 +180,17 @@ impl DynamoDirectory {
     /// On a failed condition, returns the stored item, if there is one.
     async fn put_conditional(&self, table: &str, item: Item, expected: Version, name: Option<&str>) -> Result<std::result::Result<(), Option<Item>>> {
         let key = item.get(ID).cloned().ok_or_else(|| Anomaly::fault("rtdb.directory/item", "A directory item has no id"))?;
+        let staged = item.contains_key(HOSTED_FORK_STAGE);
         let mut request = self.client.put_item().table_name(table).set_item(Some(item))
             .expression_attribute_names("#v", VERSION)
             .expression_attribute_values(":expected", number(expected))
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
         request = match name {
-            Some(name) => request.condition_expression("#v = :expected AND #n = :name").expression_attribute_names("#n", NAME)
+            Some(name) => request.condition_expression(if staged {
+                "#v = :expected AND #n = :name AND attribute_exists(#stage)"
+            } else {
+                "#v = :expected AND #n = :name AND attribute_not_exists(#stage)"
+            }).expression_attribute_names("#n", NAME).expression_attribute_names("#stage", HOSTED_FORK_STAGE)
                 .expression_attribute_values(":name", AttributeValue::S(name.to_owned())),
             None => request.condition_expression("#v = :expected"),
         };
@@ -296,6 +303,7 @@ fn deployment_item(record: &DeploymentRecord, pack_parked: bool) -> Result<Item>
     ]);
     // Absent rather than null, so an unheld deployment is not in the sparse holder index at all.
     if let Some(holder) = &record.holder { item.insert(HOLDER.to_owned(), AttributeValue::S(holder.0.clone())); }
+    if record.hosted_fork_stage.is_some() { item.insert(HOSTED_FORK_STAGE.to_owned(), AttributeValue::Bool(true)); }
     Ok(item)
 }
 
@@ -308,11 +316,16 @@ fn member_item(record: &MemberRecord) -> Result<Item> {
 }
 
 impl DynamoDirectory {
-    async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>) -> Result<DeploymentRecord> {
+    async fn insert_deployment(&self, mut record: DeploymentRecord, fork: Vec<TransactWriteItem>,
+        stage_version: Option<Version>) -> Result<DeploymentRecord> {
         require_deployment_name(&record.name)?;
-        record.version = 1;
-        let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?))
-            .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).build().map_err(build_fault)?;
+        record.version = stage_version.unwrap_or(0) + 1;
+        let deployment = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&record, self.pack_parked_records)?));
+        let deployment = match stage_version {
+            Some(expected) => deployment.condition_expression("#v = :expected").expression_attribute_names("#v", VERSION)
+                .expression_attribute_values(":expected", number(expected)),
+            None => deployment.condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID),
+        }.build().map_err(build_fault)?;
         let name_item = Item::from([(NAME.to_owned(), AttributeValue::S(record.name.clone())), (ID.to_owned(), AttributeValue::S(record.id.clone()))]);
         let name = Put::builder().table_name(&self.tables.deployment_names).set_item(Some(name_item))
             .condition_expression("attribute_not_exists(#n)").expression_attribute_names("#n", NAME).build().map_err(build_fault)?;
@@ -326,7 +339,9 @@ impl DynamoDirectory {
                 let refused = |index: usize, reasons: &[aws_sdk_dynamodb::types::CancellationReason]| reasons.get(index).and_then(|reason| reason.code()) == Some("ConditionalCheckFailed");
                 if let Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled)) = error.as_service_error() {
                     let reasons = cancelled.cancellation_reasons();
-                    if refused(0, reasons) { return Err(exists("Deployment", &record.id)); }
+                    if refused(0, reasons) {
+                        return Err(if stage_version.is_some() { fork_stage_changed() } else { exists("Deployment", &record.id) });
+                    }
                     if refused(1, reasons) { return Err(exists("Deployment name", &record.name)); }
                     if refused(2, reasons) || refused(3, reasons)
                         || (publishing_fork && reasons.iter().any(|reason| reason.code() == Some("TransactionConflict")))
@@ -418,19 +433,39 @@ impl DynamoDirectory {
 #[async_trait]
 impl Directory for DynamoDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
-        self.insert_deployment(record, Vec::new()).await
+        if record.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
+        self.insert_deployment(record, Vec::new(), None).await
+    }
+
+    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
+        require_deployment_name(&child.name)?;
+        let parent = self.deployment(fork_parent_id(&child)?).await?.ok_or_else(fork_conflict)?;
+        for _ in 0..8 {
+            let (lineage, legacy) = self.read_lineage(&parent.lineage).await?;
+            let mut stage = stage_hosted_fork_record(child.clone(), &parent, &lineage, preparation)?;
+            stage.version = 1;
+            let insert = Put::builder().table_name(&self.tables.deployments).set_item(Some(deployment_item(&stage, self.pack_parked_records)?))
+                .condition_expression("attribute_not_exists(#id)").expression_attribute_names("#id", ID).build().map_err(build_fault)?;
+            let items = vec![TransactWriteItem::builder().put(insert).build(),
+                self.write_lineage(&parent.lineage, &lineage, lineage.version(), legacy)?];
+            if self.write_retirement(items).await? { return Ok(stage); }
+            if self.deployment(&child.id).await?.is_some() { return Err(exists("Deployment", &child.id)); }
+        }
+        Err(lineage_busy())
     }
 
     async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         let id = fork_parent_id(&child)?;
         let parent = self.deployment(id).await?.ok_or_else(fork_conflict)?;
         let shared = shared_fork_lineage(&child, Some(&parent), expected_parent)?.is_some();
+        let staged = if matches!(preparation, Some(ForkPublication::Hosted(_))) { self.deployment(&child.id).await? } else { None };
+        let stage_version = fork_stage_version(&child, staged.as_ref(), &parent, preparation)?;
         let mut checks = vec![self.require_deployment_version(id, expected_parent)?];
         if shared || preparation.is_some() {
             let (state, legacy) = self.read_lineage(&parent.lineage).await?;
             checks.push(self.write_lineage(&parent.lineage, &state.published(preparation, shared)?, state.version(), legacy)?);
         }
-        self.insert_deployment(child, checks).await
+        self.insert_deployment(child, checks, stage_version).await
     }
 
     async fn lineage_state(&self, lineage: &str) -> Result<LineageState> {
@@ -502,6 +537,7 @@ impl Directory for DynamoDirectory {
         if owner.version != expected {
             return Ok(Cas::Conflict(Some(owner)));
         }
+        require_fork_stage_update(&owner, &record)?;
         let (current, legacy) = self.read_lineage(&permit.lineage).await?;
         let next = current.finish_disposal(permit, &owner, &record)?;
         record.version = expected + 1;
@@ -560,6 +596,11 @@ impl Directory for DynamoDirectory {
     }
 
     async fn replace_deployment(&self, mut record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>> {
+        if record.hosted_fork_stage.is_some() {
+            let Some(current) = self.deployment(&record.id).await? else { return Ok(Cas::Conflict(None)); };
+            if current.version != expected { return Ok(Cas::Conflict(Some(current))); }
+            require_fork_stage_update(&current, &record)?;
+        }
         record.version = expected + 1;
         let name = record.name.clone();
         match self.put_conditional(&self.tables.deployments, deployment_item(&record, self.pack_parked_records)?, expected, Some(&name)).await? {
@@ -568,6 +609,7 @@ impl Directory for DynamoDirectory {
             Err(Some(current)) => {
                 let current = decode_deployment(&current)?;
                 if current.version == expected && current.name != name { return Err(Anomaly::incorrect("rtdb.directory/rename", "A deployment's name never changes")); }
+                if current.version == expected { require_fork_stage_update(&current, &record)?; }
                 Ok(Cas::Conflict(Some(current)))
             }
         }
@@ -656,7 +698,7 @@ mod tests {
         directory.create_fork(child("first"), parent.version).await.unwrap();
 
         let second = child("second");
-        let error = directory.insert_deployment(second.clone(), vec![stale]).await.expect_err("a stale reference revision cannot publish a child");
+        let error = directory.insert_deployment(second.clone(), vec![stale], None).await.expect_err("a stale reference revision cannot publish a child");
         assert_eq!(error.code, "rtdb.directory/fork-parent-changed");
         assert!(directory.deployment(&second.id).await.unwrap().is_none());
         assert!(directory.deployment_by_name(&second.name).await.unwrap().is_none());
