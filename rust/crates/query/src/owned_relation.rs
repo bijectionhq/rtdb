@@ -85,7 +85,7 @@ pub async fn open_owned_capacity_point(
     if owner.is_empty() {
         return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
     }
-    open_owned_table_point(context, relation.capacity_table(owner), id.iid(), Some(id), None, Some(columns)).await
+    open_owned_table_point(context, relation.capacity_table(owner), id.iid(), Some(id), None, Some(columns), false).await
 }
 
 pub async fn open_owned_relation_schema(
