@@ -534,6 +534,10 @@ The archive owner retires the previous physical pin after ordering.
 Mode 6 has the same hosted Root replacement framing and renews the original retained holder at its existing exact basis.
 The request supplies zero capture and suffix selectors, and the placed owner reuses the exact previously admitted archive.
 Renewal compares the original physical pin and refreshes its expiry without requiring the application head to still equal the retained basis.
+Mode 7 supplies a retained source handle, zero capture and suffix selectors, and a fresh world UUID used as its first physical pin.
+It creates one Root fact and independent custody of the source archive at the same transaction key.
+The source pin must retain its original registration and at least sixty seconds of standing beyond the ordered deadline.
+The original holder remains in place after the sibling order.
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 

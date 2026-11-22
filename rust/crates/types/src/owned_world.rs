@@ -213,9 +213,17 @@ impl OwnedWorld {
     }
 
     pub fn can_renew_to(&self, next: &Self) -> bool {
+        self.id == next.id && self.shares_retained_archive(next)
+    }
+
+    pub fn can_seed_sibling(&self, next: &Self) -> bool {
+        self.id != next.id && next.id == next.pin && self.shares_retained_archive(next)
+    }
+
+    fn shares_retained_archive(&self, next: &Self) -> bool {
         self.pin != next.pin && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
-            && self.id == next.id && self.capture == next.capture && self.suffix == next.suffix
+            && self.capture == next.capture && self.suffix == next.suffix
             && self.manifest == next.manifest && self.basis == next.basis
             && self.parent_publication == next.parent_publication && self.schemas == next.schemas
     }

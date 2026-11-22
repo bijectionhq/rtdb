@@ -943,12 +943,15 @@ fn schema_bytes(types: &[LogicalType]) -> Result<usize> {
     types.iter().try_fold(256usize, |bytes, ty| bytes.checked_add(rtdb_columnar::estimate_builder_bytes(ty, &[])?).ok_or_else(overflow))
 }
 
+pub const SIBLING_PIN_MARGIN_MICROS: i64 = 60_000_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnedForkRoot {
     None,
     Writes,
     WritesAdvance,
     WritesRenewal,
+    WritesSibling,
     Controls,
     ProposalControls,
     ProposalWrites,
@@ -969,7 +972,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     OwnedDeadline { until: Timestamp },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
-    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot },
+    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
     OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<rtdb_types::Iid>, delete_root: Option<rtdb_types::Iid> },
     OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64, local_frontier: Option<i64> },
