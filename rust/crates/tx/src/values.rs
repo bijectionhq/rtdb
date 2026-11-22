@@ -948,6 +948,7 @@ pub enum OwnedForkRoot {
     None,
     Writes,
     WritesAdvance,
+    WritesRenewal,
     Controls,
     ProposalControls,
     ProposalWrites,

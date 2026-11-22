@@ -220,7 +220,19 @@ pub(crate) async fn fork_checkpoint_world_selected(
     let authored_advance = fork.previous.is_some() && fork.cut.is_publication()
         && fork.root.as_ref().is_some_and(|root| root.publication.is_some())
         && matches!(fork.requested, rtdb_node::WorldClockRequest::Retained);
-    let (capture, suffix) = if capture.is_nil() {
+    let renewal = fork.cut.is_renewal();
+    let (capture, suffix) = if renewal {
+        let predecessor = fork.previous.ok_or_else(OwnedWorld::unavailable)?;
+        let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(predecessor.0))
+            .filter(|retained| retained.world.as_bytes() == &fork.world.0
+                && retained.owner == owner && retained.mode == WorldClockMode::Retained
+                && retained.until > now() && fork.cut.matches_basis(retained.basis))
+            .ok_or_else(OwnedWorld::unavailable)?;
+        if !capture.is_nil() || suffix.is_some() {
+            return Err(OwnedWorld::unavailable());
+        }
+        (retained.capture, retained.suffix)
+    } else if capture.is_nil() {
         if suffix.is_some() || fork.root.is_none() || (fork.previous.is_some() && !authored_advance)
             || !(matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
                 || (matches!(fork.requested, rtdb_node::WorldClockRequest::Proposal)
@@ -352,9 +364,15 @@ pub(crate) async fn fork_checkpoint_world_selected(
         if let Some(previous) = fork.previous {
             let previous = record.checkpoint_worlds.get(&Uuid::from_bytes(previous.0)).ok_or_else(OwnedWorld::unavailable)?;
             if previous.world != id || previous.owner != retained.owner
-                || (!authored_advance && previous.until != retained.until)
+                || (!authored_advance && !renewal && previous.until != retained.until)
                 || previous.mode != WorldClockMode::Retained || retained.mode != WorldClockMode::Retained
-                || previous.basis.system_time >= retained.basis.system_time || previous.basis.tx_id >= retained.basis.tx_id
+                || if renewal {
+                    previous.basis != retained.basis || previous.capture != retained.capture
+                        || previous.suffix != retained.suffix || previous.manifest_sha256 != retained.manifest_sha256
+                        || previous.schema_digest != retained.schema_digest
+                } else {
+                    previous.basis.system_time >= retained.basis.system_time || previous.basis.tx_id >= retained.basis.tx_id
+                }
             {
                 return Err(OwnedWorld::unavailable());
             }
