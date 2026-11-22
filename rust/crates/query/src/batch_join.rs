@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::Array;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{BinaryOp, Expr, JoinKind};
-use rtdb_types::{Result, Value};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_nullable_column};
 use crate::context::Execution;
@@ -14,7 +14,7 @@ use crate::invalid;
 use crate::join_key::JoinLayout;
 use crate::join_spill::{BlockWriter, Partitions, compatible_schema};
 use crate::join_storage::{HashIndex, combine_cell_hash, hash_values};
-use crate::operators::DeferredInput;
+use crate::operators::{BatchOutput, DeferredInput, build_batch_input};
 use crate::pages::{BoxPageCursor, OwnedPage, PageCursor};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
@@ -22,19 +22,71 @@ use crate::scalar_key::ScalarKey;
 
 /// For each equality, whether its first operand is the build side's key; `None` where the join needs the row join.
 pub(crate) fn key_order(layout: &JoinLayout) -> Option<Vec<bool>> {
-    if !layout.left.computes_no_keys() || !layout.right.computes_no_keys() || layout.comparisons.len() != layout.left.key_count() { return None; }
-    layout.comparisons.iter().map(|comparison| match comparison {
+    if !layout.left.supports_batch_keys() || !layout.right.supports_batch_keys() { return None; }
+    layout.comparisons.iter().take(layout.left.key_count()).map(|comparison| match comparison {
         Expr::Binary { op: BinaryOp::Eq, left, right } => match (left.as_ref(), right.as_ref()) {
             (Expr::Column { id: first, data_type: first_type }, Expr::Column { data_type: second_type, .. })
-                if rtdb_plan::validate_equality_types(first_type, second_type).is_ok() => Some(layout.left.original.get(*first).is_some()),
+                if rtdb_plan::validate_equality_types(first_type, second_type).is_ok() => Some(layout.left.schema.get(*first).is_some()),
             _ => None,
         },
         _ => None,
     }).collect()
 }
 
+#[derive(Clone, Copy)]
+enum ThetaOperand {
+    Build(usize),
+    Probe(usize),
+    Literal(Option<i128>),
+}
+
+pub(crate) struct ThetaTest { left: ThetaOperand, right: ThetaOperand, op: BinaryOp }
+
+pub(crate) fn theta_tests(layout: &JoinLayout) -> Option<Vec<ThetaTest>> {
+    fn integer(ty: &LogicalType) -> bool {
+        match ty {
+            LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) | LogicalType::Null => true,
+            LogicalType::Maybe(ty) => integer(ty),
+            _ => false,
+        }
+    }
+    fn operand(layout: &JoinLayout, expr: &Expr) -> Option<ThetaOperand> {
+        match expr {
+            Expr::Column { id, .. } => {
+                if let Some(position) = layout.left.schema.position(*id)
+                    && integer(&layout.left.schema.fields()[position].data_type) {
+                    Some(ThetaOperand::Build(position))
+                } else {
+                    let position = layout.right.schema.position(*id)?;
+                    integer(&layout.right.schema.fields()[position].data_type).then_some(ThetaOperand::Probe(position))
+                }
+            }
+            Expr::Literal(Value::Null) => Some(ThetaOperand::Literal(None)),
+            Expr::Literal(value) if integer(&value.logical_type()) =>
+                rtdb_expr::integer(value).map(|integer| ThetaOperand::Literal(Some(integer))),
+            _ => None,
+        }
+    }
+    fn tests(layout: &JoinLayout, expr: &Expr, output: &mut Vec<ThetaTest>) -> Option<()> {
+        let Expr::Binary { op, left, right } = expr else { return None; };
+        if *op == BinaryOp::And {
+            tests(layout, left, output)?;
+            tests(layout, right, output)?;
+            return Some(());
+        }
+        if !matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
+            return None;
+        }
+        output.push(ThetaTest { left: operand(layout, left)?, right: operand(layout, right)?, op: *op });
+        Some(())
+    }
+    let mut output = Vec::new();
+    for expr in layout.comparisons.iter().skip(layout.left.key_count()) { tests(layout, expr, &mut output)?; }
+    Some(output)
+}
+
 #[derive(Clone)]
-pub(crate) struct ProbeInput { pub runtime: Arc<EmittedRelation>, pub execution: Execution, pub pushdowns: Option<Arc<Pushdowns>> }
+pub(crate) struct ProbeInput { pub runtime: Arc<EmittedRelation>, pub execution: Execution, pub pushdowns: Option<Arc<Pushdowns>>, pub output: BatchOutput }
 
 enum State {
     Build { build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout },
@@ -133,7 +185,7 @@ pub(crate) struct BatchJoin { state: State, spec: Spec }
 /// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
 struct Spec {
     order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind,
-    projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, replay_build: Option<ProbeInput>, execution: Execution,
+    projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, replay_build: Option<ProbeInput>, theta: Vec<ThetaTest>, execution: Execution,
 }
 
 impl BatchJoin {
@@ -142,7 +194,7 @@ impl BatchJoin {
         let probe_keys = layout.right.key_positions().to_vec();
         let widths = [layout.left.original.len(), layout.right.original.len()];
         Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner,
-            projected, swapped: false, unswapped: None, validate_payloads: false, replay_build: None, execution } }
+            projected, swapped: false, unswapped: None, validate_payloads: false, replay_build: None, theta: Vec::new(), execution } }
     }
 }
 
@@ -154,6 +206,8 @@ impl BatchJoin {
     pub fn validating_payloads(mut self, validate: bool) -> Self { self.spec.validate_payloads = validate; self }
 
     pub fn with_kind(mut self, kind: JoinKind) -> Self { self.spec.kind = kind; self }
+
+    pub fn with_theta(mut self, theta: Vec<ThetaTest>) -> Self { self.spec.theta = theta; self }
 
     pub fn spilling_arrow(mut self, build: Option<ProbeInput>) -> Self { self.spec.replay_build = build; self }
 }
@@ -171,7 +225,8 @@ impl Spec {
         Ok(value)
     }
 
-    async fn build(&mut self, mut build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+    async fn build(&mut self, build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout) -> Result<State> {
+        let mut build = layout.left.project_batches(build, &self.execution);
         let memory = Arc::clone(&self.execution.context.memory);
         let threshold = self.execution.context.options.join_build_rows;
         let mut batches = Vec::new();
@@ -187,7 +242,7 @@ impl Spec {
             batches.push(batch);
             if i64::try_from(rows).map_or(true, |rows| rows > threshold) {
                 if let Some(replay_build) = self.replay_build.take()
-                    && compatible_schema(&layout.left.original) && compatible_schema(&layout.right.original) {
+                    && compatible_schema(&layout.left.schema) && compatible_schema(&layout.right.schema) {
                     let replay_probe = probe.clone();
                     match self.spill_arrow(batches, build, probe, &layout).await {
                         Ok(join) => return Ok(State::Disk { join, restart: Some((replay_build, replay_probe, layout)) }),
@@ -225,15 +280,19 @@ impl Spec {
         }
         let filters = filters.finish(&memory)?;
         let pushdowns = Pushdowns::merge(probe.pushdowns.as_ref(), filters, &memory)?;
-        let Some((probe_batches, probe_projected)) = crate::operators::build_batches(probe.runtime, probe.execution, pushdowns).await? else {
-            return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches"));
+        let probe_batches = match build_batch_input(Arc::clone(&probe.runtime), probe.execution.clone(), pushdowns.clone(), probe.output).await? {
+            Some((batches, projected)) if projected == self.projected => batches,
+            _ if probe.output == BatchOutput::Arrow => {
+                let pages = DeferredInput::new(probe.runtime, probe.execution, crate::inspection::Constraints::default(), pushdowns).open_pages(None).await?;
+                crate::columnar::batches_from_pages(pages, Arc::clone(&memory))
+            }
+            _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches")),
         };
-        if probe_projected != self.projected { return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's inputs disagree on date admission")); }
         if self.tracks_build() {
             let charge = memory.reserve(rows)?;
             table.unmatched = Some((vec![1; rows], charge));
         }
-        Ok(State::Probe { table, probe: probe_batches })
+        Ok(State::Probe { table, probe: layout.right.project_batches(probe_batches, &self.execution) })
     }
 
     fn table(&self, batches: Vec<ColumnBatch>, rows: usize, inventory: Arc<MemoryReservation>) -> Result<Table> {
@@ -296,7 +355,7 @@ impl Spec {
         &self, held: Vec<ColumnBatch>, mut rest: BoxBatchCursor, probe: ProbeInput, layout: &JoinLayout,
     ) -> Result<DiskJoin> {
         let context = &self.execution.context;
-        let mut build = BlockWriter::new(&layout.left.original, context)?;
+        let mut build = BlockWriter::new(&layout.left.schema, context)?;
         for batch in held { build.append(batch, context)?; }
         while let Some(batch) = rest.next_batch().await? {
             batch.validate_readable(context)?;
@@ -304,11 +363,12 @@ impl Spec {
         }
         drop(rest);
         let build = build.finish(context)?.shuffle(1, context, |batch, row| self.spill_hash(batch, row, &self.build_keys))?;
-        let Some((mut input, projected)) = crate::operators::build_batches(probe.runtime, probe.execution, probe.pushdowns).await? else {
+        let Some((input, projected)) = build_batch_input(probe.runtime, probe.execution, probe.pushdowns, probe.output).await? else {
             return Err(crate::join_spill::layout_error());
         };
         if projected != self.projected { return Err(crate::join_spill::layout_error()); }
-        let mut probe = BlockWriter::new(&layout.right.original, context)?;
+        let mut input = layout.right.project_batches(input, &self.execution);
+        let mut probe = BlockWriter::new(&layout.right.schema, context)?;
         while let Some(batch) = input.next_batch().await? {
             batch.validate_readable(context)?;
             probe.append(batch, context)?;
@@ -339,8 +399,10 @@ impl Spec {
         let rest: BoxPageCursor = Box::new(crate::columnar::BatchRows::new(rest, Arc::clone(memory)).admitting_dates(self.projected));
         let build: BoxPageCursor = Box::new(HeldThen { pages, rest });
         let probe = DeferredInput::new(probe.runtime, probe.execution, crate::inspection::Constraints::default(), probe.pushdowns);
+        let projected = !layout.left.computes_no_keys();
         let (layout, build_left) = match self.unswapped.take() { Some(unswapped) => (unswapped, false), None => (layout, true) };
-        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, build_left, self.kind, self.execution.clone())?)))
+        Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, build_left, self.kind, self.execution.clone())?
+            .with_projected_build(projected))))
     }
 
     fn probe_batch(&self, table: &mut Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
@@ -351,15 +413,26 @@ impl Spec {
             _ => {}
         }
         let mut matched = Matches { pairs: Vec::new(), probes: Vec::new(), charge: self.execution.context.memory.reserve(4096)? };
-        match &table.keys {
-            BuildKeys::Arrow => self.probe_arrow_keys(table, probe, &mut matched)?,
-            BuildKeys::Values { keys, kind } => self.probe_value_keys(table, probe, keys, *kind, &mut matched)?,
+        if self.theta.is_empty() {
+            match &table.keys {
+                BuildKeys::Arrow => self.probe_arrow_keys(table, probe, &mut matched)?,
+                BuildKeys::Values { keys, kind } => self.probe_value_keys(table, probe, keys, *kind, &mut matched)?,
+            }
+        } else {
+            let equality = self.execution.scope()?;
+            for row in 0..probe.len {
+                self.execution.context.check_cancelled_at(row)?;
+                self.matching_build_rows(table, probe, row, &equality, |build| {
+                    matched.push(table, build, row)?;
+                    Ok(ControlFlow::Continue(()))
+                })?;
+            }
         }
         let Matches { pairs, probes, charge: matches } = matched;
         if pairs.is_empty() { return Ok(None); }
         let memory = &self.execution.context.memory;
-        let build_width = table.batches.first().map_or(0, |batch| batch.columns.len());
-        let width = build_width.checked_add(probe.columns.len()).ok_or_else(size_error)?;
+        let [build_width, probe_width] = self.widths;
+        let width = build_width.checked_add(probe_width).ok_or_else(size_error)?;
         let bound = width.checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
         let mut reservation = memory.reserve(bound)?;
         let mut columns = Vec::with_capacity(width);
@@ -372,9 +445,9 @@ impl Spec {
             }
             Ok(())
         };
-        if self.swapped { append(std::slice::from_ref(probe), &probes, probe.columns.len())?; }
+        if self.swapped { append(std::slice::from_ref(probe), &probes, probe_width)?; }
         append(&table.batches, &pairs, build_width)?;
-        if !self.swapped { append(std::slice::from_ref(probe), &probes, probe.columns.len())?; }
+        if !self.swapped { append(std::slice::from_ref(probe), &probes, probe_width)?; }
         drop(matches);
         ColumnBatch::settled(columns, pairs.len(), reservation).map(Some)
     }
@@ -383,7 +456,7 @@ impl Spec {
         let context = &self.execution.context;
         let memory = &context.memory;
         let bytes = probe.len.checked_mul(std::mem::size_of::<(usize, usize)>())
-            .and_then(|bytes| bytes.checked_add(probe.columns.len().checked_mul(std::mem::size_of::<usize>())?))
+            .and_then(|bytes| bytes.checked_add(self.widths[1].checked_mul(std::mem::size_of::<usize>())?))
             .ok_or_else(size_error)?;
         let _selection = memory.reserve(bytes)?;
         let mut selected = Vec::with_capacity(probe.len);
@@ -394,7 +467,7 @@ impl Spec {
             if matched == (self.kind == JoinKind::Semi) { selected.push((0, row)); }
         }
         if selected.is_empty() { return Ok(None); }
-        let columns = (0..probe.columns.len()).collect::<Vec<_>>();
+        let columns = (0..self.widths[1]).collect::<Vec<_>>();
         ColumnBatch::take_rows(&[probe], &selected, &columns, memory).map(Some)
     }
 
@@ -439,12 +512,46 @@ impl Spec {
                     BuildKeys::Values { keys, .. } => self.equal_values(&keys[ordinal * width..(ordinal + 1) * width], key, equality)?,
                 }
             };
-            if equal {
+            if equal && self.matches_theta(build, offset, probe, row)? {
                 matched = true;
                 if accept(ordinal)?.is_break() { break; }
             }
         }
         Ok(matched)
+    }
+
+    fn matches_theta(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Result<bool> {
+        let read = |operand| -> Result<Option<i128>> {
+            let (column, row) = match operand {
+                ThetaOperand::Literal(value) => return Ok(value),
+                ThetaOperand::Build(position) => (&build.columns[position], build_row),
+                ThetaOperand::Probe(position) => (&probe.columns[position], probe_row),
+            };
+            match ScalarKey::read(column, row) {
+                Some(ScalarKey::Signed(value)) => Ok(Some(i128::from(value))),
+                Some(ScalarKey::Null) => Ok(None),
+                _ => {
+                    let _scratch = self.execution.context.memory.reserve(column.bound(row)?)?;
+                    let value = self.cell(column, row)?;
+                    if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
+                    rtdb_expr::integer(&value).map(Some).ok_or_else(|| invalid("join-key", "Expected an integer comparison operand"))
+                }
+            }
+        };
+        for test in &self.theta {
+            let (Some(left), Some(right)) = (read(test.left)?, read(test.right)?) else { return Ok(false); };
+            let accepted = match test.op {
+                BinaryOp::Eq => left == right,
+                BinaryOp::NotEq => left != right,
+                BinaryOp::Lt => left < right,
+                BinaryOp::LtEq => left <= right,
+                BinaryOp::Gt => left > right,
+                BinaryOp::GtEq => left >= right,
+                _ => unreachable!("The comparison was checked"),
+            };
+            if !accepted { return Ok(false); }
+        }
+        Ok(true)
     }
 
     fn probe_outer(&self, table: &mut Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {

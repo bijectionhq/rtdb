@@ -238,7 +238,7 @@ impl PreparedSql {
         let cursor = if columnar {
             query.execute_columns_with_text(context, arguments, Some(self.source())).await?
         } else {
-            query.execute_with_text(context, arguments, Some(self.source())).await?
+            query.execute_column_rows(context, arguments, Some(self.source())).await?
         };
         if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
         Ok(cursor)

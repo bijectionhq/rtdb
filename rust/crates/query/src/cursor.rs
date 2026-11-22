@@ -186,13 +186,22 @@ impl PreparedQuery {
         self.execute_columns_with_text(context, parameters, None).await
     }
 
+    /// Preserves the row client's batch boundaries while using Arrow operators for supported plans.
+    pub async fn execute_column_rows(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
+        self.open(context, parameters, text, Batching::ColumnRows).await
+    }
+
     pub async fn execute_columns_with_text(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>) -> Result<QueryCursor> {
         self.open(context, parameters, text, Batching::Columns).await
     }
 
     /// Opens the query with one row of a bound Arrow batch.
     pub async fn execute_arrow_columns(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
-        measured_open(Arc::clone(&context), self.open_arrow(context, batch, row, types, text, Batching::Columns)).await
+        let retention = Arc::clone(&context);
+        let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+            Box::pin(self.open_arrow(context, batch, row, types, text, Batching::Columns))
+        });
+        measured_open(retention, open).await
     }
 
     pub fn is_parameter_projection(&self) -> bool {
@@ -213,7 +222,7 @@ impl PreparedQuery {
     pub async fn execute_parameter_projection(
         &self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], text: Option<&str>,
     ) -> Result<Option<QueryCursor>> {
-        measured_open(Arc::clone(&context), async { self.open_parameter_projection(context, arguments, types, text) }).await
+        measured_open(Arc::clone(&context), Box::pin(async { self.open_parameter_projection(context, arguments, types, text) })).await
     }
 
     fn open_parameter_projection(
@@ -286,7 +295,11 @@ impl PreparedQuery {
     }
 
     async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
-        measured_open(Arc::clone(&context), self.open_retained(context, parameters, text, batching)).await
+        let retention = Arc::clone(&context);
+        let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+            Box::pin(self.open_retained(context, parameters, text, batching))
+        });
+        measured_open(retention, open).await
     }
 
     async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
@@ -371,8 +384,12 @@ impl PreparedQuery {
                     }
                     crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages)
                 }
-                Batching::Columns if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
+                Batching::Columns | Batching::ColumnRows if analysis.is_none() => match crate::operators::build_columns(Arc::clone(&operators), execution.clone()).await? {
                     Some(input) => {
+                        if matches!(batching, Batching::ColumnRows) || fills_row_batches(operators.relation()) {
+                            let input = Box::new(RowBatchedColumns { input, pending: None, context: Arc::clone(&context) });
+                            return Ok(QueryInput::Columns(ColumnOutput { input, limit: usize::MAX, pending: None }));
+                        }
                         let limit = if uses_row_batch_limit(operators.relation()) {
                             context.options.batch_rows
                         } else {
@@ -413,16 +430,18 @@ impl PreparedQuery {
     }
 }
 
-async fn measured_open<T>(context: Arc<QueryContext>, open: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+async fn measured_open<T>(context: Arc<QueryContext>, mut open: std::pin::Pin<Box<impl std::future::Future<Output = Result<T>>>>) -> Result<T> {
     let counter = context.query_cpu.clone();
     let lease = context.catalog.read_lease();
-    rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
-        let mut open = std::pin::pin!(open);
+    let mut task = std::pin::pin!(rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
         match counter {
             Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
             None => open.await,
         }
-    })).await
+    })));
+    std::future::poll_fn(|context| {
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || task.as_mut().poll(context))
+    }).await
 }
 
 fn projected_parameter(mut relation: &Relation, mut position: usize) -> Option<usize> {
@@ -543,7 +562,7 @@ fn uses_row_batch_limit(relation: &Relation) -> bool {
     use rtdb_plan::{Expr, JoinKind, RelationNode};
     stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
         let row_batched = match relation.node() {
-            RelationNode::Values { .. } | RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. }
+            RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. }
             | RelationNode::Join { kind: JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Single | JoinKind::Semi | JoinKind::Anti, .. } => true,
             RelationNode::Aggregate { groups, .. } => !groups.is_empty(),
             RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } => {
@@ -557,6 +576,86 @@ fn uses_row_batch_limit(relation: &Relation) -> bool {
         };
         row_batched || relation.children().into_iter().any(|child| uses_row_batch_limit(child))
     })
+}
+
+fn fills_row_batches(relation: &Relation) -> bool {
+    use rtdb_plan::{BinaryOp, JoinKind, RelationNode};
+
+    fn direct_join(left: &Relation, right: &Relation, expr: &Expr) -> bool {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match expr {
+            Expr::Binary { op: BinaryOp::And, left: first, right: second } =>
+                direct_join(left, right, first) && direct_join(left, right, second),
+            Expr::Binary { op: BinaryOp::Eq, left: first, right: second } => {
+                let (Expr::Column { id: a, data_type: a_type }, Expr::Column { id: b, data_type: b_type }) =
+                    (first.as_ref(), second.as_ref()) else { return false; };
+                rtdb_plan::validate_equality_types(a_type, b_type).is_ok()
+                    && ((left.schema().get(*a).is_some() && right.schema().get(*b).is_some())
+                        || (right.schema().get(*a).is_some() && left.schema().get(*b).is_some()))
+            }
+            _ => false,
+        })
+    }
+
+    fn uses_rows(relation: &Relation, nested: bool) -> bool {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            let row_batched = match relation.node() {
+                RelationNode::Values { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Aggregate { .. } => true,
+                RelationNode::Join { left, right, kind, condition: Some(condition) } if *kind != JoinKind::Cross => nested
+                    || !matches!(left.node(), RelationNode::Scan(_)) || !matches!(right.node(), RelationNode::Scan(_))
+                    || !direct_join(left, right, condition),
+                RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. }
+                | RelationNode::Extend { input, expressions } => !matches!(input.node(), RelationNode::Scan(_))
+                    && expressions.iter().any(|named| !crate::columnar::projection::shaped(&named.expr)),
+                _ => false,
+            };
+            row_batched || relation.children().into_iter().any(|child| uses_rows(child, true))
+        })
+    }
+
+    uses_rows(relation, false)
+}
+
+struct RowBatchedColumns {
+    input: crate::columnar::BoxBatchCursor,
+    pending: Option<(Arc<crate::columnar::ColumnBatch>, usize)>,
+    context: Arc<QueryContext>,
+}
+
+#[async_trait::async_trait]
+impl crate::columnar::BatchCursor for RowBatchedColumns {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        use crate::columnar::ColumnBatch;
+        let limit = self.context.options.batch_rows;
+        let memory = &self.context.memory;
+        let mut sources = Vec::new();
+        let mut spans = Vec::new();
+        let mut rows = 0;
+        let mut reservation = memory.reserve(256)?;
+        while rows < limit {
+            self.context.check_cancelled()?;
+            let (batch, offset) = match self.pending.take() {
+                Some(pending) => pending,
+                None => {
+                    let Some(batch) = self.input.next_batch().await? else { break; };
+                    if batch.len == 0 { continue; }
+                    batch.validate_readable(&self.context)?;
+                    if rows == 0 && batch.len == limit { return Ok(Some(batch)); }
+                    (Arc::new(batch), 0)
+                }
+            };
+            let count = (batch.len - offset).min(limit - rows);
+            if offset + count < batch.len { self.pending = Some((Arc::clone(&batch), offset + count)); }
+            let bytes = (sources.len() + 1).checked_mul(256).and_then(|bytes| bytes.checked_add(256))
+                .ok_or_else(|| invalid("batch-size", "Output batch inventory exceeds addressable memory"))?;
+            Arc::get_mut(&mut reservation).expect("The output owns its page inventory").grow_to(bytes)?;
+            sources.push(batch);
+            spans.push(offset..offset + count);
+            rows += count;
+        }
+        ColumnBatch::take_ranges(sources, &spans, rows, memory)
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
 struct ColumnOutput {
@@ -592,7 +691,7 @@ tokio::task_local! { static ENCODING_ORDERED_BATCH: (); }
 /// An ordered scan can borrow its hosted page buffers during synchronous wire encoding.
 pub fn encoding_ordered_batch() -> bool { ENCODING_ORDERED_BATCH.try_with(|_| ()).is_ok() }
 #[derive(Clone, Copy)]
-enum Batching { Rows, Pages, Columns }
+enum Batching { Rows, Pages, Columns, ColumnRows }
 
 pub struct QueryCursor { schema: Arc<RuntimeSchema>, runtime_schema: Arc<RuntimeSchema>, input: Option<QueryInput>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
 impl QueryCursor {

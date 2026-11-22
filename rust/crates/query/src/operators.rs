@@ -45,9 +45,9 @@ pub(crate) fn build_batches(runtime: Arc<EmittedRelation>, execution: Execution,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BatchOutput { Pages, Arrow }
+pub(crate) enum BatchOutput { Pages, Arrow }
 
-fn build_batch_input(
+pub(crate) fn build_batch_input(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
 ) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> {
     let mut build = Box::pin(async move {
@@ -112,7 +112,7 @@ async fn build_batches_at(
             let child = runtime.child(0)?;
             let positions = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>();
             let scalar_fallback = !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
-            if positions.is_none() && scalar_fallback && !allows_scalar_projection(&child, output) { return Ok(None); }
+            if positions.is_none() && scalar_fallback && output != BatchOutput::Arrow { return Ok(None); }
             let schema = child.schema().clone();
             let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
             let Some((batches,_)) = build_batch_input(child,execution.child(0),pushdowns,output).await? else { return Ok(None) };
@@ -126,7 +126,6 @@ async fn build_batches_at(
         RelationNode::Extend { expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
             let scalar_fallback = !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
-            if scalar_fallback && !allows_scalar_projection(&child, output) { return Ok(None); }
             let schema = child.schema().clone();
             let projections = schema.fields().iter().map(rtdb_plan::Field::expression)
                 .chain(expressions.iter().map(|named| named.expr.clone())).collect();
@@ -179,9 +178,19 @@ async fn build_batches_at(
         RelationNode::Window { partition_by, order_by, expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
-            if (!partition_by.is_empty() && !matches!(child.relation().node(), RelationNode::Scan(_)))
-                || !crate::window::BatchWindow::supports(&schema, partition_by, order_by, expressions) { return Ok(None); }
+            let computed = !order_by.is_empty() && !BatchSort::supports(&schema, order_by);
+            if computed && !computed_batch_sort(&schema, order_by) { return Ok(None); }
+            if !crate::window::BatchWindow::supports(&schema, partition_by, &[], expressions) { return Ok(None); }
             let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
+            if computed {
+                let width = schema.len();
+                let Some((input, schema, order)) = project_sort_keys(input, schema, order_by, &execution)? else { return Ok(None); };
+                let positions = (0..width).chain(schema.len()..schema.len() + expressions.len()).collect();
+                let memory = Arc::clone(&execution.context.memory);
+                let window = crate::window::BatchWindow::new(input, schema, partition_by, order, expressions, true, execution)?;
+                let window = crate::columnar::BatchProject::new(Box::new(window), positions, memory);
+                return Ok(Some((Box::new(window), true)));
+            }
             let window = crate::window::BatchWindow::new(input, schema, partition_by, order_by.clone(), expressions, projected, execution)?;
             Ok(Some((Box::new(window), projected)))
         }
@@ -194,7 +203,7 @@ async fn build_batches_at(
             if !crate::aggregate::AggregateCursor::writes_scalar_vectors(&runtime, groups, aggregates)? { return Ok(None); }
             let child = runtime.child(0)?;
             let schema = child.schema().clone();
-            let Some((input, projected)) = build_batches(child, execution.child(0), pushdowns).await? else { return Ok(None); };
+            let Some((input, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
             let aggregate = crate::aggregate::AggregateCursor::from_batches(input, projected, schema,
                 groups.clone(), aggregates.clone(), runtime, execution)?;
             Ok(Some((Box::new(aggregate), false)))
@@ -231,37 +240,60 @@ async fn build_batches_at(
                 _ => (0, i64::MAX as u64),
             };
             if computed {
-                let scope = execution.scope()?;
-                let mut columns = schema.fields().iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
-                let mut fields = schema.fields().to_vec();
-                let mut order = Vec::with_capacity(order_by.len());
-                let mut max_id = fields.iter().map(|field| field.id.0).max().unwrap_or(0);
-                for key in order_by {
-                    if matches!(key.expr, Expr::Column { .. }) {
-                        order.push(key.clone());
-                        continue;
-                    }
-                    let ty = execution.expression_type(&scope, &key.expr, &schema)?;
-                    if !batch_ordered_type(&ty) { return Ok(None); }
-                    let id = max_id.checked_add(1).or_else(|| (0..u32::MAX).find(|id| !fields.iter().any(|field| field.id.0 == *id)))
-                        .ok_or_else(|| invalid("sort-key", "Sort key column ID exceeds its range"))?;
-                    max_id = max_id.max(id);
-                    let field = rtdb_plan::Field { id: rtdb_plan::ColumnId(id), name: format!("sort_key_{id}"),
-                        qualifier: None, qualified_only: false, unnamed: true, data_type: ty };
-                    order.push(rtdb_plan::SortExpr { expr: field.expression(), descending: key.descending, nulls_first: key.nulls_first });
-                    fields.push(field);
-                    columns.push(key.expr.clone());
-                }
-                let sort_schema = Schema::new(fields)?;
                 let positions = (0..schema.len()).collect();
                 let memory = Arc::clone(&execution.context.memory);
-                let input = Box::new(crate::columnar::BatchExpressions::new(batches, schema, columns, execution.clone()).validating_input(true));
-                let sort = Box::new(BatchSort::new(input, sort_schema, order, execution, true, offset, limit)?);
+                let Some((input, schema, order)) = project_sort_keys(batches, schema, order_by, &execution)? else { return Ok(None); };
+                let sort = Box::new(BatchSort::new(input, schema, order, execution, true, offset, limit)?);
                 let output = Box::new(crate::columnar::BatchProject::new(sort, positions, memory));
                 return Ok(Some((output, true)));
             }
             let sort: BoxBatchCursor = Box::new(BatchSort::new(batches, schema, order_by.clone(), execution, projected, offset, limit)?);
             Ok(Some((sort, projected)))
+        }
+        RelationNode::Mark { arguments, condition, comparison, .. } if output == BatchOutput::Arrow && !arguments.is_empty() => {
+            let child = runtime.child(0)?;
+            let schema = child.schema().clone();
+            let dependent = runtime.child(1)?;
+            let mut positions = apply_input_positions(&schema, arguments, dependent.relation())?;
+            let comparison = match condition {
+                Some(condition) => Expr::Case { branches: vec![(condition.clone(), comparison.clone())],
+                    otherwise: Box::new(Expr::Literal(Value::Bool(false))) },
+                None => comparison.clone(),
+            };
+            positions.extend(comparison.referenced_columns().into_iter().filter_map(|id| schema.position(id)));
+            positions.sort_unstable();
+            positions.dedup();
+            let comparison_schema = schema.concat(dependent.schema())?;
+            let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
+            let plan = BatchApplyPlan { schema, dependent, arguments: arguments.clone(), positions, kind: ApplyKind::Mark,
+                document_field: None, comparison: Some((comparison, comparison_schema)), execution };
+            let apply = BatchApply { input, plan };
+            Ok(Some((Box::new(apply), projected)))
+        }
+        RelationNode::Apply { arguments, kind, .. } if output == BatchOutput::Arrow => {
+            let child = runtime.child(0)?;
+            let schema = child.schema().clone();
+            let dependent = runtime.child(1)?;
+            let positions = apply_input_positions(&schema, arguments, dependent.relation())?;
+            let Some((input, projected)) = build_batch_input(child, execution.child(0), None, output).await? else { return Ok(None); };
+            let document_field = matches!(kind, ApplyKind::Pull | ApplyKind::PullMany)
+                .then(|| runtime.schema().fields().last().cloned()).flatten();
+            let plan = BatchApplyPlan { schema, dependent, arguments: arguments.clone(), positions, kind: *kind, document_field, comparison: None, execution };
+            let apply = BatchApply { input, plan };
+            Ok(Some((Box::new(apply), projected)))
+        }
+        RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } if output == BatchOutput::Arrow => {
+            let RelationNode::Sort { order_by, .. } = input.node() else { return Ok(None); };
+            let sorted = runtime.child(0)?;
+            let child = sorted.child(0)?;
+            if !BatchSort::supports(child.schema(), order_by) { return Ok(None); }
+            let schema = child.schema().clone();
+            let sort_execution = execution.child(0);
+            let Some((batches, projected)) = build_batch_input(child, sort_execution.child(0), None, output).await? else { return Ok(None); };
+            let sort = BatchSort::new(batches, schema, order_by.clone(), sort_execution, projected, 0, i64::MAX as u64)?.preserving_pages();
+            let gaps = crate::patch::BatchPatchGaps::new(Box::new(sort), sorted.schema(),
+                [*iid, *valid_from, *valid_to, *document], from, to, execution)?;
+            Ok(Some((Box::new(gaps), projected)))
         }
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } if output == BatchOutput::Arrow => {
             let Some((left, left_projected)) = build_batch_input(runtime.child(0)?, execution.child(0), pushdowns.clone(), output).await? else { return Ok(None); };
@@ -273,7 +305,7 @@ async fn build_batches_at(
             if *kind != rtdb_plan::JoinKind::Cross && execution.analysis.is_none() && execution.context.tracer.is_none() => {
             use rtdb_plan::JoinKind;
             if *kind != JoinKind::Inner && output != BatchOutput::Arrow { return Ok(None); }
-            let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, BatchOutput::Pages)?,batch_shape(&runtime.child(1)?, BatchOutput::Pages)?) else { return Ok(None) };
+            let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, output)?,batch_shape(&runtime.child(1)?, output)?) else { return Ok(None) };
             if build_projected != probe_projected { return Ok(None); }
             let build_left = crate::join::build_left(left,right,*kind,&execution)?;
             // Preserve the page join's left-first order for a standalone inner join.
@@ -284,9 +316,11 @@ async fn build_batches_at(
             let mut layout = crate::join_key::JoinLayout::new(build_relation,probe_relation,Some(condition),&execution.context.memory)?;
             layout.resolve_types(runtime.child(build_side)?.schema(),runtime.child(probe_side)?.schema(),&execution)?;
             let Some(order) = crate::batch_join::key_order(&layout) else { return Ok(None) };
-            let Some((build,projected)) = build_batches(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone()).await? else { return Ok(None) };
+            let Some(theta) = crate::batch_join::theta_tests(&layout) else { return Ok(None) };
+            if !theta.is_empty() && output != BatchOutput::Arrow { return Ok(None); }
+            let Some((build,projected)) = build_batch_input(runtime.child(build_side)?,execution.child(build_side),pushdowns.clone(),output).await? else { return Ok(None) };
             if projected != build_projected { return Ok(None); }
-            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns };
+            let probe = crate::batch_join::ProbeInput { runtime: runtime.child(probe_side)?,execution: execution.child(probe_side),pushdowns, output };
             let unswapped = if swapped {
                 let mut layout = crate::join_key::JoinLayout::new(left,right,Some(condition),&execution.context.memory)?;
                 layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
@@ -295,13 +329,13 @@ async fn build_batches_at(
             let replay_build = if output == BatchOutput::Arrow && *kind == JoinKind::Inner
                 && !swapped && replayable_spill_input(build_relation) && replayable_spill_input(probe_relation) {
                 Some(crate::batch_join::ProbeInput {
-                    runtime: runtime.child(build_side)?, execution: execution.child(build_side), pushdowns: probe.pushdowns.clone(),
+                    runtime: runtime.child(build_side)?, execution: execution.child(build_side), pushdowns: probe.pushdowns.clone(), output,
                 })
             } else {
                 None
             };
             let join = crate::batch_join::BatchJoin::new(build,probe,layout,order,projected,execution)
-                .swapped(unswapped).validating_payloads(output == BatchOutput::Arrow).with_kind(*kind).spilling_arrow(replay_build);
+                .swapped(unswapped).validating_payloads(output == BatchOutput::Arrow).with_kind(*kind).with_theta(theta).spilling_arrow(replay_build);
             Ok(Some((Box::new(join) as crate::columnar::BoxBatchCursor,projected)))
         }
         _ => Ok(None),
@@ -343,9 +377,7 @@ async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Ar
     execution: Execution) -> Result<Option<crate::columnar::BoxBatchCursor>> {
     let body = runtime.child(1)?;
     let bound = runtime.child(0)?;
-    if !matches!(bound.relation().node(), RelationNode::Scan(_)) || !columnar_binding_body(&body, binding)?
-        || !bound.schema().fields().iter().all(|field| materialized_arrow_type(&field.data_type))
-        || batch_shape(&bound, BatchOutput::Arrow)?.is_none() {
+    if !columnar_binding_body(&body, binding)? || batch_shape(&bound, BatchOutput::Pages)?.is_none() {
         return Ok(None);
     }
     let reservation = state_reservation(runtime, &execution)?;
@@ -355,20 +387,10 @@ async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Ar
     let scope = crate::materialized::BindingScope::columns(Arc::clone(binding), input, schema, execution.bindings.clone(), Arc::clone(context))?;
     let mut body_execution = execution.child(1);
     body_execution.bindings = Some(Arc::clone(&scope));
-    let (body, _) = build_batch_input(body, body_execution, None, BatchOutput::Arrow).await?
-        .ok_or_else(|| invalid("materialized-binding", "A checked Arrow reference body did not open"))?;
+    let Some((body, _)) = build_batch_input(body, body_execution, None, BatchOutput::Arrow).await? else { return Ok(None); };
     let cursor = Box::new(crate::materialized::ColumnLetCursor { body, _binding: scope });
     let cursor = crate::columnar::retain_batch_state(cursor, reservation);
     Ok(Some(crate::trace::wrap_batches(cursor, runtime.relation(), context)))
-}
-
-fn materialized_arrow_type(ty: &LogicalType) -> bool {
-    use rtdb_types::ScalarType::{Bool, F32, F64, I8, I16, I32, I64};
-    match ty {
-        LogicalType::Null | LogicalType::Scalar(Bool | F32 | F64 | I8 | I16 | I32 | I64) => true,
-        LogicalType::Maybe(ty) => materialized_arrow_type(ty),
-        _ => false,
-    }
 }
 
 pub(crate) enum OrderedInput {
@@ -460,11 +482,11 @@ fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Op
 fn columnar_binding_body(runtime: &Arc<EmittedRelation>, binding: &rtdb_plan::MaterializedBinding) -> Result<bool> {
     stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || Ok(match runtime.relation().node() {
         RelationNode::Reference { binding: reference } => reference.name == binding.name && reference.relation == binding.relation,
-        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
-            let child = runtime.child(0)?;
-            expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id, .. } if child.schema().position(*id).is_some()))
-                && columnar_binding_body(&child, binding)?
-        }
+        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } | RelationNode::Extend { expressions, .. } =>
+            expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr))
+                && columnar_binding_body(&runtime.child(0)?, binding)?,
+        RelationNode::Filter { .. } | RelationNode::Distinct { .. } | RelationNode::Limit { .. } =>
+            columnar_binding_body(&runtime.child(0)?, binding)?,
         RelationNode::Set { operator: SetOperator::Union, all: true, .. } => {
             columnar_binding_body(&runtime.child(0)?, binding)? && columnar_binding_body(&runtime.child(1)?, binding)?
         }
@@ -475,34 +497,44 @@ fn columnar_binding_body(runtime: &Arc<EmittedRelation>, binding: &rtdb_plan::Ma
 fn computed_batch_sort(schema: &Schema, order_by: &[rtdb_plan::SortExpr]) -> bool {
     !order_by.is_empty() && order_by.iter().all(|key| match &key.expr {
         Expr::Column { id, .. } => schema.position(*id).is_some(),
-        expr => crate::columnar::projection::shaped(expr) && batch_ordered_type(&expr.data_type()),
+        expr => rtdb_expr::validate_order_type(&expr.data_type()).is_ok(),
     })
 }
 
-fn batch_ordered_type(ty: &LogicalType) -> bool {
-    use rtdb_types::ScalarType::{I8, I16, I32, I64, U8, U16, U32, U64};
-    match ty {
-        LogicalType::Scalar(I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64) => true,
-        LogicalType::Maybe(inner) => batch_ordered_type(inner),
-        _ => false,
+fn project_sort_keys(
+    input: crate::columnar::BoxBatchCursor, schema: Schema, order_by: &[rtdb_plan::SortExpr], execution: &Execution,
+) -> Result<Option<(crate::columnar::BoxBatchCursor, Schema, Vec<rtdb_plan::SortExpr>)>> {
+    let scope = execution.scope()?;
+    let mut columns = schema.fields().iter().map(rtdb_plan::Field::expression).collect::<Vec<_>>();
+    let mut fields = schema.fields().to_vec();
+    let mut order = Vec::with_capacity(order_by.len());
+    let mut max_id = fields.iter().map(|field| field.id.0).max().unwrap_or(0);
+    for key in order_by {
+        if matches!(key.expr, Expr::Column { .. }) {
+            order.push(key.clone());
+            continue;
+        }
+        let ty = execution.expression_type(&scope, &key.expr, &schema)?;
+        if rtdb_expr::validate_order_type(&ty).is_err() { return Ok(None); }
+        let id = max_id.checked_add(1).or_else(|| (0..u32::MAX).find(|id| !fields.iter().any(|field| field.id.0 == *id)))
+            .ok_or_else(|| invalid("sort-key", "Sort key column ID exceeds its range"))?;
+        max_id = max_id.max(id);
+        let field = rtdb_plan::Field { id: rtdb_plan::ColumnId(id), name: format!("sort_key_{id}"),
+            qualifier: None, qualified_only: false, unnamed: true, data_type: ty };
+        order.push(rtdb_plan::SortExpr { expr: field.expression(), descending: key.descending, nulls_first: key.nulls_first });
+        fields.push(field);
+        columns.push(key.expr.clone());
     }
-}
-
-fn allows_scalar_projection(child: &EmittedRelation, output: BatchOutput) -> bool {
-    if output != BatchOutput::Arrow { return false; }
-    let mut relation = child.relation().as_ref();
-    loop {
-        relation = match relation.node() {
-            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Extend { input, .. } => input,
-            node => return matches!(node, RelationNode::Scan(_) | RelationNode::Values { .. }),
-        };
-    }
+    let output = Schema::new(fields)?;
+    let input = Box::new(crate::columnar::BatchExpressions::new(input, schema, columns, execution.clone()).validating_input(true));
+    Ok(Some((input, output, order)))
 }
 
 fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
     Ok(match relation.node() {
         RelationNode::Scan(scan) => (!crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none()).then_some(false),
+        RelationNode::Reference { .. } if output == BatchOutput::Arrow => Some(false),
         RelationNode::Values { rows } if output == BatchOutput::Arrow => crate::columnar::ColumnBatch::supports_literal_rows(rows).then_some(false),
         RelationNode::ColumnTable { expr: Expr::Parameter { .. }, .. } if output == BatchOutput::Arrow => Some(false),
         RelationNode::Filter { .. } => {
@@ -516,14 +548,12 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
             let child = runtime.child(0)?;
             let columns = expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id,.. } if child.schema().position(*id).is_some()));
-            if !columns && !allows_scalar_projection(&child, output)
+            if !columns && output != BatchOutput::Arrow
                 && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
             batch_shape(&child, output)?.map(|_| true)
         }
-        RelationNode::Extend { expressions, .. } if output == BatchOutput::Arrow => {
+        RelationNode::Extend { .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
-            if !allows_scalar_projection(&child, output)
-                && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
             batch_shape(&child, output)?.map(|_| true)
         }
         RelationNode::Set { operator, .. } if output == BatchOutput::Arrow => {
@@ -533,10 +563,24 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Aggregate { groups, aggregates, .. } if output == BatchOutput::Arrow => {
             if !crate::aggregate::AggregateCursor::writes_scalar_vectors(runtime, groups, aggregates)? { return Ok(None); }
-            batch_shape(&runtime.child(0)?, BatchOutput::Pages)?.map(|_| false)
+            batch_shape(&runtime.child(0)?, output)?.map(|_| false)
+        }
+        RelationNode::Mark { arguments, .. } if output == BatchOutput::Arrow && !arguments.is_empty() =>
+            batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Apply { .. } if output == BatchOutput::Arrow =>
+            batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::PatchGaps { input, .. } if output == BatchOutput::Arrow => {
+            let RelationNode::Sort { order_by, .. } = input.node() else { return Ok(None); };
+            let child = runtime.child(0)?.child(0)?;
+            if !crate::sort::batches::BatchSort::supports(child.schema(), order_by) { return Ok(None); }
+            batch_shape(&child, output)?
         }
         RelationNode::Join { kind: rtdb_plan::JoinKind::Cross, .. } if output == BatchOutput::Arrow => {
             batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
+        }
+        RelationNode::Join { condition: Some(_), .. } if output == BatchOutput::Arrow => {
+            batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?)
+                .and_then(|(left, right)| (left == right).then_some(left))
         }
         RelationNode::Limit { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Unnest { expr: Expr::Column { .. }, .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
@@ -549,9 +593,10 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         }
         RelationNode::Window { partition_by, order_by, expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
-            if (!partition_by.is_empty() && !matches!(child.relation().node(), RelationNode::Scan(_)))
-                || !crate::window::BatchWindow::supports(child.schema(), partition_by, order_by, expressions) { return Ok(None); }
-            batch_shape(&child, output)?
+            if !crate::window::BatchWindow::supports(child.schema(), partition_by, &[], expressions) { return Ok(None); }
+            let computed = !order_by.is_empty() && !crate::sort::batches::BatchSort::supports(child.schema(), order_by);
+            if computed && !computed_batch_sort(child.schema(), order_by) { return Ok(None); }
+            batch_shape(&child, output)?.map(|projected| projected || computed)
         }
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
@@ -579,7 +624,7 @@ async fn build_pages_at(runtime: Arc<EmittedRelation>, execution: Execution, con
     let analysis = execution.analysis.clone();
     if let RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } = relation.node() {
         let input_pages = build_pages_constrained(runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
-        let pages = Box::new(crate::patch::PatchGaps::new(input_pages, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution).await?);
+        let pages = Box::new(crate::patch::PatchGaps::new(input_pages, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution)?);
         let pages = crate::pages::retain_page_state(pages, state_reservation);
         return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
     }
@@ -1427,6 +1472,263 @@ impl PageCursor for Unnest {
     }
 }
 
+fn apply_input_positions(schema: &Schema, arguments: &[(usize, Expr)], dependent: &Relation) -> Result<Vec<usize>> {
+    fn correlated(relation: &Relation, schema: &Schema, required: &mut [bool]) {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            for expression in relation.expressions() {
+                expression.visit(&mut |expr| {
+                    if let Expr::Correlated { id, .. } = expr && let Some(position) = schema.position(*id) {
+                        required[position] = true;
+                    }
+                });
+            }
+            for child in relation.children() { correlated(child, schema, required); }
+        });
+    }
+    let mut required = vec![false; schema.len()];
+    for (_, argument) in arguments {
+        for position in crate::columnar::expression_columns(argument, schema)? { required[position] = true; }
+    }
+    correlated(dependent, schema, &mut required);
+    Ok(required.into_iter().enumerate().filter_map(|(position, used)| used.then_some(position)).collect())
+}
+
+struct BatchApply {
+    input: crate::columnar::BoxBatchCursor,
+    plan: BatchApplyPlan,
+}
+
+struct BatchApplyPlan {
+    schema: Schema,
+    dependent: Arc<EmittedRelation>,
+    arguments: Vec<(usize, Expr)>,
+    positions: Vec<usize>,
+    kind: ApplyKind,
+    document_field: Option<rtdb_plan::Field>,
+    comparison: Option<(Expr, Schema)>,
+    execution: Execution,
+}
+
+impl BatchApplyPlan {
+    async fn bind(&self, batch: &crate::columnar::ColumnBatch, row: usize) -> Result<Execution> {
+        let row = Arc::new(batch.expression_row(row, &self.positions, &self.execution.context.memory)?);
+        self.execution.bind_arguments(&self.arguments, &self.schema, row).await
+    }
+
+    async fn dependent_batches(&self, batch: &crate::columnar::ColumnBatch, row: usize) -> Result<crate::columnar::BoxBatchCursor> {
+        let execution = self.bind(batch, row).await?.child(1);
+        let runtime = Arc::clone(&self.dependent);
+        match build_batches(Arc::clone(&runtime), execution.clone(), None).await? {
+            Some((batches, _)) => Ok(batches),
+            None => Ok(crate::columnar::batches_from_pages(
+                build_pages(runtime, execution).await?, Arc::clone(&self.execution.context.memory),
+            )),
+        }
+    }
+
+    async fn documents(&self, mut batch: crate::columnar::ColumnBatch, output: &rtdb_plan::Field) -> Result<crate::columnar::ColumnBatch> {
+        use arrow_array::{ArrayRef, StructArray};
+        use crate::columnar::{Column, ColumnBatch, gather_nullable_column, poll_nested_batch};
+
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let many = self.kind == ApplyKind::PullMany;
+        let fields = self.dependent.schema().fields();
+        let width = fields.len().checked_mul(256).ok_or_else(|| invalid("row-size", "Apply document fields overflow"))?;
+        let _fields = memory.reserve(width)?;
+        let order: BTreeMap<_, _> = fields.iter().enumerate().map(|(index, field)| (field.name.as_str(), index)).collect();
+        let positions = order.values().copied().collect::<Vec<_>>();
+        let schema = Schema::new(positions.iter().map(|&position| fields[position].clone()).collect())?;
+        let mut sources = Vec::new();
+        let mut picks = Vec::new();
+        let mut offsets = Vec::with_capacity(batch.len + 1);
+        let mut valid = Vec::with_capacity(batch.len);
+        let mut reservation = memory.reserve(apply_join_bytes(batch.len, 0)?)?;
+        offsets.push(0i32);
+        for row in 0..batch.len {
+            context.check_cancelled_at(row)?;
+            let mut input = self.dependent_batches(&batch, row).await?;
+            let before = picks.len();
+            while let Some(page) = poll_nested_batch(input.as_mut()).await? {
+                if page.len == 0 { continue; }
+                page.validate_readable(context)?;
+                if !many && (picks.len() != before || page.len > 1) { return Err(crate::cardinality_violation()); }
+                let rows = picks.len().checked_add(page.len).filter(|rows| *rows <= i32::MAX as usize)
+                    .ok_or_else(|| invalid("row-size", "Apply document count exceeds the Arrow limit"))?;
+                let lease = Arc::get_mut(&mut reservation).expect("The apply documents own their result inventory");
+                lease.grow_to(apply_join_bytes(rows.max(batch.len), sources.len() + 1)?)?;
+                let projection = page.key_projection(&positions, memory)?;
+                let count = projection.len;
+                let raw = match projection.physical_record(&schema, memory) {
+                    Ok(record) => record,
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => None,
+                    Err(error) => return Err(error),
+                };
+                let doc = if let Some((page, charge)) = raw {
+                    let record: ArrayRef = Arc::new(StructArray::try_new_with_length(page.schema_ref().fields().clone(),
+                        page.columns().to_vec(), None, count).map_err(|error| invalid("apply-document", error))?);
+                    let field = Arc::new(arrow_schema::Field::new("doc", record.data_type().clone(), false));
+                    let logical = rtdb_columnar::from_field(&field)?;
+                    ColumnBatch::settled(vec![Column::Arrow { array: record, field, logical: Some(logical) }], count, charge)?
+                } else {
+                    let bytes = (0..count).try_fold(apply_join_bytes(count, 0)?, |bytes, row| {
+                        schema.fields().iter().zip(&projection.columns).try_fold(bytes, |bytes, (field, column)| {
+                            bytes.checked_add(field.name.len()).and_then(|bytes| bytes.checked_add(512))
+                                .and_then(|bytes| bytes.checked_add(column.bound(row).ok()?))
+                                .ok_or_else(|| invalid("row-size", "Apply document allocation overflow"))
+                        })
+                    })?;
+                    let charge = memory.reserve(bytes)?;
+                    let mut docs = Vec::with_capacity(count);
+                    for row in 0..count {
+                        let fields = schema.fields().iter().zip(&projection.columns)
+                            .map(|(field, column)| Ok((field.name.clone(), column.value(row)?))).collect::<Result<_>>()?;
+                        docs.push(Value::Struct(fields));
+                    }
+                    ColumnBatch::settled(vec![Column::Values(docs)], count, charge)?
+                };
+                picks.extend((0..count).map(|index| Some((sources.len(), index))));
+                sources.push(doc);
+            }
+            let found = before < picks.len();
+            if many {
+                offsets.push(picks.len() as i32);
+                valid.push(found);
+            } else if !found {
+                picks.push(None);
+            }
+        }
+        let gathered = gather_nullable_column(|index| &sources[index], &picks, 0, memory)?;
+        let (column, charge) = if many {
+            let page = ColumnBatch::settled(vec![gathered.0], picks.len(), gathered.1)?;
+            page.collect_lists(offsets, valid, output, memory)?
+        } else {
+            gathered
+        };
+        batch.append_column(column, charge, memory)?;
+        Ok(batch)
+    }
+
+    async fn joined(&self, batch: &crate::columnar::ColumnBatch) -> Result<Option<crate::columnar::ColumnBatch>> {
+        use crate::columnar::{ColumnBatch, gather_nullable_column, poll_nested_batch};
+        let context = &self.execution.context;
+        let memory = &context.memory;
+        let width = self.dependent.schema().len();
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut sources = Vec::new();
+        let mut reservation = memory.reserve(4096)?;
+        let single = matches!(self.kind, ApplyKind::Single | ApplyKind::Scalar);
+        for source_row in 0..batch.len {
+            context.check_cancelled_at(source_row)?;
+            let mut cursor = self.dependent_batches(batch, source_row).await?;
+            let before = left.len();
+            while let Some(output) = poll_nested_batch(cursor.as_mut()).await? {
+                if output.len == 0 { continue; }
+                output.validate_readable(context)?;
+                if single && (output.len > 1 || left.len() != before) { return Err(crate::cardinality_violation()); }
+                let rows = left.len().checked_add(output.len).filter(|rows| *rows <= i32::MAX as usize)
+                    .ok_or_else(|| invalid("row-size", "Apply output has too many rows"))?;
+                let bytes = apply_join_bytes(rows, sources.len() + 1)?;
+                Arc::get_mut(&mut reservation).expect("The apply join owns its result inventory").grow_to(bytes)?;
+                left.extend(std::iter::repeat_n((0, source_row), output.len));
+                right.extend((0..output.len).map(|row| Some((sources.len(), row))));
+                sources.push(output);
+            }
+            if left.len() == before && (self.kind == ApplyKind::Left || single) {
+                let bytes = apply_join_bytes(left.len() + 1, sources.len())?;
+                Arc::get_mut(&mut reservation).expect("The apply join owns its result inventory").grow_to(bytes)?;
+                left.push((0, source_row));
+                right.push(None);
+            }
+        }
+        if left.is_empty() { return Ok(None); }
+        let _left_columns = memory.reserve(batch.columns.len().checked_mul(16).ok_or_else(|| invalid("row-size", "Apply width overflow"))?)?;
+        let columns = (0..batch.columns.len()).collect::<Vec<_>>();
+        let mut output = ColumnBatch::take_rows(&[batch], &left, &columns, memory)?;
+        for position in 0..width {
+            let (column, charge) = gather_nullable_column(|source| &sources[source], &right, position, memory)?;
+            output.append_column(column, charge, memory)?;
+        }
+        Ok(Some(output))
+    }
+}
+
+fn apply_join_bytes(rows: usize, sources: usize) -> Result<usize> {
+    rows.checked_mul(128).and_then(|bytes| bytes.checked_add(sources.checked_mul(512)?))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("row-size", "Apply output allocation overflow"))
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for BatchApply {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        use crate::columnar::Column;
+        let plan = &self.plan;
+        let context = &plan.execution.context;
+        let memory = &context.memory;
+        loop {
+            context.check_cancelled()?;
+            let Some(mut batch) = crate::columnar::poll_nested_batch(self.input.as_mut()).await? else { return Ok(None); };
+            batch.validate_readable(context)?;
+            if let Some(field) = &plan.document_field { return plan.documents(batch, field).await.map(Some); }
+            if matches!(plan.kind, ApplyKind::Inner | ApplyKind::Left | ApplyKind::Single | ApplyKind::Scalar) {
+                if let Some(output) = plan.joined(&batch).await? { return Ok(Some(output)); }
+                continue;
+            }
+            let bytes = batch.len.checked_mul(128).and_then(|bytes| bytes.checked_add(256))
+                .ok_or_else(|| invalid("row-size", "Apply output allocation overflow"))?;
+            let reservation = memory.reserve(bytes)?;
+            let mut selected = Vec::with_capacity(batch.len);
+            let mut marks = Vec::with_capacity(batch.len);
+            for position in 0..batch.len {
+                context.check_cancelled_at(position)?;
+                if let Some((comparison, schema)) = &plan.comparison {
+                    let row = Arc::new(batch.expression_row(position, &plan.positions, memory)?);
+                    let execution = plan.execution.bind_arguments(&plan.arguments, &plan.schema, Arc::clone(&row)).await?;
+                    let dependent = build_pages(Arc::clone(&plan.dependent), execution.child(1)).await?;
+                    let mark = crate::mark::correlated_mark(&row, dependent, comparison, schema, &execution).await?;
+                    marks.push(match mark { Value::Bool(value) => Some(value), _ => None });
+                    continue;
+                }
+                let execution = plan.bind(&batch, position).await?;
+                let mut cursor = build(Arc::clone(&plan.dependent), execution.child(1)).await?;
+                let first = cursor.next().await?;
+                match plan.kind {
+                    ApplyKind::Semi | ApplyKind::Anti => selected.push(first.is_some() == (plan.kind == ApplyKind::Semi)),
+                    ApplyKind::Exists => marks.push(Some(first.is_some())),
+                    ApplyKind::Mark => marks.push(apply_mark(&mut cursor, first, &plan.execution).await?),
+                    _ => unreachable!("The apply mode was checked"),
+                }
+            }
+            if matches!(plan.kind, ApplyKind::Semi | ApplyKind::Anti) {
+                if !selected.iter().any(|keep| *keep) { continue; }
+                return batch.select(&selected, memory).map(Some);
+            }
+            let array = Arc::new(arrow_array::BooleanArray::from(marks));
+            let ty = LogicalType::Scalar(rtdb_types::ScalarType::Bool);
+            let ty = if plan.kind == ApplyKind::Mark { ty.maybe() } else { ty };
+            let field = Arc::new(rtdb_columnar::to_field("mark", &ty)?);
+            batch.append_column(Column::Arrow { array, field, logical: Some(ty) }, reservation, memory)?;
+            return Ok(Some(batch));
+        }
+    }
+}
+
+async fn apply_mark(cursor: &mut BoxCursor, mut next: Option<OwnedRow>, execution: &Execution) -> Result<Option<bool>> {
+    let mut mark = Some(false);
+    while let Some(candidate) = next {
+        execution.context.check_cancelled()?;
+        match candidate.values.first() {
+            Some(Value::Bool(true)) => return Ok(Some(true)),
+            Some(Value::Bool(false)) => (),
+            Some(Value::Null | Value::Undefined) => mark = None,
+            _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+        }
+        next = cursor.next().await?;
+    }
+    Ok(mark)
+}
+
 struct Apply { input: BoxPageCursor, schema: Schema, dependent: Arc<EmittedRelation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind, execution: Execution }
 impl Apply {
     fn document(&self, row: &OwnedRow) -> Value {
@@ -1479,21 +1781,7 @@ impl PageCursor for Apply {
             output_scope.reserve(row.bytes().checked_add(512).ok_or_else(|| invalid("row-size", "Apply output allocation overflow"))?)?;
             let result = match self.kind {
                 ApplyKind::Exists => Value::Bool(first.is_some()),
-                ApplyKind::Mark => {
-                    let mut mark = Value::Bool(false);
-                    let mut next = first;
-                    while let Some(candidate) = next {
-                        self.execution.context.check_cancelled()?;
-                        match candidate.values.first() {
-                            Some(Value::Bool(true)) => { mark = Value::Bool(true); break; }
-                            Some(Value::Bool(false)) => (),
-                            Some(Value::Null | Value::Undefined) => mark = Value::Null,
-                            _ => return Err(invalid("mark-type","Mark comparison must return Boolean or null")),
-                        }
-                        next = cursor.next().await?;
-                    }
-                    mark
-                }
+                ApplyKind::Mark => apply_mark(&mut cursor, first, &self.execution).await?.map_or(Value::Null, Value::Bool),
                 ApplyKind::Scalar | ApplyKind::Pull => {
                     if cursor.next().await?.is_some() { return Err(crate::cardinality_violation()); }
                     if let Some(row) = &first { output_scope.reserve(self.document_bound(row)?)?; }

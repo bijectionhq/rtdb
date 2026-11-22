@@ -253,13 +253,13 @@ impl Iterator for PageRows<'_> {
 
 /// A data file's pages of rows in order, read one at a time, with the tokens of each column's value.
 pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
-    search_pages_with_budget(data, columns, cancellation, MemoryBudget::new(usize::MAX))
+    search_pages_with_budget(Arc::<[u8]>::from(data), columns, cancellation, MemoryBudget::new(usize::MAX))
 }
 
 pub(crate) fn search_pages_with_budget<'a>(
-    data: &[u8], columns: &'a [String], cancellation: &'a CancellationToken, memory: Arc<MemoryBudget>,
+    data: impl AsRef<[u8]> + Send + 'static, columns: &'a [String], cancellation: &'a CancellationToken, memory: Arc<MemoryBudget>,
 ) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
-    let mut file = ArrowFile::open(Arc::from(data), None)?;
+    let mut file = ArrowFile::from_reader(std::io::Cursor::new(data), None)?;
     let mut page = 0;
     Ok(std::iter::from_fn(move || {
         if page == file.page_count() { return None; }

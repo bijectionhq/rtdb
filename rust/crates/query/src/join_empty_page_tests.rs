@@ -30,7 +30,7 @@ async fn actual_empty_probe_callback_prepares_theta_while_absent_callback_does_n
         let table = BuildTable::new(HashedPage::new(PageBuilder::new(0,&context.memory).unwrap().finish(),|_|Ok(0),&context.memory).unwrap(),false,&context.memory).unwrap();
         let mut cursor = JoinCursor {
             phase: Phase::Memory { table,probe: Box::new(EmptyCallback { remaining,context: Arc::clone(&context) }),_build: Box::new(EmptyCallback { remaining: false,context: Arc::clone(&context) }) },
-            plan: JoinPlan { layout,build_left: true,kind: JoinKind::Inner,execution: execution.clone() },
+            plan: JoinPlan { layout,build_left: true,kind: JoinKind::Inner,execution: execution.clone(),projected_build: false },
         };
         let result = cursor.next_page().await;
         if remaining { assert_eq!(result.err().unwrap().code,"xtdb.expression/illegal-argument-exception"); }

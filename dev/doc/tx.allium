@@ -25,6 +25,8 @@
 -- Logical relation cursors expose the root operator's pages as separate batches.
 -- A logical relation whose root is a table scan can stream those pages from its Arrow vectors.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
+-- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
@@ -36,21 +38,26 @@
 -- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.
 -- A sort can compare supported key types directly at selected Arrow positions.
 -- A sort can compute a supported key expression in its Arrow input batches and keep its payloads columnar through ordering and spill.
--- A sort can combine several computed Arrow keys with keys taken directly from its input columns.
+-- A sort can combine computed keys with keys taken directly from its input columns.
+-- Its Arrow spill records retain compatible physical payload layouts.
 -- Its spill threshold accounts for Arrow buffers held by selected payloads.
--- A top-level materialized relation over a scan with compatible fixed-width Arrow fields and simple reference operations writes its batches once as Arrow IPC and opens an independent reader for each reference.
+-- A materialized relation can write compatible pages once as Arrow IPC and open an independent reader for each reference.
+-- Those spill pages retain each record's fields and preserve their original page boundaries.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
--- An inner equijoin over repeatable scans with compatible Arrow layouts can partition and replay its spill as Arrow record batches.
 -- Its Bloom and entity ID filters use those same build-side vectors.
+-- An inner equijoin over repeatable scans with compatible Arrow layouts can partition and replay its spill as Arrow record batches.
+-- Supported computed keys and integer residual comparisons retain the payload positions through match selection.
 -- Compatible semi and anti equijoins select their output from the probe vectors and emit each selected probe position once.
 -- Their columnar output keeps the configured transport row limit.
 -- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
 -- A single equijoin fails when more than one build row matches a probe row.
 -- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
+-- Correlated Apply retains independent Arrow payload positions and reads the cells the dependent query references.
+-- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
--- A partitioned window over compatible scan keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
+-- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.
 -- The embedded logical relation entry point runs plan reporting and measured execution on that read basis.
 -- An idle native session in autocommit mode with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
 -- The reservation records its transaction outcome, advances the session's await token, and changes no application table.

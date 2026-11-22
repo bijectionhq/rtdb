@@ -579,7 +579,6 @@ impl ProtocolSession {
         let PortalState::Query(query) = &mut portal.state else { return Err(protocol("Query portal has no cursor")); };
         let environment = self.environment()?; let mut emitted = 0;
         let memory = self.node.query_memory();
-        let mut body = Vec::new();
         while limit == 0 || emitted < limit {
             if query.batch.as_ref().is_none_or(|batch| query.row == batch.batch().num_rows()) {
                 loop { query.batch = query.cursor.next_batch().await?; query.row = 0; if query.batch.as_ref().is_none_or(|batch| batch.batch().num_rows() != 0) { break; } }
@@ -589,23 +588,22 @@ impl ProtocolSession {
             let schema = batch.batch().schema();
             let row = query.row;
             let consumption: Result<()> = async {
-                let bound = (0..columns.len()).try_fold(columns.len() * 128 + 4096, |bound, column| bound.checked_add(rtdb_columnar::estimate_read_cell_bytes(schema.field(column), batch.batch().column(column).as_ref(), row)?).ok_or_else(|| protocol("Result row allocation overflow")))?;
-                let _scratch = memory.reserve(bound)?;
-                body.clear();
-                body.extend_from_slice(&u16::try_from(columns.len()).map_err(|_| protocol("Too many columns"))?.to_be_bytes());
+                let _scratch = memory.reserve(4096)?;
+                let mut body = DataRow::new(&memory)?;
+                let count = u16::try_from(columns.len()).map_err(|_| protocol("Too many columns"))?;
+                body.reserve(2)?;
+                body.bytes.extend_from_slice(&count.to_be_bytes());
                 for (index, column) in columns.iter().enumerate() {
                     let array = batch.batch().column(index).as_ref();
                     if direct_cell(column.ty, column.format, schema.field(index), array, row, &environment, &mut body)? { continue; }
+                    let _cell = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(schema.field(index), array, row)?)?;
                     let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), array, row)?;
                     match rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)? {
-                        None => body.extend_from_slice(&(-1i32).to_be_bytes()),
-                        Some(encoded) => {
-                            body.extend_from_slice(&i32::try_from(encoded.as_slice().len()).map_err(|_| protocol("Value too large"))?.to_be_bytes());
-                            body.extend_from_slice(encoded.as_slice());
-                        }
+                        None => body.null_cell()?,
+                        Some(encoded) => body.cell(encoded.as_slice())?,
                     }
                 }
-                writer.row_body(&body).await
+                writer.row_body(&body.bytes).await
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }
             query.row += 1; query.sent = query.sent.checked_add(1).ok_or_else(|| protocol("Result row count overflow"))?; emitted += 1;
@@ -921,55 +919,220 @@ fn admit_rewrite_syntax(original_bytes: usize, rewritten_bytes: usize, memory: &
     Ok(Some(memory.reserve(rewritten - original)?))
 }
 
-/// Appends a cell's length and PostgreSQL encoding straight from its array, where the array is a plain integer, float,
-/// boolean or string layout and the column's type is the one it encodes as, exactly as `rtdb_pg_codec::encode_value`
-/// encodes the cell's value. Returns false, leaving `out` as it was, for a cell that takes the value path.
-fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, environment: &SessionEnvironment, out: &mut Vec<u8>) -> Result<bool> {
+/// Unsupported layouts leave the row intact for the value codec.
+fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, environment: &SessionEnvironment, out: &mut DataRow) -> Result<bool> {
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type, Float64Type};
-    use arrow_schema::DataType;
-    if !field.metadata().is_empty() { return Ok(false); }
+    use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+        TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType};
+    use arrow_schema::{DataType, TimeUnit as ArrowUnit, UnionMode};
+    use rtdb_types::TimeUnit;
+
+    let data_type = array.data_type();
+    let is_uuid = data_type == &DataType::FixedSizeBinary(16) && field.extension_type_name() == Some("uuid");
+    if !field.metadata().is_empty() && !is_uuid { return Ok(false); }
+    if let DataType::Union(fields, UnionMode::Dense) = data_type {
+        let union = array.as_any().downcast_ref::<arrow_array::UnionArray>().ok_or_else(|| protocol("Invalid result union"))?;
+        let tag = union.type_id(row);
+        let child = fields.iter().find_map(|(id, field)| (id == tag).then_some(field)).ok_or_else(|| protocol("Result union has no active field"))?;
+        return direct_cell(ty, format, child, union.child(tag).as_ref(), union.value_offset(row), environment, out);
+    }
     let binary = format == Format::Binary;
-    let fits = match (array.data_type(), ty) {
+    let fits = match (data_type, ty) {
+        (DataType::Null, _) => field.is_nullable(),
         (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64, PgType::Int2 | PgType::Int4 | PgType::Int8) => true,
-        (DataType::Float64, PgType::Float8) | (DataType::Boolean, PgType::Bool) | (DataType::Utf8, PgType::Text | PgType::VarChar) => true,
+        (DataType::Float32 | DataType::Float64, PgType::Float4 | PgType::Float8)
+        | (DataType::Boolean, PgType::Bool) | (DataType::Utf8, PgType::Text | PgType::VarChar | PgType::Keyword)
+        | (DataType::Timestamp(..), PgType::Timestamp | PgType::TimestampTz)
+        | (DataType::Binary, PgType::Bytes) => true,
+        (DataType::FixedSizeBinary(_), PgType::Bytes) => !is_uuid,
+        (DataType::FixedSizeBinary(16), PgType::Uuid) => is_uuid,
         _ => false,
     };
     if !fits { return Ok(false); }
-    if array.is_null(row) { out.extend_from_slice(&(-1i32).to_be_bytes()); return Ok(true); }
-    let mut cell = |bytes: &[u8]| -> Result<()> {
-        out.extend_from_slice(&i32::try_from(bytes.len()).map_err(|_| protocol("Value too large"))?.to_be_bytes());
-        out.extend_from_slice(bytes);
-        Ok(())
-    };
-    match array.data_type() {
+    if data_type == &DataType::Null || array.is_null(row) {
+        out.null_cell()?;
+        return Ok(true);
+    }
+    match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            let value = match array.data_type() {
+            let value = match data_type {
                 DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
                 DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
                 DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
                 _ => array.as_primitive::<Int64Type>().value(row),
             };
-            if binary { match ty { PgType::Int2 => cell(&(value as i16).to_be_bytes())?, PgType::Int4 => cell(&(value as i32).to_be_bytes())?, _ => cell(&value.to_be_bytes())? } }
-            else { cell(value.to_string().as_bytes())? }
+            if binary {
+                match ty {
+                    PgType::Int2 => out.cell(&(value as i16).to_be_bytes())?,
+                    PgType::Int4 => out.cell(&(value as i32).to_be_bytes())?,
+                    _ => out.cell(&value.to_be_bytes())?,
+                }
+            } else {
+                out.cell(value.to_string().as_bytes())?;
+            }
         }
-        DataType::Float64 => {
-            let value = array.as_primitive::<Float64Type>().value(row);
-            if binary { cell(&value.to_be_bytes())? } else { cell(&rtdb_pg_codec::encode_value(ty, format, &Value::F64(value), environment)?)? }
+        DataType::Float32 | DataType::Float64 => {
+            let value = if data_type == &DataType::Float32 {
+                f64::from(array.as_primitive::<Float32Type>().value(row))
+            } else {
+                array.as_primitive::<Float64Type>().value(row)
+            };
+            match (ty, binary) {
+                (PgType::Float4, true) => out.cell(&(value as f32).to_be_bytes())?,
+                (PgType::Float8, true) => out.cell(&value.to_be_bytes())?,
+                (PgType::Float4, false) => out.cell(rtdb_types::java_f32_text(value as f32).as_bytes())?,
+                _ => out.cell(rtdb_types::java_f64_text(value).as_bytes())?,
+            }
         }
         DataType::Boolean => {
             let value = array.as_boolean().value(row);
-            if binary { cell(&[u8::from(value)])? } else { cell(if value { b"t" } else { b"f" })? }
+            if binary { out.cell(&[u8::from(value)])?; }
+            else { out.cell(if value { b"t" } else { b"f" })?; }
         }
-        _ => cell(array.as_string::<i32>().value(row).as_bytes())?,
+        DataType::Utf8 => out.cell(array.as_string::<i32>().value(row).as_bytes())?,
+        DataType::Binary | DataType::FixedSizeBinary(_) if ty == PgType::Bytes => {
+            let bytes = if data_type == &DataType::Binary {
+                array.as_binary::<i32>().value(row)
+            } else {
+                array.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                    .ok_or_else(|| protocol("Invalid result binary array"))?.value(row)
+            };
+            if binary {
+                out.cell(bytes)?;
+            } else {
+                let len = bytes.len().checked_mul(2).and_then(|len| len.checked_add(2)).ok_or_else(|| protocol("Value too large"))?;
+                let length = i32::try_from(len).map_err(|_| protocol("Value too large"))?;
+                out.reserve(len.checked_add(4).ok_or_else(|| protocol("Value too large"))?)?;
+                out.bytes.extend_from_slice(&length.to_be_bytes());
+                out.bytes.extend_from_slice(b"\\x");
+                for &byte in bytes {
+                    let hex = b"0123456789abcdef";
+                    out.bytes.extend_from_slice(&[hex[(byte >> 4) as usize], hex[(byte & 0xf) as usize]]);
+                }
+            }
+        }
+        DataType::FixedSizeBinary(16) => {
+            let bytes = array.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+                .ok_or_else(|| protocol("Invalid result UUID array"))?.value(row);
+            if binary { out.cell(bytes)?; }
+            else {
+                let uuid = uuid::Uuid::from_slice(bytes).map_err(|_| protocol("Invalid result UUID"))?;
+                out.cell(uuid.hyphenated().encode_lower(&mut uuid::Uuid::encode_buffer()).as_bytes())?;
+            }
+        }
+        DataType::Timestamp(unit, timezone) => {
+            let (value, unit) = match unit {
+                ArrowUnit::Second => (array.as_primitive::<TimestampSecondType>().value(row), TimeUnit::Second),
+                ArrowUnit::Millisecond => (array.as_primitive::<TimestampMillisecondType>().value(row), TimeUnit::Millisecond),
+                ArrowUnit::Microsecond => (array.as_primitive::<TimestampMicrosecondType>().value(row), TimeUnit::Microsecond),
+                ArrowUnit::Nanosecond => (array.as_primitive::<TimestampNanosecondType>().value(row), TimeUnit::Nanosecond),
+            };
+            let bytes = rtdb_pg_codec::encode_timestamp(format, value, unit, timezone.as_deref(), ty == PgType::TimestampTz, environment)?;
+            out.cell(&bytes)?;
+        }
+        _ => unreachable!("The result layout was checked"),
     }
     Ok(true)
+}
+
+struct DataRow {
+    bytes: Vec<u8>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl DataRow {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { bytes: Vec::new(), reservation: memory.reserve(256)? })
+    }
+
+    fn reserve(&mut self, additional: usize) -> Result<()> {
+        let overflow = || protocol("Result row allocation overflow");
+        let needed = self.bytes.len().checked_add(additional).ok_or_else(overflow)?;
+        let current = self.bytes.capacity();
+        if current >= needed { return Ok(()); }
+        let maximum = current.checked_mul(2).ok_or_else(overflow)?.max(needed).max(32);
+        let lease = Arc::get_mut(&mut self.reservation).expect("A DataRow owns its allocation");
+        lease.grow_to(maximum.checked_add(current).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
+        self.bytes.try_reserve_exact(maximum - self.bytes.len()).map_err(|_| overflow())?;
+        lease.shrink_to(self.bytes.capacity().checked_add(256).ok_or_else(overflow)?)
+    }
+
+    fn null_cell(&mut self) -> Result<()> {
+        self.reserve(4)?;
+        self.bytes.extend_from_slice(&(-1i32).to_be_bytes());
+        Ok(())
+    }
+
+    fn cell(&mut self, bytes: &[u8]) -> Result<()> {
+        let length = i32::try_from(bytes.len()).map_err(|_| protocol("Value too large"))?;
+        self.reserve(bytes.len().checked_add(4).ok_or_else(|| protocol("Value too large"))?)?;
+        self.bytes.extend_from_slice(&length.to_be_bytes());
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use rtdb_sql::BatchStatement;
     use super::*;
+
+    #[test]
+    fn postgres_arrow_cells_match_the_value_codec_in_both_formats() {
+        use rtdb_types::{LogicalType, ScalarType, TimeUnit};
+
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(1 << 20);
+        let instant = Value::Timestamp {
+            value: -1001, unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()),
+        };
+        let cases = [
+            (PgType::Bytes, Value::Binary(vec![0, 9, 127, 255])),
+            (PgType::Bytes, Value::FixedSizeBinary(vec![1, 2, 3])),
+            (PgType::Uuid, Value::Uuid([3; 16])),
+            (PgType::Float4, Value::F32(-0.0)),
+            (PgType::Float8, Value::F32(1.0 / 3.0)),
+            (PgType::Timestamp, instant.clone()),
+            (PgType::TimestampTz, instant),
+        ];
+        for (ty, value) in cases {
+            let logical = value.logical_type().maybe();
+            let field = rtdb_columnar::to_field("result", &logical).unwrap();
+            let array = rtdb_columnar::copy_array(&logical, &[Value::Null, value.clone()]).unwrap();
+            for format in [Format::Text, Format::Binary] {
+                let mut actual = DataRow::new(&memory).unwrap();
+                assert!(direct_cell(ty, format, &field, array.as_ref(), 0, &environment, &mut actual).unwrap());
+                assert_eq!(actual.bytes, (-1i32).to_be_bytes());
+                actual.bytes.clear();
+                assert!(direct_cell(ty, format, &field, array.as_ref(), 1, &environment, &mut actual).unwrap());
+                let payload = rtdb_pg_codec::encode_value(ty, format, &value, &environment).unwrap();
+                assert_eq!(&actual.bytes[..4], &(payload.len() as i32).to_be_bytes());
+                assert_eq!(&actual.bytes[4..], payload.as_slice());
+            }
+        }
+        let logical = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::I32));
+        let field = rtdb_columnar::to_field("result", &logical).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, &[Value::I64(7), Value::I32(-5)]).unwrap();
+        let mut output = DataRow::new(&memory).unwrap();
+        for row in 0..array.len() {
+            assert!(direct_cell(PgType::Int8, Format::Text, &field, array.as_ref(), row, &environment, &mut output).unwrap());
+        }
+        assert_eq!(&output.bytes, b"\0\0\0\x017\0\0\0\x02-5");
+    }
+
+    #[test]
+    fn postgres_text_bytea_charges_its_wire_allocation_until_drop() {
+        let memory = MemoryBudget::new(1 << 20);
+        let input = vec![0xc0; 20 * 1024];
+        let values = arrow_array::BinaryArray::from(vec![input.as_slice()]);
+        let field = arrow_schema::Field::new("b", arrow_schema::DataType::Binary, false);
+        let mut output = DataRow::new(&memory).unwrap();
+        assert!(direct_cell(PgType::Bytes, Format::Text, &field, &values, 0, &SessionEnvironment::default(), &mut output).unwrap());
+        assert_eq!(output.bytes.len(), 6 + input.len() * 2);
+        assert!(memory.used_bytes() >= output.bytes.capacity());
+        drop(output);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {
         super::simple_query_marker(normalized_simple_text(source))

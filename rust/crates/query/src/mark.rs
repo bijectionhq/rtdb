@@ -245,7 +245,7 @@ impl PageCursor for Mark {
     }
 }
 
-async fn correlated_mark(row: &OwnedRow,mut dependent: BoxPageCursor,comparison: &Expr,schema: &Schema,execution: &Execution) -> Result<Value> {
+pub(crate) async fn correlated_mark(row: &OwnedRow,mut dependent: BoxPageCursor,comparison: &Expr,schema: &Schema,execution: &Execution) -> Result<Value> {
     let mut result = Value::Bool(false);
     while let Some(mut page) = dependent.next_page().await? {
         execution.context.check_cancelled()?;

@@ -1,9 +1,9 @@
 use rtdb_types::StructFields;
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
+use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
@@ -23,6 +23,7 @@ pub(crate) enum Operation {
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PatchArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     Removed(String),
 }
 
@@ -96,7 +97,7 @@ impl SourceTransaction {
                 Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
                 Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
-                Operation::InsertIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::InsertIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } | Operation::PatchArrowIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Removed(name) => (name.capacity(), None, 0),
             };
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
@@ -294,7 +295,7 @@ impl SourceTransaction {
         let scratch = operations().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
                 Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. } | TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::OwnedWriteIids { documents, .. } | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
-                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
+                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
                 Operation::Public(TxOp::Sql { sql, args }) => {
@@ -366,6 +367,7 @@ const OPERATION_CELL_BYTES: usize = 256;
 
 struct SourceOperation<'a> {
     body: StructFields<Value>,
+    iids: Cow<'a, [Iid]>,
     documents: Option<(String, SourceDocuments<'a>)>,
 }
 
@@ -416,6 +418,7 @@ fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> Result<(String, SourceOperation<'a>)> {
     let mut body = StructFields::new();
     let mut docs = None;
+    let mut identities = Cow::Borrowed(&[][..]);
     let tag = match operation {
         Operation::Public(TxOp::Sql { sql, args }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
@@ -540,9 +543,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         }
         Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to } | TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
-                document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
+                document_id(document, memory).map(|id| id.iid())
             }).collect::<Result<_>>()?;
-            body.insert("iids".into(), Value::List(iids));
+            identities = Cow::Owned(iids);
+            body.insert("iids".into(), Value::Null);
             body.insert("field_presence".into(), owned_field_presence(documents));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((relation.name().to_owned(), SourceDocuments::Rows(documents)));
@@ -553,7 +557,8 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             }
         }
         Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } => {
-            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            identities = Cow::Borrowed(iids);
+            body.insert("iids".into(), Value::Null);
             if documents.has_exact_presence() {
                 body.insert("field_presence".into(), owned_field_presence(documents));
             }
@@ -563,9 +568,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         }
         Operation::Public(TxOp::InsertDocs { table, documents, valid_from, valid_to } | TxOp::PutDocs { table, documents, valid_from, valid_to } | TxOp::PatchDocs { table, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
-                document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
+                document_id(document, memory).map(|id| id.iid())
             }).collect::<Result<_>>()?;
-            body.insert("iids".into(), Value::List(iids));
+            identities = Cow::Owned(iids);
+            body.insert("iids".into(), Value::Null);
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Rows(documents)));
             match operation {
@@ -577,21 +583,25 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         Operation::Public(TxOp::PutArrowDocs { table, documents }) => {
             let reader = documents.id_reader()?;
             let iids = (0..documents.array().len()).map(|row| {
-                documents.iid(row, reader.as_ref(), memory).map(|iid| Value::FixedSizeBinary(iid.0.to_vec()))
+                documents.iid(row, reader.as_ref(), memory)
             }).collect::<Result<_>>()?;
-            body.insert("iids".into(), Value::List(iids));
+            identities = Cow::Owned(iids);
+            body.insert("iids".into(), Value::Null);
             time_fields(&mut body, None, None);
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
             "put-docs"
         }
-        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => {
-            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to }
+        | Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => {
+            identities = Cow::Borrowed(iids);
+            body.insert("iids".into(), Value::Null);
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
-            "put-docs"
+            if matches!(operation, Operation::PatchArrowIids { .. }) { "patch-docs" } else { "put-docs" }
         }
         Operation::InsertIids { table, documents, iids, valid_from, valid_to } | Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
-            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            identities = Cow::Borrowed(iids);
+            body.insert("iids".into(), Value::Null);
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Rows(documents)));
             match operation {
@@ -602,18 +612,20 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         }
         Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
             body.insert("table".into(), Value::Utf8(table_name(table)));
-            body.insert("iids".into(), Value::List(ids.ids().iter().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec())).collect()));
+            identities = Cow::Owned(ids.ids().iter().map(EntityId::iid).collect());
+            body.insert("iids".into(), Value::Null);
             time_fields(&mut body, *valid_from, *valid_to);
             "delete-docs"
         }
         Operation::Public(TxOp::EraseDocs { table, ids }) => {
             body.insert("table".into(), Value::Utf8(table_name(table)));
-            body.insert("iids".into(), Value::List(ids.ids().iter().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec())).collect()));
+            identities = Cow::Owned(ids.ids().iter().map(EntityId::iid).collect());
+            body.insert("iids".into(), Value::Null);
             "erase-docs"
         }
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
     };
-    Ok((tag.into(), SourceOperation { body, documents: docs }))
+    Ok((tag.into(), SourceOperation { body, iids: identities, documents: docs }))
 }
 
 pub(crate) fn document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
@@ -659,7 +671,11 @@ fn named_union<T>(
 }
 
 fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
-    let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| (value.body, value.documents)).unzip();
+    let mut iids = Vec::with_capacity(values.len());
+    let (values, documents): (Vec<_>, Vec<_>) = values.into_iter().map(|value| {
+        iids.push(value.iids);
+        (value.body, value.documents)
+    }).unzip();
     let types = values.iter().map(|value| LogicalType::Struct(value.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect())).collect::<Vec<_>>();
     let LogicalType::Struct(mut types) = LogicalType::join_all(&types) else { return Err(invalid("Transaction operation leg has no struct layout")); };
     for temporal in ["_valid_from", "_valid_to"] {
@@ -678,10 +694,16 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
     // The reference's document writers declare `documents` straight after `iids`, ahead of the valid-time columns.
     let mut documents = documents.iter().any(Option::is_some).then_some(documents);
     for (name, ty) in types {
-        let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
-        let bound = estimate_builder_bytes_refs(&ty, cells())?;
-        columns.push(arrays.column(bound, || copy_array(&ty, &cells().cloned().collect::<Vec<_>>()))?);
-        fields.push(Arc::new(to_field(&name, &ty)?));
+        let field = Arc::new(to_field(&name, &ty)?);
+        let column = if name == "iids" {
+            iid_vector(&iids, &field, arrays)?
+        } else {
+            let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
+            let bound = estimate_builder_bytes_refs(&ty, cells())?;
+            arrays.column(bound, || copy_array(&ty, &cells().cloned().collect::<Vec<_>>()))?
+        };
+        columns.push(column);
+        fields.push(field);
         if name == "iids" {
             if let Some(documents) = documents.take() {
                 let documents = named_union(documents.into_iter().flatten(), |leg| document_leg(leg, arrays, memory))?;
@@ -692,6 +714,30 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
     }
     if documents.is_some() { return Err(invalid("Document operation has no iids")); }
     rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
+}
+
+fn iid_vector(lists: &[Cow<'_, [Iid]>], field: &Field, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+    let DataType::List(item) = field.data_type() else { return Err(invalid("IIDs must be a list")); };
+    let count = lists.iter().try_fold(0usize, |count, list| count.checked_add(list.len()).ok_or_else(overflow))?;
+    i32::try_from(count).map_err(|_| overflow())?;
+    let bytes = count.checked_mul(16).ok_or_else(overflow)?;
+    let bound = bytes.checked_add(lists.len().checked_mul(16).ok_or_else(overflow)?)
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    arrays.column(bound, || {
+        let mut values = Vec::with_capacity(bytes);
+        let mut offsets = Vec::with_capacity(lists.len() + 1);
+        offsets.push(0);
+        let mut end = 0i32;
+        for list in lists {
+            for iid in list.as_ref() { values.extend_from_slice(&iid.0); }
+            end += list.len() as i32;
+            offsets.push(end);
+        }
+        let values = Arc::new(FixedSizeBinaryArray::new(16, Buffer::from_vec(values), None));
+        let array = ListArray::try_new(Arc::clone(item), OffsetBuffer::new(offsets.into()), values, None)
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(Arc::new(array))
+    })
 }
 
 fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
@@ -1154,7 +1200,14 @@ impl SourceOperationReader<'_> {
             _ => &[],
         };
         let bound = body.fields().iter().zip(body.columns()).filter(|(field, _)| value_fields.contains(&field.name().as_str()))
-            .try_fold(base, |bytes, (field, column)| bytes.checked_add(estimate_read_value_bytes(field, column.as_ref(), offset)?).ok_or_else(overflow))?;
+            .try_fold(base, |bytes, (field, column)| {
+                let retained = if field.name() == "iids" && let Some((_, rows)) = iid_list(field, column.as_ref(), offset) {
+                    rows.len().checked_mul(std::mem::size_of::<Iid>()).ok_or_else(overflow)?
+                } else {
+                    estimate_read_value_bytes(field, column.as_ref(), offset)?
+                };
+                bytes.checked_add(retained).ok_or_else(overflow)
+            })?;
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
@@ -1320,7 +1373,7 @@ impl SourceOperationReader<'_> {
                 let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
                 let valid_from = optional_timestamp(value("_valid_from")?)?;
                 let valid_to = optional_timestamp(value("_valid_to")?)?;
-                let iids = match value("iids")? { Value::Null | Value::Undefined => None, values => Some(iids(values)?) };
+                let iids = read_iids(body, offset)?;
                 if iids.as_ref().is_some_and(|iids| iids.len() != structs.len()) { return Err(invalid("Document and IID counts differ")); }
                 let identity = structs.fields().as_ptr() as usize;
                 let layout = match self.layouts.entry(identity) {
@@ -1330,6 +1383,12 @@ impl SourceOperationReader<'_> {
                 if name == "put-docs" && iids.is_some()
                     && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
                     return Ok(Operation::PutArrowIids { table: table.expect("plain put has a table"), documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
+                }
+                if name == "patch-docs" && iids.is_some()
+                    && let Some(documents) = ArrowDocuments::from_patch_source(structs, Arc::clone(&layout), source_bytes, memory)? {
+                    return Ok(Operation::PatchArrowIids {
+                        table: table.expect("patch has a table"), documents, iids: iids.expect("patch contains IIDs"), valid_from, valid_to,
+                    });
                 }
                 if let Some(relation) = owned {
                     let presence = body.column_by_name("field_presence")
@@ -1354,7 +1413,8 @@ impl SourceOperationReader<'_> {
             }
             "delete-docs" | "erase-docs" => {
                 let table = match value("table")? { Value::Utf8(table) => parse_table(&table)?, _ => return Err(invalid("Delete/erase has no table")) };
-                let ids = EntityIds::new(iids(value("iids")?)?.into_iter().map(|iid| EntityId::Uuid(iid.0)).collect(), memory)?;
+                let iids = read_iids(body, offset)?.ok_or_else(|| invalid("IIDs must be a list"))?;
+                let ids = EntityIds::new(iids.into_iter().map(|iid| EntityId::Uuid(iid.0)).collect(), memory)?;
                 if name == "delete-docs" { TxOp::DeleteDocs { table, ids, valid_from: optional_timestamp(value("_valid_from")?)?, valid_to: optional_timestamp(value("_valid_to")?)? } }
                 else { TxOp::EraseDocs { table, ids } }
             }
@@ -1466,9 +1526,36 @@ fn optional_timestamp(value: Value) -> Result<Option<Timestamp>> {
     }
 }
 fn optional_string(value: Value) -> Result<Option<String>> { match value { Value::Null | Value::Undefined => Ok(None), Value::Utf8(value) => Ok(Some(value)), _ => Err(invalid("Expected optional string")) } }
-fn iids(value: Value) -> Result<Vec<Iid>> {
-    let Value::List(values) = value else { return Err(invalid("IIDs must be a list")); };
-    values.into_iter().map(|value| match value { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid("IID must be fixed-size binary")) }).collect()
+fn iid_list<'a>(field: &Field, array: &'a dyn Array, row: usize) -> Option<(&'a FixedSizeBinaryArray, std::ops::Range<usize>)> {
+    let DataType::List(element) = field.data_type() else { return None; };
+    if !field.metadata().is_empty() || !element.metadata().is_empty() || element.data_type() != &DataType::FixedSizeBinary(16) {
+        return None;
+    }
+    let list = array.as_any().downcast_ref::<ListArray>()?;
+    if list.is_null(row) { return None; }
+    let values = list.values().as_any().downcast_ref::<FixedSizeBinaryArray>()?;
+    let offsets = list.value_offsets();
+    Some((values, offsets[row] as usize..offsets[row + 1] as usize))
+}
+
+fn read_iids(body: &StructArray, row: usize) -> Result<Option<Vec<Iid>>> {
+    let index = body.fields().iter().position(|field| field.name() == "iids").ok_or_else(|| invalid("Operation is missing iids"))?;
+    let field = &body.fields()[index];
+    let column = body.column(index).as_ref();
+    if let Some((values, rows)) = iid_list(field, column, row) {
+        return rows.map(|row| {
+            if values.is_null(row) { return Err(invalid("IID must be fixed-size binary")); }
+            Iid::from_slice(values.value(row))
+        }).collect::<Result<_>>().map(Some);
+    }
+    match read_value(field, column, row)? {
+        Value::Null | Value::Undefined => Ok(None),
+        Value::List(values) => values.into_iter().map(|value| match value {
+            Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes),
+            _ => Err(invalid("IID must be fixed-size binary")),
+        }).collect::<Result<_>>().map(Some),
+        _ => Err(invalid("IIDs must be a list")),
+    }
 }
 fn time_fields(body: &mut StructFields<Value>, from: Option<Timestamp>, to: Option<Timestamp>) {
     let time = |time: Option<Timestamp>| time.map(|time| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).unwrap_or(Value::Null);
@@ -1481,7 +1568,7 @@ pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
         Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::InsertIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } => table,
+        | Operation::InsertIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => table,
         _ => return Ok(()),
     };
     parse_table(&table_name(table))?;
@@ -2475,6 +2562,28 @@ mod tests {
     }
 
     #[test]
+    fn replay_iids_read_only_the_selected_list_position() {
+        use arrow_buffer::NullBuffer;
+
+        let first = [1; 16];
+        let second = [2; 16];
+        let third = [3; 16];
+        let elements = Arc::new(Field::new("item", DataType::FixedSizeBinary(16), true));
+        let binary = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(first.as_slice()), Some(second.as_slice()), Some(third.as_slice()), None].into_iter(), 16,
+        ).unwrap();
+        let lists = ListArray::new(elements, OffsetBuffer::new(vec![0, 1, 1, 1, 3, 4].into()),
+            Arc::new(binary), Some(NullBuffer::from(vec![true, false, true, true, true])));
+        let fields = vec![Field::new("iids", lists.data_type().clone(), true)].into();
+        let body = StructArray::new(fields, vec![Arc::new(lists)], None);
+        let body = body.slice(1, 4);
+        assert_eq!(read_iids(&body, 0).unwrap(), None);
+        assert_eq!(read_iids(&body, 1).unwrap(), Some(vec![]));
+        assert_eq!(read_iids(&body, 2).unwrap(), Some(vec![Iid(second), Iid(third)]));
+        assert!(read_iids(&body, 3).unwrap_err().message.as_deref().is_some_and(|message| message.contains("IID must be fixed-size binary")));
+    }
+
+    #[test]
     fn replay_keeps_explicit_put_and_patch_iids_even_when_the_document_id_hash_differs() {
         let memory = budget();
         let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::Utf8("different-id".into()))])], &memory).unwrap();
@@ -2487,7 +2596,8 @@ mod tests {
         ], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
         assert!(matches!(&decoded.operations[0], Operation::PutArrowIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
-        assert!(matches!(&decoded.operations[1], Operation::PatchIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
+        assert!(matches!(&decoded.operations[1], Operation::PatchArrowIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
+        assert_eq!(decoded.body_digest().unwrap(), source.body_digest().unwrap());
     }
 
     #[test]

@@ -63,14 +63,7 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Numeric => { let Value::Decimal(decimal) = value else { return Err(incompatible(ty, value)); }; if binary { crate::binary::numeric_write(decimal)? } else { decimal_text(decimal).into_bytes() } }
         PgType::Timestamp | PgType::TimestampTz => {
             let Value::Timestamp { value, unit, timezone } = value else { return Err(incompatible(ty, value)); };
-            if binary {
-                let nanos = nanos(*value, *unit);
-                let micros = if ty == PgType::Timestamp { nanos / 1000 } else { nanos.div_euclid(1000) };
-                i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec()
-            } else {
-                let format = if environment.parameter("datestyle") == Some("iso8601") { TimestampText::Iso } else { TimestampText::Pg };
-                timestamp_text(*value, *unit, timezone.as_deref().filter(|_| ty == PgType::TimestampTz), format)?.into_bytes()
-            }
+            encode_timestamp(format, *value, *unit, timezone.as_deref(), ty == PgType::TimestampTz, environment)?
         }
         PgType::Date => {
             let days = match value {
@@ -95,6 +88,18 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Default => return Err(unsupported(ty, "writer")),
     };
     Ok(bytes)
+}
+
+/// Encodes the physical timestamp cell using the result field's PostgreSQL timestamp type.
+pub fn encode_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Option<&str>, zoned: bool, environment: &SessionEnvironment) -> Result<Vec<u8>> {
+    if format == Format::Binary {
+        let nanos = nanos(value, unit);
+        let micros = if zoned { nanos.div_euclid(1000) } else { nanos / 1000 };
+        Ok(i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec())
+    } else {
+        let format = if environment.parameter("datestyle") == Some("iso8601") { TimestampText::Iso } else { TimestampText::Pg };
+        Ok(timestamp_text(value, unit, timezone.filter(|_| zoned), format)?.into_bytes())
+    }
 }
 
 fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironment) -> Result<Vec<u8>> {

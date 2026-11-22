@@ -36,6 +36,20 @@ async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
 fn inverse_equals_one(column: Expr) -> Expr { Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Divide,literal(1),column),literal(1)) }
 
 #[tokio::test]
+async fn correlated_mark_adds_a_nullable_boolean_to_the_original_arrow_input() {
+    let execution = execution(1);
+    let relation = mark(table(0, &[1, 2]), table(1, &[1]), Expr::binary(BinaryOp::Eq, column(0), column(1)), true);
+    let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+    let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected an Arrow mark");
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(batch.len, 2);
+    assert!(batch.columns.iter().all(|column| matches!(column, crate::columnar::Column::Arrow { .. })));
+    assert_eq!(batch.columns[1].value(0).unwrap(), Value::Bool(true));
+    assert_eq!(batch.columns[1].value(1).unwrap(), Value::Bool(false));
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn mark_hashes_eligibility_keys_and_keeps_unknown_marks_in_memory_and_on_disk() {
     let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
     let left_field = field(0,data_type.clone());

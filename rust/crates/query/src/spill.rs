@@ -106,6 +106,18 @@ impl SpillWriter {
         self.write_frame(&ipc.into_inner().map_err(ipc_error)?)
     }
 
+    /// Drops unpublished frames written after the supplied frame boundary.
+    pub fn discard_from(&mut self, offset: u64) -> Result<()> {
+        let bytes = self.position.checked_sub(offset).ok_or_else(|| invalid("invalid-spill", "Spill rollback exceeds its file"))?;
+        self.file.flush().map_err(io_error)?;
+        self.file.get_ref().set_len(offset).map_err(io_error)?;
+        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        self.position = offset;
+        self.retained.bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.retained.region.retained.fetch_sub(bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
     pub fn finish(mut self) -> Result<Arc<SpillFile>> {
         self.file.flush().map_err(io_error)?;
         Ok(self.retained)
@@ -151,8 +163,12 @@ impl SpillReader {
             return Err(invalid("invalid-spill", "Arrow spill frame must contain exactly one admissible batch"));
         }
         drop(ipc);
-        let bytes = batch.get_array_memory_size().checked_add(256)
-            .ok_or_else(|| invalid(error, "Arrow spill size overflow"))?;
+        let overflow = || invalid(error, "Arrow spill size overflow");
+        let schema = batch.schema_ref().fields().iter().try_fold(256usize, |bytes, field| {
+            field.size().checked_mul(4).and_then(|size| bytes.checked_add(size))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::columnar::Column>())).ok_or_else(overflow)
+        })?;
+        let bytes = batch.get_array_memory_size().checked_add(schema).ok_or_else(overflow)?;
         let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
         if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
         OwnedBatch::with_reservation(batch, reservation).map(Some)

@@ -14,12 +14,16 @@ enum Phase {
 pub(crate) struct JoinCursor {
     phase: Phase,plan: JoinPlan,
 }
-struct JoinPlan { layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution }
+struct JoinPlan { layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution,projected_build: bool }
 impl JoinCursor {
     pub fn new(build: BoxPageCursor,probe: DeferredInput,mut layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution) -> Result<Self> {
         if kind == JoinKind::Cross { return Err(invalid("join-kind","Cross join requires its page-pair cursor")); }
         if matches!(kind, JoinKind::Full | JoinKind::Single) || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left { layout.with_null_build(build_left)?; }
-        Ok(Self { phase: Phase::Build { input: build,probe },plan: JoinPlan { layout,build_left,kind,execution } })
+        Ok(Self { phase: Phase::Build { input: build,probe },plan: JoinPlan { layout,build_left,kind,execution,projected_build: false } })
+    }
+    pub fn with_projected_build(mut self, projected: bool) -> Self {
+        self.plan.projected_build = projected;
+        self
     }
 }
 impl JoinPlan {
@@ -169,7 +173,8 @@ impl PageCursor for JoinCursor {
                 Phase::Build { mut input,probe } => {
                     let mut accumulator = BuildAccumulator::new(plan.execution.context.options.join_build_rows,Arc::clone(&plan.execution.context))?;
                     while let Some(page) = input.next_page().await? {
-                        accumulator.append(plan.build_layout().project_page(page,&plan.execution).await?)?;
+                        let page = if plan.projected_build { page } else { plan.build_layout().project_page(page,&plan.execution).await? };
+                        accumulator.append(page)?;
                     }
                     match accumulator.finish()? {
                         BuildInput::Memory(page) => {
