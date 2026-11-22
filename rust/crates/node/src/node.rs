@@ -1516,7 +1516,10 @@ impl NativeSession {
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        if publication.is_some() && (writes.is_empty() || checks.is_empty() || controls.is_empty() || deadline.is_none()) {
+        if publication.is_some() && (writes.is_empty() || checks.is_empty() || controls.is_empty()
+            || deadline.is_none() || writes.len().saturating_add(controls.len())
+                .saturating_add(checks.len().saturating_mul(2)).saturating_add(4) > 4096)
+        {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let scope = self.placed_history()?;

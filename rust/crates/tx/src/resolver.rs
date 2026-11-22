@@ -883,13 +883,34 @@ impl<'a> OpenTransaction<'a> {
                     matches!(&operations[previous], Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, .. }) if guarded == relation)))
             });
             let guarded_points = point_checks.next() == Some(true) && point_checks.all(|paired| paired);
-            let writes = operations.iter().any(|operation| match operation {
-                Operation::Public(TxOp::OwnedReplaceDocs { documents, .. }) | Operation::OwnedWriteIids { documents, .. } =>
-                    !documents.rows().is_empty(),
-                _ => false,
-            });
-            let hosted = operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::HostedControl(control)) if control.is_check()));
-            if publications.next().is_some() || !writes || !scoped_check || !guarded_points || !hosted
+            let mut rows = 0usize;
+            let mut witnesses = 0usize;
+            let mut hosted = false;
+            let mut effects = 1usize; // The source publication operation materializes two effects.
+            for operation in operations {
+                let size = match operation {
+                    Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, .. })
+                    | Operation::OwnedWriteIids { relation, documents, create_only: false, .. }
+                        if relation.world() == Some(world) && !documents.rows().is_empty() => {
+                        rows = rows.saturating_add(documents.rows().len());
+                        documents.rows().len()
+                    }
+                    Operation::Public(TxOp::OwnedCheck { .. }) => {
+                        witnesses += 1;
+                        1
+                    }
+                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() => {
+                        hosted = true;
+                        1
+                    }
+                    Operation::Public(TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedDeadline { .. }
+                        | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedPublishWorld { .. }) => 1,
+                    _ => return Err(unavailable()),
+                };
+                effects = effects.saturating_add(size);
+            }
+            if publications.next().is_some() || deadline.is_none() || rows == 0
+                || !scoped_check || !guarded_points || !hosted || witnesses > 128 || effects > 4096
                 || self.owned_world.as_ref().is_none_or(|(record, _)| record.id != world)
             {
                 return Err(unavailable());
