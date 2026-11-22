@@ -1,7 +1,9 @@
 use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
-use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ffi}};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray, ffi::{FFI_ArrowArray, from_ffi}, make_array};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, from_field, to_field};
+use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, LogicalType, Result};
 
@@ -66,9 +68,6 @@ pub(crate) fn export_schema(schema: &Schema, memory: &Arc<MemoryBudget>) -> Resu
     if decimals.next().is_some() { return Err(super::invalid("Unused decimal C export parameters")); }
     Ok(exported)
 }
-
-#[cfg(test)]
-use rtdb_columnar::OwnedBatch;
 
 #[cfg(test)]
 pub(crate) fn export_batch(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
@@ -168,16 +167,16 @@ pub(crate) unsafe fn foreign_schema_bound(schema: &FFI_ArrowSchema, depth: usize
     Ok(bytes)
 }
 
-pub(crate) struct ImportedRows {
+pub(crate) struct BoundArguments {
     pub arguments: SqlArguments,
     pub names: Vec<String>,
     pub _reservation: Arc<MemoryReservation>,
 }
 
 /// Takes ownership of a valid Arrow C Data array and schema by replacing both with released structs.
-/// Foreign buffers are copied into retained native values before returning, including on zero-row binds.
+/// Foreign buffers are copied into native Arrow allocations before returning, including on zero-row binds.
 /// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
-pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<ImportedRows> {
+pub(crate) unsafe fn import_arguments(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<BoundArguments> {
     if array.release.is_none() || schema.release.is_none() { return Err(super::invalid("Arrow bind inputs have already been released")); }
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
@@ -198,22 +197,32 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
     if !matches!(imported.data_type(), DataType::Struct(_)) { return Err(super::invalid("Arrow bind requires a record-batch struct")); }
     let array = StructArray::from(imported);
     if array.null_count() > 0 { return Err(super::invalid("The bound record batch may not contain null rows")); }
-    let batch = RecordBatch::from(array);
-    let mut bound = super::add(4096, super::mul(batch.num_rows(), 64)?)?;
-    for row in 0..batch.num_rows() {
-        for (field, column) in fields.fields().iter().zip(batch.columns()) {
-            bound = super::add(bound, rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)?)?;
-        }
+    for (field, column) in fields.fields().iter().zip(array.columns()) {
+        let logical = from_field(field)?;
+        rtdb_columnar::validate_readable_column(field, column.as_ref(), &logical, memory)?;
     }
-    let _scratch = memory.reserve(super::mul(bound, 2)?)?;
-    let mut rows = Vec::with_capacity(batch.num_rows());
-    let readers = fields.fields().iter().map(|field| rtdb_columnar::ColumnReader::new(field)).collect::<Result<Vec<_>>>()?;
-    for row in 0..batch.num_rows() {
-        rows.push(readers.iter().zip(batch.columns()).map(|(reader, column)| reader.read(column.as_ref(), row)).collect::<Result<Vec<_>>>()?);
-    }
-    let types = fields.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
     let names = fields.fields().iter().map(|field| field.name().clone()).collect();
-    Ok(ImportedRows { arguments: SqlArguments::new(types, rows, memory)?, names, _reservation: schema_charge })
+    let bound = super::add(4096, super::mul(array.get_array_memory_size(), 4)?)?;
+    let mut reservation = memory.reserve(bound)?;
+    let columns = array.columns().iter().map(|column| {
+        copy_foreign_data(column.to_data()).map(make_array)
+    }).collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(array.len()));
+    drop(array);
+    let batch = RecordBatch::try_new_with_options(Arc::new(fields), columns, &options).map_err(arrow_error)?;
+    Arc::get_mut(&mut reservation).expect("Arrow import owns its reservation").shrink_to(batch.get_array_memory_size())?;
+    let arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::with_reservation(batch, reservation)?, memory)?;
+    Ok(BoundArguments { arguments, names, _reservation: schema_charge })
+}
+
+fn copy_foreign_data(data: ArrayData) -> Result<ArrayData> {
+    let buffers = data.buffers().iter().map(|buffer| Buffer::from_slice_ref(buffer.as_slice())).collect();
+    let children = data.child_data().iter().map(|child| copy_foreign_data(child.clone())).collect::<Result<Vec<_>>>()?;
+    let nulls = data.nulls().map(|nulls| {
+        let buffer = Buffer::from_slice_ref(nulls.buffer().as_slice());
+        NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len()))
+    });
+    data.into_builder().buffers(buffers).child_data(children).nulls(nulls).build().map_err(arrow_error)
 }
 
 fn decimal_format(format: &str) -> Result<Option<DecimalParameters>> {

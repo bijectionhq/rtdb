@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, UnionMode};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, arrow_relayout_bound, copy_array, copy_selected_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, estimate_read_cell_bytes, read_value_as, relayout_arrow_column, to_field};
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, ScalarType, Value};
 
-use super::{ArgumentChunk, SqlArguments, overflow};
+use super::{ArgumentChunk, SourceArgumentLayout, SqlArguments, overflow, plain_scalar_field};
 
 impl SqlArguments {
     pub(crate) fn source_columnar_batch(&self, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
@@ -46,12 +46,13 @@ type ArgumentVector = (ArrayRef, Option<Arc<MemoryReservation>>);
 fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &LogicalType, memory: &Arc<MemoryBudget>)
     -> Result<ArgumentVector> {
     match chunk {
-        ArgumentChunk::Arrow { batch, types, .. } => {
+        ArgumentChunk::Arrow { batch, types, source_layout, .. } => {
             let batch = batch.batch();
             let field = batch.schema_ref().field(position);
             let array = batch.column(position);
             let source = &types[position];
-            if can_copy_argument(source) && source.join(ty) == *ty && has_valid_union_nulls(field, array.as_ref()) {
+            if (*source_layout == SourceArgumentLayout::Uploaded || plain_scalar_field(field))
+                && can_copy_argument(source) && source.join(ty) == *ty && has_valid_union_nulls(field, array.as_ref()) {
                 if field.data_type() == target.data_type() { return Ok((Arc::clone(array), None)); }
                 if let Ok(bound) = arrow_relayout_bound(array.as_ref(), field, target)
                     && let Ok(scratch) = memory.reserve(bound)

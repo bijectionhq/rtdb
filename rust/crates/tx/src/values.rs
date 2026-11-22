@@ -162,6 +162,23 @@ impl ArrowDocuments {
         Self::from_record_batch(batch.batch(), memory)
     }
 
+    /// Admits scalar uploads whose Arrow layout can reproduce the row encoder's source representation.
+    pub fn from_ingest_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let batch = batch.batch();
+        let schema = batch.schema();
+        if batch.num_rows() == 0 || schema.index_of("_id").is_err() || !schema.fields().iter().zip(batch.columns()).all(|(field, column)| {
+            plain_scalar_field(field) && field.data_type() != &DataType::Null && column.is_valid(0)
+        }) {
+            return Ok(None);
+        }
+        let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let columns = (0..batch.num_columns()).map(|index| canonical_argument_column(&[batch], index, memory))
+            .collect::<Result<Vec<_>>>()?;
+        let canonical = RecordBatch::try_new(schema, columns)
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        Self::from_record_batch(&canonical, memory)
+    }
+
     pub(crate) fn from_record_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let schema = batch.schema();
         if batch.num_rows() == 0 || schema.fields().iter().any(|field| !Self::compatible(field, true)) {
@@ -328,6 +345,35 @@ fn canonical_nullable_uuid(array: &ArrayRef, memory: &Arc<MemoryBudget>) -> Resu
     rtdb_columnar::retain_array(column, &reservation)
 }
 
+pub(crate) fn canonical_argument_column(pages: &[&RecordBatch], index: usize, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    if let [page] = pages {
+        let array = page.column(index);
+        let nulls = array.logical_null_count();
+        if nulls == array.len() || (nulls == 0 && array.data_type() != &DataType::Boolean) {
+            return Ok(Arc::clone(array));
+        }
+    }
+
+    // The source body digest includes the payload beneath null slots and the padding on a Boolean vector.
+    let rows = pages.iter().try_fold(0usize, |rows, page| rows.checked_add(page.num_rows()).ok_or_else(overflow))?;
+    let base = rows.checked_mul(64).and_then(|bytes| bytes.checked_add(pages.len().checked_mul(64)?))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    let bound = pages.iter().try_fold(base, |bytes, page| {
+        bytes.checked_add(page.column(index).get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
+    })?;
+    let mut reservation = memory.reserve(bound)?;
+    let mut cells = Vec::with_capacity(rows);
+    let sources = pages.iter().enumerate().map(|(source, page)| {
+        cells.extend((0..page.num_rows()).map(|row| Some((source, row))));
+        page.column(index).as_ref()
+    }).collect::<Vec<_>>();
+    let column = rtdb_columnar::copy_nullable_cells(&sources, &cells)?;
+    drop(sources);
+    drop(cells);
+    Arc::get_mut(&mut reservation).expect("argument selection owns its reservation").shrink_to(column.get_array_memory_size())?;
+    rtdb_columnar::retain_array(column, &reservation)
+}
+
 pub(crate) fn plain_scalar_field(field: &arrow_schema::Field) -> bool {
     field.metadata().is_empty() && match field.data_type() {
         DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
@@ -336,6 +382,46 @@ pub(crate) fn plain_scalar_field(field: &arrow_schema::Field) -> bool {
         DataType::Null => field.is_nullable(),
         _ => false,
     }
+}
+
+#[test]
+fn scalar_ingest_batches_match_row_encoded_source_bytes() {
+    use arrow_array::{BooleanArray, Int64Array, StringArray, UInt64Array};
+    use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+    use arrow_schema::Field;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let fields = vec![
+        Field::new("_id", DataType::UInt64, false),
+        Field::new("flag", DataType::Boolean, false),
+        Field::new("number", DataType::Int64, true),
+        Field::new("text", DataType::Utf8, false),
+    ];
+    let flags = BooleanArray::new(BooleanBuffer::new(Buffer::from_vec(vec![0xff_u8]), 0, 3), None);
+    let validity = NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(vec![0xfb_u8]), 0, 3));
+    let numbers = Int64Array::new(ScalarBuffer::from(vec![8, 17, 999]), Some(validity));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![0, u64::MAX, 2])),
+        Arc::new(flags),
+        Arc::new(numbers),
+        Arc::new(StringArray::from(vec!["prefix", "left", "right"])),
+    ];
+    let batch = OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap().slice(1, 2), &memory).unwrap();
+    let docs = ArrowDocuments::from_ingest_batch(&batch, &memory).unwrap().unwrap();
+    let rows = (0..batch.batch().num_rows()).map(|row| {
+        batch.batch().schema_ref().fields().iter().zip(batch.batch().columns()).map(|(field, column)| {
+            let value = rtdb_columnar::read_execution_value(field, column.as_ref(), row).unwrap();
+            (field.name().clone(), value)
+        }).collect()
+    }).collect();
+    let table = TableRef::new("public", "docs");
+    let row_operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, &memory).unwrap(), valid_from: None, valid_to: None };
+    let arrow_operation = TxOp::PutArrowDocs { table, documents: docs };
+    let encoded = |operation| crate::SourceTransaction::new(vec![operation], SubmitOptions::default(), &memory).unwrap().encode().unwrap();
+    assert_eq!(encoded(arrow_operation).as_slice(), encoded(row_operation).as_slice());
+
+    let null_first = OwnedBatch::new(batch.batch().slice(1, 1), &memory).unwrap();
+    assert!(ArrowDocuments::from_ingest_batch(&null_first, &memory).unwrap().is_none());
 }
 
 fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<ArrayRef>> {
@@ -434,8 +520,11 @@ impl UserMetadata {
 #[derive(Clone, Debug)]
 enum ArgumentChunk {
     Rows { rows: Vec<Vec<Value>>, _reservation: Arc<MemoryReservation> },
-    Arrow { batch: OwnedBatch, types: Arc<Vec<LogicalType>>, _reservation: Arc<MemoryReservation> },
+    Arrow { batch: OwnedBatch, types: Arc<Vec<LogicalType>>, source_layout: SourceArgumentLayout, _reservation: Arc<MemoryReservation> },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceArgumentLayout { Uploaded, Canonical }
 
 impl ArgumentChunk {
     fn len(&self) -> usize {
@@ -510,11 +599,18 @@ impl SqlArguments {
         Ok(Self { types: Arc::new(types), chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
     }
     pub fn from_arrow(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::arrow(batch, SourceArgumentLayout::Uploaded, memory)
+    }
+    /// Retains the binding in Arrow and preserves the canonical field layout when encoding SQL source arguments.
+    pub fn from_arrow_with_canonical_source(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::arrow(batch, SourceArgumentLayout::Canonical, memory)
+    }
+    fn arrow(batch: OwnedBatch, source_layout: SourceArgumentLayout, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = batch.batch().schema();
         let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
         let types = Arc::new(schema.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?);
         let row_count = batch.batch().num_rows();
-        let chunk = Arc::new(ArgumentChunk::Arrow { batch, types: Arc::clone(&types), _reservation: Arc::clone(&schema_reservation) });
+        let chunk = Arc::new(ArgumentChunk::Arrow { batch, types: Arc::clone(&types), source_layout, _reservation: Arc::clone(&schema_reservation) });
         Ok(Self { types, chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
     }
     pub fn from_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -530,6 +626,15 @@ impl SqlArguments {
     /// Opened-vector field types for query or DML binding; source payload fields remain available through `types`.
     pub fn execution_types(&self) -> impl Iterator<Item = LogicalType> + '_ { self.types.iter().map(rtdb_columnar::execution_type) }
     pub fn row_count(&self) -> usize { self.row_count }
+    pub fn single_arrow_page(&self) -> Option<&OwnedBatch> {
+        match self.chunks.as_slice() {
+            [(_, chunk)] => match chunk.as_ref() {
+                ArgumentChunk::Arrow { batch, .. } => Some(batch),
+                ArgumentChunk::Rows { .. } => None,
+            },
+            _ => None,
+        }
+    }
     pub fn rows(&self) -> impl Iterator<Item = Result<ArgumentRow<'_>>> {
         self.indexed_rows().map(|row| row.map(|(_, values)| values))
     }
@@ -547,6 +652,10 @@ impl SqlArguments {
         }).collect::<Option<Vec<_>>>()?;
         let first = pages.first()?.schema_ref();
         pages.iter().all(|page| page.schema_ref() == first).then_some(pages)
+    }
+
+    pub(crate) fn retains_uploaded_source_layout(&self) -> bool {
+        self.chunks.iter().all(|(_, chunk)| matches!(chunk.as_ref(), ArgumentChunk::Arrow { source_layout: SourceArgumentLayout::Uploaded, .. }))
     }
 
     pub(crate) fn value_bytes(&self) -> Result<usize> {

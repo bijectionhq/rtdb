@@ -369,10 +369,13 @@ entity SourceMessage {
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
+    -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
     -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
     -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
+    -- Embedded ADBC bulk ingest and pgwire Arrow COPY use Arrow document vectors for compatible scalar columns.
+    -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
     -- Compatible document vectors retain the UUID extension for their UUID values through source encoding and replay.
     -- When an upload adds fields inside a fixed-size list, layout alignment copies only the selected entries and required null padding.

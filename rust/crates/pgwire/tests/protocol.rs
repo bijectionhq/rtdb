@@ -587,7 +587,7 @@ async fn arrow_copy_unsigned_ids_and_values_enter_signed_execution() {
 }
 
 #[tokio::test]
-async fn arrow_copy_batches_autocommit_separately_and_explicit_rollback_discards_all_batches() {
+async fn arrow_copy_batches_autocommit_separately_and_share_an_explicit_transaction() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
     for (table, file) in [("stream_docs", false), ("file_docs", true)] {
@@ -606,6 +606,16 @@ async fn arrow_copy_batches_autocommit_separately_and_explicit_rollback_discards
     client.send(b'd', &arrow_copy_bytes(false, 2)).await; client.send(b'c', &[]).await;
     assert_eq!(tags(&client.through(b'Z').await), b"CZ"); assert_eq!(tags(&client.query("ROLLBACK").await), b"CZ");
     let frames = client.query("SELECT n FROM stream_docs ORDER BY _id").await; assert_eq!(tags(&frames), b"TDDCZ"); assert_eq!(rows(&frames).len(), 2);
+    assert_eq!(tags(&client.query("BEGIN READ WRITE").await), b"CZ");
+    client.send(b'Q', &cstring("COPY stream_docs FROM STDIN WITH (FORMAT 'arrow-stream')")).await;
+    assert_eq!(client.receive().await.0, b'G');
+    client.send(b'd', &arrow_copy_bytes(false, 2)).await;
+    client.send(b'c', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"CZ");
+    assert_eq!(tags(&client.query("COMMIT").await), b"CZ");
+    let times = rows(&client.query("SELECT _valid_from FROM stream_docs ORDER BY _id").await);
+    assert_eq!(times.len(), 4);
+    assert_eq!(times[2], times[3]);
     drop(client); running.stop().await;
 }
 

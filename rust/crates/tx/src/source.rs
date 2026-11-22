@@ -964,7 +964,7 @@ impl SourceOperationReader<'_> {
 }
 
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
-    if let Some(pages) = arguments.uniform_arrow_pages() {
+    if arguments.retains_uploaded_source_layout() && let Some(pages) = arguments.uniform_arrow_pages() {
         let first = pages[0];
         let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
             page.get_array_memory_size().checked_mul(4).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
@@ -1108,6 +1108,28 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn canonical_arrow_sql_arguments_match_row_source_bytes() {
+        use arrow_array::{BooleanArray, StringArray, UInt64Array};
+        use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("unsigned", DataType::UInt64, true),
+            Field::new("bool", DataType::Boolean, false),
+            Field::new("label", DataType::Utf8, false).with_metadata([("client".into(), "binding".into())].into()),
+        ]));
+        let validity = NullBuffer::new(BooleanBuffer::new(Buffer::from_vec(vec![0xfb_u8]), 0, 3));
+        let numbers = UInt64Array::new(ScalarBuffer::from(vec![8, u64::MAX, 999]), Some(validity));
+        let flags = BooleanArray::new(BooleanBuffer::new(Buffer::from_vec(vec![0xff_u8]), 0, 3), None);
+        let label = StringArray::from(vec!["prefix", "left", "right"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(numbers), Arc::new(flags), Arc::new(label)]).unwrap().slice(1, 2);
+        let bindings = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let rows = bindings.rows().map(|row| row.unwrap().to_vec()).collect();
+        let reference = SqlArguments::new(bindings.types().to_vec(), rows, &memory).unwrap();
+        assert_eq!(encode_arguments(&bindings, &memory).unwrap().as_slice(), encode_arguments(&reference, &memory).unwrap().as_slice());
     }
 
     #[test]
