@@ -1749,7 +1749,12 @@ fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Re
     let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
     if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. }) | Operation::OwnedWriteIids { relation, documents, .. } = operation {
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
-        return validate_document_columns(&relation.table(owner), documents.columns(), "insert", put_columns);
+        let permitted = if relation.world().is_some() {
+            &["_id", rtdb_types::WorldShadow::FIELDS][..]
+        } else {
+            put_columns
+        };
+        return validate_document_columns(&relation.table(owner), documents.columns(), "insert", permitted);
     }
     let (table, columns, verb, permitted) = match operation {
         Operation::Public(TxOp::InsertDocs { table, documents, .. }) | Operation::InsertIids { table, documents, .. } =>
