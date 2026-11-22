@@ -271,7 +271,8 @@ impl OwnedRelation {
 
     /// Physical journal table; the reserved name cannot become an owned relation request.
     pub fn change_journal(&self, owner: &str) -> Result<TableRef> {
-        Self::new(self.name())?;
+        if self.is_world_catalog() { return Err(crate::OwnedWorld::unavailable()); }
+        Self::from_source(self.name().to_owned())?;
         Ok(Self(format!("{OWNED_CHANGE_PREFIX}{}", self.name())).table(owner))
     }
 
@@ -368,7 +369,8 @@ impl TableRef {
                         })
                         || name.strip_prefix(OWNED_CAPACITY_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
                         || name.strip_prefix(OWNED_FIXED_RANGE_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
-                        || name.strip_prefix(OWNED_CHANGE_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
+                        || name.strip_prefix(OWNED_CHANGE_PREFIX).is_some_and(|logical|
+                            OwnedRelation::from_source(logical.into()).is_ok_and(|relation| !relation.is_world_catalog()))
                         || OwnedRelation::from_source(name.into()).is_ok())
             })
     }

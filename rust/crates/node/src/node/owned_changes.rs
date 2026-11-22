@@ -98,12 +98,56 @@ impl OwnedReadSession {
         })
     }
 
+    /// Reads exact local overlay commits. The archived parent is immutable;
+    /// changes on the root after the fork are outside this world's journal.
+    pub async fn world_merged_changes(
+        &self, world: rtdb_types::Iid, relations: &[OwnedRelation], after: Timestamp, limit: usize,
+    ) -> Result<OwnedMergedChanges> {
+        let (record, _charge) = self.world_registration(world).await?
+            .filter(|(record, _)| !record.dropped && self.present.system_time < record.until)
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        if after < record.basis.system_time {
+            return Err(historical_owned_read::below_floor(record.basis.system_time));
+        }
+        if !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len()) {
+            return Err(change_feed_uncovered());
+        }
+        let guard = self.relation_release_guard(relations)?;
+        guard()?;
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        let scoped = relations.iter().map(|relation| {
+            if record.schemas.relation(relation).is_none()
+                || snapshot.relation_event_frontier(&relation.purge_table(&self.owner))? != 0 {
+                return Err(change_feed_uncovered());
+            }
+            relation.in_world(world)
+        }).collect::<Result<Vec<_>>>()?;
+        let mut page = self.merged_change_journals(&scoped, after, limit).await?;
+        for commit in &mut page.commits {
+            for group in &mut commit.changes {
+                group.relation = group.relation.root_relation().ok_or_else(change_feed_uncovered)?;
+            }
+        }
+        guard()?;
+        Ok(page)
+    }
+
     /// Merges only the preadmitted owner relations at this held cut.
     pub async fn merged_changes(
         &self,
         relations: &[OwnedRelation],
         after: Timestamp,
         limit: usize,
+    ) -> Result<OwnedMergedChanges> {
+        if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
+            return Err(change_feed_uncovered());
+        }
+        self.merged_change_journals(relations, after, limit).await
+    }
+
+    async fn merged_change_journals(
+        &self, relations: &[OwnedRelation], after: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
         if !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
             || !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len())
