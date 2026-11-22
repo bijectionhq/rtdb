@@ -1,6 +1,8 @@
 use parking_lot::Mutex;
 use rtdb_types::ReplicaPosition;
 
+mod step;
+
 /// When, in monotonic microseconds, this database's catalog was last confirmed to include every replica record then published.
 /// Passive: its callers supply the clock reading, the published tip and the applied position.
 #[derive(Debug, Default)]
@@ -10,7 +12,7 @@ pub(crate) struct ReadCurrency(Mutex<Currency>);
 struct Currency {
     anchor: Option<i64>,
     /// A tip read at an instant, confirmed once the applied position reaches it.
-    pending: Option<(i64, ReplicaPosition)>,
+    pending: Option<(i64, i64)>,
 }
 
 impl ReadCurrency {
@@ -22,21 +24,17 @@ impl ReadCurrency {
     /// Records the tip published no earlier than `observed_at`; the caller reads the clock before the tip.
     pub fn observe(&self, observed_at: i64, tip: ReplicaPosition) {
         let mut currency = self.0.lock();
-        if currency.pending.is_none_or(|(_, pending)| tip > pending) { currency.pending = Some((observed_at, tip)); }
+        currency.pending = step::observe(currency.pending, observed_at, tip.0);
     }
     /// Confirms a pending observation once the catalog has applied its tip, and returns the anchor.
     /// The caller observes installed progress before capturing its catalog.
     pub fn anchor(&self, installed: Option<ReplicaPosition>) -> Option<i64> {
         let mut currency = self.0.lock();
-        if let Some((observed_at, tip)) = currency.pending {
-            if installed.is_some_and(|position| position >= tip) {
-                currency.pending = None;
-                currency.anchor = Some(currency.anchor.map_or(observed_at, |anchor| anchor.max(observed_at)));
-            }
-        }
+        (currency.anchor, currency.pending) =
+            step::confirm(currency.anchor, currency.pending, installed.map(|position| position.0));
         currency.anchor
     }
-    pub fn pending_tip(&self) -> Option<ReplicaPosition> { self.0.lock().pending.map(|(_, tip)| tip) }
+    pub fn pending_tip(&self) -> Option<ReplicaPosition> { self.0.lock().pending.map(|(_, tip)| ReplicaPosition(tip)) }
 }
 
 #[cfg(test)]
@@ -56,6 +54,17 @@ mod tests {
         assert_eq!(currency.anchor(Some(position(4))), Some(10));
         assert!(!currency.needs_observation(14, 5));
         assert!(currency.needs_observation(15, 5));
+    }
+
+    #[test]
+    fn an_out_of_order_tip_cannot_replace_the_pending_observation() {
+        let currency = ReadCurrency::default();
+        currency.observe(10, position(5));
+        currency.observe(12, position(4));
+        currency.observe(13, position(5));
+        assert_eq!(currency.pending_tip(), Some(position(5)));
+        assert_eq!(currency.anchor(Some(position(4))), None);
+        assert_eq!(currency.anchor(Some(position(5))), Some(10));
     }
 
     #[test]

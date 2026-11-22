@@ -53,6 +53,25 @@ All three designers proposed the same mechanism; differences are noted inline.
   Bounded monotonic leases and the collector eligibility delay still cover the paths that use them.
 - **Directory implementations:** `MemoryDirectory`, `DynamoDirectory`, `RemoteDirectory` exist; there is no object-store-backed one.
 
+## Currency of the existing lease
+
+The foreground query path and the maintenance task share the same pending observation and confirmed clock anchor.
+They sample a monotonic clock before reading the published replica tip.
+A sample replaces an outstanding sample only if it names a greater tip.
+Installed progress confirms the pending tip only when it reaches that position.
+Confirmation consumes the sample and retains the later of its clock reading and the previous anchor.
+
+[ReadCurrencyAnchor](../tla/ReadCurrencyAnchor.tla) models both observers with separate clock and tip reads.
+It confirms that the installed prefix covers the sampled publication frontier and that the clock anchor never moves backward.
+It reaches a confirmation while another observation is still in flight.
+The controls cover reversing the clock and tip reads, confirming ahead of installation, moving the anchor backward and replacing a pending observation at an equal tip.
+[Lean](../lean/ReadCurrencyAnchor.lean) proves coverage and monotonicity over arbitrary finite histories of recording, installing and confirming samples.
+[Verus](../verus/read_currency/proof.rs) checks the production decisions under the surrounding mutex, including controls that weaken both an implementation and its contract.
+
+The model assumes an advancing published frontier and monotone installed prefix within one replica epoch.
+The proof of the synchronous decisions relies on the caller supplying the clock sample and installed position from that same authority.
+Admission before a memory-only query answer, handling abandoned operations, and availability across leadership turnover remain separate obligations.
+
 ## Handoff notes
 
 1. Start by reading the peer's `CatalogReaders` and `ResidenceRetirement.tla`, and the last day of commits touching `multi/src`, `directory/src` and `maintenance/src/gc.rs`. If a peer session is mid-way, coordinate through the programme rather than branching the design.

@@ -1399,6 +1399,27 @@ def verify_residence_reader_retention(args, scratch):
     verify_lean_model(args, scratch, path, "residence-reader-retention", controls, 4)
 
 
+def verify_read_currency_anchor(args, scratch):
+    path = Path("verification/lean/ReadCurrencyAnchor.lean")
+    controls = {
+        "observe-without-frontier": (
+            "      obs.required ≤ obs.tip →", "      True →",
+            ["currency_step_preserves_coverage"],
+        ),
+        "confirm-early": (
+            "state.pending = some obs → obs.tip ≤ state.installed →",
+            "state.pending = some obs → True →",
+            ["currency_step_preserves_coverage"],
+        ),
+        "prefer-older-anchor": (
+            "if new.sampledAt < old.sampledAt then some old else some new",
+            "if new.sampledAt < old.sampledAt then some new else some old",
+            ["step_does_not_rewind_the_anchor"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "read-currency-anchor", controls, 4)
+
+
 def verify_checkpoint_metadata_retention(args, scratch):
     path = Path("verification/lean/CheckpointMetadataRetention.lean")
     controls = {
@@ -1861,6 +1882,7 @@ def verify_lean(args, scratch):
             verify_repair_anchor_retention(args, scratch)
             verify_recovery_custody_handoff(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
+            verify_read_currency_anchor(args, scratch)
             verify_checkpoint_source_handoff(args, scratch)
             verify_checkpoint_copy_evidence(args, scratch)
             verify_repair_archive_custody(args, scratch)
@@ -2651,6 +2673,18 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "skip_sync"'), "Safe"),
     ("RepairAnchorRetention", "repair-anchor-reclaim-witness",
      ("INVARIANT Safe", "INVARIANT NeverReclaimsAfterAdvance"), "NeverReclaimsAfterAdvance"),
+    ("ReadCurrencyAnchor", "read-currency-anchor", None, None),
+    ("ReadCurrencyAnchor", "read-currency-anchor-clock-after-tip",
+     ('Mutation = "none"', 'Mutation = "clock_after_tip"'), "AnchorCoversPrefix"),
+    ("ReadCurrencyAnchor", "read-currency-anchor-confirm-early",
+     ('Mutation = "none"', 'Mutation = "confirm_early"'), "AnchorCoversPrefix"),
+    ("ReadCurrencyAnchor", "read-currency-anchor-rewind",
+     ('Mutation = "none"', 'Mutation = "rewind_anchor"'), "action:AnchorNeverRewinds"),
+    ("ReadCurrencyAnchor", "read-currency-anchor-replace-equal-tip",
+     ('Mutation = "none"', 'Mutation = "replace_equal_tip"'), "action:PendingDoesNotRegress"),
+    ("ReadCurrencyAnchor", "read-currency-anchor-concurrent-progress-witness",
+     ("INVARIANT AnchorCoversPrefix", "INVARIANT NeverConfirmsWhileAnotherObservationIsPending"),
+     "NeverConfirmsWhileAnotherObservationIsPending"),
     ("ResidenceComposition", "residence-composition", None, None),
     ("ResidenceComposition", "residence-composition-admit-below-floor",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "admit_below_floor"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),
@@ -5201,6 +5235,8 @@ def main():
         "rust/crates/query/src/scan.rs",
         "rust/crates/query/tests/scan.rs",
         "rust/crates/node/src/node.rs",
+        "rust/crates/node/src/read_currency.rs",
+        "rust/crates/node/src/read_currency/step.rs",
         "rust/crates/storage/src/io_region.rs",
         "rust/crates/maintenance/src/merge.rs",
         "rust/crates/maintenance/src/merge/planner.rs",

@@ -66,7 +66,7 @@ Goal: no entitled reader on any node, and no admitted in-flight request, ever lo
 1. Audit every other read path: leader transaction snapshots (registry only, no lease), spill and materialization, export, administrative collection, compactor reset, and ordered-index reads.
 2. Audit every other deletion path against the same contract: block GC, artefact removal and repair, ordered-index storage reaping, and Multi region release, deployment removal and forks.
 3. Leadership turnover: a deposed leader's in-flight snapshots against the new leader's collector.
-4. Model the production lease protocol in TLA+, including the currency anchor (a tip observation confirmed once the applied position reaches it), and verify `ReadCurrency` in Verus.
+4. Compose the currency, caller admission and provider drain with the collector under the model's clock and I/O premises. The [currency model](tla/ReadCurrencyAnchor.tla) checks competing tip samples, and [Verus](verus/read_currency/proof.rs) proves the production observation and confirmation steps.
 5. Connect the peer study `ResidenceReaderRetention` (generation cutoff vs exact dependencies) to the Multi reaper's actual release records.
 6. LIVE-2: a witness that an expired lease lets reclamation proceed, plus a mutation that blocks it.
 7. Refuse a query at admission, with a retryable `rtdb.node/catalog-not-current`, when its node cannot confirm catalog currency; today it is refused only at its first provider request.
