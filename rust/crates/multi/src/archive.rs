@@ -1247,7 +1247,7 @@ pub async fn restore(
 async fn admit_lifetime_restore(
     directory: &dyn Directory, archive: &CellStorage, keys: &dyn KeyService,
     point: &CapturePoint, manifest: &str, hosted_task: Option<&rtdb_directory::HostedTask>,
-    same_installation: bool,
+    allow_lifetime_floors: bool,
 ) -> Result<()> {
     let mut node = rtdb_node::NodeOptions::default();
     node.owned_relations = true;
@@ -1264,7 +1264,7 @@ async fn admit_lifetime_restore(
                 return Err(inconsistent("The authenticated source has another restore cut"));
             }
             let floors = read_archive_lifetime_floors(context, basis).await?;
-            if !same_installation && !floors.is_empty() {
+            if !allow_lifetime_floors && !floors.is_empty() {
                 return Err(unavailable("Fresh checkpoint replay has no original lifetime-floor transfer authority"));
             }
             Ok(())
@@ -1321,6 +1321,62 @@ async fn archive_lifetime_floors_digest(
         (table, floor.duration, floor.expired_created_through, floor.swept_present_through)
     ).collect();
     Ok(sha256(&encode(&records)?))
+}
+
+pub(crate) async fn stage_checkpoint_transfer(
+    directory: Arc<dyn Directory>, archive: &CellStorage, storage: &CellStorage, keys: &dyn KeyService,
+    request: rtdb_directory::CheckpointStageIntent, hosted_task: Option<rtdb_directory::HostedTask>,
+) -> Result<rtdb_directory::CheckpointStage> {
+    stage::stage_checkpoint_for(directory, archive, storage, keys, request, hosted_task, true).await
+}
+
+/// Issue a terminal receipt only for a previously accepted, private target
+/// stage under the original source installation's recovery authority.
+pub(crate) async fn issue_checkpoint_transfer(
+    directory: Arc<dyn Directory>, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
+    selector: StageSelector, hosted_task: Option<rtdb_directory::HostedTask>,
+) -> Result<rtdb_directory::CheckpointTransferTerminal> {
+    let (source, capture, org) = selector.source.as_ref()
+        .ok_or_else(|| inconsistent("Terminal transfer requires authenticated source authority"))?;
+    let (source, capture) = (*source, *capture);
+    let id = source.to_string();
+    let target_id = selector.destination.to_string();
+    let original = directory.deployment(&id).await?
+        .filter(|record| record.org == *org && record.parent.is_none())
+        .ok_or_else(|| inconsistent("The original transfer source is unavailable"))?;
+    if let Some(terminal) = original.checkpoint_transfer_terminal.as_deref() {
+        let stage = &terminal.fence.destination;
+        if original.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
+            || original.lifecycle != Lifecycle::Restoring || original.epoch != terminal.fence.fenced_writer_epoch
+            || stage.intent.capture != capture || stage.intent.destination != selector.destination
+            || stage.intent.operation != selector.operation
+            || stage.staged_manifest_sha256.as_deref() != Some(selector.manifest_sha256.as_str())
+            || stage.media != crate::admin::cell_media(storage, keys)?
+        {
+            return Err(inconsistent("The source already issued another terminal receipt"));
+        }
+        return Ok(terminal.clone());
+    }
+    let stage = reader::admit_transfer_destination(
+        Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
+    ).await?;
+    let point = verify_checkpoint_capture(
+        directory.as_ref(), &original, archive, keys, source, capture,
+        &stage.intent.source_manifest_sha256, hosted_task.as_ref(),
+    ).await?;
+    if point.checkpoint != stage.checkpoint || point.incarnation != stage.source_incarnation
+        || point.log_epoch != stage.source_log_epoch
+    {
+        return Err(inconsistent("The target stage has another source checkpoint"));
+    }
+    let source_version = directory.deployment(&id).await?
+        .ok_or_else(|| unavailable("The original transfer source is unavailable"))?.version;
+    let destination_version = directory.deployment(&target_id).await?
+        .ok_or_else(|| unavailable("The private transfer target is unavailable"))?.version;
+    let fence = directory.fence_checkpoint_transfer(&rtdb_directory::CheckpointTransferSelection {
+        stage, source_version, destination_version,
+    }).await?;
+    seal_checkpoint_transfer(directory.as_ref(), storage, archive, keys, hosted_task.as_ref(), &fence).await
 }
 
 /// Complete an already ordered source transfer fence. The result is a

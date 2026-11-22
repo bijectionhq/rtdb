@@ -52,7 +52,24 @@ impl ReplicaTrimPlan {
         let anchor = self.record.replica_anchor.as_deref();
         if anchor.is_none_or(|anchor| anchor.interval[1] < self.through.0) {
             let prefix = anchor.map(|anchor| JournalDigest::from_digest_bytes(stream.stream.clone(), anchor.interval, anchor.digest));
-            let proof = rtdb_logkeeper::certify_committed_prefix(&stream, self.through.0, prefix.as_ref()).await?;
+            let proof = if let Some(activation) = self.record.checkpoint_transfer_activation.as_deref() {
+                let stage = &activation.replica.bootstrap.terminal.fence.destination;
+                let first = stage.checkpoint.boundary.checked_add(1)
+                    .filter(|first| *first >= 0)
+                    .ok_or_else(|| Error::Task("The activated transfer has no exact replica genesis".into()))?;
+                if self.record.log_epoch != stage.source_log_epoch || self.through.0 < first
+                    || anchor.is_some_and(|anchor| anchor.interval[0] != first)
+                {
+                    return Ok(None);
+                }
+                if prefix.is_none() {
+                    rtdb_logkeeper::certify_committed_range(&stream, first, self.through.0).await?
+                } else {
+                    rtdb_logkeeper::certify_committed_prefix(&stream, self.through.0, prefix.as_ref()).await?
+                }
+            } else {
+                rtdb_logkeeper::certify_committed_prefix(&stream, self.through.0, prefix.as_ref()).await?
+            };
             let Some(digest) = proof.digest_bytes() else { return Ok(None); };
             let root_incarnation = anchor.map_or(self.record.incarnation, |anchor| anchor.root_incarnation);
             self.record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation, interval: proof.interval, digest }));

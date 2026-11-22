@@ -77,6 +77,7 @@ pub(crate) struct StageSelector {
     pub operation: Uuid,
     pub manifest_sha256: String,
     pub source: Option<(Uuid, Uuid, String)>,
+    pub transfer_only: bool,
 }
 
 enum Transport {
@@ -111,6 +112,7 @@ pub async fn serve_staged_checkpoint(
         operation: settings.operation,
         manifest_sha256: settings.manifest_sha256,
         source: None,
+        transfer_only: false,
     };
     serve_stage(
         directory,
@@ -164,6 +166,24 @@ async fn serve_stage(
     }).await
 }
 
+pub(super) async fn admit_transfer_destination(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    hosted_task: Option<HostedTask>,
+) -> Result<CheckpointStage> {
+    if !selector.transfer_only || selector.source.is_none() {
+        return Err(inconsistent("Terminal transfer requires a private held target stage"));
+    }
+    with_stage(directory, storage, keys, selector, hosted_task, |authority, _, verified| async move {
+        if verified.contents != CheckpointContents::Replay {
+            return Err(inconsistent("Terminal transfer requires a complete replay checkpoint"));
+        }
+        Ok(authority.stage)
+    }).await
+}
+
 async fn with_stage<T, F, Fut>(
     directory: Arc<dyn Directory>,
     storage: &CellStorage,
@@ -197,6 +217,7 @@ where
                             && &stage.intent.org == org
                     })
                 && stage.media == media
+                && stage.transfer_only == selector.transfer_only
                 && stage.staged_manifest_sha256.as_deref()
                     == Some(selector.manifest_sha256.as_str())
         })

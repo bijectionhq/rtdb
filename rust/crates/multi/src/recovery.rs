@@ -60,6 +60,16 @@ enum Action {
     RecoverCheckpoint {
         manifest_sha256: String,
     },
+    StageCheckpointTransfer {
+        source_manifest_sha256: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+    },
+    SealCheckpointTransferSource {
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+    },
     StageCheckpoint {
         source_manifest_sha256: String,
         destination: Uuid,
@@ -163,6 +173,9 @@ enum Reply {
     TransferTargetActivated {
         activation: rtdb_directory::CheckpointTransferActivation,
     },
+    TransferSourceSealed {
+        terminal: rtdb_directory::CheckpointTransferTerminal,
+    },
     TransferTargetSeeded {
         replica: rtdb_directory::CheckpointTransferReplica,
     },
@@ -250,6 +263,7 @@ impl RecoveryService {
             return Ok(Reply::Refused);
         };
         let discard = matches!(request.action, Action::DiscardCheckpointStage { .. });
+        let transfer_only = matches!(request.action, Action::StageCheckpointTransfer { .. });
         match request.action {
             Action::CaptureCheckpoint => {
                 let retained = archive::capture_receipt(
@@ -417,6 +431,11 @@ impl RecoveryService {
                 destination,
                 stage_operation,
             }
+            | Action::StageCheckpointTransfer {
+                source_manifest_sha256,
+                destination,
+                stage_operation,
+            }
             | Action::DiscardCheckpointStage {
                 source_manifest_sha256,
                 destination,
@@ -463,15 +482,15 @@ impl RecoveryService {
                         None => Reply::Deferred,
                     });
                 }
-                let stage = archive::stage_checkpoint(
-                    directory,
-                    &self.archive,
-                    &self.storage,
-                    self.keys.as_ref(),
-                    intent,
-                    self.hosted_task.clone(),
-                )
-                .await?;
+                let stage = if transfer_only {
+                    archive::stage_checkpoint_transfer(
+                        directory, &self.archive, &self.storage, self.keys.as_ref(), intent, self.hosted_task.clone(),
+                    ).await?
+                } else {
+                    archive::stage_checkpoint(
+                        directory, &self.archive, &self.storage, self.keys.as_ref(), intent, self.hosted_task.clone(),
+                    ).await?
+                };
                 let staged_manifest_sha256 = stage.staged_manifest_sha256.ok_or_else(|| {
                     Anomaly::incorrect(
                         "rtdb.multi/recovery-endpoint",
@@ -489,6 +508,26 @@ impl RecoveryService {
                     staged_manifest_sha256,
                 })
             }
+            Action::SealCheckpointTransferSource {
+                destination, stage_operation, staged_manifest_sha256,
+            } => {
+                if installation.checkpoint_stage.is_some() || destination.is_nil()
+                    || stage_operation.is_nil() || !valid_manifest(&staged_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let selector = archive::StageSelector {
+                    destination,
+                    operation: stage_operation,
+                    manifest_sha256: staged_manifest_sha256,
+                    source: Some((request.authority, request.capture, self.org.clone())),
+                    transfer_only: true,
+                };
+                let terminal = archive::issue_checkpoint_transfer(
+                    directory, &self.storage, &self.archive, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                ).await?;
+                Ok(Reply::TransferSourceSealed { terminal })
+            },
             Action::ActivateCheckpointTransferTarget {
                 destination, stage_operation, staged_manifest_sha256,
             } => {
@@ -502,6 +541,7 @@ impl RecoveryService {
                     operation: stage_operation,
                     manifest_sha256: staged_manifest_sha256,
                     source: Some((request.authority, request.capture, self.org.clone())),
+                    transfer_only: true,
                 };
                 let activation = archive::activate_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
@@ -521,6 +561,7 @@ impl RecoveryService {
                     operation: stage_operation,
                     manifest_sha256: staged_manifest_sha256,
                     source: Some((request.authority, request.capture, self.org.clone())),
+                    transfer_only: true,
                 };
                 let replica = archive::seed_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
@@ -540,6 +581,7 @@ impl RecoveryService {
                     operation: stage_operation,
                     manifest_sha256: staged_manifest_sha256,
                     source: Some((request.authority, request.capture, self.org.clone())),
+                    transfer_only: true,
                 };
                 let bootstrap = archive::verify_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
@@ -563,6 +605,7 @@ impl RecoveryService {
                     operation: stage_operation,
                     manifest_sha256: staged_manifest_sha256,
                     source: Some((request.authority, request.capture, self.org.clone())),
+                    transfer_only: false,
                 };
                 let inventory = archive::inspect_staged_owned_relations(
                     directory,
@@ -631,6 +674,7 @@ impl RecoveryService {
             operation: stage_operation,
             manifest_sha256: staged_manifest_sha256,
             source: Some((request.authority, request.capture, self.org.clone())),
+            transfer_only: false,
         };
         let mut reader = std::pin::pin!(async {
             if owned_event_files {
