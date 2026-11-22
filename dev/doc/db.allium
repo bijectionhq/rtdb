@@ -746,6 +746,7 @@ config {
 --   1. Finish the live index's block, yielding L0 tries — one per table that took rows in this block, and none at all for a table that took none.
 --      Each L0 page retains its computed metadata summary for the metadata file and releases temporary allocations for scanning that page.
 --      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
+--      The live trie writer gathers compatible document vectors from the leaf's selected positions when a field's layout changes during the block.
 --      A block cut with no transactions in it therefore writes no tries whatsoever.
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.
@@ -1822,6 +1823,9 @@ surface QueryAccess {
 
     @guarantee ColumnarScanProjection
         -- A scan preserves compatible list and struct columns as Arrow arrays when projecting selected rows.
+        -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
+        -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
+        -- Scalar evaluation within a columnar projection reads the cells referenced by the expression.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
         -- A projected dense union with compatible children retains its Arrow array when it already matches the result layout.
         -- A compatible projected array can be aligned to the result's nested fields and union legs in Arrow.

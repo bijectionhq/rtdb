@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
-use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, owned_event_batch};
+use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch};
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
@@ -342,22 +342,18 @@ impl BlockPages<'_> {
                 Err(error) => return Err(error),
             }
         }
-        let mut bound = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Page row allocation overflow"))?;
-        let mut schema_charged = Vec::new();
-        for &row in rows {
-            let source = self.table.row(row)?;
-            let schema = source.batch.arrow().schema();
-            let index = schema.index_of("op").map_err(invalid)?;
-            let (field, column) = (schema.field(index), source.batch.arrow().column(index).as_ref());
-            // Each batch derives its put type once, so only its first row is charged the schema.
-            let first = !schema_charged.iter().any(|batch| Arc::ptr_eq(batch, &source.batch));
-            let cell = if first { schema_charged.push(Arc::clone(&source.batch)); estimate_read_value_bytes(field, column, source.row)? }
-                else { rtdb_columnar::estimate_read_cell_bytes(field, column, source.row)? };
-            bound = bound.checked_add(cell).ok_or_else(|| invalid("Page allocation size overflow"))?;
-        }
+        let base = rows.len().checked_mul(std::mem::size_of::<EventRef<'_>>())
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Page row allocation overflow"))?;
+        let bound = self.table.column_types.iter().try_fold(base, |bytes, (name, ty)| {
+            bytes.checked_add(document_type_bytes(name, ty, None)?).ok_or_else(|| invalid("Page schema allocation overflow"))
+        })?;
         let _scratch = self.memory.reserve(bound)?;
-        let events = rows.iter().map(|&row| self.table.row(row)?.event()).collect::<Result<Vec<_>>>()?;
-        Ok(IndexBatch::copy_events_with_put_schema(&events, &self.table.column_types, &self.memory)?.owned.clone())
+        let events = rows.iter().map(|&row| {
+            let (chunk, offset) = self.table.locate_row(row)?;
+            let batch = &self.table.chunks[chunk].1;
+            batch.view().event_ref(offset as usize, &batch.put_field_types)
+        }).collect::<Result<Vec<_>>>()?;
+        owned_event_batch(&events, Some(self.table.column_types.clone()), true, &self.memory)
     }
 }
 
@@ -691,6 +687,38 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
         let expected = IndexBatch::copy_events_with_put_schema(&selected, live.column_types(), &memory).unwrap();
         assert_eq!(actual.batch(), expected.arrow());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn evolving_live_layouts_flush_with_column_bounded_scratch() {
+    let source = MemoryBudget::new(128 << 20);
+    let table = TableRef::new("public", "docs");
+    let make_event = |id, value| {
+        let mut document = StructFields::from([("_id".into(), Value::I64(id)), ("value".into(), value)]);
+        for column in 0..6 { document.insert(format!("payload_{column}"), Value::Binary(vec![id as u8; 1 << 17])); }
+        StoredEvent {
+            iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(document), recency: None,
+        }
+    };
+    let events = vec![make_event(2, Value::I64(2)), make_event(1, Value::Utf8("one".into()))];
+    let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
+    for event in events.iter().rev() {
+        let batch = IndexBatch::copy_events(std::slice::from_ref(event), &StructFields::new(), &source).unwrap();
+        live = live.append(&TableWrite::new(StructFields::new(), Some(batch)), event.system_from).unwrap();
+    }
+    let expected = IndexBatch::copy_events_with_put_schema(&events, live.column_types(), &source).unwrap();
+    let output = MemoryBudget::new(4 << 20);
+    assert!(IndexBatch::copy_events_with_put_schema(&events, live.column_types(), &output).is_err());
+
+    let pages = live.block_pages(&output).unwrap();
+    assert!(pages.sources.is_none());
+    let result = pages.copy(&[1, 0]).unwrap();
+    assert_eq!(result.batch(), expected.arrow());
+    drop(result);
+    drop(pages);
+    assert_eq!(output.used_bytes(), 0);
 }
 
 #[cfg(test)]

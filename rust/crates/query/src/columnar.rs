@@ -1315,6 +1315,11 @@ pub(crate) trait BatchCursor: Send {
 }
 pub(crate) type BoxBatchCursor = Box<dyn BatchCursor>;
 
+pub(crate) async fn poll_nested_batch(input: &mut dyn BatchCursor) -> Result<Option<ColumnBatch>> {
+    let mut pull = input.next_batch();
+    std::future::poll_fn(|context| stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || pull.as_mut().poll(context))).await
+}
+
 #[async_trait::async_trait]
 impl BatchCursor for crate::scan::ScanCursor {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { crate::scan::ScanCursor::next_batch(self).await }
@@ -1353,6 +1358,23 @@ impl crate::pages::PageCursor for BatchRows {
 }
 
 impl ColumnBatch {
+    pub(crate) fn slice(mut self, start: usize, count: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if count == self.len { return Ok(self); }
+        let end = start + count;
+        let scratch = self.columns.iter().filter(|column| matches!(column, Column::Selected(_))).count()
+            .checked_mul(count).and_then(|cells| cells.checked_mul(std::mem::size_of::<(usize, usize)>())).ok_or_else(size_error)?;
+        let _selection = memory.reserve(scratch)?;
+        for column in &mut self.columns {
+            match column {
+                Column::Arrow { array, .. } => *array = array.slice(start, count),
+                Column::Selected(column) => column.cells = Arc::new(column.cells[start..end].to_vec()),
+                Column::Values(values) => { values.truncate(end); values.drain(..start); }
+            }
+        }
+        self.len = count;
+        Ok(self)
+    }
+
     /// Keeps the rows `mask` selects, column by column.
     pub(crate) fn select(self, mask: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let selected = mask.iter().filter(|keep| **keep).count();
@@ -1371,17 +1393,25 @@ impl ColumnBatch {
 
 /// Filters batches, evaluating the predicate over whole columns where its shape and the columns' types allow,
 /// and row by row, exactly as the row filter does, for any batch where they don't.
-pub(crate) struct BatchFilter { input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution }
+pub(crate) struct BatchFilter { input: BoxBatchCursor, schema: rtdb_plan::Schema, stages: Vec<rtdb_plan::Expr>, execution: crate::context::Execution }
 impl BatchFilter {
-    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution) -> Self { Self { input, schema, predicate, execution } }
+    pub fn new(input: BoxBatchCursor, schema: rtdb_plan::Schema, predicate: rtdb_plan::Expr, execution: crate::context::Execution) -> Self {
+        Self::with_stages(input, schema, vec![predicate], execution)
+    }
+    pub fn with_stages(input: BoxBatchCursor, schema: rtdb_plan::Schema, stages: Vec<rtdb_plan::Expr>, execution: crate::context::Execution) -> Self {
+        Self { input, schema, stages, execution }
+    }
 }
 #[async_trait::async_trait]
 impl BatchCursor for BatchFilter {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        while let Some(batch) = self.input.next_batch().await? {
-            self.execution.context.check_cancelled()?;
-            let mask = predicate_mask(&batch, &self.predicate, &self.schema, &self.execution).await?;
-            if mask.iter().any(|keep| *keep) { return batch.select(&mask, &self.execution.context.memory).map(Some); }
+        'batches: while let Some(mut batch) = poll_nested_batch(self.input.as_mut()).await? {
+            for predicate in &self.stages {
+                let mask = predicate_mask(&batch, predicate, &self.schema, &self.execution).await?;
+                if !mask.iter().any(|keep| *keep) { continue 'batches; }
+                batch = batch.select(&mask, &self.execution.context.memory)?;
+            }
+            return Ok(Some(batch));
         }
         Ok(None)
     }
@@ -1403,22 +1433,34 @@ pub(crate) async fn predicate_mask(
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
     let scope = execution.scope()?;
     let _slots = execution.context.memory.reserve(256 + schema.len().saturating_mul(std::mem::size_of::<Value>() + 32))?;
-    let fields = predicate.referenced_columns().into_iter().map(|id| {
-        schema.position(id).ok_or_else(|| invalid("column-filter", "Predicate refers to a missing column"))
-    }).collect::<Result<Vec<_>>>()?;
+    let fields = expression_columns(predicate, schema)?;
     let mut mask = Vec::with_capacity(batch.len);
     let mut values = vec![Value::Null; batch.columns.len()];
     for row in 0..batch.len {
-        let bound = fields.iter().try_fold(256usize, |bound, &column| {
-            bound.checked_add(batch.columns[column].bound(row)?).ok_or_else(size_error)
-        })?;
-        let _row = execution.context.memory.reserve(bound)?;
-        for &column in &fields { values[column] = batch.columns[column].value(row)?; }
+        let _row = batch.load_expression_inputs(row, &fields, &mut values, &execution.context.memory)?;
         mask.push(rtdb_expr::is_true(&execution.evaluate_invocation(&scope, &invocation, &values).await?)?);
         for &column in &fields { values[column] = Value::Null; }
         scope.reset()?;
     }
     Ok(mask)
+}
+
+fn expression_columns(expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema) -> Result<Vec<usize>> {
+    expression.referenced_columns().into_iter().map(|id| {
+        schema.position(id).ok_or_else(|| invalid("column-expression", "Expression refers to a missing column"))
+    }).collect()
+}
+
+impl ColumnBatch {
+    fn load_expression_inputs(&self, row: usize, fields: &[usize], values: &mut [Value], memory: &Arc<MemoryBudget>)
+        -> Result<Arc<MemoryReservation>> {
+        let bound = fields.iter().try_fold(256usize, |bound, &column| {
+            bound.checked_add(self.columns[column].bound(row)?).ok_or_else(size_error)
+        })?;
+        let reservation = memory.reserve(bound)?;
+        for &column in fields { values[column] = self.columns[column].value(row)?; }
+        Ok(reservation)
+    }
 }
 
 /// Three-valued predicate evaluation over a batch's columns, for the predicate shapes and cell types whose
@@ -1697,6 +1739,37 @@ mod tests {
     }
     fn arrow(array: ArrayRef, scalar: ScalarType) -> Column {
         Column::Arrow { field: Arc::new(ArrowField::new("c", array.data_type().clone(), true)), array, logical: Some(LogicalType::Scalar(scalar)) }
+    }
+
+    #[tokio::test]
+    async fn scalar_projection_only_admits_its_referenced_input_cells() {
+        struct Input(Option<ColumnBatch>);
+        #[async_trait::async_trait]
+        impl BatchCursor for Input {
+            async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> { Ok(self.0.take()) }
+        }
+
+        let source = MemoryBudget::new(1 << 23);
+        let payload = "x".repeat(1 << 21);
+        let schema = Schema::new(vec![field(0, ScalarType::I64), field(1, ScalarType::Utf8)]).unwrap();
+        let batch = ColumnBatch::settled(vec![
+            arrow(Arc::new(Int64Array::from(vec![10, 20])), ScalarType::I64),
+            arrow(Arc::new(StringArray::from(vec![payload.as_str(), "small"])), ScalarType::Utf8),
+        ], 2, source.reserve(0).unwrap()).unwrap();
+        let memory = MemoryBudget::new(1 << 18);
+        let database = crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        };
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), database)].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(), &tokio_util::sync::CancellationToken::new()).unwrap();
+        let execution = crate::context::Execution { context, parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: crate::context::OuterRows::empty(&memory).unwrap(), bindings: None, analysis: None };
+        let modulo = Expr::binary(BinaryOp::Modulo, schema.fields()[0].expression(), Expr::Literal(Value::I64(3)));
+        let mut cursor = BatchExpressions::new(Box::new(Input(Some(batch))), schema, vec![modulo], execution);
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [Column::Values(values)] = page.columns.as_slice() else { panic!("Expected the evaluator's modulo results"); };
+        assert_eq!(values, &[Value::I64(1), Value::I64(2)]);
     }
 
     #[test]
@@ -2125,7 +2198,6 @@ impl BatchCursor for BatchExpressions {
         if self.clocked.is_none() { self.clocked = Some(read_clock(&self.expressions, &self.execution).await?); }
         let clocked = self.clocked.as_deref().unwrap_or_default();
         let parameters = self.execution.parameters.values();
-        let mut page = None;
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
         for (expression, kernel) in self.expressions.iter().zip(clocked) {
@@ -2153,19 +2225,22 @@ impl BatchCursor for BatchExpressions {
                 columns.push(column);
                 continue;
             }
-            if page.is_none() { page = Some(batch.rows(&self.execution.context.memory)?); }
-            let rows = page.as_ref().expect("rows were materialised for the evaluator");
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
             let scope = self.execution.scope()?;
-            let mut values = Vec::with_capacity(batch.len);
+            let _slots = self.execution.context.memory.reserve(256 + self.schema.len().saturating_mul(std::mem::size_of::<Value>() + 32))?;
+            let fields = expression_columns(expression, &self.schema)?;
+            let mut inputs = vec![Value::Null; batch.columns.len()];
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             lease.grow_to(lease.bytes().checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
-            for row in rows.rows() {
-                let value = self.execution.evaluate_invocation(&scope, &invocation, &row.values).await?;
+            let mut values = Vec::with_capacity(batch.len);
+            for row in 0..batch.len {
+                let _row = batch.load_expression_inputs(row, &fields, &mut inputs, &self.execution.context.memory)?;
+                let value = self.execution.evaluate_invocation(&scope, &invocation, &inputs).await?;
                 // The value is charged before the evaluator's scope releases what it allocated it under.
                 lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(size_error)?)?;
                 values.push(value);
+                for &column in &fields { inputs[column] = Value::Null; }
                 scope.reset()?;
             }
             columns.push(Column::Values(values));

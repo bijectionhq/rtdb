@@ -50,13 +50,16 @@ enum BatchOutput { Pages, Arrow }
 fn build_batch_input(
     runtime: Arc<EmittedRelation>, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, output: BatchOutput,
 ) -> futures::future::BoxFuture<'static, Result<Option<(crate::columnar::BoxBatchCursor, bool)>>> {
-    Box::pin(async move {
+    let mut build = Box::pin(async move {
         let relation = Arc::clone(runtime.relation());
         let context = Arc::clone(&execution.context);
         let Some((input, projected)) = build_batches_at(runtime, execution, pushdowns, output).await? else { return Ok(None); };
         let input = if output == BatchOutput::Arrow { crate::trace::wrap_batches(input, &relation, &context) } else { input };
         Ok(Some((input, projected)))
-    })
+    });
+    Box::pin(std::future::poll_fn(move |context| {
+        stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || build.as_mut().poll(context))
+    }))
 }
 
 async fn build_batches_at(
@@ -75,10 +78,25 @@ async fn build_batches_at(
             Ok(Some((batches,false)))
         }
         RelationNode::Filter { predicate,.. } => {
-            if matches!(runtime.child(0)?.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
-            let Some((batches,projected)) = build_batch_input(runtime.child(0)?,execution.child(0),pushdowns,output).await? else { return Ok(None) };
-            if projected { return Ok(None); }
-            Ok(Some((Box::new(crate::columnar::BatchFilter::new(batches,runtime.child(0)?.schema().clone(),predicate.clone(),execution)) as crate::columnar::BoxBatchCursor,false)))
+            let mut input = runtime.child(0)?;
+            let mut input_execution = execution.child(0);
+            let schema = input.schema().clone();
+            let mut stages = vec![predicate.clone()];
+            let mut state = execution.context.memory.reserve(0)?;
+            if output == BatchOutput::Pages && matches!(input.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
+            while execution.context.tracer.is_none() && let RelationNode::Filter { predicate, .. } = input.relation().node() {
+                let bound = crate::runtime_schema::local_allocation_bound(input.relation())?;
+                let lease = Arc::get_mut(&mut state).expect("Stacked filters own their reservation");
+                lease.grow_to(lease.bytes().checked_add(bound).ok_or_else(|| invalid("operator-size", "Filter stages exceed addressable memory"))?)?;
+                stages.push(predicate.clone());
+                input = input.child(0)?;
+                input_execution = input_execution.child(0);
+            }
+            let Some((batches, projected)) = build_batch_input(input, input_execution, pushdowns, output).await? else { return Ok(None); };
+            if projected && output == BatchOutput::Pages { return Ok(None); }
+            stages.reverse();
+            let filter = Box::new(crate::columnar::BatchFilter::with_stages(batches, schema, stages, execution));
+            Ok(Some((crate::columnar::retain_batch_state(filter, state), projected)))
         }
         RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
             let child = runtime.child(0)?;
@@ -107,6 +125,13 @@ async fn build_batches_at(
             let Some((left, left_projected)) = build_batch_input(left, execution.child(0), pushdowns.clone(), output).await? else { return Ok(None); };
             let Some((right, right_projected)) = build_batch_input(right, execution.child(1), pushdowns, output).await? else { return Ok(None); };
             Ok(Some((Box::new(BatchUnion { left: Some(left), right }), left_projected || right_projected)))
+        }
+        RelationNode::Limit { offset, fetch, .. } if output == BatchOutput::Arrow => {
+            let Some((input, projected)) = build_batch_input(runtime.child(0)?, execution.child(0), None, output).await? else { return Ok(None); };
+            let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+            let remaining = row_limit(fetch.as_ref(), &execution).await?;
+            let limit = BatchLimit { input: Some(input), offset, remaining, context: execution.context };
+            Ok(Some((Box::new(limit), projected)))
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow && runtime.schema().len() == 1 => {
             let Some((input, projected)) = build_batch_input(runtime.child(0)?, execution.child(0), pushdowns, output).await? else { return Ok(None); };
@@ -254,12 +279,20 @@ fn state_reservation(runtime: &Arc<EmittedRelation>, execution: &Execution) -> R
 
 /// Whether `build_batches` opens this subtree as batches, and if so whether they pass through a projection.
 fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
+    stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || batch_shape_at(runtime, output))
+}
+
+fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
     Ok(match relation.node() {
         RelationNode::Scan(scan) => (!crate::inspection::is_inspection(&scan.table.name.table) && crate::system_schema::definition(&scan.table.name.table).is_none()).then_some(false),
         RelationNode::Filter { .. } => {
-            if matches!(runtime.child(0)?.relation().node(), RelationNode::Filter { .. }) { return Ok(None); }
-            match batch_shape(&runtime.child(0)?, output)? { Some(false) => Some(false), _ => None }
+            let mut child = runtime.child(0)?;
+            while matches!(child.relation().node(), RelationNode::Filter { .. }) {
+                if output == BatchOutput::Pages { return Ok(None); }
+                child = child.child(0)?;
+            }
+            match batch_shape(&child, output)? { Some(true) if output == BatchOutput::Pages => None, shape => shape }
         }
         RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
             let child = runtime.child(0)?;
@@ -274,6 +307,7 @@ fn batch_shape(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Op
             batch_shape(&runtime.child(0)?, output)?.zip(batch_shape(&runtime.child(1)?, output)?).map(|(left, right)| left || right)
         }
         RelationNode::Distinct { .. } if output == BatchOutput::Arrow && runtime.schema().len() == 1 => batch_shape(&runtime.child(0)?, output)?,
+        RelationNode::Limit { .. } if output == BatchOutput::Arrow => batch_shape(&runtime.child(0)?, output)?,
         RelationNode::Sort { order_by, .. } | RelationNode::SortLimit { order_by, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
             if !crate::sort::batches::BatchSort::supports(child.schema(), order_by) { return Ok(None); }
@@ -757,6 +791,41 @@ impl PageCursor for Union {
 }
 
 struct BatchUnion { left: Option<crate::columnar::BoxBatchCursor>, right: crate::columnar::BoxBatchCursor }
+
+struct BatchLimit {
+    input: Option<crate::columnar::BoxBatchCursor>,
+    offset: u64,
+    remaining: Option<u64>,
+    context: Arc<crate::QueryContext>,
+}
+
+#[async_trait]
+impl crate::columnar::BatchCursor for BatchLimit {
+    async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
+        loop {
+            self.context.check_cancelled()?;
+            if self.remaining == Some(0) && self.offset == 0 { self.input = None; }
+            let Some(input) = &mut self.input else { return Ok(None); };
+            let Some(batch) = crate::columnar::poll_nested_batch(input.as_mut()).await? else { self.input = None; return Ok(None); };
+            let skipped = self.offset.min(batch.len as u64) as usize;
+            self.offset -= skipped as u64;
+            let count = self.remaining.unwrap_or(u64::MAX).min((batch.len - skipped) as u64) as usize;
+            if count == 0 { continue; }
+            if let Some(remaining) = &mut self.remaining {
+                *remaining -= count as u64;
+                if *remaining == 0 { self.input = None; }
+            }
+            return batch.slice(skipped, count, &self.context.memory).map(Some);
+        }
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        if let Some(input) = &self.input { input.trace_attributes(span); }
+    }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> {
+        self.input.as_ref().and_then(|input| input.scan_counts())
+    }
+}
+
 #[async_trait]
 impl crate::columnar::BatchCursor for BatchUnion {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
