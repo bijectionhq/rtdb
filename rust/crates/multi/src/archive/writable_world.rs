@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, now_ms};
-use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWrite, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldPointWitness, OwnedWorldWrite, TransactionStatus};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
     Timestamp, TransactionKey, Value, WorldShadow,
@@ -305,6 +305,18 @@ pub async fn commit_checkpoint_world(
     id: Uuid,
     writes: Vec<OwnedWorldWrite>,
 ) -> Result<TransactionKey> {
+    commit_checkpoint_world_checked(directory, archive, session, deployment, id, writes, Vec::new()).await
+}
+
+pub(crate) async fn commit_checkpoint_world_checked(
+    directory: &dyn Directory,
+    archive: &CellStorage,
+    session: &mut NativeSession,
+    deployment: Uuid,
+    id: Uuid,
+    writes: Vec<OwnedWorldWrite>,
+    checks: Vec<OwnedWorldPointWitness>,
+) -> Result<TransactionKey> {
     let OpenWorld {
         snapshot,
         record,
@@ -312,7 +324,7 @@ pub async fn commit_checkpoint_world(
         ..
     } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
-    let outcome = session.commit_owned_world(&record, writes).await?;
+    let outcome = session.commit_owned_world_checked(&record, writes, checks).await?;
     if !outcome.committed() {
         return Err(outcome
             .error()
@@ -325,6 +337,7 @@ pub async fn commit_checkpoint_world(
 pub struct WorldPoint {
     pub present: TransactionKey,
     pub fact: Option<WorldFact>,
+    pub(crate) witness: Option<OwnedWorldPointWitness>,
 }
 
 pub struct WorldFact {
@@ -413,22 +426,18 @@ impl OpenWorld {
     /// Outer absence allows archive fallback. A local tombstone answers absence.
     async fn read_local(
         &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, memory: &Arc<MemoryBudget>,
-    ) -> Result<Option<Option<WorldFact>>> {
-        let local = relation.in_world(self.record.id)?;
-        let Some(mut cursor) = self.snapshot.open_point_at(&local, id, Some(valid_at)).await? else {
-            return Ok(None);
+        observed: bool,
+    ) -> Result<(Option<Option<WorldFact>>, Option<OwnedWorldPointWitness>)> {
+        let read = self.snapshot.read_world_shadow(self.record.id, relation, id, valid_at, observed).await?;
+        let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory)? else {
+            return Ok((None, read.witness));
         };
-        let mut batches = Vec::new();
-        while let Some(batch) = cursor.next_batch().await? {
-            if batch.batch().num_rows() != 0 { batches.push(batch); }
-        }
-        let Some(fact) = decode_point(batches, id, memory)? else { return Ok(None); };
         let reservation = memory.reserve(WorldShadow::decode_bound(&fact.row)?)?;
         let visible = match WorldShadow::from_record(&fact.row)? {
             WorldShadow::Deleted => None,
             WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, _reservation: reservation }),
         };
-        Ok(Some(visible))
+        Ok((Some(visible), read.witness))
     }
 }
 
@@ -450,10 +459,12 @@ pub async fn read_checkpoint_world_point(
     let open = open_world(directory, archive, session, deployment, world).await?;
     let present = open.snapshot.present();
     let memory = resources.memory;
-    if let Some(fact) = open.read_local(relation, id, valid_at, memory).await? {
+    let (local, _) = open.read_local(relation, id, valid_at, memory, false).await?;
+    if let Some(fact) = local {
         open.check()?;
-        return Ok(WorldPoint { present, fact });
+        return Ok(WorldPoint { present, fact, witness: None });
     }
+    open.snapshot.check_point_purge_floor(relation, id, open.retained.basis.system_time).await?;
     let batches = read_checkpoint_owned_point(
         directory, archive, keys, hosted_task, &open.parent(deployment),
         CheckpointPoint { owner: &open.retained.owner, relation, id, valid: Some(valid) },
@@ -461,5 +472,5 @@ pub async fn read_checkpoint_world_point(
     ).await?;
     open.check()?;
     let fact = decode_point(batches.unwrap_or_default(), id, memory)?;
-    Ok(WorldPoint { present, fact })
+    Ok(WorldPoint { present, fact, witness: None })
 }

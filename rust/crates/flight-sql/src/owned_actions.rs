@@ -8,7 +8,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, TransactionStatus};
+use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldPointWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -33,6 +33,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
+pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";
 pub(crate) const COMMIT_OWNED_V3: &str = "rtdb.owned.Commit.v3";
 const MAX_RANGE_WITNESSES: usize = 32;
 const OWNED_RANGE_WITNESS: &str = "rtdb.owned.range_witness";
@@ -111,6 +112,9 @@ pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const DROP_WORLD_V1: &str = "rtdb.owned.DropWorld.v1";
 pub(crate) const FORK_WORLD_V1: &str = "rtdb.owned.ForkWorld.v1";
 pub(crate) const COMMIT_WORLD_V1: &str = "rtdb.owned.CommitWorld.v1";
+pub(crate) const COMMIT_WORLD_V2: &str = "rtdb.owned.CommitWorld.v2";
+const MAX_WORLD_WITNESSES: usize = 128;
+const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
@@ -220,6 +224,8 @@ impl Leased for OwnedReadResource {
 
 pub(crate) struct OwnedWorldReadResource {
     snapshot: Box<dyn crate::OwnedWorldRead>,
+    world: Uuid,
+    conditions: Mutex<BTreeMap<Uuid, RetainedWorldWitness>>,
     owner: ResourceOwner,
     session: String,
     database: String,
@@ -229,6 +235,45 @@ pub(crate) struct OwnedWorldReadResource {
 
 impl Leased for OwnedWorldReadResource {
     fn close(&self) { self.snapshot.close(); }
+}
+
+struct RetainedWorldWitness {
+    evidence: OwnedWorldPointWitness,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl OwnedWorldReadResource {
+    fn remember_point(&self, call: &Call, evidence: OwnedWorldPointWitness) -> Result<Uuid, Status> {
+        self.snapshot.check().map_err(status)?;
+        let mut conditions = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
+        if conditions.len() >= MAX_WORLD_WITNESSES {
+            return Err(Status::resource_exhausted("The held world read has too many point witnesses"));
+        }
+        let nonce = Uuid::new_v4();
+        if conditions.contains_key(&nonce) {
+            return Err(Status::unavailable("Could not issue an owned world point witness"));
+        }
+        let charge = call.reserve(evidence.allocation_bound())?;
+        conditions.insert(nonce, RetainedWorldWitness { evidence, _reservation: charge });
+        Ok(nonce)
+    }
+
+    fn conditions(&self, call: &Call, world: Uuid, nonces: &[u8]) -> Result<(Vec<OwnedWorldPointWitness>, Arc<MemoryReservation>), Status> {
+        self.snapshot.check().map_err(status)?;
+        if world != self.world { return Err(Status::not_found("unknown owned world point witness")); }
+        let stored = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
+        let mut seen = BTreeSet::new();
+        let mut charge = call.reserve(4096)?;
+        let conditions = nonces.chunks_exact(16).map(|bytes| {
+            let nonce = Uuid::from_slice(bytes).map_err(arrow)?;
+            if !seen.insert(nonce) { return Err(invalid("Owned world commit has a duplicate point witness")); }
+            let condition = stored.get(&nonce).ok_or_else(|| Status::not_found("unknown owned world point witness"))?;
+            let reservation = Arc::get_mut(&mut charge).expect("world commit owns its reservation");
+            reservation.grow_to(wire::add(reservation.bytes(), condition.evidence.allocation_bound())?).map_err(status)?;
+            Ok(condition.evidence.clone())
+        }).collect::<Result<_, _>>()?;
+        Ok((conditions, charge))
+    }
 }
 
 fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
@@ -375,15 +420,15 @@ impl Service {
     }
 
     pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
-        self.commit_owned(call, body, format, Vec::new()).await
+        self.commit_owned(call, body, format, Vec::new(), false).await
     }
 
-    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (length, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no witness count"))?;
         let count = usize::from(u16::from_be_bytes(*length));
-        if !(1..=MAX_RANGE_WITNESSES).contains(&count) {
-            return Err(invalid("Owned commit requires one to 32 range witnesses"));
+        if count > MAX_RANGE_WITNESSES || (count == 0 && !erase_allowed) {
+            return Err(invalid("Invalid owned commit range witness count"));
         }
         let _framing = call.reserve(count * 512)?;
         let mut witnesses = Vec::with_capacity(count);
@@ -399,10 +444,10 @@ impl Service {
                 .map(|witness| witness.evidence.clone()).ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
             witnesses.push((held, witness));
         }
-        self.commit_owned(call, body, CommitFormat::Grouped, witnesses).await
+        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed).await
     }
 
-    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses) -> Result<ActionResult, Status> {
+    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -426,7 +471,7 @@ impl Service {
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
             let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
-            self.append_owned_commit_group(&mut writes, &relation, rows)?;
+            self.append_owned_commit_group(&mut writes, &relation, rows, erase_allowed)?;
             retained.push((operations_charge, documents_charge));
         }
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
@@ -437,6 +482,7 @@ impl Service {
         writes: &mut Vec<TxOp>,
         relation: &OwnedRelation,
         rows: Vec<rtdb_types::StructFields<Value>>,
+        erase_allowed: bool,
     ) -> Result<(), Status> {
         for mut row in rows {
             strip_owned_absence(&mut row)?;
@@ -469,6 +515,12 @@ impl Service {
                 "delete" => {
                     if has_payload(&row) { return Err(invalid("Owned delete carries document values")); }
                     TxOp::OwnedDelete { relation: relation.clone(), id, valid_from, valid_to }
+                }
+                "erase" if erase_allowed => {
+                    if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
+                        return Err(invalid("Owned erase requires only a typed identity and optional observation"));
+                    }
+                    TxOp::OwnedErase { relation: relation.clone(), id }
                 }
                 _ => return Err(invalid("Unknown owned commit operation")),
             };
@@ -1048,13 +1100,14 @@ impl Service {
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             crate::WorldPoint { world: Uuid::from_bytes(*world), relation: &relation, id: &id, valid_at },
         ).await.map_err(status)?;
-        self.world_point_reply(call, result, valid_at)
+        self.world_point_reply(call, result, valid_at, None)
     }
 
     pub(crate) async fn open_world_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let world: [u8; 16] = body.try_into().map_err(|_| invalid("Owned world read open requires a world UUID"))?;
+        let bytes: [u8; 16] = body.try_into().map_err(|_| invalid("Owned world read open requires a world UUID"))?;
+        let world = Uuid::from_bytes(bytes);
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
@@ -1066,14 +1119,15 @@ impl Service {
         require_idle(&session)?;
         let snapshot = host.open_world_read(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(world),
+            world,
         ).await.map_err(status)?;
         let handle = Uuid::new_v4();
         let mut reply = Vec::with_capacity(24);
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.present().0.to_be_bytes());
         let held = Arc::new(OwnedWorldReadResource {
-            snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
+            snapshot, world, conditions: Mutex::new(BTreeMap::new()),
+            owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             _permit: permit, _reservation: reservation,
         });
         self.0.owned_world_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
@@ -1094,11 +1148,12 @@ impl Service {
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
-        let result = held.snapshot.read_point(&relation, &id, valid_at).await.map_err(status)?;
+        let mut result = held.snapshot.read_point(&relation, &id, valid_at).await.map_err(status)?;
         if result.present != held.snapshot.present() {
             return Err(Status::internal("Owned world point changed its held present"));
         }
-        let reply = self.world_point_reply(call, result, valid_at)?;
+        let nonce = result.witness.take().map(|evidence| held.remember_point(call, evidence)).transpose()?;
+        let reply = self.world_point_reply(call, result, valid_at, nonce)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }
@@ -1113,7 +1168,8 @@ impl Service {
         Ok(())
     }
 
-    fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp) -> Result<ActionResult, Status> {
+    fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>) -> Result<ActionResult, Status> {
+        let metadata = nonce.into_iter().map(|nonce| (WORLD_POINT_WITNESS.into(), nonce.simple().to_string())).collect();
         if let Some(row) = result.row {
             let crate::WorldPointRow { fields: row, revision, reservation: _retained } = row;
             let bytes = Value::document_retained_bytes(&row).map_err(status)?;
@@ -1125,11 +1181,11 @@ impl Service {
                 fields.push(rtdb_columnar::to_field(name, &logical).map_err(status)?);
                 columns.push(rtdb_columnar::build_array(&logical, std::slice::from_ref(value)).map_err(status)?);
             }
-            let schema = Arc::new(Schema::new(fields));
+            let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
             self.owned_point_reply(&schema, Some(&batch), result.present, valid_at, Some(revision))
         } else {
-            self.owned_point_reply(&Schema::empty(), None, result.present, valid_at, None)
+            self.owned_point_reply(&Schema::empty().with_metadata(metadata), None, result.present, valid_at, None)
         }
     }
 
@@ -1166,13 +1222,29 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::copy_from_slice(world.as_bytes()), reply_charge) })
     }
 
-    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_world_action(&self, call: &Call, body: &[u8], conditional: bool) -> Result<ActionResult, Status> {
         use rtdb_node::OwnedWorldWrite;
         use rtdb_types::{Interval, WorldShadow};
 
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
+        let world = Uuid::from_bytes(*world);
+        let (held, checks, _condition_charge, groups) = if conditional {
+            let (handle, rest) = groups.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no held handle"))?;
+            let (count, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned world commit has no witness count"))?;
+            let count = usize::from(u16::from_be_bytes(*count));
+            if !(1..=MAX_WORLD_WITNESSES).contains(&count) {
+                return Err(invalid("Owned world commit requires one to 128 point witnesses"));
+            }
+            let (nonces, groups) = rest.split_at_checked(count * 16)
+                .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
+            let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+            let (checks, charge) = held.conditions(call, world, nonces)?;
+            (Some(held), checks, Some(charge), groups)
+        } else {
+            (None, Vec::new(), None, groups)
+        };
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let mut writes = Vec::new();
         let mut reservations = Vec::new();
@@ -1223,9 +1295,10 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
+        if let Some(held) = held.as_ref() { held.snapshot.check().map_err(status)?; }
         let committed = host.commit_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            Uuid::from_bytes(*world), writes,
+            world, writes, checks,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }

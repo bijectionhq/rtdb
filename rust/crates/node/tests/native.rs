@@ -580,6 +580,52 @@ async fn normal_owned_points_and_commits_keep_colliding_full_ids_independent() {
 }
 
 #[tokio::test]
+async fn owned_erase_revokes_old_holds_without_erasing_a_colliding_identity() {
+    use rtdb_types::{EntityId, OwnedChangeKind, OwnedRelation};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("ordered-purge").unwrap();
+    let retained = EntityId::String("same-canonical-iid".into());
+    let erased = EntityId::Uuid(retained.iid().0);
+    let documents = Documents::new([&retained, &erased].into_iter().map(|id| StructFields::from([
+        ("_id".into(), id.as_value()), ("payload".into(), Value::I64(1)),
+    ])).collect(), node.memory()).unwrap();
+    let initial = session.state_mut().execute_tx(vec![TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents, valid_from: None, valid_to: None,
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert!(initial.committed(), "{:?}", initial.error());
+
+    let before = session.open_owned_read().await.unwrap();
+    let old_valid = before.present().system_time;
+    let purge = session.state_mut().execute_tx(vec![
+        TxOp::OwnedCheck { relation: relation.clone(), id: erased.clone(), valid_at: old_valid, expected: Some(initial.tx_key().system_time) },
+        TxOp::OwnedErase { relation: relation.clone(), id: erased.clone() },
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(purge.committed(), "{:?}", purge.error());
+    assert!(before.check().is_err());
+
+    let after = session.open_owned_read().await.unwrap();
+    assert!(rows(after.open_point(&relation, &erased).await.unwrap().unwrap()).await.is_empty());
+    assert_eq!(rows(after.open_point(&relation, &retained).await.unwrap().unwrap()).await[0][0], retained.as_value());
+    assert!(after.open_historical_point(&relation, &erased, old_valid, old_valid).await.is_err());
+    assert!(after.open_historical_point(&relation, &retained, old_valid, old_valid).await.unwrap().is_some());
+    let changes = after.changes(&relation, old_valid, 1).await.unwrap();
+    assert_eq!(changes.groups.len(), 1);
+    assert_eq!(changes.groups[0].system_time, purge.tx_key().system_time);
+    assert_eq!(changes.groups[0].touches.len(), 1);
+    assert_eq!(changes.groups[0].touches[0].kind, OwnedChangeKind::Erase);
+    assert_eq!(changes.groups[0].touches[0].id, erased);
+
+    drop(after);
+    drop(before);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
     use rtdb_types::{EntityId, OwnedRelation};
 
@@ -664,6 +710,13 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
     let over = session.state_mut().execute_tx(vec![insert(&relation, 3, vec![7, 3])],
         AutonomousTxOptions::default()).await.unwrap();
     assert_eq!(over.error().unwrap().code, "rtdb.owned/capacity-exceeded");
+    let erase = session.state_mut().execute_tx(vec![TxOp::OwnedErase {
+        relation: relation.clone(), id: EntityId::Integer(2),
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(erase.error().unwrap().code, "rtdb.owned/purge-path-uncovered");
+    let still_full = session.state_mut().execute_tx(vec![insert(&relation, 3, vec![7, 3])],
+        AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(still_full.error().unwrap().code, "rtdb.owned/capacity-exceeded");
     let outcome = session.state_mut().execute_tx(vec![
         insert(&relation, 3, vec![7, 3]), delete(1, None), insert(&relation, 4, vec![8, 4]),
         insert(&other, 1, vec![7, 1]),

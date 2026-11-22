@@ -154,7 +154,7 @@ impl DmlBuffer {
     fn append(&mut self, operation: TxOp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let bytes = match &operation {
             TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } => relation.name().len(),
-            TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } => relation.name().len()
+            TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } => relation.name().len()
                 .checked_add(id.as_value().retained_bytes()?).ok_or_else(allocation_overflow)?,
             TxOp::OwnedDeclareSearchPath { relation, name, column } | TxOp::OwnedDeclareUniquePath { relation, name, column } =>
                 (relation.name().len() + name.name().len()).checked_add(column.capacity()).ok_or_else(allocation_overflow)?,
@@ -164,7 +164,7 @@ impl DmlBuffer {
             TxOp::OwnedDeclarePath { relation, name, columns } => columns.iter().try_fold(
                 relation.name().len() + name.name().len(), |bytes, column| bytes.checked_add(column.capacity() + 64).ok_or_else(allocation_overflow),
             )?,
-            TxOp::OwnedDeadline { .. } => 0,
+            TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } => 0,
             TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),
             TxOp::OwnedCheckRange { relation, fixed, .. } =>
                 relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes()),

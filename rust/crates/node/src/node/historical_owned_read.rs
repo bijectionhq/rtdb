@@ -9,6 +9,7 @@ use super::OwnedReadSession;
 pub(super) struct Scope {
     pub(super) system_time: Timestamp,
     pub(super) relations: BTreeSet<OwnedRelation>,
+    pub(super) purge_context: Arc<rtdb_query::QueryContext>,
 }
 
 const MAX_SCOPE_RELATIONS: usize = 32;
@@ -69,9 +70,13 @@ impl OwnedReadSession {
         if selected > requested || floor.is_some_and(|floor| selected < floor) {
             return Err(unavailable());
         }
+        self.check_point_purge_floor(publication, marker, selected).await?;
         let context = self
             .context
             .with_owned_system_cut(selected, &cancellation)?;
+        let purge_context = self
+            .context
+            .with_owned_system_cut(self.present.system_time, &cancellation)?;
         self.check()?;
         context.check_cancelled()?;
         Ok(Some(Self {
@@ -88,6 +93,7 @@ impl OwnedReadSession {
             historical: Some(Scope {
                 system_time: selected,
                 relations,
+                purge_context,
             }),
             _reservation: charge,
         }))

@@ -47,6 +47,11 @@ pub(crate) async fn retire_capture(
                 return require_same_release(prior, &archive, manifest);
             }
             require_capture_open(record, capture)?;
+            if record.checkpoint_suffix_pins.values().any(|pin| {
+                pin.capture == capture && pin.expires_at_ms > now_ms()
+            }) {
+                return Err(inconsistent("A live suffix pin retains this checkpoint capture"));
+            }
             if record.checkpoint_worlds.values().any(|world| {
                 world.capture == capture && world.until.0 > now_ms().saturating_mul(1000)
             }) {

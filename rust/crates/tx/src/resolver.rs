@@ -382,6 +382,7 @@ pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Abort
 #[derive(Default)]
 struct PendingOwnedChanges {
     bytes: usize,
+    erased: bool,
     touches: Vec<Value>,
     reservations: Vec<Arc<MemoryReservation>>,
 }
@@ -392,10 +393,11 @@ pub struct OpenTransaction<'a> {
     capacity_changes: OwnedCapacityChanges,
     owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
+    purge_recorded: bool,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_world: None, owned_changes: BTreeMap::new() })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_world: None, owned_changes: BTreeMap::new(), purge_recorded: false })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -653,7 +655,9 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, false).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
-            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedErase { relation, id }) =>
+                self.erase_owned(relation, id).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
@@ -753,6 +757,9 @@ impl<'a> OpenTransaction<'a> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let target = relation.table(owner);
+        if self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
+            return Err(purge_path_uncovered());
+        }
         let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
         let declaration = self.read_owned_schema(owner, relation).await?;
         let snapshot = self.snapshot()?;
@@ -858,6 +865,15 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         for operation in operations {
+            if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
+                if self.owned_world.is_none() || deadline.is_none()
+                    || Some(*scope) != source_scope || Some(*scope) != self.context.owned_witness_scope
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
+                        "Owned world point witness is no longer admissible"));
+                }
+                continue;
+            }
             if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, fixed }) = operation {
                 let base = self.buffer.base_snapshot();
                 let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",
@@ -921,6 +937,63 @@ impl<'a> OpenTransaction<'a> {
                 Ok(locator)
             }
         }
+    }
+
+    async fn erase_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> Result<()> {
+        use rtdb_types::{EntityId, OwnedChangeKind, OwnedRelation};
+        let options = self.options;
+        let owner = options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        let snapshot = self.snapshot()?;
+        if snapshot.contains_table(&relation.unique_table(owner)) || snapshot.contains_table(&relation.capacity_table(owner)) {
+            return Err(purge_path_uncovered());
+        }
+        let table = relation.table(owner);
+        let ordered = self.tx_key();
+        let context = self.context.query_context(snapshot, ordered.system_time, &self.options.default_tz, self.trace_parent)?;
+        for catalog in [OwnedRelation::path_catalog(owner), OwnedRelation::search_catalog(owner)] {
+            let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, None).await? else { continue; };
+            while let Some(batch) = rows.next_batch().await? {
+                let batch = batch.batch();
+                for row in 0..batch.num_rows() {
+                    let read = |name| {
+                        let (slot, field) = batch.schema_ref().column_with_name(name).ok_or_else(purge_path_uncovered)?;
+                        let array = batch.column(slot).as_ref();
+                        let bound = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
+                        let _charge = self.context.memory.reserve(bound.saturating_add(4096))?;
+                        rtdb_columnar::read_value(field, array, row)
+                    };
+                    let (Value::Utf8(schema), Value::Utf8(name)) = (read("schema_name")?, read("table_name")?) else {
+                        return Err(purge_path_uncovered());
+                    };
+                    if table.schema == schema && table.table == name { return Err(purge_path_uncovered()); }
+                }
+            }
+        }
+        let locator = match rtdb_query::owned_address(context, owner, relation, id).await? {
+            rtdb_query::OwnedAddress::Assigned(locator) => locator,
+            rtdb_query::OwnedAddress::Vacant(_) => return Err(Anomaly::incorrect(
+                "rtdb.owned/purge-unassigned", "Owned erase requires a permanently assigned identity",
+            )),
+        };
+        // Verify any current valid slice belongs to this exact typed identity before erasing its locator.
+        self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+        self.record_owned_change(relation, id.clone(), OwnedChangeKind::Erase, Interval::ALL)?;
+        self.buffer.erase(table, &EntityId::Uuid(locator.0))?;
+        self.buffer.put(relation.address_table(owner), StructFields::from([
+            ("_id".into(), Value::Uuid(locator.0)),
+            ("address".into(), id.as_value()),
+            ("purged_at".into(), Value::I64(ordered.system_time.0)),
+        ]), Interval::ALL)?;
+        if !self.purge_recorded {
+            self.buffer.put(OwnedRelation::purge_catalog(owner), StructFields::from([
+                ("_id".into(), Value::I64(ordered.tx_id.0)),
+            ]), Interval::ALL)?;
+            self.purge_recorded = true;
+        }
+        Ok(())
     }
 
     async fn delete_owned(&mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
@@ -1077,15 +1150,25 @@ impl<'a> OpenTransaction<'a> {
         kind: rtdb_types::OwnedChangeKind, valid: Interval,
     ) -> Result<()> {
         let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
-        let entry = rtdb_types::OwnedChange { id, kind, valid }.to_value();
-        let bytes = entry.retained_bytes()?.checked_add(128).ok_or_else(too_large)?;
+        use rtdb_types::{OwnedChange, OwnedChangeKind};
         let group = self.owned_changes.entry(relation.name().to_owned()).or_default();
+        if group.erased || kind == OwnedChangeKind::Erase {
+            for previous in &group.touches {
+                let previous = OwnedChange::from_value(previous)?;
+                if previous.id == id && (kind == OwnedChangeKind::Erase || previous.kind == OwnedChangeKind::Erase) {
+                    return Err(Anomaly::incorrect("rtdb.owned/purge-overlap", "Owned erase cannot share its identity with another mutation in the same commit"));
+                }
+            }
+        }
+        let entry = OwnedChange { id, kind, valid }.to_value();
+        let bytes = entry.retained_bytes()?.checked_add(128).ok_or_else(too_large)?;
         let group_bytes = group.bytes.checked_add(bytes).filter(|size| *size <= rtdb_types::OWNED_CHANGE_GROUP_BYTES)
             .ok_or_else(too_large)?;
         let charge = self.context.memory.reserve(bytes)?;
         group.touches.push(entry);
         group.reservations.push(charge);
         group.bytes = group_bytes;
+        group.erased |= kind == OwnedChangeKind::Erase;
         Ok(())
     }
 
@@ -1287,6 +1370,10 @@ fn validate_owned_schema(schema: &rtdb_types::OwnedSchema, row: &StructFields<Va
         rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))?;
     }
     Ok(())
+}
+
+fn purge_path_uncovered() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/purge-path-uncovered", "Owned erase is unsupported while the relation has a governed path")
 }
 
 fn no_owned_principal() -> Anomaly {

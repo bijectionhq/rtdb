@@ -50,9 +50,11 @@ impl HeldCheckpointWorld {
     pub async fn point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
         self.check()?;
         let valid = Interval::at(valid_at)?;
-        let fact = if let Some(fact) = self.open.read_local(relation, id, valid_at, &self.memory).await? {
+        let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, true).await?;
+        let fact = if let Some(fact) = local {
             fact
         } else {
+            self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
             let (reply, result) = oneshot::channel();
             self.cancellation.run_until_cancelled(self.requests.send(ArchivePoint {
                 relation: relation.clone(), id: id.clone(), valid, reply,
@@ -61,7 +63,7 @@ impl HeldCheckpointWorld {
                 .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??
         };
         self.check()?;
-        Ok(WorldPoint { present: self.present(), fact })
+        Ok(WorldPoint { present: self.present(), fact, witness })
     }
 }
 

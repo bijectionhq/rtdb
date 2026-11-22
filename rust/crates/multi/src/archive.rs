@@ -77,7 +77,7 @@ pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod read_world;
 mod writable_world;
-pub(crate) use writable_world::{HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
+pub(crate) use writable_world::{commit_checkpoint_world_checked, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub use writable_world::{WorldFact, WorldPoint, commit_checkpoint_world, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, require_capture_open, retire_capture};
@@ -866,7 +866,8 @@ pub(crate) async fn copy_fork_checkpoint(
 /// Copies the closure of one already published checkpoint. A capture ID
 /// fixes the checkpoint before any payload copy. An interrupted copy can
 /// resume from its accepted archive or while a source admission still
-/// protects its original checkpoint metadata.
+/// protects its original checkpoint metadata. A flush receipt fixes the exact
+/// adopted root. The admission that binds its archive also pins that root.
 pub async fn capture(
     directory: Arc<dyn Directory>,
     storage: &CellStorage,
@@ -919,21 +920,33 @@ async fn capture_checkpoint(
         {
             return Err(unavailable("The installation cannot be captured"));
         }
+        let selected = if let Some(flushed) = flushed {
+            let cut = flushed.checkpoint.filter(|cut| cut.root_sha256.is_some())
+                .ok_or_else(|| unavailable("The selected source cut has no exact published root"))?;
+            if record.id != flushed.id || record.incarnation != flushed.incarnation
+                || record.log_epoch != flushed.log_epoch
+            {
+                return Err(unavailable("The selected source cut belongs to another installation lifetime"));
+            }
+            Some(cut)
+        } else {
+            None
+        };
         if let Some(registered) = record.checkpoint_captures.get(&operation) {
             if registered.archive != binding || registered.incarnation != record.incarnation
                 || registered.log_epoch != record.log_epoch
             {
                 return Err(inconsistent("The capture operation already names another archive or lifetime"));
             }
+            if selected.is_some_and(|cut| cut != registered.checkpoint) {
+                return Err(inconsistent("The capture operation already names another checkpoint"));
+            }
         } else {
-            if let Some(flushed) = flushed
-                && (record.id != flushed.id || record.incarnation != flushed.incarnation
-                    || record.log_epoch != flushed.log_epoch
-                    || !record.checkpoint.zip(flushed.checkpoint).is_some_and(|(current, cut)| {
-                        current.block >= cut.block && current.source >= cut.source
-                    }))
+            if let Some(cut) = selected
+                && (record.checkpoint != Some(cut)
+                    || flushed.is_some_and(|source| record.epoch != source.epoch || record.holder != source.holder))
             {
-                return Err(inconsistent("The capture no longer reaches its flushed source cut"));
+                return Err(unavailable("The selected source cut changed before archive admission"));
             }
             if record.checkpoint_repair_receipts.contains_key(&operation) {
                 return Err(inconsistent("The capture operation has a repair in another residence"));
@@ -1222,6 +1235,9 @@ pub(crate) async fn restore_checkpoint(
             return Ok(());
         }
         require_capture_open(record, operation)?;
+        if record.has_live_suffix_pins(rtdb_directory::now_ms()) {
+            return Err(unavailable("A live suffix pin still retains serving history"));
+        }
         if !same_incarnation(record, &point)
             || record.checkpoint != Some(point.checkpoint)
             || record.move_from.is_some()
@@ -1328,6 +1344,9 @@ pub(crate) async fn begin_retirement_at(
         }
         if record.lifecycle != Lifecycle::Deleted || record.disposal.is_none() {
             return Err(inconsistent("Recovery retirement requires a serving disposal receipt"));
+        }
+        if record.has_live_suffix_pins(rtdb_directory::now_ms()) {
+            return Err(unavailable("A live suffix pin retains an archived checkpoint"));
         }
         if record.checkpoint_worlds.values().any(|world| world.until.0 > rtdb_directory::now_ms().saturating_mul(1000)) {
             return Err(unavailable("A live world still retains an archived checkpoint"));

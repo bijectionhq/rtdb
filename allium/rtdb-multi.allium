@@ -7,6 +7,8 @@
 -- Hosted world writes use the retained schema and the ordered registration's lifetime.
 -- A held world point handle keeps one ordered local capture and one verified archive region until bounded expiry or close.
 -- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
+-- A held point condition preserves the local shadow revision, including a tombstone, or verified local absence.
+-- Ordered conditional world writes validate the witnessed placement, deadline and all local conditions before applying effects.
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
 -- A deployment is one RTDB database belonging to one customer application.
