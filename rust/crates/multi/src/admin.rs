@@ -220,6 +220,27 @@ pub async fn flush_checkpoint(directory: &dyn Directory, original: &DeploymentRe
     }
 }
 
+pub(crate) async fn pin_checkpoint_suffix(
+    directory: &dyn Directory, installation: &DeploymentRecord, control: &ControlKey,
+    capture: uuid::Uuid, lease: uuid::Uuid, basis: rtdb_types::TransactionKey, expires_at_ms: i64,
+) -> Result<()> {
+    let unavailable = || Anomaly::new(
+        AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
+        "The installation did not pin the requested checkpoint suffix",
+    );
+    let holder = installation.holder.as_ref().ok_or_else(unavailable)?;
+    let address = control_address(&members(directory).await?, holder)?;
+    let response = expect(&address, Request::PinCheckpointSuffix {
+        name: installation.name.clone(), deployment: installation.id.parse().map_err(|_| unavailable())?,
+        capture, lease, basis, expires_at_ms,
+    }, control).await?;
+    match response {
+        Response::CheckpointSuffixPinned { pin } if pin.capture == capture && pin.basis == basis
+            && pin.expires_at_ms == expires_at_ms => Ok(()),
+        _ => Err(unavailable()),
+    }
+}
+
 /// Reserves the next claim for `target` during the handoff.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     move_from_holding(directory, name, target, None, control).await
@@ -1172,7 +1193,7 @@ async fn prepare_cell_move(
         if record.has_live_suffix_pins(now_ms()) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
         }
-        record.checkpoint_suffix_pins.clear();
+        record.checkpoint_suffix_pins.retain(|_, pin| pin.archive_sha256.is_some());
         record.lifecycle = Lifecycle::Moving;
         record.epoch = record.epoch.checked_add(1).ok_or_else(|| {
             Anomaly::fault("rtdb.multi/epoch-exhausted", format!("Installation {} has no remaining writer epochs", record.id))
@@ -1218,6 +1239,7 @@ async fn prepare_cell_move(
         staged.checkpoint_recovery = None;
         staged.checkpoint_captures.clear();
         staged.checkpoint_worlds.clear();
+        staged.checkpoint_suffix_pins.clear();
         staged.checkpoint_capture_retirements.clear();
         staged.archive_retirement = None;
         staged.retired_residences.clear();
@@ -1232,6 +1254,7 @@ async fn prepare_cell_move(
             if prior.archive_retirement.is_none() {
                 staged.checkpoint_captures.clone_from(&prior.checkpoint_captures);
                 staged.checkpoint_worlds.clone_from(&prior.checkpoint_worlds);
+                staged.checkpoint_suffix_pins.clone_from(&prior.checkpoint_suffix_pins);
                 staged.checkpoint_capture_retirements.clone_from(&prior.checkpoint_capture_retirements);
             }
         }
@@ -1444,7 +1467,7 @@ async fn begin_disposal_at(directory: &dyn Directory, id: &str, incarnation: Opt
         if record.has_live_suffix_pins(now_ms()) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-pinned", "A live checkpoint suffix pin retains this residence"));
         }
-        record.checkpoint_suffix_pins.clear();
+        record.checkpoint_suffix_pins.retain(|_, pin| pin.archive_sha256.is_some());
         match record.lifecycle {
             Lifecycle::Deleted if record.disposal.is_some() => Ok(()),
             Lifecycle::Deleting => Ok(()),

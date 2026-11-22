@@ -555,6 +555,8 @@ pub struct CheckpointWorldRetention {
     pub manifest_sha256: String,
     #[serde(default)]
     pub schema_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<uuid::Uuid>,
     pub basis: rtdb_types::TransactionKey,
     pub until: rtdb_types::Timestamp,
 }
@@ -576,6 +578,9 @@ pub struct CheckpointSuffixPin {
     pub journal_interval: [i64; 2],
     pub journal_sha256: [u8; 32],
     pub expires_at_ms: i64,
+    /// Accepted ciphertext digest after independent archive publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
 }
 
 /// The original archive's release fence, including IDs cancelled before copy.

@@ -109,6 +109,100 @@ pub async fn certify_committed_prefix(config: &StreamConfig, through: i64, prefi
     Ok(JournalDigest { stream: config.stream.clone(), interval: [start, through], digest })
 }
 
+/// Certifies exactly this retained interval, seeded at its first offset.
+pub async fn certify_committed_range(config: &StreamConfig, first: i64, through: i64) -> Result<JournalDigest> {
+    validate(config)?;
+    if first < 0 || through < first { return Err(range_unavailable()); }
+    let ensemble = Ensemble::new(config.clone());
+    let mut proofs = (0..ensemble.len()).map(|server| {
+        let ensemble = &ensemble;
+        async move {
+            let status = ensemble.read(server, 0, 0, Duration::ZERO).await?;
+            if status.trim_lsn >= first || status.commit_lsn < through { return Err(range_unavailable()); }
+            durable_chain(ensemble, server, first, through, None).await
+        }
+    }).collect::<FuturesUnordered<_>>();
+    let mut accepted = None;
+    let mut agreeing = 0;
+    while let Some(result) = proofs.next().await {
+        let digest = match result {
+            Ok(digest) => digest,
+            Err(error) if error.category == AnomalyCategory::Unavailable => continue,
+            Err(error) => return Err(error),
+        };
+        if accepted.as_ref().is_some_and(|previous| previous != &digest) {
+            return Err(Anomaly::fault("rtdb.logkeeper/audit-divergence", "Replicas disagree on the retained interval"));
+        }
+        accepted = Some(digest);
+        agreeing += 1;
+    }
+    let digest = accepted.filter(|_| agreeing >= config.write_quorum).ok_or_else(range_unavailable)?;
+    Ok(JournalDigest { stream: config.stream.clone(), interval: [first, through], digest })
+}
+
+fn range_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/retained-range-unavailable", "The exact committed interval is unavailable")
+}
+
+/// Reads one complete retained copy whose raw bytes match the exact-range certificate.
+pub async fn copy_certified_range(
+    config: &StreamConfig, certificate: &JournalDigest, maximum_bytes: usize, maximum_entries: usize,
+) -> Result<Vec<crate::protocol::Entry>> {
+    validate(config)?;
+    let [first, through] = certificate.interval;
+    let count = through.checked_sub(first).and_then(|difference| difference.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok()).filter(|count| *count > 0 && *count <= maximum_entries)
+        .ok_or_else(range_unavailable)?;
+    if certificate.stream != config.stream || first < 0 { return Err(range_unavailable()); }
+    let ensemble = Ensemble::new(config.clone());
+    for server in 0..ensemble.len() {
+        let copy = async {
+            let mut retained = Vec::with_capacity(count);
+            let mut remaining = maximum_bytes;
+            let mut next = first;
+            let mut chain = RetainedChain::new(&config.stream, first);
+            while retained.len() < count {
+                let limit = u32::try_from(count - retained.len()).unwrap_or(u32::MAX).min(MAXIMUM_BATCH_ENTRIES);
+                let page = ensemble.read(server, next, limit, Duration::ZERO).await?;
+                if next <= page.trim_lsn || page.commit_lsn < through || page.entries.is_empty() {
+                    return Err(range_unavailable());
+                }
+                for entry in page.entries {
+                    if entry.lsn != next || entry.lsn > through { return Err(range_unavailable()); }
+                    remaining = remaining.checked_sub(entry.payload.len().saturating_add(64)).ok_or_else(range_unavailable)?;
+                    chain.append(&entry);
+                    retained.push(entry);
+                    if next == through { break; }
+                    next += 1;
+                }
+            }
+            if chain.digest() != certificate.digest { return Err(range_unavailable()); }
+            Ok::<_, Anomaly>(retained)
+        }.await;
+        if let Ok(entries) = copy { return Ok(entries); }
+    }
+    Err(range_unavailable())
+}
+
+/// Rechecks archived records against their exact interval in the original replica stream.
+pub fn verify_certified_range(certificate: &JournalDigest, entries: &[crate::protocol::Entry]) -> Result<()> {
+    let [first, through] = certificate.interval;
+    if first < 0 || entries.first().map(|entry| entry.lsn) != Some(first)
+        || entries.last().map(|entry| entry.lsn) != Some(through)
+    {
+        return Err(range_unavailable());
+    }
+    let mut chain = RetainedChain::new(&certificate.stream, first);
+    for (index, entry) in entries.iter().enumerate() {
+        if first.checked_add(i64::try_from(index).map_err(|_| range_unavailable())?) != Some(entry.lsn) {
+            return Err(range_unavailable());
+        }
+        chain.append(entry);
+    }
+    if chain.digest() != certificate.digest { return Err(range_unavailable()); }
+    Ok(())
+}
+
 async fn durable_chain(ensemble: &Ensemble, server: usize, mut from: i64, through: i64, mut preceding_digest: Option<[u8; 32]>) -> Result<String> {
     loop {
         let page = ensemble.digest_page(server, from, through, preceding_digest).await?;
