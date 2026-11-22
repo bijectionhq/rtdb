@@ -135,29 +135,6 @@ impl CellStorage {
         config.versioned_inventory(&root, &remotes).await
     }
 
-    pub(crate) async fn purge_serving_inventory(
-        &self,
-        deployment: &rtdb_storage::ObjectKey,
-    ) -> rtdb_types::Result<rtdb_directory::ServingInventory> {
-        match self {
-            Self::Local { .. } => Ok(rtdb_directory::ServingInventory::LocalDirectory),
-            Self::S3 { config } => {
-                Self::s3_inventory(config).await?.purge(deployment).await?;
-                Ok(rtdb_directory::ServingInventory::S3VersionsAndUploads)
-            }
-        }
-    }
-
-    pub(crate) async fn purge_inventory(&self, deployment: &ObjectKey) -> Result<rtdb_directory::DeletionInventory> {
-        match self {
-            Self::Local { .. } => Ok(rtdb_directory::DeletionInventory::CurrentObjects),
-            Self::S3 { config } => {
-                Self::s3_inventory(config).await?.purge(deployment).await?;
-                Ok(rtdb_directory::DeletionInventory::AllVersionsAndMultipartUploads)
-            }
-        }
-    }
-
     pub(crate) fn cleanup_contains(&self, other: &Self, deployment: &ObjectKey) -> Result<bool> {
         match (self, other) {
             (Self::Local { root }, Self::Local { root: other_root }) => {

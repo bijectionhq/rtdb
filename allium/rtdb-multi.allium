@@ -2304,7 +2304,11 @@ rule RefreshScopedS3Session {
 rule TransferSharedObjects {
     -- Disposal closes fork publication under the current version of the drained physical residence.
     -- The close advances the lineage generation and survives interrupted attempts.
-    -- The referrer inventory is loaded after the close. Each surviving referrer receives the bytes under its own prefix.
+    -- The referrer inventory is loaded after the close.
+    -- Each surviving referrer receives the bytes under its own prefix.
+    -- Hosted disposal enumerates declared fallback references into the admitted prefix, including sources absent from the current object listing.
+    -- An unavailable payload leaves disposal pending until every surviving referrer has a readable copy.
+    -- Release bookkeeping that has already disappeared can remain absent.
     when: DeletionDue(record)
 
     requires: ServingStorageRegionsDrained(record)
@@ -2320,6 +2324,7 @@ rule EraseAndProve {
     -- A destroyed key cannot be installed or allocated again under the same deployment identity in that cell.
     -- The terminal transaction keeps the signed receipt with the tombstone and reopens the exact lineage disposal together.
     -- A retry returns the same receipt.
+    -- Hosted removal uses the multipart and version inventory of the admitted prefix after reference transfer.
     when: SharedObjectsTransferred(record)
 
     requires: DeploymentPrefixIsDisjoint(record)
@@ -2529,10 +2534,12 @@ rule ObserveS3Inventory {
 
     ensures:
         if record.deletion_observation.first_empty_at = null:
-            EraseS3Inventory(record.storage_root.prefix)
-            Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
+            if RequiredSharedObjectsMaterialized(record):
+                EraseS3Inventory(record.storage_root.prefix)
+                if S3InventoryIsEmpty(record.storage_root.prefix) and ServingObjectsAreAbsent(record.storage_root.prefix):
+                    Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(first_empty_at: now, second_empty_at: null) })
         else if record.deletion_observation.second_empty_at = null and now >= record.deletion_observation.first_empty_at + config.credential_ttl:
-            if S3InventoryIsEmpty(record.storage_root.prefix):
+            if S3InventoryIsEmpty(record.storage_root.prefix) and ServingObjectsAreAbsent(record.storage_root.prefix):
                 Directory.cas(record.id, record.version, change: { deletion_observation.second_empty_at: now })
             else:
                 Directory.cas(record.id, record.version, change: { deletion_observation: DeletionObservation(leases_expire_at: now) })

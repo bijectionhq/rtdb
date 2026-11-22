@@ -296,6 +296,12 @@ The directory closes the lineage under the version of the fenced, drained physic
 An interrupted disposal can resume against the same residence and generation.
 The terminal directory transaction checks the exact disposal permit, installs the receipt and reopens the lineage together.
 The local disposal bucket retains the maintenance witness through provider I/O.
+Hosted disposal materializes declared fallback references from the fenced residence before it alters the source inventory.
+An unreadable referenced payload keeps the residence fenced and the receipt pending.
+The provider then aborts uploads and removes the listed versions and markers by exact identity before the first empty observation.
+Both empty observations check the provider inventory and the current serving listing.
+The native regressions cover an inherited payload, a fork's own shadow, and a declared payload unavailable at its source.
+A local S3 lifecycle test exercises fork reads and a late-arriving object during disposal in both versioned and never-versioned buckets.
 Hosted fork preparation, capture and the source side of transfer take a shared lineage hold before provider work begins.
 An exact stopped-task observation can recover that hold after process death.
 An unattested worker's abandoned hold remains pending until its issuer releases it.
@@ -308,7 +314,8 @@ The per-key owner fence covers inherited serving misses, including provider work
 | --- | --- | --- |
 | `reap_as_of` and `References::erase` | The local sweep reserves its lineage, reloads referrers and copies retained data before deleting the path. The hosted exact collector keeps witnessed loose files while their source is still referenced, and confirms provider settlement before reopening admission. | Extend exact settlement to pack contents beyond checkpoint metadata and to remaining unwitnessed legacy and unversioned releases. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
-| `erase_deployment` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage, scans and transfers published references and checks the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
+| Local `erase_deployment` and hosted `observe_s3_inventory` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage and transfers published references. Hosted disposal then purges versions and uploads through the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
+| `discard_fork` after definitive publication rejection | Local cleanup uses the unpublished prefix. Hosted cleanup can still issue ordinary path deletes under the staged prefix. | Give hosted rejection a durable cleanup handoff to the provider-inventory authority before enrolling a terminal namespace. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |
 | `finish_capture_retirement` and whole archive retirement | A capture is closed in the directory. Archive custody and the provider inventory govern physical erasure and final receipts. | Preserve capture identity and the archive's separate namespace when composing with serving retirement. |
 

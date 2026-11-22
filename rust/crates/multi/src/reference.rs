@@ -460,6 +460,23 @@ impl References {
     }
 }
 
+/// Materializes published references before a hosted inventory can remove their sources.
+pub(crate) async fn preserve_residence(bucket: &dyn ObjectStore, erasure: &crate::admin::ResidenceErasure<'_>,
+    others: &[DeploymentRecord]) -> Result<()> {
+    require_disjoint_prefix(&key(erasure.prefix())?, others.iter())?;
+    let prefix = format!("{}/", erasure.prefix());
+    for (physical, referrers) in References::scan(bucket, others).await?.by_object {
+        let Some((_, name)) = physical.strip_prefix(&prefix).and_then(|relative| relative.split_once('/')) else { continue; };
+        for referrer in referrers {
+            match copy_in(bucket, &physical, bucket, &format!("{referrer}/{name}")).await {
+                Err(Error::MissingObject(_)) if crate::store::garbage_released_at(name).is_some() => {}
+                result => result?,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Returns whether the admitted residence is empty after preserving its referrers.
 pub(crate) async fn erase_deployment(bucket: &dyn ObjectStore, erasure: &crate::admin::ResidenceErasure<'_>,
     others: &[DeploymentRecord]) -> Result<bool> {

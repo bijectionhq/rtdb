@@ -1560,11 +1560,11 @@ async fn finish_disposal_with_lock(
     }
     let journals_retired_at_ms = now_ms();
     let (signed, serving_inventory) = match storage {
-        CellStorage::Local { .. } => erase_and_sign_disposal(
-            storage, bucket.as_ref(), keys, &fenced, &erasure, &others, namespaces, journals_retired_at_ms,
+        CellStorage::Local { .. } => erase_and_sign_local_disposal(
+            bucket.as_ref(), keys, &fenced, &erasure, &others, namespaces, journals_retired_at_ms,
         ).await?,
         CellStorage::S3 { config } => {
-            let (first, last) = observe_s3_inventory(directory, storage, config, bucket.as_ref(), &fenced, &erasure, &others).await?;
+            let (first, last) = observe_s3_inventory(directory, config, bucket.as_ref(), &fenced, &erasure, &others).await?;
             let signed = sign_disposal(&fenced, keys, namespaces, DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last).await?;
             (signed, ServingInventory::S3VersionsAndUploads)
         }
@@ -1631,8 +1631,7 @@ fn retirement_journals(
     Ok(journals.into_values().collect())
 }
 
-async fn erase_and_sign_disposal(
-    storage: &CellStorage,
+async fn erase_and_sign_local_disposal(
     bucket: &dyn rtdb_storage::ObjectStore,
     keys: &dyn KeyService,
     fenced: &DeploymentRecord,
@@ -1645,10 +1644,9 @@ async fn erase_and_sign_disposal(
     if !crate::reference::erase_deployment(bucket, erasure, others).await? {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {} still has serving objects", fenced.id)));
     }
-    let serving_inventory = storage.purge_serving_inventory(&rtdb_storage::ObjectKey::new(erasure.prefix())?).await?;
     let objects_erased_at_ms = now_ms().max(journals_retired_at_ms);
     let signed = sign_disposal(fenced, keys, namespaces, DeletionInventory::CurrentObjects, None, objects_erased_at_ms).await?;
-    Ok((signed, serving_inventory))
+    Ok((signed, ServingInventory::LocalDirectory))
 }
 
 async fn sign_disposal(
@@ -1720,7 +1718,7 @@ async fn advance_observation(directory: &dyn Directory, deployment: &DeploymentR
     Ok(())
 }
 
-async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, config: &rtdb_s3::S3Config,
+async fn observe_s3_inventory(directory: &dyn Directory, config: &rtdb_s3::S3Config,
                              bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord,
                              erasure: &ResidenceErasure<'_>, others: &[DeploymentRecord]) -> Result<(i64, i64)> {
     let first_empty_at_ms = match deployment.deletion_observation {
@@ -1732,7 +1730,10 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
         }
         Some(DeletionObservation::Empty { observed_at_ms }) => observed_at_ms,
         Some(DeletionObservation::Fenced { .. }) => {
-            erase_inventory(storage, bucket, deployment, erasure, others).await?;
+            crate::reference::preserve_residence(bucket, erasure, others).await?;
+            let prefix = rtdb_storage::ObjectKey::new(erasure.prefix())?;
+            CellStorage::s3_inventory(config).await?.purge(&prefix).await?;
+            if !bucket.list(Some(&prefix)).await?.is_empty() { return Err(deletion_incomplete(deployment)); }
             let observed_at_ms = now_ms();
             advance_observation(directory, deployment, Some(DeletionObservation::Empty { observed_at_ms })).await?;
             return Err(observation_pending(observed_at_ms));
@@ -1741,10 +1742,9 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
     };
     if now_ms() < s3_write_lease_horizon(first_empty_at_ms) { return Err(observation_pending(first_empty_at_ms)); }
 
-    let cell = rtdb_storage::ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
-    let inventory = config.versioned_inventory(&cell, &BTreeMap::new()).await?;
+    let inventory = CellStorage::s3_inventory(config).await?;
     let prefix = rtdb_storage::ObjectKey::new(erasure.prefix())?;
-    if !inventory.is_empty(&prefix).await? {
+    if !inventory.is_empty(&prefix).await? || !bucket.list(Some(&prefix)).await?.is_empty() {
         advance_observation(directory, deployment, Some(DeletionObservation::Fenced { leases_expire_at_ms: now_ms() })).await?;
         return Err(deletion_incomplete(deployment));
     }
@@ -1756,12 +1756,6 @@ async fn observe_s3_inventory(directory: &dyn Directory, storage: &CellStorage, 
 
 fn deletion_incomplete(deployment: &DeploymentRecord) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/deletion-incomplete", format!("Storage still contains objects for {}", deployment.name))
-}
-
-async fn erase_inventory(storage: &CellStorage, bucket: &dyn rtdb_storage::ObjectStore, deployment: &DeploymentRecord,
-    erasure: &ResidenceErasure<'_>, others: &[DeploymentRecord]) -> Result<DeletionInventory> {
-    if !crate::reference::erase_deployment(bucket, erasure, others).await? { return Err(deletion_incomplete(deployment)); }
-    storage.purge_inventory(&rtdb_storage::ObjectKey::new(erasure.prefix())?).await
 }
 
 /// A saved replica prefix that can be passed to the offline verifier.
@@ -2134,7 +2128,7 @@ mod tests {
     use rtdb_directory::MemoryDirectory;
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, object_store::StoredObject};
 
-    use super::{CellStorage, DeploymentRecord, Directory, ErasureAuthority, KeyService, Lifecycle, ResidenceErasure, create_deployment, delete_deployment, erase_and_sign_disposal};
+    use super::{CellStorage, DeploymentRecord, Directory, ErasureAuthority, KeyService, Lifecycle, ResidenceErasure, create_deployment, delete_deployment, erase_and_sign_local_disposal};
     use crate::keys::LocalKeyService;
 
     #[tokio::test]
@@ -2224,10 +2218,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_disposal_materializes_inherited_objects_before_provider_erasure() {
+        use crate::reference::{fork, preserve_residence};
+
+        let bucket = MemoryStore::default();
+        let directory = MemoryDirectory::new();
+        let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let inherited = DeploymentRecord::new("preview", "acme", vec![], 0);
+        let shadowed = DeploymentRecord::new("shadowed-preview", "acme", vec![], 0);
+        let source = ObjectKey::new(format!("{}/v06/rows", parent.storage_prefix())).unwrap();
+        let inherited_copy = ObjectKey::new(format!("{}/v06/rows", inherited.storage_prefix())).unwrap();
+        let shadow = ObjectKey::new(format!("{}/v06/rows", shadowed.storage_prefix())).unwrap();
+        let released = ObjectKey::new(format!("{}/v06/~garbage/10-removed", parent.storage_prefix())).unwrap();
+        bucket.put(&source, Bytes::from_static(b"parent")).await.unwrap();
+        bucket.put(&released, Bytes::from_static(b"collected release marker")).await.unwrap();
+        for child in [&inherited, &shadowed] {
+            fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        }
+        bucket.put(&shadow, Bytes::from_static(b"shadow")).await.unwrap();
+        bucket.delete(&released).await.unwrap();
+        parent.lifecycle = Lifecycle::Deleting;
+        let parent = directory.create_deployment(parent).await.unwrap();
+        let permit = directory.begin_reference_disposal(&parent.id, parent.version).await.unwrap();
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
+        let children = [inherited, shadowed];
+
+        preserve_residence(&bucket, &erasure, &children).await.unwrap();
+        assert_eq!(bucket.get(&source).await.unwrap(), Bytes::from_static(b"parent"));
+        assert_eq!(bucket.get(&inherited_copy).await.unwrap(), Bytes::from_static(b"parent"));
+        assert_eq!(bucket.get(&shadow).await.unwrap(), Bytes::from_static(b"shadow"));
+
+        bucket.delete(&source).await.unwrap();
+        preserve_residence(&bucket, &erasure, &children).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_disposal_refuses_an_unreadable_declared_source_before_purging_the_inventory() {
+        let bucket = MemoryStore::default();
+        let directory = MemoryDirectory::new();
+        let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        let source = ObjectKey::new(format!("{}/v06/rows", parent.storage_prefix())).unwrap();
+        let unrelated = ObjectKey::new(format!("{}/v06/~local-only", parent.storage_prefix())).unwrap();
+        bucket.put(&source, Bytes::from_static(b"parent")).await.unwrap();
+        crate::reference::fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        bucket.put(&unrelated, Bytes::from_static(b"untouched")).await.unwrap();
+        bucket.delete(&source).await.unwrap();
+        parent.lifecycle = Lifecycle::Deleting;
+        parent.deletion_observation = Some(rtdb_directory::DeletionObservation::Fenced { leases_expire_at_ms: 0 });
+        let parent = directory.create_deployment(parent).await.unwrap();
+        let permit = directory.begin_reference_disposal(&parent.id, parent.version).await.unwrap();
+        let erasure = ResidenceErasure(ErasureAuthority::Disposing(&permit));
+        let config = rtdb_s3::S3Config::new("");
+
+        let error = super::observe_s3_inventory(directory.as_ref(), &config, &bucket, &parent, &erasure, &[child]).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/missing-object");
+        assert!(error.to_string().contains(source.as_str()));
+        assert_eq!(bucket.get(&unrelated).await.unwrap(), Bytes::from_static(b"untouched"));
+        assert_eq!(directory.deployment(&parent.id).await.unwrap().unwrap().deletion_observation, parent.deletion_observation);
+    }
+
+    #[tokio::test]
     async fn deletion_can_retry_and_keeps_the_key_if_the_prefix_is_still_populated() {
         let data = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(data.path()).unwrap();
-        let storage = CellStorage::Local { root: data.path().join("objects") };
         let mut deployment = DeploymentRecord::new("shop", "acme", vec![], 0);
         deployment.lifecycle = Lifecycle::Deleting;
         let key = keys.key(&deployment.key_id()).await.unwrap();
@@ -2241,11 +2295,11 @@ mod tests {
         let object = ObjectKey::new(format!("{}/v06/rows", deployment.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
 
-        let error = erase_and_sign_disposal(&storage, &RetainingStore(&bucket), &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap_err();
+        let error = erase_and_sign_local_disposal(&RetainingStore(&bucket), &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/disposal-prefix");
         assert_eq!(keys.key(&deployment.key_id()).await.unwrap(), key);
 
-        let (proof, _) = erase_and_sign_disposal(&storage, &bucket, &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap();
+        let (proof, _) = erase_and_sign_local_disposal(&bucket, &keys, &deployment, &erasure, &[], namespaces, 0).await.unwrap();
         assert!(proof.facts.verified_empty);
         assert!(bucket.list(Some(&ObjectKey::new(deployment.storage_prefix()).unwrap())).await.unwrap().is_empty());
         assert_eq!(keys.existing(&deployment.key_id()).await.unwrap_err().code, "rtdb.multi/key-destroyed");
