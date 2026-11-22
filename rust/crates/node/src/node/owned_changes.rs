@@ -62,6 +62,20 @@ struct Journal<'a> {
     next: OwnedJournalHeader,
 }
 
+pub struct ExpiryCandidate {
+    pub identity: Vec<u8>,
+    pub nomination: String,
+    pub created: Timestamp,
+    pub expiry: Timestamp,
+}
+
+pub struct ExpiryCandidatePage {
+    pub candidates: Vec<ExpiryCandidate>,
+    pub through: Timestamp,
+    pub diagnostic_cutoff: Timestamp,
+    _charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
 impl OwnedReadSession {
     /// Reads whole ordered owner-relation groups after an exclusive system time.
     pub async fn changes(
@@ -96,6 +110,69 @@ impl OwnedReadSession {
             retained_bytes: page.retained_bytes,
             _reservations: page._reservations,
         })
+    }
+
+    /// A bounded diagnostic page, not authority to sweep or advance a floor.
+    pub async fn expired_candidate_page(
+        &self, relation: &OwnedRelation, after: Timestamp, groups: usize,
+        scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<ExpiryCandidatePage> {
+        const REPLAY_DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+        const MAX_CANDIDATES: usize = 64;
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || !(1..=8).contains(&groups) {
+            return Err(change_feed_uncovered());
+        }
+        let policy = self.lifetime_point_policy(relation).await?.ok_or_else(change_feed_uncovered)?;
+        let cutoff = Timestamp(self.present.system_time.0.saturating_sub(REPLAY_DAY_MICROS));
+        let page = self.changes(relation, after, groups).await?;
+        let context = self.journal_context(relation)?;
+        let mut candidates = Vec::new();
+        let mut charges = Vec::new();
+        let mut through = after;
+        for group in &page.groups {
+            let expiry = Timestamp(group.system_time.0.checked_add(policy.duration).ok_or_else(change_feed_uncovered)?);
+            let mut puts = 0usize;
+            for touch in &group.touches {
+                match touch.kind {
+                    rtdb_types::OwnedChangeKind::Put => {
+                        if touch.valid != Interval::new(group.system_time, expiry)? {
+                            return Err(change_feed_uncovered());
+                        }
+                        puts += 1;
+                    }
+                    rtdb_types::OwnedChangeKind::Expired => (),
+                    _ => return Err(change_feed_uncovered()),
+                }
+            }
+            if puts != 0 && expiry > cutoff {
+                // Fixed duration and acceptance-only creates make every
+                // following creation too recent on this same held cut.
+                break;
+            }
+            if candidates.len().saturating_add(puts) > MAX_CANDIDATES {
+                if through == after { return Err(change_feed_uncovered()); }
+                break;
+            }
+            for touch in group.touches.iter().filter(|touch| touch.kind == rtdb_types::OwnedChangeKind::Put) {
+                if rtdb_query::owned_purge_floor(Arc::clone(&context), &self.owner, relation, &touch.id).await?.is_some() {
+                    continue;
+                }
+                let (nomination, created, expires) = self.nominate_expired_identity(relation, &touch.id, scope).await?;
+                if created != group.system_time || expires != expiry {
+                    return Err(change_feed_uncovered());
+                }
+                let bytes = touch.id.as_value().retained_bytes()?.saturating_mul(2).saturating_add(512);
+                charges.push(context.memory.reserve(bytes)?);
+                candidates.push(ExpiryCandidate { identity: touch.id.handle_bytes(), nomination, created, expiry });
+            }
+            through = group.system_time;
+        }
+        if page.groups.last().is_none_or(|group| group.system_time == through) {
+            through = page.covered_through;
+        }
+        self.check_live_change_relations(std::slice::from_ref(relation))?;
+        Ok(ExpiryCandidatePage { candidates, through, diagnostic_cutoff: cutoff, _charges: charges })
     }
 
     /// Reads exact local overlay commits. The archived parent is immutable;
