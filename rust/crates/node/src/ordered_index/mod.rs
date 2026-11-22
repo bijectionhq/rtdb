@@ -203,6 +203,7 @@ pub struct OwnedRangeCount {
     pub count: u64,
     pub present: rtdb_types::Timestamp,
     pub valid_at: rtdb_types::Timestamp,
+    pub expiry: Option<rtdb_types::Timestamp>,
 }
 
 pub async fn range_owned_cut(
@@ -262,6 +263,17 @@ pub async fn owned_count(
     path: &rtdb_types::OwnedRelation,
     request: OwnedCountRequest<'_>,
 ) -> Result<OwnedRangeCount> {
+    owned_count_at(context, owner, relation, path, request, None).await
+}
+
+pub(crate) async fn owned_count_at(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+    request: OwnedCountRequest<'_>,
+    lifetime: Option<i64>,
+) -> Result<OwnedRangeCount> {
     let definition = owned_definition(&context, owner, relation, path).await?;
     let database = context
         .catalog
@@ -275,7 +287,7 @@ pub async fn owned_count(
         .find_map(|key| key.get("_id"));
     let projection = owned_projection(&context, snapshot, &definition, owner, relation, identity).await?;
     let work = accelerate::owned_count(
-        &context, snapshot, &database.storage, &definition, projection, request,
+        &context, snapshot, &database.storage, &definition, projection, request, lifetime,
     );
     rtdb_storage::IoRegion::leased(context.catalog.read_lease(), work).await
 }

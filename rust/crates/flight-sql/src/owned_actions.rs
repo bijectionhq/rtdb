@@ -1283,8 +1283,13 @@ impl Service {
         let schema = batch.schema();
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
         let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply(output_schema, Some(&batch), counted.present, counted.valid_at, None)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
+        let reply = self.owned_point_reply_until(output_schema, Some(&batch),
+            counted.present, counted.valid_at, None, counted.expiry)?;
+        if historical {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+        } else {
+            held.snapshot.check_lifetime_range_release(&relation, counted.expiry).map_err(status)?;
+        }
         Ok(reply)
     }
 

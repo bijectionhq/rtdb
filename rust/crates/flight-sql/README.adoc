@@ -514,7 +514,10 @@ It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a 
 Live full-key range pages on a covered acceptance-lifetime path use the held present on the valid axis.
 A nonempty page carries `rtdb.owned.until_micros` set to its earliest exclusive row expiry.
 The placed witness expires by that time, and range encoding refuses a page whose expiry has already passed.
-Leading-key, historical, world, and count ranges remain unavailable for these relations.
+Live full-key count uses the same frozen root and held present.
+For a nonempty lifetime count, bounded rank probes on that root find the first valid instant where its cardinality decreases.
+The count's metadata and original witness include this exclusive cutoff.
+Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 
 `rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.
