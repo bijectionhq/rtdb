@@ -4192,6 +4192,55 @@ def verify_multi_trim_admission(args, source):
     print(f"{label}: directory floor enforced before physical trim, missing check rejected")
 
 
+def verify_native_recovery_trace(args, source):
+    import copy
+    import sys
+
+    label = "rust-recovery-trace"
+    trace = args.evidence / f"{label}.json"
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+        "RTDB_RECOVERY_TRACE_PATH": str(trace.resolve()),
+    }
+    test = "a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, f"{label}-capture", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError(f"{label}: the native cell did not produce its recovery trace")
+
+    validator = [sys.executable, str(ROOT / "verification/recovery_trace.py")]
+    result = run_case([*validator, str(trace)], ROOT, args.evidence, f"{label}-baseline")
+    if result.returncode:
+        raise ValueError(f"{label}: the native trace violates recovery admission")
+    original = json.loads(trace.read_text())
+    revisions = original["revisions"]
+    authorized = next(index for index, revision in enumerate(revisions) if revision["authorized_through"] is not None)
+    held = next(index for index, revision in enumerate(revisions) if revision["first_required"] and revision["authorized_through"] is not None)
+    controls = {
+        "missing-manifest": ("authorizes a trim without a covering manifest",
+            lambda trace: trace["revisions"][authorized].update(manifest=None)),
+        "replay-overlap": ("overlaps an authorized trim and a replay hold",
+            lambda trace: trace["revisions"][held].update(first_required=[revisions[held]["authorized_through"]])),
+        "unrecorded-trim": ("exceeds the authorized trim",
+            lambda trace: trace["retained_floors"][0].__setitem__(1, 1 << 48)),
+        "different-journal": ("names a different replica journal",
+            lambda trace: trace["revisions"][authorized]["scope"].__setitem__(1, -1)),
+        "missing-revision": ("follows a gap", lambda trace: trace["revisions"].pop(1)),
+    }
+    for name, (message, mutate) in controls.items():
+        modified = copy.deepcopy(original)
+        mutate(modified)
+        path = args.evidence / f"{label}-{name}.json"
+        path.write_text(json.dumps(modified) + "\n")
+        rejected = run_case([*validator, str(path)], ROOT, args.evidence, f"{label}-{name}")
+        if rejected.returncode != 1 or message not in rejected.stderr:
+            raise ValueError(f"{label}-{name}: expected {message}")
+    print(f"{label}: native authorization and retained floors agree, {len(controls)} controls rejected")
+
+
 def verify_fragment_residence_replay(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": str(ROOT / "target"),
@@ -5178,6 +5227,7 @@ def main():
             verify_compaction_publication_versions(args, source)
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
+            verify_native_recovery_trace(args, source)
             verify_placed_receipt_replay(args, source)
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_receipts(args, source)

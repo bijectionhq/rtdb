@@ -303,3 +303,11 @@ The scoped replication, storage and PostgreSQL suites passed, and all three live
 TLC explored 48 distinct states. Its controls reject volatile apply evidence, unconditional pre-block confirmation and received WAL beyond the recoverable token.
 The reachability case confirms before the first block using retained replay.
 link:../tla/ExternalConfirmation.tla[External confirmation model]
+
+== R9 · Native recovery and trim trace
+
+A native subscriber opened its replay cursor while the holder advanced the checkpoint and trimmed the journal.
+The trace recorded 26 committed directory revisions and two physical floor observations, at offsets 3 with a hold and 10 after drain.
+The validator accepted the live capture.
+Five controls reject a missing manifest, a trim overlapping a hold, a physical floor beyond its authorization, a different journal and a gap in directory revisions.
+link:../recovery_trace.py[Recovery trace validator]

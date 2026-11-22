@@ -3008,6 +3008,8 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     use rtdb_storage::log::{Log, LogOffset};
 
     let directory = ObservedDirectory::new();
+    let trace = std::env::var_os("RTDB_RECOVERY_TRACE_PATH")
+        .map(|path| (path, directory.deployment_changes().unwrap()));
     let mut cell = Cell::start_with_directory(directory.clone()).await;
     let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
@@ -3037,10 +3039,15 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
         write_quorum: 2, servers, stream: held.stream("replica"), maximum_message_bytes: 4 << 20,
     }, Default::default()).await.unwrap();
-    let retained = tokio::time::timeout(Duration::from_secs(5), async {
+    let probe_floor = async || {
+        let before = directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let floor = reader.retained_floor().await.unwrap().unwrap();
+        let after = directory.deployment(&deployment.id).await.unwrap().unwrap();
+        (before.version == after.version).then_some((before, floor))
+    };
+    let (held_record, retained) = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let floor = reader.retained_floor().await.unwrap().unwrap();
-            if floor.0 >= first_required { break floor; }
+            if let Some((record, floor)) = probe_floor().await && floor.0 >= first_required { break (record, floor); }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("holder trimmed up to the recovering subscriber");
@@ -3061,14 +3068,38 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
     tokio::spawn(connection);
     assert_eq!(cell.node(subscriber).agent.subscribed(), ["shop"]);
     assert_eq!(values(&follower, "SELECT total FROM orders").await, ["10", "20", "30"]);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let drained_probe = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let record = directory.deployment(&deployment.id).await.unwrap().unwrap();
-            let held = record.storage_regions.values().any(|region| matches!(region, StorageRegion::ReplicaReplay { .. }));
-            if !held && reader.retained_floor().await.unwrap().unwrap().0 >= updated.boundary { break; }
+            if let Some((record, floor)) = probe_floor().await
+                && floor.0 >= updated.boundary
+                && !record.storage_regions.values().any(|region| matches!(region, StorageRegion::ReplicaReplay { .. }))
+            {
+                break (record.version, floor.0);
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("closed replay hold lets the holder finish trimming");
+    if let Some((path, mut changes)) = trace {
+        let mut revisions = Vec::new();
+        loop {
+            match changes.try_recv() {
+                Ok(record) if record.id == deployment.id => revisions.push(serde_json::json!({
+                    "scope": (record.stream("replica"), record.log_epoch),
+                    "version": record.version,
+                    "checkpoint": record.checkpoint,
+                    "manifest": record.recovery_manifest_sha256,
+                    "authorized_through": record.replica_anchor.map(|anchor| anchor.interval[1]),
+                    "first_required": record.storage_regions.values().filter_map(StorageRegion::first_required_replica).collect::<Vec<_>>()
+                })),
+                Ok(_) => (),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("recovery trace lost directory revisions: {error}"),
+            }
+        }
+        let held_probe = (held_record.version, retained.0);
+        let trace = serde_json::json!({ "revisions": revisions, "retained_floors": [held_probe, drained_probe] });
+        std::fs::write(path, serde_json::to_vec(&trace).unwrap()).unwrap();
+    }
     drop((follower, client, database));
     cell.stop().await;
 }

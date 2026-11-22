@@ -50,7 +50,10 @@ A native event trace must supply the actual cut, provider identity and directory
 Its [authored fixture](../traces/residence-composition.json) projects catalog cuts and publication identities into the model.
 A trace must reach the disposal receipt with the expected replica floor and fork copy.
 Controls refuse a different physical publication, retirement before read drain, trimming an admitted recovery, erasing an uncopied fork dependency and a trace that ends before settlement.
-The checker currently runs against model fixtures. Native emission and projection of actual provider and directory outcomes remain open.
+The composed checker runs against model fixtures.
+A native checkpoint and trim replay also exports committed directory revisions and physical floors observed from the logkeepers.
+Its validator checks that authorization preserves replay holds and has a manifest from the same journal.
+The native trace covers one journal at a time. Production emission for query, custody, fork and erasure transitions remains open.
 A model counterexample to a weakened rule shows why the rule matters for the modeled system.
 
 ## Handoff notes

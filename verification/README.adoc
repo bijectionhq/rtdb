@@ -124,6 +124,10 @@ The production controls publish the root too early and stop on a missing checkpo
 The native collection replay checks that live and pending trie files remain protected until the installed checkpoint is replaced.
 Its control removes the checkpoint from collection eligibility.
 The startup replay test also covers a selected checkpoint whose first required replica offset is below the reported retained floor.
+The native recovery trace records committed directory revisions and the logkeeper's reported floors during a concurrent subscriber recovery and trim.
+The checker requires a covering published manifest and preserves each recorded replay hold.
+It checks each observed physical floor against the authorization held at that observation.
+Run `python3 verification/recovery_trace.py /path/to/rust-recovery-trace.json` to check the capture again.
 The archived controls skip cursor admission and reopen an admitted cursor.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
