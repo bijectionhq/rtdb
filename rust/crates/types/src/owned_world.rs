@@ -212,6 +212,14 @@ impl OwnedWorld {
             && self.basis.tx_id < next.basis.tx_id
     }
 
+    pub fn can_renew_to(&self, next: &Self) -> bool {
+        self.pin != next.pin && !self.dropped && !next.dropped
+            && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
+            && self.id == next.id && self.capture == next.capture && self.suffix == next.suffix
+            && self.manifest == next.manifest && self.basis == next.basis
+            && self.parent_publication == next.parent_publication && self.schemas == next.schemas
+    }
+
     pub fn same_fork(&self, other: &Self) -> bool {
         self.id == other.id
             && self.pin == other.pin

@@ -1012,6 +1012,7 @@ impl OwnedReadSession {
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
             publication: false,
+            renewal: false,
             until: self.fork_until,
             scope,
         })
@@ -1028,6 +1029,19 @@ impl OwnedReadSession {
         self.check()?;
         cut.basis = publication;
         cut.publication = true;
+        Ok(cut)
+    }
+
+    pub async fn fork_renewal_cut(
+        &self, scope: rtdb_types::PlacedAttemptScope, predecessor: TransactionKey,
+    ) -> Result<OwnedForkCut> {
+        let mut cut = self.fork_cut(scope).await?;
+        if cut.live.is_none_or(|live| predecessor.system_time >= live.system_time || predecessor.tx_id >= live.tx_id) {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        cut.live = Some(predecessor);
+        cut.basis = predecessor.system_time;
+        cut.renewal = true;
         Ok(cut)
     }
 
@@ -1574,6 +1588,7 @@ pub struct OwnedForkCut {
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
     publication: bool,
+    renewal: bool,
     until: Timestamp,
     scope: rtdb_types::PlacedAttemptScope,
 }
@@ -1582,6 +1597,7 @@ impl OwnedForkCut {
     pub fn basis(&self) -> Timestamp { self.basis }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
     pub fn is_publication(&self) -> bool { self.publication }
+    pub fn is_renewal(&self) -> bool { self.renewal }
     pub fn matches_basis(&self, basis: TransactionKey) -> bool {
         self.basis == basis.system_time && self.live.is_none_or(|live| live == basis)
             && basis.tx_id <= self.issued_on.tx_id
@@ -1671,6 +1687,8 @@ impl NativeSession {
         let proposal_publication = requested == rtdb_types::WorldClockMode::Proposal
             && fork.cut.is_publication() && fork.root.is_some();
         let root = match &fork.root {
+            Some(section) if section.publication.is_some() && fork.previous.is_some() && fork.cut.is_renewal() =>
+                OwnedForkRoot::WritesRenewal,
             Some(section) if section.publication.is_some() && fork.previous.is_some() => OwnedForkRoot::WritesAdvance,
             Some(section) if proposal_publication && section.publication.is_some() => OwnedForkRoot::ProposalWrites,
             Some(section) if section.publication.is_some() => OwnedForkRoot::Writes,
@@ -1681,7 +1699,8 @@ impl NativeSession {
         let requires_live_tip = record.initial_clock() > inherited
             || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_publication);
         let requires_tip = requires_live_tip || proposal_publication
-            || (root != OwnedForkRoot::None && record.parent_publication == Some(record.basis.system_time));
+            || (root != OwnedForkRoot::None && !fork.cut.is_renewal()
+                && record.parent_publication == Some(record.basis.system_time));
         let effects = fork.controls.len()
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
             .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
@@ -1698,7 +1717,8 @@ impl NativeSession {
             || (matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites)
                 && fork.controls.iter().all(rtdb_tx::HostedControlWrite::is_check))
             || (root == OwnedForkRoot::WritesAdvance && !fork.cut.is_publication())
-            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && root != OwnedForkRoot::WritesAdvance)
+            || (fork.cut.is_renewal() && root != OwnedForkRoot::WritesRenewal)
+            || (root != OwnedForkRoot::None && ((fork.previous.is_some() && !matches!(root, OwnedForkRoot::WritesAdvance | OwnedForkRoot::WritesRenewal))
                 || (requested != rtdb_types::WorldClockMode::Retained && !proposal_publication)
                 || (fork.cut.live.is_none() && !fork.cut.is_publication())))
             || fork.root.iter().flat_map(|section| &section.checks).any(|check| match check {

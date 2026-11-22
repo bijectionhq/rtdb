@@ -524,6 +524,9 @@ Mode 4 also admits an original retained predecessor handle with a fresh expiry a
 An authored advance carries one acceptance-valid Root replacement with its original positive point check and a checked existing owner row replacement.
 Its current application publication must strictly advance the exact predecessor before the Root replacement, new retained registration and hosted settlement can publish.
 The archive owner retires the previous physical pin after ordering.
+Mode 6 has the same hosted Root replacement framing and renews the original retained holder at its existing exact basis.
+The request supplies zero capture and suffix selectors, and the placed owner reuses the exact previously admitted archive.
+Renewal compares the original physical pin and refreshes its expiry without requiring the application head to still equal the retained basis.
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 

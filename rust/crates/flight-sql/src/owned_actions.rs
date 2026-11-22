@@ -1733,8 +1733,13 @@ impl Service {
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
         let select_publication = matches!(*mode, 4 | 5) && publish_root;
         let proposed_publication = *mode == 5 && publish_root;
+        let renewal = *mode == 6 && publish_root;
+        if renewal && (*previous_handle == [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
+            return Err(invalid("An authored renewal requires its original retained handle and derives its archive"));
+        }
         let (requested, rest) = match *mode {
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
+            6 if renewal => (rtdb_node::WorldClockRequest::Retained, rest),
             4 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
             5 if proposed_publication => (rtdb_node::WorldClockRequest::Proposal, rest),
             1 => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
@@ -1761,23 +1766,30 @@ impl Service {
         };
         let requested_until = Timestamp(i64::from_be_bytes(*until));
         let authored_advance = select_publication && !proposed_publication && *previous_handle != [0; 16];
+        let authored_replacement = authored_advance || renewal;
         let previous = if *previous_handle == [0; 16] {
             if world != pin { return Err(invalid("An initial pin must name its world")); }
             None
         } else {
-            if (requested_until == Timestamp::MIN) == authored_advance
+            if (requested_until == Timestamp::MIN) == authored_replacement
                 || !matches!(requested, rtdb_node::WorldClockRequest::Retained) || world == pin {
                 return Err(invalid("A retained advance preserves the original world lifetime and mode"));
             }
             let previous = self.owned_world_read(call, &Bytes::copy_from_slice(previous_handle))?;
             previous.snapshot.check().map_err(status)?;
             if previous.world.as_bytes() != world || previous.snapshot.clock_mode().is_writable()
-                || previous.snapshot.parent_basis().system_time >= cut.basis()
+                || (!renewal && previous.snapshot.parent_basis().system_time >= cut.basis())
                 || previous.snapshot.parent_pin().0 == *pin
             {
                 return Err(Status::failed_precondition("The original retained world cannot select this cut"));
             }
             Some(previous)
+        };
+        let cut = if renewal {
+            let predecessor = previous.as_ref().ok_or_else(unsupported)?.snapshot.parent_basis();
+            held.snapshot.fork_renewal_cut(scope, predecessor).await.map_err(status)?
+        } else {
+            cut
         };
         // Deadline, registration, one immutable attempt and a Root head
         // (or the standalone fork's optional tip check).
@@ -1788,7 +1800,7 @@ impl Service {
         let mut root_framing = None;
         let mut root_groups = 0;
         let groups = if publish_root {
-            if (previous.is_some() && !authored_advance) || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication)
+            if (previous.is_some() && !authored_replacement) || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication)
                 || (cut.live().is_none() && !cut.is_publication())
             {
                 return Err(invalid("A Root publication requires an initial retained fork at its original live hold"));
@@ -1824,7 +1836,7 @@ impl Service {
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
             }
-            if authored_advance && !matches!(writes.as_slice(), [
+            if authored_replacement && !matches!(writes.as_slice(), [
                 TxOp::OwnedReplaceDocs { documents, valid_from: None, valid_to: None, .. }
             ] if documents.rows().len() == 1) {
                 return Err(invalid("A retained authored advance requires one acceptance-valid Root replacement"));
@@ -1873,7 +1885,7 @@ impl Service {
         let (registered, key) = host.fork_world_checked(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             Uuid::from_bytes(*capture), (!suffix.is_nil()).then_some(suffix),
-            if authored_advance { requested_until } else { original.map_or(requested_until, |world| world.until()) },
+            if authored_replacement { requested_until } else { original.map_or(requested_until, |world| world.until()) },
             rtdb_node::OwnedWorldFork {
                 world: rtdb_types::Iid(*world), pin: rtdb_types::Iid(*pin),
                 previous: original.map(|world| world.parent_pin()), cut, requested, deadline,
