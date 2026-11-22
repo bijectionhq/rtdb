@@ -4,8 +4,8 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, copy_nullable_cells, estimate_builder_bytes_refs, estimate_copy_cell_bytes, to_field};
-use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use rtdb_plan::{BinaryOp, Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Expr, Relation, RelationNode, Schema};
+use rtdb_types::{ListKind, LogicalType, Result, ScalarType, Value};
 
 use crate::{QueryContext, context::{Execution, cancelled}, invalid};
 use crate::runtime_schema::{EmissionMode, EmittedRelation, RuntimeSchema, parameter_types};
@@ -195,9 +195,9 @@ impl PreparedQuery {
         let mut relation = self.relation.as_ref();
         loop {
             match relation.node() {
-                RelationNode::Values { rows } => return matches!(rows.as_slice(), [row] if row.iter().all(|expr| matches!(expr, Expr::Parameter { .. }))),
+                RelationNode::Values { rows } => return matches!(rows.as_slice(), [row] if row.iter().all(parameter_projection_expression)),
                 RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. }
-                    if expressions.iter().all(|expression| matches!(expression.expr, Expr::Parameter { .. } | Expr::Column { .. })) => relation = input,
+                    if expressions.iter().all(|expression| parameter_projection_expression(&expression.expr)) => relation = input,
                 _ => return false,
             }
         }
@@ -223,15 +223,27 @@ impl PreparedQuery {
         let mut metadata = context.memory.reserve(crate::runtime_schema::allocation_bound(&self.relation)?)?;
         let mut fields = Vec::with_capacity(runtime_schema.schema().len());
         let mut arrays = Vec::with_capacity(runtime_schema.schema().len());
-        let mut copy_cells = batch.num_rows() > 1;
+        let computed = if projection_has_arithmetic(&self.relation) {
+            let _parameter_fields = context.memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+            let Some(columns) = project_bound_columns(&self.relation, arguments)? else { return Ok(None); };
+            Some(columns)
+        } else { None };
+        let mut copy_cells = batch.num_rows() > 1 || computed.is_some();
         for (position, result) in runtime_schema.schema().fields().iter().enumerate() {
-            let Some(index) = projected_parameter(&self.relation, position) else { return Ok(None); };
             let field = to_field(&result.name, &result.data_type)?;
-            let Some(array) = batch.columns().get(index) else { return Ok(None); };
-            if field.data_type() != array.data_type() || field.metadata() != batch.schema_ref().field(index).metadata() {
+            let (array, source) = if let Some(columns) = &computed {
+                let Some(crate::columnar::Column::Arrow { array, field, .. }) = columns.get(position) else { return Ok(None); };
+                (array, field.as_ref())
+            } else {
+                let Some(index) = projected_parameter(&self.relation, position) else { return Ok(None); };
+                let Some(array) = batch.columns().get(index) else { return Ok(None); };
+                (array, batch.schema_ref().field(index))
+            };
+            if field.data_type() != array.data_type() || field.metadata() != source.metadata() {
                 return Ok(None);
             }
-            copy_cells |= array.nulls().is_some() || array.data_type() == &DataType::Boolean;
+            copy_cells |= array.nulls().is_some() || matches!(array.data_type(),
+                DataType::Boolean | DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(..) | DataType::Union(..));
             fields.push(field);
             arrays.push(Arc::clone(array));
         }
@@ -384,13 +396,74 @@ fn projected_parameter(mut relation: &Relation, mut position: usize) -> Option<u
     }
 }
 
+fn parameter_projection_expression(expression: &Expr) -> bool {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match expression {
+        Expr::Parameter { .. } | Expr::Column { .. } => true,
+        Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => {
+            let operand = |expr: &Expr| matches!(expr, Expr::Literal(Value::Null | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_) | Value::F64(_)))
+                || parameter_projection_expression(expr);
+            operand(left) && operand(right)
+        }
+        _ => false,
+    })
+}
+
+fn projection_has_arithmetic(mut relation: &Relation) -> bool {
+    loop {
+        if relation.expressions().iter().any(|expr| matches!(expr, Expr::Binary { .. })) { return true; }
+        match relation.node() {
+            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } => relation = input,
+            _ => return false,
+        }
+    }
+}
+
+fn project_bound_columns(relation: &Relation, arguments: &OwnedBatch) -> Result<Option<Vec<crate::columnar::Column>>> {
+    use crate::columnar::{ColumnBatch, projection::bound_column};
+
+    let parameters = ColumnBatch::from_owned(arguments.slice(0, 1)?)?;
+    let mut layers = Vec::new();
+    let mut relation = relation;
+    let empty = Schema::default();
+    let mut columns = Vec::new();
+    let mut schema = loop {
+        match relation.node() {
+            RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+                layers.push((relation.schema(), expressions));
+                relation = input;
+            }
+            RelationNode::Values { rows } => {
+                let [row] = rows.as_slice() else { return Ok(None); };
+                for expression in row {
+                    let Some(column) = bound_column(expression, &empty, &[], &parameters.columns)? else { return Ok(None); };
+                    columns.push(column);
+                }
+                break relation.schema();
+            }
+            _ => return Ok(None),
+        }
+    };
+    for (output, expressions) in layers.into_iter().rev() {
+        let mut projected = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            let Some(column) = bound_column(&expression.expr, schema, &columns, &parameters.columns)? else { return Ok(None); };
+            projected.push(column);
+        }
+        (schema, columns) = (output, projected);
+    }
+    Ok(Some(columns))
+}
+
 fn direct_parameter_type(ty: &LogicalType) -> bool {
-    match ty {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match ty {
         LogicalType::Maybe(ty) => direct_parameter_type(ty),
+        LogicalType::Struct(fields) => fields.values().all(direct_parameter_type),
+        LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => direct_parameter_type(element),
+        LogicalType::Union(legs) => legs.iter().all(direct_parameter_type),
         LogicalType::Null | LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 |
             ScalarType::F32 | ScalarType::F64 | ScalarType::Utf8 | ScalarType::Binary | ScalarType::FixedSizeBinary(_) | ScalarType::Uuid) => true,
         _ => false,
-    }
+    })
 }
 
 fn reserve_plan(relation: &Relation, settings: &rtdb_plan::QuerySettings, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>> {

@@ -109,6 +109,67 @@ async fn prepared_parameter_projection_selects_the_first_row_and_releases_the_ba
 }
 
 #[tokio::test]
+async fn computed_parameter_projection_uses_arrow_arithmetic_and_preserves_nested_payloads() {
+    use arrow_array::{Array, Int64Array, RecordBatch, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let long = LogicalType::Scalar(ScalarType::I64);
+    let payload = Value::List(vec![Value::Struct([("label".into(), Value::Utf8("kept".into()))].into()), Value::I64(7)]);
+    let payload_type = payload.logical_type();
+    let types = [long.clone(), long.clone(), payload_type.clone()];
+    let fields = vec![Field::new("a", DataType::Int64, false), Field::new("b", DataType::Int64, false), to_field("payload", &payload_type).unwrap()];
+    let bound = |a| {
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields.clone())), vec![
+            Arc::new(Int64Array::from(vec![a])),
+            Arc::new(Int64Array::from(vec![3])),
+            copy_array(&payload_type, std::slice::from_ref(&payload)).unwrap(),
+        ]).unwrap();
+        OwnedBatch::new(batch, &memory).unwrap()
+    };
+    let query = PreparedSql::prepare("SELECT ($1 + $2) * $2 AS total, $3 AS payload", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut projected = query.try_open_parameter_projection(Arc::clone(&context), &bound(11), &types).await.unwrap().unwrap();
+    let mut ordinary = query.open_query_columns_typed(Arc::clone(&context), vec![Value::I64(11), Value::I64(3), payload.clone()], &types).await.unwrap();
+    let actual = projected.next_batch().await.unwrap().unwrap();
+    let expected = ordinary.next_batch().await.unwrap().unwrap();
+
+    assert_eq!(projected.schema(), ordinary.schema());
+    assert_eq!(actual.batch(), expected.batch());
+    assert_eq!(actual.batch().column(0).as_primitive::<Int64Type>().value(0), 42);
+    assert!(actual.batch().column(1).as_list::<i32>().is_valid(0));
+    assert!(query.try_open_parameter_projection(context, &bound(i64::MAX), &types).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_parameter_projection_copies_only_the_first_fixed_size_list() {
+    use arrow_array::{RecordBatch, cast::AsArray};
+    use arrow_schema::Schema;
+    use rtdb_columnar::{OwnedBatch, copy_array, to_field};
+
+    let memory = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let first = Value::FixedSizeList(vec![Value::I64(20), Value::I64(22)]);
+    let second = Value::FixedSizeList(vec![Value::I64(0), Value::I64(0)]);
+    let ty = first.logical_type();
+    let schema = Arc::new(Schema::new(vec![to_field("input", &ty).unwrap()]));
+    let batch = RecordBatch::try_new(schema, vec![copy_array(&ty, &[first.clone(), second]).unwrap()]).unwrap();
+    let bound = OwnedBatch::new(batch, &memory).unwrap();
+    let upload = Arc::downgrade(bound.reservation());
+    let query = PreparedSql::prepare("SELECT $1 AS fixed", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_parameter_projection(context, &bound, &[ty]).await.unwrap().unwrap();
+    drop(bound);
+    assert!(upload.upgrade().is_none());
+
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    let batch = page.batch();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_fixed_size_list().value_length(), 2);
+    assert_eq!(read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0).unwrap(), first);
+}
+
+#[tokio::test]
 async fn postgres_preparation_keeps_inline_xtql_source_and_result_fields() {
     let memory = MemoryBudget::new(1 << 26);
     let context = context(None, &memory);

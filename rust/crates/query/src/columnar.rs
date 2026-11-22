@@ -2209,7 +2209,10 @@ pub(crate) mod projection {
             _ => None,
         }
     }
-    fn numbers<'a>(expr: &Expr, schema: &Schema, batch: &'a ColumnBatch, computed: &'a mut Option<Column>, parameters: &[Value]) -> Result<Option<Numbers<'a>>> {
+    #[derive(Clone, Copy)]
+    enum Parameters<'a> { Values(&'a [Value]), Columns(&'a [Column]) }
+
+    fn numbers<'a>(expr: &Expr, schema: &Schema, columns: &'a [Column], len: usize, computed: &'a mut Option<Column>, parameters: Parameters<'a>) -> Result<Option<Numbers<'a>>> {
         let plain = |logical: &Option<LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(logical) => super::plain_scalar(logical) == Some(&expected), None => field.metadata().is_empty() };
         let array_numbers = |column: &'a Column| -> Option<Numbers<'a>> {
             let Column::Arrow { array, field, logical } = column else { return None };
@@ -2220,33 +2223,40 @@ pub(crate) mod projection {
             }
         };
         Ok(match expr {
-            Expr::Column { id, .. } => schema.position(*id).and_then(|position| array_numbers(&batch.columns[position])),
+            Expr::Column { id, .. } => schema.position(*id).and_then(|position| array_numbers(&columns[position])),
             Expr::Literal(value) => constant(value).map(Numbers::Constant),
-            Expr::Parameter { index, .. } => parameters.get(*index).and_then(constant).map(Numbers::Constant),
+            Expr::Parameter { index, .. } => match parameters {
+                Parameters::Values(values) => values.get(*index).and_then(constant).map(Numbers::Constant),
+                Parameters::Columns(columns) => columns.get(*index).and_then(array_numbers),
+            },
             Expr::Binary { .. } => {
-                *computed = arithmetic(expr, schema, batch, parameters)?;
+                *computed = arithmetic(expr, schema, columns, len, parameters)?;
                 computed.as_ref().and_then(array_numbers)
             }
             _ => None,
         })
     }
-    fn arithmetic(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
+    fn arithmetic(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: Parameters<'_>) -> Result<Option<Column>> {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || arithmetic_at(expr, schema, columns, len, parameters))
+    }
+
+    fn arithmetic_at(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: Parameters<'_>) -> Result<Option<Column>> {
         let Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply), left, right } = expr else { return Ok(None) };
         let (mut left_computed, mut right_computed) = (None, None);
-        let Some(left) = numbers(left, schema, batch, &mut left_computed, parameters)? else { return Ok(None) };
-        let Some(right) = numbers(right, schema, batch, &mut right_computed, parameters)? else { return Ok(None) };
+        let Some(left) = numbers(left, schema, columns, len, &mut left_computed, parameters)? else { return Ok(None) };
+        let Some(right) = numbers(right, schema, columns, len, &mut right_computed, parameters)? else { return Ok(None) };
         if matches!(left, Numbers::Constant(_)) && matches!(right, Numbers::Constant(_)) { return Ok(None); }
         let floating = match (left.floating(), right.floating()) { (Some(a), Some(b)) => a || b, (Some(a), None) | (None, Some(a)) => a, (None, None) => return Ok(None) };
         let float = |number: Number| match number { Number::Int(value) => value as f64, Number::Float(value) => value };
         let (array, scalar): (ArrayRef, ScalarType) = if floating {
-            let values: Float64Array = (0..batch.len).map(|row| match (left.get(row), right.get(row)) {
+            let values: Float64Array = (0..len).map(|row| match (left.get(row), right.get(row)) {
                 (Some(a), Some(b)) => Some(match op { BinaryOp::Add => float(a) + float(b), BinaryOp::Subtract => float(a) - float(b), _ => float(a) * float(b) }),
                 _ => None,
             }).collect();
             (Arc::new(values), ScalarType::F64)
         } else {
-            let mut values = Vec::with_capacity(batch.len);
-            for row in 0..batch.len {
+            let mut values = Vec::with_capacity(len);
+            for row in 0..len {
                 values.push(match (left.get(row), right.get(row)) {
                     (Some(Number::Int(a)), Some(Number::Int(b))) => match match op { BinaryOp::Add => a.checked_add(b), BinaryOp::Subtract => a.checked_sub(b), _ => a.checked_mul(b) } {
                         Some(value) => Some(value),
@@ -2259,6 +2269,14 @@ pub(crate) mod projection {
         };
         let field = Arc::new(ArrowField::new("value", array.data_type().clone(), true));
         Ok(Some(Column::Arrow { array, field, logical: Some(LogicalType::Scalar(scalar)) }))
+    }
+
+    pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], parameters: &[Column]) -> Result<Option<Column>> {
+        match expr {
+            Expr::Column { id, .. } => Ok(schema.position(*id).map(|position| columns[position].duplicate())),
+            Expr::Parameter { index, .. } => Ok(parameters.get(*index).map(Column::duplicate)),
+            _ => arithmetic(expr, schema, columns, 1, Parameters::Columns(parameters)),
+        }
     }
 
     /// Whether an expression has a shape the kernel may compute; its cells' types decide per batch.
@@ -2344,7 +2362,7 @@ pub(crate) mod projection {
                 }))
             }
             Expr::Literal(value) if literal(value) => Ok(Some(Column::Values(vec![value.clone(); batch.len]))),
-            Expr::Binary { .. } => arithmetic(expr, schema, batch, parameters),
+            Expr::Binary { .. } => arithmetic(expr, schema, &batch.columns, batch.len, Parameters::Values(parameters)),
             Expr::Struct(fields) => {
                 let mut columns = Vec::with_capacity(fields.len());
                 for (_, field) in fields {
