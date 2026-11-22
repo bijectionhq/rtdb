@@ -511,6 +511,10 @@ Its source accepts immutable creation only, preserving complete identities after
 One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
 A held retained parent point at its original archive basis also checks the live relation lifetime.
 It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a fact that was visible at the basis and has since expired, and absence when no fact was visible at the basis.
+Live full-key range pages on a covered acceptance-lifetime path use the held present on the valid axis.
+A nonempty page carries `rtdb.owned.until_micros` set to its earliest exclusive row expiry.
+The placed witness expires by that time, and range encoding refuses a page whose expiry has already passed.
+Leading-key, historical, world, and count ranges remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 
 `rtdb.owned.PublishWorldCut.v2` orders one initial retained fork alongside a Root publication at the same source position.

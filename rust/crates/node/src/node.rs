@@ -888,7 +888,7 @@ impl OwnedRangeWitness {
         self.fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes())
     }
 
-    pub fn same_range(&self, other: &Self) -> bool { self.fixed == other.fixed }
+    pub fn same_range(&self, other: &Self) -> bool { self.fixed == other.fixed && self.until == other.until }
 
     pub fn matches_scope(&self, scope: Option<rtdb_types::PlacedAttemptScope>) -> bool {
         Some(self.scope) == scope
@@ -1451,8 +1451,79 @@ impl OwnedReadSession {
         Ok((page, evidence))
     }
 
+    /// A live lifetime page reuses the covered path at held present, then
+    /// hydrates each nominated identity to certify its release horizon.
+    pub async fn range_page_by_key_lifetime(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedRangeRequest<'_>, valid_at: Option<Timestamp>,
+    ) -> Result<(crate::OwnedRangePage, Option<OwnedRangeWitness>, Option<Timestamp>)> {
+        let Some(duration) = self.lifetime_point_duration(relation).await? else {
+            return self.range_page_by_key_at_observed(relation, path, request, valid_at)
+                .await.map(|(page, witness)| (page, witness, None));
+        };
+        self.admit_read().await?;
+        let present = self.present.system_time;
+        if valid_at.is_some_and(|at| at != present) {
+            return Err(lifetime_read_unavailable());
+        }
+        let valid = rtdb_types::Interval::at(present)?;
+        let guard = self.relation_release_guard_for([relation], true)?;
+        let context = Arc::clone(&self.context).with_owned_read_guard(guard);
+        context.check_cancelled()?;
+        let page = crate::ordered_index::owned_range(Arc::clone(&context), &self.owner, relation, path,
+            crate::ordered_index::RowBounds::Compound(request), Some(present)).await?;
+        let mut expiry: Option<Timestamp> = None;
+        if let Some(batch) = &page.batch {
+            let batch = batch.batch();
+            let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(lifetime_read_unavailable)?;
+            for row in 0..batch.num_rows() {
+                context.check_cancelled()?;
+                let ids = batch.column(column).as_ref();
+                let size = rtdb_columnar::estimate_read_value_bytes(field, ids, row)?;
+                let _identity = context.memory.reserve(size.saturating_add(4096))?;
+                let id = read_value(field, ids, row)?.entity_id()?;
+                let mut point = rtdb_query::open_owned_point(
+                    Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from"]),
+                ).await?.ok_or_else(lifetime_read_unavailable)?;
+                let mut until = None;
+                while let Some(part) = point.next_batch().await? {
+                    for index in 0..part.batch().num_rows() {
+                        if until.is_some() { return Err(lifetime_read_unavailable()); }
+                        let created = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
+                        let cutoff = Timestamp(created.0.checked_add(duration).ok_or_else(lifetime_read_unavailable)?);
+                        if created > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
+                        until = Some(cutoff);
+                    }
+                }
+                let until = until.ok_or_else(lifetime_read_unavailable)?;
+                expiry = Some(expiry.map_or(until, |prior| prior.min(until)));
+            }
+        }
+        self.check_lifetime_range_release(relation, expiry)?;
+        let evidence = self.relation_witness_for(relation, true, expiry)?;
+        Ok((page, evidence, expiry))
+    }
+
+    pub fn check_lifetime_range_release(
+        &self, relation: &rtdb_types::OwnedRelation, until: Option<Timestamp>,
+    ) -> Result<()> {
+        self.check_live_point_relation(relation)?;
+        if until.is_some_and(|until| until <= self.node.now()) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/lifetime-expired",
+                "The held range reached its creation lifetime"));
+        }
+        Ok(())
+    }
+
     fn relation_witness(&self, relation: &rtdb_types::OwnedRelation) -> Result<Option<OwnedRangeWitness>> {
-        self.check_relation(relation)?;
+        self.relation_witness_for(relation, false, None)
+    }
+
+    fn relation_witness_for(
+        &self, relation: &rtdb_types::OwnedRelation, lifetime: bool, expiry: Option<Timestamp>,
+    ) -> Result<Option<OwnedRangeWitness>> {
+        let guard = self.relation_release_guard_for([relation], lifetime)?;
+        guard()?;
         let Some(scope) = self.witness_scope else { return Ok(None); };
         let database = self.context.catalog.database(&self.database)?;
         let [snapshot] = database.partitions.as_slice() else {
@@ -1462,9 +1533,10 @@ impl OwnedReadSession {
         if snapshot.tx_basis() != Some(self.present) {
             return Err(Anomaly::incorrect("rtdb.owned/range-witness", "The exact owned range basis is unavailable"));
         }
-        self.check_relation(relation)?;
+        guard()?;
         Ok(Some(OwnedRangeWitness {
-            relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until, fixed: None,
+            relation: relation.clone(), basis: self.present, scope, frontier,
+            until: expiry.map_or(self.witness_until, |expiry| expiry.min(self.witness_until)), fixed: None,
         }))
     }
 
