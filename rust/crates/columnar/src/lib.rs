@@ -17,10 +17,10 @@ pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DE
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value, read_execution_value_as};
 pub use read_allocation::{estimate_copy_cell_bytes, estimate_event_copy_cell_bytes, estimate_event_null_cell_bytes, estimate_null_copy_cell_bytes,
     estimate_read_cell_bytes, estimate_read_value_bytes};
-pub use read_check::validate_readable_column;
+pub use read_check::{ColumnPresence, validate_readable_cell, validate_readable_column};
 pub use iid::{IidView, build_iids};
 pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells, interleave};
-pub use hash::{hash_cell, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
+pub use hash::{decimal_cell_as_f64, hash_cell, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
 pub use memory::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn, Selection, retain_array, retain_buffer, retain_buffer_with_owner, shared_allocation_size};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
 pub use values::{ColumnReader, build_array, build_struct_array, copy_array, read_value, read_value_as, struct_field_cell};

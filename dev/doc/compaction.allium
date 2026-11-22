@@ -211,6 +211,9 @@ contract OutputSegmentLayout {
         -- Its coefficient buffers represent values at that scale.
         -- Copied cells retain their coefficient bytes and their decimal type leg in the merged schema.
 
+    @invariant PageMetadataReadsArrowCells
+        -- Page metadata derives numeric statistics and logical presence from Arrow cells.
+
     @invariant MillisecondDateStatisticsUseEpochDays
         -- A millisecond date's page statistics and value hash use its epoch day, obtained by truncating the stored milliseconds divided by milliseconds per day toward zero.
         -- The numeric statistic is that epoch day multiplied by seconds per day.

@@ -370,11 +370,13 @@ variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
+    -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
     -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
-    -- Embedded ADBC bulk ingest and pgwire Arrow COPY use Arrow document vectors for compatible scalar columns.
+    -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit compatible document columns in Arrow.
+    -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
     -- Compatible document vectors retain the UUID extension for their UUID values through source encoding and replay.
@@ -750,6 +752,7 @@ config {
 --      A block cut with no transactions in it therefore writes no tries whatsoever.
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.
+--      Per-table cardinality sketches hash the captured live Arrow cells in physical field order and exclude logical nulls.
 --      Block GC's per-table sweep depends on this — see block-gc.allium, EveryTableBlockAtCurrentIndex.
 --   4. Build and persist the block file, carrying the boundary's term and its position within that term, which are what seed a restarted node's fence and term position, and stamp the database's last-upload time.
 --   5. Append the upload to the replica log and await it.
@@ -943,6 +946,7 @@ rule LeaderProcessesTx {
         -- The refused transaction uses the normally assigned system time, so it still advances the resolved head.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
+        -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
         -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         -- An invalid SQL table projection contributes its error before dependent column binding and INSERT schema errors in the same abort.
     -- For concrete document writes, forbidden columns abort with the table reference and offending column names in source schema order.

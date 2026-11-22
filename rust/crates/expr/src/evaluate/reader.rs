@@ -167,7 +167,7 @@ fn plain_type(ty: &LogicalType) -> &LogicalType {
 }
 
 pub(super) fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<'_>) -> Result<LogicalType> {
-    if context.parameter_types.is_some_and(|types| types.len() != context.parameters.len()) {
+    if context.parameter_types.is_some_and(|types| types.len() != context.parameters.width()) {
         return Err(Anomaly::fault("rtdb.expr/parameter-schema", "Parameter values and declared types have different widths"));
     }
     context.reserve(expression_type_bound(expr)?.checked_mul(8).ok_or_else(overflow)?)?;

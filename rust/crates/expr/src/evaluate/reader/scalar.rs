@@ -54,7 +54,7 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
         Expr::Parameter { index,data_type } => {
             if let Some(ty) = frame.context.parameter_types.and_then(|types| types.get(*index)) { retained_type(ty,frame)? }
             else if *data_type == LogicalType::Nothing {
-                let value = frame.context.parameters.get(*index).ok_or_else(||Anomaly::incorrect("xtdb/missing-parameter",format!("Missing parameter ${}",index + 1)))?;
+                let value = frame.context.parameters.get(*index)?.ok_or_else(||Anomaly::incorrect("xtdb/missing-parameter",format!("Missing parameter ${}",index + 1)))?;
                 frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;
                 value.logical_type()
             } else { retained_type(data_type,frame)? }

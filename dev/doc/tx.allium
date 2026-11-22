@@ -17,6 +17,9 @@
 -- Native Flight SQL handles and captured-basis execution are in rust/crates/flight-sql/src/{state,lease,execute,actions}.rs.
 -- Native embedded ADBC and Clojure adapters are in rust/crates/ffi and bindings/jvm.
 -- Embedded ADBC copies bound Arrow buffers into native allocations and releases the foreign buffers before returning.
+-- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
+-- Scalar evaluation reads a bound parameter from its Arrow column when the expression reaches it.
+-- A prepared Flight SQL query compacts the first row of a multi-row parameter batch for the streaming cursor.
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 -- Logical relation cursors expose the root operator's pages as separate batches.
@@ -65,7 +68,7 @@
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
 --      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
 --      The connection streams Arrow IPC in CopyData frames and ends it before the CopyDone and command completion frames.
---      COPY FROM STDIN with an Arrow format submits compatible scalar document columns as Arrow batches.
+--      COPY FROM STDIN with an Arrow format submits compatible document columns as Arrow batches.
 --      Without an explicit transaction, each input batch commits separately.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
 --      An implicit basis on a linearizable subscriber follows the installed replica prefix confirmed by its active loglet.

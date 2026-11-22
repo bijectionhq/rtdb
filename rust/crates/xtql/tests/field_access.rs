@@ -19,7 +19,7 @@ async fn project(expression: &str,argument: V,scope: &rtdb_expr::EvaluationScope
     let options = CompileOptions { parameter_types: vec![argument.logical_type()],..Default::default() };
     let Statement::Query(relation) = compile(&source,&EmptyCatalog,&options)?.statement else { panic!("query") };
     let RelationNode::Project { input,expressions } = relation.node() else { panic!("projection") };
-    evaluate_async(&expressions[0].expr,input.schema(),&[],&EvalContext { parameters: &[argument],allocation: Some(scope),..Default::default() }).await
+    evaluate_async(&expressions[0].expr,input.schema(),&[],&EvalContext { parameters: rtdb_expr::Parameters::Values(&[argument]),allocation: Some(scope),..Default::default() }).await
 }
 
 #[tokio::test]

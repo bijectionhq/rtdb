@@ -52,7 +52,7 @@ impl PatchGaps {
                 PatchEndpoint::Default if !lower => return Ok(Timestamp::MAX),
                 PatchEndpoint::Default | PatchEndpoint::CurrentTime => return execution.context.current_time.as_micros(),
                 PatchEndpoint::DateTime(value) => value,
-                PatchEndpoint::Parameter(index) => execution.parameters.values().get(index).ok_or_else(|| invalid("patch-parameter", "Patch endpoint parameter is absent"))?,
+                PatchEndpoint::Parameter(index) => execution.parameters.get(index)?.ok_or_else(|| invalid("patch-parameter", "Patch endpoint parameter is absent"))?,
             };
             scope.reserve(value.retained_bytes()?.checked_add(execution.context.timezone.len()).and_then(|bytes|bytes.checked_mul(8)).and_then(|bytes|bytes.checked_add(16_384)).ok_or_else(||invalid("patch-endpoint-size", "Patch endpoint conversion exceeds addressable memory"))?)?;
             rtdb_expr::query_clock_instant(value, &execution.context.timezone)?.as_micros()

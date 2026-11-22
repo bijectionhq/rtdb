@@ -51,6 +51,71 @@ async fn prepared_parameter_projection_keeps_the_bound_arrow_buffers() {
 }
 
 #[tokio::test]
+async fn prepared_query_reads_an_arrow_parameter_only_when_reached() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray, cast::AsArray, types::Int64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let source = MemoryBudget::new(1 << 24);
+    let context = context(None, &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false), Field::new("text", DataType::Utf8, false)]));
+    let text = "x".repeat(1 << 21);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3])), Arc::new(StringArray::from(vec![text]))]).unwrap();
+    let bound = OwnedBatch::new(batch, &source).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare(
+        "SELECT CASE WHEN v < 0 THEN CAST(CHAR_LENGTH($2) AS BIGINT) ELSE v + $1 END AS n FROM (VALUES (10), (20)) AS t(v)",
+        &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic,
+    ).unwrap();
+    let mut cursor = query.try_open_query_arrow(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    assert!(source.used_bytes() > 0);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_primitive::<Int64Type>().values().as_ref(), &[13, 23]);
+    drop(cursor);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn vector_query_does_not_decode_an_unreached_case_arm() {
+    use arrow_array::{RecordBatch, StringArray, cast::AsArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let source = MemoryBudget::new(1 << 24);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    write(&state, 1, Value::I64(10), &memory);
+    let context = context(Some(&state), &memory);
+    let schema = Arc::new(Schema::new(vec![Field::new("left", DataType::Utf8, false), Field::new("right", DataType::Utf8, false)]));
+    let text = "x".repeat(1 << 21);
+    let array = |values: Vec<&str>| Arc::new(StringArray::from(values));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array(vec!["small"]), array(vec![text.as_str()])]).unwrap();
+    let bound = OwnedBatch::new(batch, &source).unwrap();
+    let types = [LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::Utf8)];
+    let query = PreparedSql::prepare(
+        "SELECT CASE WHEN v < 0 THEN $2 ELSE $1 END AS label FROM docs",
+        &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic,
+    ).unwrap();
+    let mut cursor = query.try_open_query_arrow(Arc::clone(&context), &bound, &types).await.unwrap().unwrap();
+    let before = memory.used_bytes();
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_string::<i32>().value(0), "small");
+    assert!(memory.used_bytes().saturating_sub(before) < 1 << 20);
+    drop((output, cursor, bound));
+    assert_eq!(source.used_bytes(), 0);
+
+    let batch = RecordBatch::try_new(schema, vec![array(vec!["first", text.as_str()]), array(vec!["other", text.as_str()])]).unwrap();
+    let bound = OwnedBatch::new(batch, &source).unwrap();
+    let mut cursor = query.try_open_query_arrow(context, &bound, &types).await.unwrap().unwrap();
+    drop(bound);
+    assert!(source.used_bytes() < 1 << 16);
+    let output = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(output.batch().column(0).as_string::<i32>().value(0), "first");
+}
+
+#[tokio::test]
 async fn prepared_parameter_projection_canonicalizes_masked_and_boolean_buffers() {
     use arrow_array::{Array, BooleanArray, Int64Array, NullArray, RecordBatch, cast::AsArray, types::Int64Type};
     use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};

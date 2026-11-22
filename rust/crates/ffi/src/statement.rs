@@ -167,7 +167,7 @@ impl StatementHandle {
                     check_argument_row_count(args)?;
                     if let Some(args) = args
                         && let Some(page) = args.single_arrow_page()
-                        && let Some(cursor) = prepared.try_open_parameter_projection(Arc::clone(&context), page, args.types()).await? {
+                        && let Some(cursor) = prepared.try_open_query_arrow(Arc::clone(&context), page, args.types()).await? {
                         return Ok(cursor);
                     }
                     let values = argument_row(args, self.session.region.memory())?;

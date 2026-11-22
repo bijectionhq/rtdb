@@ -16,7 +16,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, 
 use tokio_util::sync::CancellationToken;
 
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
-use crate::values::plain_scalar_field;
+use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
@@ -389,19 +389,22 @@ impl<'a> OpenTransaction<'a> {
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
-        self.execute_sql_typed(sql, arguments, None, &mut None).await
+        self.execute_sql_typed(sql, arguments.map(|values| BoundArgumentRow::Values { values, types: None }), &mut None).await
     }
 
     /// `planned` carries one operation's mutation from each argument row to the next, which reuses it while the
     /// transaction's catalog answers the planning's lookups the same.
-    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>, planned: &mut Option<PlannedMutation>) -> Result<()> {
+    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<BoundArgumentRow<'_>>, planned: &mut Option<PlannedMutation>) -> Result<()> {
         self.context.check_cancelled()?;
         // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
         let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let parameter_types = match types {
-            Some(types) => types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
-            None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
+        let parameter_types = match arguments {
+            Some(BoundArgumentRow::Values { types: Some(types), .. } | BoundArgumentRow::Arrow { types, .. }) =>
+                types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
+            Some(BoundArgumentRow::Values { values, .. }) =>
+                values.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
+            None => Default::default(),
         };
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let with_sql = |error: Anomaly| error.with_context("sql", sql.into());
@@ -473,7 +476,7 @@ impl<'a> OpenTransaction<'a> {
         Ok(query.next_batch().await?.is_some())
     }
 
-    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
+    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<()> {
         use rtdb_sql::Mutation;
         let (table, input, kind) = match mutation {
             Mutation::Put { table, input } => (Some(table), input, MutationKind::Put),
@@ -588,9 +591,9 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
                 Some(arguments) => {
                     let mut planned = None;
-                    for row in arguments.indexed_rows() {
+                    for row in arguments.indexed_bound_rows() {
                         let (index, row) = row?;
-                        self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                        self.execute_sql_typed(sql, Some(row), &mut planned)
                             .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
                     }
                     Ok(())
@@ -601,9 +604,9 @@ impl<'a> OpenTransaction<'a> {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
                 let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
                 let mut planned = None;
-                for row in arguments.indexed_rows() {
+                for row in arguments.indexed_bound_rows() {
                     let (index, row) = row?;
-                    self.execute_sql_typed(sql, Some(&row), Some(arguments.types()), &mut planned)
+                    self.execute_sql_typed(sql, Some(row), &mut planned)
                         .await.map_err(|error| error.with_context("arg-idx", index.into()))?;
                 }
                 Ok(())
@@ -925,14 +928,18 @@ fn reads_tables(mutation: &rtdb_sql::Mutation) -> bool {
     }
 }
 
-async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
+async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<BoundArgumentRow<'_>>, syntax: Option<Arc<MemoryReservation>>) -> Result<QueryCursor> {
     let count = input.parameter_count();
     if arguments.is_none() && count != 0 { return Err(Anomaly::incorrect("xtdb.indexer/missing-sql-args", "Arguments list was expected but not provided").with_context("param-count", count.into())); }
-    let arguments = arguments.unwrap_or_default();
-    if arguments.len() != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {} provided, {count} expected", arguments.len())).with_context("param-count", count.into()).with_context("arg-count", arguments.len().into())); }
+    let width = arguments.map_or(0, BoundArgumentRow::width);
+    if width != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {width} provided, {count} expected")).with_context("param-count", count.into()).with_context("arg-count", width.into())); }
     let query = PreparedQuery::new_in(input, &context.memory)?;
     drop(syntax);
-    query.execute_columns(context, arguments.to_vec()).await
+    match arguments {
+        Some(BoundArgumentRow::Arrow { batch, row, types }) => query.execute_arrow_columns(context, batch.clone(), row, types, None).await,
+        Some(BoundArgumentRow::Values { values, .. }) => query.execute_columns(context, values.to_vec()).await,
+        None => query.execute_columns(context, Vec::new()).await,
+    }
 }
 async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
     while let Some(batch) = cursor.next_batch().await? {
@@ -1015,14 +1022,13 @@ enum MutationKind { Put, Delete, Erase }
 fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<MemoryBudget>) -> Result<Option<OwnedBatch>> {
     let Some((index, _)) = batch.schema_ref().column_with_name("doc") else { return Ok(None); };
     let Some(content) = batch.column(index).as_struct_opt() else { return Ok(None); };
-    if content.is_empty() || content.null_count() != 0 || !content.fields().iter().all(|field| {
+    if content.is_empty() || content.null_count() != 0 { return Ok(None); }
+    let scalar = content.fields().iter().all(|field| {
         plain_scalar_field(field) && !matches!(field.data_type(), DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
-    }) {
-        return Ok(None);
-    }
+    });
     // A nullable field stores the scalar leg before null. When a later write adds a different type,
     // a null seen before the first scalar must still take its position in the transaction's union.
-    if content.columns().iter().any(|array| array.is_null(0) && array.null_count() != array.len()) {
+    if scalar && content.columns().iter().any(|array| array.is_null(0) && array.null_count() != array.len()) {
         return Ok(None);
     }
 
@@ -1044,6 +1050,11 @@ fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<
         // The row path orders header errors against admission of earlier documents.
         let Ok(header) = read_header(row) else { return Ok(None); };
         headers.push(header);
+    }
+    if !scalar {
+        let content = RecordBatch::from(content.clone());
+        let Some(documents) = ArrowDocuments::from_canonical_ingest(&content, IngestMode::Mutation, memory)? else { return Ok(None); };
+        return rtdb_format::data::owned_put_batch(Arc::new(documents.array().clone()), &headers, None, memory).map(Some);
     }
     let copy_bound = content.columns().iter().try_fold(
         content.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?,
@@ -1323,6 +1334,49 @@ mod tests {
             Ok(())
         }).unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    }
+
+    #[test]
+    fn nested_dml_payloads_use_arrow_with_distinct_per_row_valid_times() {
+        use arrow_array::{ArrayRef, FixedSizeBinaryArray, TimestampMicrosecondArray};
+        use arrow_schema::Field;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let docs = (1i64..=2).map(|id| Value::Struct(StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("value".into(), Value::Struct(StructFields::from([
+                ("dates".into(), Value::List(vec![Value::I64(id * 10), Value::I64(id * 11)])),
+                ("flags".into(), Value::FixedSizeList(vec![Value::Bool(id == 1), Value::Bool(true)])),
+            ]))),
+        ]))).collect::<Vec<_>>();
+        let doc_type = docs[0].logical_type();
+        let doc_field = rtdb_columnar::to_field("doc", &doc_type).unwrap();
+        let iids = (1i64..=2).map(|id| rtdb_types::EntityId::Integer(id).iid().0).collect::<Vec<_>>();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(FixedSizeBinaryArray::try_from_iter(iids.iter()).unwrap()),
+            Arc::new(TimestampMicrosecondArray::from(vec![12, 50]).with_timezone("UTC")),
+            Arc::new(TimestampMicrosecondArray::from(vec![20, 75]).with_timezone("UTC")),
+            rtdb_columnar::copy_array(&doc_type, &docs).unwrap(),
+        ];
+        let fields = vec![
+            Field::new("_iid", columns[0].data_type().clone(), false),
+            Field::new("_valid_from", columns[1].data_type().clone(), false),
+            Field::new("_valid_to", columns[2].data_type().clone(), false),
+            doc_field,
+        ];
+        let query_memory = MemoryBudget::new(1 << 24);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let batch = OwnedBatch::new(batch, &query_memory).unwrap();
+        let system_time = Timestamp(10);
+        let mut events = Vec::new();
+        mutation_events(batch.batch(), MutationKind::Put, system_time, |event| { events.push(event); Ok(()) }).unwrap();
+        let expected = rtdb_index::IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
+        let output = mutation_put_batch(batch.batch(), system_time, &memory).unwrap().expect("Expected Arrow mutation payload");
+        drop(batch);
+        assert_eq!(query_memory.used_bytes(), 0);
+        assert_eq!(output.batch(), expected.arrow());
+        assert_eq!(events[0].valid_time, Interval::from_micros(12, 20).unwrap());
+        assert_eq!(events[1].valid_time, Interval::from_micros(50, 75).unwrap());
     }
 
     #[tokio::test]

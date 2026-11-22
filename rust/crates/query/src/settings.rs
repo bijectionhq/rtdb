@@ -42,7 +42,7 @@ impl QueryContext {
         Ok(context)
     }
 
-    pub(crate) fn apply_settings(self: Arc<Self>, settings: &QuerySettings, parameters: &[Value]) -> Result<Arc<Self>> {
+    pub(crate) fn apply_settings(self: Arc<Self>, settings: &QuerySettings, parameters: rtdb_expr::Parameters<'_>) -> Result<Arc<Self>> {
         self.check_cancelled()?;
         let mut bytes = catalog_bound(&self.catalog)?;
         if let Some(times) = self.read_basis.as_ref().and_then(|basis| basis.times.as_ref()) { bytes = bytes.checked_add(basis_bound(times)?).ok_or_else(size_error)?; }
@@ -90,10 +90,10 @@ impl QueryContext {
     }
 }
 
-fn setting_value<'a>(expression: &'a SettingValue, parameters: &'a [Value]) -> Result<&'a Value> {
+fn setting_value<'a>(expression: &'a SettingValue, parameters: rtdb_expr::Parameters<'a>) -> Result<&'a Value> {
     match expression {
         SettingValue::Literal(value) => Ok(value),
-        SettingValue::Parameter { index } => parameters.get(*index).ok_or_else(|| invalid("missing-parameter", "Query setting parameter is absent")),
+        SettingValue::Parameter { index } => parameters.get(*index)?.ok_or_else(|| invalid("missing-parameter", "Query setting parameter is absent")),
         SettingValue::TimestampLiteral(_) => Err(invalid("invalid-setting-value", "An unadmitted timestamp literal requires CLOCK_TIME resolution")),
         SettingValue::Unevaluated { .. } => Err(invalid("invalid-setting-value", "Query settings resolve literals and parameters, not scalar expressions")),
     }

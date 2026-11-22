@@ -69,7 +69,7 @@ impl Inputs<'_> {
 }
 
 /// A lowered expression, with the divisors whose zeros the evaluator would reject.
-struct Lowering<'a> { inputs: Inputs<'a>, parameters: &'a [Value], divisors: Vec<Arc<dyn PhysicalExpr>>, functions: Vec<(Arc<datafusion_expr::ScalarUDF>, Vec<Arc<dyn PhysicalExpr>>, usize)> }
+struct Lowering<'a> { inputs: Inputs<'a>, parameters: rtdb_expr::Parameters<'a>, divisors: Vec<Arc<dyn PhysicalExpr>>, functions: Vec<(Arc<datafusion_expr::ScalarUDF>, Vec<Arc<dyn PhysicalExpr>>, usize)> }
 
 fn literal(value: &Value, expected: &DataType) -> Option<ScalarValue> {
     Some(match (value, expected) {
@@ -90,7 +90,19 @@ impl Lowering<'_> {
             Expr::Literal(value) => Arc::new(df::Literal::new(literal(value, &data_type)?)),
             Expr::Parameter { index, .. } => match self.inputs.arguments {
                 Some(_) => self.inputs.bind(InputPosition::Argument(*index), &data_type)?,
-                None => Arc::new(df::Literal::new(literal(self.parameters.get(*index)?, &data_type)?)),
+                None => {
+                    let value = if let Some(value) = self.parameters.known(*index) {
+                        literal(value, &data_type)?
+                    } else {
+                        let cell = self.parameters.arrow_cell(*index)?;
+                        if !(integer(&data_type) || matches!(data_type, DataType::Boolean | DataType::Float64))
+                            || cell.array.data_type() != &data_type || !cell.field.metadata().is_empty() {
+                            return None;
+                        }
+                        ScalarValue::try_from_array(cell.array, cell.row).ok()?
+                    };
+                    Arc::new(df::Literal::new(value))
+                }
             },
             Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide), left, right } => {
                 if !(integer(&data_type) || data_type == DataType::Float64) { return None; }
@@ -223,12 +235,12 @@ fn lowerable_at(expr: &Expr, remaining: Option<usize>) -> bool {
 }
 
 /// Evaluates `expr` over a batch's columns, or `None` where the evaluator must compute this batch.
-pub(crate) fn evaluate(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<ArrayRef> {
+pub(crate) fn evaluate(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<ArrayRef> {
     if !lowerable(expr) { return None; }
     evaluate_at(expr, schema, &batch.columns, batch.len, parameters, None)
 }
 
-fn evaluate_at(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: &[Value], arguments: Option<&[Column]>) -> Option<ArrayRef> {
+fn evaluate_at(expr: &Expr, schema: &Schema, columns: &[Column], len: usize, parameters: rtdb_expr::Parameters<'_>, arguments: Option<&[Column]>) -> Option<ArrayRef> {
     let inputs = Inputs { schema, columns, arguments, positions: Vec::new(), fields: Vec::new(), arrays: Vec::new() };
     let mut lowering = Lowering { inputs, parameters, divisors: Vec::new(), functions: Vec::new() };
     let (lowered, data_type) = lowering.lower(expr)?;
@@ -257,7 +269,7 @@ fn zero_present(array: &ArrayRef) -> bool {
 }
 
 /// The column `evaluate` computed, typed as the expression's declared scalar.
-pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<Column> {
+pub(crate) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<Column> {
     computed_column(expr, evaluate(expr, schema, batch, parameters)?)
 }
 
@@ -289,7 +301,7 @@ pub(crate) fn bound_column(expr: &Expr, schema: &Schema, columns: &[Column], arg
     });
     referenced?;
     let mut reservation = memory.reserve(bytes)?;
-    let Some(array) = evaluate_at(expr, schema, columns, 1, &[], Some(arguments)) else { return Ok(None); };
+    let Some(array) = evaluate_at(expr, schema, columns, 1, rtdb_expr::Parameters::Values(&[]), Some(arguments)) else { return Ok(None); };
     let retained = array.get_array_memory_size();
     if retained > bytes { return Ok(None); }
     Arc::get_mut(&mut reservation).expect("bound expression owns its reservation").shrink_to(retained)?;
@@ -306,7 +318,7 @@ fn computed_column(expr: &Expr, array: ArrayRef) -> Option<Column> {
 }
 
 /// The truth of a predicate per row, as the row filter's: `None` for a null.
-pub(crate) fn truth(predicate: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Option<Vec<Option<bool>>> {
+pub(crate) fn truth(predicate: &Expr, schema: &Schema, batch: &ColumnBatch, parameters: rtdb_expr::Parameters<'_>) -> Option<Vec<Option<bool>>> {
     let array = evaluate(predicate, schema, batch, parameters)?;
     let booleans = array.as_any().downcast_ref::<arrow_array::BooleanArray>()?;
     Some(booleans.iter().collect())
@@ -410,13 +422,13 @@ mod tests {
             let batch = batch(&mut random, 48, &memory);
             let expr = if round % 2 == 0 { number(&mut random, 3) } else { predicate(&mut random, 3) };
             let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
-            let context = rtdb_expr::EvalContext { parameters: &[], parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
+            let context = rtdb_expr::EvalContext { parameters: rtdb_expr::Parameters::Values(&[]), parameter_types: None, current_time: rtdb_types::Instant::from(Timestamp(0)), timezone: "UTC",
                 outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
             let expected: Vec<rtdb_types::Result<Value>> = (0..batch.len).map(|row| {
                 let values: Vec<Value> = batch.columns.iter().map(|column| column.value(row).unwrap()).collect();
                 rtdb_expr::evaluate(&expr, &schema, &values, &context)
             }).collect();
-            let Some(column) = super::column(&expr, &schema, &batch, &[]) else { declined += 1; continue };
+            let Some(column) = super::column(&expr, &schema, &batch, rtdb_expr::Parameters::Values(&[])) else { declined += 1; continue };
             computed += 1;
             for (row, expected) in expected.into_iter().enumerate() {
                 let expected = expected.unwrap_or_else(|error| panic!("the vectorised path computed {expr:?} where the evaluator raises {error:?}"));

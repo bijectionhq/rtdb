@@ -59,8 +59,8 @@ fn nth_and_nullable_count_sources_choose_their_leg_before_input_size() {
     assert_eq!(run(&trim(oversized(),call("nth",vec![Expr::List(vec![divide()]),literal(-1)]))).unwrap(),V::Null);
     let count = Expr::Parameter { index: 0,data_type: L::Scalar(S::I64).maybe() };
     let expression = trim(oversized(),count);
-    assert_eq!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: &[V::Null],..Default::default() }).unwrap(),V::Null);
-    assert_eq!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: &[V::I64(0)],..Default::default() }).unwrap_err().code,"xtdb.expression/overflow-error");
+    assert_eq!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: rtdb_expr::Parameters::Values(&[V::Null]),..Default::default() }).unwrap(),V::Null);
+    assert_eq!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: rtdb_expr::Parameters::Values(&[V::I64(0)]),..Default::default() }).unwrap_err().code,"xtdb.expression/overflow-error");
 }
 
 #[tokio::test(start_paused = true)]

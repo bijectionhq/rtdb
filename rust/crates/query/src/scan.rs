@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray};
+use arrow_array::{Array, StructArray, cast::AsArray};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
@@ -15,7 +15,7 @@ use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
-use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, EventHeader, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
 
 use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
@@ -248,11 +248,18 @@ use crate::analysis::ScanCounts;
 /// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
 /// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name one IID — `_id = 7.0` still
 /// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
-fn id_selection(scan: &Scan, parameters: &[Value]) -> Option<std::collections::BTreeSet<Iid>> {
+fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<std::collections::BTreeSet<Iid>> {
     let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
     let eid = |expr: &Expr| -> Option<Iid> {
         if let Some(uuid) = uuid_constant(expr, parameters) { return Some(Iid(uuid)); }
-        let value = match expr { Expr::Literal(value) => value, Expr::Parameter { index, .. } => parameters.get(*index)?, _ => return None };
+        let value = match expr {
+            Expr::Literal(value) => value,
+            Expr::Parameter { index, .. } => {
+                if let Some(cell) = parameters.arrow_cell(*index) { return arrow_parameter_iid(cell); }
+                parameters.known(*index)?
+            }
+            _ => return None,
+        };
         value.entity_id().ok().map(|entity| entity.iid())
     };
     let equality = |expr: &Expr| -> Option<Iid> {
@@ -283,11 +290,24 @@ fn stores_uuid_ids(table: &rtdb_types::TableRef, snapshots: &[Snapshot]) -> bool
 }
 
 /// The UUID a literal or parameter is, or that the cast of a string one to UUID gives, which is how `UUID '...'` is bound.
-fn uuid_constant(expr: &Expr, parameters: &[Value]) -> Option<[u8; 16]> {
-    fn constant<'v>(expr: &'v Expr, parameters: &'v [Value]) -> Option<&'v Value> {
-        match expr { Expr::Literal(value) => Some(value), Expr::Parameter { index, .. } => parameters.get(*index), _ => None }
+fn uuid_constant(expr: &Expr, parameters: rtdb_expr::Parameters<'_>) -> Option<[u8; 16]> {
+    fn constant<'v>(expr: &'v Expr, parameters: rtdb_expr::Parameters<'v>) -> Option<&'v Value> {
+        match expr { Expr::Literal(value) => Some(value), Expr::Parameter { index, .. } => parameters.known(*index), _ => None }
     }
     let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
+    let (operand, cast) = match expr {
+        Expr::Cast { expr, target: rtdb_plan::CastTarget::Fixed(target) } if *target == uuid => (expr.as_ref(), true),
+        _ => (expr, false),
+    };
+    if let Expr::Parameter { index, .. } = operand && let Some(cell) = parameters.arrow_cell(*index) {
+        if cell.array.is_null(cell.row) { return None; }
+        let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
+        return match (cell.field.data_type(), extension, cast) {
+            (DataType::FixedSizeBinary(16), Some("uuid"), _) => cell.array.as_fixed_size_binary().value(cell.row).try_into().ok(),
+            (DataType::Utf8, None, true) => EntityId::uuid(cell.array.as_string::<i32>().value(cell.row)).ok().map(|id| id.iid().0),
+            _ => None,
+        };
+    }
     let value = match expr {
         Expr::Cast { expr, target: rtdb_plan::CastTarget::Fixed(target) } if *target == uuid => match constant(expr, parameters)? {
             text @ Value::Utf8(_) => return match rtdb_expr::cast(text, &uuid, "UTC").ok()? { Value::Uuid(bytes) => Some(bytes), _ => None },
@@ -297,12 +317,22 @@ fn uuid_constant(expr: &Expr, parameters: &[Value]) -> Option<[u8; 16]> {
     };
     match value { Value::Uuid(bytes) => Some(*bytes), _ => None }
 }
+
+fn arrow_parameter_iid(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<Iid> {
+    if cell.array.is_null(cell.row) { return None; }
+    let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
+    match (cell.field.data_type(), extension) {
+        (DataType::Utf8, None) => Some(EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row))),
+        (DataType::Utf8, Some("xt/clj-keyword")) => Some(EntityId::keyword_iid(cell.array.as_string::<i32>().value(cell.row))),
+        _ => cell.signed_integer().map(|value| EntityId::Integer(value).iid()),
+    }
+}
 /// The inclusive IID interval that `_id` range predicates select: the conjuncts comparing `_id` with a UUID literal or
 /// parameter by `<`, `<=`, `>`, `>=` or BETWEEN, where every `_id` of the table is a UUID. A UUID is its own IID and
 /// UUIDs order as their bytes do, so those conjuncts hold exactly for the rows whose IID lies in the interval. An ID
 /// of any other type is hashed into its IID, so a table holding one is not narrowed. `Err` where no IID satisfies
 /// the conjuncts. The predicates are applied to the rows read either way.
-fn id_interval(scan: &Scan, parameters: &[Value]) -> std::result::Result<Option<(Iid, Iid)>, Unsatisfiable> {
+fn id_interval(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> std::result::Result<Option<(Iid, Iid)>, Unsatisfiable> {
     use rtdb_plan::BinaryOp as Op;
     let Some(field) = scan.columns.iter().find(|field| field.name == "_id") else { return Ok(None) };
     if field.data_type != rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid) { return Ok(None); }
@@ -411,9 +441,9 @@ impl ScanCursor {
             return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
         }
         let fixed_iids = scan.iids.is_some();
-        if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.values()); }
+        if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.evaluator()); }
         let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
-            match id_interval(&scan, execution.parameters.values()) {
+            match id_interval(&scan, execution.parameters.evaluator()) {
                 Ok(interval) => interval,
                 Err(Unsatisfiable) => { scan.iids = Some(Default::default()); None }
             }
@@ -499,7 +529,7 @@ impl PartitionScan {
     #[allow(clippy::too_many_arguments)]
     fn new(snapshot: Snapshot, storage: Arc<BufferPool>, mut scan: Scan, execution: Execution, bounds: TemporalBounds, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, canonical_entity_iids: bool, fragment: Option<(Iid, Iid)>) -> Self {
         let slots = vec![None; scan.columns.len()];
-        let interval = if stores_uuid_ids(&scan.table.name.table, std::slice::from_ref(&snapshot)) { id_interval(&scan, execution.parameters.values()) } else { Ok(None) };
+        let interval = if stores_uuid_ids(&scan.table.name.table, std::slice::from_ref(&snapshot)) { id_interval(&scan, execution.parameters.evaluator()) } else { Ok(None) };
         let confined = interval.and_then(|interval| intersect(fragment, interval)).unwrap_or_else(|Unsatisfiable| {
             scan.iids = Some(Default::default());
             fragment
@@ -1389,13 +1419,13 @@ mod tests {
         let equals = |value: Expr| Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), value);
         let parameter = Expr::Parameter { index: 0, data_type: LogicalType::Scalar(ScalarType::Utf8) };
         let iid = |value: Value| value.entity_id().unwrap().iid();
-        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::I64(7)))), &[]), Some([iid(Value::I64(7))].into()));
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::I64(7)))), rtdb_expr::Parameters::Values(&[])), Some([iid(Value::I64(7))].into()));
         let either = Expr::binary(rtdb_plan::BinaryOp::Or, equals(Expr::Literal(Value::I64(7))), Expr::binary(rtdb_plan::BinaryOp::Eq, parameter.clone(), id.expression()));
-        assert_eq!(id_selection(&scan(either.clone()), &[Value::Utf8("seven".into())]), Some([iid(Value::I64(7)), iid(Value::Utf8("seven".into()))].into()));
-        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::F64(7.0)))), &[]), None, "7.0 still matches the integer ID 7");
-        assert_eq!(id_selection(&scan(either), &[Value::Null]), None);
+        assert_eq!(id_selection(&scan(either.clone()), rtdb_expr::Parameters::Values(&[Value::Utf8("seven".into())])), Some([iid(Value::I64(7)), iid(Value::Utf8("seven".into()))].into()));
+        assert_eq!(id_selection(&scan(equals(Expr::Literal(Value::F64(7.0)))), rtdb_expr::Parameters::Values(&[])), None, "7.0 still matches the integer ID 7");
+        assert_eq!(id_selection(&scan(either), rtdb_expr::Parameters::Values(&[Value::Null])), None);
         let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
-        assert_eq!(id_selection(&scan(range), &[]), None);
+        assert_eq!(id_selection(&scan(range), rtdb_expr::Parameters::Values(&[])), None);
     }
 
     #[test]
@@ -1410,7 +1440,7 @@ mod tests {
         let at = |value: u128| Expr::Literal(Value::Uuid(value.to_be_bytes()));
         let compare = |op, value: u128| Expr::binary(op, id.clone(), at(value));
         let range = |lower: u128, upper: u128| Ok(Some((Iid(lower.to_be_bytes()), Iid(upper.to_be_bytes()))));
-        let interval = |predicates: Vec<Expr>| id_interval(&scan(&uuid_type, predicates), &[]);
+        let interval = |predicates: Vec<Expr>| id_interval(&scan(&uuid_type, predicates), rtdb_expr::Parameters::Values(&[]));
         use rtdb_plan::BinaryOp::{And, Eq, Gt, GtEq, Lt, LtEq, Or};
 
         assert_eq!(interval(vec![compare(GtEq, 10), compare(LtEq, 20)]), range(10, 20));
@@ -1425,14 +1455,14 @@ mod tests {
 
         let parameter = |index| Expr::Parameter { index, data_type: uuid_type.clone() };
         let bound = scan(&uuid_type, vec![Expr::binary(GtEq, id.clone(), parameter(0)), Expr::binary(Lt, id.clone(), parameter(1))]);
-        assert_eq!(id_interval(&bound, &[Value::Uuid(10u128.to_be_bytes()), Value::Uuid(20u128.to_be_bytes())]), range(10, 19));
-        assert_eq!(id_interval(&bound, &[Value::Uuid(10u128.to_be_bytes()), Value::Null]), range(10, u128::MAX), "a bound that is no UUID confines nothing");
-        assert_eq!(id_interval(&bound, &[Value::Utf8("a".into()), Value::I64(7)]), Ok(None));
+        assert_eq!(id_interval(&bound, rtdb_expr::Parameters::Values(&[Value::Uuid(10u128.to_be_bytes()), Value::Uuid(20u128.to_be_bytes())])), range(10, 19));
+        assert_eq!(id_interval(&bound, rtdb_expr::Parameters::Values(&[Value::Uuid(10u128.to_be_bytes()), Value::Null])), range(10, u128::MAX), "a bound that is no UUID confines nothing");
+        assert_eq!(id_interval(&bound, rtdb_expr::Parameters::Values(&[Value::Utf8("a".into()), Value::I64(7)])), Ok(None));
 
         let typed = |text: &str| Expr::Cast { expr: Box::new(Expr::Literal(Value::Utf8(text.into()))), target: rtdb_plan::CastTarget::Fixed(uuid_type.clone()) };
         assert_eq!(interval(vec![Expr::binary(GtEq, id.clone(), typed("00000000-0000-0000-0000-00000000000a")), Expr::binary(Lt, id.clone(), typed("00000000-0000-0000-0000-000000000014"))]), range(10, 19), "UUID '...' is a cast of its text");
         assert_eq!(interval(vec![Expr::binary(GtEq, id.clone(), typed("not a uuid"))]), Ok(None));
-        assert_eq!(id_selection(&scan(&uuid_type, vec![Expr::binary(Eq, id.clone(), typed("00000000-0000-0000-0000-00000000000a"))]), &[]), Some([Iid(10u128.to_be_bytes())].into()));
+        assert_eq!(id_selection(&scan(&uuid_type, vec![Expr::binary(Eq, id.clone(), typed("00000000-0000-0000-0000-00000000000a"))]), rtdb_expr::Parameters::Values(&[])), Some([Iid(10u128.to_be_bytes())].into()));
 
         assert_eq!(interval(vec![compare(GtEq, 21), compare(LtEq, 20)]), Err(Unsatisfiable));
         assert_eq!(interval(vec![compare(GtEq, 20), compare(LtEq, 20)]), range(20, 20));
@@ -1446,7 +1476,7 @@ mod tests {
         // An ID of any other type is hashed into its IID, so its order says nothing about the IID's.
         for id_type in [LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::I64), LogicalType::join_all(&[uuid_type.clone(), LogicalType::Scalar(ScalarType::Utf8)])] {
             let id = field(&id_type).expression();
-            assert_eq!(id_interval(&scan(&id_type, vec![Expr::binary(GtEq, id, at(10))]), &[]), Ok(None), "{id_type:?}");
+            assert_eq!(id_interval(&scan(&id_type, vec![Expr::binary(GtEq, id, at(10))]), rtdb_expr::Parameters::Values(&[])), Ok(None), "{id_type:?}");
         }
 
         assert_eq!(intersect(Some((Iid([1; 16]), Iid([5; 16]))), Some((Iid([3; 16]), Iid([9; 16])))), Ok(Some((Iid([3; 16]), Iid([5; 16])))));
