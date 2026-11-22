@@ -427,6 +427,15 @@ Use the coverage time as the next exclusive system time.
 An empty page carries only the response schema and terminator.
 Revisions are dense within the authenticated owner's relation, and each returned system time belongs to a commit with a change on that relation.
 
+`rtdb.owned.ReadHeldWorldPoint.v1` may include `rtdb.owned.world_point_witness`, an opaque 32-digit hexadecimal nonce.
+The witness exists only under an authenticated placed read with a retained lease. It may accompany an absent result or an archived winner.
+`rtdb.owned.CommitWorld.v2` takes the 16-byte world UUID, the 16-byte held world handle, a big-endian u16 witness count from 1 to 128, and that many distinct raw 16-byte nonces.
+The remaining bytes are the same relation groups as `CommitWorld.v1`.
+The original session and placement must still own the held world read.
+Before applying any write, the ordered resolver checks the placement and earliest lease deadline, then the local shadow observations.
+A local tombstone has its own observed revision. An archived winner certifies local absence. The parent cut itself is fixed by the world registration.
+The response has the same transaction-key row as `CommitWorld.v1`.
+
 === Reading a merged held change feed
 
 `rtdb.owned.ReadHeldMergedChanges.v1` takes the 16-byte held handle, an exclusive signed Int64 ordered system time in big-endian microseconds, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by that many relation prefixes.

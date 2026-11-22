@@ -79,7 +79,7 @@ impl SourceTransaction {
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     (owned_path_bytes(relation, name, columns)?, None, 0),
-                Operation::Public(TxOp::OwnedDeadline { .. }) => (0, None, 0),
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) =>
@@ -305,7 +305,7 @@ impl SourceTransaction {
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
                     owned_path_bytes(relation, name, columns)?,
-                Operation::Public(TxOp::OwnedDeadline { .. }) => 0,
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) => range_evidence_bytes(relation, fixed),
@@ -463,6 +463,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             } else {
                 "rtdb-owned-check-range-v1"
             }
+        }
+        Operation::Public(TxOp::OwnedCheckWorldScope { scope }) => {
+            body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
+            "rtdb-owned-check-world-scope-v1"
         }
         Operation::Public(TxOp::OwnedDeadline { until }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -1078,6 +1082,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-deadline-v1" => &["until"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
+            "rtdb-owned-check-world-scope-v1" => &["scope"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
@@ -1150,6 +1155,10 @@ impl SourceOperationReader<'_> {
                         Some(Arc::new(rtdb_types::FixedRangeEvidence::from_value(&value("fixed")?)?))
                     } else { None },
                 }
+            }
+            "rtdb-owned-check-world-scope-v1" => {
+                let Value::Binary(scope) = value("scope")? else { return Err(invalid("Owned world witness has no placement scope")); };
+                TxOp::OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope::decode(&scope)? }
             }
             "rtdb-owned-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };

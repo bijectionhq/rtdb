@@ -653,7 +653,7 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, false).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
-            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
@@ -858,6 +858,15 @@ impl<'a> OpenTransaction<'a> {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         for operation in operations {
+            if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
+                if self.owned_world.is_none() || deadline.is_none()
+                    || Some(*scope) != source_scope || Some(*scope) != self.context.owned_witness_scope
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
+                        "Owned world point witness is no longer admissible"));
+                }
+                continue;
+            }
             if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, fixed }) = operation {
                 let base = self.buffer.base_snapshot();
                 let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",

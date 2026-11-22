@@ -991,6 +991,37 @@ impl OwnedReadSession {
         Ok(record)
     }
 
+    /// Reads the exact local shadow, retaining its revision even when that shadow is a tombstone.
+    pub async fn read_world_shadow(
+        &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid_at: Timestamp, observed: bool,
+    ) -> Result<OwnedWorldShadowRead> {
+        let valid = rtdb_types::Interval::at(valid_at)?;
+        let relation = relation.in_world(world)?;
+        self.admit_read().await?;
+        let mut row = None;
+        let mut local_revision = None;
+        if let Some(mut cursor) = rtdb_query::open_owned_point(
+            Arc::clone(&self.context), &self.owner, &relation, id, Some(valid), None,
+        ).await? {
+            while let Some(batch) = cursor.next_batch().await? {
+                if batch.batch().num_rows() == 0 { continue; }
+                if row.is_some() || batch.batch().num_rows() != 1 {
+                    return Err(rtdb_types::OwnedWorld::unavailable());
+                }
+                let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, &self.context.memory)?;
+                if revision > self.present.system_time { return Err(rtdb_types::OwnedWorld::unavailable()); }
+                local_revision = Some(revision);
+                row = Some(batch);
+            }
+        }
+        self.check()?;
+        let witness = self.witness_scope.filter(|_| observed).map(|scope| OwnedWorldPointWitness {
+            world, relation, id: id.clone(), valid_at, local_revision, scope, until: self.witness_until,
+        });
+        Ok(OwnedWorldShadowRead { row, witness })
+    }
+
     pub fn close(&self) { self.cancellation.cancel(); }
     pub fn check(&self) -> Result<()> { self.context.check_cancelled() }
 
@@ -1181,6 +1212,34 @@ impl Drop for OwnedReadSession {
     fn drop(&mut self) { self.close(); }
 }
 
+pub struct OwnedWorldShadowRead {
+    pub row: Option<rtdb_columnar::OwnedBatch>,
+    pub witness: Option<OwnedWorldPointWitness>,
+}
+
+#[derive(Clone)]
+pub struct OwnedWorldPointWitness {
+    world: rtdb_types::Iid,
+    relation: rtdb_types::OwnedRelation,
+    id: rtdb_types::EntityId,
+    valid_at: Timestamp,
+    local_revision: Option<Timestamp>,
+    scope: rtdb_types::PlacedAttemptScope,
+    until: Timestamp,
+}
+
+impl OwnedWorldPointWitness {
+    pub fn allocation_bound(&self) -> usize {
+        use rtdb_types::EntityId;
+        let bytes = match &self.id {
+            EntityId::String(id) => id.len(),
+            EntityId::Keyword(id) => id.as_str().len(),
+            EntityId::Integer(_) | EntityId::Uuid(_) => 0,
+        };
+        bytes.saturating_add(self.relation.name().len()).saturating_add(1024)
+    }
+}
+
 pub struct OwnedWorldWrite {
     pub relation: rtdb_types::OwnedRelation,
     pub id: rtdb_types::EntityId,
@@ -1219,10 +1278,37 @@ impl NativeSession {
     pub async fn commit_owned_world(
         &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
     ) -> Result<TransactionResult> {
-        if !(1..=4096).contains(&writes.len()) { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        let _operations = self.service.node.memory().reserve((writes.len() + 1) * (std::mem::size_of::<TxOp>() + 512))?;
-        let mut ops = Vec::with_capacity(writes.len() + 1);
-        ops.push(TxOp::OwnedDeadline { until: record.until });
+        self.commit_owned_world_checked(record, writes, Vec::new()).await
+    }
+
+    pub async fn commit_owned_world_checked(
+        &mut self, record: &rtdb_types::OwnedWorld, writes: Vec<OwnedWorldWrite>,
+        checks: Vec<OwnedWorldPointWitness>,
+    ) -> Result<TransactionResult> {
+        if !(1..=4096).contains(&writes.len()) || checks.len() > 128 { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        let scope = self.placed_history()?;
+        let now = self.service.node.now();
+        let mut until = record.until;
+        for check in &checks {
+            if check.world != record.id || check.relation.world() != Some(record.id)
+                || scope != Some(check.scope) || now >= check.until
+            {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
+            until = until.min(check.until);
+        }
+        let count = writes.len() + checks.len() + 2;
+        let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
+        let mut ops = Vec::with_capacity(count);
+        ops.push(TxOp::OwnedDeadline { until });
+        if let Some(check) = checks.first() {
+            ops.push(TxOp::OwnedCheckWorldScope { scope: check.scope });
+        }
+        for check in checks {
+            ops.push(TxOp::OwnedCheck {
+                relation: check.relation, id: check.id, valid_at: check.valid_at, expected: check.local_revision,
+            });
+        }
         for OwnedWorldWrite { relation, id, shadow, valid } in writes {
             let relation = relation.in_world(record.id)?;
             let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;

@@ -1093,3 +1093,72 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
         source(vec![check(leave.result().tx_key(), 4, 3)]), &context).await.unwrap();
     assert_eq!(stale_empty.result().error().unwrap().code, "rtdb.owned/stale-range");
 }
+
+#[tokio::test]
+async fn owned_world_conditions_distinguish_local_absence_from_a_tombstone_revision() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, PlacedAttemptScope, TransactionKey, TxId, WorldSchemas, WorldShadow};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-world", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let world = OwnedWorld {
+        id: Iid([8; 16]), capture: Iid([9; 16]), manifest: "a".repeat(43),
+        basis: TransactionKey { tx_id: TxId(0), system_time: Timestamp(10) }, until: Timestamp(200), dropped: false,
+        schemas: WorldSchemas::new(std::collections::BTreeMap::from([(
+            "orders".into(), rtdb_types::OwnedSchema::from_json(br#"{"fields":[]}"#).unwrap(),
+        )])).unwrap(),
+    };
+    let local = OwnedRelation::new("orders").unwrap().in_world(world.id).unwrap();
+    let id = EntityId::Integer(1);
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let register = TxOp::OwnedInsertDocs {
+        relation: OwnedRelation::world_catalog(),
+        documents: Documents::new(vec![world.record()], &context.memory).unwrap(), valid_from: None, valid_to: None,
+    };
+    let write = |shadow: WorldShadow| TxOp::OwnedReplaceDocs {
+        relation: local.clone(), documents: Documents::new(vec![shadow.record(&id).unwrap()], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(50)), valid_to: Some(Timestamp(100)),
+    };
+    let condition = |expected| TxOp::OwnedCheck {
+        relation: local.clone(), id: id.clone(), valid_at: Timestamp(75), expected,
+    };
+    let commands = |scope, deadline, check, write| vec![
+        TxOp::OwnedDeadline { until: Timestamp(deadline) },
+        TxOp::OwnedCheckWorldScope { scope },
+        check, write,
+    ];
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let opened = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![register]), &context).await.unwrap();
+    assert!(opened.result().committed());
+    let tombstone = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(commands(scope, 150, condition(None), write(WorldShadow::Deleted))), &context).await.unwrap();
+    assert!(tombstone.result().committed());
+
+    let present = || WorldShadow::Present(StructFields::from([("_id".into(), id.as_value())]));
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(commands(scope, 150, condition(None), write(present()))), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-point");
+    assert!(!stale.writes().tables().contains_key(&local.table("owner")));
+
+    let revision = Some(tombstone.result().tx_key().system_time);
+    let moved = PlacedAttemptScope::new("installed-world", 2).unwrap();
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(commands(moved, 150, condition(revision), write(present()))), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/world-witness-unavailable");
+    let expired = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(commands(scope, 104, condition(revision), write(present()))), &context).await.unwrap();
+    assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
+    let changed = resolver.resolve_source(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(commands(scope, 150, condition(revision), write(present()))), &context).await.unwrap();
+    assert!(changed.result().committed());
+}

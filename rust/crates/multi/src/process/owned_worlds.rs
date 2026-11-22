@@ -3,12 +3,12 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldPoint, WorldPointResult, WorldPointRow};
-use rtdb_node::{NodeOptions, OwnedWorldWrite};
+use rtdb_node::{NodeOptions, OwnedWorldPointWitness, OwnedWorldWrite};
 use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey};
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_checked, drop_checkpoint_world, fork_checkpoint_world, read_checkpoint_world_point},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -89,10 +89,10 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
-    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>) -> BoxFuture<'a, Result<TransactionKey>> {
+    fn commit_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, writes: Vec<OwnedWorldWrite>, checks: Vec<OwnedWorldPointWitness>) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
-            commit_checkpoint_world(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes).await
+            commit_checkpoint_world_checked(self.directory.as_ref(), &self.storage, call.session, deployment, world, writes, checks).await
         })
     }
 
@@ -123,5 +123,5 @@ fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
         let (fields, revision, reservation) = fact.into_parts();
         WorldPointRow { fields, revision, reservation }
     });
-    WorldPointResult { present: read.present.system_time, row }
+    WorldPointResult { present: read.present.system_time, row, witness: read.witness }
 }
