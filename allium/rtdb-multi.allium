@@ -2146,7 +2146,8 @@ rule Fork {
     -- A local fork acquires a preparation in the current lineage generation before reading storage and consumes it when the child publishes.
     -- A hosted fork holds a preparation in the current lineage generation through provider I/O.
     -- Its child identity and physical custody are recorded before it writes objects, keys or journals.
-    -- Publication checks the exact staged child and the current preparation.
+    -- Each provider upload is recorded on its staged child before submission.
+    -- Publication checks the exact staged child, the current preparation and a drained storage region.
     -- An intervening retirement therefore requires fresh preparation.
     -- Local preparation, publication and reclamation hold the same volume maintenance lock through their admitted provider work.
     when: ForkRequested(parent, basis, org)
@@ -2203,6 +2204,8 @@ rule RecoverUnpublishedHostedFork {
     -- A reaper can close an abandoned stage after the source preparation has been released.
     -- Attested task stoppage can release an abandoned preparation.
     -- The stage version orders reaper recovery against publication.
+    -- Closing the stage closes its storage region to further publication and retains unresolved upload IDs.
+    -- The reaper verifies the physical namespace and settles each retained upload before provider inventory disposal.
     -- An unpublished stage contributes no references to the served lineage.
     when: HostedForkCleanupRequested(stage)
 
@@ -2210,7 +2213,9 @@ rule RecoverUnpublishedHostedFork {
 
     ensures:
         if Directory.cas(stage.id, stage.version, change: { lifecycle: deleting, epoch: Next(stage.epoch) }):
-            DisposeStagedResidence(stage)
+            SettleStagedProviderPublications(stage)
+            if ServingPublicationsSettled(stage):
+                DisposeStagedResidence(stage)
 }
 
 rule ForkReadsAreCapped {

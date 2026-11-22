@@ -102,14 +102,14 @@ async fn exercise_cell(storage: CellStorage) {
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
     let parent = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     eprintln!("S3 phase: fork parent");
-    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
     prove_rejected_fork_disposal(&cell, &child).await;
     let copied = rtdb_multi::reference::stores(bucket.as_ref(), &child.storage_prefix()).await.unwrap();
     for store in &copied {
         assert!(rtdb_multi::reference::physical_objects(bucket.as_ref(), store).await.unwrap().is_empty(), "a fork on S3 references its parent's objects rather than copying them");
     }
     let external = admin::fork_into(
-        cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop",
+        &cell.directory, &cell.storage(), &cell.keys(), "shop",
         admin::ForkDestination { name: "outside-preview", org: Some("recipient"), hosted_task: None }, &control(),
     ).await.unwrap();
     let versioned = rtdb_multi::reference::stores(bucket.as_ref(), &external.storage_prefix()).await.unwrap();
@@ -156,7 +156,7 @@ async fn prove_rejected_fork_disposal(cell: &Cell, published: &rtdb_directory::D
     let directory = cell.directory.as_ref();
     let storage = cell.storage();
     let keys = cell.keys();
-    assert_eq!(admin::fork(directory, &storage, &keys, "shop", &published.name, &control()).await.unwrap_err().code, "rtdb.directory/exists");
+    assert_eq!(admin::fork(&cell.directory, &storage, &keys, "shop", &published.name, &control()).await.unwrap_err().code, "rtdb.directory/exists");
     let rejected = directory.deployments().await.unwrap().into_iter().find(|record| {
         record.name == published.name && record.hosted_fork_stage.is_some()
     }).unwrap();

@@ -487,11 +487,18 @@ pub(crate) fn track_checkpoint_stage_publications(
     ));
 }
 
+pub(crate) fn track_hosted_fork_publications(io: &mut Arc<IoRegion>, directory: Arc<dyn Directory>, deployment: String, region: Uuid) {
+    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
+        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::HostedFork },
+    ));
+}
+
 #[derive(Clone, Copy)]
 enum PublicationOwner {
     Serving,
     Transfer,
     CheckpointStage(Uuid),
+    HostedFork,
 }
 
 struct DirectoryPublications {
@@ -517,6 +524,8 @@ impl PublicationJournal for DirectoryPublications {
                     && record.checkpoint_stage.as_ref().is_some_and(|stage| {
                         stage.intent.operation == operation && stage.staged_manifest_sha256.is_none()
                     }),
+                PublicationOwner::HostedFork => record.lifecycle == Lifecycle::Restoring
+                    && record.hosted_fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),
             };
             if !accepts_writes || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
             {
@@ -674,6 +683,13 @@ async fn abort_remote_publications(
     let CellStorage::S3 { config } = archive.as_ref().unwrap_or(serving) else {
         return Err(unrecognized());
     };
+    if record.hosted_fork_stage.is_some() {
+        let bucket = serving.bucket(IoRegion::new()).await?;
+        let namespace = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?;
+        if namespace.is_none() || namespace != record.storage_namespaces.map(|binding| binding.objects) {
+            return Err(storage_region_error("Hosted fork staging uses different provider custody"));
+        }
+    }
     let inventory = CellStorage::s3_inventory(config).await?;
     for (&attempt, publication) in publications {
         let key = ObjectKey::new(publication.key.clone())?;
@@ -2166,6 +2182,83 @@ mod tests {
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
             archive: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned() })]),
         });
+    }
+
+    #[tokio::test]
+    async fn a_recovered_hosted_fork_aborts_its_exact_upload_before_disposal() {
+        use rtdb_directory::{DeletionObservation, ForkPreparation, ForkPublication};
+        use rtdb_storage::remote::PublicationUploads;
+
+        let Ok(endpoint) = std::env::var("RTDB_S3_ENDPOINT") else { return };
+        if !endpoint.starts_with("http://127.0.0.1:") { return; }
+        let bucket_name = std::env::var("RTDB_S3_BUCKET").expect("a fixture bucket");
+        let mut config = rtdb_s3::S3Config::new(bucket_name);
+        config.endpoint = Some(endpoint);
+        config.region = Some("us-east-1".into());
+        config.path_style_access_enabled = true;
+        config.prefix = Some(format!("fork-upload-{}", Uuid::new_v4()));
+        let mut wrong_config = config.clone();
+        wrong_config.prefix = Some(format!("other-storage-{}", Uuid::new_v4()));
+        let wrong_storage = CellStorage::S3 { config: wrong_config };
+        let root = CellStorage::s3_root(&config).unwrap();
+        let inventory = CellStorage::s3_inventory(&config).await.unwrap();
+        let storage = CellStorage::S3 { config };
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(data.path()).unwrap();
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut parent = DeploymentRecord::new("shop", "acme", vec![], 0);
+        parent.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
+        let parent = directory.create_deployment(parent).await.unwrap();
+        let mut child = DeploymentRecord::new("preview", "acme", vec![], 0);
+        child.parent = Some(parent.id.clone());
+        child.lineage.clone_from(&parent.lineage);
+        child.storage_namespaces = parent.storage_namespaces;
+        let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
+        directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
+        directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
+        let prefix = key(&child.storage_prefix());
+        let object = key(&format!("{prefix}/v06/rows"));
+        let target = format!("{root}/{object}").into();
+        let attempt = Uuid::new_v4();
+        let upload = inventory.reserve(&target, attempt).await.unwrap();
+        let journal = DirectoryPublications {
+            directory: directory.clone(), deployment: child.id.clone(), region: preparation.token,
+            writer_epoch: None, owner: PublicationOwner::HostedFork,
+        };
+        assert!(journal.admit(&key(&format!("{}/v06/rows", parent.storage_prefix())), attempt, &upload).await.is_err());
+        journal.admit(&object, attempt, &upload).await.unwrap();
+        assert_eq!(directory.publish_fork(child.clone(), parent.version, Some(ForkPublication::Hosted(preparation))).await.unwrap_err().code,
+            "rtdb.directory/fork-stage-changed");
+
+        directory.change_lineage(&parent.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
+        let stage = directory.deployment(&child.id).await.unwrap().unwrap();
+        crate::admin::close_abandoned_hosted_fork(directory.as_ref(), &stage).await.unwrap();
+        let closed = directory.deployment(&child.id).await.unwrap().unwrap();
+        assert!(matches!(&closed.storage_regions[&preparation.token], StorageRegion::Remote { closed: true, publications, .. }
+            if publications[&attempt].upload_id == upload));
+        assert!(journal.admit(&object, Uuid::new_v4(), &upload).await.is_err());
+        assert_eq!(reconcile_storage_regions(directory.as_ref(), &wrong_storage, &keys, &closed).await.unwrap_err().code,
+            "rtdb.multi/storage-region");
+        assert!(!inventory.is_empty(&prefix).await.unwrap());
+
+        let finish = || crate::admin::finish_disposal(directory.as_ref(), &storage, &keys, &child.id, 4 << 20);
+        assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/storage-lease-active");
+        assert!(directory.deployment(&child.id).await.unwrap().unwrap().storage_regions.is_empty());
+        assert!(inventory.is_empty(&prefix).await.unwrap());
+        let replace_observation = |observation| crate::admin::update_installation(directory.as_ref(), &child.id, move |current| {
+            current.deletion_observation = Some(observation);
+            Ok(())
+        });
+        replace_observation(DeletionObservation::Fenced { leases_expire_at_ms: 0 }).await.unwrap();
+        assert_eq!(finish().await.unwrap_err().code, "rtdb.multi/deletion-verification-pending");
+        let horizon = (rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE).as_millis() as i64;
+        replace_observation(DeletionObservation::Empty { observed_at_ms: now_ms() - horizon }).await.unwrap();
+        let receipt = finish().await.unwrap();
+        assert_eq!(receipt.deployment, child.id);
+        assert!(inventory.complete(&target, &upload, Bytes::from_static(b"late publication")).await.is_err());
+        assert!(inventory.is_empty(&prefix).await.unwrap());
     }
 
     #[tokio::test]

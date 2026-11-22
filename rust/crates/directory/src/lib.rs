@@ -916,15 +916,22 @@ fn fork_stage_changed() -> Anomaly {
 fn stage_hosted_fork_record(mut child: DeploymentRecord, parent: &DeploymentRecord, lineage: &LineageState,
     preparation: ForkPreparation) -> Result<DeploymentRecord> {
     shared_fork_lineage(&child, Some(parent), parent.version)?;
+    let owner = lineage.preparations().find_map(|(held, owner)| match owner {
+        PreparationOwner::Hosted { task } if held == preparation => Some(task.clone()),
+        _ => None,
+    }).ok_or_else(fork_stage_changed)?;
     if child.lifecycle != Lifecycle::Live || child.holder.is_some() || child.hosted_fork_stage.is_some()
         || child.checkpoint_stage.is_some() || child.incarnation != 1 || child.epoch > 1
-        || child.storage_namespaces != parent.storage_namespaces
-        || !lineage.preparations().any(|(held, owner)| held == preparation && matches!(owner, PreparationOwner::Hosted { .. }))
+        || child.storage_namespaces != parent.storage_namespaces || !child.storage_regions.is_empty()
     {
         return Err(fork_stage_changed());
     }
     child.lifecycle = Lifecycle::Restoring;
     child.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
+    child.storage_regions.insert(preparation.token, StorageRegion::Remote {
+        tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        archive: None, repair_archive: None, owner, closed: false, publications: BTreeMap::new(),
+    });
     Ok(child)
 }
 
@@ -937,7 +944,7 @@ fn fork_stage_version(child: &DeploymentRecord, staged: Option<&DeploymentRecord
     expected.lifecycle = Lifecycle::Restoring;
     expected.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
     expected.version = staged.version;
-    if child.lifecycle != Lifecycle::Live || *staged != expected { return Err(fork_stage_changed()); }
+    if child.lifecycle != Lifecycle::Live || !child.storage_regions.is_empty() || *staged != expected { return Err(fork_stage_changed()); }
     Ok(Some(staged.version))
 }
 

@@ -638,15 +638,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
-                    admin::fork_time_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, rtdb_types::Timestamp(time.timestamp_micros()),
+                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, rtdb_types::Timestamp(time.timestamp_micros()),
                         Duration::from_secs(arguments.number("grace", 3600u64)?), 4 << 20).await?
                 }
                 (at_block, _) => match at_block {
                 Some(block) => {
                     let block = block.parse().map_err(|_| usage("--at-block must be a block index".into()))?;
-                    admin::fork_block_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
+                    admin::fork_block_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
                 }
-                None => admin::fork_into(directory.as_ref(), &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
+                None => admin::fork_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
                 },
             };
             println!("{}", serde_json::to_string_pretty(&record).expect("a record serializes"));

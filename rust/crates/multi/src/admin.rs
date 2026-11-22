@@ -489,56 +489,56 @@ pub struct ForkDestination<'a> {
 
 /// Forks `parent` into a new deployment in its lineage.
 /// The parent is flushed, and the child references its objects and starts on fresh logs.
-pub async fn fork(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
+pub async fn fork(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, control: &ControlKey) -> Result<DeploymentRecord> {
     fork_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, control).await
 }
 
-pub async fn fork_into(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, control: &ControlKey) -> Result<DeploymentRecord> {
-    let original = fork_source(directory, parent).await?;
+pub async fn fork_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, control: &ControlKey) -> Result<DeploymentRecord> {
+    let original = fork_source(directory.as_ref(), parent).await?;
     if let Some(org) = destination.org { validate_org(org)?; }
-    let source = flush_checkpoint(directory, &original, control).await?;
+    let source = flush_checkpoint(directory.as_ref(), &original, control).await?;
     let source = &source;
-    with_fork_access(directory, storage, keys, source, destination.hosted_task, |access|
-        fork_with_tail(directory, storage, access, keys, source, destination, None, Vec::new(), 4 << 20)).await
+    with_fork_access(directory.as_ref(), storage, keys, source, destination.hosted_task, |access|
+        fork_with_tail(directory.clone(), storage, access, keys, source, destination, None, Vec::new(), 4 << 20)).await
 }
 
 /// Forks `parent` as of one of its past blocks: the fork's state is that block's, and what the parent wrote after it is not the fork's.
 /// Only a block younger than the reaper's `grace` can be forked from: an object it needs that the parent released since is erased only once the grace has passed.
-pub async fn fork_at_block(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: Duration) -> Result<DeploymentRecord> {
+pub async fn fork_at_block(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, block: i64, grace: Duration) -> Result<DeploymentRecord> {
     fork_block_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, block, grace).await
 }
 
-pub async fn fork_block_into(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, block: i64, grace: Duration) -> Result<DeploymentRecord> {
-    let source = fork_source(directory, parent).await?;
+pub async fn fork_block_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, block: i64, grace: Duration) -> Result<DeploymentRecord> {
+    let source = fork_source(directory.as_ref(), parent).await?;
     let source = &source;
-    with_fork_access(directory, storage, keys, source, destination.hosted_task, |access| async move {
+    with_fork_access(directory.as_ref(), storage, keys, source, destination.hosted_task, |access| async move {
         let age = now_ms() - crate::reference::written_at_ms(access.bucket.as_ref(), &source.storage_prefix(), block).await?;
         if age >= grace.as_millis() as i64 { return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("Block {block} was written {}s ago, beyond the reaper's grace of {}s", age / 1000, grace.as_secs()))); }
-        fork_with_tail(directory, storage, access, keys, source, destination, Some(block), Vec::new(), 4 << 20).await
+        fork_with_tail(directory.clone(), storage, access, keys, source, destination, Some(block), Vec::new(), 4 << 20).await
     }).await
 }
 
 /// Forks `parent` as of a system time at or after its checkpoint: the fork starts from the checkpoint's block, with the parent's transactions after it up to `system_time` copied into its own stream.
 /// A time before the checkpoint is a past block's, which `fork_at_block` forks from.
-pub async fn fork_at_time(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+pub async fn fork_at_time(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, name: &str, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     fork_time_into(directory, storage, keys, parent, ForkDestination { name, org: None, hosted_task: None }, system_time, grace, maximum_message_bytes).await
 }
 
-pub async fn fork_time_into(directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
-    let source = fork_source(directory, parent).await?;
+pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, parent: &str, destination: ForkDestination<'_>, system_time: rtdb_types::Timestamp, grace: Duration, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+    let source = fork_source(directory.as_ref(), parent).await?;
     let checkpoint = source.checkpoint.ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-checkpoint", format!("{parent} has published no block to fork from")))?;
     if system_time.0 < checkpoint.system_time { return Err(Anomaly::incorrect("rtdb.multi/before-checkpoint", format!("{parent}'s last published block is after that time: fork at a past block instead"))); }
     let source = &source;
-    with_fork_access(directory, storage, keys, source, destination.hosted_task, |access| async move {
+    with_fork_access(directory.as_ref(), storage, keys, source, destination.hosted_task, |access| async move {
         if now_ms() - crate::reference::written_at_ms(access.bucket.as_ref(), &source.storage_prefix(), checkpoint.block).await? >= grace.as_millis() as i64 {
             return Err(Anomaly::incorrect("rtdb.multi/block-too-old", format!("{parent}'s last published block is older than the reaper's grace")));
         }
-        let servers = replica_servers(directory, source).await?;
+        let servers = replica_servers(directory.as_ref(), source).await?;
         let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: source.stream("replica"), maximum_message_bytes };
         let material = fork_key(keys, source).await?;
         let reader = crate::logs::SealedLog::new(rtdb_logkeeper::open_reader(stream, CancellationToken::new()).await?, &material, &source.replica_seal_scope())?;
         let tail = crate::logs::transactions_until(&reader, checkpoint.boundary, system_time).await?;
-        fork_with_tail(directory, storage, access, keys, source, destination, Some(checkpoint.block), tail, maximum_message_bytes).await
+        fork_with_tail(directory.clone(), storage, access, keys, source, destination, Some(checkpoint.block), tail, maximum_message_bytes).await
     }).await
 }
 
@@ -550,7 +550,7 @@ async fn fork_key(keys: &dyn KeyService, source: &DeploymentRecord) -> Result<[u
     keys.existing_key(&source.key_id()).await?.ok_or_else(|| fork_unavailable(&source.name))
 }
 
-async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access: ForkAccess, keys: &dyn KeyService, source: &DeploymentRecord, destination: ForkDestination<'_>, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
+async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, access: ForkAccess, keys: &dyn KeyService, source: &DeploymentRecord, destination: ForkDestination<'_>, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let ForkAccess { bucket, io, preparation, maintenance } = access;
     let org = destination.org.unwrap_or(&source.org);
     validate_org(org)?;
@@ -562,7 +562,7 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access
     child.log_epoch = source.log_epoch + 1;
     child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
-    child.ensemble = choose_ensemble(directory, &child, source.ensemble.len()).await?;
+    child.ensemble = choose_ensemble(directory.as_ref(), &child, source.ensemble.len()).await?;
     let source_key = fork_key(keys, source).await?;
     let child_stream = if tail.is_empty() {
         None
@@ -570,15 +570,24 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access
         // The first holder claims the next epoch and seals the fork's tail.
         child.epoch = 1;
         crate::logs::renumber_into(&mut tail, rtdb_types::StorageEpoch(child.log_epoch))?;
-        let servers = replica_servers(directory, &child).await?;
+        let servers = replica_servers(directory.as_ref(), &child).await?;
         child.replica_journals.extend(servers.iter().cloned());
         Some(StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: child.stream("replica"), maximum_message_bytes })
     };
-    let stage = match preparation {
-        ForkPublication::Hosted(preparation) => Some(directory.stage_hosted_fork(child.clone(), preparation).await?),
+    let hosted = match preparation {
+        ForkPublication::Hosted(preparation) => {
+            let stage = directory.stage_hosted_fork(child.clone(), preparation).await?;
+            let mut target_io = io.child();
+            crate::store::track_hosted_fork_publications(&mut target_io, directory.clone(), child.id.clone(), preparation.token);
+            Some((stage, preparation.token, target_io))
+        }
         _ => None,
     };
     let prepared = async {
+        let bucket = match &hosted {
+            Some((_, _, target_io)) => storage.bucket(target_io.clone()).await?,
+            None => bucket,
+        };
         let key = if same_organisation {
             crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
             keys.install(&child.key_id(), source_key).await?;
@@ -598,16 +607,27 @@ async fn fork_with_tail(directory: &dyn Directory, storage: &CellStorage, access
         Ok(())
     }.await;
     io.close_and_wait().await;
+    let prepared = match &hosted {
+        Some((_, region, _)) => prepared.and(crate::store::release_region(directory.as_ref(), &child.id, *region, false).await),
+        None => prepared,
+    };
     let published = match prepared {
-        Ok(()) => publish_fork(directory, source, &child, preparation).await,
+        Ok(()) => publish_fork(directory.as_ref(), source, &child, preparation).await,
         Err(error) => Err(ForkPublicationError::Rejected(error)),
     };
     match published {
         Ok(stored) => Ok(stored),
         Err(ForkPublicationError::Uncertain(error)) => Err(error),
         Err(ForkPublicationError::Rejected(error)) => {
-            let cleanup = if let Some(stage) = stage {
-                close_hosted_fork(directory, stage).await
+            let cleanup = if let Some((stage, _, _)) = hosted {
+                async {
+                    if let Some(current) = directory.deployment(&stage.id).await?
+                        .filter(|current| current.lifecycle == Lifecycle::Restoring && current.hosted_fork_stage == stage.hosted_fork_stage)
+                    {
+                        close_hosted_fork(directory.as_ref(), current).await?;
+                    }
+                    Ok(())
+                }.await
             } else {
                 async {
                     let io = rtdb_storage::IoRegion::new().child_holding(maintenance.map(|lock| lock as Arc<dyn Send + Sync>));
@@ -653,6 +673,13 @@ async fn publish_fork(directory: &dyn Directory, source: &DeploymentRecord, chil
 }
 
 async fn close_hosted_fork(directory: &dyn Directory, mut stage: DeploymentRecord) -> Result<()> {
+    let Some(hosted) = &stage.hosted_fork_stage else { return Ok(()); };
+    let region = hosted.preparation.token;
+    match stage.storage_regions.get_mut(&region) {
+        Some(rtdb_directory::StorageRegion::Remote { closed, publications, .. }) if !publications.is_empty() => *closed = true,
+        Some(rtdb_directory::StorageRegion::Remote { .. }) => { stage.storage_regions.remove(&region); }
+        _ => {}
+    }
     let version = stage.version;
     stage.lifecycle = Lifecycle::Deleting;
     stage.epoch = stage.epoch.checked_add(1).ok_or_else(|| {
@@ -2211,7 +2238,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_deletion_and_fork_retry_before_mutating_storage_when_maintenance_is_active() {
-        let directory = MemoryDirectory::new();
+        let directory: std::sync::Arc<dyn Directory> = MemoryDirectory::new();
         let data = tempfile::tempdir().unwrap();
         let storage = CellStorage::Local { root: data.path().join("objects") };
         let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
@@ -2221,7 +2248,7 @@ mod tests {
 
         let deletion = delete_deployment(directory.as_ref(), &storage, &keys, "shop", 4 << 20).await.unwrap_err();
         assert_eq!(deletion.code, "rtdb.multi/storage-maintenance-busy");
-        let fork = super::fork_at_block(directory.as_ref(), &storage, &keys, "shop", "fork", 0, std::time::Duration::from_secs(60)).await.unwrap_err();
+        let fork = super::fork_at_block(&directory, &storage, &keys, "shop", "fork", 0, std::time::Duration::from_secs(60)).await.unwrap_err();
         assert_eq!(fork.code, "rtdb.multi/storage-maintenance-busy");
         assert_eq!(directory.deployment(&deployment.id).await.unwrap(), Some(deployment.clone()));
         assert!(directory.deployment_by_name("fork").await.unwrap().is_none());
@@ -2271,6 +2298,7 @@ mod tests {
         assert_eq!(closed.lifecycle, Lifecycle::Deleting);
         assert_eq!(closed.storage_prefix(), child.storage_prefix());
         assert_eq!(closed.hosted_fork_stage, stage.hosted_fork_stage);
+        assert!(closed.storage_regions.is_empty());
         assert!(directory.deployment_by_name(&child.name).await.unwrap().is_none());
     }
 
@@ -2381,7 +2409,7 @@ mod tests {
         updated.read_width = 2;
         let updated = directory.replace_deployment(updated, source.version).await.unwrap().applied().unwrap();
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
-            super::fork_with_tail(directory.as_ref(), &storage, access, &keys, &source,
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source,
                 super::ForkDestination { name: "child", org: None, hosted_task: None }, None, Vec::new(), 4 << 20)).await.unwrap();
         assert_eq!(keys.existing(&child.key_id()).await.unwrap(), key);
         let before = bucket.list(None).await.unwrap().into_iter().map(|item| item.key).collect::<Vec<_>>();
@@ -2391,7 +2419,7 @@ mod tests {
         deleting.epoch += 1;
         directory.replace_deployment(deleting, updated.version).await.unwrap().applied().unwrap();
         let error = super::with_fork_access(directory.as_ref(), &storage, &keys, &updated, None, |access|
-            super::fork_with_tail(directory.as_ref(), &storage, access, &keys, &updated,
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &updated,
                 super::ForkDestination { name: "refused", org: None, hosted_task: None }, None, Vec::new(), 4 << 20)).await.unwrap_err();
         assert_eq!(error.code, "rtdb.multi/fork-unavailable");
         assert!(directory.deployment_by_name("refused").await.unwrap().is_none());
@@ -2424,7 +2452,7 @@ mod tests {
 
         let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
         let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
-            super::fork_with_tail(directory.as_ref(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
         let destination = super::ForkDestination { name: "grandchild", org: None, hosted_task: None };
         let old_generation = directory.lineage_state(&child.lineage).await.unwrap().open_generation().unwrap();
         let preparation = super::ForkPublication::Remote { generation: old_generation };
@@ -2454,7 +2482,7 @@ mod tests {
         assert_eq!(bucket.get(&copied).await.unwrap(), bytes);
 
         let grandchild = super::with_fork_access(directory.as_ref(), &storage, &keys, &child, None, |access|
-            super::fork_with_tail(directory.as_ref(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+            super::fork_with_tail(directory.clone(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
         let child_store = format!("{}/v06", child.storage_prefix());
         let manifest = crate::reference::Base::load(bucket.as_ref(), &format!("{}/v06", grandchild.storage_prefix())).await.unwrap();
         assert_eq!(manifest.objects.get("rows"), Some(&child_store));

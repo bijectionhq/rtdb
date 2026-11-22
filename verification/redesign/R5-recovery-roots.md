@@ -312,18 +312,23 @@ The per-key owner fence covers inherited serving misses, including provider work
 
 Hosted fork preparation reserves the child ID in the directory before writing objects, keys or a replica tail.
 Its staged record binds the source preparation, physical residence, object and key namespaces, and any journals receiving the tail.
-The directory atomically publishes the exact staged child, its serving name and the source lineage update.
+The stage transaction installs a storage region for the destination's provider writes.
+The fork writer records the exact multipart upload on that region before sending data or completion.
+The directory atomically publishes the exact staged child, its serving name and the source lineage update after that region has drained.
 Definitive rejection closes the staged record after its I/O drains.
 A reaper recovering an abandoned stage checks that its source preparation was released, including recovery through attested task stoppage.
 An abandoned stage with a retained preparation and no usable stoppage evidence stays fenced.
 Closing the stage uses its exact record version, so a successful publication wins against a reaper holding an older observation.
 Staged manifests do not enter the published reference inventory.
+Stage closure retains unresolved publications while closing admission to new ones.
+The reaper confirms the storage namespace and settles retained uploads by exact identity before disposing the residence.
 The ordinary disposal path retires the recorded journals, checks both provider inventories across the credential horizon, and withdraws the staged key.
-A cleanup proof for a process-stopped fork still depends on the hosted provider contract for outstanding writes.
-The bounded directory model explored 43 states and rejects writes before staging, early name publication, recovery while preparation is held, and stale recovery after publication.
-It reaches both publication with a concurrent reaper observation and settled disposal after a name collision.
+A cleanup proof for a process-stopped fork still depends on hosted task attestation and the provider's exact abort semantics.
+The bounded model explored 178 states and rejects writes before staging, early name publication, recovery while preparation is held, stale recovery after publication, untracked submissions and clearing an upload before provider closure.
+It reaches publication with a concurrent reaper observation, disposal after a name collision, and disposal after aborting a submitted upload.
 The directory contract checks that a stale cleanup update conflicts with a published child.
 The S3 lifecycle regression exercises a rejected stage with the same requested name as a published fork in versioned and never-versioned local buckets.
+A second S3 regression exercises an unresolved fork publication through recovery, namespace verification, exact abort, and disposal.
 [Staging and publication model](../tla/HostedForkStage.tla)
 
 ### Serving and archive removal entry points
@@ -333,7 +338,7 @@ The S3 lifecycle regression exercises a rejected stage with the same requested n
 | `reap_as_of` and `References::erase` | The local sweep reserves its lineage, reloads referrers and copies retained data before deleting the path. The hosted exact collector keeps witnessed loose files while their source is still referenced, and confirms provider settlement before reopening admission. | Extend exact settlement to pack contents beyond checkpoint metadata and to remaining unwitnessed legacy and unversioned releases. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | Local `erase_deployment` and hosted `observe_s3_inventory` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage and transfers published references. Hosted disposal then purges versions and uploads through the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
-| `discard_local_fork` and hosted fork staging | The local path uses the unpublished prefix. Hosted preparation persists the child before effects and the reaper closes abandoned stages by record version before ordinary inventory disposal. | Qualify provider settlement for stopped fork writers and account for every in-flight publication at the disposal boundary. |
+| `discard_local_fork` and hosted fork staging | The local path uses the unpublished prefix. Hosted preparation journals uploads on the staged child. Recovery closes admission and settles those upload IDs before ordinary inventory disposal. | Qualify exact provider settlement and task stoppage for hosted fork writers. |
 | `ordered_index_storage::reap` | The directory generation floor and reader registry close admission. Remote cleanup aborts journaled uploads and checks the generation prefix inventory. | Preserve the independent generation and residence bindings in any shared retirement API. |
 | `finish_capture_retirement` and whole archive retirement | A capture is closed in the directory. Archive custody and the provider inventory govern physical erasure and final receipts. | Preserve capture identity and the archive's separate namespace when composing with serving retirement. |
 

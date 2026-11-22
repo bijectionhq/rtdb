@@ -1473,7 +1473,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
-    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
     assert_eq!((child.lineage.as_str(), child.parent.as_deref()), (parent.lineage.as_str(), Some(parent.id.as_str())));
     let root = cell.data.path().join("objects");
     let own = |prefix: &str| files_under(&root.join(prefix)).into_iter().filter(|path| !path.components().any(|part| part.as_os_str() == rtdb_multi::reference::BASE_MANIFEST)).count();
@@ -3808,8 +3808,8 @@ async fn a_fork_at_a_past_block_holds_that_blocks_state_and_diverges_from_it() {
     cell.node(holder).agent.flush("shop").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
 
-    assert!(admin::fork_at_block(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "too-old", 0, Duration::ZERO).await.is_err(), "a block older than the reaper's grace is refused");
-    admin::fork_at_block(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-then", 0, Duration::from_secs(3600)).await.unwrap();
+    assert!(admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-old", 0, Duration::ZERO).await.is_err(), "a block older than the reaper's grace is refused");
+    admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", 0, Duration::from_secs(3600)).await.unwrap();
     let then = cell.connect("shop-then").await;
     assert_eq!(values(&then, "SELECT _id FROM orders").await, ["0", "1", "2"], "the fork holds the first block's state, and none of what came after");
     then.simple_query("INSERT INTO orders (_id, total) VALUES (50, 1)").await.unwrap();
@@ -3839,11 +3839,11 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     let then = rtdb_types::Timestamp(chrono::DateTime::parse_from_str(&written, "%Y-%m-%d %H:%M:%S%.f%:z").unwrap().timestamp_micros());
     for id in 5..7 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
 
-    assert!(admin::fork_at_time(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "too-early", rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
+    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
         "a time before the checkpoint is a past block's");
-    admin::fork_at_time(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-then", then, Duration::from_secs(3600), 4 << 20).await.unwrap();
+    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", then, Duration::from_secs(3600), 4 << 20).await.unwrap();
     admin::fork_time_into(
-        cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop",
+        &cell.directory, &cell.storage(), &cell.keys(), "shop",
         admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None },
         then, Duration::from_secs(3600), 4 << 20,
     ).await.unwrap();
@@ -3885,11 +3885,11 @@ async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_i
     drop(client);
 
     let current = admin::fork_into(
-        directory, &storage, &keys, "shop",
+        &cell.directory, &storage, &keys, "shop",
         admin::ForkDestination { name: "shop-current", org: Some("recipient-org"), hosted_task: None }, &control(),
     ).await.unwrap();
     let historical = admin::fork_block_into(
-        directory, &storage, &keys, "shop",
+        &cell.directory, &storage, &keys, "shop",
         admin::ForkDestination { name: "shop-historical", org: Some("recipient-org"), hosted_task: None },
         first.block, Duration::from_secs(3600),
     ).await.unwrap();
@@ -3937,7 +3937,7 @@ async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log
     for id in 0..8 {
         parent.simple_query(&format!("INSERT INTO orders (_id) VALUES ({id})")).await.unwrap();
     }
-    let child = admin::fork(cell.directory.as_ref(), &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
     let preview = cell.connect("shop-preview").await;
     preview.simple_query("INSERT INTO orders (_id) VALUES (8)").await.unwrap();
     let holder = cell.holder("shop-preview").await.unwrap();
