@@ -383,6 +383,65 @@ async fn held_owned_point_reads_an_explicit_valid_instant_at_the_original_system
 }
 
 #[tokio::test]
+async fn held_owned_valid_during_clips_winners_and_omits_deleted_windows() {
+    use rtdb_types::{EntityId, Interval, OwnedRelation, TimeUnit};
+
+    let mut settings = options();
+    settings.owned_relations = true;
+    let (node, driver) = running(settings, services()).await;
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("valid-history").unwrap();
+    let id = EntityId::Integer(1);
+    let documents = |value| Documents::new(vec![StructFields::from([
+        ("_id".into(), id.as_value()), ("value".into(), Value::I64(value)),
+    ])], node.memory()).unwrap();
+    let base = TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: documents(10), valid_from: Some(Timestamp(0)), valid_to: Some(Timestamp(100)),
+    };
+    let first = writer.state_mut().execute_tx(vec![base], AutonomousTxOptions::default()).await.unwrap();
+    assert!(first.committed());
+    let correction = TxOp::OwnedReplaceDocs {
+        relation: relation.clone(), documents: documents(20), valid_from: Some(Timestamp(20)), valid_to: Some(Timestamp(60)),
+    };
+    let second = writer.state_mut().execute_tx(vec![correction], AutonomousTxOptions::default()).await.unwrap();
+    assert!(second.committed());
+    let delete = |from, to| TxOp::OwnedDelete {
+        relation: relation.clone(), id: id.clone(), valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)),
+    };
+    assert!(writer.state_mut().execute_tx(vec![delete(30, 40)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let held = writer.open_owned_read().await.unwrap();
+    assert!(writer.state_mut().execute_tx(vec![delete(60, 90)], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let valid = Interval::from_micros(10, 70).unwrap();
+    let mut cursor = held.open_valid_during(&relation, &id, valid).await.unwrap().unwrap();
+    let mut actual = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        let batch = batch.batch();
+        let read = |name, row| {
+            let (slot, field) = batch.schema_ref().column_with_name(name).unwrap();
+            rtdb_columnar::read_value(field, batch.column(slot).as_ref(), row).unwrap()
+        };
+        let instant = |name, row| match read(name, row) {
+            Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => value,
+            other => panic!("unexpected timestamp {other:?}"),
+        };
+        for row in 0..batch.num_rows() {
+            actual.push((instant("_valid_from", row), instant("_valid_to", row), read("value", row), instant("_system_from", row)));
+        }
+    }
+    assert_eq!(actual, [
+        (10, 20, Value::I64(10), first.tx_key().system_time.0),
+        (20, 30, Value::I64(20), second.tx_key().system_time.0),
+        (40, 60, Value::I64(20), second.tx_key().system_time.0),
+        (60, 70, Value::I64(10), first.tx_key().system_time.0),
+    ]);
+    drop(cursor);
+    drop(held);
+    drop(writer);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn normal_owned_points_and_commits_keep_colliding_full_ids_independent() {
     use rtdb_types::{EntityId, OwnedRelation};
 

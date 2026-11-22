@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, TemporalFilter};
+use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{PreparedQuery, QueryContext, QueryCursor};
@@ -19,12 +19,30 @@ pub async fn open_owned_point(
     }
     if relation.is_world_catalog() {
         if !matches!(id, EntityId::Uuid(_)) { return Err(rtdb_types::OwnedWorld::unavailable()); }
-        return open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns).await;
+        return open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await;
     }
     match owned_address(Arc::clone(&context), owner, relation, id).await? {
-        OwnedAddress::Assigned(locator) => open_owned_table_point(context, relation.table(owner), locator, Some(id), valid, columns).await,
+        OwnedAddress::Assigned(locator) => open_owned_table_point(context, relation.table(owner), locator, Some(id), valid, columns, false).await,
         OwnedAddress::Vacant(_) => Ok(None),
     }
+}
+
+/// Returns the held system point's winning rows across a clipped business-valid window.
+pub async fn open_owned_valid_during(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+) -> Result<Option<QueryCursor>> {
+    if relation.world().is_some() || relation.is_world_catalog() || valid.is_empty() {
+        return Err(Anomaly::incorrect("rtdb.owned/history-window", "Owned history requires a nonempty valid window on a root relation"));
+    }
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
+    if snapshot.system_time_cap() != Some(context.current_time.as_micros()?) {
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/history-cut", "Owned history requires an exact retained system cut"));
+    }
+    let OwnedAddress::Assigned(locator) = owned_address(Arc::clone(&context), owner, relation, id).await? else {
+        return Ok(None);
+    };
+    open_owned_table_point(context, relation.table(owner), locator, Some(id), Some(valid), None, true).await
 }
 
 /// Reads one full identity in a relation's private uniqueness table.
@@ -34,7 +52,7 @@ pub async fn open_owned_unique_point(
     if owner.is_empty() {
         return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
     }
-    open_owned_table_point(context, relation.unique_table(owner), id.iid(), Some(id), None, Some(columns)).await
+    open_owned_table_point(context, relation.unique_table(owner), id.iid(), Some(id), None, Some(columns), false).await
 }
 
 pub async fn open_owned_relation_schema(
@@ -45,13 +63,13 @@ pub async fn open_owned_relation_schema(
     }
     let id = EntityId::String(relation.name().into());
     open_owned_table_point(
-        context, OwnedRelation::relation_catalog(owner), id.iid(), Some(&id), None, Some(&["schema"]),
+        context, OwnedRelation::relation_catalog(owner), id.iid(), Some(&id), None, Some(&["schema"]), false,
     ).await
 }
 
 async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
-    valid: Option<Interval>, columns: Option<&[&str]>,
+    valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
@@ -63,10 +81,16 @@ async fn open_owned_table_point(
     for required in ["_id", "_system_from"] {
         if !fields.contains(&required) { fields.push(required); }
     }
-    let columns = fields.into_iter().enumerate().map(|(index, name)| Field {
+    if history {
+        for required in ["_valid_from", "_valid_to"] {
+            if !fields.contains(&required) { fields.push(required); }
+        }
+    }
+    let columns: Vec<_> = fields.into_iter().enumerate().map(|(index, name)| Field {
         id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false,
         unnamed: false, data_type: table.scan_column_type(name),
     }).collect();
+    let order = columns.iter().find(|field| field.name == "_valid_from").map(Field::expression);
     let timestamp = |time: Timestamp| Expr::Literal(Value::Timestamp {
         value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
     });
@@ -74,10 +98,16 @@ async fn open_owned_table_point(
         from: timestamp(valid.lower()), to: timestamp(valid.upper()),
     });
     let scan = Arc::new(Relation::scan(Scan {
-        table, columns, valid_time, system_time: TemporalFilter::Default, clamp_valid_time: false,
+        table, columns, valid_time, system_time: TemporalFilter::Default, clamp_valid_time: history,
         iids: Some([locator].into()), predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
-    let query = PreparedQuery::new_in(scan, &context.memory)?;
+    let plan = if history {
+        let expr = order.ok_or_else(|| Anomaly::fault("rtdb.owned/history-schema", "Owned history omitted its valid start"))?;
+        Arc::new(scan.sort(vec![SortExpr { expr, descending: false, nulls_first: false }])?)
+    } else {
+        scan
+    };
+    let query = PreparedQuery::new_in(plan, &context.memory)?;
     query.execute(context, Vec::new()).await.map(Some)
 }
 
@@ -116,10 +146,10 @@ pub async fn owned_address(
         context.check_cancelled()?;
         let slot = EntityId::Uuid(locator.0);
         let columns = ["address"];
-        let cursor = open_owned_table_point(Arc::clone(&context), registry.clone(), locator, Some(&slot), None, Some(&columns)).await?;
+        let cursor = open_owned_table_point(Arc::clone(&context), registry.clone(), locator, Some(&slot), None, Some(&columns), false).await?;
         let Some(occupant) = address_row(cursor, &slot, &context).await? else {
             // A vacant registry slot may never cover an unregistered data row.
-            let cursor = open_owned_table_point(Arc::clone(&context), table, locator, None, Some(Interval::ALL), Some(&["_id"])).await?;
+            let cursor = open_owned_table_point(Arc::clone(&context), table, locator, None, Some(Interval::ALL), Some(&["_id"]), false).await?;
             if let Some(mut cursor) = cursor {
                 while let Some(batch) = cursor.next_batch().await? {
                     if batch.batch().num_rows() != 0 { return Err(address_unavailable()); }

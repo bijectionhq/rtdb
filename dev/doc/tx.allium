@@ -70,6 +70,7 @@
 -- The first tracked group shares its transaction with the relation's feed floor.
 -- A held feed page reads whole groups through its held cut and refuses a missing floor or requested group.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
+-- A held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
