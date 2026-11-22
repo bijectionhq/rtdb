@@ -200,7 +200,7 @@ async fn serve_stage(
             let record = &record;
             async move {
                 let store = open_inventory(storage, keys, record, &authority.stage, region).await?;
-                serve_reader(authority, record, storage, store, transport, stop).await
+                Box::pin(serve_reader(authority, record, storage, store, transport, stop)).await
             }
         },
     )
