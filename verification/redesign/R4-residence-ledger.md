@@ -85,7 +85,8 @@ A trie release from a legacy marker awaits a receipt in an enrolled residence.
 It treats file identity within one residence and completion of provider effects as premises.
 The retirement plan already observes loose provider versions when available.
 The hosted reaper settles witnessed loose files against their immutable S3 versions after validating current manifests and fencing inherited reads at the physical owner.
-Pack coverage, unwitnessed releases and provider qualification remain open.
+For older markers, it can recover the version from the authenticated receipt for the same installed cut and object.
+Pack coverage, releases without a matching publication witness and provider qualification remain open.
 
 ## Tests and proofs
 

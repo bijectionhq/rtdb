@@ -1196,6 +1196,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
         // A released object is either its own object or one entry of a pack; a pack goes once every entry in it has been released for the grace period.
         let mut due: BTreeMap<String, String> = BTreeMap::new();
         let mut exact = BTreeSet::new();
+        let mut retained_markers = BTreeSet::new();
         for name in records {
             let Some(location) = physical(&own, &name) else { continue };
             let Ok(bytes) = bucket.get(&crate::reference::key(&location)?).await else { continue };
@@ -1216,6 +1217,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 reaped.waiting += 1;
                 continue;
             }
+            if !local && released.trie_floor.is_some() && own.contains(&name) { retained_markers.insert(name.clone()); }
             due.insert(released.key, name);
         }
         due.retain(|key, _| !exact.contains(key));
@@ -1261,6 +1263,7 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
         let mut local_records = Vec::new();
         for (name, garbage_record) in &due {
             if !packed.contains(name) {
+                if retained_markers.contains(garbage_record) { reaped.waiting += 1; continue; }
                 if own.contains(garbage_record) { local_records.push(garbage_record); }
                 forgotten.insert(garbage_record.clone());
                 reaped.erased += 1;
@@ -1357,7 +1360,7 @@ pub async fn run_reaper(
                                     let threshold = now.saturating_sub(grace.as_millis() as i64);
                                     for record in &deployments {
                                         if cancellation.is_cancelled() { return; }
-                                        if let Err(error) = exact_retirement::reap(directory.as_ref(), bucket.as_ref(), &provider, record, threshold, references.as_ref().ok()).await {
+                                        if let Err(error) = exact_retirement::reap(directory.as_ref(), bucket.as_ref(), &provider, record, threshold, references.as_ref().ok(), keys.as_deref()).await {
                                             eprintln!("Exact garbage for {} is pending: {}", record.id, error.code);
                                         }
                                     }

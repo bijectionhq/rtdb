@@ -25,6 +25,8 @@ pub enum RetirementWork {
         version: PhysicalObjectVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         release_version: Option<PhysicalObjectVersion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_receipt: Option<String>,
     },
 }
 

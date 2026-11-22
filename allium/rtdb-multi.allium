@@ -2385,6 +2385,19 @@ rule AuthorizeHostedVersionErasure {
         ExactVersionRetirementAuthorized(release)
 }
 
+rule RecoverHostedReleaseWitness {
+    -- An older release can use the authenticated installation receipt for its exact catalog cut and object.
+    -- The original release remains durable when the provider hides the released version from current-name listing.
+    -- The source fence drains inherited reads of the protected object and the older marker before removal.
+    when: LegacyHostedReleaseDue(release)
+
+    requires: InstalledCatalogFloorCovers(release)
+    requires: AuthenticatedReceiptNamesPublication(release.residence, release.cut, release.object, version)
+
+    ensures:
+        HostedVersionReleasePrepared(release, version, ReceiptOf(release))
+}
+
 rule HostedCheckpointCapture {
     -- A new archive receipt covers the verified replay inventory.
     -- Shared group artefacts are recorded once. Required files must be available before the receipt is published.

@@ -5,13 +5,16 @@ use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result};
 use uuid::Uuid;
 
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, permits_release};
+use crate::keys::KeyService;
 use crate::reference::{Base, References, stores};
+
+mod receipts;
 
 const MAXIMUM_RELEASE_BYTES: u64 = 32 << 10;
 
 struct ReleaseWitness {
     record: super::GarbageRecord,
-    version: PhysicalObjectVersion,
+    version: Option<PhysicalObjectVersion>,
     release_version: Option<PhysicalObjectVersion>,
 }
 
@@ -25,7 +28,8 @@ async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Optio
         Err(Error::MissingObject(_)) => return Ok(None),
         result => result?,
     };
-    let Ok(StoredRelease::Exact { record, version }) = serde_json::from_slice(&observed.value) else { return Ok(None); };
+    let Ok(stored) = serde_json::from_slice::<StoredRelease>(&observed.value) else { return Ok(None); };
+    let (record, version) = stored.into_parts();
     Ok(Some(ReleaseWitness { record, version, release_version: observed.version }))
 }
 
@@ -48,12 +52,12 @@ impl ExactVersions for rtdb_s3::VersionedInventory {
 }
 
 pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
-    candidate: &DeploymentRecord, threshold: i64, advisory: Option<&References>) -> Result<()> {
+    candidate: &DeploymentRecord, threshold: i64, advisory: Option<&References>, keys: Option<&dyn KeyService>) -> Result<()> {
     let lineage = &candidate.lineage;
     let mut state = super::recover_hosted_lineage(directory, lineage).await?;
     if let Some(retirement) = state.retirement() {
         if let RetirementWork::S3 { deployment, .. } = &retirement.work && *deployment == candidate.id {
-            finish(directory, bucket, provider, lineage, &state, retirement).await?;
+            finish(directory, bucket, provider, lineage, &state, retirement, keys).await?;
         }
         return Ok(());
     }
@@ -62,24 +66,40 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
     let source = candidate.storage_prefix();
     for store in stores(bucket, &source).await? {
         let markers = ObjectKey::new(format!("{store}/{GARBAGE_DIRECTORY}"))?;
+        let mut eligible = Vec::new();
         for marker in bucket.list(Some(&markers)).await? {
-            let Some(ReleaseWitness { record, version, release_version: Some(release_version) }) =
-                read_release(bucket, &marker.key).await? else { continue; };
-            if record.trie_floor.is_none() || !permits_release(candidate, &store, &record) || record.released_at_ms > threshold { continue; }
-            let target = ObjectKey::new(format!("{store}/{}", record.key))?;
+            let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
+            if witness.release_version.is_none() || witness.record.trie_floor.is_none()
+                || !permits_release(candidate, &store, &witness.record) || witness.record.released_at_ms > threshold { continue; }
+            let target = ObjectKey::new(format!("{store}/{}", witness.record.key))?;
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
-            if !provider.available(&target, &version).await?
-                || !provider.available(&marker.key, &release_version).await?
-            { continue; }
+            eligible.push((marker.key, target, witness));
+        }
+        let mut receipts = None;
+        for (marker, target, witness) in &eligible {
+            let (version, legacy_receipt) = match (&witness.version, keys) {
+                (Some(version), _) => (version.clone(), None),
+                (None, Some(keys)) => {
+                    if receipts.is_none() {
+                        let historical = eligible.iter().filter(|(_, _, entry)| entry.version.is_none()).map(|(_, _, entry)| &entry.record);
+                        receipts = Some(receipts::ReceiptIndex::load(bucket, keys, candidate, &store, historical).await?);
+                    }
+                    let Some(publication) = receipts.as_ref().and_then(|index| index.get(&witness.record)) else { continue; };
+                    (publication.version.clone(), Some(publication.receipt.clone()))
+                }
+                (None, None) => continue,
+            };
+            let Some(release_version) = &witness.release_version else { continue; };
+            if !provider.available(target, &version).await? || !provider.available(marker, release_version).await? { continue; }
             let retirement = LineageRetirement {
                 token: Uuid::new_v4(), source: source.clone(),
                 work: RetirementWork::S3 { deployment: candidate.id.clone(), target: target.to_string(),
-                    release: marker.key.to_string(), version, release_version: Some(release_version) },
+                    release: marker.to_string(), version, release_version: Some(release_version.clone()), legacy_receipt },
             };
             let reserved = directory.change_lineage(lineage, LineageChange::ReserveRetirement {
                 retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
             }).await?;
-            if finish(directory, bucket, provider, lineage, &reserved, &retirement).await? { return Ok(()); }
+            if finish(directory, bucket, provider, lineage, &reserved, &retirement, keys).await? { return Ok(()); }
             state = directory.lineage_state(lineage).await?;
             if state.preparations().next().is_some() || state.open_generation().is_none() { return Ok(()); }
         }
@@ -88,12 +108,12 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
 }
 
 async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn ExactVersions,
-    lineage: &str, state: &LineageState, retirement: &LineageRetirement) -> Result<bool> {
-    let RetirementWork::S3 { deployment, target, release, version, release_version } = &retirement.work else { return Err(changed()); };
+    lineage: &str, state: &LineageState, retirement: &LineageRetirement, keys: Option<&dyn KeyService>) -> Result<bool> {
+    let RetirementWork::S3 { deployment, target, release, version, release_version, .. } = &retirement.work else { return Err(changed()); };
     let target = ObjectKey::new(target)?;
     let release = ObjectKey::new(release)?;
     if !state.exact_erasure_authorized() {
-        let ready = prepare(directory, bucket, lineage, retirement, deployment, &target, &release, version, release_version.as_ref()).await;
+        let ready = prepare(directory, bucket, lineage, retirement, &target, &release, keys).await;
         match ready {
             Ok(true) => {
                 if let Err(error) = directory.change_lineage(lineage, LineageChange::AuthorizeExactErasure { retirement: retirement.clone() }).await {
@@ -141,8 +161,8 @@ async fn settle(directory: &dyn Directory, lineage: &str, deployment: &str, reti
 }
 
 async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &str, retirement: &LineageRetirement,
-    deployment: &str, target: &ObjectKey, release: &ObjectKey, version: &PhysicalObjectVersion,
-    release_version: Option<&PhysicalObjectVersion>) -> Result<bool> {
+    target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>) -> Result<bool> {
+    let RetirementWork::S3 { deployment, version, release_version, legacy_receipt, .. } = &retirement.work else { return Err(changed()); };
     let root = ObjectKey::new(&retirement.source)?;
     let Some((store, relative)) = target.as_str().strip_prefix(&format!("{root}/")).and_then(|suffix| suffix.split_once('/'))
         else { return Err(changed()); };
@@ -151,10 +171,20 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
     if !release.is_under(&markers) { return Err(changed()); }
     let Some(ReleaseWitness { record: witness, version: observed, release_version: observed_release }) =
         read_release(bucket, release).await? else { return Ok(false); };
-    if witness.key != relative || witness.trie_floor.is_none() || *version != observed
-        || release_version.is_some_and(|expected| observed_release.as_ref() != Some(expected))
+    if witness.key != relative || witness.trie_floor.is_none()
+        || release_version.as_ref().is_some_and(|expected| observed_release.as_ref() != Some(expected))
     {
         return Err(changed());
+    }
+    match (observed, legacy_receipt.as_deref(), keys) {
+        (Some(observed), None, _) if observed == *version => {},
+        (None, Some(receipt), Some(keys)) if release_version.is_some() => {
+            let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
+            if owner.storage_prefix() != retirement.source
+                || !receipts::verify(bucket, keys, &owner, &store, &witness, receipt, version).await?
+            { return Ok(false); }
+        }
+        _ => return Ok(false),
     }
     let release_name = release.as_str().strip_prefix(&format!("{store}/")).ok_or_else(changed)?;
 
@@ -179,7 +209,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
             StorageRegion::Remote { archive: Some(_), .. } | StorageRegion::Local { archive: Some(_), .. } => true,
             _ => false,
         }) { return Err(changed()); }
-        let fence = StorageRegion::ExactRetirement { object: target.to_string(), release: release_version.map(|_| release.to_string()) };
+        let fence = StorageRegion::ExactRetirement { object: target.to_string(), release: release_version.as_ref().map(|_| release.to_string()) };
         if let Some(previous) = record.storage_regions.insert(retirement.token, fence.clone()) && previous != fence {
             return Err(changed());
         }
@@ -187,7 +217,9 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, lineage: &
     }).await?;
 
     let base = Base::load(bucket, &store).await?;
-    base.forget(bucket, &store, &[relative.to_owned()].into()).await?;
+    let mut released = std::collections::BTreeSet::from([relative.to_owned()]);
+    if release_version.is_some() { released.insert(release_name.to_owned()); }
+    base.forget(bucket, &store, &released).await?;
     Ok(true)
 }
 
@@ -300,7 +332,7 @@ mod tests {
 
         let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
         directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
-        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None).await.unwrap();
+        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
         assert!(directory.lineage_state(&parent.lineage).await.unwrap().retirement().is_none());
 
         let mut child = DeploymentRecord::new("preview", &parent.org, vec![], 0);
@@ -308,7 +340,7 @@ mod tests {
         child.parent = Some(parent.id.clone());
         crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         let child = directory.publish_fork(child, parent.version, Some(rtdb_directory::ForkPublication::Hosted(preparation))).await.unwrap();
-        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None).await.unwrap();
+        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
         assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
         let child_store = format!("{}/{root}", child.storage_prefix());
         let base = Base::load(bucket.as_ref(), &child_store).await.unwrap();
@@ -320,16 +352,16 @@ mod tests {
             record.storage_regions.insert(reader, StorageRegion::ReferenceRead { custody: ReplayCustody::Local, object: Some(target.to_string()) });
             Ok(())
         }).await.unwrap();
-        assert_eq!(reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None).await.unwrap_err().code, "rtdb.multi/exact-retirement");
+        assert_eq!(reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap_err().code, "rtdb.multi/exact-retirement");
         assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
         super::super::release_region(directory.as_ref(), &parent.id, reader, false).await.unwrap();
 
-        assert_eq!(reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None).await.unwrap_err().code, "fixture/provider-reply-lost");
+        assert_eq!(reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap_err().code, "fixture/provider-reply-lost");
         let authorizing = directory.lineage_state(&parent.lineage).await.unwrap();
         assert!(authorizing.exact_erasure_authorized());
         let token = authorizing.retirement().unwrap().token;
         assert!(matches!(directory.deployment(&parent.id).await.unwrap().unwrap().storage_regions.get(&token), Some(StorageRegion::ExactRetirement { .. })));
-        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None).await.unwrap();
+        reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
         assert_eq!(versions.attempts.load(Ordering::Relaxed), 2);
         assert_eq!(versions.markers.load(Ordering::Relaxed), 1, "the release marker goes through versioned settlement");
         assert!(directory.lineage_state(&parent.lineage).await.unwrap().retirement().is_none());
@@ -373,7 +405,7 @@ mod tests {
         let queue = release_version.key.clone();
         let retirement = LineageRetirement { token: Uuid::new_v4(), source: residence,
             work: RetirementWork::S3 { deployment: owner.id.clone(), target: object.clone(),
-                release: marker.clone(), version: publication, release_version: Some(release_version) },
+                release: marker.clone(), version: publication, release_version: Some(release_version), legacy_receipt: None },
         };
         let mut fenced = owner.clone();
         fenced.storage_regions.insert(retirement.token, StorageRegion::ExactRetirement { object, release: Some(marker) });
@@ -431,7 +463,7 @@ mod tests {
             }
         });
         let bucket = MemoryStore::default();
-        let first = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &erasing, &retirement).await.unwrap_err();
+        let first = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &erasing, &retirement, None).await.unwrap_err();
         assert_eq!(first.message.as_deref(), Some("The retired object version is still present"),
             "a deletion reply without absence cannot settle the retirement");
         assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), fenced);
@@ -440,16 +472,90 @@ mod tests {
 
         let directory = MemoryDirectory::open(data.path()).unwrap();
         let state = directory.lineage_state(&owner.lineage).await.unwrap();
-        let absent = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement).await
+        let absent = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None).await
             .expect_err("the release marker needs its own absence evidence");
         assert_eq!(absent.message.as_deref(), Some("The retired object version is still present"));
         assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), fenced);
         assert_eq!(directory.lineage_state(&owner.lineage).await.unwrap().open_generation(), None);
 
-        finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement).await.unwrap();
+        finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         assert!(!directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.contains_key(&retirement.token),
             "settlement removes the physical owner's fence");
         assert_eq!(directory.lineage_state(&owner.lineage).await.unwrap().open_generation(), Some(1));
+    }
+    #[tokio::test]
+    async fn hosted_reaper_retains_legacy_evidence_until_the_recovered_version_settles() {
+        use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
+
+        let directory = MemoryDirectory::new();
+        let bucket = VersionedReleaseStore(MemoryStore::default());
+        let files = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();
+        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let namespace = Uuid::new_v4();
+        owner.storage_namespaces = Some(StorageNamespaces { objects: namespace, keys: [0; 32] });
+        let epoch = StorageEpoch(0);
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
+        let selected = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch,
+            replica_epoch: epoch, through: ReplicaPosition(1) };
+        let floor = CatalogAdmissionFloor { residence: owner.storage_prefix(), object_namespace: namespace,
+            cut: CatalogCut { through: ReplicaPosition(2), ..selected } };
+        owner.catalog_admission_floors.insert(root.clone(), floor.clone());
+        let owner = directory.create_deployment(owner).await.unwrap();
+        let store = format!("{}/{root}", owner.storage_prefix());
+        let key = "tables/orders/data/l01-rc-b00.arrow";
+        let marker = ObjectKey::new(format!("{store}/{GARBAGE_DIRECTORY}/00000000000000000000-release")).unwrap();
+        let release = super::super::GarbageRecord { key: key.into(), released_at_ms: 0, trie_floor: Some(floor) };
+        bucket.put(&marker, serde_json::to_vec(&release).unwrap().into()).await.unwrap();
+
+        let records = directory.deployments().await.unwrap();
+        for outcome in super::super::reaper_pass(&bucket, &records, i64::MAX, Duration::ZERO).await.unwrap() { outcome.unwrap(); }
+        assert!(bucket.head(&marker).await.is_ok());
+
+        let target = ObjectKey::new(format!("{store}/{key}")).unwrap();
+        let version = PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
+            key: format!("cell/{target}"), version: "original".into() };
+        let versions = Provider { version: version.clone(), attempts: AtomicUsize::new(0), markers: AtomicUsize::new(0) };
+        let intent = RetirementIntent { selected, table: rtdb_types::TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
+            files: vec![RetirementFile { key: key.into(), version: Some(version), matches_publication: true }] };
+        let encoded = serde_json::to_vec(&intent).unwrap();
+        let relative = format!("{}/installed/{}", journal_directory(selected), intent_digest(&encoded));
+        let receipt = ObjectKey::new(format!("{store}/{relative}")).unwrap();
+        let cipher = crate::cipher::Cipher::new(&keys.key(&owner.key_id()).await.unwrap()).unwrap();
+        let mut bytes = 2i64.to_be_bytes().to_vec();
+        bytes.extend(encoded);
+        bucket.put(&receipt, cipher.seal_deterministic(&relative, &bytes).unwrap()).await.unwrap();
+
+        let reader = Uuid::new_v4();
+        crate::admin::update_installation(directory.as_ref(), &owner.id, |record| {
+            record.storage_regions.insert(reader, StorageRegion::ReferenceRead { custody: ReplayCustody::Local, object: Some(marker.to_string()) });
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(reap(directory.as_ref(), &bucket, &versions, &owner, 0, None, Some(&keys)).await.unwrap_err().code, "rtdb.multi/exact-retirement");
+        assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
+        super::super::release_region(directory.as_ref(), &owner.id, reader, false).await.unwrap();
+
+        assert_eq!(reap(directory.as_ref(), &bucket, &versions, &owner, 0, None, Some(&keys)).await.unwrap_err().code, "fixture/provider-reply-lost");
+        let state = directory.lineage_state(&owner.lineage).await.unwrap();
+        assert!(state.exact_erasure_authorized());
+        let retirement = state.retirement().unwrap();
+        assert!(matches!(&retirement.work,
+            RetirementWork::S3 { legacy_receipt: Some(path), version, release_version: Some(release_version), .. }
+                if path == receipt.as_str() && version == &versions.version && release_version.version == "marker"));
+        let fenced = directory.deployment(&owner.id).await.unwrap().unwrap();
+        assert!(matches!(fenced.storage_regions.get(&retirement.token), Some(StorageRegion::ExactRetirement { object, release: Some(release) })
+            if object == target.as_str() && release == marker.as_str()));
+        assert!(bucket.head(&marker).await.is_ok());
+
+        bucket.delete(&receipt).await.unwrap();
+        bucket.put(&target, Bytes::from_static(b"replacement")).await.unwrap();
+        reap(directory.as_ref(), &bucket, &versions, &owner, 0, None, None).await.unwrap();
+        assert!(directory.lineage_state(&owner.lineage).await.unwrap().retirement().is_none());
+        assert!(directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.is_empty());
+        assert_eq!(versions.attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(versions.markers.load(Ordering::Relaxed), 1);
+        assert!(bucket.head(&marker).await.is_ok());
+        assert_eq!(bucket.get(&target).await.unwrap().as_ref(), b"replacement");
     }
 }

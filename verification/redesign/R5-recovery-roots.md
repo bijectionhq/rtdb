@@ -161,9 +161,15 @@ The hosted retirement model explored 47 states and rejected four unsafe protocol
 The marker settlement model separately checks a replacement at the same marker key, a delayed exact removal, independent absence evidence and atomic reopening.
 [Marker settlement model](../tla/ExactMarkerSettlement.tla)
 It also reached a redundant provider effect after settlement while the replacement remained available.
-The legacy collector leaves owned loose trie files and derived artefacts in place when their release records lack a matching immutable publication witness.
-Those records need conversion from retained receipts or a separately settled path-based protocol for unversioned providers.
+The legacy collector retains covered loose file markers while their immutable publication witness is being recovered, even when a current-name listing hides the provider version.
+The reaper authenticates retained receipts under the exact source residence key and matches the full installed cut and logical object.
+The same two-version retirement protocol orders the recovered data and original marker against readers and confirms absence of each version.
+The authorized reservation can finish from its persisted versions if the historical receipt or residence key later becomes unavailable.
+The retained receipt model explored 16 states, rejected four unsafe changes and reached settlement after losing the original receipt.
+Releases without a matching immutable publication witness still need a separately settled protocol for unversioned providers.
+[Retained receipt model](../tla/RetainedReleaseReceipt.tla)
 Live provider qualification still needs rolling deployment evidence and the exact provider's listing, deletion and credential behavior.
+The hosted reaper role needs transactional puts confined to the cell's `~reference-revision/` rows in `deployment-names` and a deployment-table condition check for whole-residence disposal.
 
 ### Shared fork publication and referrer inventories
 

@@ -195,7 +195,7 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord) 
     let scope = parent.storage_prefix();
     let target = format!("{scope}/v06/payload");
     let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope.clone(), work: crate::RetirementWork::S3 {
-        deployment: parent.id.clone(), target: target.clone(), release: format!("{scope}/v06/~garbage/release"),
+        deployment: parent.id.clone(), target: target.clone(), release: format!("{scope}/v06/~garbage/release"), legacy_receipt: None,
         version: PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
             key: format!("cell/{target}"), version: "original".into() },
         release_version: Some(PhysicalObjectVersion {
