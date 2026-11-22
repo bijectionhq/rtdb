@@ -5,6 +5,7 @@ use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, OwnedBatch};
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_node::NodeOptions;
+use rtdb_plan::Catalog;
 use rtdb_query::{
     CatalogSnapshot, DatabaseSnapshot, QueryContext, open_owned_point, owned_row_revision,
 };
@@ -71,9 +72,24 @@ pub async fn read_checkpoint_owned_point(
     ).await
 }
 
+pub(super) fn require_relation_purge_history(context: &QueryContext, owner: &str) -> Result<()> {
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else {
+        return Err(inconsistent("The archived world has no exact purge history"));
+    };
+    if snapshot.contains_table(&OwnedRelation::obsolete_purge_table(owner)) {
+        return Err(rtdb_types::Anomaly::new(
+            rtdb_types::AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset",
+            "Owner-wide archive purge history requires a reset before native held reads",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn read_checkpoint_point_in_context(
     context: Arc<QueryContext>, point: CheckpointPoint<'_>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
+    require_relation_purge_history(&context, point.owner)?;
     let memory = Arc::clone(&context.memory);
     let Some(mut cursor) = open_owned_point(
         context, point.owner, point.relation, point.id, point.valid, None,

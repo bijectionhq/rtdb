@@ -598,14 +598,29 @@ async fn owned_erase_revokes_old_holds_without_erasing_a_colliding_identity() {
     }], AutonomousTxOptions::default()).await.unwrap();
     assert!(initial.committed(), "{:?}", initial.error());
 
+    let unrelated = OwnedRelation::new("other-retained-hold").unwrap();
+    let other_document = Documents::new(vec![StructFields::from([
+        ("_id".into(), retained.as_value()), ("payload".into(), Value::I64(2)),
+    ])], node.memory()).unwrap();
+    let separate = session.state_mut().execute_tx(vec![TxOp::OwnedInsertDocs {
+        relation: unrelated.clone(), documents: other_document, valid_from: None, valid_to: None,
+    }], AutonomousTxOptions::default()).await.unwrap();
+    assert!(separate.committed(), "{:?}", separate.error());
+
     let before = session.open_owned_read().await.unwrap();
+    let mut stale_cursor = before.open_point(&relation, &erased).await.unwrap().unwrap();
+    let unaffected_cursor = before.open_point(&unrelated, &retained).await.unwrap().unwrap();
     let old_valid = before.present().system_time;
     let purge = session.state_mut().execute_tx(vec![
         TxOp::OwnedCheck { relation: relation.clone(), id: erased.clone(), valid_at: old_valid, expected: Some(initial.tx_key().system_time) },
         TxOp::OwnedErase { relation: relation.clone(), id: erased.clone() },
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(purge.committed(), "{:?}", purge.error());
-    assert!(before.check().is_err());
+    before.check().unwrap();
+    before.check_relation(&unrelated).unwrap();
+    assert!(before.open_point(&relation, &erased).await.is_err());
+    assert!(stale_cursor.next_batch().await.is_err());
+    assert_eq!(rows(unaffected_cursor).await[0][0], retained.as_value());
 
     let after = session.open_owned_read().await.unwrap();
     assert!(rows(after.open_point(&relation, &erased).await.unwrap().unwrap()).await.is_empty());

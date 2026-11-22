@@ -767,7 +767,7 @@ impl Service {
         let marker = EntityId::String(marker.to_owned());
         let snapshot = held.snapshot.derive_as_of(Timestamp(i64::from_be_bytes(*requested)), &publication, &marker, relations)
             .await.map_err(status)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&publication).map_err(status)?;
         match snapshot {
             Some(snapshot) => self.retain_owned_read(call, snapshot, permit, false),
             None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
@@ -823,7 +823,7 @@ impl Service {
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(system, valid, &id, cursor).await?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -854,7 +854,7 @@ impl Service {
         let history = held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await.map_err(status)?;
         let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };
         let reply = self.history_reply(call, &id, read, valid, system, None).await?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -888,7 +888,7 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         let reply = self.owned_point_reply(&schema, Some(&rows), system, valid, None)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -948,7 +948,7 @@ impl Service {
             }
             results.push(reply);
         }
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         let header_len = header.len() + if page.witness.is_some() { 16 } else { 0 };
         let framing = ActionResult { body: Bytes::from_static(&[0; 35]).slice(..header_len) };
         if wire::add(bytes, framing.encoded_len())? > self.0.config.maximum_message_bytes {
@@ -1074,7 +1074,7 @@ impl Service {
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
         let reply = self.owned_point_reply(schema, page.batch.as_ref().map(OwnedBatch::batch), present, valid_at.unwrap_or(present), None)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -1109,7 +1109,7 @@ impl Service {
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
         let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);
         let reply = self.owned_point_reply(output_schema, Some(&batch), counted.present, counted.valid_at, None)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -1177,7 +1177,7 @@ impl Service {
         };
         let present = held.snapshot.present().system_time;
         let reply = self.owned_point_reply(&schema, output.as_ref(), present, present, None)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relations(partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)
     }
 
@@ -1197,7 +1197,7 @@ impl Service {
         let page = held.snapshot.changes(&relation, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)))
             .await.map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -1228,7 +1228,7 @@ impl Service {
         let page = held.snapshot.merged_changes(&relations, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)))
             .await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relations(&relations).map_err(status)?;
         Ok(reply)
     }
 
@@ -1312,11 +1312,21 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
-        let result = host.read_point(
+        let snapshot = host.open_world_read(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            crate::WorldPoint { world: Uuid::from_bytes(*world), relation: &relation, id: &id, valid_at },
+            Uuid::from_bytes(*world),
         ).await.map_err(status)?;
-        self.world_point_reply(call, result, valid_at, None)
+        let reply = async {
+            let result = snapshot.read_point(&relation, &id, valid_at, false).await.map_err(status)?;
+            if result.present != snapshot.present() {
+                return Err(Status::internal("Owned world point changed its held present"));
+            }
+            let reply = self.world_point_reply(call, result, valid_at, None)?;
+            snapshot.check_relation(&relation).map_err(status)?;
+            Ok(reply)
+        }.await;
+        snapshot.close();
+        reply
     }
 
     pub(crate) async fn open_world_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1376,7 +1386,7 @@ impl Service {
         }
         let nonce = result.witness.take().map(|evidence| held.remember_point(call, evidence)).transpose()?;
         let reply = self.world_point_reply(call, result, valid_at, nonce)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -1409,7 +1419,7 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         let reply = self.owned_point_reply(&schema, Some(&rows), held.snapshot.present(), valid, None)?;
-        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -1581,7 +1591,7 @@ impl Service {
         let present = snapshot.system_time();
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(present, valid.unwrap_or(present), id, cursor).await?;
-        snapshot.check().map_err(status)?;
+        snapshot.check_relation(relation).map_err(status)?;
         Ok(reply)
     }
 

@@ -499,7 +499,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         Operation::Public(TxOp::OwnedErase { relation, id }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("id".into(), id.as_value());
-            "rtdb-owned-erase-v1"
+            "rtdb-owned-erase-v2"
         }
         Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1110,7 +1110,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
-            "rtdb-owned-erase-v1" => &["relation", "id"],
+            "rtdb-owned-erase-v2" => &["relation", "id"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
             "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
@@ -1212,7 +1212,7 @@ impl SourceOperationReader<'_> {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
                 TxOp::OwnedDeadline { until: Timestamp(until) }
             }
-            "rtdb-owned-erase-v1" => {
+            "rtdb-owned-erase-v2" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned erase has no relation")); };
                 TxOp::OwnedErase { relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()? }
             }
