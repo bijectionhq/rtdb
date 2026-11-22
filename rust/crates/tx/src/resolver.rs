@@ -172,7 +172,7 @@ impl TxResolver {
         let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
         tx.write_result(&result, None)?;
-        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time, Default::default())?; }
+        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?; }
         self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
     }
 
@@ -301,7 +301,12 @@ impl TxResolver {
                 Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
                 _ => None,
             }).collect();
-            tx.write_attempt_outcome(attempt, log_time, controls)?;
+            let worlds = if result.committed() {
+                crate::replica::worlds::source_inventory(&request.operations)?
+            } else {
+                Vec::new()
+            };
+            tx.write_attempt_outcome(attempt, log_time, controls, worlds)?;
         }
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
@@ -501,7 +506,10 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(receipts_table(), document, interval(log_time, expires)?)
     }
 
-    fn write_attempt_outcome(&mut self, attempt: PlacedAttempt, log_time: Timestamp, controls: std::collections::BTreeSet<&str>) -> Result<()> {
+    fn write_attempt_outcome(
+        &mut self, attempt: PlacedAttempt, log_time: Timestamp,
+        controls: std::collections::BTreeSet<&str>, worlds: Vec<Value>,
+    ) -> Result<()> {
         let key = self.tx_key();
         let mut document = StructFields::from([
             ("_id".into(), Value::Utf8(attempt.outcome_key())),
@@ -511,6 +519,9 @@ impl<'a> OpenTransaction<'a> {
         if !controls.is_empty() {
             document.insert(crate::hosted_control::CONTROL_TABLES.into(),
                 Value::List(controls.into_iter().map(|name| Value::Utf8(name.into())).collect()));
+        }
+        if !worlds.is_empty() {
+            document.insert(crate::replica::worlds::WORLD_EFFECTS.into(), Value::List(worlds));
         }
         let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
         self.buffer.put(TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE), document, interval(log_time, expires)?)
@@ -868,9 +879,17 @@ impl<'a> OpenTransaction<'a> {
         }).take(9).collect::<Vec<_>>();
         let world_batch = publications.len() > 1;
         if publications.len() > 8 { return Err(unavailable()); }
+        if publications.is_empty() && operations.iter().any(|operation| match operation {
+            Operation::Public(TxOp::OwnedReplaceDocs { relation, .. })
+            | Operation::OwnedWriteIids { relation, .. } => relation.world().is_some(),
+            _ => false,
+        }) {
+            return Err(unavailable());
+        }
         let mut scoped = operations.iter().filter_map(Operation::owned_relation);
         let mut admitted = BTreeSet::new();
         if let Some(first) = scoped.next() {
+            if first.is_world_catalog() { return Err(unavailable()); }
             let world = first.world();
             if world_batch {
                 admitted.insert(world.ok_or_else(unavailable)?);
@@ -879,7 +898,7 @@ impl<'a> OpenTransaction<'a> {
                     if admitted.len() > 8 { return Err(unavailable()); }
                 }
             } else {
-                if scoped.any(|relation| relation.world() != world || relation.is_world_catalog() != first.is_world_catalog()) {
+                if scoped.any(|relation| relation.world() != world || relation.is_world_catalog()) {
                     return Err(unavailable());
                 }
                 admitted.extend(world);

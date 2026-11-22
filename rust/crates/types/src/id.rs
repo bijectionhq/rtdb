@@ -324,10 +324,34 @@ impl TableRef {
     pub fn owned_world_scope(&self) -> (bool, Option<Iid>) {
         let Some((_, name)) = self.table.split_once('-') else { return (false, None); };
         if self.schema != OWNED_SCHEMA_V1 { return (false, None); }
-        let addressed = name.strip_prefix(OWNED_ADDRESS_PREFIX).unwrap_or(name);
+        let addressed = name.strip_prefix(OWNED_ADDRESS_PREFIX)
+            .or_else(|| name.strip_prefix(OWNED_CHANGE_PREFIX)).unwrap_or(name);
         let world = addressed.strip_prefix(OWNED_WORLD_PREFIX)
             .and_then(|rest| rest.split_once('.')).and_then(|(world, _)| world.parse().ok());
         (name == OWNED_WORLD_CATALOG, world)
+    }
+
+    /// The protected storage name after its already validated owner namespace.
+    pub fn owned_storage_name(&self) -> Option<&str> {
+        self.supported_owned_name().then(|| self.table.split_once('-').map(|(_, name)| name)).flatten()
+    }
+
+    /// Maps a logical data table, its address table, or its journal to the
+    /// exact original relation. No other protected metadata is a companion.
+    pub fn owned_effect_relation_name(&self) -> Option<&str> {
+        let name = self.owned_storage_name()?;
+        let relation = name.strip_prefix(OWNED_ADDRESS_PREFIX)
+            .or_else(|| name.strip_prefix(OWNED_CHANGE_PREFIX)).unwrap_or(name);
+        OwnedRelation::from_source(relation.to_owned()).ok()
+            .filter(|relation| !relation.is_world_catalog()).map(|_| relation)
+    }
+
+    pub fn is_owned_change_journal(&self) -> bool {
+        self.owned_storage_name().is_some_and(|name| name.starts_with(OWNED_CHANGE_PREFIX))
+    }
+
+    pub fn is_owned_world_clock_table(&self) -> bool {
+        self.owned_storage_name() == Some(OWNED_WORLD_CLOCKS)
     }
 
     pub fn is_owned_path_catalog(&self) -> bool {

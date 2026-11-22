@@ -9,6 +9,8 @@ use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_
 
 use crate::{RetainedAnomaly, TransactionResult};
 
+pub(crate) mod worlds;
+
 pub struct ReplayedTransaction {
     pub writes: StagedWrite,
     pub result: TransactionResult,
@@ -35,7 +37,8 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         TransactionResult::Aborted { tx_key: key, error }
     };
     let mut tables = BTreeMap::new();
-    let mut owned_namespace = None;
+    let mut owned_owner = None;
+    let mut owned_scopes = BTreeSet::new();
     for (name, bytes) in &message.table_data {
         let (schema, physical_name) = name.split_once('/').ok_or_else(|| invalid("Replica table must use schema/table"))?;
         if schema.is_empty() || physical_name.is_empty() || physical_name.contains('/') { return Err(invalid("Invalid replica table name")); }
@@ -44,18 +47,22 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
             if !table.supported_owned_name() {
                 return Err(invalid("Unknown owned relation policy or invalid owned relation name"));
             }
-            let namespace = (&physical_name[..64], table.owned_world_scope());
-            if owned_namespace.is_some_and(|seen| seen != namespace) {
-                return Err(invalid("Resolved transaction writes more than one owner or world scope"));
+            let owner = &physical_name[..64];
+            if owned_owner.is_some_and(|seen| seen != owner) {
+                return Err(invalid("Resolved transaction writes more than one owned principal"));
             }
-            owned_namespace = Some(namespace);
+            owned_owner = Some(owner);
+            owned_scopes.insert(table.owned_world_scope());
         }
         let pages = crate::ipc::decode(bytes, memory)?;
         if pages.len() != 1 { return Err(invalid("Resolved transaction table must contain exactly one record batch")); }
         let batch = IndexBatch::from_owned(pages.into_iter().next().ok_or_else(|| invalid("Replica table has no batch"))?)?;
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
     }
-    if let Some((_, owned_scope)) = owned_namespace {
+    let outcome = placed_attempt.map(|attempt| read_placed_outcome(&tables, attempt, key, memory)).transpose()?;
+    let proof = outcome.as_ref().map(|(proof, _)| proof);
+    let world_effects = proof.and_then(|proof| proof.get(worlds::WORLD_EFFECTS));
+    if owned_owner.is_some() {
         if !result.committed() || message.db_op.is_some() {
             return Err(invalid("Resolved owned transaction mixes storage scopes"));
         }
@@ -70,35 +77,43 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                         ))
             })
             .collect();
-        if !controls.is_empty() {
-            let Some(attempt) = placed_attempt.filter(|_| owned_scope == (false, None)) else {
-                return Err(invalid(
-                    "Resolved hosted controls require one placed owned root",
-                ));
-            };
-            verify_hosted_controls(&tables, &controls, attempt, key, memory)?;
+        match world_effects {
+            Some(Value::List(effects)) => {
+                if !controls.is_empty() || proof.is_some_and(|proof| proof.contains_key(crate::hosted_control::CONTROL_TABLES)) {
+                    return Err(invalid("Resolved world effects may only check hosted controls"));
+                }
+                worlds::verify(&tables, effects, key, memory)?;
+            }
+            Some(Value::Undefined | Value::Null) | None => {
+                if owned_scopes.len() != 1 {
+                    return Err(invalid("Cross-scope owned effects have no placed world inventory"));
+                }
+                if !controls.is_empty() {
+                    let proof = proof.filter(|_| owned_scopes.contains(&(false, None))).ok_or_else(|| {
+                        invalid("Resolved hosted controls require one placed owned root")
+                    })?;
+                    verify_hosted_controls(proof, &controls, key)?;
+                }
+            }
+            Some(_) => return Err(invalid("Invalid placed world inventory carrier")),
         }
+    } else if matches!(world_effects, Some(value) if !matches!(value, Value::Undefined | Value::Null)) {
+        return Err(invalid("Placed world inventory has no owned effects"));
     }
     Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt })
 }
 
-fn verify_hosted_controls(
-    tables: &BTreeMap<TableRef, TableWrite>,
-    controls: &[(&TableRef, &TableWrite)],
-    attempt: PlacedAttempt,
-    key: TransactionKey,
+fn read_placed_outcome(
+    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, key: TransactionKey,
     memory: &Arc<MemoryBudget>,
-) -> Result<()> {
-    use crate::hosted_control::{CONTROL_TABLES, admits_name};
-
-    let mismatch =
-        || invalid("Resolved hosted controls differ from their ordered attempt inventory");
+) -> Result<(StructFields<Value>, Arc<rtdb_columnar::MemoryReservation>)> {
+    let mismatch = || invalid("Resolved owned effects differ from their ordered placed attempt");
     let outcome = tables
         .get(&TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE))
         .and_then(TableWrite::batch)
         .filter(|batch| batch.len() == 1)
         .ok_or_else(mismatch)?;
-    let _decode = memory.reserve(
+    let decode = memory.reserve(
         outcome
             .arrow()
             .get_array_memory_size()
@@ -113,9 +128,19 @@ fn verify_hosted_controls(
     if event.system_from != key.system_time
         || !matches!(proof.get("_id"), Some(Value::Utf8(id)) if id == &attempt.outcome_key())
         || proof.get("tx_id") != Some(&Value::I64(key.tx_id.0))
+        || !matches!(proof.get("tx_system_time"), Some(Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, .. }) if *value == key.system_time.0)
     {
         return Err(mismatch());
     }
+    Ok((proof, decode))
+}
+
+fn verify_hosted_controls(
+    proof: &StructFields<Value>, controls: &[(&TableRef, &TableWrite)], key: TransactionKey,
+) -> Result<()> {
+    use crate::hosted_control::{CONTROL_TABLES, admits_name};
+
+    let mismatch = || invalid("Resolved hosted controls differ from their ordered attempt inventory");
     let Some(Value::List(names)) = proof.get(CONTROL_TABLES) else {
         return Err(mismatch());
     };

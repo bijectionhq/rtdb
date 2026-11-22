@@ -10,8 +10,8 @@ use rtdb_types::{
 use uuid::Uuid;
 
 use super::{
-    CellStorage, CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, KeyService,
-    capture_receipt, read_world::{CaptureSelection, read_checkpoint_point_in_context, with_checkpoint_context, with_registered_capture_context},
+    CellStorage, CheckpointReadResources, CheckpointReadWorld, KeyService,
+    capture_receipt, read_world::{CaptureSelection, with_registered_capture_context},
     replica_suffix, require_capture_open, same_lifetime,
 };
 use crate::admin::update_installation;
@@ -80,45 +80,10 @@ fn world_record(
 
 /// Forks an independently archived, exact parent cut. The directory pin
 /// precedes the ordered assertion, so a partial fork can only retain media.
-pub async fn fork_checkpoint_world(
-    directory: &dyn Directory,
-    archive: &CellStorage,
-    keys: &dyn KeyService,
-    hosted_task: Option<&HostedTask>,
-    session: &mut NativeSession,
-    deployment_id: Uuid,
-    capture: Uuid,
-    until: Timestamp,
-    resources: CheckpointReadResources<'_>,
-) -> Result<Uuid> {
-    fork_checkpoint_world_at(
-        directory, archive, keys, hosted_task, session, deployment_id, capture, None,
-        until, resources,
-    ).await
-}
-
-pub(crate) async fn fork_checkpoint_world_at(
-    directory: &dyn Directory,
-    archive: &CellStorage,
-    keys: &dyn KeyService,
-    hosted_task: Option<&HostedTask>,
-    session: &mut NativeSession,
-    deployment_id: Uuid,
-    capture: Uuid,
-    suffix: Option<Uuid>,
-    until: Timestamp,
-    resources: CheckpointReadResources<'_>,
-) -> Result<Uuid> {
-    let (world, _) = fork_checkpoint_world_selected(
-        directory, archive, keys, hosted_task, session, deployment_id, capture, suffix, until, resources, None,
-    ).await?;
-    Ok(world)
-}
-
 pub(crate) async fn fork_checkpoint_world_selected(
     directory: &dyn Directory, archive: &CellStorage, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
     session: &mut NativeSession, deployment_id: Uuid, capture: Uuid, suffix: Option<Uuid>,
-    until: Timestamp, resources: CheckpointReadResources<'_>, fork: Option<rtdb_node::OwnedWorldFork>,
+    until: Timestamp, resources: CheckpointReadResources<'_>, fork: rtdb_node::OwnedWorldFork,
 ) -> Result<(Uuid, TransactionKey)> {
     let owner = session
         .state()
@@ -161,10 +126,10 @@ pub(crate) async fn fork_checkpoint_world_selected(
     drop(live);
     let parent = CheckpointReadWorld { deployment: deployment_id, capture, manifest_sha256: manifest, suffix, basis };
 
-    if fork.as_ref().is_some_and(|fork| fork.basis != basis.system_time) {
+    if fork.basis != basis.system_time {
         return Err(OwnedWorld::unavailable());
     }
-    let id = fork.as_ref().map_or_else(Uuid::new_v4, |fork| Uuid::from_bytes(fork.world.0));
+    let id = Uuid::from_bytes(fork.world.0);
     if id.is_nil() { return Err(OwnedWorld::unavailable()); }
     let retained = CheckpointWorldRetention {
         owner,
@@ -185,14 +150,14 @@ pub(crate) async fn fork_checkpoint_world_selected(
         }
         admit_capture(record, archive, &parent)?;
         let now = now();
-        if until <= now || fork.as_ref().is_some_and(|fork| fork.deadline <= now || Some(fork.scope) != scope) {
+        if until <= now || fork.deadline <= now || Some(fork.scope) != scope {
             return Err(OwnedWorld::unavailable());
         }
         record
             .checkpoint_worlds
             .retain(|_, world| world.until > now);
         if let Some(existing) = record.checkpoint_worlds.get(&id) {
-            return if fork.is_some() && existing == &retained { Ok(()) } else { Err(OwnedWorld::unavailable()) };
+            return if existing == &retained { Ok(()) } else { Err(OwnedWorld::unavailable()) };
         }
         if record.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS {
             return Err(OwnedWorld::unavailable());
@@ -203,18 +168,10 @@ pub(crate) async fn fork_checkpoint_world_selected(
     .await?;
     admit_session(session, &installed, &retained.owner)?;
     let registration = world_record(id, &retained, schemas);
-    let checked = fork.is_some();
-    let outcome = if let Some(fork) = fork {
-        session.register_owned_world_checked(&registration, fork).await?
-    } else {
-        session.register_owned_world(&registration).await?
-    };
+    let outcome = session.register_owned_world_checked(&registration, fork).await?;
     if !outcome.committed() {
-        // A competing retry can already have published this checked world.
-        // Keep its exact pin available for recovery until drop or expiry.
-        if !checked {
-            let _ = retire_world_pin(directory, &deployment, id, &retained, installed.incarnation, installed.log_epoch).await;
-        }
+        // A competing retry may already have registered this world.
+        // Its exact pending pin remains eligible for recovery until expiry.
         return Err(outcome
             .error()
             .cloned()
@@ -295,58 +252,6 @@ async fn open_world(
     })
 }
 
-/// Orders a terminal world marker before allowing archive retirement.
-pub async fn drop_checkpoint_world(
-    directory: &dyn Directory,
-    session: &mut NativeSession,
-    deployment: Uuid,
-    id: Uuid,
-) -> Result<()> {
-    let deployment = deployment.to_string();
-    let owner = session
-        .state()
-        .user()
-        .filter(|owner| !owner.is_empty())
-        .ok_or_else(OwnedWorld::unavailable)?;
-    let installation = directory
-        .deployment(&deployment)
-        .await?
-        .ok_or_else(OwnedWorld::unavailable)?;
-    admit_session(session, &installation, owner)?;
-    let retained = installation.checkpoint_worlds.get(&id);
-    if retained.is_some_and(|retained| retained.owner != owner) {
-        return Err(OwnedWorld::unavailable());
-    }
-    let snapshot = session.open_owned_read().await?;
-    let (world, _retained) = snapshot
-        .world_registration(Iid(*id.as_bytes()))
-        .await?
-        .ok_or_else(OwnedWorld::unavailable)?;
-    drop(snapshot);
-
-    let Some(pin) = retained else {
-        return if world.dropped {
-            Ok(())
-        } else {
-            Err(OwnedWorld::unavailable())
-        };
-    };
-    if !matches_retention(&world, pin) {
-        return Err(OwnedWorld::unavailable());
-    }
-    if !world.dropped {
-        let outcome = session.drop_owned_world(world).await?;
-        if !outcome.committed() {
-            return Err(outcome
-                .error()
-                .cloned()
-                .unwrap_or_else(OwnedWorld::unavailable));
-        }
-    }
-
-    retire_world_pin(directory, &deployment, id, pin, installation.incarnation, installation.log_epoch).await
-}
-
 async fn retire_world_pin(
     directory: &dyn Directory, deployment: &str, id: Uuid, pin: &CheckpointWorldRetention,
     incarnation: u64, log_epoch: i32,
@@ -366,18 +271,6 @@ async fn retire_world_pin(
     Ok(())
 }
 
-/// Applies complete local replacements and tombstones in one ordered write.
-pub async fn commit_checkpoint_world(
-    directory: &dyn Directory,
-    archive: &CellStorage,
-    session: &mut NativeSession,
-    deployment: Uuid,
-    id: Uuid,
-    writes: Vec<OwnedWorldWrite>,
-) -> Result<TransactionKey> {
-    commit_checkpoint_world_checked(directory, archive, session, deployment, id, writes, Vec::new(), Vec::new(), None, None).await
-}
-
 pub(crate) async fn commit_checkpoint_world_checked(
     directory: &dyn Directory,
     archive: &CellStorage,
@@ -387,7 +280,7 @@ pub(crate) async fn commit_checkpoint_world_checked(
     writes: Vec<OwnedWorldWrite>,
     checks: Vec<OwnedWorldPointWitness>,
     controls: Vec<rtdb_node::HostedControlWrite>,
-    deadline: Option<Timestamp>,
+    deadline: Timestamp,
     publication: Option<rtdb_node::OwnedWorldPublication>,
 ) -> Result<TransactionKey> {
     let OpenWorld {
@@ -410,7 +303,7 @@ pub(crate) async fn commit_checkpoint_world_checked(
     }
     if dropping {
         // The ordered terminal marker is authoritative. A failed retirement leaves
-        // the exact pin retained until expiry or a retry via the archive drop owner.
+        // the exact pin retained until expiry.
         let _ = retire_world_pin(directory, &deployment.to_string(), id, &retained, incarnation, log_epoch).await;
     }
     Ok(outcome.tx_key())
@@ -550,41 +443,3 @@ impl OpenWorld {
     }
 }
 
-/// A local tombstone suppresses the pinned parent's row for this full identity.
-pub async fn read_checkpoint_world_point(
-    directory: &dyn Directory,
-    archive: &CellStorage,
-    keys: &dyn KeyService,
-    hosted_task: Option<&HostedTask>,
-    session: &mut NativeSession,
-    deployment: Uuid,
-    world: Uuid,
-    relation: &OwnedRelation,
-    id: &EntityId,
-    valid_at: Timestamp,
-    resources: CheckpointReadResources<'_>,
-) -> Result<WorldPoint> {
-    let valid = Interval::at(valid_at)?;
-    let open = open_world(directory, archive, session, deployment, world).await?;
-    let present = open.snapshot.present();
-    let memory = resources.memory;
-    let (local, _) = open.read_local(relation, id, valid_at, memory, false).await?;
-    if let Some(fact) = local {
-        open.check()?;
-        open.snapshot.check_relation(relation)?;
-        return Ok(WorldPoint { present, fact, shadowed: true, witness: None });
-    }
-    open.snapshot.check_point_purge_floor(relation, id, open.retained.basis.system_time).await?;
-    let guard = open.snapshot.relation_release_guard([relation])?;
-    let batches = with_checkpoint_context(
-        directory, archive, keys, hosted_task, &open.parent(deployment), resources,
-        |context| read_checkpoint_point_in_context(
-            context.with_owned_read_guard(guard),
-            CheckpointPoint { owner: &open.retained.owner, relation, id, valid: Some(valid) },
-        ),
-    ).await?;
-    let fact = decode_point(batches.unwrap_or_default(), id, memory)?;
-    open.check()?;
-    open.snapshot.check_relation(relation)?;
-    Ok(WorldPoint { present, fact, shadowed: false, witness: None })
-}

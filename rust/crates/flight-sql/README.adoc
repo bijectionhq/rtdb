@@ -413,15 +413,10 @@ The placed Multi host enables world actions on a listener configured for owned n
 An authenticated, idle autocommit session must remain bound to its writer placement and epoch.
 The host resolves deployment and archive authority from the authenticated placement and the world record.
 
-`rtdb.owned.ReadWorldPoint.v1` takes a 16-byte world UUID, the relation prefix, and a terminated Arrow IPC stream containing one batch and one row.
-The row has `_id` of a supported identity type and a non-null `valid_micros: Int64`.
-The read resolves the local world shadow at one reserved present, including tombstones, then uses the retained archived cut if there is no shadow.
-The IPC metadata reports the live world present as `rtdb.owned.present_micros` and the selected instant as `rtdb.owned.valid_micros`.
-A found row includes the winning local or archived `rtdb.owned.revision_micros`. An absent row has no record batch.
-
 `rtdb.owned.OpenWorldRead.v3` takes the world UUID and admits one live cut and its verified archived parent.
 The 48-byte result contains the opaque handle, the live present, archived parent transaction ID and system time, and the last application clock. Int64 minimum identifies a world with no local application publication. Each coordinate is a signed big-endian 64-bit integer. Times are Unix microseconds.
-`rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then the same relation and Arrow fields as the one-shot read.
+`rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then a relation prefix and a terminated single-row Arrow IPC stream with `_id` and non-null `valid_micros: Int64`.
+The response reports the held present and valid instant in schema metadata. A found row also carries its exact winning revision.
 The point response schema includes `rtdb.owned.world_shadowed` (0 or 1). A local tombstone counts as a shadow.
 Every call reads the same live cut and archive root. The held handle stays bound to the original authenticated session and attachment.
 Use `rtdb.owned.CloseWorldRead.v1` with the 16-byte handle to cancel the read. Success has zero Flight results. The archive lease releases after in-flight I/O drains.
@@ -439,19 +434,7 @@ Resume after the last visible identity when that flag is set.
 The page merges exact archived and local shadow candidates. A winning local tombstone hides the identity.
 Missing coverage, an archive purge floor after the parent cut, or excessive work refuses the page.
 
-`rtdb.owned.DropWorld.v1` takes exactly the 16-byte world UUID.
-The ordered terminal record fences subsequent world operations before the host releases its archive pin.
-Success has zero Flight results.
-
-`rtdb.owned.ForkWorld.v1` takes a registered 16-byte capture UUID followed by a signed big-endian 64-bit expiration time in Unix microseconds.
-The host resolves the live deployment's capture receipt and reopens its verified archive root to obtain the parent transaction key.
-Success returns one Flight result containing the new world UUID as 16 bytes.
-`rtdb.owned.ForkWorld.v2` takes a registered 16-byte capture UUID, the 16-byte lease UUID of a published replica suffix for that capture, and the same 64-bit expiration.
-The host authenticates the archived suffix and applies its inline resolved transactions in a private recovered partition at the exact accepted transaction key.
-The world retains that suffix with its parent capture and reopens the same replay cut for held and one-shot reads.
-The reply and subsequent world read and write actions use the same wire shapes.
-
-`rtdb.owned.CommitWorld.v1` takes a 16-byte world UUID, then the Commit.v2 relation grouping without a deadline.
+World overlay groups use the following row shape.
 The group count is a big-endian u16 from 1 to 32.
 Each group consists of a relation prefix, its big-endian u32 Arrow length, and one terminated IPC stream with a nonempty batch.
 The request admits up to 4096 rows across all groups.
@@ -483,12 +466,8 @@ Revisions are dense within the authenticated owner's relation, and each returned
 
 `rtdb.owned.ReadHeldWorldPoint.v2` with flag 1 may include `rtdb.owned.world_point_witness`, an opaque 32-digit hexadecimal nonce.
 The witness exists only under an authenticated placed read with a retained lease. It may accompany an absent result or an archived winner.
-`rtdb.owned.CommitWorld.v2` takes the 16-byte world UUID, the 16-byte held world handle, a big-endian u16 witness count from 1 to 128, and that many distinct raw 16-byte nonces.
-The remaining bytes are the same relation groups as `CommitWorld.v1`.
 The original session and placement must still own the held world read.
-Before applying any write, the ordered resolver checks the placement and earliest lease deadline, then the local shadow observations.
-A local tombstone has its own observed revision. An archived winner certifies local absence. The parent cut itself is fixed by the world registration.
-The response has the same transaction-key row as `CommitWorld.v1`.
+A local tombstone has its own observed revision. An archived winner certifies local absence. The parent cut is fixed by the world registration.
 
 `rtdb.owned.CommitWorld.v3` validates an admitted world condition without writing any fact or publishing a clock.
 It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix microseconds, the held handle, a big-endian u16 witness count from 1 to 128, and the distinct 16-byte nonces.
