@@ -2139,6 +2139,152 @@ async fn a_trusted_checkpoint_and_replica_journal_rebuild_after_l0_is_removed() 
 }
 
 #[tokio::test]
+async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_through_collection() {
+    use rtdb_format::{catalog::BlockCatalog, keys::{block_key, oversized_block_index, oversized_key}};
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_storage = directory.path().join("source");
+    let objects = source_storage.join("v06");
+    let source_log = directory.path().join("log");
+    let replica_log = source_log.join("REPLICA_LOG");
+    let primary = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog { path: Some(source_log.display().to_string()), epoch: Some(0) })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(source_storage.display().to_string()), epoch: Some(0) })),
+        ..Default::default()
+    };
+    let mut settings = options();
+    settings.membership = Membership::Durable { primary: primary.clone(), skipped: BTreeSet::new() };
+    settings.garbage.blocks_to_keep = 1;
+    let runtime = services();
+    let native = || {
+        let mut resources = NativeResources::default().with_local_log_clock(Arc::clone(&runtime.clock), false);
+        resources.maximum_log_message_bytes = 16 << 10;
+        NodeServices { resources: Arc::new(resources), ..runtime.clone() }
+    };
+    let cancellation = CancellationToken::new();
+    let memory = rtdb_columnar::MemoryBudget::new(512 << 20);
+    let flush = async |database: &Database| {
+        let mut status = database.watch_status();
+        let position = database.flush().await.unwrap();
+        let adopted = tokio::time::timeout(Duration::from_secs(10), status.wait_for(|status| {
+            status.adopted_block.as_ref().and_then(|block| block.latest_source_position()).is_some_and(|source| source >= position)
+        })).await.unwrap().unwrap();
+        adopted.adopted_block.clone().unwrap()
+    };
+    let receipt = |catalog: &BlockCatalog| RepairCheckpoint {
+        block: catalog.block_index(), sha256: catalog.publication_sha256().unwrap(),
+    };
+    let (node, driver) = running(settings.clone(), native()).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    session.state_mut().execute_operation(put(&node, -2, -2)).await.unwrap();
+    let old = flush(&database).await;
+    session.state_mut().execute_operation(put(&node, -1, -1)).await.unwrap();
+    let base = flush(&database).await;
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    let mut offline = settings.clone();
+    offline.replication.enabled = false;
+    offline.compaction_threads = 0;
+    let export = async |label: &str| {
+        let (exporter, driver) = running(offline.clone(), native()).await;
+        let plan = exporter.snapshot_export("xtdb", Timestamp(0)).await.unwrap().unwrap();
+        plan.copy(&cancellation).await.unwrap();
+        let detached = directory.path().join(label);
+        std::fs::rename(objects.join(plan.directory().as_str()), &detached).unwrap();
+        drop(plan);
+        stop(&exporter, driver).await;
+        detached
+    };
+    let trusted_base = export("base").await;
+    let mut hold = RetainRepairBase {
+        source_storage: source_storage.clone(), replica_log: replica_log.clone(),
+        base_storage: trusted_base.clone(), base: receipt(&base),
+    };
+    hold.base.sha256[0] ^= 1;
+    assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap_err().code, "rtdb.repair/invalid-checkpoint");
+    hold.base = receipt(&base);
+    assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap(), base.boundary_replica_position().unwrap());
+
+    settings.automatic_gc = true;
+    let (node, driver) = running(settings.clone(), native()).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let result = session.state_mut().execute_operation(TxOp::Sql {
+        sql: "INSERT INTO docs (_id, value) SELECT x AS _id, x AS value FROM GENERATE_SERIES(1, 3000) AS g(x)".into(),
+        args: None,
+    }).await.unwrap().unwrap();
+    assert!(result.committed());
+    let through = flush(&database).await;
+    let payload = std::fs::read_dir(objects.join("oversized")).unwrap().map(|entry| entry.unwrap().path())
+        .find(|path| oversized_block_index(path.to_str().unwrap()) == Some(through.block_index())).unwrap();
+    let sql = "SELECT count(*) FROM docs";
+    let expected = rows(session.query_sql(sql, vec![]).await.unwrap()).await;
+    assert_eq!(expected, vec![vec![Value::I64(3002)]]);
+    let sentinel = objects.join(oversized_key(old.block_index(), "unreferenced").unwrap());
+    std::fs::write(&sentinel, []).unwrap();
+    session.state_mut().execute_operation(put(&node, -3, -3)).await.unwrap();
+    let replacement = flush(&database).await;
+    let await_collection = async |path: &std::path::Path| {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while path.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.unwrap();
+    };
+    await_collection(&sentinel).await;
+    assert!(!objects.join(block_key(old.block_index()).unwrap()).exists());
+    let root = objects.join(block_key(through.block_index()).unwrap());
+    assert!(root.exists());
+    for entry in through.table_entries().unwrap() {
+        assert!(objects.join(entry.slug.block_key(through.block_index()).unwrap()).exists());
+    }
+    assert!(payload.exists());
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    let repair = LocalRepair {
+        source_storage: source_storage.clone(), base_storage: Some(trusted_base),
+        replica_log, output_parent: directory.path().to_owned(), base: receipt(&base), through: receipt(&through),
+    };
+    let rebuilt = repair.rebuild(memory.clone(), &cancellation).await.unwrap();
+    assert_eq!(rebuilt.latest_transaction, through.latest_completed_tx().unwrap());
+    let mut reopened = settings.clone();
+    reopened.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog {
+                path: Some(directory.path().join("replacement-log").display().to_string()), epoch: Some(1),
+            })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(rebuilt.path.display().to_string()), epoch: Some(0) })),
+            ..primary
+        },
+        skipped: BTreeSet::new(),
+    };
+    let (reader, driver) = running(reopened, native()).await;
+    let mut reader_session = reader.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(reader_session.query_sql(sql, vec![]).await.unwrap()).await, expected);
+    drop(reader_session);
+    stop(&reader, driver).await;
+
+    let next_base = export("next-base").await;
+    assert_eq!(hold.install(memory.clone(), &cancellation).await.unwrap_err().code, "rtdb.repair/invalid-checkpoint");
+    hold.base_storage = next_base;
+    hold.base = receipt(&replacement);
+    hold.install(memory, &cancellation).await.unwrap();
+
+    let (node, driver) = running(settings, native()).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    session.state_mut().execute_operation(put(&node, -4, -4)).await.unwrap();
+    assert!(flush(&database).await.block_index() > replacement.block_index());
+    await_collection(&payload).await;
+    assert!(!root.exists());
+    drop((session, database));
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn compactor_reset_requires_a_completed_transaction() {
     let mut settings = options();
     settings.compaction_threads = 0;

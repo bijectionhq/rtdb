@@ -1595,6 +1595,17 @@ def verify_replica_trim_admission(args, scratch):
     verify_lean_model(args, scratch, path, "replica-trim-admission", controls, 3)
 
 
+def verify_repair_anchor_retention(args, scratch):
+    path = Path("verification/lean/RepairAnchorRetention.lean")
+    controls = {
+        "allow-older-anchor": (
+            "(atHead : first = s.head)", "(atHead : first ≤ s.head)",
+            ["every_transition_preserves_coverage"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "repair-anchor-retention", controls, 4)
+
+
 def verify_replica_hold_close(args, scratch):
     path = Path("verification/lean/ReplicaHoldClose.lean")
     controls = {
@@ -1835,6 +1846,7 @@ def verify_lean(args, scratch):
             verify_hosted_trie_release(args, scratch)
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
+            verify_repair_anchor_retention(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
             verify_checkpoint_source_handoff(args, scratch)
             verify_checkpoint_copy_evidence(args, scratch)
@@ -2602,6 +2614,17 @@ TLA_CASES = (
     ("CatalogAdmissionFloor", "catalog-floor-failover-witness", (
         "INVARIANTS CoveredByReceipt HeldViewAdmissible",
         "INVARIANT FreshReadAfterFailoverWitness"), "FreshReadAfterFailoverWitness"),
+    ("RepairAnchorRetention", "repair-anchor-retention", None, None),
+    ("RepairAnchorRetention", "repair-anchor-stale-pin",
+     ('Mutation = "none"', 'Mutation = "stale_pin"'), "Safe"),
+    ("RepairAnchorRetention", "repair-anchor-ignored",
+     ('Mutation = "none"', 'Mutation = "ignore_anchor"'), "Safe"),
+    ("RepairAnchorRetention", "repair-anchor-forgotten",
+     ('Mutation = "none"', 'Mutation = "forget_anchor"'), "Safe"),
+    ("RepairAnchorRetention", "repair-anchor-unsynced",
+     ('Mutation = "none"', 'Mutation = "skip_sync"'), "Safe"),
+    ("RepairAnchorRetention", "repair-anchor-reclaim-witness",
+     ("INVARIANT Safe", "INVARIANT NeverReclaimsAfterAdvance"), "NeverReclaimsAfterAdvance"),
     ("ResidenceComposition", "residence-composition", None, None),
     ("ResidenceComposition", "residence-composition-admit-below-floor",
      ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "admit_below_floor"\nINVARIANT RetainedCutsReadable'), "RetainedCutsReadable"),

@@ -74,3 +74,21 @@ async fn a_newer_local_journal_keeps_prior_holds_and_can_install_its_own_floor()
     assert!(successor.retain_catalog(Some(current)).await?.is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn malformed_repair_anchor_prevents_collection_after_reopen() -> rtdb_types::Result<()> {
+    let location = tempfile::tempdir().unwrap();
+    let store = LocalStore::open(location.path())?;
+    let file = ObjectKey::new("oversized/b00-payload.binpb")?;
+    store.put(&file, Bytes::from_static(b"replica bytes")).await?;
+    store.install_repair_anchor(rtdb_storage::LocalRepairAnchor {
+        block: rtdb_types::BlockIndex(1), boundary: ReplicaPosition(7), sha256: [1; 32],
+    }).await?;
+    drop(store);
+    std::fs::write(location.path().join(".tmp/catalog-ledger/repair-anchor"), b"{").unwrap();
+
+    let reopened = LocalStore::open(location.path())?;
+    assert_eq!(reopened.collect_recovery_file(&file).await.unwrap_err().code, "rtdb.storage/catalog-ledger");
+    assert_eq!(reopened.get(&file).await?, Bytes::from_static(b"replica bytes"));
+    Ok(())
+}

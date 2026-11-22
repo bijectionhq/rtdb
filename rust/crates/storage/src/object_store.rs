@@ -198,6 +198,10 @@ pub trait ObjectStore: Send + Sync {
     /// A listing may observe concurrent writes or deletions while enumerating the names.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
+    /// Collects an eligible checkpoint or offloaded replica file unless recovery still retains its block.
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
+        self.delete(key).await.map_err(Into::into)
+    }
     /// Drops any copy of the object held on this node, leaving the remote object untouched.
     async fn forget(&self, _key: &ObjectKey) -> Result<()> { Ok(()) }
     /// The object as a file on this node's disk, for a reader that maps it rather than holding its bytes; `None` where the store keeps no local file.
@@ -326,6 +330,24 @@ impl LocalStore {
         self.catalog = Some(Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), replica_epoch)));
         self
     }
+    /// Synchronizes an existing immutable object and its directory entries through the storage root.
+    pub async fn sync_existing(&self, key: &ObjectKey) -> Result<()> {
+        let root = self.root.clone();
+        let path = self.path(key);
+        let key = key.clone();
+        self.io.run(move || {
+            let file = open_object(&path, &key)?;
+            crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
+            sync_parents(&path, &root)
+        }).await
+    }
+
+    /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
+    pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
+        let ledger = crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch());
+        self.io.run(move || Ok(ledger.install_repair_anchor(anchor))).await?
+    }
+
     /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 
@@ -574,24 +596,39 @@ impl ObjectStore for LocalStore {
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path(key);
         let root = self.root.clone();
-        self.io.run(move || {
-            match fs::remove_file(&path) {
-                Ok(()) => (),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                Err(error) => return Err(Error::io(&path, error)),
+        self.io.run(move || remove_local_object(&root, &path)).await
+    }
+
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
+        use rtdb_format::keys::{block_index_from_key, oversized_block_index};
+        let block = if key.as_str().starts_with("oversized/") {
+            oversized_block_index(key.as_str()).ok_or_else(|| Error::InvalidKey(key.to_string()))?
+        } else {
+            block_index_from_key(key.as_str())?
+        };
+        let path = self.path(key);
+        let root = self.root.clone();
+        let ledger = crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0));
+        self.io.run(move || Ok(ledger.collect_recovery_file(block, || remove_local_object(&root, &path)))).await?
+    }
+}
+
+fn remove_local_object(root: &Path, path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(Error::io(path, error)),
+    }
+    // A retry can observe an unlink whose parent was not flushed.
+    // If a containing directory is also absent, confirm its removal.
+    let mut parent = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
+    loop {
+        match crate::sync_directory(parent) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root => {
+                parent = parent.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
             }
-            // A retry can observe an unlink whose parent was not flushed.
-            // If a containing directory is also absent, confirm its removal.
-            let mut parent = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
-            loop {
-                match crate::sync_directory(parent) {
-                    Ok(()) => return Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root.as_path() => {
-                        parent = parent.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
-                    }
-                    Err(error) => return Err(Error::io(parent, error)),
-                }
-            }
-        }).await
+            Err(error) => return Err(Error::io(parent, error)),
+        }
     }
 }

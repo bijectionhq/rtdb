@@ -346,7 +346,7 @@ impl BlockStore {
         Ok(Some(latest))
     }
 
-    async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> {
+    pub(crate) async fn latest_listed_block(&self) -> Result<Option<BlockIndex>> {
         let directory = ObjectKey::new("blocks")?;
         Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max())
     }

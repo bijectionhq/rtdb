@@ -4,9 +4,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, StorageEpoch};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch};
 
 use crate::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalRepairAnchor {
+    pub block: BlockIndex,
+    pub boundary: ReplicaPosition,
+    pub sha256: [u8; 32],
+}
+
+impl LocalRepairAnchor {
+    fn well_formed(self) -> bool { self.block.0 >= 0 && self.boundary.0 >= 0 }
+}
 
 pub(crate) struct LocalCatalogLedger {
     directory: PathBuf,
@@ -43,7 +54,7 @@ impl LocalCatalogLedger {
         }
         if let Some(prior) = self.floor()? {
             if covers(prior, cut) {
-                self.sync_floor()?;
+                self.sync_ledger()?;
                 return Ok(true);
             }
             let replaces_journal = same_storage(cut, prior) && cut.replica_epoch > prior.replica_epoch;
@@ -75,7 +86,7 @@ impl LocalCatalogLedger {
         crate::sync_file(next.as_file()).map_err(|error| Error::io(next.path(), error))?;
         let path = self.directory.join("floor");
         next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-        self.sync_floor()?;
+        self.sync_ledger()?;
         Ok(true)
     }
 
@@ -84,11 +95,60 @@ impl LocalCatalogLedger {
         if cut.replica_epoch != self.replica_epoch || !self.floor()?.is_some_and(|floor| covers(floor, cut)) {
             return Ok(false);
         }
-        self.sync_floor()?;
+        self.sync_ledger()?;
         Ok(true)
     }
 
-    fn sync_floor(&self) -> Result<()> {
+    pub(crate) fn install_repair_anchor(&self, next: LocalRepairAnchor) -> Result<()> {
+        let _gate = self.lock()?;
+        if !next.well_formed() {
+            return Err(invalid("Invalid local repair anchor"));
+        }
+        if let Some(prior) = self.repair_anchor()? {
+            if prior == next { return self.sync_ledger(); }
+            if next.block <= prior.block || next.boundary <= prior.boundary
+                || next.boundary.epoch() != prior.boundary.epoch()
+            {
+                return Err(invalid("The repair anchor must advance in the same replica journal"));
+            }
+        }
+
+        let mut staged = tempfile::NamedTempFile::new_in(&self.directory)
+            .map_err(|error| Error::io(&self.directory, error))?;
+        staged.write_all(&serde_json::to_vec(&(next.block, next.boundary, next.sha256)).map_err(invalid)?)
+            .map_err(|error| Error::io(staged.path(), error))?;
+        crate::sync_file(staged.as_file()).map_err(|error| Error::io(staged.path(), error))?;
+        let path = self.directory.join("repair-anchor");
+        staged.persist(&path).map_err(|error| Error::io(&path, error.error))?;
+        self.sync_ledger()
+    }
+
+    pub(crate) fn collect_recovery_file(&self, block: BlockIndex, remove: impl FnOnce() -> crate::Result<()>) -> Result<()> {
+        let _gate = self.lock()?;
+        if let Some(anchor) = self.repair_anchor()? {
+            if block >= anchor.block { return Ok(()); }
+            self.sync_ledger()?;
+        }
+        Ok(remove()?)
+    }
+
+    fn repair_anchor(&self) -> Result<Option<LocalRepairAnchor>> {
+        let path = self.directory.join("repair-anchor");
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::io(path, error).into()),
+        };
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file).take(1025).read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
+        if bytes.len() > 1024 { return Err(invalid("Local repair anchor exceeds its format bound")); }
+        let (block, boundary, sha256) = serde_json::from_slice(&bytes).map_err(invalid)?;
+        let anchor = LocalRepairAnchor { block, boundary, sha256 };
+        if !anchor.well_formed() { return Err(invalid("Malformed local repair anchor")); }
+        Ok(Some(anchor))
+    }
+
+    fn sync_ledger(&self) -> Result<()> {
         for directory in [&self.directory, &self.root.join(".tmp"), self.root.as_ref()] {
             crate::sync_directory(directory).map_err(|error| Error::io(directory, error))?;
         }

@@ -29,7 +29,7 @@ pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
 pub use rtdb_tx::HostedControlWrite;
-pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore};
+pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase};
 pub use node::{OwnedIdentityPage, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
 #[cfg(feature = "search")]
 pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};

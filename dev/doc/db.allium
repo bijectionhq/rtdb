@@ -1794,6 +1794,14 @@ contract LocalCheckpointRepair {
         -- The same stopped local replica journal covers both checkpoint boundaries.
         -- Repair holds the journal's writer lock throughout the rebuild.
 
+    @invariant RetainedRepairBase
+        -- With the serving journal locked, the operator can install an independently stored export of the current checkpoint as its retained repair base.
+        -- Admission verifies the serving and exported root publications, the export's complete primary inventory, and the matching record in the local journal.
+        -- Installation follows synchronization of the exported files and their directory entries.
+        -- The store preserves block catalogs, per-table block files and offloaded replica payloads at and beyond that block across restarts.
+        -- An operator advances protection by installing a newer verified base in the same replica journal.
+        -- The collector synchronizes the replacement anchor before removing files covered by the previous anchor.
+
     @invariant ReplayThroughSelectedCut
         -- The rebuild copies the base primary inventory and replays admitted resolved transactions through the exact target boundary.
         -- The rebuilt checkpoint has the selected target's transaction head and table registry.

@@ -26,6 +26,12 @@
 -- The block-file reasoning above therefore does NOT carry over — a delete here can break a running read path, and that is the price of having no replica-log coordination.
 -- A follower past the bound does not skip the record: the fetch throws out of the replica tail, which notifies the watchers' error state, and since that state is absorbing the database stops consuming and stays unqueryable until the process restarts.
 --
+-- A native local store can retain a separately exported current checkpoint as a repair base.
+-- The block collector skips its checkpoint metadata and offloaded replica payloads at or above the installed anchor.
+-- Anchor replacement and physical removal serialize at the storage root.
+-- A durable successor anchor permits the ordinary block retention rule to collect older files.
+-- The store retains the anchor across restarts.
+--
 -- Per-database, leader-only, signal-driven. Same lifecycle and trigger model
 -- as Trie GC (see gc.allium): constructed when the LeaderSystem opens,
 -- closed when it closes, signalled at every block boundary, awaitable for

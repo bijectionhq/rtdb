@@ -86,6 +86,15 @@ This path applies to epoch-zero local storage with both checkpoints in the same 
 The command publishes a separate `repair-…/storage` directory and reports its checkpoint digest, last transaction and original replica epoch.
 Use that storage with a new empty local log configured at an epoch higher than the one reported.
 The rebuilt catalog contains primary data, so derived indexes can be rebuilt by their normal maintenance paths.
+`rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256` protects an independently exported repair base for epoch-zero local storage.
+Stop all users of the original store and move a trusted export of its current block outside the serving storage root before installing it.
+Supply the export's parent of `v06` as `EXPORTED_STORAGE` and use the original `REPLICA_LOG`.
+RTDB checks both checkpoint publications, the exported table blocks and primary file inventory, and the replica boundary.
+RTDB synchronizes the exported files and their directory entries before installing the bound.
+Keep the detached export and original local journal available.
+The native block collector preserves root catalogs, per-table block metadata, and offloaded replica payloads from the retained block onward, including after restart.
+Export and retain a newer current block in the same journal to advance the bound and allow collection of older files.
+An old target remains usable for `repair-checkpoint` while the active retention bound covers its interval.
 `compactor` opens the database catalog, follows replica progress, performs deterministic compaction and publishes results through the source log.
 It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
 A separate writer must apply its source-log notifications before jobs are acknowledged.

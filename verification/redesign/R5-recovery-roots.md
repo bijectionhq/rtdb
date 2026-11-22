@@ -64,7 +64,13 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
   It verifies the checkpoint publications and base table inventories, replays resolved writes into independent primary storage, and publishes a detached checkpoint with a new digest.
   The native regression takes the base from a snapshot export and removes its original primary inventory and the source's L0 files.
   It restarts from the rebuilt checkpoint and resumes writes in a fresh log epoch.
-  The online reset and automatic L0 collection still need an independently held known-good root and journal suffix available through replacement and activation.
+- `retain-repair-base` installs a separately exported current local checkpoint as a durable block collection bound.
+  Its journal already retains synced records; the bound protects checkpoint metadata and offloaded replica payloads in the original store.
+  Anchor installation and each block-file removal serialize on the local storage gate.
+  The collector synchronizes the anchor before acting on a newer bound.
+  Advancing the anchor makes older checkpoint files and payloads eligible under block retention.
+  The archive owner keeps the detached primary copy available.
+  Online reset and automatic L0 collection also need that recovery obligation to survive repair activation and apply at every collection entry point.
 
 ## Handoff notes
 
@@ -79,6 +85,18 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - **Native:** crash during compaction and during reset, then recover from a root plus the log suffix; collect superseded L0 files and recover again; trim the log below the root and recover.
 - **TLA+ / Apalache:** extend `InstalledCheckpoint.tla` and `ResidenceRetirement.tla` with roots as holds and L0 collection.
 - **Mutations that must fail:** releasing a root before its successor is complete; collecting an L0 file still in a live root's closure; trimming the log above a live root's first required record.
+
+## Local retention verification
+
+[RepairAnchorRetention](../lean/RepairAnchorRetention.lean) proves coverage for arbitrary file identities and finite schedules of publication, head advance, anchor replacement, selection, removal, and restart.
+The model assumes durable publication and a monotone serving head.
+The native installer checks the exact current head and export before publishing the anchor.
+The native collector holds the filesystem gate through the deletion decision and effect.
+[The bounded TLC model](../tla/RepairAnchorRetention.tla) includes three block indices and checkpoint catalog, table and offload files at each index.
+It distinguishes the visible anchor from its last durable value.
+The check explores 5,766 states and rejects late admission of an older cut, removal without the anchor check, an acknowledged anchor lost on restart, and removal based on an unsynchronized successor.
+It reaches physical removal of an older offload after advancing the anchor and restarting.
+The native regression runs the automatic collector, repairs to an older target using its real offloaded transaction, and observes removal after anchoring a newer export.
 
 ## Source retention through copy completion
 

@@ -115,6 +115,21 @@ fn compactor_reset_requires_database_and_preserves_dry_run_configuration() {
 }
 
 #[test]
+fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
+    let base = format!("9@{}", "a1".repeat(32));
+    let Command::RetainRepairBase { request, memory_bytes } = parse(&[
+        "retain-repair-base", "source", "logs/REPLICA_LOG", "export", &base, "--memory-limit", "104857600",
+    ]) else { panic!("expected repair base retention") };
+    assert_eq!(request.source_storage.to_str(), Some("source"));
+    assert_eq!(request.base_storage.to_str(), Some("export"));
+    assert_eq!(request.replica_log.to_str(), Some("logs/REPLICA_LOG"));
+    assert_eq!(request.base.block.0, 9);
+    assert_eq!(request.base.sha256, [0xa1; 32]);
+    assert_eq!(memory_bytes, 104857600);
+    assert!(cli::parse(["retain-repair-base", "source", "logs/REPLICA_LOG", &base].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
 fn checkpoint_repair_requires_exact_publication_receipts() {
     let base = format!("9@{}", "a1".repeat(32));
     let through = format!("23@{}", "C4".repeat(32));

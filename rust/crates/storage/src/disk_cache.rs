@@ -416,6 +416,12 @@ impl ObjectStore for DiskCachedStore {
         self.remote.delete(key).await?;
         self.cache.invalidate(&self.key(key)?)
     }
+    async fn collect_recovery_file(&self, key: &ObjectKey) -> rtdb_types::Result<()> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.remote.collect_recovery_file(key).await?;
+        self.cache.invalidate(&self.key(key)?).map_err(Into::into)
+    }
     async fn forget(&self, key: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; self.cache.invalidate(&self.key(key)?) }
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.copy(source, destination).await }
 }

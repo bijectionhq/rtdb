@@ -28,6 +28,19 @@ async fn run() -> Result<()> {
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
         Command::CompactorReset { options, database, dry_run } => reset_compactor(options, database, dry_run).await,
+        Command::RetainRepairBase { request, memory_bytes } => {
+            let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let installation = request.install(memory, &cancellation);
+            tokio::pin!(installation);
+            let boundary = tokio::select! {
+                result = &mut installation => result?,
+                _ = shutdown_signal() => { cancellation.cancel(); installation.await? }
+            };
+            write_report(std::io::stdout().lock(), |output| {
+                writeln!(output, "Retained repair base {} from replica boundary {}", request.base.block.0, boundary.0)
+            })
+        },
         Command::RepairCheckpoint { request, memory_bytes } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();

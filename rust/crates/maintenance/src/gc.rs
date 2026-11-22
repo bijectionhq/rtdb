@@ -291,7 +291,7 @@ impl BlockCollector {
         let results = stream::iter(objects).map(|object| async move {
             let _permit = deletes.acquire().await.map_err(crate::invalid)?;
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            self.store.delete(&object.key).await.map_err(crate::invalid)
+            self.store.collect_recovery_file(&object.key).await
         }).buffer_unordered(self.config.delete_parallelism).collect::<Vec<Result<()>>>().await;
         for result in results { result?; }
         Ok(())
