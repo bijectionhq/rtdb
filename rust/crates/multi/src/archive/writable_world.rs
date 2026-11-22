@@ -137,7 +137,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
     let (capture, suffix) = if capture.is_nil() {
-        if suffix.is_some() || fork.root.publication.is_none() || fork.previous.is_some()
+        if suffix.is_some() || fork.root.is_none() || fork.previous.is_some()
             || !matches!(fork.requested, rtdb_node::WorldClockRequest::Retained)
         {
             return Err(OwnedWorld::unavailable());

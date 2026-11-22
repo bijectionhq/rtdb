@@ -503,9 +503,10 @@ It takes the v1 fields through the fingerprint and requires mode 0, an all-zero 
 An all-zero capture and suffix select an already certified archive of that key from the placed host's Directory.
 Archive discovery does not create a capture or advance the original hold.
 Next come a big-endian u16 range witness count and its original 16-byte Root handle and 16-byte nonce pairs, then the big-endian u32 byte length and ordered Root fact groups.
-Root groups may supply point checks, inserts, replacements and deletes and must supply at least one fact write.
+Root groups may supply point checks, inserts, replacements and deletes.
 The remainder contains the common hosted groups with at least one check and optional checked replacements.
-The resolver writes the world registration, Root head, fact changes, hosted replacements and one shared immutable attempt marker in the same transaction.
+With Root fact writes, the resolver publishes the Root head in the same transaction as the world registration, facts, hosted replacements and one shared immutable attempt marker.
+Without Root fact writes, at least one hosted replacement is required and the Root head does not advance.
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 

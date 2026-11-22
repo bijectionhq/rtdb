@@ -1761,8 +1761,9 @@ impl Service {
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
             }
-            if writes.is_empty() { return Err(invalid("A Root publication requires fact writes")); }
-            root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes });
+            if !writes.is_empty() {
+                root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes });
+            }
             controls
         } else {
             groups
@@ -1776,6 +1777,9 @@ impl Service {
         let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, !publish_root)?;
         if !controls.iter().any(rtdb_tx::HostedControlWrite::is_check) {
             return Err(invalid("A retained fork requires a hosted ownership check"));
+        }
+        if publish_root && root.publication.is_none() && controls.iter().all(rtdb_tx::HostedControlWrite::is_check) {
+            return Err(invalid("A co-ordered fork requires Root facts or a hosted control replacement"));
         }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
@@ -1804,7 +1808,7 @@ impl Service {
             rtdb_node::OwnedWorldFork {
                 world: rtdb_types::Iid(*world), pin: rtdb_types::Iid(*pin),
                 previous: original.map(|world| world.parent_pin()), cut, requested, deadline,
-                attempt: attempt.into(), fingerprint: *fingerprint, controls, root,
+                attempt: attempt.into(), fingerprint: *fingerprint, controls, root: publish_root.then_some(root),
             },
         ).await.map_err(status)?;
         if registered.as_bytes() != world { return Err(unsupported()); }
