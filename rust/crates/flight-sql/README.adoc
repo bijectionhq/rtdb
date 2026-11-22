@@ -269,3 +269,9 @@ A null endpoint is open. Lower is inclusive and upper is exclusive in ascending 
 The exclusive `after` endpoint advances in the requested direction.
 For the next page, use the last returned row as `after` with the same held handle, path, bounds, and direction.
 The response uses the same covering schema and held time metadata as v1, with no record batch when the page is empty.
+
+`rtdb.owned.DeclareSearchPath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
+Its fields are `_id: Utf8` for the path name and `column: Utf8` for the stored clear-text column.
+The relation must already exist in the authenticated owner's namespace, and the column must contain only text or null.
+The FTS maintenance lane uses the private declaration to build the relation's search files.
+A successful declaration returns the same transaction-key Arrow row as Create.

@@ -76,7 +76,7 @@ pub async fn open_owned_path_catalog(
     catalog: &TableRef,
     path: Option<&str>,
 ) -> Result<Option<QueryCursor>> {
-    if !catalog.is_owned_path_catalog() {
+    if !catalog.is_owned_path_catalog() && !catalog.is_owned_search_catalog() {
         return Err(Anomaly::incorrect("rtdb.owned/path-catalog", "Expected an owned path catalog"));
     }
     let name = QualifiedTable { database: context.catalog.default_database().to_owned(), table: catalog.clone() };

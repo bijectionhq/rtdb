@@ -611,7 +611,9 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None),
             Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
-                self.declare_owned_path(relation, name, columns).await,
+                self.declare_owned_path(relation, name, columns, false).await,
+            Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
+                self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
@@ -660,17 +662,26 @@ impl<'a> OpenTransaction<'a> {
         self.execute_mutation(mutation, context, None, None).await
     }
     async fn declare_owned_path(
-        &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation, columns: &[String],
+        &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation,
+        columns: &[String], search: bool,
     ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let target = relation.table(owner);
-        let catalog = rtdb_types::OwnedRelation::path_catalog(owner);
+        let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
         let snapshot = self.snapshot()?;
         if !snapshot.contains_table(&target) {
             return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires an existing relation"));
         }
         let available = snapshot.column_names(&target);
-        if !(2..=16).contains(&columns.len())
+        if search {
+            let [column] = columns else { return Err(invalid_search_path_column()); };
+            let types = snapshot.column_types_for(&target, columns.iter().cloned());
+            if column.starts_with('_') || !available.contains(column)
+                || !types.get(column).is_some_and(rtdb_types::LogicalType::is_clear_search_text)
+            {
+                return Err(invalid_search_path_column());
+            }
+        } else if !(2..=16).contains(&columns.len())
             || columns.last().is_none_or(|column| column != "_id")
             || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
             || columns.iter().any(|column| !available.contains(column) || (column.starts_with('_') && column != "_id"))
@@ -945,6 +956,10 @@ async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
 
 fn insert_exists() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document")
+}
+
+fn invalid_search_path_column() -> Anomaly {
+    Anomaly::incorrect("rtdb.owned/search-column", "Owned search requires one stored clear-text UTF-8 column")
 }
 
 fn no_owned_principal() -> Anomaly {

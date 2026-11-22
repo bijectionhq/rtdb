@@ -144,6 +144,53 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() {
+    use rtdb_types::{OwnedRelation, StructFields};
+
+    let mut options = options();
+    options.owned_relations = true;
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("owned-search-docs").unwrap();
+    let path = OwnedRelation::new("owned-body").unwrap();
+    let documents = rtdb_tx::Documents::new((0..20).map(|id| StructFields::from([
+        ("_id".into(), Value::I64(id)),
+        ("body".into(), Value::Utf8("an invoice".into())),
+        ("secret".into(), Value::Binary(vec![7, 9])),
+    ])).collect(), node.memory()).unwrap();
+    let insert = TxOp::OwnedInsertDocs { relation: relation.clone(), documents, valid_from: Some(Timestamp(0)), valid_to: None };
+    assert!(session.state_mut().execute_tx(vec![insert], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let declare = |column: &str| TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: column.into() };
+    let rejected = session.state_mut().execute_tx(vec![declare("secret")], AutonomousTxOptions::default()).await.unwrap();
+    assert!(!rejected.committed());
+    let accepted = session.state_mut().execute_tx(vec![declare("body")], AutonomousTxOptions::default()).await.unwrap();
+    assert!(accepted.committed(), "{:?}", accepted.error());
+    let private_catalog = OwnedRelation::search_catalog("xtdb");
+    let direct = format!("SELECT _id FROM {}.\"{}\"", private_catalog.schema, private_catalog.table);
+    assert!(session.query_sql(&direct, vec![]).await.is_err());
+
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let catalog = database.trie_catalog();
+    let table = relation.table("xtdb");
+    let settled: Vec<_> = catalog.current_tries(&table).into_iter().filter(|trie| trie.key.level() > 0).collect();
+    assert!(!settled.is_empty(), "compaction produced no settled owned trie");
+    assert!(settled.iter().all(|trie| trie.artefacts.iter().any(|record| {
+        record.kind() == "search" && record.definition_id().starts_with("owned-body~a")
+            && record.definition_version() == accepted.tx_key().tx_id.0
+    })));
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
 struct Counting { inner: rtdb_search::SearchAccelerator, narrowed: std::sync::atomic::AtomicUsize }
 #[async_trait]
 impl rtdb_query::ScanAccelerator for Counting {

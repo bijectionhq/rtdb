@@ -124,11 +124,8 @@ async fn owned_definitions(
     let mut definitions = Vec::new();
     for table in owned_catalogs {
         if let Some(cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &table, None).await? {
-            let owner = &table.table[..64];
             for definition in read_definitions(cursor).await? {
-                if !definition.table.supported_owned_name() || definition.table.is_owned_path_catalog()
-                    || !definition.table.table.starts_with(owner)
-                {
+                if !table.owns_path_target(&definition.table) {
                     return Err(format_error("Owned path definition refers to another owner or an internal catalog"));
                 }
                 definitions.push(definition);
