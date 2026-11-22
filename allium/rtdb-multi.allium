@@ -1419,6 +1419,8 @@ rule WritePackAndManifest {
     -- A small flush writes one pack: every table's trie data, metadata and catalog delta, with a footer index, read by range.
     -- A large flush may write one pack per table.
     -- A versioned pack ties every ranged member read to the physical publication of its index.
+    -- Recovery may verify multiple members against one fresh observation of their containing pack.
+    -- A moved pack is verified using the index of its destination publication.
     -- A reference transferred into a fork opens the copied pack through its own index and provider version.
     -- The boot object inlines catalogs, schema and the top trie levels, up to boot_inline_limit.
     -- A flush waiter returns a holder-lost result when its holding is deposed.

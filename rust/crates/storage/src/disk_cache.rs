@@ -321,6 +321,9 @@ impl ObjectStore for DiskCachedStore {
     async fn observe_head(&self, key: &ObjectKey) -> Result<crate::ObjectObservation<StoredObject>> {
         self.remote.observe_head(key).await
     }
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> Result<std::collections::BTreeMap<ObjectKey, crate::ObjectObservation<StoredObject>>> {
+        self.remote.observe_heads(keys).await
+    }
     async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<crate::ObjectObservation<Bytes>> {
         self.remote.observe_range(key, range).await
     }

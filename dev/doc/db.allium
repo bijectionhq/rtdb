@@ -671,6 +671,7 @@ config {
 -- A hosted serving receipt also commits to the exact replay inventory, including each logical length and any observed physical version.
 -- Its digest covers the root, replica epoch and first required replica offset.
 -- The admitted store recomputes the inventory commitment from fresh storage observations before opening the cut.
+-- A single fresh observation can cover members that share an admitted pack.
 -- A hosted prefix trim requires a checkpoint with this commitment.
 -- Startup, cursor recovery and checkpoint suffix admission check the same persisted prefix authorization.
 -- An unpublished archived suffix retains its journal interval while its pin is active.

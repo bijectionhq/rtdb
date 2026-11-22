@@ -933,6 +933,11 @@ impl ObjectStore for EncryptingStore {
         let observed = self.inner.observe_head(key).await?;
         Ok(ObjectObservation { value: plain(observed.value), version: observed.version })
     }
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        let mut observed = self.inner.observe_heads(keys).await?;
+        for head in observed.values_mut() { head.value.size = head.value.size.saturating_sub(SEALED_OVERHEAD); }
+        Ok(observed)
+    }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.inner.retirement_version(key).await
     }
@@ -1121,6 +1126,9 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 impl ObjectStore for GarbageStore {
     async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         self.inner.observe_head(key).await
+    }
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        self.inner.observe_heads(keys).await
     }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.index_pages.as_ref().map(|pages| pages as &dyn IndexPageLifecycle)

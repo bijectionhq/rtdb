@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore, StoredObject};
 use rtdb_types::PhysicalObjectVersion;
@@ -120,11 +121,23 @@ fn require_same_version(pack: &ObjectKey, expected: Option<&PhysicalObjectVersio
     Ok(())
 }
 
+fn require_pack_relocation(pack: &ObjectKey, expected: Option<&PhysicalObjectVersion>, observed: Option<&PhysicalObjectVersion>) -> rtdb_storage::Result<()> {
+    let copied = expected.zip(observed).is_some_and(|(prior, current)| {
+        prior.namespace == current.namespace && prior.key != current.key
+    });
+    if copied { Ok(()) } else { require_same_version(pack, expected, observed) }
+}
+
 #[derive(Clone)]
 struct LocatedEntry {
     pack: ObjectKey,
     entry: PackEntry,
     version: Option<Arc<PhysicalObjectVersion>>,
+}
+
+enum HeadRequest {
+    MemberPack(ObjectKey, Vec<(ObjectKey, LocatedEntry)>),
+    Loose(ObjectKey),
 }
 
 enum PackRead { Full, Exact(usize), Range(Range<u64>) }
@@ -289,15 +302,37 @@ impl PackingStore {
             return Ok(location);
         }
         // A fork's reference can move to its own copy. A new version at the same physical path cannot inherit the admitted index.
-        let copied = location.version.as_deref().zip(head.version.as_ref()).is_some_and(|(prior, current)| {
-            prior.namespace == current.namespace && prior.key != current.key
-        });
-        if !copied {
-            require_same_version(&location.pack, location.version.as_deref(), head.version.as_ref())?;
-        }
+        require_pack_relocation(&location.pack, location.version.as_deref(), head.version.as_ref())?;
         let mut publication = read_pack_index(self.inner.as_ref(), &location.pack, head).await?;
         let entry = publication.value.entries.remove(object.as_str()).ok_or_else(|| Error::MissingObject(object.to_string()))?;
         Ok(LocatedEntry { pack: location.pack.clone(), entry, version: publication.version.map(Arc::new) })
+    }
+
+    async fn observe_members(&self, pack: &ObjectKey, members: Vec<(ObjectKey, LocatedEntry)>)
+    -> rtdb_storage::Result<Vec<(ObjectKey, ObjectObservation<StoredObject>)>> {
+        let head = self.inner.observe_head(pack).await?;
+        let mut relocated = false;
+        for (_, location) in &members {
+            if location.version.as_deref() == head.version.as_ref() { continue; }
+            require_pack_relocation(pack, location.version.as_deref(), head.version.as_ref())?;
+            relocated = true;
+        }
+        let size = head.value.size;
+        let version = head.version.clone();
+        let index = if relocated { Some(read_pack_index(self.inner.as_ref(), pack, head).await?.value) } else { None };
+        members.into_iter().map(|(object, location)| {
+            let entry = match &index {
+                Some(index) => index.entries.get(object.as_str()).ok_or_else(|| Error::MissingObject(object.to_string()))?,
+                None => &location.entry,
+            };
+            if !entry_fits(entry.offset, entry.length, size) {
+                return Err(Error::Task(format!("The stored pack {pack} does not cover {object}")));
+            }
+            Ok((object.clone(), ObjectObservation {
+                value: StoredObject { key: object.clone(), size: entry.length },
+                version: version.clone(),
+            }))
+        }).collect()
     }
 
     /// Observes the owned publication named by this member's admitted index.
@@ -365,6 +400,31 @@ impl ObjectStore for PackingStore {
             value: StoredObject { key: object.clone(), size: location.entry.length },
             version: location.version.as_deref().cloned(),
         })
+    }
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        let mut requests = Vec::new();
+        let mut packs: BTreeMap<ObjectKey, Vec<_>> = BTreeMap::new();
+        for object in keys {
+            if let Some(location) = self.locate(object).await? {
+                packs.entry(location.pack.clone()).or_default().push((object.clone(), location));
+            } else {
+                requests.push(HeadRequest::Loose(object.clone()));
+            }
+        }
+        requests.extend(packs.into_iter().map(|(pack, members)| HeadRequest::MemberPack(pack, members)));
+        let batches = futures::stream::iter(requests).map(|request| async move {
+            match request {
+                HeadRequest::MemberPack(pack, members) => self.observe_members(&pack, members).await,
+                HeadRequest::Loose(key) => {
+                    let head = self.inner.observe_head(&key).await?;
+                    Ok(vec![(key, head)])
+                }
+            }
+        }).buffer_unordered(16);
+        futures::pin_mut!(batches);
+        let mut observed = BTreeMap::new();
+        while let Some(batch) = batches.try_next().await? { observed.extend(batch); }
+        Ok(observed)
     }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
         if packed(key.as_str()) { return Ok(None); }
@@ -469,6 +529,7 @@ pub(crate) mod tests {
         versions: Mutex<BTreeMap<ObjectKey, usize>>,
         ranges: std::sync::atomic::AtomicUsize,
         change_on_range: std::sync::atomic::AtomicUsize,
+        heads: std::sync::atomic::AtomicUsize,
         pub(crate) change_on_exact: std::sync::atomic::AtomicBool,
     }
 
@@ -486,6 +547,7 @@ pub(crate) mod tests {
     impl ObjectStore for VersionedPacks {
         async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
         async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
+            self.heads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(ObjectObservation { value: self.head(key).await?, version: Some(self.version(key)) })
         }
         async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
@@ -519,6 +581,33 @@ pub(crate) mod tests {
         async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { unreachable!("tests publish bytes") }
         async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.inner.list(directory).await }
         async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+    }
+
+    #[tokio::test]
+    async fn fresh_heads_share_one_pack_observation_and_refuse_a_replaced_version() {
+        let raw = Arc::new(VersionedPacks::default());
+        let store = PackingStore::open(raw.clone(), PackDiscovery::List).await.unwrap();
+        let root = catalog_key(0).unwrap();
+        let table = object("tables/t/blocks/b00.binpb");
+        let loose = object("tables/t/data/l01-rc-b00.arrow");
+        store.put(&table, Bytes::from_static(b"table")).await.unwrap();
+        store.put(&root, Bytes::from_static(b"root")).await.unwrap();
+        store.put(&loose, Bytes::from_static(b"loose")).await.unwrap();
+        let requests = [table.clone(), root.clone(), loose.clone()];
+        let prior = raw.heads.load(std::sync::atomic::Ordering::Relaxed);
+        let heads = store.observe_heads(&requests).await.unwrap();
+        assert_eq!(raw.heads.load(std::sync::atomic::Ordering::Relaxed) - prior, 2);
+        assert_eq!(heads[&table].value.size, 5);
+        assert_eq!(heads[&root].value.size, 4);
+        assert_eq!(heads[&table].version, heads[&root].version);
+        assert_ne!(heads[&root].version, heads[&loose].version);
+
+        let pack = object(&block_pack(root.as_str()));
+        let bytes = raw.get(&pack).await.unwrap();
+        raw.delete(&pack).await.unwrap();
+        assert!(matches!(store.observe_heads(&requests).await, Err(Error::MissingObject(_))));
+        raw.put(&pack, bytes).await.unwrap();
+        assert!(matches!(store.observe_heads(&requests).await, Err(Error::Remote { .. })));
     }
 
     #[tokio::test]

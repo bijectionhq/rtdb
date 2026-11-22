@@ -313,6 +313,18 @@ impl ObjectStore for CheckpointStore {
         Ok(metadata)
     }
 
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        let (archived, serving): (Vec<_>, Vec<_>) = keys.iter().cloned()
+            .partition(|key| self.archive.objects.contains_key(key));
+        let mut observed = self.serving.observe_heads(&serving).await?;
+        let archived = futures::stream::iter(archived.into_iter().map(|key| async move {
+            Ok::<_, Error>((key.clone(), self.observe_head(&key).await?))
+        })).buffer_unordered(16);
+        futures::pin_mut!(archived);
+        while let Some((key, head)) = archived.try_next().await? { observed.insert(key, head); }
+        Ok(observed)
+    }
+
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         let Some(object) = self.archive.objects.get(key) else {
             return self.serving.observe_fresh_exact(key, length).await;
@@ -743,21 +755,27 @@ pub(crate) async fn recovery_manifest_sha256(
     let path = key(&block_key(BlockIndex(checkpoint.block))?)?;
     let catalog = BlockCatalog::decode(&store.get_fresh(&path).await?)?;
     verify_cut(&catalog, checkpoint, epoch)?;
-    let closure = catalog_objects(store, &catalog, CheckpointContents::Replay).await?;
+    let mut closure = catalog_objects(store, &catalog, CheckpointContents::Replay).await?.into_iter();
 
     let mut manifest = ring::digest::Context::new(&ring::digest::SHA256);
     manifest.update(b"rtdb/recovery-manifest/v1\0");
     manifest.update(&encode(&(root, epoch.0, first_required))?);
-    let observations = futures::stream::iter(closure.into_iter().map(|(name, digest)| async move {
-        let source = CheckpointCopySource::observe(store, name, digest).await?;
-        if digest.is_some() {
-            source.read(store).await?;
-        }
-        encode(&(source.name.as_str(), source.logical_bytes as u64, source.version, digest))
-    })).buffered(16);
-    futures::pin_mut!(observations);
-    while let Some(member) = observations.try_next().await? {
-        manifest.update(&member);
+    loop {
+        let batch = closure.by_ref().take(256).collect::<Vec<_>>();
+        if batch.is_empty() { break; }
+        let names = batch.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+        let mut heads = store.observe_heads(&names).await?;
+        let observations = futures::stream::iter(batch.into_iter().map(|(name, digest)| {
+            let head = heads.remove(&name);
+            async move {
+                let head = head.ok_or_else(|| inconsistent("A recovery inventory member has no storage observation"))?;
+                let source = CheckpointCopySource::from_head(name, digest, head)?;
+                if digest.is_some() { source.read(store).await?; }
+                encode(&(source.name.as_str(), source.logical_bytes as u64, source.version, digest))
+            }
+        })).buffered(16);
+        futures::pin_mut!(observations);
+        while let Some(member) = observations.try_next().await? { manifest.update(&member); }
     }
     Ok(manifest.finish().as_ref().try_into().expect("SHA-256 has 32 bytes"))
 }
@@ -779,6 +797,11 @@ impl CheckpointCopySource {
         metadata_digest: Option<[u8; 32]>,
     ) -> Result<Self> {
         let observed = store.observe_head(&name).await?;
+        Self::from_head(name, metadata_digest, observed)
+    }
+
+    fn from_head(name: ObjectKey, metadata_digest: Option<[u8; 32]>, observed: ObjectObservation<StoredObject>) -> Result<Self> {
+        if observed.value.key != name { return Err(inconsistent("Checkpoint storage observed a different logical member")); }
         let logical_bytes = usize::try_from(observed.value.size)
             .map_err(|_| unavailable("Checkpoint object exceeds addressable length"))?;
         Ok(Self { name, logical_bytes, version: observed.version, metadata_digest })

@@ -135,6 +135,12 @@ pub trait ObjectStore: Send + Sync {
     async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
         Ok(ObjectObservation { value: self.head_fresh(key).await?, version: None })
     }
+    /// Observes every logical key from storage, sharing evidence for members of one physical publication.
+    async fn observe_heads(&self, keys: &[ObjectKey]) -> Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
+        let mut observed = BTreeMap::new();
+        for key in keys { observed.insert(key.clone(), self.observe_head(key).await?); }
+        Ok(observed)
+    }
     /// Observes the current provider version of a loose object owned by this store.
     /// Missing, inherited, packed or unversioned objects return no evidence.
     async fn retirement_version(&self, _key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
