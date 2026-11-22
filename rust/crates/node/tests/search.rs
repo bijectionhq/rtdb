@@ -203,11 +203,11 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
     assert_eq!(corpus.frequencies["invoice"], 19);
     assert_eq!(corpus.frequencies["paid"], 1);
     let partitions = [(relation, path)];
-    let hits = held.ranked_search(&partitions, "invoice", 2).await.unwrap();
+    let (hits, _) = held.ranked_search(&partitions, "invoice", 2, false).await.unwrap();
     assert_eq!(hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
         [rtdb_types::EntityId::Integer(1), rtdb_types::EntityId::Integer(2)]);
     assert_eq!(hits[0].score.to_bits(), hits[1].score.to_bits());
-    let paid = held.ranked_search(&partitions, "paid", 2).await.unwrap();
+    let (paid, _) = held.ranked_search(&partitions, "paid", 2, false).await.unwrap();
     assert_eq!(paid[0].id, rtdb_types::EntityId::Integer(0));
     drop(held);
     node.shutdown();

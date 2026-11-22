@@ -1113,13 +1113,21 @@ impl OwnedReadSession {
     /// Ranks a covered clear-text query at this read's cut and validates its full identities.
     #[cfg(feature = "search")]
     pub async fn ranked_search(
-        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str, limit: usize,
-    ) -> Result<Vec<rtdb_search::OwnedSearchHit>> {
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str, limit: usize, observe: bool,
+    ) -> Result<(Vec<rtdb_search::OwnedSearchHit>, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let work = rtdb_search::owned_ranked(Arc::clone(&self.context), &self.owner, partitions, query, limit);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
+        let mut witnesses = Vec::with_capacity(partitions.len());
+        if observe {
+            for (relation, _) in partitions {
+                if let Some(witness) = self.relation_witness(relation)? {
+                    witnesses.push(witness);
+                }
+            }
+        }
         self.check()?;
-        Ok(hits)
+        Ok((hits, witnesses))
     }
 
     /// Reads one covered page from the named ordered path at this held cut.
