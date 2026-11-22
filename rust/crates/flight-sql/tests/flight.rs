@@ -305,6 +305,40 @@ async fn prepared_query_projects_nullable_and_boolean_arrow_parameters() {
 }
 
 #[tokio::test]
+async fn prepared_query_computes_arrow_arguments_and_returns_a_nested_column() {
+    use rtdb_columnar::{copy_array, read_value, to_field};
+    use rtdb_types::Value;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let prepared = client.prepare("SELECT $1 + $2 AS total, $3 AS payload", None).await;
+    let command = CommandPreparedStatementQuery { prepared_statement_handle: prepared.prepared_statement_handle };
+    let payload = Value::List(vec![Value::Utf8("kept".into()), Value::I64(7)]);
+    let ty = payload.logical_type();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("left", DataType::Int64, false),
+        Field::new("right", DataType::Int64, false),
+        to_field("doc", &ty).unwrap(),
+    ]));
+    let arguments = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![20])),
+        Arc::new(Int64Array::from(vec![22])),
+        copy_array(&ty, std::slice::from_ref(&payload)).unwrap(),
+    ]).unwrap();
+    client.upload(command.clone(), vec![arguments]).await;
+    let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+    let request = client.request(descriptor);
+    let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+    let batches = client.redeem(&info).await;
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema().as_ref(), &info.try_decode_schema().unwrap());
+    assert_eq!(integer(&batches[0], 0, 0), 42);
+    assert_eq!(read_value(batches[0].schema_ref().field(1), batches[0].column(1).as_ref(), 0).unwrap(), payload);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn prepared_updates_coalesce_compatible_parameter_layouts_across_uploads() {
     use rtdb_types::Value;
 

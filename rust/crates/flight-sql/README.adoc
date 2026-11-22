@@ -103,6 +103,8 @@ Prepared query binding retains the first Arrow batch.
 Flight SQL derives the result schema from the bound Arrow fields and encodes the batch when issuing a query ticket.
 Ticket redemption validates the argument batch and reads the first parameter row when opening the query.
 A pure projection of compatible bound parameters stays in Arrow.
+Compatible nested lists, fixed-size lists, and structs are projected as Arrow columns.
+Supported addition, subtraction, and multiplication read integer and floating-point arguments through the query engine's Arrow projection kernel.
 For a batch with multiple rows, it copies the selected first row without retaining the rest of the batch.
 It reuses compatible buffers and normalizes Boolean padding and masked cells when copying is needed.
 An update submitted through `GetFlightInfo` passes the bound batch to the transaction path as Arrow arguments.

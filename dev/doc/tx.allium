@@ -20,6 +20,8 @@
 -- Logical relation cursors expose the root operator's pages as separate batches.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
+-- Compatible list and struct parameters stay in Arrow through that projection.
+-- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- When a bound Boolean or nullable buffer needs normalization, the projection copies selected cells within Arrow.
 -- Compatible nested fields and union legs retain their value buffers when encoding changes their declared layout.
 -- Columnar UNION ALL preserves duplicates and forwards batches in input order.
