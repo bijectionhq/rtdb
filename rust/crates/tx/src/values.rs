@@ -5,7 +5,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
 use rtdb_columnar::{ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 mod arguments;
 mod union;
@@ -157,24 +157,42 @@ pub struct ArrowDocuments {
     source_bytes: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum IngestMode { External, Mutation }
+
 impl ArrowDocuments {
     pub fn from_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         Self::from_record_batch(batch.batch(), memory)
     }
 
-    /// Admits scalar uploads whose Arrow layout can reproduce the row encoder's source representation.
+    /// Admits uploads whose Arrow layout can reproduce the row encoder's source representation.
     pub fn from_ingest_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let batch = batch.batch();
+        if batch.schema_ref().index_of("_id").is_err() { return Ok(None); }
+        Self::from_canonical_ingest(batch, IngestMode::External, memory)
+    }
+
+    pub(crate) fn from_canonical_ingest(batch: &RecordBatch, mode: IngestMode, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let schema = batch.schema();
-        if batch.num_rows() == 0 || schema.index_of("_id").is_err() || !schema.fields().iter().zip(batch.columns()).all(|(field, column)| {
-            plain_scalar_field(field) && field.data_type() != &DataType::Null && column.is_valid(0)
-        }) {
-            return Ok(None);
-        }
+        if batch.num_rows() == 0 || batch.num_columns() == 0 { return Ok(None); }
         let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
-        let columns = (0..batch.num_columns()).map(|index| canonical_argument_column(&[batch], index, memory))
-            .collect::<Result<Vec<_>>>()?;
-        let canonical = RecordBatch::try_new(schema, columns)
+        let types = schema.fields().iter().zip(batch.columns()).map(|(field, column)| ingest_type(field, column.as_ref(), mode))
+            .collect::<Result<Option<Vec<_>>>>()?;
+        let Some(types) = types else { return Ok(None); };
+        let mut fields = Vec::with_capacity(types.len());
+        let mut columns = Vec::with_capacity(types.len());
+        for (index, (field, ty)) in schema.fields().iter().zip(types).enumerate() {
+            let array = match mode {
+                IngestMode::External => canonical_argument_column(&[batch], index, memory)?,
+                IngestMode::Mutation => copy_argument_column(&[batch], index, memory)?,
+            };
+            let Some(array) = normalized_document_array(&array, memory, true)? else { return Ok(None); };
+            let target = rtdb_columnar::to_field(field.name(), &ty)?;
+            let Ok(array) = ingest_layout(array, target.data_type()) else { return Ok(None); };
+            fields.push(target);
+            columns.push(array);
+        }
+        let canonical = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
         Self::from_record_batch(&canonical, memory)
     }
@@ -292,6 +310,60 @@ impl ArrowDocuments {
     }
 }
 
+fn ingest_type(field: &arrow_schema::Field, array: &dyn Array, mode: IngestMode) -> Result<Option<LogicalType>> {
+    if !field.metadata().is_empty() || array.is_empty() || !array.is_valid(0) { return Ok(None); }
+    Ok(Some(match field.data_type() {
+        DataType::Struct(fields) if array.null_count() == 0 => {
+            let array = array.as_struct();
+            let mut types = StructFields::new();
+            for (field, column) in fields.iter().zip(array.columns()) {
+                let Some(ty) = ingest_type(field, column.as_ref(), mode)? else { return Ok(None); };
+                if types.insert(field.name().clone(), ty).is_some() { return Ok(None); }
+            }
+            LogicalType::Struct(types)
+        }
+        DataType::List(field) if array.null_count() == 0 => {
+            let array = array.as_list::<i32>();
+            let offsets = array.value_offsets();
+            let start = offsets[0] as usize;
+            let end = offsets[array.len()] as usize;
+            let values = array.values().slice(start, end - start);
+            let Some(element) = ingest_type(field, values.as_ref(), mode)? else { return Ok(None); };
+            LogicalType::List { kind: ListKind::List, element: Box::new(element) }
+        }
+        DataType::FixedSizeList(field, width) if array.null_count() == 0 => {
+            let array = array.as_fixed_size_list();
+            let Some(element) = ingest_type(field, array.values().as_ref(), mode)? else { return Ok(None); };
+            LogicalType::List { kind: ListKind::FixedSizeList(*width), element: Box::new(element) }
+        }
+        ty if ty != &DataType::Null && plain_scalar_field(field)
+            && (matches!(mode, IngestMode::External) || !matches!(ty, DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64)) => {
+            rtdb_columnar::execution_field_type(&field.clone().with_nullable(array.null_count() != 0))?
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn ingest_layout(array: ArrayRef, target: &DataType) -> Result<ArrayRef> {
+    if array.data_type() == target { return Ok(array); }
+    let data = array.to_data();
+    let layout_error = |message| Anomaly::incorrect("rtdb.tx/document-schema", message);
+    let children = match target {
+        DataType::Struct(fields) => fields.iter().collect::<Vec<_>>(),
+        DataType::List(field) | DataType::FixedSizeList(field, _) => vec![field],
+        _ => return Err(layout_error("Ingest leaf disagrees with its canonical layout")),
+    };
+    if children.len() != data.child_data().len() {
+        return Err(layout_error("Ingest children disagree with their canonical layout"));
+    }
+    let children = children.into_iter().zip(data.child_data()).map(|(child, data)| {
+        ingest_layout(arrow_array::make_array(data.clone()), child.data_type()).map(|array| array.to_data())
+    }).collect::<Result<Vec<_>>>()?;
+    let data = data.into_builder().data_type(target.clone()).child_data(children).build()
+        .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+    Ok(arrow_array::make_array(data))
+}
+
 pub(crate) fn contains_fixed_size_list(layout: &DataType) -> bool {
     match layout {
         DataType::FixedSizeList(..) => true,
@@ -349,17 +421,28 @@ pub(crate) fn canonical_argument_column(pages: &[&RecordBatch], index: usize, me
     if let [page] = pages {
         let array = page.column(index);
         let nulls = array.logical_null_count();
-        if nulls == array.len() || (nulls == 0 && array.data_type() != &DataType::Boolean) {
+        if nulls == array.len() || (nulls == 0 && !matches!(array.data_type(), DataType::Boolean | DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(..))) {
             return Ok(Arc::clone(array));
         }
     }
+    copy_argument_column(pages, index, memory)
+}
 
+fn copy_argument_column(pages: &[&RecordBatch], index: usize, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
     // The source body digest includes the payload beneath null slots and the padding on a Boolean vector.
     let rows = pages.iter().try_fold(0usize, |rows, page| rows.checked_add(page.num_rows()).ok_or_else(overflow))?;
     let base = rows.checked_mul(64).and_then(|bytes| bytes.checked_add(pages.len().checked_mul(64)?))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
     let bound = pages.iter().try_fold(base, |bytes, page| {
-        bytes.checked_add(page.column(index).get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
+        let column = page.column(index);
+        let field = page.schema_ref().field(index);
+        if !matches!(field.data_type(), DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(..)) {
+            return bytes.checked_add(column.get_array_memory_size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow);
+        }
+        let bytes = bytes.checked_add(field.size().checked_mul(8).ok_or_else(overflow)?).ok_or_else(overflow)?;
+        (0..page.num_rows()).try_fold(bytes, |bytes, row| {
+            bytes.checked_add(rtdb_columnar::estimate_copy_cell_bytes(field, column.as_ref(), row)?).ok_or_else(overflow)
+        })
     })?;
     let mut reservation = memory.reserve(bound)?;
     let mut cells = Vec::with_capacity(rows);
@@ -422,6 +505,84 @@ fn scalar_ingest_batches_match_row_encoded_source_bytes() {
 
     let null_first = OwnedBatch::new(batch.batch().slice(1, 1), &memory).unwrap();
     assert!(ArrowDocuments::from_ingest_batch(&null_first, &memory).unwrap().is_none());
+}
+
+#[test]
+fn nested_ingest_reserves_child_positions_before_gathering() {
+    use arrow_array::Int64Array;
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::Field;
+
+    let count = 1 << 16;
+    let children = StructArray::try_new_with_length(Fields::empty(), Vec::new(), None, count).unwrap();
+    let list = ListArray::new(Arc::new(Field::new("item", children.data_type().clone(), false)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, count as i32])), Arc::new(children), None);
+    let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("items", list.data_type().clone(), false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1])), Arc::new(list)]).unwrap();
+    let source = MemoryBudget::new(1 << 24);
+    let batch = OwnedBatch::new(batch, &source).unwrap();
+    let constrained = MemoryBudget::new(1 << 20);
+    let error = ArrowDocuments::from_ingest_batch(&batch, &constrained).unwrap_err();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(constrained.used_bytes(), 0);
+}
+
+#[test]
+fn nested_ingest_does_not_charge_the_unselected_list_prefix() {
+    use arrow_array::Int64Array;
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::Field;
+
+    let prefix = 1 << 20;
+    let source = MemoryBudget::new(1 << 25);
+    let memory = MemoryBudget::new(1 << 20);
+    let list = ListArray::new(Arc::new(Field::new("item", DataType::Int64, false)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![prefix, prefix + 1])),
+        Arc::new(Int64Array::from(vec![7; prefix as usize + 1])), None);
+    let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("items", list.data_type().clone(), false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1])), Arc::new(list)]).unwrap();
+    let batch = OwnedBatch::new(batch, &source).unwrap();
+    let output = ArrowDocuments::from_ingest_batch(&batch, &memory).unwrap().expect("Expected the selected list");
+    assert_eq!(output.array().column(1).as_list::<i32>().values().len(), 1);
+}
+
+#[test]
+fn nested_ingest_compacts_list_offsets_and_uses_the_canonical_source_layout() {
+    use arrow_array::{BooleanArray, FixedSizeListArray, Int64Array, UInt64Array};
+    use arrow_buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
+    use arrow_schema::Field;
+
+    let memory = MemoryBudget::new(1 << 24);
+    let list = ListArray::new(
+        Arc::new(Field::new("item", DataType::UInt64, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![1i32, 3, 4])),
+        Arc::new(UInt64Array::from(vec![0, 2, u64::MAX, 7, 99])),
+        None,
+    );
+    let bits = BooleanBuffer::new(Buffer::from_vec(vec![0xff_u8]), 0, 4);
+    let flags = FixedSizeListArray::new(
+        Arc::new(Field::new("flag", DataType::Boolean, true)), 2,
+        Arc::new(BooleanArray::new(bits, None)), None,
+    );
+    let record = StructArray::new(
+        Fields::from(vec![Field::new("values", list.data_type().clone(), true), Field::new("flags", flags.data_type().clone(), true)]),
+        vec![Arc::new(list), Arc::new(flags)],
+        None,
+    );
+    let fields = vec![Field::new("_id", DataType::Int64, false), Field::new("record", record.data_type().clone(), true)];
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(record)]).unwrap();
+    let batch = OwnedBatch::new(batch, &memory).unwrap();
+    let docs = ArrowDocuments::from_ingest_batch(&batch, &memory).unwrap().expect("Expected compatible nested Arrow documents");
+    let rows = (0..batch.batch().num_rows()).map(|row| {
+        batch.batch().schema_ref().fields().iter().zip(batch.batch().columns()).map(|(field, column)| {
+            (field.name().clone(), rtdb_columnar::read_execution_value(field, column.as_ref(), row).unwrap())
+        }).collect()
+    }).collect();
+    let table = TableRef::new("public", "docs");
+    let row_operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, &memory).unwrap(), valid_from: None, valid_to: None };
+    let arrow_operation = TxOp::PutArrowDocs { table, documents: docs };
+    let encoded = |operation| crate::SourceTransaction::new(vec![operation], SubmitOptions::default(), &memory).unwrap().encode().unwrap();
+    assert_eq!(encoded(arrow_operation).as_slice(), encoded(row_operation).as_slice());
 }
 
 fn normalized_document_array(array: &ArrayRef, memory: &Arc<MemoryBudget>, normalize_unions: bool) -> Result<Option<ArrayRef>> {

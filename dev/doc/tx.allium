@@ -64,7 +64,7 @@
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
 --      COPY (query) TO STDOUT WITH (FORMAT 'arrow-stream') uses the connection's read basis.
 --      The connection streams Arrow IPC in CopyData frames and ends it before the CopyDone and command completion frames.
---      COPY FROM STDIN with an Arrow format submits compatible scalar document columns as Arrow batches.
+--      COPY FROM STDIN with an Arrow format submits compatible document columns as Arrow batches.
 --      Without an explicit transaction, each input batch commits separately.
 --      A pgwire connection through an RTDB Multi gateway keeps its connection await token after an idle backend replacement.
 --      An implicit basis on a linearizable subscriber follows the installed replica prefix confirmed by its active loglet.

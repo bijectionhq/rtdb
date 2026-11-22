@@ -1773,6 +1773,27 @@ mod tests {
     }
 
     #[test]
+    fn row_copy_builds_an_arrow_record_from_compatible_nested_vectors() {
+        let memory = MemoryBudget::new(1 << 20);
+        let logical = LogicalType::List { kind: ListKind::List, element: Box::new(LogicalType::Scalar(ScalarType::Binary)) };
+        let array = rtdb_columnar::copy_array(&logical, &[Value::List(vec![Value::Binary(vec![7; 1 << 16])])]).unwrap();
+        let mut output = field(0, ScalarType::I64);
+        output.data_type = logical.clone();
+        let schema = Schema::new(vec![output.clone()]).unwrap();
+        let column = Column::Arrow {
+            array: Arc::clone(&array), field: Arc::new(rtdb_columnar::to_field(&output.name, &logical).unwrap()), logical: Some(logical),
+        };
+        let batch = ColumnBatch::settled(vec![column], 1, memory.reserve(0).unwrap()).unwrap();
+        let expression = Expr::RowCopy(vec![output]);
+        let bound = projection::bound(&expression, &schema, &batch).unwrap().unwrap();
+        assert!(bound < 1 << 17);
+        let result = projection::column(&expression, &schema, &batch, rtdb_expr::Parameters::Values(&[])).unwrap().unwrap();
+        let Column::Arrow { array: record, .. } = result else { panic!("Expected columnar record"); };
+        let record = record.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(Arc::ptr_eq(record.column(0), &array));
+    }
+
+    #[test]
     fn ordered_gather_interleaves_arrow_batches_and_preserves_missing_cells() {
         let memory = MemoryBudget::new(1 << 20);
         let page = |columns| ColumnBatch::settled(columns, 2, memory.reserve(0).unwrap()).unwrap();
@@ -2401,6 +2422,16 @@ pub(crate) mod projection {
             Expr::Call { name, args, .. } if name == "coalesce" => return coalesce_bound(args, schema, batch),
             Expr::Cast { expr: inner, target: CastTarget::Fixed(_) } => return bound(inner, schema, batch),
             Expr::RowCopy(fields) => {
+                if row_copy_compatible(fields, schema, batch) {
+                    let bytes = fields.iter().try_fold(4096usize, |bytes, field| {
+                        let position = schema.position(field.id).expect("Row-copy field is in the input");
+                        let retained = batch.columns[position].retained_bytes()?;
+                        let metadata = field.data_type.retained_bytes()?.checked_add(field.name.len())
+                            .and_then(|bytes| bytes.checked_mul(8)).ok_or_else(super::size_error)?;
+                        bytes.checked_add(retained).and_then(|bytes| bytes.checked_add(metadata)).ok_or_else(super::size_error)
+                    })?;
+                    return Ok(Some(bytes));
+                }
                 let mut total = per_row(std::mem::size_of::<Value>().checked_add(256).ok_or_else(super::size_error)?)?;
                 for field in fields {
                     let Some(position) = schema.position(field.id) else { return Ok(None) };
@@ -2526,22 +2557,34 @@ pub(crate) mod projection {
         Ok(Some(Column::Values(values)))
     }
 
-    /// A record of input columns copied cell for cell: one struct array where every field is a plain scalar column,
-    /// otherwise one record per row, admitted as the evaluator's output is.
+    fn row_copy_compatible(fields: &[rtdb_plan::Field], schema: &Schema, batch: &ColumnBatch) -> bool {
+        !fields.is_empty() && fields.iter().enumerate().all(|(index, field)| {
+            if fields[..index].iter().any(|other| other.name == field.name) { return false; }
+            let Some(column) = schema.position(field.id).and_then(|position| batch.columns.get(position)) else { return false; };
+            let Column::Arrow { array, field: source, logical: Some(logical) } = column else { return false; };
+            let scalar = super::plain_scalar(logical).is_some() && super::scalar_layout(array.data_type()) && array.data_type() != &DataType::Null;
+            let nested = matches!(array.data_type(), DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(..))
+                && super::stable_read_layout(logical, source)
+                && rtdb_columnar::to_field(source.name(), logical).is_ok_and(|field| field.data_type() == array.data_type());
+            scalar || nested
+        })
+    }
+
     fn row_copy(fields: &[rtdb_plan::Field], schema: &Schema, batch: &ColumnBatch) -> Result<Option<Column>> {
         let Some(columns) = fields.iter().map(|field| schema.position(field.id).map(|position| &batch.columns[position])).collect::<Option<Vec<_>>>() else { return Ok(None) };
-        let unique = fields.iter().enumerate().all(|(index, field)| fields[..index].iter().all(|other| other.name != field.name));
-        let mut children = Vec::with_capacity(fields.len());
-        let mut types = StructFields::new();
-        for (field, column) in fields.iter().zip(&columns) {
-            let Column::Arrow { array, field: source, logical: Some(logical) } = column else { break };
-            if !unique || super::plain_scalar(logical).is_none() || !super::scalar_layout(array.data_type()) || array.data_type() == &DataType::Null { break; }
-            let child = ArrowField::new(field.name.clone(), array.data_type().clone(), source.is_nullable() || array.null_count() != 0).with_metadata(source.metadata().clone());
-            children.push((Arc::new(child), Arc::clone(array)));
-            types.insert(field.name.clone(), logical.clone());
-        }
-        let (arrow_fields, arrays): (Vec<_>, Vec<_>) = children.into_iter().unzip();
-        if !fields.is_empty() && arrays.len() == fields.len() && let Ok(array) = StructArray::try_new(arrow_fields.into(), arrays, None) {
+        if row_copy_compatible(fields, schema, batch) {
+            let mut arrow_fields = Vec::with_capacity(fields.len());
+            let mut arrays = Vec::with_capacity(fields.len());
+            let mut types = StructFields::new();
+            for (field, column) in fields.iter().zip(&columns) {
+                let Column::Arrow { array, field: source, logical: Some(logical) } = column else { unreachable!("Column layout was checked"); };
+                let child = ArrowField::new(field.name.clone(), array.data_type().clone(), source.is_nullable() || array.null_count() != 0)
+                    .with_metadata(source.metadata().clone());
+                arrow_fields.push(Arc::new(child));
+                arrays.push(Arc::clone(array));
+                types.insert(field.name.clone(), logical.clone());
+            }
+            let Ok(array) = StructArray::try_new(arrow_fields.into(), arrays, None) else { return Ok(None); };
             let field = Arc::new(ArrowField::new("value", array.data_type().clone(), false));
             return Ok(Some(Column::Arrow { array: Arc::new(array), field, logical: Some(LogicalType::Struct(types)) }));
         }
