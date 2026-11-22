@@ -524,7 +524,12 @@ The protected marker also stores the replay-present sweep floor.
 Trusted native maintenance may nominate one exact created identity and a cutoff granted by its replay-retention authority.
 The ordered source requires superuser maintenance authority, a deadline, the original creation revision and expiry at or before the permitted cutoff.
 It orders an all-history retirement event, the monotone sweep floor and an `expired` journal touch together.
-Retries of retired identities publish no duplicate touch. Hosted candidate enumeration and archive-media collection remain separate.
+Retries of retired identities publish no duplicate touch.
+`rtdb.owned.NominateHeldExpiry.v1` is a placed hosted-control read over the original 16-byte hold and the ordinary typed point request.
+It seals one exact expired identity from the installed lifetime at held present and returns one Arrow row containing `nomination`, `created_micros`, and `expiry_micros`.
+The sealed token expires with the hold and binds the complete identity, owning principal, relation, placement epoch, and original transaction key.
+The action carries no removal authority, replay cutoff, or document payload.
+Hosted sweep dispatch still requires the logical replay-retention owner. Archive-media collection remains separate.
 Leading-key, historical, and world ranges and historical or world counts remain unavailable for these relations.
 Other read coordinates and paths refuse this declaration.
 

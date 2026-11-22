@@ -186,6 +186,7 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const READ_HELD_WORLD_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldChanges.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
+pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
 pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_IDENTITY_MORE: &str = "rtdb.owned.identity_more";
@@ -1480,6 +1481,24 @@ impl Service {
             Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores, ordinals]).map_err(arrow)?)
         };
         self.owned_point_reply(&schema, output.as_ref(), present, valid, None)
+    }
+
+    pub(crate) async fn nominate_held_expiry_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry nomination needs the original held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let (nomination, created, expiry) = held.snapshot.nominate_expired_identity(&relation, &id, scope).await.map_err(status)?;
+        let batch = RecordBatch::try_from_iter([
+            ("nomination", Arc::new(StringArray::from(vec![nomination])) as ArrayRef),
+            ("created_micros", Arc::new(Int64Array::from(vec![created.0])) as ArrayRef),
+            ("expiry_micros", Arc::new(Int64Array::from(vec![expiry.0])) as ArrayRef),
+        ]).map_err(arrow)?;
+        let present = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)?;
+        held.snapshot.check_live_point_relation(&relation).map_err(status)?;
+        Ok(reply)
     }
 
     pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
