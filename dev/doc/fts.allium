@@ -16,6 +16,7 @@
 -- Owned corpus statistics require published files covering all sources of the held cut.
 -- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
 -- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
+-- Retained-world ranking checks for a placed world host before decoding the Flight request.
 -- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
 -- Public SQL search definitions remain scoped to the public catalog.
 --

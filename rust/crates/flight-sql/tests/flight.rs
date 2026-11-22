@@ -842,7 +842,9 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.CloseWorldRead.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
-        assert_eq!(refused.code(), tonic::Code::Unimplemented);
+        assert_eq!(refused.code(), tonic::Code::Unimplemented, "{action}");
     }
+    let refused = client.action("rtdb.owned.SearchHeldWorld.v1", Bytes::new()).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unimplemented);
     running.stop().await;
 }

@@ -1221,7 +1221,7 @@ impl Service {
     }
 
     pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
         let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world search valid instant"))?;
         let valid = Timestamp(i64::from_be_bytes(*valid));
