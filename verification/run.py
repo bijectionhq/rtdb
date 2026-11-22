@@ -2686,6 +2686,8 @@ TLA_CASES = (
      ("INVARIANT AnchorCoversPrefix", "INVARIANT NeverConfirmsWhileAnotherObservationIsPending"),
      "NeverConfirmsWhileAnotherObservationIsPending"),
     ("TrieGcRetry", "trie-gc-retry", None, None),
+    ("TrieGcRetry", "trie-gc-retry-omit-hold",
+     ('Mutation = "none"', 'Mutation = "omit_hold"'), "RetainsWhileHeld"),
     ("TrieGcRetry", "trie-gc-only-block-signals",
      ('Mutation = "none"', 'Mutation = "only_block_signals"'), "temporal:EventuallyReapsWhenDrained"),
     ("TrieGcRetry", "trie-gc-retry-witness",
@@ -4396,6 +4398,25 @@ def verify_native_trie_gc_retry(args, source):
     print("rust-trie-gc-retry: idle successor finished the installed retirement, and omitting retries was rejected")
 
 
+def verify_native_reader_drain(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    cases = (
+        ("rust-remote-response-drain", ["-p", "rtdb-storage", "--features", "remote", "--test", "remote_lifetime"],
+         "cancelled_remote_body_keeps_its_catalog_owner_until_the_provider_drains"),
+        ("rust-hosted-trie-retirement-drain", ["-p", "rtdb-multi", "--lib"],
+         "store::exact_retirement::tests::the_exact_reaper_resumes_an_installed_trie_release_after_its_reader_drains"),
+    )
+    for case, selection, test in cases:
+        result = run_case(["cargo", "test", "--locked", *selection, test, "--", "--exact"],
+                          source / "rust", args.evidence, case, env)
+        if result.returncode or f"{test} ... ok" not in result.stdout:
+            raise ValueError(f"{case}: provider drain and retirement did not follow the retained catalog")
+        print(f"{case}: native replay passed")
+
+
 def verify_native_transaction_catalog_hold(args, source):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
@@ -5491,6 +5512,7 @@ def main():
             verify_native_current_catalog(args, source)
             verify_native_collector_turnover(args, source)
             verify_native_trie_gc_retry(args, source)
+            verify_native_reader_drain(args, source)
             verify_native_transaction_catalog_hold(args, source)
             verify_native_exact_marker(args, source)
             verify_compaction_publication_versions(args, source)

@@ -25,7 +25,7 @@ Retry ==
 
 Collect ==
     /\ wake /\ wake' = FALSE
-    /\ queued' = (queued \/ ~held)
+    /\ queued' = (queued \/ ~held \/ Mutation = "omit_hold")
     /\ UNCHANGED <<term, held, erased>>
 
 Reap ==

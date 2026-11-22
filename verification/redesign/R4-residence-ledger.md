@@ -72,7 +72,11 @@ The model assumes an advancing published frontier and monotone installed prefix 
 The proof of the synchronous decisions relies on the caller supplying the clock sample and installed position from that same authority.
 Query capture, delegated fragments and membership queries check the lease at admission, including paths that can answer from memory. The native query fixture exercises the admission refusal and offline acceptance. The [collector turnover study](../tla/CollectorTurnover.tla) checks that a fresh trie selection in a successor term starts its own lease window and protects bounded in-flight I/O.
 The native fixture observes the successor retain the files through that interval and reclaim them at expiry.
-Full term handoff, outstanding provider drain and settlement of deferred releases remain open.
+A native replay elects a successor on a shared journal while the predecessor holds an open cursor and observes the successor finish the installed retirement without another write.
+The remote adapter fixture retains the catalog owner through cancellation until the provider finishes consuming the response body.
+The hosted fixture passes an installed receipt through the directory floor, release queue and exact reaper and resumes after a lost provider reply.
+The fixtures establish the local filesystem ledger and the hosted versioned release path with controlled providers.
+A coordinated hold through hosted term placement and live-provider qualification remain open.
 
 ## Handoff notes
 

@@ -103,3 +103,31 @@ The catalog owner remains alive and the drained region refuses new provider requ
 Finishing the stream releases the owner and completes the drain.
 All 15 remote lifetime tests passed against the production adapter and a controlled in-memory provider.
 The fixture exercises the provider response stream in-process.
+
+== W1 · Idle successor and exact hosted retirement
+
+The two-node fixture uses the production replication and maintenance drivers, a shared in-memory journal and a shared filesystem catalog ledger.
+The first node remains serving while the second wins a later replica term.
+The successor compacts the trie and installs its retirement receipt while the predecessor still owns the earlier cursor.
+Both files remain readable and the cursor returns its original result.
+The cursor then closes and the successor completes the receipt with no further transaction or block.
+The native control disables the idle retry and fails at the completion assertion.
+
+The term supervisor signals native trie collection on entry and while idle when automatic collection is enabled.
+The retry period is the reader lease, bounded between 100 milliseconds and 60 seconds.
+The eight-state link:../tla/TrieGcRetry.tla[retry model] checks held-reader protection and progress for an installed receipt after the successor starts and the hold drains.
+Its liveness property assumes fair retry, collection and reaper actions.
+The controls reject release while held and the absence of an idle retry.
+A reachability case observes a completed successor retirement.
+
+The exact hosted fixture retains an actual directory catalog ticket through cancellation of the waiter.
+The installed receipt stays below the collection floor until the admitted work finishes.
+The floor then advances and the serving store queues the exact publication for the production reaper.
+The versioned in-memory provider erases the target and drops the response.
+The next pass settles that same retirement and its marker.
+The fixture covers the reaper through its provider interface.
+
+At e256dbe553 the full Multi library, Node library and native Node suites passed 166, 23 and 122 cases.
+The native baseline and the idle-retry control are retained under retention-e2e-native-nekk6250/.
+The model commands and logs are under retention-e2e-tlc-izsdl7tu/.
+The full remote lifetime suite passed its 15 cases.
