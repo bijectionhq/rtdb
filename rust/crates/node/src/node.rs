@@ -1216,6 +1216,14 @@ impl OwnedReadSession {
         if let Some(scope) = &self.historical {
             self.check_point_purge_floor(relation, id, scope.system_time).await?;
         }
+        if valid_at.is_none() && relation.world().is_none()
+            && rtdb_query::read_owned_relation_schema(Arc::clone(&self.context), &self.owner, relation)
+                .await?.is_some_and(|(schema, _)| schema.requires_bounded_period())
+        {
+            return Err(rtdb_types::Anomaly::incorrect(
+                "rtdb.owned/validity-policy", "A bounded-period point requires an explicit valid instant",
+            ));
+        }
         let lifetime = self.lifetime_point_duration(relation).await?;
         if lifetime.is_some() && valid_at.is_some_and(|valid| valid != self.present.system_time) {
             return Err(lifetime_read_unavailable());

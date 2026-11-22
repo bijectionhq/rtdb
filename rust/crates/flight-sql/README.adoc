@@ -248,6 +248,10 @@ Each listed cell must be null or undefined in the incoming batch.
 Unknown payload fields are refused.
 The `explicit` validity policy is the default and accepts supported mutation validity metadata.
 The `acceptance` policy begins every Root put or delete at its ordered system time with an open valid end and rejects explicit endpoints.
+The `bounded_period` policy requires two finite, strictly ordered mutation endpoints on each Root assertion or retraction.
+An ordered transaction may affect one period per complete key. Separate ordered replacements may overlap at the same key, with the latest accepted assertion winning at each valid instant.
+Use the same complete entity key across periods and pass the requested valid instant to the held point action.
+World mutation and acceptance-only unique occupancy remain unavailable for this policy.
 Relations without a declaration continue to infer their schema.
 
 === Holding one owned read cut

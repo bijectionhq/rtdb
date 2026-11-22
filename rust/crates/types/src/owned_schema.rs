@@ -23,6 +23,7 @@ enum Validity {
     #[default]
     Explicit,
     Acceptance,
+    BoundedPeriod,
 }
 
 impl Validity {
@@ -217,6 +218,28 @@ impl OwnedSchema {
     }
 
     pub fn lifetime_micros(&self) -> Option<i64> { self.0.lifetime_micros }
+
+    pub fn requires_bounded_period(&self) -> bool {
+        self.0.validity == Validity::BoundedPeriod
+    }
+
+    pub fn require_root_write_period(
+        &self, from: Option<crate::Timestamp>, to: Option<crate::Timestamp>,
+    ) -> Result<()> {
+        if self.requires_bounded_period() {
+            if !matches!((from, to), (Some(from), Some(to))
+                if crate::Timestamp::MIN < from && from < to && to < crate::Timestamp::MAX)
+            {
+                return Err(Anomaly::incorrect(
+                    "rtdb.owned/validity-policy",
+                    "This root relation requires an explicit finite nonempty valid period",
+                ));
+            }
+            Ok(())
+        } else {
+            self.require_write_validity(from.is_some() || to.is_some())
+        }
+    }
 
     pub fn require_write_validity(&self, explicit: bool) -> Result<()> {
         if explicit && self.0.validity == Validity::Acceptance {
