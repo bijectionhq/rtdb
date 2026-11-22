@@ -741,6 +741,12 @@ impl ColumnBatch {
         Ok(Self { columns, len: page.len(), reservation, appended: Vec::new() })
     }
 
+    pub(crate) fn empty_with_width(width: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bytes = width.checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let reservation = memory.reserve(bytes)?;
+        Self::settled((0..width).map(|_| Column::Values(Vec::new())).collect(), 0, reservation)
+    }
+
     /// Materialises every row, admitting the page's rows together before any is built.
     /// Rows share the page's charge, which ends when the last of them drops.
     pub fn rows(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedPage> { self.rows_admitting(memory, false) }
@@ -1976,15 +1982,18 @@ impl BatchCursor for RetainedBatchState {
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
-pub(crate) fn batches_from_pages(pages: crate::pages::BoxPageCursor, memory: Arc<MemoryBudget>) -> BoxBatchCursor {
-    Box::new(BatchesFromPages { pages, memory })
+pub(crate) fn batches_from_pages(pages: crate::pages::BoxPageCursor, width: usize, memory: Arc<MemoryBudget>) -> BoxBatchCursor {
+    Box::new(BatchesFromPages { pages, width, memory })
 }
-struct BatchesFromPages { pages: crate::pages::BoxPageCursor, memory: Arc<MemoryBudget> }
+struct BatchesFromPages { pages: crate::pages::BoxPageCursor, width: usize, memory: Arc<MemoryBudget> }
 
 #[async_trait::async_trait]
 impl BatchCursor for BatchesFromPages {
     async fn next_batch(&mut self) -> Result<Option<ColumnBatch>> {
-        self.pages.next_page().await?.map(|page| ColumnBatch::from_page(&page, &self.memory)).transpose()
+        self.pages.next_page().await?.map(|page| {
+            if page.len() == 0 { ColumnBatch::empty_with_width(self.width, &self.memory) }
+            else { ColumnBatch::from_page(&page, &self.memory) }
+        }).transpose()
     }
 }
 

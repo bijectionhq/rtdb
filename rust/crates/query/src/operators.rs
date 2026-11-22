@@ -258,11 +258,13 @@ async fn build_batches_at(
             let build = runtime.child(1)?;
             let probe = runtime.child(0)?;
             let Some(keys) = crate::mark::batch_membership_keys(probe.schema(), build.schema(), comparison) else { return Ok(None); };
-            if crate::join::rows_at_most(dependent, &execution)? > execution.context.options.join_build_rows { return Ok(None); }
+            if !crate::mark::bounded_membership_input(dependent)
+                || crate::join::rows_at_most(dependent, &execution)? > execution.context.options.join_build_rows { return Ok(None); }
             let Some(probe_projected) = batch_shape(&probe, output)? else { return Ok(None); };
-            let Some((build, build_projected)) = build_batch_input(build, execution.child(1), None, output).await? else { return Ok(None); };
+            if batch_shape(&build, output)?.is_none() { return Ok(None); }
+            let build = crate::batch_join::ProbeInput { runtime: build, execution: execution.child(1), pushdowns: None, output };
             let probe = crate::batch_join::ProbeInput { runtime: probe, execution: execution.child(0), pushdowns: None, output };
-            let mark = crate::mark::BatchMembership::new(build, build_projected, probe, probe_projected, keys, execution)?;
+            let mark = crate::mark::BatchMembership::new(build, probe, probe_projected, keys, execution)?;
             Ok(Some((Box::new(mark), probe_projected)))
         }
         RelationNode::Mark { arguments, condition, comparison, .. } if output == BatchOutput::Arrow && !arguments.is_empty() => {
@@ -407,9 +409,10 @@ async fn build_materialized_columns(runtime: &Arc<EmittedRelation>, binding: &Ar
     let scope = crate::materialized::BindingScope::columns(Arc::clone(binding), input, schema, execution.bindings.clone(), Arc::clone(context))?;
     let mut body_execution = execution.child(1);
     body_execution.bindings = Some(Arc::clone(&scope));
+    let width = body.schema().len();
     let (body, projected) = match build_batch_input(Arc::clone(&body), body_execution.clone(), None, BatchOutput::Arrow).await? {
         Some(input) => input,
-        None => (crate::columnar::batches_from_pages(build_pages(body, body_execution).await?, Arc::clone(&context.memory)), false),
+        None => (crate::columnar::batches_from_pages(build_pages(body, body_execution).await?, width, Arc::clone(&context.memory)), false),
     };
     let cursor = Box::new(crate::materialized::ColumnLetCursor { body, _binding: scope });
     let cursor = crate::columnar::retain_batch_state(cursor, reservation);
@@ -1540,7 +1543,7 @@ impl BatchApplyPlan {
         match build_batches(Arc::clone(&runtime), execution.clone(), None).await? {
             Some((batches, _)) => Ok(batches),
             None => Ok(crate::columnar::batches_from_pages(
-                build_pages(runtime, execution).await?, Arc::clone(&self.execution.context.memory),
+                build_pages(runtime, execution).await?, self.dependent.schema().len(), Arc::clone(&self.execution.context.memory),
             )),
         }
     }

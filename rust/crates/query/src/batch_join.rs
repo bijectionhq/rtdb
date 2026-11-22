@@ -330,7 +330,7 @@ impl Spec {
             Some((batches, projected)) if projected == self.projected => batches,
             _ if probe.output == BatchOutput::Arrow => {
                 let pages = DeferredInput::new(probe.runtime, probe.execution, crate::inspection::Constraints::default(), pushdowns).open_pages(None).await?;
-                crate::columnar::batches_from_pages(pages, Arc::clone(&memory))
+                crate::columnar::batches_from_pages(pages, layout.right.original.len(), Arc::clone(&memory))
             }
             _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches")),
         };

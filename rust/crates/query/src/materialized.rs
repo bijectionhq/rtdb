@@ -6,7 +6,7 @@ use rtdb_types::{Anomaly, Result, Value};
 use tokio::sync::Mutex;
 use crate::{
     QueryContext,
-    columnar::{BatchCursor, BatchRows, BoxBatchCursor, Column, ColumnBatch, poll_nested_batch},
+    columnar::{BatchCursor, BatchRows, BoxBatchCursor, ColumnBatch, poll_nested_batch},
     invalid,
     pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor},
     spill::{SpillFile, SpillReader, SpillWriter},
@@ -48,7 +48,7 @@ impl BindingScope {
             Replay::Columns(file) => Ok(Box::new(ColumnReference::new(&file, context, definition.relation.schema().len())?)),
             Replay::Rows(file) => {
                 let pages = Box::new(Reference { reader: file.reader(Arc::clone(&context.memory))?, context: Arc::clone(context) });
-                Ok(crate::columnar::batches_from_pages(pages, Arc::clone(&context.memory)))
+                Ok(crate::columnar::batches_from_pages(pages, definition.relation.schema().len(), Arc::clone(&context.memory)))
             }
         }
     }
@@ -188,11 +188,7 @@ impl BatchCursor for ColumnReference {
                 ColumnBatch::from_owned(batch).map(Some)
             }
             Some(0) => {
-                let bytes = self.width.checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256))
-                    .ok_or_else(|| invalid("materialized-page", "Materialized column container size overflow"))?;
-                let reservation = self.context.memory.reserve(bytes)?;
-                let columns = (0..self.width).map(|_| Column::Values(Vec::new())).collect();
-                ColumnBatch::settled(columns, 0, reservation).map(Some)
+                ColumnBatch::empty_with_width(self.width, &self.context.memory).map(Some)
             }
             Some(count) => {
                 let page = read_rows(&mut self.reader, count, &self.context)?;
@@ -221,6 +217,7 @@ impl BatchCursor for ColumnLetCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columnar::Column;
     use std::{collections::{BTreeMap, VecDeque}, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
     use rtdb_columnar::MemoryBudget;
     use rtdb_plan::{ColumnId, Expr, Field, Relation, RelationNode, Schema};
@@ -278,6 +275,13 @@ mod tests {
             let scope = BindingScope::new(Arc::clone(&definition),input,None,Arc::clone(&context)).unwrap();
             let mut first = scope.open(&definition).await.unwrap();assert_eq!(polls.load(Ordering::SeqCst),4);
             let mut second = scope.open(&definition).await.unwrap();assert_eq!(polls.load(Ordering::SeqCst),4);
+            let mut columns = scope.open_columns(&definition).await.unwrap();
+            assert_eq!(columns.next_batch().await.unwrap().unwrap().len, 2);
+            let empty = columns.next_batch().await.unwrap().unwrap();
+            assert_eq!((empty.len, empty.columns.len()), (0, 1));
+            assert_eq!(columns.next_batch().await.unwrap().unwrap().columns[0].value(0).unwrap(), Value::I64(3));
+            assert!(columns.next_batch().await.unwrap().is_none());
+            drop((columns, empty));
             drop(scope);
             for cursor in [&mut first,&mut second] {
                 let mut page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),2);

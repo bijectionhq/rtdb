@@ -1,12 +1,11 @@
 use std::sync::Arc;
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp,Expr,Schema};
-#[cfg(test)]
-use rtdb_plan::Relation;
+use rtdb_plan::{BinaryOp,Expr,Relation,RelationNode,Schema,TemporalFilter};
 use rtdb_types::{LogicalType,Result,Value};
 use crate::{context::Execution,cursor::OwnedRow,invalid,operators::{DeferredInput,build_pages},pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor},runtime_schema::EmittedRelation,join_key::JoinLayout,join_storage::{BuildAccumulator,BuildInput,BuildTable,HashedPage,PartitionSpool,hash_values}};
 use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, poll_nested_batch};
 use crate::set_keys::BatchKeyIndex;
+use crate::batch_join::ProbeInput;
 
 enum State {
     Build { probe: DeferredInput,runtime: Arc<EmittedRelation> },
@@ -84,30 +83,48 @@ pub(crate) fn batch_membership_keys(input: &Schema, dependent: &Schema, comparis
         .then_some((probe, candidate))
 }
 
+pub(crate) fn bounded_membership_input(input: &Relation) -> bool {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || match input.node() {
+        RelationNode::Scan(scan) => matches!(scan.valid_time, TemporalFilter::Default | TemporalFilter::At(_)),
+        RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
+        | RelationNode::Filter { input, .. } => bounded_membership_input(input),
+        RelationNode::Values { .. } => true,
+        _ => false,
+    })
+}
+
 // The build retains only its comparison column. The probe keeps its whole batch and adds a Boolean vector.
 pub(crate) struct BatchMembership {
-    build: Option<BoxBatchCursor>,
+    build: Option<ProbeInput>,
     probe: MembershipProbe,
     index: BatchKeyIndex,
     keys: (usize, usize),
-    build_projected: bool,
     probe_projected: bool,
     facts: CandidateFacts,
     execution: Execution,
 }
 
 enum MembershipProbe {
-    Unopened(crate::batch_join::ProbeInput),
+    Unopened(ProbeInput),
     Open(BoxBatchCursor),
     Done,
 }
 
 impl BatchMembership {
-    pub fn new(build: BoxBatchCursor, build_projected: bool, probe: crate::batch_join::ProbeInput,
+    pub fn new(build: ProbeInput, probe: ProbeInput,
         probe_projected: bool, keys: (usize, usize), execution: Execution) -> Result<Self> {
         let index = BatchKeyIndex::vector_hashing(&execution.context)?;
-        Ok(Self { build: Some(build), probe: MembershipProbe::Unopened(probe), index, keys, build_projected, probe_projected,
+        Ok(Self { build: Some(build), probe: MembershipProbe::Unopened(probe), index, keys, probe_projected,
             facts: CandidateFacts { empty: true, null: false, nested: false }, execution })
+    }
+
+    async fn open(input: ProbeInput) -> Result<(BoxBatchCursor, bool)> {
+        let batches = crate::operators::build_batch_input(Arc::clone(&input.runtime), input.execution.clone(), input.pushdowns, input.output).await?;
+        if let Some(batches) = batches { return Ok(batches); }
+        let memory = Arc::clone(&input.execution.context.memory);
+        let width = input.runtime.schema().len();
+        let pages = build_pages(input.runtime, input.execution).await?;
+        Ok((crate::columnar::batches_from_pages(pages, width, memory), false))
     }
 
     fn is_null(column: &Column, row: usize, context: &crate::QueryContext) -> Result<bool> {
@@ -123,7 +140,8 @@ impl BatchCursor for BatchMembership {
         let context = &self.execution.context;
         let memory = &context.memory;
         let (probe_key, build_key) = self.keys;
-        if let Some(mut build) = self.build.take() {
+        if let Some(build) = self.build.take() {
+            let (mut build, projected) = Self::open(build).await?;
             while let Some(batch) = poll_nested_batch(build.as_mut()).await? {
                 batch.validate_readable(context)?;
                 if batch.len == 0 { continue; }
@@ -132,19 +150,16 @@ impl BatchCursor for BatchMembership {
                     context.check_cancelled_at(row)?;
                     self.facts.null |= Self::is_null(&batch.columns[build_key], row, context)?;
                 }
-                let key = batch.key_projection(&[build_key], memory)?;
-                self.index.build(key, self.build_projected, context)?;
+                let _rows = memory.reserve(batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
+                    .ok_or_else(|| invalid("mark-size", "Membership key positions exceed addressable memory"))?)?;
+                let rows = (0..batch.len).map(|row| (0, row)).collect::<Vec<_>>();
+                let key = batch.key_projection(&[build_key], memory)?.compact_group_keys(&rows, memory)?;
+                self.index.build(key, projected, context)?;
             }
         }
         let state = std::mem::replace(&mut self.probe, MembershipProbe::Done);
         let mut probe = match state {
-            MembershipProbe::Unopened(probe) => {
-                let input = crate::operators::build_batch_input(Arc::clone(&probe.runtime), probe.execution.clone(), probe.pushdowns, probe.output).await?;
-                match input {
-                    Some((cursor, _)) => cursor,
-                    None => crate::columnar::batches_from_pages(build_pages(probe.runtime, probe.execution).await?, Arc::clone(memory)),
-                }
-            }
+            MembershipProbe::Unopened(probe) => Self::open(probe).await?.0,
             MembershipProbe::Open(probe) => probe,
             MembershipProbe::Done => return Ok(None),
         };

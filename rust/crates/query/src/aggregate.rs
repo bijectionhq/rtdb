@@ -360,7 +360,12 @@ impl BatchCursor for AggregateCursor {
             let batch = ColumnBatch::settled(vec![], 1, self.execution.context.memory.reserve(256)?)?;
             (batch, columns, _reservation)
         } else {
-            let Some(ReducedGroups { keys, columns, _reservation }) = self.reduce_grouped(input).await? else { return Ok(None); };
+            let Some(ReducedGroups { keys, columns, _reservation }) = self.reduce_grouped(input).await? else {
+                for (aggregate, types) in self.aggregates.iter().zip(self.runtime.aggregates()?) {
+                    validate_collection_order(aggregate, types, &self.schema, &self.execution)?;
+                }
+                return Ok(None);
+            };
             (keys, columns, _reservation)
         };
         let context = &self.execution.context;
@@ -371,7 +376,8 @@ impl BatchCursor for AggregateCursor {
             let mut states = match column.accumulation {
                 Accumulation::Scalar(states) => states,
                 Accumulation::Vectors(vectors) => {
-                    let (column, charge) = vectors.finish(batch.len, aggregate, field, types, &self.execution).await?;
+                    validate_collection_order(aggregate, types, &self.schema, &self.execution)?;
+                    let (column, charge) = vectors.finish(batch.len, aggregate, field, &self.execution).await?;
                     batch.append_column(column, charge, &context.memory)?;
                     continue;
                 }
@@ -708,17 +714,7 @@ impl AggregateColumn {
             }
             Accumulation::Vectors(_) => return Err(invalid("aggregate-input", "A row aggregate collected output vectors")),
             Accumulation::Collected(rows) => {
-                if matches!(aggregate.function,AggregateFunction::Percentile { .. }) {
-                    let declared = aggregate.argument.as_ref().map_or(LogicalType::Null,rtdb_plan::Expr::data_type);
-                    rtdb_expr::validate_order_type(&declared.join(&types.input))?;
-                }
-                if aggregate.function == AggregateFunction::ArrayAgg {
-                    let scope = execution.scope()?;
-                    for order in &aggregate.order_by {
-                        let ty = execution.expression_type(&scope,&order.expr,schema)?;
-                        rtdb_expr::validate_order_type(&ty)?;
-                    }
-                }
+                validate_collection_order(aggregate, types, schema, execution)?;
                 let present = rows.len() > 0;
                 let mut binder = Binder::after(schema)?;
                 let group_field = binder.field("_aggregate_group",None,LogicalType::Scalar(ScalarType::U64))?;
@@ -766,6 +762,20 @@ impl AggregateColumn {
         }
         Ok(())
     }
+}
+
+fn validate_collection_order(aggregate: &AggregateExpr, types: &AggregateTypes, schema: &Schema, execution: &Execution) -> Result<()> {
+    if matches!(aggregate.function, AggregateFunction::Percentile { .. }) {
+        let declared = aggregate.argument.as_ref().map_or(LogicalType::Null, rtdb_plan::Expr::data_type);
+        rtdb_expr::validate_order_type(&declared.join(&types.input))?;
+    }
+    if !aggregate.order_by.is_empty() {
+        let scope = execution.scope()?;
+        for order in &aggregate.order_by {
+            rtdb_expr::validate_order_type(&execution.expression_type(&scope, &order.expr, schema)?)?;
+        }
+    }
+    Ok(())
 }
 
 struct CollectionVectors {
@@ -820,11 +830,9 @@ impl CollectionVectors {
         Arc::get_mut(&mut self.reservation).expect("The list aggregate owns its result positions").grow_to(bytes)
     }
 
-    async fn finish(mut self, groups: usize, aggregate: &AggregateExpr, output: &rtdb_plan::Field, types: &AggregateTypes,
+    async fn finish(mut self, groups: usize, aggregate: &AggregateExpr, output: &rtdb_plan::Field,
         execution: &Execution) -> Result<(Column, Arc<rtdb_columnar::MemoryReservation>)> {
         if let AggregateFunction::Percentile { kind, fraction: PercentileFraction::Literal(fraction), descending } = aggregate.function {
-            let declared = aggregate.argument.as_ref().map_or(LogicalType::Null, rtdb_plan::Expr::data_type);
-            rtdb_expr::validate_order_type(&declared.join(&types.input))?;
             return self.percentiles(groups, kind, fraction, descending, output, execution).await;
         }
         if let Some(order) = self.order.take() {
@@ -955,8 +963,6 @@ impl CollectionOrder {
 
     async fn sort(self, input: CollectionVectors, groups: usize, order: &[rtdb_plan::SortExpr], execution: &Execution) -> Result<CollectionVectors> {
         use crate::{operators::project_sort_keys, scalar_key::ScalarKey, sort::batches::BatchSort};
-        let scope = execution.scope()?;
-        for key in order { rtdb_expr::validate_order_type(&execution.expression_type(&scope, &key.expr, &self.schema)?)?; }
         let context = &execution.context;
         let memory = &context.memory;
         let group = self.positions.len();
@@ -973,7 +979,7 @@ impl CollectionOrder {
         };
         let mut sorted = BatchSort::new(source, schema, order, execution.clone(), projected, 0, i64::MAX as u64)?;
         while let Some(batch) = sorted.next_batch().await? {
-            let _positions = memory.reserve(batch.len.checked_mul(std::mem::size_of::<(usize, usize)>())
+            let _positions = memory.reserve(batch.len.checked_mul(2 * std::mem::size_of::<(usize, usize)>())
                 .ok_or_else(|| invalid("aggregate-size", "Ordered list positions overflow"))?)?;
             let mut picks = Vec::with_capacity(batch.len);
             for row in 0..batch.len {
@@ -989,7 +995,11 @@ impl CollectionOrder {
                 };
                 if let Some(value) = value { picks.push((row, value as usize)); }
             }
-            output.collect(&batch, 0, picks.iter().copied(), groups, context)?;
+            if !picks.is_empty() {
+                let rows = picks.iter().map(|&(row, _)| (0, row)).collect::<Vec<_>>();
+                let arguments = batch.key_projection(&[0], memory)?.compact_group_keys(&rows, memory)?;
+                output.collect(&arguments, 0, picks.iter().enumerate().map(|(row, &(_, group))| (row, group)), groups, context)?;
+            }
         }
         Ok(output)
     }

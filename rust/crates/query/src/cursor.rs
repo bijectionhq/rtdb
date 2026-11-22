@@ -600,6 +600,7 @@ fn fills_row_batches(relation: &Relation) -> bool {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
             let row_batched = match relation.node() {
                 RelationNode::Values { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Aggregate { .. } => true,
+                RelationNode::Let { .. } => nested,
                 RelationNode::Join { left, right, kind, condition: Some(condition) } if *kind != JoinKind::Cross => nested
                     || !matches!(left.node(), RelationNode::Scan(_)) || !matches!(right.node(), RelationNode::Scan(_))
                     || !direct_join(left, right, condition),

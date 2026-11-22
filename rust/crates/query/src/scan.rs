@@ -2250,6 +2250,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn limit_zero_leaves_the_arrow_membership_build_unopened() {
+        use rtdb_plan::{BinaryOp, Relation, RelationNode, Schema, TemporalFilter};
+        let (state, table, _) = live_table_with_values([Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (probe, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut build = probe.clone();
+        build.columns[0].id = ColumnId(10);
+        build.valid_time = TemporalFilter::At(Expr::Literal(Value::Bool(true)));
+        let comparison = Expr::binary(BinaryOp::Eq, probe.columns[0].expression(), build.columns[0].expression());
+        let input = Arc::new(Relation::scan(probe).unwrap());
+        let dependent = Arc::new(Relation::scan(build).unwrap());
+        let output = rtdb_plan::Field { id: ColumnId(11), name: "member".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Bool).maybe() };
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        let mark = Arc::new(Relation::new(schema, RelationNode::Mark { input, dependent, arguments: vec![],
+            condition: None, comparison, output }).unwrap());
+        let relation = Arc::new(mark.limit(None, Some(Expr::Literal(Value::I64(0)))).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(relation, &execution.context.catalog, &[], &memory).unwrap();
+        let mut rows = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+        let mut columns = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected Arrow membership");
+        assert!(rows.next_page().await.unwrap().is_none());
+        assert!(columns.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn a_projected_arrow_join_fills_flight_transport_batches() {
         use rtdb_plan::{BinaryOp, JoinKind, NamedExpr, Relation};
 
@@ -2538,7 +2563,7 @@ mod tests {
         let expr = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(Value::I64(1)));
         field.id = ColumnId(10);
         let projected = Arc::new(relation.project(vec![NamedExpr { field, expr }]).unwrap());
-        let runtime = crate::runtime_schema::EmittedRelation::derive(projected, &execution.context.catalog, &[], &memory).unwrap();
+        let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&projected), &execution.context.catalog, &[], &memory).unwrap();
         let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected a nested Arrow CTE");
         let mut values = Vec::new();
         while let Some(batch) = cursor.next_batch().await.unwrap() {
@@ -2548,6 +2573,10 @@ mod tests {
         assert_eq!(values, [2, 3, 4, 2, 3, 4].map(Value::I64));
         drop(cursor);
         assert_eq!(execution.context.spill_bytes(), 0);
+        let prepared = crate::PreparedQuery::new(projected).unwrap();
+        let mut cursor = prepared.execute_columns(execution.context, vec![]).await.unwrap();
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 6);
+        assert!(cursor.next_batch().await.unwrap().is_none());
     }
 
     #[tokio::test]
