@@ -37,15 +37,21 @@ impl ResumeToken {
 }
 
 #[derive(Clone, Debug)]
-pub struct ConfirmationState { held: Lsn, received: Lsn, durable: Option<Lsn>, confirmed: Lsn }
+pub struct ConfirmationState { held: Lsn, received: Lsn, durable: Option<Lsn>, replayable: Option<Lsn>, confirmed: Lsn }
 impl ConfirmationState {
-    pub fn new(resume: Lsn, durable: Option<Lsn>) -> Self { Self { held: resume, received: resume, durable, confirmed: Lsn(0) } }
+    pub fn new(resume: Lsn, durable: Option<Lsn>) -> Self { Self { held: resume, received: resume, durable, replayable: None, confirmed: Lsn(0) } }
     pub fn held(&self) -> Lsn { self.held }
     pub fn received(&self) -> Lsn { self.received }
     pub fn confirmed(&self) -> Lsn { self.confirmed }
     pub fn received_through(&mut self, lsn: Lsn) { self.received = self.received.max(lsn); }
     pub fn submitted(&mut self, lsn: Lsn) { self.held = self.held.max(lsn); }
-    pub fn adopted(&mut self, lsn: Option<Lsn>) { self.durable = match (self.durable, lsn) { (Some(old), Some(new)) => Some(old.max(new)), (old, None) => old, (None, new) => new }; }
-    pub fn confirmable(&self) -> Lsn { if self.durable.is_none_or(|durable| durable >= self.held) { self.received } else { self.durable.unwrap_or_default() } }
+    pub fn adopted(&mut self, lsn: Option<Lsn>) { self.durable = self.durable.max(lsn); }
+    pub fn recovered_by_replay(&mut self, lsn: Lsn) {
+        if lsn <= self.held { self.replayable = self.replayable.max(Some(lsn)); }
+    }
+    pub fn confirmable(&self) -> Lsn {
+        if self.durable.is_some_and(|durable| durable >= self.held) { self.received }
+        else { self.durable.max(self.replayable).unwrap_or_default() }
+    }
     pub fn confirmed_through(&mut self, lsn: Lsn) { self.confirmed = self.confirmed.max(lsn); }
 }

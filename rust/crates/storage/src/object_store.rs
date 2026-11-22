@@ -105,6 +105,8 @@ pub trait IndexPageLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Published checkpoint files survive a process restart on the same storage.
+    fn syncs_checkpoints(&self) -> bool { false }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
     /// Registers a captured catalog in a shared serving store.
     /// A missing cut represents an opaque capture. Standalone stores need no remote registration.
@@ -401,6 +403,8 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 
 #[async_trait]
 impl ObjectStore for LocalStore {
+    fn syncs_checkpoints(&self) -> bool { true }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let (path, key) = (self.path(key), key.clone());
         self.io.run(move || {

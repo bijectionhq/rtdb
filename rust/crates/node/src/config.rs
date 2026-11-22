@@ -91,7 +91,7 @@ pub trait SessionIdentity: Send + Sync {
 
 #[async_trait]
 pub trait ExternalSourceDriver: Send {
-    /// Resume uses admitted applied progress; upstream confirmation uses only adopted block progress.
+    /// Resume uses admitted applied progress. Upstream confirmation requires a recoverable token.
     /// The caller cancels and joins this run before assigning another leader term.
     async fn run(self: Box<Self>, term: TermHandle, after: Option<Arc<[u8]>>, blocks: watch::Receiver<DriverStatus>, cancellation: CancellationToken) -> Result<()>;
 }

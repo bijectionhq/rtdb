@@ -36,3 +36,4 @@ workspace = true
 [dev-dependencies]
 rtdb-storage.workspace = true
 rtdb-trie.workspace = true
+tempfile.workspace = true

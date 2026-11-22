@@ -107,3 +107,102 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     wait_for_slot_release(&mut control, &slot).await;
     control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap(); control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap(); control.query(&format!("DROP TABLE {table}")).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires an explicitly configured PostgreSQL 17+ server with wal_level=logical and replication credentials"]
+async fn native_source_recovers_confirmed_local_journal_transactions_before_the_first_block() {
+    use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationConfig, ReplicationDriver, Role};
+    use rtdb_storage::{LocalStore, cache::BufferPool, log::{LocalLog, LocalLogOptions}};
+    use rtdb_types::{SourcePosition, StorageEpoch, Timestamp};
+    use tokio_util::sync::CancellationToken;
+
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryBudget::new(1 << 28);
+    let start_target = || async {
+        let open_log = |name| LocalLog::open(&directory.path().join(name),
+            LocalLogOptions { maximum_message_bytes: 4 << 20, queue_capacity: 32 }).unwrap();
+        let (source, intake) = open_log("source");
+        let (replica, journal) = open_log("replica");
+        let stop_logs = CancellationToken::new();
+        let logs_jobs = [tokio::spawn(intake.run(stop_logs.clone())), tokio::spawn(journal.run(stop_logs.clone()))];
+        let store = Arc::new(LocalStore::open(directory.path().join("objects")).unwrap());
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 25));
+        let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0),
+            rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), cache.clone(), memory.clone()).unwrap();
+        let blocks = BlockStore::new(store, cache.clone(), memory.clone(), 100_000_000).unwrap();
+        let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), Default::default()).await.unwrap();
+        let partition = recovered.partition.clone();
+        let progress = ProgressMonitor::new(recovered.progress.clone());
+        let resolve = Arc::new(rtdb_tx::ResolveContext { owned_witness_scope: None, database: "cdc".into(), storage: cache, memory: memory.clone(), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
+        let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() },
+            logs, blocks, recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
+        let replication = tokio::spawn(driver.run());
+        wait_for(|| matches!(handle.status().role, Role::Leading(_))).await;
+        (handle, replication, partition, stop_logs, logs_jobs)
+    };
+
+    let mut remote = Remote::new(std::env::var("RTDB_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into()), std::env::var("RTDB_PG_DATABASE").expect("RTDB_PG_DATABASE"), std::env::var("RTDB_PG_USER").expect("RTDB_PG_USER"), std::env::var("RTDB_PG_PASSWORD").unwrap_or_default());
+    remote.port = std::env::var("RTDB_PG_PORT").unwrap_or_else(|_| "5432".into()).parse().unwrap();
+    remote.ssl = SslMode::Disable;
+    remote.status_interval = Duration::from_millis(50);
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let table = format!("rtdb_early_{suffix}");
+    let publication = format!("rtdb_pub_{suffix}");
+    let slot = format!("rtdb_slot_{suffix}");
+    let mut control = Connection::open(&remote, false, memory.clone()).await.unwrap();
+    control.query(&format!("CREATE TABLE {table} (_id integer PRIMARY KEY, value text)")).await.unwrap();
+    control.query(&format!("INSERT INTO {table} VALUES (1, 'snapshot')")).await.unwrap();
+    control.query(&format!("CREATE PUBLICATION {publication} FOR TABLE {table}")).await.unwrap();
+    let config = SourceConfig { remote: "test".into(), slot_name: slot.clone(), publication_name: publication.clone(), indexer: None, ignore_tables: BTreeSet::new() };
+
+    let (handle, replication, _, stop_logs, logs_jobs) = start_target().await;
+    let source = crate::SourceDriver::new(remote.clone(), config.clone(), memory.clone(), None).unwrap();
+    let cancel_source = CancellationToken::new();
+    let source_job = tokio::spawn(source.run(handle.term().unwrap(), None, handle.watch_status(), cancel_source.clone()));
+    let applied = || handle.progress().current().external_token.as_deref().and_then(|token| crate::ResumeToken::decode(token).ok());
+    wait_for(|| applied().is_some_and(|token| token.snapshot_completed)).await;
+    let snapshot_lsn = applied().unwrap().lsn;
+    control.query(&format!("INSERT INTO {table} VALUES (2, 'replica only')")).await.unwrap();
+    wait_for(|| applied().is_some_and(|token| token.lsn > snapshot_lsn)).await;
+    let confirmed = applied().unwrap().lsn;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let result = control.query(&format!("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '{slot}'")).await.unwrap();
+            let upstream: crate::Lsn = result.rows[0].cell(0).unwrap().unwrap().parse().unwrap();
+            if upstream >= confirmed { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(handle.status().adopted_block.is_none());
+    cancel_source.cancel();
+    source_job.await.unwrap().unwrap();
+    handle.shutdown();
+    replication.await.unwrap().unwrap();
+    drop(handle);
+    stop_logs.cancel();
+    for job in logs_jobs { job.await.unwrap().unwrap(); }
+
+    let (handle, replication, partition, stop_logs, logs_jobs) = start_target().await;
+    let after = handle.progress().current().external_token.unwrap();
+    assert_eq!(crate::ResumeToken::decode(&after).unwrap().lsn, confirmed);
+    assert!(handle.status().adopted_block.is_none());
+    let table_ref = rtdb_types::TableRef::new("public", &table);
+    let row_count = || partition.value().live().tables().get(&table_ref).map(|table| table.row_count());
+    assert_eq!(row_count(), Some(2));
+    wait_for_slot_release(&mut control, &slot).await;
+    let source = crate::SourceDriver::new(remote, config, memory.clone(), None).unwrap();
+    let cancel_resumed = CancellationToken::new();
+    let source_job = tokio::spawn(source.run(handle.term().unwrap(), Some(after), handle.watch_status(), cancel_resumed.clone()));
+    control.query(&format!("INSERT INTO {table} VALUES (3, 'resumed')")).await.unwrap();
+    wait_for(|| row_count() == Some(3)).await;
+    cancel_resumed.cancel();
+    source_job.await.unwrap().unwrap();
+    handle.shutdown();
+    replication.await.unwrap().unwrap();
+    stop_logs.cancel();
+    for job in logs_jobs { job.await.unwrap().unwrap(); }
+    wait_for_slot_release(&mut control, &slot).await;
+    control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap();
+    control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap();
+    control.query(&format!("DROP TABLE {table}")).await.unwrap();
+}

@@ -4967,6 +4967,7 @@ dependencies = [
  "rtdb-tx",
  "rtdb-types",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-util",

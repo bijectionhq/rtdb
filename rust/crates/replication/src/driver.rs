@@ -134,6 +134,14 @@ impl ReplicationHandle {
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
 impl TermHandle {
     pub fn term(&self) -> Term { self.term }
+    /// The applied resume token covered by the store and the retained durable journal.
+    pub fn recoverable_external_token(&self) -> Option<Arc<[u8]>> {
+        if self.handle.logs.retains_recovery_history() && self.handle.status.borrow().role == Role::Leading(self.term) {
+            self.handle.progress.current().external_token
+        } else {
+            None
+        }
+    }
     /// Replaces a quiescent catalog and returns after its new block has been adopted in this term.
     /// The caller must exclusively operate the database with compaction and GC disabled.
     /// A failed receipt never permits deletion of the old catalog's files.

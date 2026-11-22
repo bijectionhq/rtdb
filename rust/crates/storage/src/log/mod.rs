@@ -125,6 +125,8 @@ pub trait LogReplayTail: Send {
 
 #[async_trait]
 pub trait Log: Send + Sync {
+    /// The reopened journal retains its synced prefix, and reads expose only that durable history.
+    fn retains_synced_history(&self) -> bool { false }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     fn latest(&self) -> Result<LogOffset>;

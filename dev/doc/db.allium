@@ -1221,6 +1221,8 @@ rule LeaderAppliesOwnTx {
         if head.tx_result.committed and head.db_op != null:
             ApplyDbOpToCatalog(database.catalog, head.db_op)
         watchers.notifyTx(head.tx_result, head.src_msg_id, head.external_source_token)
+        if head.external_source_token != null:
+            ExternalReplicaPrefixApplied(database, head.external_source_token)
 }
 
 rule LeaderAppliesInheritedTx {
@@ -1234,6 +1236,8 @@ rule LeaderAppliesInheritedTx {
         if record.committed and record.db_op != null:
             ApplyDbOpToCatalog(database.catalog, record.db_op)
         ApplyResolvedTxFromRecord(record)
+        if record.external_source_token != null:
+            ExternalReplicaPrefixApplied(database, record.external_source_token)
 }
 
 rule LeaderUploadsBlockOnBoundary {
@@ -1623,16 +1627,9 @@ rule ClientOpensSnapshot {
 }
 
 rule ExternalSourceLearnsDurableExtent {
-    -- Confirming a resume token tells the upstream it may discard everything behind it, so a confirmed position is a claim that we can recover without it.
-    -- Only a durable block backs that claim: between apply and the next block the sole copies are the replica log and the leader's live index, and the upstream cannot re-send what we told it to drop.
-    --
-    -- So this token, and not the applied position, is the source's licence to confirm.
-    -- It is also not the watchers' token, which is the one that may run ahead — replica-log replay advances it past block boundaries — which is why the token an assignment starts after is not a position we are entitled to confirm.
-    --
-    -- What a source does with the licence is its own rule: it may confirm further where the log above the extent demonstrably holds nothing of ours. See pgsrc.allium.
-    --
-    -- The gap this opens is the block cadence: a database whose blocks stop landing pins the upstream's log while ingestion and queries stay healthy.
-    -- That is a monitoring obligation, not a correctness one (#5867).
+    -- Confirmation permits the upstream to discard its history through the token.
+    -- An adopted block supplies a recoverable token to the source.
+    -- The source's protocol determines how that token bounds confirmation.
     when: BlockBecameDurable(database, external_source_token)
     requires: log_processor.mode = Leader
     requires: database.external_source != null
@@ -1643,6 +1640,19 @@ rule ExternalSourceLearnsDurableExtent {
             source: log_processor.external_source,
             token: external_source_token
         )
+}
+
+rule ExternalSourceLearnsReplayExtent {
+    -- Synced local journals retain the durable prefix through restart.
+    -- Synced local storage retains the checkpoint files used to open that prefix.
+    -- The leader can supply the token from applied read-back before a block adopts it.
+    when: ExternalReplicaPrefixApplied(database, external_source_token)
+    requires: log_processor.mode = Leader
+    requires: database.external_source != null
+    requires: RetainsSyncedJournalsAndCheckpoints(database)
+
+    ensures:
+        RecoverableReplayExtentAdvanced(source: log_processor.external_source, token: external_source_token)
 }
 
 ---- Rules: Error Handling

@@ -293,3 +293,13 @@ The controls reject publishing an incomplete inventory, authorizing a trim from 
 The reachability case opens a recovery after a trim.
 Allium check and analysis added no diagnostics to the edited specifications.
 link:../tla/ReplicaTrimAdmission.tla[Trim admission model]
+
+== R5 · PostgreSQL confirmation before block adoption
+
+Synced local source and replica journals and synced local checkpoint storage support an early confirmation from an applied transaction.
+The PostgreSQL 17 replay confirms a transaction at the upstream slot before the first block exists, reopens both journals, and resumes the same slot without losing either imported row.
+The other native PostgreSQL replays cover the checkpoint-only bound and concurrent snapshot import.
+The scoped replication, storage and PostgreSQL suites passed, and all three live PostgreSQL fixture tests passed.
+TLC explored 48 distinct states. Its controls reject volatile apply evidence, unconditional pre-block confirmation and received WAL beyond the recoverable token.
+The reachability case confirms before the first block using retained replay.
+link:../tla/ExternalConfirmation.tla[External confirmation model]

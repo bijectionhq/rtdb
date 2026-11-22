@@ -58,10 +58,11 @@ A target submission or apply failure ends the source instead of reopening the up
 == Confirmation and reconnect
 
 The resume token is taken from admitted applied progress.
-The durable token is taken only from an adopted block catalog.
-When a durable token exists below the held LSN, that token bounds slot confirmation.
-When the durable token covers held progress, received WAL may advance confirmation across unrelated WAL.
-The pinned source also permits received progress when there is no durable block yet.
+An adopted block supplies a durable token after the initial import completes.
+A target backed by synced local storage and retained local journals can also confirm completed tokens it has applied, including before the first block.
+Restarting with the same files recovers those transactions by replay.
+Other storage and journal combinations rely on the adopted block for confirmation.
+When the adopted block covers all held progress, received WAL may advance confirmation across unrelated WAL.
 Neither a connection reopen nor an incoming keepalive automatically advances the flush/apply positions sent to PostgreSQL.
 An explicit standby-status message is sent before the first stream read, at status deadlines, on requested keepalive replies, and when the confirmable bound advances.
 

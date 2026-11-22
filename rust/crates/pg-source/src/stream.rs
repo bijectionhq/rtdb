@@ -22,6 +22,9 @@ impl ChangeStream {
                         b'w' => {
                             let start = Lsn(input.u64()?); input.u64()?; input.i64()?; self.received = self.received.max(start);
                             let transaction = self.decoder.receive(input.rest())?;
+                            if let Some(transaction) = &transaction {
+                                self.received = self.received.max(transaction.lsn);
+                            }
                             Ok(StreamUpdate { received: self.received, transaction, reply_requested: false })
                         }
                         b'k' => { self.received = self.received.max(Lsn(input.u64()?)); input.i64()?; let reply_requested = input.u8()? != 0; input.end()?; Ok(StreamUpdate { received: self.received, transaction: None, reply_requested }) }

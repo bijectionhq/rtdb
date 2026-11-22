@@ -139,6 +139,9 @@ When the provider cannot establish that coverage, upstream acknowledgement remai
 The replica root and its suffix hold are passive immutable evidence.
 The source connector sends acknowledgements after the applied monitor publishes the corresponding evidence.
 The recovery authority owns retention and returns the release grant.
+The PostgreSQL source can confirm an applied token on a standalone target whose local journals retain the synced prefix and whose local store syncs checkpoint publication.
+Restart on the same media can recover the acknowledged transactions before a block is cut.
+The hosted logkeeper path still requires a scope-specific recovery grant for early confirmation.
 The storage model must exercise a lost copy reply and trim during restore.
 Native CDC qualification must reconnect from an acknowledged token across a crash before block flush and show that neither the token's data nor a preceding transaction is lost.
 
