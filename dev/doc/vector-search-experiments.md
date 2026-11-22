@@ -16,7 +16,7 @@ WHERE status = 'open' AND embedding IS NOT NULL
 ORDER BY distance, _id
 LIMIT 10;
 ```
-It will serve as the oracle for approximate retrieval.
+It serves as the oracle for approximate retrieval.
 The ordered secondary index can provide a bounded IID scope for selective predicates before the query reads embeddings.
 
 ## Approximate retrieval
@@ -85,7 +85,7 @@ The run uses the first twelve held-out queries and independently trains 512 cent
 The dataset and generated binary files stay in the ignored build directory.
 
 The experiment loads the primary table and centroid index from the same fixed input.
-It does not yet publish an ANN generation through the replica log.
+The benchmark owns the ANN generation for one process.
 The index retains the fixture's valid-time point and captured flushed frontier.
 The churn prototype reads the captured live segments for writes that change a row at the covered point.
 A put or delete whose valid interval contains the point shadows the indexed version of that row.
@@ -144,6 +144,7 @@ At 32 probes the unfiltered worst query recalled 40% of its exact top 10.
 The ~1% random filter filled all twelve pages at that probe budget and still recalled only 42.5% on average.
 Result count alone is therefore an inadequate signal that the search has covered a filter.
 The whole-cluster predicate could open every qualifying cluster within eight probes.
+The stationary random filters selected 118, 1,042, and 9,925 eligible rows, and the whole-cluster filter selected 1,228.
 
 ## Churn and snapshot coverage
 
@@ -177,6 +178,31 @@ The IID-to-ID lookup added 2,400,000 bytes of resident metadata at this size.
 
 The stationary and churn runs occurred at different levels of host load.
 Compare the query paths within each run and use the churn tests and recall results to assess the effect of changed rows.
+
+## Architecture decision
+
+Keep `COSINE_DISTANCE` and filtered exact SQL as the default query contract.
+The existing ordered index already gives highly selective filters a faster route without changing any returned distance or row.
+The next exact execution optimization should evaluate typed Arrow float buffers in batches and fetch other projected columns only for the winners.
+The scalar oracle remains the reference for distance and tie behavior.
+
+Use a secondary centroid index for the explicit approximate route.
+Store stable row identity separately from the cluster address and resolve visible rows through the table snapshot.
+Use the ordered scope and exact scoring when the candidate set is cheap to enumerate.
+For broad ANN, start with warm centroid metadata, bounded concurrent reads of the relevant blocks, and full-precision reranking through SQL.
+The low recall for random selective filters shows why a fixed global probe count cannot serve all filter shapes.
+Cluster eligibility and per-cluster matching counts are candidates for adaptive probing, and the exact route supplies a fallback when a useful filtered search cannot stay within its budget.
+
+Production ANN needs a durable definition, a published generation and a precise source frontier.
+Keep the search generation pinned for the lifetime of the captured query.
+Account for newly visible versions at valid-time boundaries and for the writes outside the published frontier.
+An erase requires both immediate exclusion from results and eventual removal of the obsolete vector bytes under the index retirement protocol.
+Those are the publication and lifetime obligations to take from the existing ordered index and SlateDB's checkpoint design.
+
+Keep fixed-probe ANN in the benchmark until filtered recall and cold provider I/O have been measured against a batched exact baseline.
+The present cold measurements count local range requests and bytes.
+The pack time excludes centroid training, and the churn timings leave full generation rebuilds outside the write path.
+The rebuild and generation-retirement costs still need to be measured over sustained writes.
 
 ## Verification
 
