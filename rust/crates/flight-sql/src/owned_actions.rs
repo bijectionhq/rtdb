@@ -172,6 +172,7 @@ pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOv
 #[derive(Clone, Copy)]
 pub(crate) enum WorldOrder { ParentRange, ParentCount, OverlayRange }
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
+pub(crate) const SEARCH_HELD_OWNED_STAGED_V1: &str = "rtdb.owned.SearchHeldStaged.v1";
 pub(crate) const SEARCH_HELD_OWNED_V4: &str = "rtdb.owned.SearchHeld.v4";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
@@ -1259,7 +1260,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], staged: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1268,10 +1269,55 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
+        let (overlay, request, staged_scope) = if staged {
+            self.hosted_control_policy(call)?;
+            let scope = self.hosted_control_scope(call).await?;
+            let (length, request) = request.split_first_chunk::<4>()
+                .ok_or_else(|| invalid("Staged search has no overlay length"))?;
+            let (ipc, request) = request.split_at_checked(u32::from_be_bytes(*length) as usize)
+                .ok_or_else(|| invalid("Staged search has a truncated overlay"))?;
+            (Some(request_batch(call, ipc)?), request, Some(scope))
+        } else {
+            (None, request, None)
+        };
+        let prefix_len = body.len() - request.len();
         let rank = owned_rank_request(call, request)?;
-        let (page, witnesses) = held.snapshot.ranked_search_page(
-            &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe,
+        let overlay = overlay.as_ref().map(|input| {
+            let input = input.batch();
+            if !rank.observe || !(1..=64).contains(&input.num_rows()) || input.num_columns() != 3 {
+                return Err(invalid("Staged search requires bounded rows and original evidence"));
+            }
+            let partitions = input.column_by_name("partition").and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let ids = input.column_by_name("_id").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let text = input.column_by_name("text").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let (Some(partitions), Some(ids), Some(text)) = (partitions, ids, text) else {
+                return Err(invalid("Invalid staged search overlay layout"));
+            };
+            let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(self.memory()), rank.query).map_err(status)?;
+            for row in 0..input.num_rows() {
+                if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
+                    || partitions.value(row) >= rank.partitions.len() as u64
+                {
+                    return Err(invalid("Invalid staged search identity"));
+                }
+                corpus.shadow(
+                    partitions.value(row) as usize,
+                    rtdb_types::EntityId::String(ids.value(row).to_owned()),
+                    (!text.is_null(row)).then(|| text.value(row)),
+                ).map_err(status)?;
+            }
+            Ok(corpus)
+        }).transpose()?;
+        let (page, witnesses) = held.snapshot.ranked_search_with_overlay(
+            &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe, overlay,
         ).await.map_err(status)?;
+        if let Some(scope) = staged_scope {
+            if witnesses.len() != rank.partitions.len()
+                || witnesses.iter().any(|witness| !witness.matches_scope(Some(scope)))
+            {
+                return Err(Status::failed_precondition("Staged search did not retain its original placed corpus"));
+            }
+        }
         let mut nonces = Vec::new();
         if !witnesses.is_empty() {
             if witnesses.len() != rank.partitions.len() { return Err(Status::internal("Incomplete owned search evidence")); }
@@ -1280,7 +1326,8 @@ impl Service {
             }
         }
         let present = held.snapshot.present().system_time;
-        let scope = owned_rank_scope(b"rtdb.owned.search.held.v4\0", &body[..16 + rank.frame_len], rank.query);
+        let domain = if staged { b"rtdb.owned.search.staged.v1\0".as_slice() } else { b"rtdb.owned.search.held.v4\0".as_slice() };
+        let scope = owned_rank_scope(domain, &body[..prefix_len + rank.frame_len], rank.query);
         let reply = self.owned_rank_reply(call, page, scope, nonces, present, present)?;
         held.snapshot.check_relations(rank.partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)

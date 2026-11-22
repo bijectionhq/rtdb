@@ -478,6 +478,11 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
+`rtdb.owned.SearchHeldStaged.v1` requires the configured placed hosted-control owner and original live Root hold.
+Following the 16-byte hold, it takes a big-endian u32 length and one Arrow batch with `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8`. The remainder uses the SearchHeld.v4 argument framing with evidence required.
+The batch contains one to 64 complete staged shadows in selected partition order. Null text masks the old run and contributes no text, covering deletion and absent/null fields.
+Ranking uses one complete corpus, and the reply binds the entire shadow frame into the usual rank scope. The whole-relation witnesses still describe the original source. The action cannot commit the supplied shadows.
+
 `rtdb.owned.SearchHeldWorld.v1` takes the original 16-byte world handle and a signed big-endian i64 valid instant, then the same partition, offset, limit, evidence flag and query framing as SearchHeld.v4.
 The evidence flag must be one, and every partition must have unchanged Root purge frontiers since the archive cut. Retained worlds require complete clear-text artefacts.
 Writable held and proposal worlds require a declared clear-text column in the archived relation and installed world schema. They exhaust the exact held local UTF-8 shadow keys, including tombstones and replacements without text. Matching typed archived runs are excluded before collecting token lengths or term frequencies. The local text and unshadowed archive contribute to one corpus and one rank window.

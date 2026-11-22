@@ -1265,8 +1265,16 @@ impl OwnedReadSession {
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
         offset: usize, limit: usize, observe: bool,
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
+        self.ranked_search_with_overlay(partitions, query, offset, limit, observe, None).await
+    }
+
+    #[cfg(feature = "search")]
+    pub async fn ranked_search_with_overlay(
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
+        offset: usize, limit: usize, observe: bool, overlay: Option<rtdb_search::HeldTextCorpus>,
+    ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, None);
+        let work = rtdb_search::owned_ranked_with_overlay(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, None, overlay);
         let hits = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {
