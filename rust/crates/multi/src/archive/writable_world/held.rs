@@ -54,6 +54,7 @@ impl HeldCheckpointWorld {
         let fact = if let Some(fact) = local {
             fact
         } else {
+            self.open.snapshot.check_point_purge_floor(relation, id, self.open.retained.basis.system_time).await?;
             let (reply, result) = oneshot::channel();
             self.cancellation.run_until_cancelled(self.requests.send(ArchivePoint {
                 relation: relation.clone(), id: id.clone(), valid, reply,

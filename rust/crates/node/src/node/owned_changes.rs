@@ -318,20 +318,22 @@ impl OwnedReadSession {
             return Ok(page);
         }
 
+        page.floor = rtdb_query::owned_purge_floor(Arc::clone(&self.context), &self.owner, relation, id)
+            .await?.unwrap_or(Timestamp::MIN);
         if let Some(journal) = self
             .covered_journal(snapshot, relation, self.present.system_time)
             .await?
         {
             if journal.floor.through_events != 0 {
-                page.floor = journal.floor.committed_at;
-                if system.lower() < page.floor {
+                page.floor = page.floor.max(journal.floor.committed_at);
+            }
+            if system.lower() < page.floor {
                     return Err(Anomaly::new(
                         AnomalyCategory::Unavailable,
                         "rtdb.owned/version-floor",
                         "The requested system window precedes the certified owned history floor",
                     )
                     .with_context("history-floor-micros", page.floor.0.into()));
-                }
             }
             self.require_journal_head(relation, journal.head_revision, journal.head)
                 .await?;

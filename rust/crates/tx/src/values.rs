@@ -920,6 +920,7 @@ pub enum TxOp {
         fixed: Option<Arc<rtdb_types::FixedRangeEvidence>>,
     },
     OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
+    OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },
     OwnedDelete { relation: rtdb_types::OwnedRelation, id: EntityId, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedReplaceDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedInsertDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
@@ -933,7 +934,7 @@ pub enum TxOp {
 
 impl TxOp {
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
+        matches!(self, Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
     }
 }
 

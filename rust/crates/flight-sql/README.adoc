@@ -306,6 +306,13 @@ A covered empty page can carry a witness.
 Each held handle issues one nonce per observed relation, up to 32 relations.
 `rtdb.owned.Commit.v3` prefixes an unchanged Commit.v2 body with an unsigned 16-bit big-endian witness count (1–32), then that many pairs of 16 raw held-handle bytes and 16 raw nonce bytes.
 The commit reply is unchanged.
+`rtdb.owned.Commit.v4` uses the same framing and accepts zero through 32 witnesses.
+It adds the `erase` mutation for a permanently assigned root identity.
+An erase row accepts the typed `_id` and an optional point observation, with no validity endpoints or non-null payload values.
+The resolver refuses erase on a relation with a governed ordered, search, or unique path or a prefix-capacity rule and refuses any other mutation of the same identity in the same commit.
+Erase adds an all-history event and a distinct `erase` change entry at the ordered cut.
+It revokes older native holds for the owner and refuses historical point and archived fallback reads preceding the identity's erase.
+The receipt acknowledges ordered erasure. Disposal of backing objects and keys has its own lifecycle.
 Both values belong to the same authenticated session, database, and placed writer epoch.
 The handle must still admit reads when submitted, and the witness's exclusive ordering deadline may be earlier than the request deadline.
 The resolver compares the witnessed relation's complete event frontier at ordering before applying any mutations.

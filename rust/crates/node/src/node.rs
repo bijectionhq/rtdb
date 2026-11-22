@@ -1034,8 +1034,11 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid_at: Option<Timestamp>,
     ) -> Result<Option<QueryCursor>> {
         self.admit_access().await?;
-        if self.historical.as_ref().is_some_and(|scope| !scope.relations.contains(relation)) {
-            return Err(historical_owned_read::unavailable());
+        if let Some(scope) = &self.historical {
+            if !scope.relations.contains(relation) {
+                return Err(historical_owned_read::unavailable());
+            }
+            self.check_point_purge_floor(relation, id, scope.system_time).await?;
         }
         let valid = valid_at.map(|at| rtdb_types::Interval::new(at, at.next()?)).transpose()?;
         rtdb_query::open_owned_point(Arc::clone(&self.context), &self.owner, relation, id, valid, None).await
@@ -1048,9 +1051,24 @@ impl OwnedReadSession {
     ) -> Result<Option<QueryCursor>> {
         self.admit_read().await?;
         let _ = self.certify_historical_cut(relation, system).await?;
+        self.check_point_purge_floor(relation, id, system).await?;
         self.check()?;
         let valid = rtdb_types::Interval::new(valid, valid.next()?)?;
         rtdb_query::open_owned_point_at_system(Arc::clone(&self.context), &self.owner, relation, id, valid, system).await
+    }
+
+    /// Prevents returning point bytes from an older archive or historical cut after an ordered erase.
+    pub async fn check_point_purge_floor(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, system: Timestamp,
+    ) -> Result<()> {
+        self.admit_access().await?;
+        let context = self.historical.as_ref().map_or(&self.context, |scope| &scope.purge_context);
+        if rtdb_query::owned_purge_floor(Arc::clone(context), &self.owner, relation, id)
+            .await?.is_some_and(|floor| system < floor)
+        {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The point cut precedes its ordered erase"));
+        }
+        self.check()
     }
 
     /// Returns the typed identity's winning valid slices at this held system cut.
@@ -1362,13 +1380,21 @@ impl NativeSession {
         } else {
             present.system_time
         };
+        let purge_table = rtdb_types::OwnedRelation::purge_catalog(&owner);
+        let [snapshot] = context.catalog.database(&database)?.partitions.as_slice() else {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The owned read has no single purge frontier"));
+        };
+        let purge_frontier = snapshot.relation_event_frontier(&purge_table)?;
         let guarded_node = node.clone();
         let guarded_database = database.clone();
         let context = context.with_owned_read_guard(Arc::new(move || {
             if clock.monotonic_micros() >= deadline {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-expired", "The retained owned read expired"));
             }
-            guarded_node.attached_database(&guarded_database, Some(&attached))?;
+            let database = guarded_node.attached_database(&guarded_database, Some(&attached))?;
+            if database.snapshot().relation_event_frontier(&purge_table)? != purge_frontier {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-purged", "The retained owned read was revoked by an ordered erase"));
+            }
             if let Some(lease) = &lease { lease.check()?; }
             Ok(())
         }));

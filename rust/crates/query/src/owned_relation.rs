@@ -208,6 +208,43 @@ pub async fn owned_address(
     Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/address-exhausted", "No owned address locator is available"))
 }
 
+/// Verifies the permanent full address before returning the last ordered erase cut.
+pub async fn owned_purge_floor(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+) -> Result<Option<Timestamp>> {
+    let OwnedAddress::Assigned(locator) = owned_address(Arc::clone(&context), owner, relation, id).await? else {
+        return Ok(None);
+    };
+    let slot = EntityId::Uuid(locator.0);
+    let Some(mut cursor) = open_owned_table_point(
+        Arc::clone(&context), relation.address_table(owner), locator, Some(&slot), None,
+        Some(&["address", "purged_at"]), false,
+    ).await? else { return Err(address_unavailable()); };
+    let mut found = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        if batch.num_rows() == 0 { continue; }
+        if found.is_some() || batch.num_rows() != 1 { return Err(address_unavailable()); }
+        let revision = owned_row_revision(batch, 0, &slot, &context.memory)?;
+        let value = |name| {
+            let (position, field) = batch.schema_ref().column_with_name(name).ok_or_else(address_unavailable)?;
+            let column = batch.column(position).as_ref();
+            let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, 0)?;
+            let _scratch = context.memory.reserve(bytes.saturating_add(4096))?;
+            rtdb_columnar::read_value(field, column, 0)
+        };
+        if &value("address")?.entity_id().map_err(|_| address_unavailable())? != id {
+            return Err(address_unavailable());
+        }
+        found = Some(match value("purged_at")? {
+            Value::Null | Value::Undefined => None,
+            Value::I64(time) if Timestamp(time) == revision => Some(revision),
+            _ => return Err(address_unavailable()),
+        });
+    }
+    found.ok_or_else(address_unavailable)
+}
+
 async fn address_row(
     cursor: Option<QueryCursor>, slot: &EntityId, context: &QueryContext,
 ) -> Result<Option<EntityId>> {

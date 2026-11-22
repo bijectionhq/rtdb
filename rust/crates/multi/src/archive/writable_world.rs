@@ -464,6 +464,7 @@ pub async fn read_checkpoint_world_point(
         open.check()?;
         return Ok(WorldPoint { present, fact, witness: None });
     }
+    open.snapshot.check_point_purge_floor(relation, id, open.retained.basis.system_time).await?;
     let batches = read_checkpoint_owned_point(
         directory, archive, keys, hosted_task, &open.parent(deployment),
         CheckpointPoint { owner: &open.retained.owner, relation, id, valid: Some(valid) },

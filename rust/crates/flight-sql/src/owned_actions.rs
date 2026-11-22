@@ -33,6 +33,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
+pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";
 pub(crate) const COMMIT_OWNED_V3: &str = "rtdb.owned.Commit.v3";
 const MAX_RANGE_WITNESSES: usize = 32;
 const OWNED_RANGE_WITNESS: &str = "rtdb.owned.range_witness";
@@ -419,15 +420,15 @@ impl Service {
     }
 
     pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
-        self.commit_owned(call, body, format, Vec::new()).await
+        self.commit_owned(call, body, format, Vec::new(), false).await
     }
 
-    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (length, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Owned commit has no witness count"))?;
         let count = usize::from(u16::from_be_bytes(*length));
-        if !(1..=MAX_RANGE_WITNESSES).contains(&count) {
-            return Err(invalid("Owned commit requires one to 32 range witnesses"));
+        if count > MAX_RANGE_WITNESSES || (count == 0 && !erase_allowed) {
+            return Err(invalid("Invalid owned commit range witness count"));
         }
         let _framing = call.reserve(count * 512)?;
         let mut witnesses = Vec::with_capacity(count);
@@ -443,10 +444,10 @@ impl Service {
                 .map(|witness| witness.evidence.clone()).ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
             witnesses.push((held, witness));
         }
-        self.commit_owned(call, body, CommitFormat::Grouped, witnesses).await
+        self.commit_owned(call, body, CommitFormat::Grouped, witnesses, erase_allowed).await
     }
 
-    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses) -> Result<ActionResult, Status> {
+    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -470,7 +471,7 @@ impl Service {
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
             let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
-            self.append_owned_commit_group(&mut writes, &relation, rows)?;
+            self.append_owned_commit_group(&mut writes, &relation, rows, erase_allowed)?;
             retained.push((operations_charge, documents_charge));
         }
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
@@ -481,6 +482,7 @@ impl Service {
         writes: &mut Vec<TxOp>,
         relation: &OwnedRelation,
         rows: Vec<rtdb_types::StructFields<Value>>,
+        erase_allowed: bool,
     ) -> Result<(), Status> {
         for mut row in rows {
             strip_owned_absence(&mut row)?;
@@ -513,6 +515,12 @@ impl Service {
                 "delete" => {
                     if has_payload(&row) { return Err(invalid("Owned delete carries document values")); }
                     TxOp::OwnedDelete { relation: relation.clone(), id, valid_from, valid_to }
+                }
+                "erase" if erase_allowed => {
+                    if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
+                        return Err(invalid("Owned erase requires only a typed identity and optional observation"));
+                    }
+                    TxOp::OwnedErase { relation: relation.clone(), id }
                 }
                 _ => return Err(invalid("Unknown owned commit operation")),
             };

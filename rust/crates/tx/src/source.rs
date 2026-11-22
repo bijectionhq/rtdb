@@ -32,7 +32,7 @@ impl Operation {
             Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. }
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. }
-                | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
+                | TxOp::OwnedErase { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
                 | TxOp::OwnedReplaceDocs { relation, .. }) | Self::OwnedWriteIids { relation, .. } => Some(relation),
             _ => None,
         }
@@ -84,7 +84,7 @@ impl SourceTransaction {
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) =>
                     (range_evidence_bytes(relation, fixed), None, 0),
-                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
+                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
@@ -309,7 +309,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) => range_evidence_bytes(relation, fixed),
-                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. }) =>
+                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id }) =>
                     relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?,
                 Operation::Removed(name) => name.capacity(),
             };
@@ -478,6 +478,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("valid_at".into(), Value::I64(valid_at.0));
             body.insert("expected".into(), expected.map_or(Value::Null, |expected| Value::I64(expected.0)));
             "rtdb-owned-check-v1"
+        }
+        Operation::Public(TxOp::OwnedErase { relation, id }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("id".into(), id.as_value());
+            "rtdb-owned-erase-v1"
         }
         Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1086,6 +1091,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
+            "rtdb-owned-erase-v1" => &["relation", "id"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
             "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
@@ -1163,6 +1169,10 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
                 TxOp::OwnedDeadline { until: Timestamp(until) }
+            }
+            "rtdb-owned-erase-v1" => {
+                let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned erase has no relation")); };
+                TxOp::OwnedErase { relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()? }
             }
             "rtdb-owned-check-v1" | "rtdb-owned-delete-v1" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned operation has no relation")); };

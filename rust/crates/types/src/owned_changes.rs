@@ -8,6 +8,7 @@ pub const OWNED_CHANGE_PAGE_GROUPS: usize = 128;
 pub enum OwnedChangeKind {
     Put,
     Delete,
+    Erase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ impl OwnedChange {
                     match self.kind {
                         OwnedChangeKind::Put => "put",
                         OwnedChangeKind::Delete => "delete",
+                        OwnedChangeKind::Erase => "erase",
                     }
                     .into(),
                 ),
@@ -58,6 +60,7 @@ impl OwnedChange {
         let kind = match fields.get("op") {
             Some(Value::Utf8(op)) if op == "put" => OwnedChangeKind::Put,
             Some(Value::Utf8(op)) if op == "delete" => OwnedChangeKind::Delete,
+            Some(Value::Utf8(op)) if op == "erase" => OwnedChangeKind::Erase,
             _ => return Err(change_feed_uncovered()),
         };
         let Some(Value::I64(from)) = fields.get("valid_from_micros") else {
@@ -69,7 +72,7 @@ impl OwnedChange {
             _ => return Err(change_feed_uncovered()),
         };
         let valid = Interval::new(Timestamp(*from), to).map_err(|_| change_feed_uncovered())?;
-        if valid.is_empty() {
+        if valid.is_empty() || (kind == OwnedChangeKind::Erase && valid != Interval::ALL) {
             return Err(change_feed_uncovered());
         }
         Ok(Self { id, kind, valid })
