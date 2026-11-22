@@ -236,6 +236,9 @@ Use `rtdb.owned.OpenRead.v1` with an empty body to reserve one present and retai
 The one result body contains 16 opaque handle bytes followed by the signed big-endian 64-bit Unix microsecond present.
 Send `rtdb.owned.ReadHeldPoint.v1` with those 16 handle bytes followed by the ordinary ReadPoint action body.
 The Arrow response uses the held present and valid instant on every call, including missing rows.
+`rtdb.owned.ReadHeldPoint.v2` uses the same framing with exactly one Arrow row and two columns, `_id` and `valid_micros: Int64?`.
+A null `valid_micros` uses the held default. Otherwise it selects one business-valid microsecond within the original held system cut.
+`rtdb.owned.valid_micros` echoes the selected instant even when the row is absent, and `rtdb.owned.present_micros` stays at the held present.
 Send `rtdb.owned.CloseRead.v1` with only the 16 handle bytes to release it.
 Close success has zero Flight results.
 

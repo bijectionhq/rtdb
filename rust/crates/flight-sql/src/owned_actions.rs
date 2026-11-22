@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -87,6 +87,7 @@ impl<'a> CommitRequest<'a> {
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_READ_V1: &str = "rtdb.owned.OpenRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
+pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
@@ -324,7 +325,7 @@ impl Service {
         Ok(entry)
     }
 
-    pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], with_valid: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -333,11 +334,8 @@ impl Service {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, id, _identity) = point_request(call, request)?;
-        let cursor = held.snapshot.open_point(&relation, &id).await.map_err(status)?;
-        let reply = self.finish_owned_point(held.snapshot.present().system_time, &id, cursor).await?;
-        held.snapshot.check().map_err(status)?;
-        Ok(reply)
+        let (relation, id, valid, _identity) = point_request(call, request, with_valid)?;
+        self.execute_owned_point(&held.snapshot, &relation, &id, valid).await
     }
 
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], full_key: bool) -> Result<ActionResult, Status> {
@@ -379,9 +377,8 @@ impl Service {
             let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
             held.snapshot.range(&relation, &path, lower, upper, limit).await
         }.map_err(status)?;
-        let reply = self.owned_point_reply(
-            &page.schema, page.batch.as_ref().map(OwnedBatch::batch), held.snapshot.present().system_time, None,
-        )?;
+        let present = held.snapshot.present().system_time;
+        let reply = self.owned_point_reply(&page.schema, page.batch.as_ref().map(OwnedBatch::batch), present, present, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }
@@ -398,20 +395,27 @@ impl Service {
 
     pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (relation, id, _identity) = point_request(call, body)?;
+        let (relation, id, _, _identity) = point_request(call, body, false)?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
-        let cursor = snapshot.open_point(&relation, &id).await.map_err(status)?;
-        let reply = self.finish_owned_point(snapshot.present().system_time, &id, cursor).await?;
+        self.execute_owned_point(&snapshot, &relation, &id, None).await
+    }
+
+    async fn execute_owned_point(
+        &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
+    ) -> Result<ActionResult, Status> {
+        let present = snapshot.present().system_time;
+        let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
+        let reply = self.finish_owned_point(present, valid.unwrap_or(present), id, cursor).await?;
         snapshot.check().map_err(status)?;
         Ok(reply)
     }
 
-    async fn finish_owned_point(&self, present: Timestamp, id: &EntityId, result: Option<QueryCursor>) -> Result<ActionResult, Status> {
+    async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
-            return self.owned_point_reply(&Schema::empty(), None, present, None);
+            return self.owned_point_reply(&Schema::empty(), None, present, valid, None);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -423,18 +427,18 @@ impl Service {
         }
         if let Some(batch) = result {
             let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, self.memory()).map_err(status)?;
-            self.owned_point_reply(batch.batch().schema_ref(), Some(batch.batch()), present, Some(revision))
+            self.owned_point_reply(batch.batch().schema_ref(), Some(batch.batch()), present, valid, Some(revision))
         } else {
             let schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
-            self.owned_point_reply(&schema, None, present, None)
+            self.owned_point_reply(&schema, None, present, valid, None)
         }
     }
 
-    fn owned_point_reply(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, revision: Option<Timestamp>) -> Result<ActionResult, Status> {
+    fn owned_point_reply(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>) -> Result<ActionResult, Status> {
         let _metadata = self.memory().reserve(wire::schema_bound(schema)?).map_err(status)?;
         let mut metadata = schema.metadata().clone();
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
-        metadata.insert(OWNED_VALID.into(), present.0.to_string());
+        metadata.insert(OWNED_VALID.into(), valid.0.to_string());
         if let Some(revision) = revision { metadata.insert(OWNED_REVISION.into(), revision.0.to_string()); }
         let columns: Vec<_> = schema.fields().iter().enumerate()
             .filter(|(_, field)| field.name() != "_system_from")
@@ -459,18 +463,33 @@ impl Service {
     }
 }
 
-fn point_request(call: &Call, body: &[u8]) -> Result<(OwnedRelation, EntityId, Arc<MemoryReservation>), Status> {
+fn point_request(
+    call: &Call, body: &[u8], with_valid: bool,
+) -> Result<(OwnedRelation, EntityId, Option<Timestamp>, Arc<MemoryReservation>), Status> {
     let (relation, arrow) = split_relation(body)?;
     let batch = request_batch(call, arrow)?;
     let batch = batch.batch();
-    if batch.num_columns() != 1 || batch.num_rows() != 1 {
-        return Err(invalid("Owned point action requires one _id cell"));
+    let expected_columns = if with_valid { 2 } else { 1 };
+    if batch.num_columns() != expected_columns || batch.num_rows() != 1 {
+        return Err(invalid("Owned point action requires one row with the fields for its action version"));
     }
-    let field = batch.schema_ref().field(0);
-    let values = batch.column(0).as_ref();
+    let (column, field) = batch.schema_ref().column_with_name("_id").expect("validated _id");
+    let values = batch.column(column).as_ref();
     let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?)?)?;
     let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;
-    Ok((relation, id, identity))
+    let valid = if with_valid {
+        let (column, field) = batch.schema_ref().column_with_name("valid_micros")
+            .ok_or_else(|| invalid("Owned held point v2 requires valid_micros"))?;
+        if field.data_type() != &DataType::Int64 || !field.is_nullable() || !field.metadata().is_empty() {
+            return Err(invalid("Owned held point valid_micros must be nullable Int64"));
+        }
+        let values = batch.column(column).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| invalid("Owned held point valid_micros must be nullable Int64"))?;
+        (!values.is_null(0)).then(|| Timestamp(values.value(0)))
+    } else {
+        None
+    };
+    Ok((relation, id, valid, identity))
 }
 
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
