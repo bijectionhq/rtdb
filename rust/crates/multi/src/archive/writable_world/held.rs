@@ -89,11 +89,13 @@ enum ArchiveRead {
 enum OrderedRead {
     Page { after: Option<StructFields<Value>>, descending: bool, limit: usize },
     Count,
+    Measure,
 }
 
 enum OrderedResult {
     Page(OwnedRangePage),
     Count(u64),
+    Measure { count: u64, sum: i128 },
 }
 
 pub(crate) struct WorldIdentityPage {
@@ -368,6 +370,17 @@ impl HeldCheckpointWorld {
         let (result, witness) = self.ordered(relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count).await?;
         let OrderedResult::Count(count) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((count, witness))
+    }
+
+    pub async fn measure(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>,
+    ) -> Result<(u64, i128, OwnedWorldWitness)> {
+        if self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
+        let (result, witness) = self.ordered(
+            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Measure,
+        ).await?;
+        let OrderedResult::Measure { count, sum } = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((count, sum, witness))
     }
 
     async fn ordered(
@@ -712,6 +725,16 @@ pub(crate) async fn open_held_checkpoint_world(
                                                 let request = OwnedCountRequest { lower, upper, valid_at: valid };
                                                 let counted = rtdb_node::count_owned_cut(context, &owner, &relation, &path, request).await?;
                                                 OrderedResult::Count(counted.count)
+                                            }
+                                            OrderedRead::Measure => {
+                                                let request = OwnedCountRequest { lower, upper, valid_at: valid };
+                                                let result = rtdb_node::measure_owned_cut(
+                                                    context, &owner, &relation, &path, request,
+                                                ).await?;
+                                                OrderedResult::Measure {
+                                                    count: result.count,
+                                                    sum: result.sum.ok_or_else(OwnedWorld::unavailable)?,
+                                                }
                                             }
                                         };
                                         guard()?;

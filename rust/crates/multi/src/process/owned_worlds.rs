@@ -122,6 +122,11 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::count(self, relation, path, request))
     }
+    fn measure<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
+    ) -> BoxFuture<'a, Result<(u64, i128, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::measure(self, relation, path, request))
+    }
     fn overlay_range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {

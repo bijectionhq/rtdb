@@ -170,9 +170,10 @@ const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
 pub(crate) const HELD_WORLD_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_COUNT_V1: &str = "rtdb.owned.CountHeldWorldRange.v1";
+pub(crate) const HELD_WORLD_MEASURE_V1: &str = "rtdb.owned.MeasureHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
 #[derive(Clone, Copy)]
-pub(crate) enum WorldOrder { ParentRange, ParentCount, OverlayRange }
+pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange }
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
@@ -290,6 +291,14 @@ fn witnessed_schema(
 fn count_batch(count: u64) -> Result<RecordBatch, Status> {
     let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
     RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![count]))]).map_err(arrow)
+}
+
+fn measure_batch(count: u64, sum: i128) -> Result<RecordBatch, Status> {
+    let sum = sum.to_be_bytes();
+    RecordBatch::try_from_iter([
+        ("count", Arc::new(UInt64Array::from(vec![count])) as arrow_array::ArrayRef),
+        ("sum_i128", Arc::new(BinaryArray::from_iter_values([sum.as_slice()]))),
+    ]).map_err(arrow)
 }
 
 impl Leased for OwnedReadResource {
@@ -1287,11 +1296,7 @@ impl Service {
             held.snapshot.count_range_observed(&relation, &path, request).await
         }.map_err(status)?;
         let batch = if measured {
-            let sum = counted.sum.ok_or_else(|| invalid("Owned measure has no covered sum"))?.to_be_bytes();
-            RecordBatch::try_from_iter([
-                ("count", Arc::new(UInt64Array::from(vec![counted.count])) as arrow_array::ArrayRef),
-                ("sum_i128", Arc::new(BinaryArray::from_iter_values([sum.as_slice()]))),
-            ]).map_err(arrow)?
+            measure_batch(counted.count, counted.sum.ok_or_else(|| invalid("Owned measure has no covered sum"))?)?
         } else {
             count_batch(counted.count)?
         };
@@ -1314,7 +1319,7 @@ impl Service {
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, arrow)?;
-        let count = matches!(order, WorldOrder::ParentCount);
+        let count = matches!(order, WorldOrder::ParentCount | WorldOrder::ParentMeasure);
         let fields = if count { 4 } else { 7 };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != fields {
             return Err(invalid("Invalid held world range arguments"));
@@ -1330,8 +1335,13 @@ impl Service {
         let upper = compound_bound(Some(upper))?;
         let (schema, page, witness, count_rows) = if count {
             let request = OwnedCountRequest { lower, upper, valid_at };
-            let (count, witness) = held.snapshot.count(relation.clone(), path, request).await.map_err(status)?;
-            let rows = count_batch(count)?;
+            let (rows, witness) = if matches!(order, WorldOrder::ParentMeasure) {
+                let (count, sum, witness) = held.snapshot.measure(relation.clone(), path, request).await.map_err(status)?;
+                (measure_batch(count, sum)?, witness)
+            } else {
+                let (count, witness) = held.snapshot.count(relation.clone(), path, request).await.map_err(status)?;
+                (count_batch(count)?, witness)
+            };
             (rows.schema(), None, witness, Some(rows))
         } else {
             let (Some(after), Some(Value::Bool(descending)), Some(Value::I64(limit))) =
