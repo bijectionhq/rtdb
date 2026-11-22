@@ -558,6 +558,8 @@ pub struct CheckpointWorldRetention {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suffix: Option<uuid::Uuid>,
     pub basis: rtdb_types::TransactionKey,
+    pub parent_publication: Option<rtdb_types::Timestamp>,
+    pub mode: rtdb_types::WorldClockMode,
     pub until: rtdb_types::Timestamp,
 }
 

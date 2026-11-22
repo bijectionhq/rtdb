@@ -153,10 +153,10 @@ pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdent
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
-pub(crate) const OPEN_WORLD_READ_V3: &str = "rtdb.owned.OpenWorldRead.v3";
+pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const FORK_HELD_WORLD_V1: &str = "rtdb.owned.ForkHeldWorld.v1";
+pub(crate) const FORK_HELD_WORLD_V2: &str = "rtdb.owned.ForkHeldWorld.v2";
 #[derive(Clone, Copy)]
 pub(crate) enum WorldCommitFormat {
     Validation,
@@ -1396,12 +1396,14 @@ impl Service {
         ).await.map_err(status)?;
         let handle = Uuid::new_v4();
         let parent = snapshot.parent_basis();
-        let mut reply = Vec::with_capacity(48);
+        let mut reply = Vec::with_capacity(57);
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.present().0.to_be_bytes());
         reply.extend_from_slice(&parent.tx_id.0.to_be_bytes());
         reply.extend_from_slice(&parent.system_time.0.to_be_bytes());
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
+        reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
+        reply.push(u8::from(snapshot.is_held()));
         let held = Arc::new(OwnedWorldReadResource {
             snapshot, world, conditions: Mutex::new(BTreeMap::new()),
             owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
@@ -1557,6 +1559,16 @@ impl Service {
         let (suffix, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no suffix selector"))?;
         let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no deadline"))?;
+        let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
+        let (requested, rest) = match *mode {
+            0 => (rtdb_node::WorldClockRequest::Retained, rest),
+            1 => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
+            2 => {
+                let (start, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no explicit clock start"))?;
+                (rtdb_node::WorldClockRequest::Held { start: Some(Timestamp(i64::from_be_bytes(*start))) }, rest)
+            }
+            _ => return Err(invalid("Invalid world fork clock mode")),
+        };
         let (attempt, rest) = rest.split_first_chunk::<22>().ok_or_else(|| invalid("World fork has no attempt identity"))?;
         let (fingerprint, groups) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("World fork has no fingerprint"))?;
         let attempt = std::str::from_utf8(attempt).map_err(|_| invalid("Invalid world fork attempt identity"))?;
@@ -1566,10 +1578,10 @@ impl Service {
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let policy = self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
-        let (basis, lease_deadline) = held.snapshot.fork_cut(scope).await.map_err(status)?;
+        let cut = held.snapshot.fork_cut(scope).await.map_err(status)?;
         let groups = owned_groups(groups, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 3; // Deadline, registration and attempt marker.
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4; // Deadline, optional tip check, registration and attempt.
         let (controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
@@ -1582,8 +1594,8 @@ impl Service {
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             Uuid::from_bytes(*capture), (!suffix.is_nil()).then_some(suffix), Timestamp(i64::from_be_bytes(*until)),
             rtdb_node::OwnedWorldFork {
-                world: rtdb_types::Iid(*world), basis, deadline: Timestamp(i64::from_be_bytes(*deadline)).min(lease_deadline),
-                scope, attempt: attempt.into(), fingerprint: *fingerprint, controls,
+                world: rtdb_types::Iid(*world), cut, requested, deadline: Timestamp(i64::from_be_bytes(*deadline)),
+                attempt: attempt.into(), fingerprint: *fingerprint, controls,
             },
         ).await.map_err(status)?;
         if registered.as_bytes() != world { return Err(unsupported()); }

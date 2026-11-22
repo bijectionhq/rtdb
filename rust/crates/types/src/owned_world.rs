@@ -59,6 +59,12 @@ impl WorldSchemas {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum WorldClockMode {
+    Retained,
+    Held { start: Timestamp },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedWorld {
     pub id: Iid,
@@ -66,19 +72,43 @@ pub struct OwnedWorld {
     pub suffix: Option<Iid>,
     pub manifest: String,
     pub basis: TransactionKey,
+    pub parent_publication: Option<Timestamp>,
+    pub mode: WorldClockMode,
     pub until: Timestamp,
     pub schemas: WorldSchemas,
     pub dropped: bool,
 }
 
 impl OwnedWorld {
+    pub fn inherited_clock(&self) -> Timestamp {
+        self.parent_publication.unwrap_or(self.basis.system_time)
+    }
+
+    pub fn initial_clock(&self) -> Timestamp {
+        match self.mode {
+            WorldClockMode::Retained => self.inherited_clock(),
+            WorldClockMode::Held { start } => start,
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        matches!(self.mode, WorldClockMode::Held { .. })
+    }
+
     pub fn record(&self) -> StructFields<Value> {
+        let (mode, start) = match self.mode {
+            WorldClockMode::Retained => ("retained", Value::Null),
+            WorldClockMode::Held { start } => ("held", Value::I64(start.0)),
+        };
         let mut row = StructFields::from([
             ("_id".into(), Value::Uuid(self.id.0)),
             ("capture".into(), Value::Uuid(self.capture.0)),
             ("manifest".into(), Value::Utf8(self.manifest.clone())),
             ("basis_id".into(), Value::I64(self.basis.tx_id.0)),
             ("basis_time".into(), Value::I64(self.basis.system_time.0)),
+            ("parent_publication".into(), self.parent_publication.map_or(Value::Null, |at| Value::I64(at.0))),
+            ("mode".into(), Value::Utf8(mode.into())),
+            ("held_start".into(), start),
             ("until".into(), Value::I64(self.until.0)),
             ("dropped".into(), Value::Bool(self.dropped)),
             (
@@ -113,17 +143,25 @@ impl OwnedWorld {
         else {
             return Err(Self::unavailable());
         };
-        let dropped = match row.get("dropped") {
-            None | Some(Value::Null | Value::Undefined) => false,
-            Some(Value::Bool(dropped)) => *dropped,
+        let parent_publication = match row.get("parent_publication") {
+            Some(Value::Null) => None,
+            Some(Value::I64(at)) if Timestamp::MIN.0 < *at && *at <= *time => Some(Timestamp(*at)),
             _ => return Err(Self::unavailable()),
         };
+        let inherited = parent_publication.unwrap_or(Timestamp(*time));
+        let mode = match (row.get("mode"), row.get("held_start")) {
+            (Some(Value::Utf8(mode)), Some(Value::Null)) if mode == "retained" => WorldClockMode::Retained,
+            (Some(Value::Utf8(mode)), Some(Value::I64(start))) if mode == "held"
+                && *start >= inherited.0 && *start < Timestamp::MAX.0 => WorldClockMode::Held { start: Timestamp(*start) },
+            _ => return Err(Self::unavailable()),
+        };
+        let Some(Value::Bool(dropped)) = row.get("dropped") else { return Err(Self::unavailable()); };
         let suffix = match row.get("suffix") {
             None | Some(Value::Null | Value::Undefined) => None,
             Some(Value::Uuid(id)) if *id != [0; 16] => Some(Iid(*id)),
             _ => return Err(Self::unavailable()),
         };
-        if row.len() != 7 + usize::from(row.contains_key("dropped")) + usize::from(row.contains_key("suffix"))
+        if row.len() != 11 + usize::from(row.contains_key("suffix"))
             || *id == [0; 16]
             || *capture == [0; 16]
             || *until <= *time
@@ -143,9 +181,11 @@ impl OwnedWorld {
                 tx_id: TxId(*tx_id),
                 system_time: Timestamp(*time),
             },
+            parent_publication,
+            mode,
             until: Timestamp(*until),
             schemas: WorldSchemas::from_bytes(schemas)?,
-            dropped,
+            dropped: *dropped,
         })
     }
 
@@ -155,6 +195,8 @@ impl OwnedWorld {
             && self.suffix == other.suffix
             && self.manifest == other.manifest
             && self.basis == other.basis
+            && self.parent_publication == other.parent_publication
+            && self.mode == other.mode
             && self.until == other.until
             && self.schemas == other.schemas
     }

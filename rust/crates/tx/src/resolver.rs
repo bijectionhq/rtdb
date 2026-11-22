@@ -944,21 +944,31 @@ impl<'a> OpenTransaction<'a> {
         if operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedForkWorld { .. }))) {
             let mut forks = 0;
             let mut checks = 0;
+            let mut expected_tip = None;
+            let mut checked_tip = None;
             for operation in operations {
                 match operation {
                     Operation::Public(TxOp::OwnedDeadline { .. }) => {}
                     Operation::Public(TxOp::HostedControl(control)) if control.is_check() => { checks += 1; }
+                    Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected })
+                        if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION && id == "head"
+                            && checked_tip.is_none() => {
+                        checked_tip = Some((*valid_at, *expected));
+                    }
                     Operation::Public(TxOp::OwnedForkWorld { record, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
                         if world.id.0 == [0; 16] || world.dropped || deadline.is_none_or(|until| until > world.until) {
                             return Err(unavailable());
+                        }
+                        if world.initial_clock() > world.inherited_clock() {
+                            expected_tip = Some((world.basis.system_time, world.parent_publication));
                         }
                         forks += 1;
                     }
                     _ => return Err(unavailable()),
                 }
             }
-            if forks != 1 || checks == 0 || operations.len() >= 4096 {
+            if forks != 1 || checks == 0 || expected_tip != checked_tip || operations.len() >= 4096 {
                 return Err(unavailable());
             }
         }
@@ -1122,15 +1132,18 @@ impl<'a> OpenTransaction<'a> {
     ) -> Result<()> {
         use rtdb_types::{OwnedRelation, OwnedWorld};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
-        let basis = self.owned_worlds.get(&world)
-            .ok_or_else(OwnedWorld::unavailable)?.0.basis.system_time;
+        let record = &self.owned_worlds.get(&world).ok_or_else(OwnedWorld::unavailable)?.0;
+        if !record.is_held() && !drop_world {
+            return Err(OwnedWorld::unavailable());
+        }
+        let initial_clock = record.initial_clock();
         let snapshot = self.buffer.base_snapshot();
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let previous = rtdb_query::read_owned_world_clock(context, owner, world).await?;
-        if previous != expected || previous.is_some_and(|at| at <= basis) {
+        if previous != expected || previous.is_some_and(|at| !record.is_held() || at <= initial_clock) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/stale-clock", "The hosted world application clock changed"));
         }
-        let head = previous.unwrap_or(basis);
+        let head = previous.unwrap_or(initial_clock);
         let next = if drop_world {
             None
         } else {
@@ -1317,6 +1330,7 @@ impl<'a> OpenTransaction<'a> {
             }
             let world = relation.world().ok_or_else(unavailable)?;
             let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
+            if !record.is_held() { return Err(unavailable()); }
             let schema = record.schemas.relation(&root)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             schema.require_write_validity(true)?;

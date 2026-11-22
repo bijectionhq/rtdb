@@ -416,10 +416,11 @@ The placed Multi host enables world actions on a listener configured for owned n
 An authenticated, idle autocommit session must remain bound to its writer placement and epoch.
 The host resolves deployment and archive authority from the authenticated placement and the world record.
 
-`rtdb.owned.OpenWorldRead.v3` takes the world UUID and admits one live cut and its verified archived parent.
-The 48-byte result contains the opaque handle, the live present, archived parent transaction ID and system time, and the last application clock. Int64 minimum identifies a world with no local application publication. Each coordinate is a signed big-endian 64-bit integer. Times are Unix microseconds.
+`rtdb.owned.OpenWorldRead.v4` takes the world UUID and admits one live cut and its verified archived parent.
+The 57-byte result contains the opaque handle, live present, archived parent transaction ID and system time, last local application clock, initial data clock and one mode byte (0 retained, 1 held). Int64 minimum identifies an absent local application publication. Each integer is signed big-endian. Times are Unix microseconds.
 `rtdb.owned.ReadHeldWorldPoint.v2` takes the 16-byte held handle, one observation flag byte (0 for read-only or 1 to request a witness), then a relation prefix and a terminated single-row Arrow IPC stream with `_id` and non-null `valid_micros: Int64`.
 The response reports the held present and valid instant in schema metadata. A found row also carries its exact winning revision.
+Retained worlds are read-only. Held worlds accept fixed-valid replacements, tombstones and explicit clock advances.
 The point response schema includes `rtdb.owned.world_shadowed` (0 or 1). A local tombstone counts as a shadow.
 Every call reads the same live cut and archive root. The held handle stays bound to the original authenticated session and attachment.
 Use `rtdb.owned.CloseWorldRead.v1` with the 16-byte handle to cancel the read. Success has zero Flight results. The archive lease releases after in-flight I/O drains.
@@ -481,9 +482,11 @@ The ordered transaction checks the world registration, placement, deadline, loca
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
 
-`rtdb.owned.ForkHeldWorld.v1` creates one retained world from an authenticated Root hold at the exact authorized capture or accepted suffix.
-The body carries the 16-byte hold, minted world, capture and optional suffix (nil selects the base capture), followed by expiry and deadline as big-endian i64, the 22-byte attempt ID, its 32-byte fingerprint, and check-only hosted controls.
-The placed owner derives the archived cut before pinning and orders the registration with the attempt marker.
+`rtdb.owned.ForkHeldWorld.v2` creates a retained or held world from an authenticated Root hold at the exact authorized capture or accepted suffix.
+The body carries the 16-byte hold, minted world, capture and optional suffix (nil selects the base capture), followed by expiry and deadline as big-endian i64.
+A byte selects retained (0), held at the inherited clock (1), or held with an explicit start (2 followed by a big-endian i64 timestamp).
+The final fields are the 22-byte attempt ID, its 32-byte fingerprint, and check-only hosted controls.
+The placed owner derives the parent publication from the archived cut. A forward start requires an unchanged original live Root head.
 The response carries the minted 16-byte world followed by the transaction ID and system time as big-endian i64.
 
 `rtdb.owned.CommitHeldWorlds.v3` orders fixed-valid replacements and tombstones in one to eight distinct hosted checkpoint worlds as one source transaction.
