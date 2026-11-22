@@ -1,4 +1,4 @@
-use std::{fmt::Write, sync::Arc};
+use std::{collections::BTreeMap, fmt::Write, sync::Arc};
 
 use rtdb_columnar::OwnedBatch;
 use rtdb_types::{
@@ -11,20 +11,30 @@ use crate::{
 };
 
 pub const OWNED_UNIQUE_KEY_MAX: usize = 4096;
-const DECLARATION_ID: &str = "!path";
+pub const OWNED_UNIQUE_PATHS_MAX: usize = 16;
+pub const OWNED_UNIQUE_POLICY_ID: &str = "!path";
 
-pub struct OwnedUniqueRule {
-    pub path: OwnedRelation,
-    pub column: String,
+#[derive(Default)]
+pub struct OwnedUniquePolicy {
+    pub paths: BTreeMap<OwnedRelation, String>,
     pub through_events: i64,
 }
 
-impl OwnedUniqueRule {
+impl OwnedUniquePolicy {
     pub fn document(&self) -> StructFields<Value> {
+        let paths = self
+            .paths
+            .iter()
+            .map(|(path, column)| {
+                Value::Struct(StructFields::from([
+                    ("path".into(), Value::Utf8(path.name().into())),
+                    ("column".into(), Value::Utf8(column.clone())),
+                ]))
+            })
+            .collect();
         StructFields::from([
-            ("_id".into(), Value::Utf8(DECLARATION_ID.into())),
-            ("path".into(), Value::Utf8(self.path.name().into())),
-            ("column".into(), Value::Utf8(self.column.clone())),
+            ("_id".into(), Value::Utf8(OWNED_UNIQUE_POLICY_ID.into())),
+            ("paths".into(), Value::List(paths)),
             ("through_events".into(), Value::I64(self.through_events)),
         ])
     }
@@ -39,36 +49,65 @@ pub fn owned_unique_key_id(key: &[u8]) -> EntityId {
     EntityId::String(name)
 }
 
-pub async fn read_owned_unique_rule(
+pub fn owned_unique_path_key(path: &OwnedRelation, key: &[u8]) -> EntityId {
+    let name = path.name().as_bytes();
+    let mut bytes = Vec::with_capacity(1 + name.len() + key.len());
+    bytes.push(name.len() as u8);
+    bytes.extend_from_slice(name);
+    bytes.extend_from_slice(key);
+    owned_unique_key_id(&bytes)
+}
+
+pub async fn read_owned_unique_policy(
     context: Arc<QueryContext>,
     owner: &str,
     relation: &OwnedRelation,
-) -> Result<OwnedUniqueRule> {
-    let id = EntityId::String(DECLARATION_ID.into());
+) -> Result<OwnedUniquePolicy> {
+    let id = EntityId::String(OWNED_UNIQUE_POLICY_ID.into());
     let cursor = open_owned_unique_point(
         context.clone(),
         owner,
         relation,
         &id,
-        &["path", "column", "through_events"],
+        &["paths", "through_events"],
     )
     .await?;
     let batch = single(cursor).await?.ok_or_else(uncovered)?;
     owned_row_revision(batch.batch(), 0, &id, &context.memory)?;
-    let (Value::Utf8(path), Value::Utf8(column), Value::I64(through_events)) = (
-        cell(&batch, "path", &context)?,
-        cell(&batch, "column", &context)?,
+    let (Value::List(paths), Value::I64(through_events)) = (
+        cell(&batch, "paths", &context)?,
         cell(&batch, "through_events", &context)?,
     ) else {
         return Err(uncovered());
     };
-    if through_events < 0 || column.is_empty() || column.len() > 96 || column.starts_with('_') {
+    if through_events < 0 || !(1..=OWNED_UNIQUE_PATHS_MAX).contains(&paths.len()) {
         return Err(uncovered());
     }
-    let path = OwnedRelation::new(path).map_err(|_| uncovered())?;
-    Ok(OwnedUniqueRule {
-        path,
-        column,
+    let mut installed = BTreeMap::new();
+    for path in paths {
+        let Value::Struct(path) = path else {
+            return Err(uncovered());
+        };
+        let (Some(Value::Utf8(name)), Some(Value::Utf8(column))) =
+            (path.get("path"), path.get("column"))
+        else {
+            return Err(uncovered());
+        };
+        let name = OwnedRelation::new(name.clone()).map_err(|_| uncovered())?;
+        if path.len() != 2
+            || column.is_empty()
+            || column.len() > 96
+            || column.starts_with('_')
+            || installed
+                .last_key_value()
+                .is_some_and(|(prior, _)| prior >= &name)
+        {
+            return Err(uncovered());
+        }
+        installed.insert(name, column.clone());
+    }
+    Ok(OwnedUniquePolicy {
+        paths: installed,
         through_events,
     })
 }
@@ -83,7 +122,8 @@ pub async fn lookup_owned_unique(
     context: Arc<QueryContext>,
     owner: &str,
     relation: &OwnedRelation,
-    rule: &OwnedUniqueRule,
+    path: &OwnedRelation,
+    column: &str,
     key: &[u8],
     valid: Timestamp,
 ) -> Result<Option<OwnedUniqueHit>> {
@@ -93,8 +133,10 @@ pub async fn lookup_owned_unique(
             "A unique lookup needs a complete Binary key of at most 4096 bytes",
         ));
     }
-    let _key = context.memory.reserve(key.len() * 4 + 4096)?;
-    let id = owned_unique_key_id(key);
+    let _key = context
+        .memory
+        .reserve((key.len() + path.name().len()) * 4 + 4096)?;
+    let id = owned_unique_path_key(path, key);
     let cursor =
         open_owned_unique_point(context.clone(), owner, relation, &id, &["holder"]).await?;
     let Some(row) = single(cursor).await? else {
@@ -109,7 +151,7 @@ pub async fn lookup_owned_unique(
         open_owned_point(context.clone(), owner, relation, &holder, Some(valid), None).await?;
     let row = single(cursor).await?.ok_or_else(uncovered)?;
     let revision = owned_row_revision(row.batch(), 0, &holder, &context.memory)?;
-    match cell(&row, &rule.column, &context)? {
+    match cell(&row, column, &context)? {
         Value::Binary(actual) if actual.as_slice() == key => {
             Ok(Some(OwnedUniqueHit { row, revision }))
         }

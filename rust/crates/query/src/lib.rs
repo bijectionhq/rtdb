@@ -66,7 +66,7 @@ mod owned_purge;
 pub use owned_purge::{OwnedPurgeBucket, owned_purge_floor, read_owned_purge_bucket, purge_coverage_document};
 mod owned_relation;
 mod owned_unique;
-pub use owned_unique::{OwnedUniqueHit, OwnedUniqueRule, OWNED_UNIQUE_KEY_MAX, lookup_owned_unique, owned_unique_key_id, read_owned_unique_rule};
+pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, OWNED_UNIQUE_PATHS_MAX, OWNED_UNIQUE_POLICY_ID, lookup_owned_unique, owned_unique_key_id, owned_unique_path_key, read_owned_unique_policy};
 pub use owned_relation::{
     OwnedChangeEntry, OwnedIdentityCandidates, open_owned_artefact_candidate, open_owned_capacity_point, open_owned_identity_page, open_owned_path_catalog, open_owned_point, open_owned_point_at_system,
     open_owned_unique_point, open_owned_valid_boundaries, open_owned_valid_during_at, owned_identity_candidates, owned_row_revision, read_owned_parent_schemas, read_owned_root_publication,
