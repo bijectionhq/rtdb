@@ -74,6 +74,9 @@ impl OwnedReadSession {
         let context = self
             .context
             .with_owned_system_cut(selected, &cancellation)?;
+        let purge_context = self
+            .context
+            .with_owned_system_cut(self.present.system_time, &cancellation)?;
         self.check()?;
         context.check_cancelled()?;
         Ok(Some(Self {
@@ -90,7 +93,7 @@ impl OwnedReadSession {
             historical: Some(Scope {
                 system_time: selected,
                 relations,
-                purge_context: Arc::clone(&self.context),
+                purge_context,
             }),
             _reservation: charge,
         }))
