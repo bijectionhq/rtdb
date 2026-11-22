@@ -367,58 +367,79 @@ fn int_value(value: &Value) -> Option<i64> {
     match value { Value::I8(v) => Some(i64::from(*v)), Value::I16(v) => Some(i64::from(*v)), Value::I32(v) => Some(i64::from(*v)), Value::I64(v) => Some(*v), _ => None }
 }
 
-/// A probe batch's key cells, where its column holds only the build key's kind (an integer union's legs included).
-enum ProbeKey<'a> { Int(Vec<Option<i64>>), Utf8(&'a arrow_array::StringArray) }
+/// Borrows a probe key from its integer, integer-union, or string column.
+enum ProbeKey<'a> { IntArrow(&'a dyn Array), IntValues(&'a [Value]), Utf8(&'a arrow_array::StringArray) }
 impl<'a> ProbeKey<'a> {
     fn of(column: &'a Column, kind: KeyKind) -> Option<Self> {
         match (column, kind) {
-            (Column::Arrow { array, field, .. }, KeyKind::Utf8) if field.metadata().is_empty() => array.as_any().downcast_ref::<arrow_array::StringArray>().map(Self::Utf8),
-            (Column::Arrow { array, field, .. }, KeyKind::Int) if field.metadata().is_empty() => int_cells(array.as_ref()).map(Self::Int),
-            (Column::Values(values), KeyKind::Int) => values.iter().map(|value| match value { Value::Null => Some(None), value => int_value(value).map(Some) }).collect::<Option<Vec<_>>>().map(Self::Int),
+            (Column::Arrow { array, field, .. }, KeyKind::Utf8) if field.metadata().is_empty() =>
+                array.as_any().downcast_ref::<arrow_array::StringArray>().map(Self::Utf8),
+            (Column::Arrow { array, field, .. }, KeyKind::Int) if field.metadata().is_empty() && int_layout(array.as_ref()) =>
+                Some(Self::IntArrow(array.as_ref())),
+            (Column::Values(values), KeyKind::Int) if values.iter().all(|value| matches!(value, Value::Null) || int_value(value).is_some()) =>
+                Some(Self::IntValues(values)),
             _ => None,
         }
     }
-    /// The row's hash as `hash_values` takes it of the cell's value; none for a null, which matches nothing.
-    fn hash(&self, row: usize) -> Option<u32> {
-        let cell = match self {
-            Self::Int(cells) => rtdb_columnar::hash_value(&Value::I64(cells[row]?), 0).ok()?,
-            Self::Utf8(array) => { if array.is_null(row) { return None; } rtdb_columnar::xxhash32(array.value(row).as_bytes(), 0) as i32 }
-        };
-        Some(combine_cell_hash(0, cell))
+
+    fn integer(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::IntArrow(array) => int_cell(*array, row),
+            Self::IntValues(values) => int_value(&values[row]),
+            Self::Utf8(_) => None,
+        }
     }
+
+    fn hash(&self, row: usize) -> Option<u32> {
+        let key = match self {
+            Self::Utf8(array) if !array.is_null(row) => ScalarKey::Text(array.value(row)),
+            Self::Utf8(_) => return None,
+            _ => ScalarKey::Signed(self.integer(row)?),
+        };
+        Some(combine_cell_hash(0, key.hash() as i32))
+    }
+
     fn equals(&self, row: usize, build: &Value) -> bool {
         match (self, build) {
-            (Self::Int(cells), build) => cells[row].is_some_and(|probe| int_value(build) == Some(probe)),
             (Self::Utf8(array), Value::Utf8(build)) => !array.is_null(row) && array.value(row) == build.as_str(),
-            _ => false,
+            (Self::Utf8(_), _) => false,
+            _ => self.integer(row).is_some_and(|probe| int_value(build) == Some(probe)),
         }
     }
 }
-/// An integer column's cells widened to i64, through each leg of a dense union whose legs are integers or null.
-pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
+
+fn int_layout(array: &dyn Array) -> bool {
+    use arrow_schema::DataType;
+    match array.data_type() {
+        DataType::Union(legs, arrow_schema::UnionMode::Dense) => legs.iter().all(|(_, leg)| {
+            leg.metadata().is_empty() && matches!(leg.data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null)
+        }),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => true,
+        _ => false,
+    }
+}
+
+fn int_cell(array: &dyn Array, row: usize) -> Option<i64> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
     use arrow_schema::DataType;
-    let scalar = |array: &dyn Array, row: usize| -> Option<Option<i64>> {
-        if array.is_null(row) { return Some(None); }
-        Some(Some(match array.data_type() {
-            DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
-            DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
-            DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
-            DataType::Int64 => array.as_primitive::<Int64Type>().value(row),
-            DataType::Null => return Some(None),
-            _ => return None,
-        }))
-    };
-    match array.data_type() {
-        DataType::Union(legs, arrow_schema::UnionMode::Dense) => {
-            if !legs.iter().all(|(_, leg)| leg.metadata().is_empty() && matches!(leg.data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null)) { return None; }
-            let union = array.as_any().downcast_ref::<arrow_array::UnionArray>()?;
-            (0..union.len()).map(|row| scalar(union.child(union.type_id(row)).as_ref(), union.value_offset(row))).collect()
+
+    if array.is_null(row) { return None; }
+    Some(match array.data_type() {
+        DataType::Int8 => i64::from(array.as_primitive::<Int8Type>().value(row)),
+        DataType::Int16 => i64::from(array.as_primitive::<Int16Type>().value(row)),
+        DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
+        DataType::Int64 => array.as_primitive::<Int64Type>().value(row),
+        DataType::Union(..) => {
+            let union = array.as_union();
+            return int_cell(union.child(union.type_id(row)).as_ref(), union.value_offset(row));
         }
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => (0..array.len()).map(|row| scalar(array, row)).collect(),
-        _ => None,
-    }
+        _ => return None,
+    })
+}
+
+pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
+    int_layout(array).then(|| (0..array.len()).map(|row| int_cell(array, row)).collect())
 }
 
 #[async_trait::async_trait]

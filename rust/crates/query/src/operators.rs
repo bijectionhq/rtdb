@@ -278,7 +278,9 @@ pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Exec
     if let RelationNode::Let { binding, .. } = runtime.relation().node() {
         return build_materialized_columns(&runtime, binding, execution).await;
     }
-    let standalone_join = matches!(runtime.relation().node(), RelationNode::Join { kind: rtdb_plan::JoinKind::Inner, condition: Some(_), .. });
+    let standalone_join = matches!(runtime.relation().node(),
+        RelationNode::Join { left, right, kind: rtdb_plan::JoinKind::Inner, condition: Some(_) }
+            if matches!(left.node(), RelationNode::Scan(_)) && matches!(right.node(), RelationNode::Scan(_)));
     if !standalone_join && batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
     let reservation = state_reservation(&runtime, &execution)?;
     let Some((batches, _)) = build_batch_input(runtime, execution, None, BatchOutput::Arrow).await? else { return Ok(None) };

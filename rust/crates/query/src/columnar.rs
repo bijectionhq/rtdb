@@ -490,15 +490,22 @@ impl ColumnBatch {
     /// A page of rows as columns of values, charged as each column is built.
     pub fn from_page(page: &OwnedPage, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = page.rows().first().map_or(0, |row| row.values.len());
-        let mut reservation = memory.reserve(256)?;
+        let bound = width.checked_mul(std::mem::size_of::<Column>()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let mut reservation = memory.reserve(bound)?;
         let mut columns = Vec::with_capacity(width);
         for position in 0..width {
-            let column = Column::Values(page.rows().iter().map(|row| row.values.get(position).cloned().ok_or_else(|| invalid("column-row", "A row is narrower than its page"))).collect::<Result<_>>()?);
+            let cells = page.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
+            let bytes = page.rows().iter().try_fold(cells, |bytes, row| {
+                let value = row.values.get(position).ok_or_else(|| invalid("column-row", "A row is narrower than its page"))?;
+                bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)
+            })?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
-            lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
-            columns.push(column);
+            lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
+            let mut values = Vec::with_capacity(page.len());
+            values.extend(page.rows().iter().map(|row| row.values[position].clone()));
+            columns.push(Column::Values(values));
         }
-        Self::settled(columns, page.len(), reservation)
+        Ok(Self { columns, len: page.len(), reservation, appended: Vec::new() })
     }
 
     /// Materialises every row, admitting the page's rows together before any is built.
