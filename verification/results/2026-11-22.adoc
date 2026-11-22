@@ -70,3 +70,52 @@ Local evidence under `/private/tmp/rtdb-formal.QMjPSJsX/` includes command argum
 
 The production tree is `80a7f0f32943b1bc525e379a464263a42c20a1b0`.
 The two preceding merge commits consolidated branch history while retaining identical source trees.
+
+== W2 and R5 · Fork publication across whole-residence disposal
+
+Production change `4ac4d1716`, tree `925442dae362203bcb0b3a1150cf074c0bd8b8d4`.
+This increment uses the local reclamation lineage state introduced in `6e9d6182d`.
+Whole-residence disposal acquires a distinct, persistent phase against the version of the drained physical owner. The phase advances the preparation generation before the referrer inventory is read.
+An interrupted disposal can resume against the same physical scope. Its receipt and the reopening of that phase publish together.
+A remote fork observes the open generation before storage preparation. After disposal, a stale preparation is refused and a fresh one can use the surviving copy.
+
+[cols="1,4",options="header"]
+|===
+|Evidence | Result
+
+|Lean
+|Three theorems cover generation monotonicity over arbitrary histories, rejection of preparations from before the close and exact residence settlement. Their axiom audit was empty. Three mutation controls matched. The full Lean runner passed after adjusting the monotonicity proof to accept both advancing and unchanged generations, so the close mutation is attributed to the stale-preparation law.
+
+|TLC and Apalache
+|TLC explored 42 states of the model with a source, existing child and prospective grandchild, including restart. Five safety controls failed as expected, and the reachability control found fresh publication after receipt. All 365 repository cases matched their expected outcomes.
+Apalache checked the same invariant through 11 transitions and completed the other configured symbolic checks.
+
+|Verus
+|The shared-reference area verified 11 functions and laws, including the production tests for an open current generation and exact disposal scope. Eight new code and paired code-and-contract controls matched.
+All 41 areas and 219 controls matched.
+
+|Native
+|493 cases passed and 11 were ignored across Directory, storage, S3, maintenance, Multi and simulation. The fixture ran the shared Directory contract in memory, over TCP and with in-memory DynamoDB Local 3.3.2.
+The disposal replay reopens a durable local directory after reserving the lineage, checks that disposal copies into the published child and rejects an old preparation, then publishes a fresh fork.
+The replay rejects three source controls covering a lost reservation, a receipt that leaves the reservation behind and publication with a stale generation.
+The two existing lineage publication controls and both inherited-read disposal controls also matched.
+
+|JVM
+|3,198 standard tests, 3,348 property cases and 12 focused S3 proxy integration tests passed with zero failures, errors or skips. The FFI artifact was rebuilt and retained SHA-256 `0b7f18375ac27e9d12cdd03b163c2e728447bd7fc398176ecbaa39f933a0bac3`. The proxy tests exercise the JVM adapter on a local endpoint.
+
+|Other design checks
+|The existing Alloy, Maude, mCRL2 and AutoHyper suites matched.
+|===
+
+The execution evidence covers the local provider, TCP and DynamoDB Local. The remote directory transaction is exercised against DynamoDB Local. Live S3 disposal and ordinary remote garbage collection still need provider evidence and the ordinary reaper still needs version-bound authorization. Physical-owner admission for administrative copy and remote preparation I/O remains open.
+
+=== Reproduction
+
+The model cases, executable predicate proofs and mutations are included in link:../README.adoc[the repository runner].
+The native controls require a loopback DynamoDB Local endpoint to exercise the backend transaction.
+Commands and logs are retained under `/private/tmp/rtdb-formal.QMjPSJsX/`.
+
+* `reference-disposal-final-native-sjixezbz/` has the scoped Rust run and the targeted native replays. The local fixture was started in memory with telemetry disabled and stopped after the run.
+* `reference-disposal-combined-h_5pk4lw/` has the TLC, Apalache, Verus, Alloy, Maude, mCRL2 and AutoHyper runs.
+* `reference-disposal-lean-final-dy6zlwij/` has the full Lean run and its controls.
+* `reference-disposal-jvm.log` and `reference-disposal-s3-integration.log` have the Gradle results.
