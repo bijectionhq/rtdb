@@ -2101,6 +2101,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn columnar_outer_joins_preserve_null_keys_unmatched_positions_and_empty_inputs() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(2), Value::Null]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        left.columns.push(Field { id: ColumnId(1), name: "_id".into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) });
+        let mut right = left.clone();
+        for field in &mut right.columns { field.id.0 += 10; }
+        let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+        left.predicates.push(Expr::binary(BinaryOp::NotEq, left.columns[1].expression(), Expr::Literal(Value::I64(2))));
+        right.predicates.push(Expr::binary(BinaryOp::NotEq, right.columns[1].expression(), Expr::Literal(Value::I64(1))));
+        for (kind, empty_side) in [
+            (JoinKind::Full, None), (JoinKind::Left, None), (JoinKind::Right, None), (JoinKind::Single, None),
+            (JoinKind::Full, Some(0)), (JoinKind::Full, Some(1)),
+        ] {
+            let (mut left, mut right) = (left.clone(), right.clone());
+            if let Some(side) = empty_side {
+                let input = if side == 0 { &mut left } else { &mut right };
+                input.predicates.push(Expr::Literal(Value::Bool(false)));
+            }
+            let plan = Arc::new(Relation::join(
+                Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), kind, Some(condition.clone()),
+            ).unwrap());
+            let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+            let mut expected = crate::operators::build_pages(Arc::clone(&runtime), execution.clone()).await.unwrap();
+            let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected columnar join");
+            let mut actual = Vec::new();
+            let mut baseline = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                assert!(batch.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
+                actual.extend((0..batch.len).map(|row| batch.columns.iter().map(|column| column.value(row).unwrap()).collect::<Vec<_>>()));
+            }
+            while let Some(page) = expected.next_page().await.unwrap() {
+                baseline.extend(page.rows().iter().map(|row| row.values.clone()));
+            }
+            assert_eq!(actual, baseline, "{kind:?} with empty side {empty_side:?}");
+            assert!(!actual.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_single_join_detects_duplicate_matches_before_emitting_a_page() {
+        use rtdb_plan::{BinaryOp, JoinKind, Relation};
+
+        let (state, table, _) = live_table_with_values([Value::I64(1), Value::I64(1)]);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (left, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);
+        let mut right = left.clone();
+        right.columns[0].id = ColumnId(10);
+        let condition = Expr::binary(BinaryOp::Eq, left.columns[0].expression(), right.columns[0].expression());
+        let plan = Arc::new(Relation::join(
+            Arc::new(Relation::scan(left).unwrap()), Arc::new(Relation::scan(right).unwrap()), JoinKind::Single, Some(condition),
+        ).unwrap());
+        let runtime = crate::runtime_schema::EmittedRelation::derive(plan, &execution.context.catalog, &[], &memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().expect("Expected columnar join");
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, crate::cardinality_violation().code);
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn outer_unnest_expands_list_positions_and_keeps_arrow_payloads() {
         use rtdb_plan::{Relation, RelationNode, Schema};
 

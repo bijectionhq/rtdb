@@ -256,8 +256,8 @@ async fn build_batches_at(
             let join = crate::cross::CrossBatchJoin::new(left, right, execution.context);
             Ok(Some((Box::new(join), left_projected || right_projected)))
         }
-        RelationNode::Join { left,right,kind: kind @ (rtdb_plan::JoinKind::Inner | rtdb_plan::JoinKind::Semi | rtdb_plan::JoinKind::Anti),condition: Some(condition) }
-            if execution.analysis.is_none() && execution.context.tracer.is_none() => {
+        RelationNode::Join { left,right,kind,condition: Some(condition) }
+            if *kind != rtdb_plan::JoinKind::Cross && execution.analysis.is_none() && execution.context.tracer.is_none() => {
             use rtdb_plan::JoinKind;
             if *kind != JoinKind::Inner && output != BatchOutput::Arrow { return Ok(None); }
             let (Some(build_projected),Some(probe_projected)) = (batch_shape(&runtime.child(0)?, BatchOutput::Pages)?,batch_shape(&runtime.child(1)?, BatchOutput::Pages)?) else { return Ok(None) };
@@ -296,8 +296,9 @@ pub(crate) async fn build_columns(runtime: Arc<EmittedRelation>, execution: Exec
         return build_materialized_columns(&runtime, binding, execution).await;
     }
     let standalone_join = matches!(runtime.relation().node(),
-        RelationNode::Join { left, right, kind: rtdb_plan::JoinKind::Inner | rtdb_plan::JoinKind::Semi | rtdb_plan::JoinKind::Anti, condition: Some(_) }
-            if matches!(left.node(), RelationNode::Scan(_)) && matches!(right.node(), RelationNode::Scan(_)));
+        RelationNode::Join { left, right, kind, condition: Some(_) }
+            if *kind != rtdb_plan::JoinKind::Cross
+                && matches!(left.node(), RelationNode::Scan(_)) && matches!(right.node(), RelationNode::Scan(_)));
     if !standalone_join && batch_shape(&runtime, BatchOutput::Arrow)?.is_none() { return Ok(None); }
     let reservation = state_reservation(&runtime, &execution)?;
     let Some((batches, _)) = build_batch_input(runtime, execution, None, BatchOutput::Arrow).await? else { return Ok(None) };

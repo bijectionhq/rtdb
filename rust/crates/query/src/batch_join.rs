@@ -1,6 +1,6 @@
 //! Equi-joins of batch inputs on column equalities.
 //! Build rows are indexed in input order and the probe gathers its matches from the saved column positions.
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::ControlFlow};
 use std::sync::Arc;
 
 use arrow_array::Array;
@@ -8,7 +8,7 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{BinaryOp, Expr, JoinKind};
 use rtdb_types::{Result, Value};
 
-use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows};
+use crate::columnar::{BatchCursor, BoxBatchCursor, Column, ColumnBatch, gather_column_rows, gather_nullable_column};
 use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
@@ -47,6 +47,7 @@ struct Table {
     keys: BuildKeys,
     index: HashIndex,
     rows: usize,
+    unmatched: Option<(Vec<u8>, Arc<MemoryReservation>)>,
     _keys: Arc<MemoryReservation>,
     _inventory: Arc<MemoryReservation>,
 }
@@ -64,13 +65,17 @@ pub(crate) struct BatchJoin { state: State, spec: Spec }
 
 /// What the join compares and how it reads cells, fixed for its lifetime.
 /// `unswapped` is the join's own layout where the join builds its right input, which a spill hands to the row join.
-struct Spec { order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, kind: JoinKind, projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, execution: Execution }
+struct Spec {
+    order: Vec<bool>, build_keys: Vec<usize>, probe_keys: Vec<usize>, widths: [usize; 2], kind: JoinKind,
+    projected: bool, swapped: bool, unswapped: Option<JoinLayout>, validate_payloads: bool, execution: Execution,
+}
 
 impl BatchJoin {
     pub fn new(build: BoxBatchCursor, probe: ProbeInput, layout: JoinLayout, order: Vec<bool>, projected: bool, execution: Execution) -> Self {
         let build_keys = layout.left.key_positions().to_vec();
         let probe_keys = layout.right.key_positions().to_vec();
-        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, kind: JoinKind::Inner, projected, swapped: false, unswapped: None, validate_payloads: false, execution } }
+        let widths = [layout.left.original.len(), layout.right.original.len()];
+        Self { state: State::Build { build, probe, layout }, spec: Spec { order, build_keys, probe_keys, widths, kind: JoinKind::Inner, projected, swapped: false, unswapped: None, validate_payloads: false, execution } }
     }
 }
 
@@ -85,6 +90,12 @@ impl BatchJoin {
 }
 
 impl Spec {
+    fn preserves_probe(&self) -> bool {
+        crate::join::preserves_probe(self.kind, !self.swapped)
+    }
+    fn tracks_build(&self) -> bool {
+        crate::join::tracks_build(self.kind, !self.swapped)
+    }
     fn cell(&self, column: &Column, row: usize) -> Result<Value> {
         let mut value = column.value(row)?;
         if self.projected { value.admit_expression_dates()?; }
@@ -147,7 +158,7 @@ impl Spec {
         let index = HashIndex::new(&hashes, &memory)?;
         drop(hashes);
         drop(_hashes);
-        let blooms = self.kind != JoinKind::Anti;
+        let blooms = matches!(self.kind, JoinKind::Inner | JoinKind::Semi) || self.tracks_build() && self.kind != JoinKind::Full;
         let mut filters = PushdownBuilder::new(layout.condition.as_ref(), &layout.left.schema, &layout.right.original, i64::try_from(rows).map_err(|_| size_error())?, blooms, &self.execution)?;
         if blooms {
             match &keys {
@@ -173,7 +184,14 @@ impl Spec {
             return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's probe input did not open as batches"));
         };
         if probe_projected != self.projected { return Err(rtdb_types::Anomaly::fault("rtdb.query/batch-join", "A batch join's inputs disagree on date admission")); }
-        Ok(State::Probe { table: Table { batches, starts, keys, index, rows, _keys: reservation, _inventory: inventory }, probe: probe_batches })
+        let unmatched = if self.tracks_build() {
+            let charge = memory.reserve(rows)?;
+            Some((vec![1; rows], charge))
+        } else {
+            None
+        };
+        Ok(State::Probe { table: Table { batches, starts, keys, index, rows, unmatched,
+            _keys: reservation, _inventory: inventory }, probe: probe_batches })
     }
 
     fn arrow_build_hashes(&self, batches: &[ColumnBatch], hashes: &mut Vec<u32>) -> Result<bool> {
@@ -199,9 +217,13 @@ impl Spec {
         Ok(State::Rows(Box::new(crate::join::JoinCursor::new(build, probe, layout, build_left, self.kind, self.execution.clone())?)))
     }
 
-    fn probe_batch(&self, table: &Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
+    fn probe_batch(&self, table: &mut Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
         if self.validate_payloads { probe.validate_readable(&self.execution.context)?; }
-        if self.kind != JoinKind::Inner { return self.probe_membership(table, probe); }
+        match self.kind {
+            JoinKind::Semi | JoinKind::Anti => return self.probe_membership(table, probe),
+            JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Single => return self.probe_outer(table, probe),
+            _ => {}
+        }
         let mut matched = Matches { pairs: Vec::new(), probes: Vec::new(), charge: self.execution.context.memory.reserve(4096)? };
         match &table.keys {
             BuildKeys::Arrow => self.probe_arrow_keys(table, probe, &mut matched)?,
@@ -240,52 +262,113 @@ impl Spec {
         let _selection = memory.reserve(bytes)?;
         let mut selected = Vec::with_capacity(probe.len);
         let equality = self.execution.scope()?;
-        let width = self.build_keys.len();
         for row in 0..probe.len {
             context.check_cancelled_at(row)?;
-            let mut probe_values = None;
-            let mut hashed = if self.kind == JoinKind::Semi {
-                let hash = match arrow_hash(probe, row, &self.probe_keys) {
-                    Some(hash) => hash,
-                    None => {
-                        let key = self.value_keys(probe, row, &self.probe_keys)?;
-                        let hash = hash_values(&key.0)?;
-                        probe_values = Some(key);
-                        hash
-                    }
-                };
-                Some(table.index.candidates(hash))
-            } else {
-                None
-            };
-            // Anti joins test the build side in source order, including candidates with different hashes.
-            let mut all = 0..table.rows;
-            let candidates = std::iter::from_fn(|| match &mut hashed { Some(rows) => rows.next(), None => all.next() });
-            let mut matched = false;
-            for (candidate, ordinal) in candidates.enumerate() {
-                context.check_cancelled_at(candidate)?;
-                let (batch, offset) = table.position(ordinal);
-                let build = &table.batches[batch];
-                if let Some(equal) = self.equal_arrow(build, offset, probe, row) {
-                    if equal { matched = true; break; }
-                    continue;
-                }
-                if probe_values.is_none() { probe_values = Some(self.value_keys(probe, row, &self.probe_keys)?); }
-                let key = &probe_values.as_ref().expect("The probe key was read").0;
-                matched = match &table.keys {
-                    BuildKeys::Arrow => {
-                        let (build, _scratch) = self.value_keys(build, offset, &self.build_keys)?;
-                        self.equal_values(&build, key, &equality)?
-                    }
-                    BuildKeys::Values { keys, .. } => self.equal_values(&keys[ordinal * width..(ordinal + 1) * width], key, &equality)?,
-                };
-                if matched { break; }
-            }
+            let matched = self.matching_build_rows(table, probe, row, &equality, |_| Ok(ControlFlow::Break(())))?;
             if matched == (self.kind == JoinKind::Semi) { selected.push((0, row)); }
         }
         if selected.is_empty() { return Ok(None); }
         let columns = (0..probe.columns.len()).collect::<Vec<_>>();
         ColumnBatch::take_rows(&[probe], &selected, &columns, memory).map(Some)
+    }
+
+    fn matching_build_rows(
+        &self, table: &Table, probe: &ColumnBatch, row: usize, equality: &rtdb_expr::EvaluationScope,
+        mut accept: impl FnMut(usize) -> Result<ControlFlow<()>>,
+    ) -> Result<bool> {
+        let mut probe_values = None;
+        let mut hashed = if self.kind != JoinKind::Anti {
+            let hash = match arrow_hash(probe, row, &self.probe_keys) {
+                Some(hash) => hash,
+                None => {
+                    let key = self.value_keys(probe, row, &self.probe_keys)?;
+                    let hash = hash_values(&key.0)?;
+                    probe_values = Some(key);
+                    hash
+                }
+            };
+            Some(table.index.candidates(hash))
+        } else {
+            None
+        };
+        // Anti joins test the build side in source order, including candidates with different hashes.
+        let mut all = 0..table.rows;
+        let candidates = std::iter::from_fn(|| match &mut hashed { Some(rows) => rows.next(), None => all.next() });
+        let mut matched = false;
+        let width = self.build_keys.len();
+        for (candidate, ordinal) in candidates.enumerate() {
+            self.execution.context.check_cancelled_at(candidate)?;
+            let (batch, offset) = table.position(ordinal);
+            let build = &table.batches[batch];
+            let equal = if let Some(equal) = self.equal_arrow(build, offset, probe, row) {
+                equal
+            } else {
+                if probe_values.is_none() { probe_values = Some(self.value_keys(probe, row, &self.probe_keys)?); }
+                let key = &probe_values.as_ref().expect("The probe key was read").0;
+                match &table.keys {
+                    BuildKeys::Arrow => {
+                        let (build, _scratch) = self.value_keys(build, offset, &self.build_keys)?;
+                        self.equal_values(&build, key, equality)?
+                    }
+                    BuildKeys::Values { keys, .. } => self.equal_values(&keys[ordinal * width..(ordinal + 1) * width], key, equality)?,
+                }
+            };
+            if equal {
+                matched = true;
+                if accept(ordinal)?.is_break() { break; }
+            }
+        }
+        Ok(matched)
+    }
+
+    fn probe_outer(&self, table: &mut Table, probe: &ColumnBatch) -> Result<Option<ColumnBatch>> {
+        let context = &self.execution.context;
+        let mut matches = OuterPositions::new(&context.memory)?;
+        let equality = self.execution.scope()?;
+        let mut unmatched = table.unmatched.take();
+        for row in 0..probe.len {
+            context.check_cancelled_at(row)?;
+            let mut matched_once = false;
+            let matched = self.matching_build_rows(table, probe, row, &equality, |ordinal| {
+                if matched_once && self.kind == JoinKind::Single { return Err(crate::cardinality_violation()); }
+                matched_once = true;
+                if let Some((unmatched, _)) = &mut unmatched { unmatched[ordinal] = 0; }
+                matches.push(Some(table.position(ordinal)), Some((0, row)))?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+            if !matched && self.preserves_probe() { matches.push(None, Some((0, row)))?; }
+        }
+        table.unmatched = unmatched;
+        self.gather_outer(table, Some(probe), matches)
+    }
+
+    fn unmatched_build(&self, table: &Table) -> Result<Option<ColumnBatch>> {
+        let Some((unmatched, _)) = &table.unmatched else { return Ok(None); };
+        let mut matches = OuterPositions::new(&self.execution.context.memory)?;
+        for (ordinal, flag) in unmatched.iter().enumerate() {
+            self.execution.context.check_cancelled_at(ordinal)?;
+            if *flag != 0 { matches.push(Some(table.position(ordinal)), None)?; }
+        }
+        self.gather_outer(table, None, matches)
+    }
+
+    fn gather_outer(&self, table: &Table, probe: Option<&ColumnBatch>, positions: OuterPositions) -> Result<Option<ColumnBatch>> {
+        let count = positions.build.len();
+        if count == 0 { return Ok(None); }
+        let memory = &self.execution.context.memory;
+        let mut columns = ColumnBatch::settled(vec![], count, memory.reserve(256)?)?;
+        let mut sides = [
+            (table.batches.as_slice(), self.widths[0], &positions.build),
+            (probe.map_or(&[][..], std::slice::from_ref), self.widths[1], &positions.probe),
+        ];
+        if self.swapped { sides.swap(0, 1); }
+        for (batches, width, rows) in sides {
+            for position in 0..width {
+                let (column, lease) = gather_nullable_column(|index| &batches[index], rows, position, memory)?;
+                columns.append_column(column, lease, memory)?;
+            }
+        }
+        Ok(Some(columns))
     }
 
     fn probe_value_keys(&self, table: &Table, probe: &ColumnBatch, keys: &[Value], kind: Option<KeyKind>, matches: &mut Matches) -> Result<()> {
@@ -355,7 +438,7 @@ impl Spec {
         for (&left, &right) in self.build_keys.iter().zip(&self.probe_keys) {
             let left = ScalarKey::read(&build.columns[left], build_row)?;
             let right = ScalarKey::read(&probe.columns[right], probe_row)?;
-            matched &= left.equal(right)? && left != ScalarKey::Null;
+            matched &= left.equal(right)? && (self.preserves_probe() || left != ScalarKey::Null);
         }
         Some(matched)
     }
@@ -363,6 +446,14 @@ impl Spec {
     fn equal_values(&self, build: &[Value], probe: &[Value], equality: &rtdb_expr::EvaluationScope) -> Result<bool> {
         let mut unknown = false;
         for ((build, probe), build_first) in build.iter().zip(probe).zip(&self.order) {
+            if self.preserves_probe() {
+                let build_null = matches!(build, Value::Null | Value::Undefined);
+                let probe_null = matches!(probe, Value::Null | Value::Undefined);
+                if build_null || probe_null {
+                    if build_null != probe_null { return Ok(false); }
+                    continue;
+                }
+            }
             let (left, right) = if *build_first { (build, probe) } else { (probe, build) };
             let equal = rtdb_expr::sql_eq_in_timezone(left, right, &self.execution.context.timezone, equality)?;
             equality.reset()?;
@@ -409,6 +500,38 @@ impl Matches {
         }
         self.pairs.push(table.position(build));
         self.probes.push((0, row));
+        Ok(())
+    }
+}
+
+type OptionalPosition = Option<(usize, usize)>;
+
+struct OuterPositions {
+    build: Vec<OptionalPosition>,
+    probe: Vec<OptionalPosition>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl OuterPositions {
+    fn new(memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Self> {
+        Ok(Self { build: Vec::new(), probe: Vec::new(), reservation: memory.reserve(256)? })
+    }
+
+    fn push(&mut self, build: OptionalPosition, probe: OptionalPosition) -> Result<()> {
+        if self.build.len() == i32::MAX as usize { return Err(size_error()); }
+        if self.build.len() == self.build.capacity() {
+            let capacity = self.build.capacity().saturating_mul(2).clamp(16, i32::MAX as usize);
+            let bytes = capacity.checked_mul(2 * std::mem::size_of::<OptionalPosition>())
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+            let replacement = self.build.capacity().max(self.probe.capacity())
+                .checked_mul(std::mem::size_of::<OptionalPosition>()).ok_or_else(size_error)?;
+            let _replacement = self.reservation.budget().reserve(replacement)?;
+            Arc::get_mut(&mut self.reservation).expect("Outer join owns its match positions").grow_to(bytes)?;
+            self.build.reserve_exact(capacity - self.build.len());
+            self.probe.reserve_exact(capacity - self.probe.len());
+        }
+        self.build.push(build);
+        self.probe.push(probe);
         Ok(())
     }
 }
@@ -511,9 +634,9 @@ impl BatchCursor for BatchJoin {
             self.spec.execution.context.check_cancelled()?;
             match std::mem::replace(&mut self.state, State::Done) {
                 State::Build { build, probe, layout } => { self.state = self.spec.build(build, probe, layout).await?; }
-                State::Probe { table, mut probe } => {
-                    let Some(batch) = probe.next_batch().await? else { return Ok(None) };
-                    let output = self.spec.probe_batch(&table, &batch)?;
+                State::Probe { mut table, mut probe } => {
+                    let Some(batch) = probe.next_batch().await? else { return self.spec.unmatched_build(&table) };
+                    let output = self.spec.probe_batch(&mut table, &batch)?;
                     self.state = State::Probe { table, probe };
                     if let Some(output) = output { return Ok(Some(output)); }
                 }
