@@ -1595,6 +1595,18 @@ def verify_replica_trim_admission(args, scratch):
     verify_lean_model(args, scratch, path, "replica-trim-admission", controls, 3)
 
 
+def verify_recovery_custody_handoff(args, scratch):
+    path = Path("verification/lean/RecoveryCustodyHandoff.lean")
+    controls = {
+        "leave-suffix-unchecked": (
+            "(clean : Disjoint replacement.needs plan.units)",
+            "(clean : Disjoint replacement.root plan.units)",
+            ["step_preserves_joint_safety", "commit_can_arm_erasure_with_a_clean_replacement"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "recovery-custody-handoff", controls, 4)
+
+
 def verify_repair_anchor_retention(args, scratch):
     path = Path("verification/lean/RepairAnchorRetention.lean")
     controls = {
@@ -1847,6 +1859,7 @@ def verify_lean(args, scratch):
             verify_replica_trim_admission(args, scratch)
             verify_replica_hold_close(args, scratch)
             verify_repair_anchor_retention(args, scratch)
+            verify_recovery_custody_handoff(args, scratch)
             verify_checkpoint_metadata_retention(args, scratch)
             verify_checkpoint_source_handoff(args, scratch)
             verify_checkpoint_copy_evidence(args, scratch)
@@ -2614,6 +2627,19 @@ TLA_CASES = (
     ("CatalogAdmissionFloor", "catalog-floor-failover-witness", (
         "INVARIANTS CoveredByReceipt HeldViewAdmissible",
         "INVARIANT FreshReadAfterFailoverWitness"), "FreshReadAfterFailoverWitness"),
+    ("RecoveryCustodyHandoff", "recovery-custody-handoff", None, None),
+    ("RecoveryCustodyHandoff", "recovery-custody-incomplete",
+     ('Mutation = "none"', 'Mutation = "incomplete_replacement"'), "Safe"),
+    ("RecoveryCustodyHandoff", "recovery-custody-reuses-erased-suffix",
+     ('Mutation = "none"', 'Mutation = "reuse_erased_suffix"'), "Safe"),
+    ("RecoveryCustodyHandoff", "recovery-custody-ignores-independent-fork",
+     ('Mutation = "none"', 'Mutation = "ignore_independent"'), "Safe"),
+    ("RecoveryCustodyHandoff", "recovery-custody-early-acknowledgment",
+     ('Mutation = "none"', 'Mutation = "confirm_without_coverage"'), "Safe"),
+    ("RecoveryCustodyHandoff", "recovery-custody-misses-deadline",
+     ('Mutation = "none"', 'Mutation = "miss_deadline"'), "Safe"),
+    ("RecoveryCustodyHandoff", "recovery-custody-completed-erasure-witness",
+     ("INVARIANT Safe", "INVARIANT NeverFinishesWithIndependentCopy"), "NeverFinishesWithIndependentCopy"),
     ("RepairAnchorRetention", "repair-anchor-retention", None, None),
     ("RepairAnchorRetention", "repair-anchor-stale-pin",
      ('Mutation = "none"', 'Mutation = "stale_pin"'), "Safe"),

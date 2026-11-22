@@ -60,6 +60,9 @@ A separate native checkpoint and trim replay exports committed directory revisio
 Its validator checks that authorization preserves replay holds and has a manifest from the same journal.
 It covers one journal at a time. Native composition across query admission, hosted provider custody, directory settlement and recovery trimming remains open.
 A model counterexample to a weakened rule shows why the rule matters for the modeled system.
+The [recovery and custody model](../tla/RecoveryCustodyHandoff.tla) composes readable root and suffix replacement, covered upstream confirmation, independent copy admission, and cutover to deadline-bound revocation.
+The [Lean proof](../lean/RecoveryCustodyHandoff.lean) checks preservation for arbitrary units and finite schedules under those authority premises.
+See [R7](R7-eraser.md#verification) for the remaining provider obligations.
 
 ## Handoff notes
 

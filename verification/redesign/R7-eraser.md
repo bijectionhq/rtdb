@@ -57,4 +57,15 @@ Certification also needs a native replay of copy-completed-with-lost-reply, cros
 Check the provider's actual key versions and cache grants when verifying a completion receipt.
 Physical history collection and metadata retention are separate acceptance checks.
 
+[RecoveryCustodyHandoff](../lean/RecoveryCustodyHandoff.lean) proves joint safety for arbitrary unit identities and finite schedules of confirmation, independent copy admission, erasure commit, revocation, and physical retirement.
+The replacement cut covers the acknowledged upstream position, and its declared primary and replay units are readable and disjoint from the retiring custody set.
+A runtime refinement must establish that those units reconstruct the confirmed prefix.
+An independent copy retains readable units outside that set.
+At the deadline the old units have no usable grants, and their ciphertext can be removed.
+A retry payload can be one of those old units while its committed coordinate remains covered by recovery.
+[The TLC model](../tla/RecoveryCustodyHandoff.tla) explored 2,376 states and reached retirement with an independent copy and an advanced confirmation.
+Controls cover incomplete replacement, a retained reference in the new suffix, a shared independent unit, early upstream confirmation, and a missed revocation deadline.
+The transition at the deadline assumes a provider that can revoke all applicable grants.
+Runtime provider qualification and the protocol for outstanding same-domain provider operations are separate obligations.
+
 [R4](R4-residence-ledger.md) · [R5](R5-recovery-roots.md) · [R6](R6-sealing.md) · [Authority boundaries](authority-boundaries.md)
