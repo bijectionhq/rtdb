@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, num::NonZeroUsize};
 
 use rtdb_types::{EntityId, OwnedRelation};
 
@@ -23,7 +23,7 @@ struct TouchedRule {
 
 struct CapacityRule {
     column: String,
-    prefix_bytes: usize,
+    prefix_bytes: Option<NonZeroUsize>,
     cap: i64,
     through_events: i64,
 }
@@ -32,7 +32,7 @@ impl CapacityRule {
     fn new(column: String, prefix_bytes: i64, cap: i64, through_events: i64) -> Result<Self> {
         let prefix_bytes = usize::try_from(prefix_bytes)
             .ok()
-            .filter(|n| (1..=MAX_KEY_BYTES).contains(n))
+            .filter(|n| *n <= MAX_KEY_BYTES)
             .ok_or_else(invalid_rule)?;
         if column.is_empty()
             || column.len() > 96
@@ -44,7 +44,7 @@ impl CapacityRule {
         }
         Ok(Self {
             column,
-            prefix_bytes,
+            prefix_bytes: NonZeroUsize::new(prefix_bytes),
             cap,
             through_events,
         })
@@ -57,12 +57,19 @@ impl CapacityRule {
                 "policy".into(),
                 Value::Struct(StructFields::from([
                     ("column".into(), Value::Utf8(self.column.clone())),
-                    ("prefix_bytes".into(), Value::I64(self.prefix_bytes as i64)),
+                    ("prefix_bytes".into(), Value::I64(self.prefix_bytes.map_or(0, NonZeroUsize::get) as i64)),
                     ("cap".into(), Value::I64(self.cap)),
                     ("through_events".into(), Value::I64(self.through_events)),
                 ])),
             ),
         ])
+    }
+
+    fn bucket<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+        if !(1..=MAX_KEY_BYTES).contains(&key.len()) {
+            return None;
+        }
+        key.get(..self.prefix_bytes.map_or(key.len(), NonZeroUsize::get))
     }
 
     fn decode(value: Value) -> Result<Self> {
@@ -201,10 +208,10 @@ impl OpenTransaction<'_> {
             .ok_or_else(uncovered)
             .and_then(CapacityRule::decode)
             .map_err(count_uncovered)?;
-        if rule.column != column || rule.prefix_bytes != prefix.len() {
+        if rule.column != column || rule.bucket(prefix) != Some(prefix) {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/count-bound",
-                "The count interval must equal a complete declared Binary prefix",
+                "The count interval must identify one declared Binary partition",
             ));
         }
         if snapshot.relation_event_frontier(&relation.table(owner))? != rule.through_events {
@@ -241,6 +248,14 @@ impl OpenTransaction<'_> {
         let target = relation.table(owner);
         let snapshot = self.snapshot()?;
         if snapshot.contains_table(&storage) {
+            let prior = self.capacity_cell(snapshot.clone(), owner, relation,
+                &EntityId::String(RULE.into()), "policy").await?
+                .ok_or_else(uncovered).and_then(CapacityRule::decode)?;
+            if prior.column == rule.column && prior.prefix_bytes == rule.prefix_bytes
+                && prior.cap == rule.cap && prior.through_events == snapshot.relation_event_frontier(&target)?
+            {
+                return Ok(());
+            }
             return Err(Anomaly::new(
                 AnomalyCategory::Conflict,
                 "rtdb.owned/capacity-exists",
@@ -405,10 +420,7 @@ impl OpenTransaction<'_> {
                     let Value::Binary(key) = key else {
                         return Err(invalid_key());
                     };
-                    let prefix = key
-                        .get(..rule.prefix_bytes)
-                        .filter(|_| key.len() <= MAX_KEY_BYTES)
-                        .ok_or_else(invalid_key)?;
+                    let prefix = rule.bucket(&key).ok_or_else(invalid_key)?;
                     allocations.push(self.context.memory.reserve(prefix.len() * 4 + 512)?);
                     let delta = deltas.entry(unique_id(prefix)).or_default();
                     let count = if final_state {
@@ -514,14 +526,14 @@ impl OpenTransaction<'_> {
 fn invalid_rule() -> Anomaly {
     Anomaly::incorrect(
         "rtdb.owned/capacity-rule",
-        "A capacity rule requires a Binary column, a prefix length of 1 to 4096, and a positive cap",
+        "A capacity rule requires a Binary column, a whole key or bounded prefix, and a positive cap",
     )
 }
 
 fn invalid_key() -> Anomaly {
     Anomaly::incorrect(
         "rtdb.owned/capacity-key",
-        "A capacity key must be Binary and contain its declared prefix within 4096 bytes",
+        "A capacity key must contain its declared Binary partition within 4096 bytes",
     )
 }
 
