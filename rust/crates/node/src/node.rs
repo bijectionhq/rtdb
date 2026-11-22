@@ -1,4 +1,6 @@
 mod owned_changes;
+mod owned_identities;
+pub use owned_identities::OwnedIdentityPage;
 pub use owned_changes::{OwnedChangeCommit, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS};
 
 use rtdb_types::StructFields;
@@ -1083,16 +1085,7 @@ impl OwnedReadSession {
         valid: rtdb_types::Interval,
         system: Timestamp,
     ) -> Result<OwnedValidHistory<'a>> {
-        self.admit_access().await?;
-        let at_head = self.historical.is_none() && system == self.present.system_time;
-        self.require_scoped_relation(relation)?;
-        if let Some(scope) = &self.historical {
-            if system != scope.system_time {
-                return Err(historical_owned_read::unavailable());
-            }
-        } else if !at_head {
-            self.certify_historical_cut(relation, system).await?;
-        }
+        let at_head = self.admit_root_system(relation, system).await?;
         if !at_head {
             self.check_point_purge_floor(relation, id, system).await?;
         }
@@ -1232,6 +1225,20 @@ impl OwnedReadSession {
     async fn admit_read(&self) -> Result<()> {
         if self.historical.is_some() { return Err(historical_owned_read::unavailable()); }
         self.admit_access().await
+    }
+
+    async fn admit_root_system(&self, relation: &rtdb_types::OwnedRelation, system: Timestamp) -> Result<bool> {
+        self.admit_access().await?;
+        let at_head = self.historical.is_none() && system == self.present.system_time;
+        self.require_scoped_relation(relation)?;
+        if let Some(scope) = &self.historical {
+            if system != scope.system_time {
+                return Err(historical_owned_read::unavailable());
+            }
+        } else if !at_head {
+            self.certify_historical_cut(relation, system).await?;
+        }
+        Ok(at_head)
     }
 
     fn retained_root_context(&self) -> &Arc<QueryContext> {

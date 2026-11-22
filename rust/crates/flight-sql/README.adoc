@@ -377,6 +377,12 @@ Schema metadata includes `rtdb.owned.version_revision` and `rtdb.owned.version_m
 Requests before the certified floor refuse and report `history-floor-micros` in the anomaly context.
 Coverage or response-size failures refuse the page.
 
+`rtdb.owned.ReadHeldIdentityPage.v1` takes the 16-byte held handle, the relation prefix, and one terminated Arrow stream with one row.
+The fields are `system_micros: Int64`, `valid_micros: Int64`, `after: Utf8`, and `limit: Int64`. A null bound starts at the first key.
+The response echoes both time coordinates and carries visible UTF-8 identities from the admitted relation in strictly ascending order.
+The limit is 1–128. Schema metadata `rtdb.owned.identity_more` is 1 when the next page can resume after the last returned identity, including when the response reaches its byte bound.
+Historical cuts require certified coverage and honor ordered erasure floors.
+
 === Working in a hosted checkpoint world
 
 The placed Multi host enables world actions on a listener configured for owned native actions.

@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -103,6 +103,7 @@ pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
+pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const READ_WORLD_POINT_V1: &str = "rtdb.owned.ReadWorldPoint.v1";
@@ -127,6 +128,7 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
 pub(crate) const HELD_OWNED_CHANGES_V2: &str = "rtdb.owned.ReadHeldChanges.v2";
 const READ_IDLE: Duration = Duration::from_secs(60);
+const OWNED_IDENTITY_MORE: &str = "rtdb.owned.identity_more";
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
 const OWNED_VALID_FROM: &str = "rtdb.owned.valid_from_micros";
@@ -693,6 +695,40 @@ impl Service {
         let history = held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await.map_err(status)?;
         let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };
         let reply = self.history_reply(call, &id, read, valid, system, None).await?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_identities_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Owned identity page has no held read handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 4 || batch.num_rows() != 1 {
+            return Err(invalid("Owned identity page requires one row with a cut, a bound, and a limit"));
+        }
+        let system = history_request_endpoint(batch, "system_micros")?;
+        let valid = history_request_endpoint(batch, "valid_micros")?;
+        let limit = usize::try_from(history_request_integer(batch, "limit")?)
+            .map_err(|_| invalid("Owned identity limit is out of range"))?;
+        let (column, field) = batch.schema_ref().column_with_name("after")
+            .ok_or_else(|| invalid("Owned identity page requires an exclusive bound"))?;
+        let after = batch.column(column).as_any().downcast_ref::<StringArray>()
+            .filter(|_| field.metadata().is_empty())
+            .ok_or_else(|| invalid("Owned identity bound must be nullable Utf8"))?;
+        let after = (!after.is_null(0)).then(|| after.value(0));
+        let page = held.snapshot.identity_page(&relation, system, valid, after, limit).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
+        let _copy = call.reserve(bytes)?;
+        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
+        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let schema = rows.schema_ref().as_ref().clone().with_metadata(
+            [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
+        );
+        let reply = self.owned_point_reply(&schema, Some(&rows), system, valid, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }

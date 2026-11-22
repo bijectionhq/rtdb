@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
+use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{PreparedQuery, QueryContext, QueryCursor};
@@ -66,6 +66,49 @@ pub async fn open_owned_valid_during_at(
         return Ok(None);
     };
     open_owned_table_point(context, relation.table(owner), locator, Some(id), Some(valid), None, true).await
+}
+
+/// Opens a bounded page of visible identities in complete UTF-8 key order.
+pub async fn open_owned_identity_page(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
+    valid: Timestamp, after: Option<&str>, fetch: i64,
+) -> Result<Option<QueryCursor>> {
+    if relation.world().is_some() || relation.is_world_catalog() {
+        return Err(address_unavailable());
+    }
+    let context = owned_context_at_system(context, system)?;
+    if !require_owned_address_coverage(&context, owner, relation)? {
+        return Ok(None);
+    }
+    let name = QualifiedTable {
+        database: context.catalog.default_database().to_owned(),
+        table: relation.table(owner),
+    };
+    let context = context.for_owned_relation(name.clone(), None);
+    let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
+    let id = Field {
+        id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false,
+        unnamed: false, data_type: table.scan_column_type("_id"),
+    };
+    let order = id.expression();
+    let predicates = after.map(|after| Expr::binary(
+        BinaryOp::Gt, order.clone(), Expr::Literal(Value::Utf8(after.into())),
+    )).into_iter().collect();
+    let scan = Arc::new(Relation::scan(Scan {
+        table,
+        columns: vec![id],
+        valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
+            value: valid.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+        })),
+        system_time: TemporalFilter::Default,
+        clamp_valid_time: false,
+        iids: None, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
+    })?);
+    let sorted = Arc::new(scan.sort(vec![SortExpr {
+        expr: order, descending: false, nulls_first: false,
+    }])?);
+    let page = Arc::new(sorted.limit(None, Some(Expr::Literal(Value::I64(fetch))))?);
+    PreparedQuery::new_in(page, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }
 
 /// Reads one full identity in a relation's private uniqueness table.

@@ -4591,6 +4591,8 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     let other = OwnedRelation::new("other").unwrap();
     let marker = EntityId::String("head".into());
     let fact = EntityId::String("key".into());
+    let second_key = EntityId::String("second-key".into());
+    let unselected_key = EntityId::String("future-key".into());
     let put = |relation: &OwnedRelation, id: &EntityId, value| TxOp::OwnedReplaceDocs {
         relation: relation.clone(),
         documents: Documents::new(vec![StructFields::from([
@@ -4598,10 +4600,10 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
         ])], node.memory()).unwrap(),
         valid_from: (relation == &publications).then_some(Timestamp::MIN), valid_to: None,
     };
-    let first = session.state_mut().execute_tx(vec![put(&publications, &marker, 1), put(&facts, &fact, 1)],
+    let first = session.state_mut().execute_tx(vec![put(&publications, &marker, 1), put(&facts, &fact, 1), put(&facts, &second_key, 5)],
         AutonomousTxOptions::default()).await.unwrap();
     let intermediate = session.reserve_ordered_present().await.unwrap();
-    let second = session.state_mut().execute_tx(vec![put(&publications, &marker, 2), put(&facts, &fact, 2)],
+    let second = session.state_mut().execute_tx(vec![put(&publications, &marker, 2), put(&facts, &fact, 2), put(&facts, &unselected_key, 6)],
         AutonomousTxOptions::default()).await.unwrap();
     assert!(first.committed() && second.committed());
 
@@ -4655,6 +4657,16 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     let version = page.versions.pop().unwrap();
     assert_eq!(version.system_time, old.system_time());
     assert_eq!(rows(version.timeline).await.len(), 1);
+
+    let cut = old.system_time();
+    let keys = old.identity_page(&facts, cut, cut, None, 1).await.unwrap();
+    assert_eq!(keys.keys, vec!["key".to_owned()]);
+    assert!(keys.more);
+    let keys = old.identity_page(&facts, cut, cut, keys.keys.last().map(String::as_str), 1).await.unwrap();
+    assert_eq!(keys.keys, vec!["second-key".to_owned()]);
+    assert!(!keys.more);
+    assert!(old.identity_page(&facts, cut, Timestamp::MIN, None, 2).await.unwrap().keys.is_empty());
+    assert!(old.identity_page(&other, cut, cut, None, 1).await.is_err());
 
     drop(old);
     drop(session);
