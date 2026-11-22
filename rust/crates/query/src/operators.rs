@@ -193,23 +193,29 @@ async fn build_batches_at(
             let schema = child.schema().clone();
             let computed = !BatchSort::supports(&schema, order_by);
             if computed && !computed_batch_sort(order_by) { return Ok(None); }
+            let pushdowns = match relation.node() {
+                RelationNode::SortLimit { offset, fetch, .. } if offset.is_some() || fetch.is_some() => None,
+                _ => pushdowns,
+            };
+            let Some((batches, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
+            let (offset, limit) = match relation.node() {
+                RelationNode::SortLimit { offset, fetch, .. } => {
+                    let offset = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
+                    let count = row_limit(fetch.as_ref(), &execution).await?.unwrap_or(i64::MAX as u64);
+                    if count == 0 && offset == 0 {
+                        let empty = BatchLimit { input: Some(batches), offset, remaining: Some(0), context: execution.context };
+                        return Ok(Some((Box::new(empty), projected || computed)));
+                    }
+                    (offset, offset.saturating_add(count).min(i64::MAX as u64))
+                }
+                _ => (0, i64::MAX as u64),
+            };
             let computed_type = if computed {
                 let scope = execution.scope()?;
                 let ty = execution.expression_type(&scope, &order_by[0].expr, &schema)?;
                 if !batch_ordered_type(&ty) { return Ok(None); }
                 Some(ty)
             } else { None };
-            let (offset, limit, pushdowns) = match relation.node() {
-                RelationNode::SortLimit { offset, fetch, .. } => {
-                    let offset_rows = row_limit(offset.as_ref(), &execution).await?.unwrap_or(0);
-                    let count = row_limit(fetch.as_ref(), &execution).await?.unwrap_or(i64::MAX as u64);
-                    if count == 0 { return Ok(None); }
-                    let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-                    (offset_rows, offset_rows.saturating_add(count).min(i64::MAX as u64), pushdowns)
-                }
-                _ => (0, i64::MAX as u64, pushdowns),
-            };
-            let Some((batches, projected)) = build_batch_input(child, execution.child(0), pushdowns, output).await? else { return Ok(None); };
             if let Some(ty) = computed_type {
                 let key = &order_by[0];
                 let next = schema.fields().iter().map(|field| field.id.0).max().unwrap_or(0)
