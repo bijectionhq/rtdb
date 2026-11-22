@@ -90,6 +90,14 @@ pub(super) async fn read_checkpoint_point_in_context(
     context: Arc<QueryContext>, point: CheckpointPoint<'_>,
 ) -> Result<Option<Vec<OwnedBatch>>> {
     require_relation_purge_history(&context, point.owner)?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else {
+        return Err(inconsistent("The archived world has no exact relation lifetime scope"));
+    };
+    let root = point.relation.root_relation();
+    if snapshot.contains_table(&root.as_ref().unwrap_or(point.relation).lifetime_table(point.owner)) {
+        return Err(unavailable("Creation-lifetime relations do not admit archived point reads"));
+    }
     let memory = Arc::clone(&context.memory);
     let Some(mut cursor) = open_owned_point(
         context, point.owner, point.relation, point.id, point.valid, None,
