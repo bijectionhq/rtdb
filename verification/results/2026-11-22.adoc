@@ -213,3 +213,32 @@ Local evidence under `/private/tmp/rtdb-formal.QMjPSJsX/`:
 * `pack-exact-native-cy326ms7/` has the scoped Rust, DynamoDB Local 3.3.2, native mutations and FFI builds.
 * `reaper-boundary-native-8qk_n5e5/` has the API boundary and scoped Rust results.
 * The Gradle logs are `build/test-run.log` and `build/pack-exact-s3-integration.log` in `/private/tmp/rtdb-publication-version.5mfxM4cf/`.
+
+== R5 · Terminal S3 enrollment
+
+The enrollment command authenticates the provisioning authority and provider root before admitting a never-versioned allocation.
+It requires clean object, version and multipart inventories and persists the qualification before activating the namespace.
+Terminal readers, scoped writers and inventory opens require the same qualification and allocation marker.
+
+TLC explored 46 states for enrollment.
+It rejected trusting bucket status alone, resuming over dirty inventory, permitting an early write after the inventory check and reopening under a legacy alias.
+The reachability run reopened an enrolled allocation after publication.
+TLC also matched the existing publication identity, hosted path release and tombstone disposal studies.
+link:../tla/TerminalNamespaceEnrollment.tla[Enrollment model]
+
+The scoped native run on `1db6dc564` passed 564 cases and five doctests, with 11 ignored cases.
+The loopback S3 suite exercised fresh and resumed enrollment, rejection of occupied and versioned scopes, an outstanding multipart upload and dirty bootstrap residue.
+The fixture normalized the emulator's bucket-versioning response to the AWS XML schema.
+The command-line replay exercised first activation, repeat activation and rejection in a different allocation.
+The bucket-level allocation test refuses nesting under a legacy residence.
+The existing fork and disposal replay passed against both bucket profiles.
+
+The JVM run against the rebuilt FFI at `4ac35e3d5` passed 3,198 standard, 3,348 property and 5,629 integration cases, with one PostgreSQL integration skip.
+The focused build on `bd79d69b6` plus the Flight SQL compilation fix passed 246 unit tests, with one ignored case.
+Allium 3.7.2 check and analysis added no diagnostics relative to the existing target spec.
+
+The provider-policy fence and irreversible key retirement need live qualification.
+The loopback emulator does not enforce the MinIO session-policy integration contract.
+New tombstone retirement requires a per-publication witness from the serving write path.
+
+The native, fixture and TLC evidence is under `/private/tmp/rtdb-terminal-enroll-native-rebased.log`, `/private/tmp/rtdb-terminal-enrollment-fixture.log` and `/private/tmp/rtdb-terminal-enrollment-3o3k6t8m/`.

@@ -526,8 +526,12 @@ contract ObjectStorage {
     inventory: (prefix: String) -> List<String>
 
     @invariant ObjectsAreImmutable
-        -- Every object is written once, under a key never reused.
-        -- So a cached object or range is correct forever or unreachable; nothing is ever invalidated.
+        -- Each published payload has an immutable identity.
+        -- A terminal physical key accepts one payload and retains its tombstone after retirement until residence disposal.
+
+    @invariant TerminalAllocationPolicy
+        -- The provisioning authority binds the exact provider root and its lifetime storage policy before enrollment.
+        -- The provider fences ordinary writes before activation and enforces create-once publication afterward.
 
     @invariant WritersCarryTheirEpoch
         -- Every object a holder writes is under prefix + "/e" + epoch, written with put-if-absent, using a StorageCredential scoped to that epoch's prefix.
@@ -2313,11 +2317,41 @@ rule VerifyWriterDuringWatchStartup {
             WriteRefused(record)
 }
 
+rule EnrollTerminalS3Allocation {
+    -- The allocation names a provider root disjoint from legacy storage.
+    -- The provisioning authority attests the provider policy for that exact root from its allocation onward.
+    when: TerminalAllocationEnrollmentRequested(operator, allocation, qualification)
+
+    requires: QualificationAuthenticatesExactAllocation(qualification, allocation)
+    requires: ServingBucketNeverVersioned(allocation.namespace)
+    requires: ProviderFencesOrdinaryWritesUntilActivation(allocation)
+    requires: ProviderEnforcesCreateOnceForAllocationLifetime(allocation)
+
+    ensures:
+        if StoredQualificationAndActivationMarkerAuthenticate(allocation):
+            TerminalAllocationEnrolled(allocation)
+        else if FreshTerminalInventoryContainsOnlyEnrollmentResidue(allocation):
+            StoreImmutableQualification(allocation, qualification)
+            InstallAllocationActivationMarker(allocation)
+            TerminalAllocationEnrolled(allocation)
+}
+
+rule OpenTerminalS3Allocation {
+    when: TerminalAllocationAccessRequested(requester, allocation)
+
+    requires: StoredQualificationAndActivationMarkerAuthenticate(allocation)
+    requires: AdapterUsesExactProviderRoot(allocation)
+
+    ensures:
+        OpenEnrolledTerminalAllocation(allocation)
+}
+
 rule RefreshScopedS3Session {
     when: S3WriteCredentialsRequested(record, writer_epoch)
 
     requires: DeploymentStillUsesStoragePrefix(record)
     requires: WriterOrCompactorAuthorized(record, writer_epoch)
+    requires: TerminalStorageUsesScopedConditionalCreation(record)
 
     ensures:
         let session = ProviderAssumedWriteRole(prefix: record.storage_root.prefix, max_age: config.credential_ttl)
@@ -2974,11 +3008,34 @@ surface StorageAccess {
 
     context holding: Holding
 
+    provides:
+        TerminalAllocationAccessRequested(node, allocation)
+
     contracts:
         demands ObjectStorage
 
     @guarantee ZombiesCannotDamageStorage
         -- A deposed holder can create only orphans under its own epoch's prefix until its credential expires, and can delete nothing.
+}
+
+surface TerminalStorageEnrollment {
+    facing operator: Operator
+
+    provides:
+        TerminalAllocationEnrollmentRequested(operator, allocation, qualification)
+
+    contracts:
+        demands ObjectStorage
+}
+
+surface TerminalStorageMaintenance {
+    facing reaper: Reaper
+
+    provides:
+        TerminalAllocationAccessRequested(reaper, allocation)
+
+    contracts:
+        demands ObjectStorage
 }
 
 ------------------------------------------------------------

@@ -3,6 +3,8 @@ mod scoped;
 pub use scoped::{SCOPED_S3_CLOCK_ALLOWANCE, SCOPED_S3_WRITE_TTL, ScopedS3Writes, WriteAuthorization};
 #[cfg(feature = "versioning")]
 mod versions;
+#[cfg(feature = "versioning")]
+mod terminal;
 
 #[cfg(feature = "versioning")]
 pub use versions::{NeverVersionedObject, NeverVersionedRetirement, VersionedInventory};
@@ -15,6 +17,18 @@ use rtdb_format::keys::StorageRoot;
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result, S3ObjectNamespace};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub const LEGACY_CELL_ROOT: &str = "cell";
+pub const CELL_STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
+const TERMINAL_CELL_PREFIX: &str = "cell-terminal-";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalS3Scope {
+    pub allocation: Uuid,
+    pub authority: [u8; 32],
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3Credentials { pub access_key: String, pub secret_key: String }
@@ -43,6 +57,8 @@ pub struct S3Config {
     #[serde(default)]
     pub path_style_access_enabled: bool,
     pub remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_scope: Option<TerminalS3Scope>,
 }
 
 enum S3Authorization {
@@ -52,7 +68,7 @@ enum S3Authorization {
 
 impl S3Config {
     pub fn new(bucket: impl Into<String>) -> Self {
-        Self { bucket: bucket.into(), region: None, prefix: None, credentials: None, endpoint: None, path_style_access_enabled: false, remote: None }
+        Self { bucket: bucket.into(), region: None, prefix: None, credentials: None, endpoint: None, path_style_access_enabled: false, remote: None, terminal_scope: None }
     }
 
     pub fn resolve_credentials(&self, remotes: &dyn S3CredentialResolver) -> Result<Option<S3Credentials>> {
@@ -68,17 +84,56 @@ impl S3Config {
         ObjectKey::new(StorageRoot::under_prefix(self.prefix.as_deref(), storage_root.as_str())).map_err(Anomaly::from)
     }
 
+    pub fn cell_root(&self) -> Result<ObjectKey> {
+        let Some(scope) = &self.terminal_scope else {
+            if self.prefix.as_deref().is_some_and(is_terminal_root) { return Err(reserved_terminal_root()); }
+            return Ok(ObjectKey::new(LEGACY_CELL_ROOT)?);
+        };
+        if self.prefix.as_deref().is_some_and(|prefix| !prefix.is_empty()) {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "A terminal allocation starts at the bucket root"));
+        }
+        if scope.allocation.is_nil() {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "A terminal S3 allocation must have a nonzero identity"));
+        }
+        Ok(ObjectKey::new(format!("{TERMINAL_CELL_PREFIX}{}", scope.allocation.simple()))?)
+    }
+
+    fn require_cell_root(&self, storage_root: &ObjectKey) -> Result<()> {
+        let configured = self.cell_root()?;
+        if self.terminal_scope.is_some() && *storage_root != configured {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "The requested S3 root is outside its terminal allocation"));
+        }
+        if self.terminal_scope.is_none() && is_terminal_root(self.object_prefix(storage_root)?.as_str()) {
+            return Err(reserved_terminal_root());
+        }
+        Ok(())
+    }
+
     /// `storage_root` is appended to the configured prefix and must already contain the storage version and epoch.
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
     /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
     pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        if self.terminal_scope.is_some() {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "A terminal S3 allocation must be opened as a cell"));
+        }
+        self.require_cell_root(storage_root)?;
         Ok(self.open_store(storage_root, remotes, io, false).await?)
     }
 
     /// Opens the cell's immutable namespace. Any result that leaves an
     /// individual write uncertain belongs to the region's retirement owner.
     pub async fn open_cell(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
-        self.open_store(storage_root, remotes, io, true).await
+        self.require_cell_root(storage_root)?;
+        #[cfg(not(feature = "versioning"))]
+        if self.terminal_scope.is_some() {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "Terminal cells require S3 inventory support"));
+        }
+        let store = self.open_store(storage_root, remotes, io, true).await?;
+        #[cfg(feature = "versioning")]
+        if let Some(scope) = &self.terminal_scope {
+            terminal::require_enrollment(store.as_ref(), &self.object_prefix(storage_root)?, scope).await?;
+        }
+        Ok(store)
     }
 
     async fn open_store(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>, cell: bool) -> Result<Arc<RemoteStore>> {
@@ -169,6 +224,19 @@ impl S3Config {
 
     #[cfg(feature = "versioning")]
     pub async fn versioned_inventory(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver) -> Result<VersionedInventory> {
+        self.require_cell_root(storage_root)?;
+        let inventory = self.open_inventory(storage_root, remotes).await?;
+        if self.terminal_scope.is_some() {
+            let store = self.open_cell(storage_root, remotes, IoRegion::new()).await?;
+            if store.s3_namespace() != Some(inventory.namespace()) {
+                return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "The store and inventory resolve to different S3 namespaces"));
+            }
+        }
+        Ok(inventory)
+    }
+
+    #[cfg(feature = "versioning")]
+    async fn open_inventory(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver) -> Result<VersionedInventory> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let root = self.object_prefix(storage_root)?;
         let endpoint = self.configured_endpoint()?;
@@ -239,6 +307,9 @@ impl S3Config {
     }
 
     pub fn to_proto(&self) -> Result<pb::S3ObjectStoreConfig> {
+        if self.terminal_scope.is_some() {
+            return Err(Anomaly::incorrect("xtdb.aws/terminal-scope", "The classic S3 configuration cannot encode a terminal allocation"));
+        }
         if self.remote.is_some() && self.credentials.is_some() { return Err(Anomaly::incorrect("xtdb.aws/conflicting-config", "S3 has both remote and inline credentials")); }
         Ok(pb::S3ObjectStoreConfig { bucket: Some(self.bucket.clone()), region: self.region.clone(), prefix: self.prefix.clone(),
             credentials: self.credentials.as_ref().map(|credentials| pb::S3Credentials { access_key: Some(credentials.access_key.clone()), secret_key: Some(credentials.secret_key.clone()) }),
@@ -249,8 +320,19 @@ impl S3Config {
         let nonempty = |value: &Option<String>| value.as_ref().filter(|value| !value.is_empty()).cloned();
         Self { bucket: config.bucket.clone().unwrap_or_default(), region: nonempty(&config.region), prefix: nonempty(&config.prefix),
             credentials: config.credentials.as_ref().map(|credentials| S3Credentials { access_key: credentials.access_key.clone().unwrap_or_default(), secret_key: credentials.secret_key.clone().unwrap_or_default() }),
-            endpoint: nonempty(&config.endpoint), path_style_access_enabled: config.path_style_access_enabled.unwrap_or_default(), remote: nonempty(&config.remote) }
+            endpoint: nonempty(&config.endpoint), path_style_access_enabled: config.path_style_access_enabled.unwrap_or_default(), remote: nonempty(&config.remote), terminal_scope: None }
     }
+}
+
+fn is_terminal_root(path: &str) -> bool {
+    let component = path.split_once('/').map_or(path, |(component, _)| component);
+    component.strip_prefix(TERMINAL_CELL_PREFIX).is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn reserved_terminal_root() -> Anomaly {
+    Anomaly::incorrect("xtdb.aws/terminal-scope", "An S3 prefix cannot enter the reserved space for terminal allocations")
 }
 
 #[cfg(test)]

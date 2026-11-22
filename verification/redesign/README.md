@@ -12,7 +12,7 @@ The second review revises the custody and erasure contracts and adds the placed 
 | R2 Engine-owned retry receipts | — | Landed `85a868c07` (receipts are bitemporal rows in `xt.idempotency_receipts`; R8 removes them physically) |
 | R3 Epoch-qualified physical names | — | Landed `ae7b66e10` (naming epoch only; an input digest proved unnecessary) |
 | R4 Residence ledger, holds and collection floor | [R4-residence-ledger.md](R4-residence-ledger.md) | Multi admission floor and durable retry landed; renewable holds, classic authority and full timer removal remain |
-| R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi recovery and checkpoint-metadata holds exist; roots not yet the recovery contract |
+| R5 Recovery roots; collectable L0 | [R5-recovery-roots.md](R5-recovery-roots.md) | Multi has checkpoint-metadata and suffix holds, exact-version collection for covered objects, and enrollment for isolated terminal S3 namespaces. Complete recovery closures, new terminal retirement admission and provider qualification remain open. |
 | R6 Sealing with destroyable data keys | [R6-sealing.md](R6-sealing.md) | Multi seals under a per-deployment key; classic unsealed; no per-unit keys |
 | R7 History collection and privacy erasure | [R7-eraser.md](R7-eraser.md) | Contract and bounded custody model; runtime pending |
 | R8 Retention of receipts and transaction metadata | [R8-metadata-retention.md](R8-metadata-retention.md) | Placed outcome witnesses have a logical receipt window. Physical expiry and transaction metadata retention remain open. |

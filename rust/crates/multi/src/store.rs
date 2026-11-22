@@ -200,6 +200,11 @@ impl RemoteStorageFactory for CellStoreFactory {
     async fn open_for_recovery(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<OpenedRecoveryStore> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        if (config.writer_epoch.is_some() || config.compactor) && self.scoped_writes.is_none()
+            && matches!(&config.storage, CellStorage::S3 { config } if config.terminal_scope.is_some())
+        {
+            return Err(Anomaly::incorrect("rtdb.multi/terminal-storage", "A terminal cell writer requires a scoped S3 role"));
+        }
         let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
@@ -217,13 +222,13 @@ impl RemoteStorageFactory for CellStoreFactory {
             let store = format!("{}/{}", config.prefix, storage_root.as_str());
             let writer = match (&self.scoped_writes, &config.storage) {
                 (Some(scoped), crate::deployment::CellStorage::S3 { config: storage }) if config.writer_epoch.is_some() || config.compactor => {
-                    let cell_root = ObjectKey::new(crate::deployment::S3_CELL_ROOT)?;
+                    let cell_root = storage.cell_root()?;
                     let root = ObjectKey::new(format!("{cell_root}/{store}"))?;
                     let member = scoped.member.get().cloned()
                         .ok_or_else(|| Anomaly::fault("rtdb.multi/write-member-missing", "The node has no registered identity for scoped writes"))?;
                     let authorization = Arc::new(ScopedWriter { directory: Arc::clone(&self.directory), deployment: config.deployment.clone(),
                         prefix: config.prefix.clone(), epoch: config.writer_epoch, member });
-                    Some(scoped.issuer.open(storage, &cell_root, &root, authorization, region)?)
+                    Some(scoped.issuer.open(storage, &cell_root, &root, authorization, region).await?)
                 }
                 _ => None,
             };
@@ -1849,6 +1854,33 @@ mod tests {
     use rtdb_storage::MemoryStore;
 
     fn key(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
+
+    #[tokio::test]
+    async fn terminal_writers_and_compactors_require_scoped_credentials_before_storage_admission() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let root = tempfile::tempdir().unwrap();
+        let local = CellStorage::Local { root: root.path().join("objects") };
+        let keys = Arc::new(crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap());
+        let bucket = local.bucket(IoRegion::new()).await.unwrap();
+        let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
+        let allocation = uuid::Uuid::new_v4();
+        let storage = CellStorage::parse(&format!("s3://fixture?terminal={allocation}.{}", "A".repeat(43))).unwrap();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
+        let factory = CellStoreFactory {
+            directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
+            scoped_writes: None, hosted_task: None, local_witnesses: None,
+        };
+        for (writer_epoch, compactor) in [(Some(0), false), (None, true)] {
+            let configuration = CellStoreConfig {
+                storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
+                writer_epoch, compactor, snapshot_block: None,
+            };
+            let configuration = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&configuration).unwrap() };
+            let result = factory.open(&configuration, &key("v06"), IoRegion::new()).await;
+            assert!(matches!(result, Err(error) if error.code == "rtdb.multi/terminal-storage"));
+            assert!(directory.deployment(&record.id).await.unwrap().unwrap().storage_regions.is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn an_attach_after_the_deletion_fence_does_not_create_a_root_marker() {

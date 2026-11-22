@@ -635,7 +635,7 @@ mod tests {
         owner.storage_namespaces = Some(media);
         let owner = directory.create_deployment(owner).await.unwrap();
         let residence = owner.storage_prefix();
-        let root = crate::deployment::S3_CELL_ROOT;
+        let root = rtdb_s3::LEGACY_CELL_ROOT;
         let object = format!("{residence}/v06/tables/t/data/l01-rc-b00.arrow");
         let marker = format!("{residence}/v06/~garbage/release");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

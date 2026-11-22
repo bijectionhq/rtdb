@@ -564,6 +564,26 @@ The source of the intermittent long tail and lower aggregate throughput on the 6
 
 ### Stage 5: the storage fence and manifests
 
+#### Enrollment for terminal S3 storage
+
+The terminal profile uses `s3://BUCKET?terminal=ALLOCATION.PUBLIC_KEY`, where `ALLOCATION` is a fresh UUID and `PUBLIC_KEY` is an Ed25519 public key encoded in unpadded base64url.
+Provision the matching bucket-level `cell-terminal-<simple-uuid>` prefix and its create-once policy before granting serving credentials.
+Bucket-level prefixes of that form are reserved for terminal allocations.
+Keep serving credentials fenced until enrollment completes and preserve the policy and bootstrap records for the allocation's lifetime.
+Serving principals create new objects, and the qualified retirement principal alone can conditionally replace a retired payload with its permanent tombstone.
+Allocation disposal must drain provider writes before removing terminal objects.
+
+Run `rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE` with provisioning credentials authorized to read the provider inventory and conditionally write the two bootstrap records.
+The qualification file is a JSON envelope with `payload` and `signature` strings encoded in unpadded base64url.
+The raw payload is a JSON object with `policy` set to `create_once_v1`, the `allocation` UUID, the provider-encoded physical `root` without a trailing slash, and `namespace` containing the exact `bucket`, `region`, and `endpoint` (`null` for the default endpoint).
+The Ed25519 signature covers the bytes `rtdb.s3/terminal-enrollment/v1`, one zero byte, and the raw payload in order.
+The signer attests that the named allocation has been protected since creation and is reserved for the same provider account and policies throughout its lifetime.
+The command prints the enrolled allocation UUID.
+The same command can settle an interrupted bootstrap, and the enrolled URL is the storage-root configuration for readers, scoped writers and the reaper.
+The bucket policy and provider roles must be qualified independently of the command's inventory checks.
+
+See [the recovery-root design](../../verification/redesign/R5-recovery-roots.md#never-versioned-serving-buckets) for the retirement and disposal requirements.
+
 **Why.**
 A deposed holder must be unable to damage storage, and recovery must not depend on listing (spec contract `ObjectStorage`).
 

@@ -27,6 +27,13 @@ pub async fn initialize_storage(storage: &CellStorage, keys: &dyn KeyService) ->
     storage_namespaces(bucket.as_ref(), keys).await
 }
 
+pub async fn enroll_terminal_storage(storage: &CellStorage, evidence: bytes::Bytes) -> Result<uuid::Uuid> {
+    let CellStorage::S3 { config } = storage else {
+        return Err(Anomaly::incorrect("rtdb.multi/terminal-storage", "Terminal enrollment requires an S3 cell"));
+    };
+    config.enroll_terminal_cell(&BTreeMap::new(), evidence).await
+}
+
 /// Creates a deployment, choosing its ensemble from the live logkeepers in its affinity order.
 /// Allocates identity and nothing else: no objects, no log state, no compute.
 pub async fn create_deployment(directory: &dyn Directory, name: &str, org: &str, replicas: usize) -> Result<DeploymentRecord> {

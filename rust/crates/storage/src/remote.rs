@@ -97,6 +97,8 @@ impl RemoteStore {
         self
     }
 
+    pub fn s3_namespace(&self) -> Option<&S3ObjectNamespace> { self.version_namespace.as_deref() }
+
     /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
     /// This closes the complete shared region when the store was opened with `new_in`.
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }

@@ -243,6 +243,16 @@ A clean enrollment can establish that contract for its fresh namespace.
 Historical keys need independent evidence of the same contract before they can be enrolled.
 [Publication identity comparison](../tla/PublicationTagIdentity.tla)
 
+The terminal profile binds a fresh allocation UUID and the provisioner's Ed25519 public key to a bucket-level `cell-terminal-<simple-uuid>` root separate from every legacy cell root.
+The provisioner must fence ordinary writes while bootstrapping and enforce create-once publication and a permanent tombstone at every retired key for the duration of the allocation.
+The enrollment command checks a signed qualification for the exact resolved provider and physical root, verifies the bucket status, and checks objects, versions, delete markers and uploads.
+It installs the immutable qualification before the activation marker.
+A restart can finish activation when the matching qualification is the only residue; after activation it can reopen the same allocation with its published objects.
+The serving adapter, scoped writer factory and retirement inventory check the same qualification and activation marker before opening.
+The bounded model checks those distinctions and exercises reopen after publication.
+Its early-write counterexample assumes that an ordinary write bypasses the provisioning fence after the final inventory check.
+[Enrollment model](../tla/TerminalNamespaceEnrollment.tla)
+
 The native S3 adapter validates the exact physical namespace and key, executes a conditional zero-byte replacement, and requires fresh evidence of the same retirement token and never-versioned bucket status.
 Cell-store reads and listings treat these tombstones as absent, and a conditional create conflict refuses to adopt the tombstone as a published object.
 The production reaper can resume an authorized data-and-marker pair from the directory after restart and settles its owner fence and lineage together.
@@ -261,7 +271,7 @@ An untracked retry or early settlement can recreate the disposed key in its nega
 TLC explored 33 states and reached purge with a delayed completion whose closed upload could no longer affect storage.
 An initiation that loses its response before admission can leave an empty upload for provider lifecycle cleanup.
 Hosted qualification must establish conditional multipart completion for a zero-byte payload and confirm that a closed upload cannot publish after whole-residence disposal.
-Enabling new retirements still needs terminal namespace enrollment and the matching reaper policy.
+Enabling new retirements still needs per-key publication witnesses recorded during serving writes, a matching reaper policy and live provider qualification.
 [Disposal composition model](../tla/TombstoneDisposal.tla)
 
 ### Shared fork publication and referrer inventories

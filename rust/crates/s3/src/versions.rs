@@ -39,6 +39,26 @@ impl VersionedInventory {
         Self { client, namespace, root, request_payer: requester_pays.then_some(RequestPayer::Requester), scope_multipart_listing }
     }
 
+    pub(crate) fn namespace(&self) -> &S3ObjectNamespace { &self.namespace }
+
+    pub(crate) async fn enrollment_inventory_is_clean(&self, existing_evidence: Option<&ObjectKey>) -> Result<bool> {
+        let root = Path::from(self.root.as_str());
+        let prefix = format!("{root}/");
+        if !self.multipart_batch(&prefix).await?.is_empty() { return Ok(false); }
+        let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(&prefix).max_keys(2)
+            .set_request_payer(self.request_payer.clone()).send().await
+            .map_err(|error| unavailable(format!("Checking terminal enrollment versions failed: {error}")))?;
+        if page.is_truncated() != Some(false) || !page.delete_markers().is_empty() { return Ok(false); }
+        Ok(match (existing_evidence, page.versions()) {
+            (None, []) => true,
+            (Some(evidence), [version]) => {
+                let key = Path::from(format!("{}/{evidence}", self.root));
+                version.key() == Some(key.as_ref()) && version.version_id() == Some("null")
+            }
+            _ => false,
+        })
+    }
+
     pub async fn exact_retirement_available(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<bool> {
         let path = self.observed_path(key, observed)?;
         Ok(self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::WouldExposeOlderData)
@@ -146,8 +166,12 @@ impl VersionedInventory {
     /// Observes the version and multipart inventories without modifying either.
     pub async fn is_empty(&self, deployment: &ObjectKey) -> Result<bool> {
         let prefix = self.prefix(deployment);
-        if !self.multipart_batch(&prefix).await?.is_empty() { return Ok(false); }
-        Ok(self.version_batch(&prefix).await?.is_empty())
+        self.prefix_is_empty(&prefix).await
+    }
+
+    async fn prefix_is_empty(&self, prefix: &str) -> Result<bool> {
+        if !self.multipart_batch(prefix).await?.is_empty() { return Ok(false); }
+        Ok(self.version_batch(prefix).await?.is_empty())
     }
 
     /// Finds immediate directories even when every object under them is

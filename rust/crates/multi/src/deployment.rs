@@ -8,6 +8,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, MemberRole};
 use rtdb_format::database::proto::{DatabaseConfig, RemoteStorage, database_config};
+use rtdb_s3::CELL_STORAGE_NAMESPACE_MARKER as STORAGE_NAMESPACE_MARKER;
 use rtdb_storage::{Error as StoreError, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, JournalEndpoint, Result};
 use serde::{Deserialize, Serialize};
@@ -46,10 +47,6 @@ pub enum CellStorage {
     S3 { config: rtdb_s3::S3Config },
 }
 
-/// The key under an S3 configuration's prefix that a cell's objects are kept below.
-pub(crate) const S3_CELL_ROOT: &str = "cell";
-const STORAGE_NAMESPACE_MARKER: &str = "~cell-namespace";
-
 pub(crate) fn s3_write_lease_horizon(at_ms: i64) -> i64 {
     let interval = rtdb_s3::SCOPED_S3_WRITE_TTL + rtdb_s3::SCOPED_S3_CLOCK_ALLOWANCE;
     at_ms.saturating_add(interval.as_millis() as i64)
@@ -63,7 +60,7 @@ impl CellStorage {
     }
 
     pub(crate) fn s3_root(config: &rtdb_s3::S3Config) -> Result<ObjectKey> {
-        config.object_prefix(&ObjectKey::new(S3_CELL_ROOT)?)
+        config.object_prefix(&config.cell_root()?)
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> rtdb_types::Result<bool> {
@@ -123,14 +120,14 @@ impl CellStorage {
         config: &rtdb_s3::S3Config,
         io: std::sync::Arc<rtdb_storage::IoRegion>,
     ) -> rtdb_types::Result<std::sync::Arc<rtdb_storage::remote::RemoteStore>> {
-        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        let root = config.cell_root()?;
         config.open_cell(&root, &std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new(), io).await
     }
 
     pub(crate) async fn s3_inventory(
         config: &rtdb_s3::S3Config,
     ) -> rtdb_types::Result<rtdb_s3::VersionedInventory> {
-        let root = rtdb_storage::ObjectKey::new(S3_CELL_ROOT)?;
+        let root = config.cell_root()?;
         let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
         config.versioned_inventory(&root, &remotes).await
     }
@@ -146,9 +143,8 @@ impl CellStorage {
                 Ok(canonical(other_root)?.starts_with(canonical(root)?.join(deployment.as_str())))
             }
             (Self::S3 { config }, Self::S3 { config: other_config }) if config.bucket == other_config.bucket => {
-                let cell = ObjectKey::new(S3_CELL_ROOT)?;
-                let root = config.object_prefix(&cell)?;
-                let other_root = other_config.object_prefix(&cell)?;
+                let root = Self::s3_root(config)?;
+                let other_root = Self::s3_root(other_config)?;
                 let Some(relative) = other_root.as_str().strip_prefix(&format!("{root}/")) else { return Ok(false) };
                 Ok(ObjectKey::new(relative)?.is_under(deployment))
             }
@@ -156,7 +152,6 @@ impl CellStorage {
         }
     }
 
-    /// The storage `spec` names: `s3://BUCKET[/PREFIX]`, with `endpoint`, `region` and `path_style` as query parameters, or a local directory.
     pub fn parse(spec: &str) -> rtdb_types::Result<Self> {
         let Some(location) = spec.strip_prefix("s3://") else { return Ok(CellStorage::Local { root: PathBuf::from(spec) }) };
         let (location, query) = location.split_once('?').unwrap_or((location, ""));
@@ -168,9 +163,18 @@ impl CellStorage {
                 Some(("endpoint", endpoint)) => config.endpoint = Some(endpoint.to_owned()),
                 Some(("region", region)) => config.region = Some(region.to_owned()),
                 Some(("path_style", on)) => config.path_style_access_enabled = on == "true",
+                Some(("terminal", scope)) if config.terminal_scope.is_none() => {
+                    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+                    let invalid = || Anomaly::incorrect("rtdb.multi/storage-spec", "Terminal storage requires an allocation UUID and a base64url Ed25519 public key");
+                    let (allocation, authority) = scope.split_once('.').ok_or_else(invalid)?;
+                    let allocation = uuid::Uuid::parse_str(allocation).map_err(|_| invalid())?;
+                    let authority = URL_SAFE_NO_PAD.decode(authority).ok().and_then(|bytes| bytes.try_into().ok()).ok_or_else(invalid)?;
+                    config.terminal_scope = Some(rtdb_s3::TerminalS3Scope { allocation, authority });
+                }
                 _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.multi/storage-spec", format!("Unknown S3 storage parameter {pair}"))),
             }
         }
+        config.cell_root()?;
         Ok(CellStorage::S3 { config })
     }
 }

@@ -25,6 +25,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--config FILE] [--control ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
+       rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
@@ -418,6 +419,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
             let namespaces = admin::initialize_storage(&storage, key_service(arguments.required("keys")?).await?.as_ref()).await?;
             println!("{}", serde_json::to_string(&namespaces).expect("storage namespaces serialize"));
+            Ok(())
+        }
+        "enroll-terminal-storage" => {
+            let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let evidence = std::fs::read(arguments.required("qualification")?).map_err(io)?;
+            println!("{}", admin::enroll_terminal_storage(&storage, evidence.into()).await?);
             Ok(())
         }
         "gateway" => {
