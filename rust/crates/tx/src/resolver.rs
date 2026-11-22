@@ -266,6 +266,9 @@ impl TxResolver {
             if has_owned_operations && outcome.is_ok() {
                 outcome = tx.finish_owned_unique().await;
             }
+            if outcome.is_ok() {
+                outcome = tx.write_owned_changes().await;
+            }
             outcome.and_then(|()| match (replay, receipt) {
                 (Some(replay), _) => tx.write_replay_marker(replay),
                 (None, Some((id, digest))) => tx.put_receipt(&id, &digest),
@@ -370,14 +373,22 @@ pub trait TransactionWriter: Send {
 }
 pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Aborted { error: Anomaly, user_metadata: Option<UserMetadata> } }
 
+#[derive(Default)]
+struct PendingOwnedChanges {
+    bytes: usize,
+    touches: Vec<Value>,
+    reservations: Vec<Arc<MemoryReservation>>,
+}
+
 pub struct OpenTransaction<'a> {
     buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext>,
     unique_changes: OwnedUniqueChanges,
     owned_world: Option<(rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
+    owned_changes: BTreeMap<String, PendingOwnedChanges>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), owned_world: None })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), owned_world: None, owned_changes: BTreeMap::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -882,7 +893,8 @@ impl<'a> OpenTransaction<'a> {
         let system_from = self.tx_key().system_time;
         self.buffer.append(relation.table(owner), StoredEvent {
             iid: locator, system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
-        })
+        })?;
+        self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid)
     }
 
     async fn write_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool) -> Result<()> {
@@ -1000,6 +1012,9 @@ impl<'a> OpenTransaction<'a> {
                             return Err(insert_exists());
                         }
                     }
+                    if relation.world().is_none() && !relation.is_world_catalog() {
+                        self.record_owned_change(relation, id, rtdb_types::OwnedChangeKind::Put, valid_time)?;
+                    }
                 }
             }
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
@@ -1010,6 +1025,66 @@ impl<'a> OpenTransaction<'a> {
         }
         Ok(())
     }
+    fn record_owned_change(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
+        kind: rtdb_types::OwnedChangeKind, valid: Interval,
+    ) -> Result<()> {
+        let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
+        let entry = rtdb_types::OwnedChange { id, kind, valid }.to_value();
+        let bytes = entry.retained_bytes()?.checked_add(128).ok_or_else(too_large)?;
+        let group = self.owned_changes.entry(relation.name().to_owned()).or_default();
+        let group_bytes = group.bytes.checked_add(bytes).filter(|size| *size <= rtdb_types::OWNED_CHANGE_GROUP_BYTES)
+            .ok_or_else(too_large)?;
+        let charge = self.context.memory.reserve(bytes)?;
+        group.touches.push(entry);
+        group.reservations.push(charge);
+        group.bytes = group_bytes;
+        Ok(())
+    }
+
+    async fn write_owned_changes(&mut self) -> Result<()> {
+        use rtdb_types::OwnedRelation;
+
+        if self.owned_changes.is_empty() { return Ok(()); }
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let base = self.buffer.base_snapshot();
+        for (name, group) in std::mem::take(&mut self.owned_changes) {
+            self.context.check_cancelled()?;
+            let relation = OwnedRelation::new(name)?;
+            let journal = relation.change_journal(owner)?;
+            let frontier = base.relation_event_frontier(&journal)?;
+            let previous = base.relation_event_frontier(&relation.table(owner))?;
+            let revision = frontier.max(1);
+            if frontier == 0 {
+                let floor = StructFields::from([
+                    ("_id".into(), Value::I64(0)), ("entry".into(), Value::Null),
+                    ("through_events".into(), Value::I64(previous)),
+                ]);
+                self.buffer.put(journal.clone(), floor, Interval::ALL)?;
+            } else {
+                let context = self.context.query_context(base.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                let (entry, covered, _retained) = rtdb_query::read_owned_change_entry(context, owner, &relation, revision - 1).await
+                    .map_err(|error| if error.code == "rtdb.owned/change-feed-uncovered" {
+                        Anomaly::incorrect("rtdb.owned/change-feed-gap", "The owned relation has a change feed coverage gap")
+                    } else { error })?;
+                if !matches!(entry, Value::List(touches) if !touches.is_empty()) || covered != previous {
+                    return Err(Anomaly::incorrect("rtdb.owned/change-feed-gap", "The owned relation has a change feed coverage gap"));
+                }
+            }
+            let through = previous.checked_add(i64::try_from(group.touches.len()).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            if revision == i64::MAX {
+                return Err(Anomaly::incorrect("rtdb.owned/change-feed-exhausted", "The owned change feed revision space is exhausted"));
+            }
+            let entry = StructFields::from([
+                ("_id".into(), Value::I64(revision)), ("entry".into(), Value::List(group.touches)),
+                ("through_events".into(), Value::I64(through)),
+            ]);
+            self.buffer.put(journal, entry, Interval::ALL)?;
+        }
+        Ok(())
+    }
+
     fn put_arrow_documents(&mut self, table: &TableRef, documents: &crate::ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
         let array = documents.array();
         let memory = &self.context.memory;

@@ -106,6 +106,7 @@ pub(crate) const SEARCH_HELD_OWNED_V1: &str = "rtdb.owned.SearchHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
+pub(crate) const HELD_OWNED_CHANGES_V1: &str = "rtdb.owned.ReadHeldChanges.v1";
 const READ_IDLE: Duration = Duration::from_secs(60);
 const OWNED_PRESENT: &str = "rtdb.owned.present_micros";
 const OWNED_VALID: &str = "rtdb.owned.valid_micros";
@@ -582,6 +583,54 @@ impl Service {
         let reply = self.owned_point_reply(&schema, output.as_ref(), present, present, None)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned change read has no held handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, cursor) = split_relation(request)?;
+        let (after, rest) = cursor.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change read has no revision"))?;
+        let (limit, tail) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned change read has no group limit"))?;
+        if !tail.is_empty() { return Err(invalid("Owned change read has trailing bytes")); }
+        let page = held.snapshot.changes(&relation, u64::from_be_bytes(*after), usize::from(u16::from_be_bytes(*limit)))
+            .await.map_err(status)?;
+        let reply = self.owned_changes_reply(&page)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
+    fn owned_changes_reply(&self, page: &rtdb_node::OwnedChangePage) -> Result<ActionResult, Status> {
+        use rtdb_types::{LogicalType, ScalarType};
+
+        let logical_id = LogicalType::from_legs([ScalarType::I64, ScalarType::Utf8, ScalarType::Keyword, ScalarType::Uuid]
+            .into_iter().map(LogicalType::Scalar));
+        let touches_type = LogicalType::list(LogicalType::Struct(StructFields::from([
+            ("_id".into(), logical_id),
+            ("op".into(), LogicalType::Scalar(ScalarType::Utf8)),
+            ("valid_from_micros".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+        ])));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("revision", DataType::UInt64, false),
+            rtdb_columnar::to_field("touches", &touches_type).map_err(status)?,
+        ]));
+        if page.groups.is_empty() { return self.owned_action_reply(&schema, None); }
+        let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
+        let revisions = UInt64Array::from(page.groups.iter().map(|group| group.revision).collect::<Vec<_>>());
+        let touches: Vec<_> = page.groups.iter().map(|group| Value::List(
+            group.touches.iter().map(rtdb_types::OwnedChange::to_value).collect(),
+        )).collect();
+        let _arrow = self.memory().reserve(rtdb_columnar::estimate_builder_bytes(&touches_type, &touches).map_err(status)?)
+            .map_err(status)?;
+        let touches = rtdb_columnar::build_array(&touches_type, &touches).map_err(status)?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(revisions), touches]).map_err(arrow)?;
+        self.owned_action_reply(&schema, Some(&batch))
     }
 
     pub(crate) fn close_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {

@@ -30,6 +30,8 @@ mod version;
 mod object_sort;
 mod owned_schema;
 mod owned_world;
+mod owned_changes;
+pub use owned_changes::{OwnedChange, OwnedChangeGroup, OwnedChangeKind, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, change_feed_uncovered};
 pub use owned_world::{OwnedWorld, WorldSchemas, WorldShadow};
 pub use owned_schema::OwnedSchema;
 mod memory;

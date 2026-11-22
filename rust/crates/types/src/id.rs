@@ -185,6 +185,7 @@ const OWNED_WORLD_CATALOG: &str = ".worlds";
 const OWNED_WORLD_PREFIX: &str = ".world-";
 const OWNED_UNIQUE_PREFIX: &str = ".unique-";
 const OWNED_ADDRESS_PREFIX: &str = ".addresses-";
+const OWNED_CHANGE_PREFIX: &str = ".changes-";
 
 /// A native relation provisioned in the authenticated principal's namespace.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -213,6 +214,12 @@ impl OwnedRelation {
     pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
 
     pub fn world_catalog() -> Self { Self(OWNED_WORLD_CATALOG.into()) }
+
+    /// Physical journal table; the reserved name cannot become an owned relation request.
+    pub fn change_journal(&self, owner: &str) -> Result<TableRef> {
+        Self::new(self.name())?;
+        Ok(Self(format!("{OWNED_CHANGE_PREFIX}{}", self.name())).table(owner))
+    }
 
     pub fn in_world(&self, world: Iid) -> Result<Self> {
         Self::new(self.name())?;
@@ -290,7 +297,7 @@ impl TableRef {
     pub fn owns_path_target(&self, target: &Self) -> bool {
         (self.is_owned_path_catalog() || self.is_owned_search_catalog())
             && target.supported_owned_name()
-            && !target.is_owned_path_catalog() && !target.is_owned_search_catalog() && !target.is_owned_unique_table() && !target.is_owned_address_table()
+            && target.table.split_once('-').is_some_and(|(_, logical)| OwnedRelation::new(logical).is_ok())
             && target.table[..64] == self.table[..64]
     }
 
@@ -303,6 +310,7 @@ impl TableRef {
                         || name.strip_prefix(OWNED_ADDRESS_PREFIX).is_some_and(|relation| {
                             OwnedRelation::from_source(relation.into()).is_ok_and(|relation| !relation.is_world_catalog())
                         })
+                        || name.strip_prefix(OWNED_CHANGE_PREFIX).is_some_and(|logical| OwnedRelation::new(logical).is_ok())
                         || OwnedRelation::from_source(name.into()).is_ok())
             })
     }

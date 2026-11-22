@@ -879,6 +879,12 @@ impl OwnedRangeWitness {
     }
 }
 
+pub struct OwnedChangePage {
+    pub groups: Vec<rtdb_types::OwnedChangeGroup>,
+    pub retained_bytes: usize,
+    _reservations: Vec<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
 /// A database-scoped capture held by the same authenticated native session.
 pub struct OwnedReadSession {
     context: Arc<QueryContext>,
@@ -978,6 +984,76 @@ impl OwnedReadSession {
         Ok((page, Some(OwnedRangeWitness {
             relation: relation.clone(), basis: self.present, scope, frontier, until: self.witness_until,
         })))
+    }
+
+    /// Reads whole ordered owner-relation groups from an exclusive dense revision.
+    pub async fn changes(&self, relation: &rtdb_types::OwnedRelation, after: u64, limit: usize) -> Result<OwnedChangePage> {
+        use rtdb_types::{OwnedChange, OwnedChangeGroup, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES,
+            OWNED_CHANGE_PAGE_GROUPS, change_feed_uncovered};
+
+        if !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit) {
+            return Err(Anomaly::incorrect("rtdb.owned/change-page-limit", "Owned change reads require one to 128 groups"));
+        }
+        self.admit_read().await?;
+        let database = self.context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        let journal = relation.change_journal(&self.owner)?;
+        let frontier = snapshot.relation_event_frontier(&journal)?;
+        if frontier < 2 || snapshot.tx_basis() != Some(self.present) {
+            return Err(change_feed_uncovered());
+        }
+        let through = u64::try_from(frontier - 1).map_err(|_| change_feed_uncovered())?;
+        if after > through { return Err(change_feed_uncovered()); }
+        let (floor, from, _floor_charge) = rtdb_query::read_owned_change_entry(Arc::clone(&self.context), &self.owner, relation, 0).await?;
+        if floor != Value::Null { return Err(change_feed_uncovered()); }
+        let (head, latest, _head_charge) = rtdb_query::read_owned_change_entry(
+            Arc::clone(&self.context), &self.owner, relation, frontier - 1,
+        ).await?;
+        if !matches!(head, Value::List(touches) if !touches.is_empty()) || latest <= from
+            || latest != snapshot.relation_event_frontier(&relation.table(&self.owner))?
+        {
+            return Err(change_feed_uncovered());
+        }
+        let mut previous = if after == 0 { from } else if after == through { latest } else {
+            let (entry, covered, _anchor_charge) = rtdb_query::read_owned_change_entry(
+                Arc::clone(&self.context), &self.owner, relation, i64::try_from(after).map_err(|_| change_feed_uncovered())?,
+            ).await?;
+            if !matches!(entry, Value::List(touches) if !touches.is_empty()) || covered <= from || covered > latest {
+                return Err(change_feed_uncovered());
+            }
+            covered
+        };
+
+        let mut page = OwnedChangePage {
+            groups: Vec::with_capacity(limit),
+            retained_bytes: 0,
+            _reservations: vec![self.context.memory.reserve(limit * 256)?],
+        };
+        let mut bytes = 0usize;
+        for revision in after + 1..=through.min(after + limit as u64) {
+            self.check()?;
+            let (entry, covered, retained) = rtdb_query::read_owned_change_entry(
+                Arc::clone(&self.context), &self.owner, relation, i64::try_from(revision).map_err(|_| change_feed_uncovered())?,
+            ).await?;
+            let Value::List(touches) = entry else { return Err(change_feed_uncovered()); };
+            let increment = i64::try_from(touches.len()).map_err(|_| change_feed_uncovered())?;
+            if increment == 0 || previous.checked_add(increment) != Some(covered) || covered > latest {
+                return Err(change_feed_uncovered());
+            }
+            let group_bytes = touches.iter().try_fold(0usize, |bytes, touch| {
+                bytes.checked_add(touch.retained_bytes()?).and_then(|bytes| bytes.checked_add(128))
+                    .filter(|bytes| *bytes <= OWNED_CHANGE_GROUP_BYTES).ok_or_else(change_feed_uncovered)
+            })?;
+            if group_bytes > OWNED_CHANGE_PAGE_BYTES - bytes { break; }
+            let touches = touches.iter().map(OwnedChange::from_value).collect::<Result<Vec<_>>>()?;
+            bytes += group_bytes;
+            previous = covered;
+            page.groups.push(OwnedChangeGroup { revision, touches });
+            page._reservations.push(retained);
+        }
+        self.check()?;
+        page.retained_bytes = bytes;
+        Ok(page)
     }
 
     /// Counts a covered full-key range at this held system cut and an explicit valid instant.

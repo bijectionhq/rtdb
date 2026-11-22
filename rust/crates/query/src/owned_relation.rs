@@ -293,3 +293,36 @@ pub async fn read_owned_parent_schemas(
     }
     Ok((WorldSchemas::new(fields)?, charge))
 }
+
+pub async fn read_owned_change_entry(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, revision: i64,
+) -> Result<(Value, i64, Arc<rtdb_columnar::MemoryReservation>)> {
+    use rtdb_types::change_feed_uncovered;
+
+    let id = EntityId::Integer(revision);
+    let memory = Arc::clone(&context.memory);
+    let journal = relation.change_journal(owner)?;
+    let Some(mut cursor) = open_owned_table_point(context, journal, id.iid(), Some(&id), None, Some(&["entry", "through_events"])).await? else {
+        return Err(change_feed_uncovered());
+    };
+    let mut entry = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        for row in 0..batch.num_rows() {
+            if entry.is_some() { return Err(change_feed_uncovered()); }
+            owned_row_revision(batch, row, &id, &memory)?;
+            let (frontier_column, frontier_field) = batch.schema_ref().column_with_name("through_events")
+                .ok_or_else(change_feed_uncovered)?;
+            let Value::I64(through) = rtdb_columnar::read_value(frontier_field, batch.column(frontier_column).as_ref(), row)?
+                else { return Err(change_feed_uncovered()); };
+            if through < 0 { return Err(change_feed_uncovered()); }
+            let (index, field) = batch.schema_ref().column_with_name("entry").ok_or_else(change_feed_uncovered)?;
+            let values = batch.column(index).as_ref();
+            let size = rtdb_columnar::estimate_read_value_bytes(field, values, row)?;
+            let retained = memory.reserve(size.checked_mul(2).and_then(|bytes| bytes.checked_add(4096))
+                .ok_or_else(change_feed_uncovered)?)?;
+            entry = Some((rtdb_columnar::read_value(field, values, row)?, through, retained));
+        }
+    }
+    entry.ok_or_else(change_feed_uncovered)
+}

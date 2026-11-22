@@ -66,6 +66,9 @@
 -- A covered held range may mint a witness of its owner relation's cumulative event frontier and placed writer epoch.
 -- Ordered validation refuses a witnessed write when that relation's frontier changed or the witness expired or belongs to another placed epoch.
 -- Events in other owner relations leave the witness valid.
+-- An owned root mutation appends its owner relation's next dense change group in the same committed transaction.
+-- The first tracked group shares its transaction with the relation's feed floor.
+-- A held feed page reads whole groups through its held cut and refuses a missing floor or requested group.
 -- Held reads require the original session and attachment and refuse after expiry, lease loss, or closure.
 -- An owned path declaration is maintained from the ordered owner's private catalog.
 -- An owned unique declaration starts before any relation data and admits one Binary key per row.

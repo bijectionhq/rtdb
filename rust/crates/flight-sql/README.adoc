@@ -364,3 +364,21 @@ A `replace` carries the complete fact fields in its struct. The struct may inclu
 A `delete` carries a null struct and writes a world tombstone over the interval.
 The resolver validates replacements against the schema inherited from the archived cut and orders all groups atomically at the live world deadline.
 Success returns the standard transaction-key Arrow row.
+
+=== Reading owned relation changes
+
+`rtdb.owned.ReadHeldChanges.v1` takes the 16 raw held-handle bytes, a relation prefix, an unsigned 64-bit big-endian exclusive revision, and an unsigned 16-bit big-endian maximum of 1–128 groups.
+Use revision zero to start at the installed feed floor.
+The first tracked mutation installs that floor and its first group in the same ordered transaction.
+Writes before installation are outside the feed; a held cut without an installed floor or with a missing requested group refuses.
+
+The reply is a terminated Arrow stream with `revision: UInt64` and `touches: List<Struct>`.
+Each touch contains the full native `_id`, `op: Utf8` (`put` or `delete`), `valid_from_micros: Int64`, and `valid_to_micros: Int64?`.
+The exclusive upper endpoint is null for an unbounded interval.
+A group records the relation's committed mutations in their original order.
+Writes exceeding the 1 MiB retained-value budget for a relation's group abort.
+A page stops before its next whole group if that group would exceed the 8 MiB retained-value budget.
+Use the last returned revision to continue.
+An empty page carries only the response schema and terminator.
+Revisions are dense within the authenticated owner's relation, and the same held read excludes later commits.
+The feed does not return payload values, global transaction positions, pre-install changes, child world changes, or another relation's writes.
