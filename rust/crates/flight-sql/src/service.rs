@@ -239,6 +239,9 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
+            if session.fresh_replica && !matches!(kind, CallKind::Action) {
+                return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
+            }
             if session.audience_source() != audience_source
                 || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::AudienceCleanup)
             {
@@ -260,15 +263,18 @@ impl Service {
             let catalog = self.0.node.catalog();
             let placed_name = || requested_database.filter(|name| !name.is_empty())
                 .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"));
-            let (peer, verified_attachment) = if let Some(proof) = forwarded_peer {
+            let (peer, verified_attachment, fresh_replica) = if let Some(proof) = forwarded_peer {
                 let verifier = self.0.config.forwarded_peer.as_ref()
                     .ok_or_else(|| auth::unauthenticated("This listener does not accept forwarded peers"))?;
                 let proof = proof.to_str().map_err(|_| auth::unauthenticated("Invalid forwarded peer proof"))?;
                 let attachment = catalog.database(placed_name()?).map_err(status)?;
-                let peer = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
-                (Some(peer.to_string()), Some(attachment))
+                let (peer, fresh_replica) = verifier.verify(proof, &attachment).map_err(auth::auth_error)?;
+                if fresh_replica && (!is_handshake || audience_source.is_some()) {
+                    return Err(Status::permission_denied("A replica route requires its fresh Flight handshake"));
+                }
+                (Some(peer.to_string()), Some(attachment), fresh_replica)
             } else {
-                (request.remote_addr().map(|address| address.ip().to_string()), None)
+                (request.remote_addr().map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
             let placement = if catalog.is_placed() {
@@ -290,7 +296,7 @@ impl Service {
             let memory = audience.map_or(self.memory(), |audience| &audience.memory);
             let mint = |audience_slot| -> Result<Arc<Session>, Status> {
                 let session = Arc::new(Session::new(Uuid::new_v4().to_string(), Arc::clone(&caller),
-                    placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
+                    placement.as_ref(), fresh_replica, audience_slot, memory.reserve(capacity).map_err(status)?));
                 sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout,
                     self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
                 Ok(session)

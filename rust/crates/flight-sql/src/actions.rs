@@ -8,11 +8,64 @@ use tonic::{Response, Status};
 use uuid::Uuid;
 use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
+fn fresh_replica_action(action: &str) -> bool {
+    use crate::owned_actions::*;
+    matches!(action, CLOSE_SESSION
+        | OWNED_SPATIAL_READINESS_V1
+        | OBSERVE_HELD_HOSTED_V1
+        | CONFIRM_APPLIED_HOSTED_V6
+        | READ_HELD_HOSTED_CONTROL_V2
+        | OPEN_OWNED_SCOPED_READ_V2
+        | OPEN_OWNED_READ_AS_OF_V1
+        | OPEN_FRESH_OWNED_READ_V2
+        | SPATIAL_OPEN_OWNED
+        | SPATIAL_RANK_NEXT_OWNED
+        | SPATIAL_NEXT_OWNED
+        | SPATIAL_RANK_OPEN_OWNED
+        | SPATIAL_RANK_OPEN_OWNED_V2
+        | SPATIAL_CLOSE_OWNED
+        | SPATIAL_HELD_OWNED_V1
+        | SPATIAL_HELD_OWNED_V2
+        | SPATIAL_HELD_OWNED_V3
+        | SEARCH_HELD_OWNED_V5
+        | HELD_OWNED_RANGE_V1
+        | HELD_OWNED_RANGE_V2
+        | HELD_OWNED_RANGE_V3
+        | HELD_OWNED_RANGE_V4
+        | HELD_OWNED_COUNT_V1
+        | HELD_OWNED_COUNT_V2
+        | HELD_OWNED_MEASURE_V1
+        | HELD_OWNED_MEASURE_AT_V1
+        | HELD_OWNED_STORAGE_USAGE_V1
+        | HELD_OWNED_MERGED_CHANGES_DESCENDING_V1
+        | HELD_OWNED_MERGED_CHANGES_V3
+        | HELD_OWNED_CHANGES_V3
+        | READ_HELD_UNIQUE_V1
+        | READ_HELD_UNIQUE_WINDOW_V1
+        | HELD_OWNED_POINT_V1
+        | HELD_OWNED_POINT_V2
+        | HELD_OWNED_FIXED_POINT_V1
+        | HELD_PROTECTED_COVERAGE_V1
+        | HELD_OWNED_IDENTITIES_V1
+        | HELD_OWNED_IDENTITIES_ALL_VALID_V1
+        | HELD_OWNED_VERSIONS_V2
+        | HELD_OWNED_PATH_TOUCH_V1
+        | HELD_OWNED_HISTORICAL_POINT_V1
+        | HELD_OWNED_POSITION_POINT_V1
+        | HELD_OWNED_VALID_DURING_V2
+        | HELD_OWNED_VALID_REGION_V1
+        | HELD_OWNED_POSITION_VALID_DURING_V1
+        | CLOSE_OWNED_READ_V1)
+}
+
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
         use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
         use rtdb_storage::audience_work;
+        if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
+            return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
+        }
         let turn = if call.session.audience_source().is_some() {
             let admit = || -> Result<_, Status> {
                 Ok(match action.r#type.as_str() {
@@ -317,3 +370,16 @@ fn pack_as<M: Message>(type_url: &str, value: &M, service: &Service) -> Result<A
     Ok(ActionResult { body: wire::retain(Any { type_url: type_url.into(), value: value.encode_to_vec().into() }.encode_to_vec(), charge) })
 }
 fn raw<M: Message>(value: &M, service: &Service) -> Result<ActionResult, Status> { let charge = service.memory().reserve(wire::add(value.encoded_len(), 256)?).map_err(status)?; Ok(ActionResult { body: wire::retain(value.encode_to_vec(), charge) }) }
+
+#[cfg(test)]
+#[test]
+fn fresh_flight_sessions_admit_only_read_actions() {
+    use crate::owned_actions::*;
+    assert!(fresh_replica_action(OPEN_FRESH_OWNED_READ_V2));
+    assert!(fresh_replica_action(HELD_OWNED_POINT_V2));
+    assert!(fresh_replica_action(CLOSE_OWNED_READ_V1));
+    assert!(!fresh_replica_action(OPEN_OWNED_READ_V3));
+    assert!(!fresh_replica_action(OFFER_CLOCK_SLOT_V1));
+    assert!(!fresh_replica_action(COMMIT_OWNED_V7));
+    assert!(!fresh_replica_action(DECIDE_HOSTED_V1));
+}
