@@ -2,6 +2,8 @@ mod historical_owned_read;
 mod hosted_control;
 mod hosted_observation;
 mod owned_changes;
+mod owned_usage;
+pub use owned_usage::OwnedStorageUsage;
 mod owned_identities;
 mod owned_unique;
 pub use owned_identities::OwnedIdentityPage;

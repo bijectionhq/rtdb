@@ -192,6 +192,7 @@ pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
+pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorageUsage.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V3: &str = "rtdb.owned.ReadHeldMergedChanges.v3";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
@@ -1730,6 +1731,48 @@ impl Service {
             .await.map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
         held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_storage_usage_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned storage usage requires a held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (count, mut request) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Owned storage usage requires a relation count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=32).contains(&count) { return Err(invalid("Owned storage usage requires one to 32 relations")); }
+        let _charge = call.reserve(count * 1024)?;
+        let mut relations = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (relation, tail) = split_relation(request)?;
+            relations.push(relation);
+            request = tail;
+        }
+        if !request.is_empty() { return Err(invalid("Owned storage usage has trailing bytes")); }
+        let usage = held.snapshot.storage_usage(&relations).await.map_err(status)?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("relation", DataType::Utf8, false),
+            Field::new("current_data_bytes", DataType::Int64, false),
+            Field::new("history_data_bytes", DataType::Int64, false),
+            Field::new("current_search_bytes", DataType::Int64, true),
+            Field::new("history_search_bytes", DataType::Int64, true),
+            Field::new("ordered_index_bytes", DataType::Int64, true),
+        ]).with_metadata(std::collections::HashMap::from([
+            (OWNED_PRESENT.into(), held.snapshot.present().system_time.0.to_string()),
+        ])));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+            Arc::new(StringArray::from_iter_values(relations.iter().map(|relation| relation.name()))),
+            Arc::new(Int64Array::from_iter_values(usage.iter().map(|row| row.current_data_bytes))),
+            Arc::new(Int64Array::from_iter_values(usage.iter().map(|row| row.history_data_bytes))),
+            Arc::new(Int64Array::from_iter(usage.iter().map(|row| row.current_search_bytes))),
+            Arc::new(Int64Array::from_iter(usage.iter().map(|row| row.history_search_bytes))),
+            Arc::new(Int64Array::from_iter(usage.iter().map(|row| row.ordered_index_bytes))),
+        ]).map_err(arrow)?;
+        let reply = self.owned_action_reply(&schema, Some(&batch))?;
+        held.snapshot.check().map_err(status)?;
+        held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
 
