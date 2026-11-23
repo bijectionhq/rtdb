@@ -1217,15 +1217,21 @@ rule CommitWriting {
 }
 
 -- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
--- A placed attempt receipt stops redeeming after the installed ordered receipt clock reaches its exclusive expiry.
--- A placed COMMIT SYNC sets the connection await token to the applied replica prefix of the exact quorum-installed attempt outcome.
--- An internal append receipt requires durable decision installation on a quorum. Synchronous completion also requires application.
--- A provisional intake receipt carries attempt identity only.
+-- A volatile intake receipt identifies a provisional offer.
+-- Covered effectful admission reserves the original slot and funds its terminal witness under the exact request binding.
+-- Exact retry redeems the original slot, and a retired issuance namespace excludes recreation.
+-- The effect or refusal and the receiver's exact terminal witness occupy one ordered record.
+-- Closure competes in that order and excludes all late copies at that receiver if it wins.
+-- An internal append receipt requires durable decision installation on a quorum.
+-- COMMIT SYNC returns an applied replica prefix containing the exact quorum-installed witness.
 -- Strict guarded admission counts only original durable votes from its recorded roster with an admissible upper sample strictly before cutoff.
--- The same decision installation gates visibility. A fenced attempt with missing evidence remains unknown unless durable evidence excludes an original timely quorum.
--- An applied prefix remains a causal basis after attempt receipt expiry.
--- In the versioned placed outcome format, admitted writers collect expired attempt rows as ordered erasures.
--- Before pinning an implicit read basis, an attempt receipt is redeemed and an applied token waits for its installed prefix.
+-- The same decision installation gates visibility.
+-- A fenced attempt with missing evidence remains unknown unless durable evidence excludes an original timely quorum.
+-- A missing witness or exclusive receipt expiry leaves unresolved obligations charged and does not settle the effect.
+-- The successor installs the authentic prefix and accepts outstanding slot obligations before opening fresh work.
+-- An applied prefix remains a causal basis after receipt expiry.
+-- An ordered erasure can collect settled evidence after its retention, holds and export obligations end.
+-- Before pinning an implicit read basis, redeem the attempt and wait for its exact installed applied prefix.
 -- A supplied snapshot token still caps the history visible to the read.
 -- A frozen placed attachment confirms await tokens from its own admitted checkpoint before pinning the read basis.
 

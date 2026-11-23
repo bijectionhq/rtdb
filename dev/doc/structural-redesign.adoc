@@ -51,12 +51,13 @@ Dependent forks retain scoped key grants.
 Independent exports own fresh keys.
 |Convergence based on independently generated ciphertext, copied keys in independent custody.
 
-|Volatile intake positions and durable transaction identity
-|An intake receipt names an epoch-qualified attempt.
-A checkpointed replica outcome binds the attempt to an applied causal basis.
-Placed clients redeem opaque receipts scoped to the authenticated principal and deployment history.
-Closing an epoch establishes negative outcomes only after the successor installs the recovered prefix.
-|Public reuse of volatile source offsets.
+|Placed receiver admission and decision
+|A provisional intake token names an offer.
+Covered work begins when the receiver durably reserves the original scoped attempt slot and its settlement capacity.
+The installed receiver orders the effect, refusal or fence with its exact terminal witness.
+Once applied, that witness yields a causal basis under the original principal and lineage.
+The receiver keeps unresolved obligations charged across receipt expiry and transfers them at a writable succession.
+|Volatile admission, window-based settlement and public reuse of source offsets.
 
 |Directory leases, idle cost and fresh reads
 |The active journal quorum supplies a certified decision cut on demand.

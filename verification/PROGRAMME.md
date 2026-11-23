@@ -190,7 +190,13 @@ Goal: accelerated MATCH returns the reference scan's rows, and ranked early term
 
 ## W7 · Effect-path and bypass audit
 
-Goal: no production effect can bypass the verified decision that is supposed to admit it.
+Goal: every production effect passes through its owning admission and decision.
+
+For placed audit coverage, model provisional intake, durable scope-owned credit, exact receiver admission, terminal effect or fence, and authentic succession.
+Exercise reader expiry with pending receiver debt and fair settlement when the ordered receiver recovers.
+Fail controls for use of volatile admission, split terminal append, late copies after a fence, reclaim of pending credit on expiry, and reissue from a stale cut.
+Trace native and hosted paths through intake, the resolver, replica decoding and apply, checkpoint installation, status and causal redemption.
+A parent or exporter's offer supplies evidence only for its own boundary.
 
 The design doc's *Production boundary and responsibilities* table names one owner per area: replica admission and apply, resolution and overlay, temporal resolution, compaction and catalog, read entitlement and GC, storage and recovery, cache, and search. For each area:
 

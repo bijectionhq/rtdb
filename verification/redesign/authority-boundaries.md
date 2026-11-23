@@ -5,51 +5,31 @@ The TLA+ models cover small transition protocols and isolate their assumptions f
 
 ## Submission, outcome, and read basis
 
-The placed holder's source log is volatile.
-Its positions can repeat after an epoch change because the new intake starts after the last source position found in the durable replica stream.
-The serving protocol binds an asynchronous receipt to an exact attempt even when a successor reuses its position.
+A placed holder's volatile source position identifies provisional intake.
+The durable receiver slot binds the installation and history, issuance namespace, authenticated scope and exact request.
+It reserves evidence and settlement capacity before allowing a covered effect.
+Exact retries redeem the same slot, and stale addresses cannot recreate it.
+Positions in volatile intake can repeat after a writer change.
 
-Placed intake records now carry the history and writer epoch of the opened log.
-The resolver binds that scope to the record's source position and authenticated principal and stages an outcome witness with both commits and aborts.
-The replica frame carries the full attempt identity, and the checkpointed outcome table indexes its digest to the transaction key.
-Each intake includes a fresh nonce so the indexed digest alone does not disclose the principal.
-The outcome witness has a logical receipt window beginning at the logged intake timestamp.
-Physical expiry remains open.
+The resolver orders the effect, refusal or exclusion of all late copies with the slot's exact terminal witness.
+Replica apply and checkpoint recovery preserve the original binding and decision position.
+A synchronous response or redemption of a terminal receipt yields a causal token for the applied prefix containing the witness.
+A provisional token must be redeemed before it supplies a read lower bound.
 
-The volatile intake assigns a typed attempt identity consisting of the database history identity, sealed writer epoch and local sequence.
-An asynchronous submit returns a provisional receipt carrying that identity.
-Apply publishes the mapping from attempt to durable outcome with the resolved replica frame, and preserves it through checkpoints for the declared receipt window.
-The durable witness retains the full transaction key.
-The connection uses the paired source and replica coordinates of the installed prefix to redeem a current-epoch attempt.
-The progress monitor retains the last applied result with its exact attempt identity.
-When that result has retired from the monitor, redemption reads the checkpointed witness and confirms the full transaction key.
-A synchronous response or the redemption of an asynchronous receipt yields a causal token bound to a prefix that contains that outcome.
-A provisional receipt is redeemed before it can supply a read lower bound.
-A lost response is retried by the existing scoped application retry key and body digest.
+Receipt expiry ends the observation window.
+Missing evidence at a cut may leave the outcome unresolved and does not release credit, close a slot or permit fresh issuance.
+A sealed handoff installs the authentic predecessor prefix and transfers unresolved obligations before opening a new namespace.
+Frozen attachments authenticate the original scope and open evidence within their held checkpoint cut.
+An absent witness at that cut cannot certify a negative decision.
 
-After sealing and recovering the old writer, an absent attempt in the closed epoch receives an unresolved outcome once recovery proves the relevant prefix has been searched through its final position.
-An absence beyond the retained receipt window receives an expired outcome.
-An absent attempt in the current epoch can still be pending.
-After migration, numeric-only receipts from the volatile intake carry insufficient identity and must fail explicitly at the placed boundary.
-Classic deployments can continue to use the durable source position for their existing receipt format.
-A database incarnation must also distinguish deletion and recreation at the same name.
+The passive slot and witness values carry exact identity and disposition.
+The active holder selects between intake, append and shutdown.
+The progress monitor publishes the applied prefix and wakes waiters.
 
-The passive identity and outcome types hold immutable coordinates.
-The active holder owns selection between admission, append and shutdown.
-The progress monitor owns publication of the applied outcome and wakes waiters.
-The immutable receipt is scoped to the authenticated principal, deployment history and attempt.
-The native submission result and SQL session use the same versioned receipt representation.
-A frozen attachment authenticates receipts in the deployment's history and checks them against the exact checkpoint root it admitted and loaded.
-An applied token must name its journal and a position at or below that cut.
-A provisional receipt needs an exact outcome witness in the checkpoint.
-A missing outcome on the frozen attachment yields a retryable refusal.
-The frozen receipt model checks identity, cut coverage and how the attachment classifies absence. [FrozenReceiptCut.tla](../tla/FrozenReceiptCut.tla)
+The current placed outcome implementation and the [serving authority](../tla/PlacedServingAuthority.tla) and [frozen cut](../tla/FrozenReceiptCut.tla) models cover provisional receipt identity and terminal redemption.
+Durable reservation, fencing and succession are implementation and proof obligations for the receiver slot contract.
 
-Acceptance starts with a fault replay that pauses an intake after submission, seals the epoch, commits another transaction at the same local position and tries to redeem both receipts and use them as read bases.
-It also covers an append that committed without a reply, an epoch change while awaiting, an outcome restored from a checkpoint, and independent installations serving the same database name.
-The model `PlacedServingAuthority.tla` distinguishes an attempt from its position in the committed sequence.
-
-Current paths are [Multi intake](../../rust/crates/multi/src/logs.rs), [node submit and await](../../rust/crates/node/src/node.rs), [session basis](../../rust/crates/node/src/session.rs), and [installed progress](../../rust/crates/replication/src/driver.rs).
+Current source paths are [Multi intake](../../rust/crates/multi/src/logs.rs), [node submit and await](../../rust/crates/node/src/node.rs), [session basis](../../rust/crates/node/src/session.rs), and [installed progress](../../rust/crates/replication/src/driver.rs).
 
 ## Placement and freshness
 
