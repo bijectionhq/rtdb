@@ -227,7 +227,7 @@ impl OwnedReadSession {
         for witness in witnesses {
             if witness.scope != scope
                 || witness.basis != self.present
-                || witness.fixed.is_some()
+                || witness.region.is_some()
                 || witness.relation.world().is_some()
                 || witness.relation.is_world_catalog()
             {

@@ -31,7 +31,7 @@ impl TableRetirements for RetiredRelations {
         let catalog = CatalogSnapshot::new(&self.database, BTreeMap::from([(
             self.database.clone(), DatabaseSnapshot { partitions: vec![snapshot.clone()], storage: Arc::clone(&self.storage) },
         )]), false)?;
-        let context = QueryContext::new(catalog, Arc::clone(&self.memory), present.into(), "UTC", QueryOptions::default(), cancellation)?;
+        let context = QueryContext::new(catalog, Arc::clone(&self.memory), present, "UTC", QueryOptions::default(), cancellation)?;
         let mut due = BTreeSet::new();
         for retired in catalogs {
             let ready: Vec<_> = rtdb_query::read_owned_retirements(Arc::clone(&context), retired.clone()).await?
