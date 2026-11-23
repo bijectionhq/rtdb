@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
 use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
+use crate::audience_seat::{parse_seat_alternate, session_seat_count, session_seat_index};
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
 pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v19";
@@ -56,7 +57,7 @@ impl std::fmt::Display for AudienceSeat {
 }
 
 impl AudienceSeat {
-    pub(crate) fn index(self) -> usize { self.turn * 2 + usize::from(self.alternate) }
+    pub(crate) fn index(self) -> usize { session_seat_index(self.turn, self.alternate) }
 }
 
 impl AudienceFlightConfig {
@@ -73,15 +74,16 @@ impl AudienceFlightConfig {
         if value.len() > 41 { return Err(invalid()); }
         let (turn, rest) = value.split_once('/').ok_or_else(invalid)?;
         let (alternate, attempt) = rest.split_once('/').ok_or_else(invalid)?;
-        let turn = turn.parse::<usize>().ok().filter(|turn| *turn < self.turns).ok_or_else(invalid)?;
-        let alternate = match alternate { "0" => false, "1" => true, _ => return Err(invalid()) };
+        let turn = turn.parse::<usize>().map_err(|_| invalid())?;
+        let [digit] = alternate.as_bytes() else { return Err(invalid()); };
+        let alternate = parse_seat_alternate(self.turns, turn, *digit).ok_or_else(invalid)?;
         let attempt = uuid::Uuid::parse_str(attempt).ok().filter(|attempt| !attempt.is_nil()).ok_or_else(invalid)?;
         let seat = AudienceSeat { turn, alternate, attempt };
         if seat.to_string() != value { return Err(invalid()); }
         Ok(seat)
     }
 
-    pub(crate) fn session_seats(self) -> usize { 2 * self.turns }
+    pub(crate) fn session_seats(self) -> usize { session_seat_count(self.turns) }
 
     pub fn source(self) -> uuid::Uuid { self.source }
     pub fn permits(self) -> usize { 2 * (self.turns + 1) }

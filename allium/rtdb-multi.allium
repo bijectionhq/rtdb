@@ -3291,11 +3291,12 @@ actor Gateway {
     -- The audience route derives the holder endpoint from that member's advertised host and the installed audience port.
     -- It cannot activate or warm a deployment or ask the ordinary control endpoint for a route.
     -- An audience handshake names one of two session seats per prepaid turn and an exact mint attempt.
+    -- The holder allocates the seats within its installed audience reservation.
     -- Only a retry of the live attempt under the same authenticated credential can recover that occupied seat.
     -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
+    -- A lost close request or reply leaves a new mint subject to the same seat permit.
     -- An authenticated original audience bearer can close its own session or read after the writer attachment is gone.
-    -- A new handshake may retire a seat bound to a different attachment only after matching its authenticated candidate to the current local catalog.
-    -- A retiring predecessor still holds the seat until its final original owner drains.
+    -- A handshake authenticated against the current local attachment can retire a displaced or expired session for that deployment.
     -- The writer authenticates the session with the peer in that proof.
     -- Each Flight SQL call using a session token resolves its original writer placement.
     -- A displaced Flight SQL session must establish a new authenticated session.

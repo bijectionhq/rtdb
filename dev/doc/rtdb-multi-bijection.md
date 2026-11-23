@@ -88,6 +88,20 @@ It reads the exact deployment and that deployment's member by key and dials the 
 A missing, stale, or parked placement makes the audience handshake unavailable.
 The writer lifecycle remains with the placement owners. At the holder, acquisition verifies the recovered source and writer quorum.
 
+Each installed holder reserves two Flight session seats per prepaid turn.
+The gateway and holder parse the same seat selector, and the gateway requires the holder to acknowledge the exact selector and mint attempt before wrapping a new session token.
+A live seat can recover its original session under the same credential and exact mint attempt.
+For the same deployment, the holder compares the candidate with the current local attachment before retiring a displaced or expired occupant.
+Close, expiry and displacement can end a registry entry while its session still owns the permit.
+A lost close request leaves the existing session in place until retirement, and a lost reply leaves the permit charged while original I/O drains.
+
+On 2026-11-23, Verus 0.2026.11.20.9da409b checked seven obligations and rejected fourteen controls in the audience session seat area.
+See [the area manifest](../../verification/verus/audience_session_seats/area.json) for the mutations and expected diagnostics.
+The area checks the shipped alternate parser, registry size and indexing, attachment and admission decisions, and a lost-close model that invokes the shipped admission decision.
+Source inspection ties vacancy to an acquired semaphore permit, retry to lookup of the original live registry entry, and retained provider I/O to a strong reference to the session through its I/O admission.
+The checked bound applies to one installed holder reservation and assumes those runtime ownership and serialization rules, the sampled catalog, and authenticated identity comparisons.
+Cross-holder placement and the time for provider I/O to drain require their own evidence.
+
 ### Query from the application
 
 Funrun reads through the Conductor at the transaction's basis, served from the holder's tail and cache.

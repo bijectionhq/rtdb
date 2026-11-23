@@ -1,4 +1,5 @@
 mod auth;
+mod audience_seat;
 mod config;
 mod error;
 mod execute;

@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, SeatState, admit_audience_seat, occupied_seat_action};
 
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
 
@@ -294,36 +295,56 @@ impl Service {
                 let displaced = || Status::unavailable("The audience Flight writer attachment changed during handshake");
                 let authenticated = placement.as_ref().ok_or_else(displaced)?;
                 let current = catalog.database(authenticated.name()).map_err(|_| displaced())?;
-                if !Arc::ptr_eq(authenticated, &current) { return Err(displaced()); }
+                let candidate_is_current = Arc::ptr_eq(authenticated, &current);
                 let existing = match original.upgrade() {
-                    Some(session) if session.placed_database() != Some(current.name()) => return Err(occupied()),
-                    Some(session) if session.holds_attachment(&current) && session.audience_remaining_micros().is_some() => Some(session),
                     Some(session) => {
-                        // A newly authenticated attachment can retire its detached or expired predecessor.
-                        // The seat permit still travels with any outstanding original I/O.
-                        self.retire_session(&session);
-                        None
+                        let attachment = if session.placed_database() != Some(current.name()) {
+                            SeatAttachment::ForeignDeployment
+                        } else if session.holds_attachment(&current) {
+                            SeatAttachment::Current { unexpired: session.audience_remaining_micros().is_some() }
+                        } else {
+                            SeatAttachment::Displaced
+                        };
+                        match occupied_seat_action(candidate_is_current, attachment) {
+                            OccupiedSeatAction::RejectStaleCandidate => return Err(displaced()),
+                            OccupiedSeatAction::RejectForeignDeployment => return Err(occupied()),
+                            OccupiedSeatAction::CheckRetry => Some(session),
+                            OccupiedSeatAction::Retire => {
+                                self.retire_session(&session);
+                                None
+                            }
+                        }
                     }
-                    None => None,
+                    None if candidate_is_current => None,
+                    None => return Err(displaced()),
                 };
-                if let Some(session) = existing {
+                let seat_state = if let Some(session) = existing {
                     let same_credential = session.caller.mac.as_ref().zip(caller.mac.as_ref())
                         .is_some_and(|(left, right)| auth::equal(left, right));
-                    if session.audience_seat() != Some(requested) || !same_credential
-                    {
-                        return Err(occupied());
-                    }
-                    match sessions.lookup(&session.id, true) {
-                        Lookup::Found(session) => session,
-                        _ => return Err(occupied()),
+                    SeatState::Live {
+                        same_credential,
+                        same_attempt: session.audience_seat() == Some(requested),
+                        session,
                     }
                 } else {
-                    let permit = Arc::clone(&slot.permit).try_acquire_owned().map_err(|_| occupied())?;
-                    let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
-                    let session = mint(Some(AudienceSession { source, seat: requested,
-                        cache: Arc::clone(&audience.cache), expires_at, _permit: permit }))?;
-                    *original = Arc::downgrade(&session);
-                    session
+                    match Arc::clone(&slot.permit).try_acquire_owned() {
+                        Ok(permit) => SeatState::Vacant(permit),
+                        Err(_) => SeatState::Draining,
+                    }
+                };
+                match admit_audience_seat(seat_state) {
+                    SeatDecision::Resume(session) => match sessions.lookup(&session.id, true) {
+                        Lookup::Found(registered) => registered,
+                        _ => return Err(occupied()),
+                    },
+                    SeatDecision::Mint(permit) => {
+                        let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
+                        let session = mint(Some(AudienceSession { source, seat: requested,
+                            cache: Arc::clone(&audience.cache), expires_at, _permit: permit }))?;
+                        *original = Arc::downgrade(&session);
+                        session
+                    }
+                    SeatDecision::Refuse => return Err(occupied()),
                 }
             } else {
                 mint(None)?

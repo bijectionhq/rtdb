@@ -1,0 +1,270 @@
+{
+  "summary": "Flight audience turns have two distinct seats and mint only with a vacant seat's permit. A live retry requires the original credential and exact attempt, and retirement requires the current attachment.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 7,
+  "controls": {
+    "resume_with_wrong_attempt": {
+      "defect": "The Live seat resumes under the original credential with a different mint attempt.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "if same_credential && same_attempt =>",
+          "replace": "if same_credential =>"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "admit_audience_seat",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "resume_with_wrong_credential": {
+      "defect": "The Live seat resumes an exact attempt under a different credential.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "if same_credential && same_attempt =>",
+          "replace": "if same_attempt =>"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "admit_audience_seat",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "reject_exact_retry": {
+      "defect": "Even the original credential and attempt cannot resume.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "if same_credential && same_attempt =>",
+          "replace": "if same_credential && same_attempt && false =>"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "admit_audience_seat",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "retire_with_stale_candidate": {
+      "defect": "Authentication on an earlier attachment authorizes retirement of a displaced session.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "    if !candidate_is_current {\n        return OccupiedSeatAction::RejectStaleCandidate;\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "occupied_seat_action",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "retire_current_live_session": {
+      "defect": "A current candidate retires its live session instead of checking for an exact retry.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "        SeatAttachment::Current { unexpired: true } => OccupiedSeatAction::CheckRetry,\n        SeatAttachment::Displaced | SeatAttachment::Current { unexpired: false } => OccupiedSeatAction::Retire,",
+          "replace": "        SeatAttachment::Displaced | SeatAttachment::Current { .. } => OccupiedSeatAction::Retire,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "occupied_seat_action",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "retire_foreign_deployment": {
+      "defect": "A current candidate retires a session from another deployment.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "SeatAttachment::ForeignDeployment => OccupiedSeatAction::RejectForeignDeployment,",
+          "replace": "SeatAttachment::ForeignDeployment => OccupiedSeatAction::Retire,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "occupied_seat_action",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "allocate_third_seat": {
+      "defect": "The holder allocates three positions per prepaid turn.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "\n    2 * turns\n",
+          "replace": "\n    3 * turns\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "session_seat_count",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "alias_alternates": {
+      "defect": "Both alternates refer to the same registry slot.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "    2 * turn + if alternate { 1 } else { 0 }",
+          "replace": "    2 * turn"
+        },
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "ensures out == 2 * turn + if alternate { 1int } else { 0int },",
+          "replace": "ensures out == 2 * turn,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/audience_session_seats/laws.rs",
+          "function": "prepaid_seats_are_distinct_and_in_range",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "accept_third_alternate": {
+      "defect": "The shared gateway and holder parser accepts a third seat selector.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "        b'1' => Some(true),",
+          "replace": "        b'1' => Some(true),\n        b'2' => Some(false),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "parse_seat_alternate",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "accept_unprepaid_turn": {
+      "defect": "The shared parser accepts the first turn beyond the reserved range.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "if turn >= turns {",
+          "replace": "if turn > turns {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "parse_seat_alternate",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "lose_close_request_and_free_seat": {
+      "defect": "The lost-close model treats a close that never arrived as if the live seat were released.",
+      "mutate": [
+        {
+          "file": "verification/verus/audience_session_seats/laws.rs",
+          "find": "if selected != close_target || !close_arrived {",
+          "replace": "if selected != close_target {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/audience_session_seats/laws.rs",
+          "function": "a_lost_close_cannot_admit_a_third_session",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "free_seat_with_retained_io": {
+      "defect": "The lost-close model treats a closed seat as vacant while its retained I/O is still running.",
+      "mutate": [
+        {
+          "file": "verification/verus/audience_session_seats/laws.rs",
+          "find": "    } else if retained_io {\n        SeatState::Draining\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/audience_session_seats/laws.rs",
+          "function": "a_lost_close_cannot_admit_a_third_session",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "refuse_vacant_seat": {
+      "defect": "A vacant seat refuses to mint even with an acquired permit.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "SeatState::Vacant(permit) => SeatDecision::Mint(permit),\n        SeatState::Live { session, same_credential, same_attempt }",
+          "replace": "SeatState::Vacant(_) => SeatDecision::Refuse,\n        SeatState::Live { session, same_credential, same_attempt }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "admit_audience_seat",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "keep_expired_session": {
+      "defect": "An expired session on the current attachment remains eligible for retry.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "        SeatAttachment::Current { unexpired: true } => OccupiedSeatAction::CheckRetry,\n        SeatAttachment::Displaced | SeatAttachment::Current { unexpired: false } => OccupiedSeatAction::Retire,",
+          "replace": "        SeatAttachment::Current { .. } => OccupiedSeatAction::CheckRetry,\n        SeatAttachment::Displaced => OccupiedSeatAction::Retire,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "occupied_seat_action",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    }
+  }
+}
