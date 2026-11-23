@@ -2977,7 +2977,8 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
-            let standing = !proposal_overlay && matches!(&section.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_));
+            let standing = !proposal_overlay && matches!(&section.effect,
+                OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop);
             if !worlds.insert(section.world)
                 || (section.checks.is_empty() && !standing && !retained_release && !terminal_proposal && !proposal_close)
                 || section.checks.len() > 128

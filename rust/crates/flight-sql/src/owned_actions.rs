@@ -3340,8 +3340,9 @@ impl Service {
             proposal_eligible &= mode == rtdb_types::WorldClockMode::Proposal
                 && ((*kind == 0 && count != 0) || *kind == 3);
             terminal_proposal |= *kind == 3;
-            if count == 0 && !matches!(*kind, 0 | 1)
-                && !release_eligible && !close_eligible && !(proposal_eligible && terminal_proposal)
+            let standing_drop = *kind == 2 && mode != rtdb_types::WorldClockMode::Proposal;
+            if count == 0 && !matches!(*kind, 0 | 1) && !standing_drop
+                && !close_eligible && !(proposal_eligible && terminal_proposal)
             {
                 return Err(invalid("This world effect requires original witnesses"));
             }
@@ -3468,7 +3469,7 @@ impl Service {
         let observed_root = !root.checks.is_empty() || !root_witnesses.is_empty();
         let release = *root_kind == 3;
         if (*root_kind == 0 && observed_root) || (*root_kind == 1 && !observed_root)
-            || (release || delete_root) != release_eligible || (release && observed_root)
+            || ((release || delete_root) && !release_eligible) || (release && observed_root)
             || (proposal_close != close_eligible) || ((delete_root || proposal_land || proposal_close) && !observed_root)
         {
             return Err(invalid("The Root section kind disagrees with its observations"));

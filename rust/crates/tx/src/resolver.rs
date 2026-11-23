@@ -1720,7 +1720,9 @@ impl<'a> OpenTransaction<'a> {
             }
             for (world, attempt, own_fingerprint, advance_to, drop_world, settlement_pin, _) in publications {
                 let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
-                if (witnesses == 0 && (drop_world || (proposal_overlay.is_some() && settlement_pin.is_none())))
+                let proposal_drop = drop_world && self.owned_worlds.get(&world).is_none_or(|(record, _)|
+                    record.mode == rtdb_types::WorldClockMode::Proposal);
+                if (witnesses == 0 && (proposal_drop || (proposal_overlay.is_some() && settlement_pin.is_none())))
                     || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
                     || (rows == 0) != (advance_to.is_some() || drop_world || settlement_pin.is_some())
                     || drop_world && advance_to.is_some()
