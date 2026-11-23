@@ -566,9 +566,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("version".into(), Value::I64(1));
             "rtdb-hosted-constraint-refusal-v1"
         }
-        Operation::Public(TxOp::OwnedDeadline { until }) => {
+        Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging }) => {
             body.insert("until".into(), Value::I64(until.0));
-            "rtdb-owned-deadline-v1"
+            if *recheck_at_staging { "rtdb-owned-staging-deadline-v1" } else { "rtdb-owned-deadline-v1" }
         }
         Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1336,7 +1336,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-capacity-v1" => &["relation", "column", "prefix", "at_most"],
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
-            "rtdb-owned-deadline-v1" => &["until"],
+            "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => &["until"],
             "rtdb-hosted-constraint-refusal-v1" => &["version"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
             "rtdb-owned-root-retained-sibling-v1" => &["registration", "previous", "sibling", "attempt", "fingerprint"],
@@ -1551,9 +1551,9 @@ impl SourceOperationReader<'_> {
                 }
                 TxOp::HostedConstraintRefusal
             }
-            "rtdb-owned-deadline-v1" => {
+            "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
-                TxOp::OwnedDeadline { until: Timestamp(until) }
+                TxOp::OwnedDeadline { until: Timestamp(until), recheck_at_staging: name == "rtdb-owned-staging-deadline-v1" }
             }
             "rtdb-owned-sweep-expired-v2" => {
                 let (Value::Utf8(relation), Value::I64(created), Value::I64(expiry), Value::Binary(scope)) =

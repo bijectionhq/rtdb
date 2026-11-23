@@ -419,9 +419,7 @@ mod tests {
         ops.push(delete_row("fact_first"));
         ops.extend(
             [
-                TxOp::OwnedDeadline {
-                    until: Timestamp(8),
-                },
+                TxOp::owned_deadline(Timestamp(8)),
                 TxOp::OwnedCheckWorldScope { scope },
                 TxOp::OwnedCheckWorldPurge {
                     relation: relation.clone(),

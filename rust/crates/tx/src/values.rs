@@ -1172,7 +1172,7 @@ pub enum TxOp {
     OwnedDeclarePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String> },
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
-    OwnedDeadline { until: Timestamp },
+    OwnedDeadline { until: Timestamp, recheck_at_staging: bool },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
     OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
@@ -1202,6 +1202,10 @@ pub enum TxOp {
 }
 
 impl TxOp {
+    pub fn owned_deadline(until: Timestamp) -> Self {
+        Self::OwnedDeadline { until, recheck_at_staging: false }
+    }
+
     pub fn is_owned(&self) -> bool {
         matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. })
     }
