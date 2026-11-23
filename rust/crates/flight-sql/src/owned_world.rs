@@ -130,6 +130,13 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
         before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
     ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>>;
+    fn preflight_accepted_scope<'a>(
+        &'a self, relations: &'a [OwnedRelation], system: Timestamp,
+    ) -> BoxFuture<'a, Result<Timestamp>>;
+    fn accepted_point<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
+        system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;

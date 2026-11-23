@@ -30,6 +30,7 @@ struct ArchivePoint {
     id: EntityId,
     valid: Interval,
     lifetime: Option<ArchiveLifetimeRead>,
+    expected_schema: Option<rtdb_types::OwnedSchema>,
     guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     reply: oneshot::Sender<Result<Option<WorldFact>>>,
 }
@@ -37,6 +38,11 @@ struct ArchivePoint {
 enum ArchiveRead {
     Coverage {
         frontiers: Vec<(OwnedRelation, i64)>,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    AcceptedScope {
+        schemas: Vec<(OwnedRelation, rtdb_types::OwnedSchema)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -243,6 +249,60 @@ impl HeldCheckpointWorld {
         Ok(())
     }
 
+    pub async fn preflight_accepted_scope(&self, relations: &[OwnedRelation], system: Timestamp) -> Result<Timestamp> {
+        self.check()?;
+        let clock = self.open.snapshot.certify_world_accepted_scope(&self.open.record, relations, system).await?;
+        let guard = self.open.snapshot.relation_release_guard(relations)?;
+        let mut schemas = Vec::with_capacity(relations.len());
+        for relation in relations {
+            let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+            schemas.push((relation.clone(), schema.clone()));
+        }
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::AcceptedScope {
+            schemas, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        guard()?;
+        self.check()?;
+        Ok(clock)
+    }
+
+    pub async fn accepted_point(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
+        system: Timestamp,
+    ) -> Result<(Option<WorldFact>, bool)> {
+        self.check_relation(relation)?;
+        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
+            return Err(OwnedWorld::unavailable());
+        }
+        let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
+        let guard = self.open.snapshot.relation_release_guard([relation])?;
+        self.require_archive_coverage(vec![(relation.clone(), 0)], guard).await?;
+        self.open.snapshot.check_point_purge_floor(relation, id, self.parent_basis().system_time).await?;
+        let local = cut.shadow(id, valid).await?;
+        let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
+        let shadowed = local.is_some();
+        let fact = match local {
+            Some(fact) => match WorldShadow::from_record(fact.row)? {
+                WorldShadow::Deleted => None,
+                WorldShadow::Present(row) => Some(WorldFact {
+                    row, revision: fact.revision, lifetime: None, _reservation: fact._reservation,
+                }),
+            },
+            None => self.archive_point_checked(relation, id, valid, None, Some(schema)).await?,
+        };
+        if let Some(fact) = &fact {
+            let upper = if shadowed { system } else { self.parent_basis().system_time };
+            if fact.revision > upper { return Err(OwnedWorld::unavailable()); }
+            schema.validate_row(&fact.row)?;
+        }
+        self.check_relation(relation)?;
+        Ok((fact, shadowed))
+    }
+
     pub async fn parent_point(
         &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool,
     ) -> Result<WorldPoint> {
@@ -288,11 +348,18 @@ impl HeldCheckpointWorld {
     }
 
     async fn archive_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, lifetime: Option<ArchiveLifetimeRead>) -> Result<Option<WorldFact>> {
+        self.archive_point_checked(relation, id, valid_at, lifetime, None).await
+    }
+
+    async fn archive_point_checked(
+        &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp,
+        lifetime: Option<ArchiveLifetimeRead>, expected_schema: Option<&rtdb_types::OwnedSchema>,
+    ) -> Result<Option<WorldFact>> {
         let valid = Interval::at(valid_at)?;
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, self.open.retained.basis.system_time).await?;
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Point(ArchivePoint {
-            relation: relation.clone(), id: id.clone(), valid, lifetime, guard, reply,
+            relation: relation.clone(), id: id.clone(), valid, lifetime, expected_schema: expected_schema.cloned(), guard, reply,
         }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?
@@ -813,6 +880,26 @@ pub(crate) async fn open_held_checkpoint_world(
                                     ));
                                     let _ = reply.send(coverage);
                                 }
+                                ArchiveRead::AcceptedScope { schemas, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        check_archive_coverage(&context, &owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        for (relation, expected) in schemas {
+                                            let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &owner, &relation).await?;
+                                            if !actual.is_some_and(|(schema, _)| schema == expected) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                        }
+                                        context.check_cancelled()
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
                                 ArchiveRead::PathColumns { relation, path, expected_schema, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
@@ -832,9 +919,16 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Point(ArchivePoint { relation, id, valid, lifetime, guard, mut reply }) => {
+                                ArchiveRead::Point(ArchivePoint { relation, id, valid, lifetime, expected_schema, guard, mut reply }) => {
                                     let read = async {
-                                        let batches = read_checkpoint_point_in_context(Arc::clone(&context).with_owned_read_guard(guard), CheckpointPoint {
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        if let Some(expected) = expected_schema {
+                                            let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &owner, &relation).await?;
+                                            if !actual.is_some_and(|(schema, _)| schema == expected) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                        }
+                                        let batches = read_checkpoint_point_in_context(context, CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }, lifetime).await?;
                                         decode_point(batches.unwrap_or_default(), &id, memory, lifetime.map(|live| live.policy.duration))

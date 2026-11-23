@@ -70,7 +70,7 @@ pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, 
 pub use owned_relation::{
     OwnedChangeEntry, OwnedIdentityCandidates, open_owned_artefact_candidate, open_owned_capacity_point, open_owned_constraint_projection, open_owned_identity_page, open_owned_identity_prefix, open_owned_path_catalog, open_owned_point, open_owned_point_at_system,
     open_owned_unique_point, open_owned_valid_boundaries, open_owned_valid_during_at, owned_identity_candidates, owned_row_revision, read_owned_parent_schemas, read_owned_root_publication,
-    read_owned_change_entry, read_owned_fixed_range_changes, read_owned_fixed_range_rule, read_owned_lifetime_floor, read_owned_lifetime_floor_table, read_owned_relation_schema, read_owned_schema_catalog, read_owned_world, read_owned_world_clock,
+    read_owned_change_entry, read_owned_fixed_range_changes, read_owned_fixed_range_rule, read_owned_lifetime_floor, read_owned_lifetime_floor_table, read_owned_relation_schema, read_owned_schema_catalog, read_owned_world, read_owned_world_clock, read_owned_world_clock_revision,
 };
 pub use owned_relation::{open_owned_lifetime_point, open_owned_point_with_position_mask, owned_row_lifetime, read_owned_point_revision};
 
