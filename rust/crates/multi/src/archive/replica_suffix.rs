@@ -655,7 +655,7 @@ impl ReplayControl {
             ReplicaBody::TriesAdded(row) => Self::Advance(row.source_msg_id),
             ReplicaBody::ArtefactsAdded(row) => Self::Advance(row.source_msg_id),
             ReplicaBody::ArtefactsRemoved(row) => Self::Advance(row.source_msg_id),
-            ReplicaBody::TriesDeleted(_) => Self::Advance(None),
+            ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => Self::Advance(None),
             _ => return Err(suffix_unavailable()),
         })
     }

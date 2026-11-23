@@ -96,7 +96,7 @@ impl BlockPreparation {
         let catalog = self.table_catalog()?;
         catalog.tables().iter().map(|(table, meta)| {
             let block = meta.to_block(trie_catalog.partitions(table)?)?;
-            Ok((table.clone(), trie_catalog.with_search_manifest(table, block)))
+            Ok((table.clone(), trie_catalog.with_retirement(table, trie_catalog.with_search_manifest(table, block))))
         }).collect()
     }
 }
@@ -309,6 +309,14 @@ impl PartitionState {
     pub fn remove_artefacts(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>) {
         let mut value = self.value.write();
         let trie_catalog = value.trie_catalog.without_artefacts(table, entries);
+        let mut next = value.as_ref().clone();
+        next.trie_catalog = Arc::new(trie_catalog);
+        *value = Arc::new(next);
+    }
+    /// Applies a replicated table retirement (trie-cat.allium: RetireTable).
+    pub fn retire_tables(&self, tables: impl IntoIterator<Item = TableRef>, as_of: Timestamp) {
+        let mut value = self.value.write();
+        let trie_catalog = value.trie_catalog.with_retired_tables(tables, as_of);
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(trie_catalog);
         *value = Arc::new(next);

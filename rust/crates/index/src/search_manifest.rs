@@ -40,6 +40,13 @@ impl SearchManifest {
         }
     }
 
+    /// A retired table's active runs serve no later reader; collection releases them as it does superseded ones.
+    pub fn retire_all(&mut self, as_of: Timestamp) {
+        for (id, run) in std::mem::take(&mut self.active) {
+            self.retired.insert(id, RetiredSearchRun { run: Some(run), superseded_at: Some(as_of.0), ..Default::default() });
+        }
+    }
+
     pub fn apply_uploaded(&mut self, change: SearchRunChange, as_of: Timestamp) {
         let uploaded = if change.retire_only() { None } else { change.run.clone() };
         if self.publish(change, as_of) { return; }

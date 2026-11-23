@@ -16,7 +16,7 @@ pub use failure::{CompactionFailure, CompactionObserver, StderrCompactionObserve
 pub use gc::{BlockCollector, CollectionObserver, CollectorClock, GarbageConfig, TrieCollector, block_is_garbage};
 pub use job::{CompactionJob, RecencyMode, available_jobs};
 pub use merge::{MergeConfig, RecencyPartition, SegmentCompactor, recency_partition};
-pub use publication::{CompactionPublisher, SnapshotSource, TrieDeletionPublisher};
+pub use publication::{CompactionPublisher, SnapshotSource, TableRetirements, TrieDeletionPublisher};
 pub use retirement_intent::ResetRetirements;
 
 /// Reading a stored file within the memory budget, as compaction reads its inputs.

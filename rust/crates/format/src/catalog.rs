@@ -227,6 +227,11 @@ impl TableBlock {
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
 
+    pub fn with_retired_as_of(mut self, micros: Option<i64>) -> Self {
+        if self.wire.retired_as_of_micros != micros { Arc::make_mut(&mut self.wire).retired_as_of_micros = micros; }
+        self
+    }
+
     pub fn with_search_runs(mut self, active: Vec<crate::log::proto::SearchRun>, retired: Vec<crate::log::proto::RetiredSearchRun>) -> Self {
         let wire = Arc::make_mut(&mut self.wire);
         wire.search_runs = active;

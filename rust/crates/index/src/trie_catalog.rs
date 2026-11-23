@@ -98,6 +98,8 @@ struct TableTries {
     shards: BTreeMap<Shard, ShardValue>,
     l1h_recencies: BTreeMap<BlockIndex, BTreeSet<CivilDate>>,
     search: std::sync::Arc<crate::search_manifest::SearchManifest>,
+    /// When the table's relation was retired: every trie it holds or later receives is garbage from then on.
+    retired: Option<Timestamp>,
 }
 
 impl TableTries {
@@ -109,11 +111,25 @@ impl TableTries {
         // descriptors still certify the original input to derived indexes.
         self.shard_with_floor(Shard::root(0, None), block).supersede(block, None, as_of);
     }
+    /// Supersedes every trie the table holds with no successor.
+    fn retire(&mut self, as_of: Timestamp) {
+        let at = *self.retired.get_or_insert(as_of);
+        for trie in self.shards.values_mut().flat_map(|shard| shard.tries.values_mut()) {
+            if matches!(trie.state, TrieState::Live | TrieState::Nascent) { trie.garbage(at); }
+        }
+        self.l1h_recencies.clear();
+        std::sync::Arc::make_mut(&mut self.search).retire_all(at);
+    }
     fn apply(&mut self, mut trie: CatalogTrie, file_size_target: i64, as_of: Timestamp) -> Result<()> {
         let shard = Shard::of(&trie.key);
         let block = trie.key.block_index();
         if self.shards.get(&shard).is_some_and(|state| state.max_block_index >= block) { return Ok(()); }
         if let Some(metadata) = &mut trie.metadata { metadata.iid_bloom = None; }
+        if let Some(retired) = self.retired {
+            trie.garbage(retired);
+            self.shards.entry(shard).or_default().insert(trie);
+            return Ok(());
+        }
         match (shard.level, shard.recency) {
             (0, _) => { trie.state = TrieState::Live; self.shards.entry(shard).or_default().insert(trie); }
             (1, Some(recency)) => {
@@ -233,6 +249,24 @@ impl TrieCatalog {
     pub fn garbage_tries(&self, table: &TableRef, as_of: Timestamp) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.key.level() != 0 && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)).collect()
     }
+    /// When the table's relation was retired, if it was.
+    pub fn retired_as_of(&self, table: &TableRef) -> Option<Timestamp> {
+        self.tables.get(table).and_then(|state| state.retired)
+    }
+
+    /// Supersedes every trie of each retired table with no successor, and makes each trie the table later receives garbage on arrival (trie-cat.allium: RetireTable).
+    /// A table the catalog does not hold yet is recorded too, so its first flushed tries arrive as garbage.
+    /// A table already retired keeps its first retirement time.
+    pub fn with_retired_tables(&self, tables: impl IntoIterator<Item = TableRef>, as_of: Timestamp) -> Self {
+        let mut next = self.clone();
+        for table in tables { next.tables.entry(table).or_default().retire(as_of); }
+        next
+    }
+
+    pub fn with_retirement(&self, table: &TableRef, block: TableBlock) -> TableBlock {
+        block.with_retired_as_of(self.retired_as_of(table).map(|at| at.0))
+    }
+
     pub fn search_runs(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::SearchRun> {
         self.tables.get(table).into_iter().flat_map(|state| state.search.active())
     }
@@ -346,11 +380,11 @@ impl TrieCatalog {
         next.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
         for (table, tries) in replacements {
             let mut state = TableTries::default();
-            if let Some(previous) = self.tables.get(&table) { state.search = previous.search.clone(); }
+            if let Some(previous) = self.tables.get(&table) { state.search = previous.search.clone(); state.retired = previous.retired; }
             let mut shard = ShardValue::default();
             for mut trie in tries {
                 if Shard::of(&trie.key) != Shard::root(0, None) { return Err(invalid("Reset accepts only unpartitioned L0 tries")); }
-                trie.state = TrieState::Live;
+                trie.state = state.retired.map_or(TrieState::Live, |as_of| TrieState::Garbage { as_of });
                 shard.insert(trie);
             }
             state.shards.insert(Shard::root(0, None), shard);
@@ -379,6 +413,7 @@ impl TrieCatalog {
         }
         for (table, old) in &self.tables {
             primary.tables.entry(table.clone()).or_default().search = std::sync::Arc::clone(&old.search);
+            if let Some(retired) = old.retired { primary.tables.entry(table.clone()).or_default().retire(retired); }
             for (shard, old) in old.shards.iter().filter(|(shard, _)| shard.level == 0) {
                 let new = primary.tables.entry(table.clone()).or_default().shards.entry(shard.clone()).or_default();
                 new.max_block_index = new.max_block_index.max(old.max_block_index);
@@ -425,6 +460,7 @@ impl TrieCatalog {
             let mut state = TableTries::default();
             let wire = blocks[&table].as_proto();
             state.search = std::sync::Arc::new(crate::search_manifest::SearchManifest::load(&wire.search_runs, &wire.retired_search_runs)?);
+            state.retired = wire.retired_as_of_micros.map(Timestamp);
             for partition in partitions {
                 let shard = decode_shard(&partition)?;
                 let mut value = ShardValue::default();

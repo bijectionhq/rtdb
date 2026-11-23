@@ -13,7 +13,7 @@ use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use crate::{ArtefactPublisher, CycleWorker, SnapshotSource, TrieDeletionPublisher};
+use crate::{ArtefactPublisher, CycleWorker, SnapshotSource, TableRetirements, TrieDeletionPublisher};
 use crate::retirement_intent::{self, FileRelease, PendingRetirement};
 
 #[derive(Clone, Debug)]
@@ -73,6 +73,7 @@ pub struct TrieCollector {
     first_pending_search: Mutex<BTreeMap<(TableRef, ObjectKey), i64>>,
     first_search_observed: Mutex<BTreeMap<(TableRef, [u8; 32]), i64>>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
+    retirements: Option<Arc<dyn TableRetirements>>,
     store: Arc<dyn ObjectStore>,
     partition: Arc<PartitionState>,
     publisher: Arc<dyn TrieDeletionPublisher>,
@@ -85,12 +86,27 @@ impl TrieCollector {
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
         Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), first_pending_search: Mutex::default(), search: None,
-            store, partition, publisher, observer, config })
+            retirements: None, store, partition, publisher, observer, config })
     }
 
     pub fn with_search(mut self, publisher: Arc<dyn ArtefactPublisher>, version: rtdb_types::StorageVersion, epoch: rtdb_types::StorageEpoch) -> Self {
         self.search = Some((publisher, version, epoch));
         self
+    }
+
+    pub fn with_retirements(mut self, retirements: Arc<dyn TableRetirements>) -> Self {
+        self.retirements = Some(retirements);
+        self
+    }
+
+    /// Publishes the retirement of every due table, in chunks; their tries become garbage for later cycles to collect.
+    async fn retire_due_tables(&self, retirements: &dyn TableRetirements, cancellation: &CancellationToken) -> Result<()> {
+        let Some((tables, as_of)) = retirements.due(cancellation).await? else { return Ok(()); };
+        for chunk in tables.chunks(self.config.chunk_size) {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            retirements.retire(chunk.to_vec(), as_of).await?;
+        }
+        Ok(())
     }
 
     /// Keeps the eligible tries whose reader lease has elapsed since this collector first observed them.
@@ -138,6 +154,12 @@ impl TrieCollector {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             self.observer.table_failed(None, &error);
             return Ok(());
+        }
+        if let Some(retirements) = &self.retirements
+            && let Err(error) = self.retire_due_tables(retirements.as_ref(), cancellation).await
+        {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            self.observer.table_failed(None, &error);
         }
         let Some(as_of) = as_of else { return Ok(()); };
         let tables: Vec<_> = collection.current().table_catalog().entries().cloned().collect();

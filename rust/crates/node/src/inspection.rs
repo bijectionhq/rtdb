@@ -195,6 +195,7 @@ fn replica_message(message: &ReplicaBody) -> Result<(&'static str, String)> {
         ReplicaBody::NoOp(_) => ("no-op", edn::map([("type", ":no-op".into())])),
         ReplicaBody::ArtefactsAdded(artefacts) => ("artefacts-added", artefacts_message(&ArtefactsMessage::Added(artefacts), true)),
         ReplicaBody::ArtefactsRemoved(artefacts) => ("artefacts-removed", artefacts_message(&ArtefactsMessage::Removed(artefacts), true)),
+        ReplicaBody::TablesRetired(retired) => ("tables-retired", edn::map([("type", ":tables-retired".into()), ("table-names", edn::vector(retired.table_names.iter().map(|name| edn::quoted(name)))), ("as-of", edn::instant(retired.as_of_micros.unwrap_or_default()))])),
         _ => ("unknown", edn::map([("type", ":unknown".into())])),
     })
 }

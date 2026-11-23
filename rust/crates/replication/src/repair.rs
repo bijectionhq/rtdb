@@ -469,7 +469,7 @@ async fn replay(
                 if position == through { return Ok(digest); }
             }
             ReplicaBody::NoOp(_) | ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_)
-            | ReplicaBody::TriesDeleted(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
+            | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
             ReplicaBody::OversizedMessage(_) => return Err(invalid("The source journal has an unresolved oversized record")),
         }
     }

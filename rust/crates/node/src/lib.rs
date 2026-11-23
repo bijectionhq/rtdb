@@ -7,6 +7,7 @@ mod catalog;
 mod config;
 mod database;
 mod read_currency;
+mod table_retirement;
 mod node;
 mod backends;
 mod runtime;

@@ -31,6 +31,37 @@ fn historical_l1_waits_for_current_file_and_covered_l0_stays_in_source_inventory
 }
 
 #[test]
+fn a_retired_table_supersedes_every_trie_with_no_successor_and_keeps_its_retirement_across_checkpoints() {
+    let initial = apply(&[("l00-rc-b00", 10), ("l00-rc-b01", 10), ("l01-rc-b00", 15), ("l02-rc-p0-b01", 10)]);
+    assert!(!current(&initial).is_empty());
+    let retired = initial.with_retired_tables([table()], Timestamp(200));
+    assert!(current(&retired).is_empty());
+    assert!(retired.live_and_nascent_tries(&table()).is_empty());
+    assert_eq!(retired.retired_as_of(&table()), Some(Timestamp(200)));
+    assert_eq!(retired.garbage_tries(&table(), Timestamp(200)).iter().map(|trie| trie.key.to_string()).collect::<BTreeSet<_>>(),
+        names(&["l01-rc-b00", "l02-rc-p0-b01"]));
+    assert!(retired.garbage_tries(&table(), Timestamp(199)).is_empty());
+
+    let again = retired.with_retired_tables([table()], Timestamp(300));
+    assert_eq!(again.retired_as_of(&table()), Some(Timestamp(200)));
+    let arrived = again.with_tries(table(), [notification("l01-rc-b01", 15), notification("l00-rc-b02", 10)], Timestamp(400)).unwrap();
+    assert!(current(&arrived).is_empty());
+    assert!(arrived.iter_tries(&table()).all(|trie| matches!(trie.state, TrieState::Garbage { .. })));
+
+    let block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, arrived.partitions(&table()).unwrap()).unwrap();
+    let block = TableBlock::decode(&arrived.with_retirement(&table(), block).encode()).unwrap();
+    let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(500)).unwrap();
+    assert_eq!(loaded.retired_as_of(&table()), Some(Timestamp(200)));
+    let late = loaded.with_tries(table(), [notification("l01-rc-b03", 15)], Timestamp(600)).unwrap();
+    assert!(current(&late).is_empty());
+
+    let unseen = TableRef::new("public", "unflushed");
+    let early = TrieCatalog::new(20).unwrap().with_retired_tables([unseen.clone()], Timestamp(10));
+    let flushed = early.with_tries(unseen.clone(), [notification("l00-rc-b00", 10)], Timestamp(20)).unwrap();
+    assert!(flushed.current_tries(&unseen).is_empty());
+}
+
+#[test]
 fn levelled_current_files_supersede_only_partial_files() {
     let catalog = apply(&[("l01-rc-b00", 10), ("l01-r20200101-b01", 15), ("l01-rc-b01", 5), ("l01-rc-b02", 20), ("l01-rc-b03", 5)]);
     assert_eq!(current(&catalog), names(&["l01-r20200101-b01", "l01-rc-b02", "l01-rc-b03"]));

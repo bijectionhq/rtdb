@@ -155,6 +155,7 @@ value TrieKey {
 -- garbage: the trie has been fully superseded by compaction output.
 --   The garbage collector deletes the data and meta files from the object store,
 --   then removes the trie from the catalog.
+--   A table retirement (rule RetireTable) also makes every trie of the retired table garbage, with no successor.
 
 enum TrieState { nascent | live | garbage }
 
@@ -199,6 +200,7 @@ entity TrieCatalog {
     -- deleteTries(tries): remove garbage entries from the catalog after file deletion.
     -- withArtefacts(table, entries): record artefacts on their tries' entries (rule AddArtefact).
     -- withoutArtefacts(table, entries): remove artefact records from their tries' entries (rule RemoveArtefact).
+    -- retired_as_of(table): when the table's relation was retired (rule RetireTable), or null.
     -- holds(table, trie_key): whether any shard of the table holds the trie, as live, nascent or garbage.
     -- is_live(table, trie_key): whether the table holds the trie in a live shard list.
     -- artefacts(table, trie_key): the artefact records on the trie's entry.
@@ -438,6 +440,36 @@ rule mark_block_index_live {
     ensures:
         if nascent_trie != null:
             transition nascent_trie from :nascent to :live
+}
+
+------------------------------------------------------------
+-- Rules: Table retirement
+------------------------------------------------------------
+
+rule RetireTable {
+    -- Applied on every node from a replicated TablesRetired record (gc.allium: RetireDueTables).
+    -- A retired relation's table supersedes its tries with no successor: no compaction output replaces them and no reader selects them again.
+    -- A table already retired keeps its first retirement time, so a repeated record changes nothing.
+    -- A table the catalog does not yet hold is recorded too, so the tries a later block flush gives it arrive as garbage.
+    -- Its active search runs retire with it, for collection to release as it does superseded ones.
+    -- The retirement time travels in the table's block file, so a recovered catalog keeps it.
+    -- See: index/src/trie_catalog.rs (with_retired_tables)
+    when: RetireTable(table, as_of)
+
+    ensures:
+        trie_catalog.retired_as_of(table) = trie_catalog.retired_as_of(table) ?? as_of
+        for shard_state in trie_catalog.tries[table]:
+            for trie in shard_state.live + shard_state.nascent:
+                transition trie to :garbage with garbage_as_of = trie_catalog.retired_as_of(table)
+}
+
+rule InsertTrie_Retired {
+    -- Takes precedence over every InsertTrie rule above: a trie arriving for a retired table, from a late flush or an in-flight compaction job, is garbage on arrival and supersedes nothing.
+    when: InsertTrie(trie, as_of)
+    requires: trie_catalog.retired_as_of(trie.table) != null
+
+    ensures:
+        add trie as :garbage to shard [trie.level, trie.recency, trie.part] with garbage_as_of = trie_catalog.retired_as_of(trie.table)
 }
 
 ------------------------------------------------------------

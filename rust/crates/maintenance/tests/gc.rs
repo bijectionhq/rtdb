@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey, block_key, oversized_key}};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
-use rtdb_maintenance::{BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TrieCollector, TrieDeletionPublisher, block_is_garbage};
+use rtdb_maintenance::{BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TableRetirements, TrieCollector, TrieDeletionPublisher, block_is_garbage};
 use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, PhysicalObjectVersion, S3ObjectNamespace, StorageEpoch, StorageVersion, TableRef, Timestamp};
@@ -118,6 +118,53 @@ async fn trie_gc_deletes_artefacts_and_both_files_before_publishing_and_preserve
     assert!(store.head(&live_artefact).await.is_ok(), "a live trie's artefacts stay");
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     assert_eq!(publisher.commits.lock().unwrap().len(), 2);
+}
+
+struct DueRetirement { state: Arc<PartitionState>, table: TableRef, retired: Mutex<Vec<(Vec<TableRef>, Timestamp)>> }
+#[async_trait]
+impl TableRetirements for DueRetirement {
+    async fn due(&self, _: &CancellationToken) -> Result<Option<(Vec<TableRef>, Timestamp)>> {
+        Ok(self.state.value().trie_catalog().retired_as_of(&self.table).is_none().then(|| (vec![self.table.clone()], Timestamp(50))))
+    }
+    async fn retire(&self, tables: Vec<TableRef>, as_of: Timestamp) -> Result<()> {
+        self.retired.lock().unwrap().push((tables.clone(), as_of));
+        self.state.retire_tables(tables, as_of);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_retired_table_loses_its_compacted_tries_through_the_ordinary_deletion_and_keeps_l0_recovery() {
+    let table = TableRef::new("public", "retired");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let mut catalog = TrieCatalog::new(16).unwrap();
+    for key in ["l00-rc-b00", "l01-rc-b00"] {
+        catalog = catalog.with_tries(table.clone(), [CatalogTrie { key: key.parse().unwrap(), data_file_size: 1, metadata: None, state: TrieState::Live, artefacts: Vec::new(), published_files: None }], Timestamp(10)).unwrap();
+    }
+    let store = Arc::new(MemoryStore::default());
+    for key in ["l00-rc-b00", "l01-rc-b00"] {
+        let key: TrieKey = key.parse().unwrap();
+        store.put(&ObjectKey::new(entry.slug.data_key(&key)).unwrap(), Bytes::from_static(b"data")).await.unwrap();
+        store.put(&ObjectKey::new(entry.slug.metadata_key(&key)).unwrap(), Bytes::from_static(b"metadata")).await.unwrap();
+    }
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let publisher = Arc::new(DeletedPublisher { store: store.clone(), table: entry.clone(), commits: Mutex::new(Vec::new()) });
+    let retirements = Arc::new(DueRetirement { state: state.clone(), table: table.clone(), retired: Mutex::new(Vec::new()) });
+    let observer = Arc::new(Observer::default());
+    let collector = TrieCollector::new(store.clone(), state.clone(), publisher.clone(), observer.clone(), unleased(), fixed_clock()).unwrap()
+        .with_retirements(retirements.clone());
+
+    collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
+    assert_eq!(*retirements.retired.lock().unwrap(), vec![(vec![table.clone()], Timestamp(50))]);
+    assert!(publisher.commits.lock().unwrap().is_empty(), "the cycle that retires collects from the catalog it captured before");
+    assert!(state.value().trie_catalog().current_tries(&table).is_empty());
+
+    collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
+    assert_eq!(*publisher.commits.lock().unwrap(), vec![vec!["l01-rc-b00".parse::<TrieKey>().unwrap()]]);
+    assert_eq!(retirements.retired.lock().unwrap().len(), 1);
+    assert!(store.head(&ObjectKey::new(entry.slug.data_key(&"l00-rc-b00".parse().unwrap())).unwrap()).await.is_ok());
+    assert!(observer.0.lock().unwrap().is_empty());
 }
 
 #[derive(Clone, Copy)]

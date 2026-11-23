@@ -78,6 +78,9 @@
 -- A new collector, after restart or failover, observes afresh.
 -- Both sides measure elapsed time, so clocks need no synchronization; the margin covers twice the rate drift over one lease plus the longest provider request.
 --
+-- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
+-- Their tries then become garbage like any superseded trie, and the deletion rules below collect them unchanged.
+--
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.
 --
@@ -453,6 +456,52 @@ rule CommitTriesDeletedRule {
 }
 
 ------------------------------------------------------------
+-- Rules: Retired relations
+------------------------------------------------------------
+
+-- Published by the leader's trie GC; every node, the leader included on read-back, applies it to its trie catalog.
+-- See: replica-log.proto (TablesRetired)
+entity TablesRetiredMessage {
+    table_names: List<String>
+    as_of: Instant
+}
+
+rule RetireDueTables {
+    -- A hosted Root commit retires an owned relation at a transaction, with a retention (tx.allium).
+    -- At the start of each cycle, before selecting garbage, the collector reads every principal's retired catalog at the applied present.
+    -- A relation is due once its retirement time plus its retention is at or before that present, and no undropped world in the same principal's world catalog names it in its schemas.
+    -- Its tables are its data, change journal, unique, capacity, fixed-range, purge, purge-floor and lifetime tables that the table catalog holds and that are not retired yet.
+    -- World overlays of the relation stay outside: they go with their world.
+    -- The collector publishes the due tables in chunks of tries_deleted_chunk_size, each with the applied present as its retirement time, and awaits each record's application.
+    -- The cycle that publishes still collects from the catalog it captured before, so the newly garbage tries wait for a later cycle.
+    -- From then on they are garbage like any superseded trie: the eligibility, reader and checkpoint protection, reader lease and DeleteAndCommitChunk rules apply unchanged.
+    -- L0 recovery files of a retired table stay, as every table's do.
+    -- A failure is reported to the observer and leaves the rest of the cycle running.
+    -- See: maintenance/src/gc.rs (retire_due_tables), node/src/table_retirement.rs
+    when: RetireDueTables(present)
+
+    let due = retired_relation_tables(present)
+
+    requires: due.count > 0
+
+    ensures:
+        for chunk in chunk_by(due, config.tries_deleted_chunk_size):
+            TablesRetiredMessage.created(table_names: chunk, as_of: present)
+            for table in chunk:
+                trie_cat/RetireTable(table, present)
+}
+
+rule FollowerReplaysTablesRetired {
+    -- Idempotent, as rule RetireTable is, so the record is never stale.
+    when: msg: TablesRetiredMessage.created
+    requires: log_processor.mode = Follower
+
+    ensures:
+        for name in msg.table_names:
+            trie_cat/RetireTable(parse_table_ref(database.name, name), msg.as_of)
+}
+
+------------------------------------------------------------
 -- Rules: Follower replay
 ------------------------------------------------------------
 
@@ -554,6 +603,8 @@ surface TrieGcAdmin {
 --   default_garbage_as_of()       — block-time threshold minus garbage_lifetime
 --                                   (TrieGarbageCollector.kt: defaultGarbageAsOf)
 --   parse_table_ref(db, name)     — TableRef.parse (api/.../table/TableRef.kt)
+--   retired_relation_tables(t)    — the tables of owned relations due at present t (rule RetireDueTables)
+--                                   (node/src/table_retirement.rs)
 --   ObjectStoreDelete(path)       — DELETE one key (storage/ObjectStore.kt)
 
 ------------------------------------------------------------

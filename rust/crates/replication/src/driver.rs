@@ -190,6 +190,15 @@ impl TermHandle {
             Applied::Transaction(_) | Applied::Control => Err(invalid("Deletion received a different result")),
         }
     }
+    /// Returns once this term's installed prefix applies the retirement (trie-cat.allium: RetireTable).
+    pub async fn publish_retirements(&self, tables: Vec<TableRef>, as_of: Timestamp) -> Result<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.handle.commands.send(Command::Retire { term: self.term, tables, as_of, completion: sender }).await.map_err(|_| term_ended())?;
+        match receiver.await.map_err(|_| term_ended())?? {
+            Applied::Control => Ok(()),
+            Applied::Transaction(_) | Applied::TrieRemoval(_) => Err(invalid("Table retirement received a different result")),
+        }
+    }
     pub async fn submit_external(&self, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>) -> Result<ExternalReceipt> {
         let (sender, receiver) = oneshot::channel();
         self.handle.commands.send(Command::External { term: self.term, writer, system_time, token, completion: sender }).await.map_err(|_| term_ended())?;
@@ -219,13 +228,14 @@ enum Replacement {
 enum Command {
     ResetCompactor { term: Term, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacement: Replacement, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
+    Retire { term: Term, tables: Vec<TableRef>, as_of: Timestamp, completion: oneshot::Sender<Result<Applied>> },
     External { term: Term, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>, completion: oneshot::Sender<Result<Applied>> },
 }
 impl Command {
-    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } => *term } }
+    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::Retire { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } => *term } }
     fn fail(self, error: Anomaly) {
         match self {
-            Self::Delete { completion, .. } | Self::External { completion, .. } => { let _ = completion.send(Err(error)); }
+            Self::Delete { completion, .. } | Self::Retire { completion, .. } | Self::External { completion, .. } => { let _ = completion.send(Err(error)); }
             Self::ResetCompactor { completion, .. } => { let _ = completion.send(Err(error)); }
         }
     }
@@ -1190,6 +1200,11 @@ impl ReplicationDriver {
                         complete_record(&mut leader.pending, record.envelope.term_sequence, Err(trie_removal_unconfirmed()));
                     }
                 }
+                ReplicaBody::TablesRetired(message) => {
+                    let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
+                    self.partition.retire_tables(tables, Timestamp(message.as_of_micros.unwrap_or_default()));
+                    self.complete_control(&record);
+                }
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("Unresolved oversized body reached apply")),
             }
         }
@@ -1226,7 +1241,7 @@ impl ReplicationDriver {
             ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
             ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|source| source <= progress.source_position.0),
-            ReplicaBody::TriesDeleted(_) | ReplicaBody::OversizedMessage(_) => false,
+            ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::OversizedMessage(_) => false,
         }
     }
     fn complete_control(&mut self, record: &ReplicaRecord) {
@@ -1503,6 +1518,14 @@ impl ReplicationDriver {
                 }
                 let message = proto::TriesDeleted { table_name: Some(table.schema_and_table()), trie_keys: keys.into_iter().map(|key| key.to_string()).collect() };
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesDeleted(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)
+            }
+            Command::Retire { tables, as_of, completion, .. } => {
+                if tables.is_empty() {
+                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-table-retirement", "A table retirement names at least one table")));
+                    return Ok(());
+                }
+                let message = proto::TablesRetired { table_names: tables.iter().map(TableRef::schema_and_table).collect(), as_of_micros: Some(as_of.0) };
+                leader.enqueue(WriteBody::Message(ReplicaBody::TablesRetired(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)
             }
             Command::External { mut writer, system_time, token, completion, .. } => {
                 if !self.config.external_source {

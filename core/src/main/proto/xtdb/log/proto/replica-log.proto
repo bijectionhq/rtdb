@@ -17,6 +17,7 @@ message ReplicaLogMessage {
         OversizedMessage oversized_message = 8;
         ArtefactsAdded artefacts_added = 10;
         ArtefactsRemoved artefacts_removed = 11;
+        TablesRetired tables_retired = 12;
     }
 
     // The leader term that produced this message, for read-side fencing: followers
@@ -33,6 +34,13 @@ message ReplicaLogMessage {
 message TriesDeleted {
     string table_name = 1;
     repeated string trie_keys = 2;
+}
+
+// Published by the leader's trie GC once retired relations are past their retention: every
+// node supersedes each named table's tries with no successor at `as_of_micros`.
+message TablesRetired {
+    repeated string table_names = 1;
+    int64 as_of_micros = 2;
 }
 
 message ResolvedTx {

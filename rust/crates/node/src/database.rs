@@ -403,7 +403,7 @@ impl DatabaseFactory {
             )));
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let currency = Arc::<ReadCurrency>::default();
-            let supervisor = MaintenanceSupervisor { currency: Arc::clone(&currency), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
+            let supervisor = MaintenanceSupervisor { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), currency: Arc::clone(&currency), logs: Arc::clone(&logs), store: resources.store, partition: Arc::clone(&partition), replication: replication.clone(), compaction: compaction.clone(), artefacts: artefacts.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source, ordered_worker, ordered_cycle: ordered_cycle.clone(), clock: Arc::clone(&self.clock) };
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
@@ -574,6 +574,9 @@ impl TermRegion {
 }
 
 struct MaintenanceSupervisor {
+    database: String,
+    storage: Arc<BufferPool>,
+    memory: Arc<MemoryBudget>,
     store: Arc<dyn ObjectStore>,
     partition: Arc<PartitionState>,
     replication: ReplicationHandle,
@@ -597,7 +600,10 @@ impl MaintenanceSupervisor {
         let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
             let clock = Arc::clone(&self.clock);
             Arc::new(move || clock.monotonic_micros())
-        })?.with_search(artefacts, self.logs.storage_version, self.logs.storage_epoch));
+        })?.with_search(artefacts, self.logs.storage_version, self.logs.storage_epoch).with_retirements(Arc::new(crate::table_retirement::RetiredRelations {
+            database: self.database.clone(), partition: Arc::clone(&self.partition), storage: Arc::clone(&self.storage),
+            memory: Arc::clone(&self.memory), term: handle.clone(),
+        })));
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;

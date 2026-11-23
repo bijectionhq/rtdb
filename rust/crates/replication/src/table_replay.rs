@@ -126,7 +126,7 @@ impl<'a> RetainedTableReplay<'a> {
                     }
                 }
                 ReplicaBody::NoOp(_) | ReplicaBody::TriesAdded(_)
-                | ReplicaBody::TriesDeleted(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
+                | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("An oversized replica record was not resolved")),
             }
         }

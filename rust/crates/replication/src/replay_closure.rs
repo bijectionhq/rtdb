@@ -111,7 +111,7 @@ pub async fn tail_dependencies<E: Borrow<ReplicaEnvelope>>(base: ReplayBase<'_>,
                 }
             }
             ReplicaBody::ResolvedTx(_) | ReplicaBody::NoOp(_) | ReplicaBody::BlockBoundary(_)
-                | ReplicaBody::TriesDeleted(_) | ReplicaBody::ArtefactsRemoved(_) => {}
+                | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsRemoved(_) => {}
             ReplicaBody::OversizedMessage(_) => return Err(invalid("An oversized payload holds another oversized message")),
         }
     }

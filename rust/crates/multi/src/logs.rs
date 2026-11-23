@@ -358,7 +358,7 @@ fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
         ReplicaBody::NoOp(noop) => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
         ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
         ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
-        ReplicaBody::TriesDeleted(_) => return Ok(Scanned::Consumes),
+        ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => return Ok(Scanned::Consumes),
         _ => None,
     };
     Ok(match position.filter(|position| *position >= 0).map(SourcePosition).filter(|position| position.epoch() == epoch) {
