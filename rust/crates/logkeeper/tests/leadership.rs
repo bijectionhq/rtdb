@@ -183,18 +183,20 @@ async fn a_read_installs_a_partial_decision_before_another_quorum_can_serve() {
         }
     }).await.expect("the whole ensemble joined the active loglet");
     let staged = writer_routes.iter().map(CountingProxy::accepted_appends).collect::<Vec<_>>();
+    let installed = writer_routes[0].accepted_commits();
     for route in &writer_routes[1..] { route.drop_commits(); }
     let pending = writer.enqueue(Bytes::from_static(b"partial decision"), Timestamp(2)).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        let first = open_reader(ensemble.config_of(&[0], "read-installs-decision"), CancellationToken::new()).await.unwrap();
-        while first.read_range(LogOffset(1), LogOffset(2)).await.unwrap().is_empty()
+        while writer_routes[0].accepted_commits() == installed
             || writer_routes.iter().zip(&staged).any(|(route, &previous)| route.accepted_appends() == previous)
         {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }).await.expect("one journal installed the decision and the other journals staged the bytes");
     assert_eq!(writer.latest().unwrap(), baseline);
+    let local = open_reader(ensemble.config_of(&[0], "read-installs-decision"), CancellationToken::new()).await.unwrap();
+    assert!(local.read_range(LogOffset(1), LogOffset(2)).await.unwrap().is_empty());
     drop(pending);
     drop(writer);
 

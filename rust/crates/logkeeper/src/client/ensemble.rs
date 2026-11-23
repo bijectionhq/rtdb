@@ -1,8 +1,8 @@
 //! Typed requests to the servers of one stream's ensemble.
 
 use super::connection::{Binding, Callback, Connection, connection, remote};
-use super::{JournalEndpoint, StreamConfig};
-use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexRequest, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
+use super::{JournalEndpoint, StreamConfig, read_index_evidence::valid_reply};
+use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexReply, ReadIndexRequest, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
@@ -149,8 +149,25 @@ impl Ensemble {
         self.ack(server, reply)
     }
 
+    fn decision_request(&self, epoch: u64, through: i64) -> Commit {
+        Commit { stream: self.stream(), epoch, commit_lsn: through, ensemble: self.identity.clone() }
+    }
+
+    pub fn commit_request(&self, epoch: u64, through: i64) -> RequestBody {
+        RequestBody::Commit(self.decision_request(epoch, through))
+    }
+
     pub async fn commit(&self, server: usize, epoch: u64, commit: i64) -> Result<Ack> {
-        let reply = self.links[server].call(RequestBody::Commit(Commit { stream: self.stream(), epoch, commit_lsn: commit })).await;
+        let reply = self.links[server].call(self.commit_request(epoch, commit)).await;
+        self.ack(server, reply)
+    }
+
+    pub fn publish_request(&self, epoch: u64, through: i64) -> RequestBody {
+        RequestBody::Publish(self.decision_request(epoch, through))
+    }
+
+    pub async fn publish(&self, server: usize, epoch: u64, through: i64) -> Result<Ack> {
+        let reply = self.links[server].call(self.publish_request(epoch, through)).await;
         self.ack(server, reply)
     }
 
@@ -201,10 +218,12 @@ impl Ensemble {
         self.ack(server, reply)
     }
 
-    pub async fn read_index(&self, server: usize, epoch: u64, nonce: Bytes) -> Result<i64> {
-        let request = ReadIndexRequest { loglet: Some(self.loglet_check(epoch)), nonce: nonce.clone() };
+    pub async fn read_index(&self, server: usize, epoch: u64, nonce: [u8; 16]) -> Result<ReadIndexReply> {
+        let request = ReadIndexRequest { loglet: Some(self.loglet_check(epoch)), nonce: Bytes::copy_from_slice(&nonce) };
         match self.links[server].call(RequestBody::ReadIndex(request)).await? {
-            ResponseBody::ReadIndex(reply) if reply.nonce == nonce => Ok(reply.decided),
+            ResponseBody::ReadIndex(reply) if <[u8; 16]>::try_from(reply.nonce.as_ref()).is_ok_and(|observed| {
+                valid_reply(u128::from_be_bytes(nonce), u128::from_be_bytes(observed), reply.decided, reply.visible)
+            }) => Ok(reply),
             ResponseBody::Refused(refused) if refused.promised > epoch =>
                 Err(Error::Deposed { epoch, promised: refused.promised }),
             other => Err(self.unexpected(server, other)),

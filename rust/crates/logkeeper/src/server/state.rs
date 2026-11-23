@@ -21,6 +21,7 @@ pub enum Event {
     /// Drops every entry at or above the lsn.
     Truncate(i64),
     Append(Entry),
+    Install(i64),
     Commit(i64),
     Trim(i64),
     Drop(u64),
@@ -80,6 +81,7 @@ pub struct StreamState<P = Bytes> {
     /// Entries at or below this lsn are dropped.
     pub trim: i64,
     pub commit: i64,
+    pub(super) installed: i64,
     /// Entry `i` has lsn `trim + 1 + i`.
     pub entries: VecDeque<Held<P>>,
     pub(super) epoch_runs: VecDeque<EpochRun>,
@@ -116,7 +118,7 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
 
 impl<P> Default for StreamState<P> {
     fn default() -> Self {
-        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, trim: -1, commit: -1, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
+        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, trim: -1, commit: -1, installed: -1, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
     }
 }
 
@@ -182,13 +184,18 @@ impl<P: Payload> StreamState<P> {
                 let last = self.last();
                 while self.epoch_runs.back().is_some_and(|run| run.start_lsn > last) { self.epoch_runs.pop_back(); }
                 self.commit = self.commit.min(last);
+                self.installed = self.installed.min(last);
             }
             Event::Append(entry) => {
                 self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
                     guarded: entry.guarded, guarded_before: entry.guarded_before, timed_origin: entry.timed_origin.clone().map(Box::new),
                     payload: P::decided(&entry.payload), observed_sync: None });
             }
-            Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
+            Event::Install(lsn) => self.installed = self.installed.max((*lsn).min(self.last())),
+            Event::Commit(lsn) => {
+                self.commit = self.commit.max((*lsn).min(self.last()));
+                self.installed = self.installed.max(self.commit);
+            }
             Event::Trim(through) => {
                 if *through <= self.trim { return; }
                 if *through >= self.last() {
@@ -204,6 +211,7 @@ impl<P: Payload> StreamState<P> {
                 }
                 self.trim = *through;
                 self.commit = self.commit.max(*through);
+                self.installed = self.installed.max(*through);
             }
             Event::Drop(epoch) => {
                 *self = Self { promised: self.promised.max(*epoch), dropped: true, ..Self::default() };
@@ -289,7 +297,29 @@ impl<P: Payload> StreamState<P> {
 
     pub fn commit(&mut self, epoch: u64, commit: i64) -> Decision {
         if let Some(refusal) = self.check_writer(epoch) { return Decision { events: Vec::new(), reply: refusal }; }
-        let events = self.commit_event(commit, self.last()).into_iter().collect();
+        let events = if self.active_ensemble.is_some() {
+            (commit.min(self.last()) > self.installed).then_some(Event::Install(commit))
+        } else {
+            self.commit_event(commit, self.last())
+        };
+        self.persist(events.into_iter().collect(), |state| {
+            ResponseBody::Accepted(Accepted { last_lsn: state.last(), commit_lsn: state.installed })
+        })
+    }
+
+    pub(super) fn commit_bound(&mut self, epoch: u64, through: i64, ensemble: [u8; 32]) -> Decision {
+        if self.active_ensemble.is_some_and(|active| active != ensemble) {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        self.commit(epoch, through)
+    }
+
+    pub(super) fn publish(&mut self, epoch: u64, through: i64, ensemble: [u8; 32]) -> Decision {
+        if let Some(refusal) = self.check_writer(epoch) { return Decision { events: Vec::new(), reply: refusal }; }
+        if self.active_ensemble != Some(ensemble) || self.installed < through {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        let events = self.commit_event(through, self.last()).into_iter().collect();
         self.persist(events, Self::accepted)
     }
 
@@ -358,7 +388,7 @@ impl<P: Payload> StreamState<P> {
             synced: self.synced.unwrap_or(0),
             trim_lsn: self.trim,
             last_lsn: self.last(),
-            commit_lsn: self.commit,
+            commit_lsn: self.installed,
             runs: self.runs(),
             guarded_tail: self.entries.back().is_some_and(|entry| entry.guarded),
         })

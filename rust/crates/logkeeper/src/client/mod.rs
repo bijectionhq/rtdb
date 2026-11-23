@@ -3,6 +3,7 @@
 mod audit;
 mod connection;
 mod ensemble;
+mod read_index_evidence;
 mod guarded_recovery;
 pub(crate) mod recovery;
 mod writer;
@@ -364,12 +365,11 @@ impl QuorumLog {
         if quorum <= ensemble.len() / 2 {
             return Err(unavailable("read indexes require intersecting write quorums"));
         }
-        let nonce = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let nonce = *uuid::Uuid::new_v4().as_bytes();
         let round = async {
-            let mut probes: FuturesUnordered<_> = (0..ensemble.len()).map(|server| {
-                let nonce = nonce.clone();
-                async move { (server, ensemble.read_index(server, epoch, nonce).await) }
-            }).collect();
+            let mut probes: FuturesUnordered<_> = (0..ensemble.len())
+                .map(|server| async move { (server, ensemble.read_index(server, epoch, nonce).await) })
+                .collect();
             let mut observed = Vec::with_capacity(quorum);
             while observed.len() < quorum {
                 if observed.len() + probes.len() < quorum {
@@ -382,35 +382,53 @@ impl QuorumLog {
                 }
             }
 
-            let selected = observed.iter().map(|&(_, decided)| decided).max().expect("nonempty quorum");
-            let mut installed = 0;
-            let mut repair = FuturesUnordered::new();
-            for (server, decided) in observed {
-                if decided >= selected { installed += 1; }
-                else { repair.push(ensemble.commit(server, epoch, selected)); }
+            let selected = observed.iter().map(|(_, reply)| reply.decided).max().expect("nonempty quorum");
+            let confirmed = || ActiveLogletReadIndex {
+                stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(selected),
+            };
+            if observed.iter().any(|(_, reply)| reply.visible >= selected) {
+                return Ok(confirmed());
             }
-            while installed < quorum {
-                if installed + probes.len() + repair.len() < quorum {
+
+            let mut installed = Vec::with_capacity(quorum);
+            let mut repair = FuturesUnordered::new();
+            let install = |server| async move { (server, ensemble.commit(server, epoch, selected).await) };
+            for (server, reply) in observed {
+                if reply.decided >= selected { installed.push(server); }
+                else { repair.push(install(server)); }
+            }
+            while installed.len() < quorum {
+                if installed.len() + probes.len() + repair.len() < quorum {
                     return Err(unavailable("a quorum did not install the selected decision"));
                 }
                 tokio::select! {
                     Some((server, reply)) = probes.next(), if !probes.is_empty() => match reply {
-                        Ok(decided) if decided >= selected => installed += 1,
-                        Ok(_) => repair.push(ensemble.commit(server, epoch, selected)),
+                        Ok(reply) if reply.visible >= selected => return Ok(confirmed()),
+                        Ok(reply) if reply.decided >= selected => installed.push(server),
+                        Ok(_) => repair.push(install(server)),
                         Err(error @ Error::Deposed { .. }) => return Err(error),
                         Err(_) => (),
                     },
-                    Some(reply) = repair.next(), if !repair.is_empty() => match reply {
-                        Ok(Ack::Accepted(ack)) if ack.commit_lsn >= selected => installed += 1,
+                    Some((server, reply)) = repair.next(), if !repair.is_empty() => match reply {
+                        Ok(Ack::Accepted(ack)) if ack.commit_lsn >= selected => installed.push(server),
                         Ok(Ack::Refused(refusal)) if refusal.promised > epoch =>
                             return Err(Error::Deposed { epoch, promised: refusal.promised }),
                         _ => (),
                     },
                 }
             }
-            Ok(ActiveLogletReadIndex {
-                stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(selected),
-            })
+
+            let mut exposure: FuturesUnordered<_> = installed.into_iter()
+                .map(|server| ensemble.publish(server, epoch, selected)).collect();
+            while let Some(reply) = exposure.next().await {
+                match reply {
+                    Ok(Ack::Accepted(ack)) if ack.commit_lsn >= selected => return Ok(confirmed()),
+                    Ok(Ack::Refused(refusal)) if refusal.promised > epoch =>
+                        return Err(Error::Deposed { epoch, promised: refusal.promised }),
+                    _ => (),
+                }
+            }
+            Err(unavailable("the selected decision could not be made visible for replay"))
         };
         tokio::select! {
             biased;

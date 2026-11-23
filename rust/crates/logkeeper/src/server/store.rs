@@ -197,7 +197,14 @@ impl Store {
                 if !overwrite.complete { return Outcome::Now(failed("activation requires a complete overwrite")); }
                 (overwrite.stream, Box::new(move |state| state.repair(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.commit_lsn, ensemble)))
             }
-            RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
+            RequestBody::Commit(commit) => {
+                let Ok(ensemble) = commit.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid decision ensemble")); };
+                (commit.stream, Box::new(move |state| state.commit_bound(commit.epoch, commit.commit_lsn, ensemble)))
+            }
+            RequestBody::Publish(commit) => {
+                let Ok(ensemble) = commit.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid publication ensemble")); };
+                (commit.stream, Box::new(move |state| state.publish(commit.epoch, commit.commit_lsn, ensemble)))
+            }
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::TrimDurable(trim) => {
@@ -218,7 +225,7 @@ impl Store {
                 return self.check_after_durability(&check.stream, admission, |state| {
                     match state.read_index(check.epoch, ensemble) {
                         ResponseBody::Accepted(accepted) => ResponseBody::ReadIndex(ReadIndexReply {
-                            nonce: request.nonce, decided: accepted.commit_lsn,
+                            nonce: request.nonce, decided: state.installed, visible: accepted.commit_lsn,
                         }),
                         other => other,
                     }

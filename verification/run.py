@@ -390,9 +390,9 @@ def verify_read_index_frontiers(args, scratch):
     path = Path("verification/lean/ReadIndexFrontiers.lean")
     controls = {
         "offset-without-history": (
-            "later.history = earlier.history ∧ ∃ suffix, later.entries = earlier.entries ++ suffix",
-            "∃ suffix, later.entries = earlier.entries ++ suffix",
-            ["extension_transitive", "handoff_preserves_installed_prefix", "matching_offsets_do_not_bind_history"],
+            "¬ Extends foreign original",
+            "¬ (foreign.entries.length = original.entries.length)",
+            ["matching_offsets_do_not_bind_history"],
         ),
     }
     verify_lean_model(args, scratch, path, "read-index-frontiers", controls, 6)

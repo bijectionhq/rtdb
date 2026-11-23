@@ -48,6 +48,8 @@ struct Snapshot {
     retired: bool,
     #[prost(bytes = "bytes", tag = "6")]
     active_ensemble: Bytes,
+    #[prost(sint64, optional, tag = "7")]
+    installed: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -88,13 +90,15 @@ enum Kind {
     Drop(u64),
     #[prost(message, tag = "13")]
     ObservedSync(ObservedSync),
+    #[prost(sint64, tag = "14")]
+    Install(i64),
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 14")]
     kind: Option<Kind>,
     // An activation is an optional refinement of an existing synced record.
     #[prost(bytes = "bytes", tag = "12")]
@@ -112,6 +116,7 @@ fn record(event: &Event) -> Kind {
         Event::Activate { epoch, .. } => Kind::Synced(*epoch),
         Event::Truncate(from) => Kind::Truncate(*from),
         Event::Append(entry) => Kind::Append(entry.clone()),
+        Event::Install(lsn) => Kind::Install(*lsn),
         Event::Commit(lsn) => Kind::Commit(*lsn),
         Event::Trim(through) => Kind::Trim(*through),
         Event::Drop(epoch) => Kind::Drop(*epoch),
@@ -560,6 +565,7 @@ impl Journal {
             frame(id, Kind::Snapshot(Snapshot {
                 promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.dropped,
                 active_ensemble: state.active_ensemble.as_ref().map_or_else(Bytes::new, |ensemble| Bytes::copy_from_slice(ensemble)),
+                installed: Some(state.installed),
             }), &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
@@ -704,7 +710,9 @@ impl Replay {
                     *state = StreamState {
                         promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced),
                         active_ensemble: decode_ensemble(path, &snapshot.active_ensemble)?,
-                        trim: snapshot.trim, commit: snapshot.commit, dropped: snapshot.retired, ..StreamState::default()
+                        trim: snapshot.trim, commit: snapshot.commit,
+                        installed: snapshot.installed.ok_or_else(|| corrupt(path, "snapshot has no installed decision frontier"))?,
+                        dropped: snapshot.retired, ..StreamState::default()
                     };
                 }
                 Kind::Promise(epoch) => state.apply(&Event::Promise(epoch)),
@@ -735,6 +743,7 @@ impl Replay {
                         return Err(corrupt(path, "invalid sync observation"));
                     }
                 }
+                Kind::Install(lsn) => state.apply(&Event::Install(lsn)),
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
                 Kind::Drop(epoch) => state.apply(&Event::Drop(epoch)),

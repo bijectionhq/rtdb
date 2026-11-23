@@ -194,6 +194,8 @@ pub(crate) struct Commit {
     pub epoch: u64,
     #[prost(sint64, tag = "3")]
     pub commit_lsn: i64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -247,6 +249,8 @@ pub struct ReadIndexReply {
     pub nonce: Bytes,
     #[prost(sint64, tag = "2")]
     pub decided: i64,
+    #[prost(sint64, tag = "3")]
+    pub visible: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -298,6 +302,8 @@ pub(crate) enum RequestBody {
     Overwrite(Overwrite),
     #[prost(message, tag = "7")]
     Commit(Commit),
+    #[prost(message, tag = "33")]
+    Publish(Commit),
     #[prost(message, tag = "8")]
     Trim(Trim),
     #[prost(message, tag = "9")]
@@ -329,7 +335,7 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32, 33")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,

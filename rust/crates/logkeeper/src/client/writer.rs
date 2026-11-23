@@ -8,7 +8,7 @@ use super::guarded_recovery::{
     predecessor_commit_target, recover_guarded_tail, recovery_commit_quorum, sealed_journal_evidence, valid_guarded_source,
 };
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Commit, Entry, RequestBody, Sealed};
+use crate::protocol::{Accepted, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -46,6 +46,7 @@ struct Replica {
     installed: i64,
     /// The latest ordinary publication queued on this connection.
     installing: i64,
+    publishing: i64,
     link: Link,
 }
 
@@ -554,15 +555,18 @@ impl Writer {
         }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
         let replicas = (0..ensemble.len()).map(|server| if active.contains(&server) {
-            Replica { acked: last, installed: last, installing: last, link: Link::Live }
+            Replica { acked: last, installed: last, installing: last, publishing: -1, link: Link::Live }
         } else {
-            Replica { acked: -1, installed: -1, installing: -1, link: Link::Down(long_ago) }
+            Replica { acked: -1, installed: -1, installing: -1, publishing: -1, link: Link::Down(long_ago) }
         }).collect();
         let pipeline = Pipeline { next_lsn: last + 1, commit: last, publication: None, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
         let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0 });
         {
             let mut state = writer.state.lock();
-            if let State::Open(pipeline) = &mut *state { writer.repair_down(pipeline); }
+            if let State::Open(pipeline) = &mut *state {
+                writer.publish_stable(pipeline);
+                writer.repair_down(pipeline);
+            }
         }
         Ok(writer)
     }
@@ -696,10 +700,12 @@ impl Writer {
                 replica.acked = replica.acked.max(accepted.last_lsn);
                 replica.installed = replica.installed.max(accepted.commit_lsn);
                 self.advance(pipeline);
+                self.publish_stable(pipeline);
             }
             Ok(Ack::Refused(_)) | Err(_) => {
                 let replica = &mut pipeline.replicas[server];
                 replica.installing = replica.installed;
+                replica.publishing = -1;
                 if matches!(replica.link, Link::Live) {
                     pipeline.replicas[server].link = Link::Repairing;
                     self.spawn_repair(server);
@@ -715,9 +721,7 @@ impl Writer {
             let witnesses = flight.witnesses.as_ref().expect("commit started");
             for (server, mark) in witnesses.iter().enumerate() {
                 if *mark == Mark::Pending {
-                    self.send(pipeline, server, RequestBody::Commit(Commit {
-                        stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: flight.lsn,
-                    }));
+                    self.send(pipeline, server, self.ensemble.commit_request(self.epoch, flight.lsn));
                 }
             }
             return;
@@ -760,6 +764,17 @@ impl Writer {
         }
     }
 
+    fn publish_stable(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        let through = pipeline.commit;
+        for server in 0..pipeline.replicas.len() {
+            let replica = &mut pipeline.replicas[server];
+            if matches!(replica.link, Link::Live) && replica.installed >= through && replica.publishing < through {
+                replica.publishing = through;
+                self.send(pipeline, server, self.ensemble.publish_request(self.epoch, through));
+            }
+        }
+    }
+
     fn install_through(self: &Arc<Self>, pipeline: &mut Pipeline, through: i64) {
         for server in 0..pipeline.replicas.len() {
             let replica = &mut pipeline.replicas[server];
@@ -767,9 +782,7 @@ impl Writer {
                 && replica.installed < through && replica.installing < through
             {
                 replica.installing = through;
-                self.send(pipeline, server, RequestBody::Commit(Commit {
-                    stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: through,
-                }));
+                self.send(pipeline, server, self.ensemble.commit_request(self.epoch, through));
             }
         }
     }
