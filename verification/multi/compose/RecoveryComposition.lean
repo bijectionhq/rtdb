@@ -29,6 +29,15 @@ structure RecordedAppend (ledger : Ledger Voter) (state : OrderedJournal.State)
   expiryPlacement : record.receipt.expiresAt.placement = record.receipt.attempt.placement
   decoded : state.receipts (projectAttempt record.receipt) = some (projectReceipt record.receipt)
 
+theorem recorded_append_reissues_while_live
+    (initial : RecordedAppend ledger before position)
+    (path : OrderedJournal.Trace readers activations before after)
+    (live : after.observed < initial.record.receipt.expiresAt.next) :
+    OrderedJournal.Reissue after (projectAttempt initial.record.receipt)
+      initial.record.receipt.requestDigest = some (projectReceipt initial.record.receipt) :=
+  OrderedJournal.repeated_payload_returns_exact_receipt
+    (OrderedJournal.live_receipt_survives_recovery initial.decoded path live)
+
 /-- Different choices about the same ordered position give the same outcome.
 The RTDB recovery trace preserves its projection throughout its lifetime. -/
 theorem recovery_reissues_exact_chosen_append
@@ -42,11 +51,9 @@ theorem recovery_reissues_exact_chosen_append
       OrderedJournal.Reissue after (projectAttempt result.receipt) result.receipt.requestDigest =
         some (projectReceipt result.receipt) := by
   have agrees := Protocol.same_chosen_append voters initial.certifiedPrefix recovered initial.selected selected
-  have decoded := initial.decoded
-  rw [agrees] at decoded
-  have retained := OrderedJournal.live_receipt_survives_recovery decoded path live
-  exact ⟨congrArg Protocol.Append.receipt agrees,
-    OrderedJournal.repeated_payload_returns_exact_receipt retained⟩
+  refine ⟨congrArg Protocol.Append.receipt agrees, ?_⟩
+  rw [← agrees] at live ⊢
+  exact recorded_append_reissues_while_live initial path live
 
 theorem recovery_reissues_append_after_cohort_repair
     {oldLedger : Ledger OldVoter} {newLedger : Ledger NewVoter}
@@ -64,11 +71,9 @@ theorem recovery_reissues_append_after_cohort_repair
         some (projectReceipt result.receipt) := by
   have agrees := Protocol.same_append_after_transfer oldVoters newVoters transfer initial.certifiedPrefix
     recovered beforeSeal afterInstall initial.selected selected
-  have decoded := initial.decoded
-  rw [agrees] at decoded
-  have retained := OrderedJournal.live_receipt_survives_recovery decoded path live
-  exact ⟨congrArg Protocol.Append.receipt agrees,
-    OrderedJournal.repeated_payload_returns_exact_receipt retained⟩
+  refine ⟨congrArg Protocol.Append.receipt agrees, ?_⟩
+  rw [← agrees] at live ⊢
+  exact recorded_append_reissues_while_live initial path live
 
 /-- All the native semantics live in this function. An applied position can
 justify readiness while fidelity still requires a value at the exact cut. -/
@@ -104,6 +109,7 @@ theorem prepared_checkpoint_and_trim_need_no_writer
       advancing covered unheld
   exact ⟨trimmed, .cons publishStep (.cons trimStep (.nil trimmed)), rfl, rfl, rfl⟩
 
+#print axioms recorded_append_reissues_while_live
 #print axioms recovery_reissues_exact_chosen_append
 #print axioms recovery_reissues_append_after_cohort_repair
 #print axioms prepared_checkpoint_and_trim_need_no_writer
