@@ -1,5 +1,5 @@
-//! Check that an owned schedule publication orders coverage with its admissions.
-//! Cadence and executable semantics belong to the schedule owner.
+//! Check exact task carriers and atomic schedule coverage on owned orders.
+//! Cadence and executable interpretation belong to the application owner.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,6 +12,7 @@ const ADMISSION: &str = "bj_fact_root_admission";
 const CATALOG: &str = "schedule-catalog:";
 const COVERAGE: &str = "schedule-coverage:";
 const CLOCK: &str = "clock-task:";
+const ACTION: &str = "action-task:";
 const MAX_CONTROL_BYTES: usize = 64 << 10;
 
 fn invalid() -> Anomaly {
@@ -33,6 +34,33 @@ fn body(control: &HostedControlWrite) -> Result<Json> {
 
 fn digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn action_command_matches(record: &Json) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let Some(task) = record.get("task") else { return false };
+    let Some(cutoff) = task.get("cutoff") else { return false };
+    let exact = match (task["emitted_key"].as_str(), task["emitted_command"].as_str()) {
+        (None, None) => true,
+        (Some(_), Some(command)) => {
+            command.starts_with("[\"bijection.task.emit.v2\",")
+                && task["command"].as_array().is_some_and(|bytes| {
+                    let digest = Sha256::digest(command.as_bytes());
+                    bytes.len() == digest.len()
+                        && bytes.iter().zip(digest.iter()).all(|(byte, expected)| {
+                            byte.as_u64() == Some(u64::from(*expected))
+                        })
+                })
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    exact && (cutoff.is_null() || (
+        task["external"].is_object() && task["emitted_command"].is_string()
+            && cutoff.as_object().is_some_and(|term| term.len() == 1
+                && (term.get("fixed").is_some_and(|at| !at.is_null())
+                    || term.get("fromAcceptance").and_then(Json::as_i64).is_some_and(|offset| offset > 0)))
+    ))
 }
 
 pub(super) fn validate(operations: &[Operation]) -> Result<()> {
@@ -96,10 +124,16 @@ pub(super) fn validate(operations: &[Operation]) -> Result<()> {
 
     let mut admitted = BTreeSet::new();
     for (id, control) in controls {
-        if !id.starts_with(CLOCK) || control.expected().is_some() {
+        if control.expected().is_some() || !(id.starts_with(CLOCK) || id.starts_with(ACTION)) {
             continue;
         }
         let data = body(control)?;
+        if id.starts_with(ACTION) {
+            if !action_command_matches(&data) {
+                return Err(Anomaly::incorrect("rtdb.hosted/task-command", "The action carrier differs from its authored command"));
+            }
+            continue;
+        }
         if data.pointer("/task/continuation/kind").and_then(Json::as_str) == Some("cron") {
             let task = data.pointer("/task/key").and_then(Json::as_str).ok_or_else(invalid)?;
             if !admitted.insert(task.to_owned()) {
@@ -111,4 +145,30 @@ pub(super) fn validate(operations: &[Operation]) -> Result<()> {
         return Err(invalid());
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn an_emitted_action_cannot_substitute_its_command() {
+        let command = r#"["bijection.task.emit.v2",{"deadline":"contract"},null]"#;
+        let hash = Sha256::digest(command.as_bytes()).to_vec();
+        let mut row = serde_json::json!({
+            "task": {
+                "emitted_key": "original",
+                "emitted_command": command,
+                "command": hash,
+                "cutoff": null,
+            },
+        });
+        assert!(action_command_matches(&row));
+        row["task"]["emitted_command"] = serde_json::json!(
+            r#"["bijection.task.emit.v2",{"deadline":{"in":"1"}},null]"#
+        );
+        assert!(!action_command_matches(&row));
+    }
 }
