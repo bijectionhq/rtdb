@@ -110,6 +110,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, true).await?)]),
                 crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V1 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::READ_HELD_WORLD_CHANGES_V3 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 => Ok(vec![Ok(self.held_world_region_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 => Ok(vec![Ok(self.held_owned_storage_usage_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V1 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V3 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),

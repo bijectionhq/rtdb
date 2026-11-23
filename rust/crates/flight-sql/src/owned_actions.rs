@@ -288,6 +288,7 @@ pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldWorldChangesDescending.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
+pub(crate) const READ_HELD_WORLD_REGION_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldRegionChanges.v1";
 pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorageUsage.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V3: &str = "rtdb.owned.ReadHeldMergedChanges.v3";
@@ -2956,15 +2957,7 @@ impl Service {
         let page = if tail.is_empty() {
             held.snapshot.changes(&relation, after, limit).await
         } else {
-            let (from, tail) = tail.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change region has no valid start"))?;
-            let (to, tail) = tail.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change region has no valid end"))?;
-            let (lower, tail) = count_component(tail, 4096)?;
-            let (upper, tail) = count_component(tail, 4096)?;
-            if !tail.is_empty() { return Err(invalid("Owned change region has trailing bytes")); }
-            let valid = Interval::from_micros(i64::from_be_bytes(*from), i64::from_be_bytes(*to)).map_err(status)?;
-            let _bounds = call.reserve(8192 + lower.len() + upper.len())?;
-            let bound = |bytes: &[u8]| (!bytes.is_empty()).then(|| EntityId::from_handle_bytes(bytes)).transpose().map_err(status);
-            let (lower, upper) = (bound(lower)?, bound(upper)?);
+            let (lower, upper, valid, _bounds) = change_region_request(call, tail)?;
             held.snapshot.changes_in_region(&relation, after, limit, lower.as_ref(), upper.as_ref(), valid).await
         }.map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
@@ -3042,6 +3035,29 @@ impl Service {
         let page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending, None)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
+        Ok(reply)
+    }
+
+    pub(crate) async fn held_world_region_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("World region changes require a held world handle"))?;
+        let (relation, request) = split_relation(request)?;
+        let (after, request) = request.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("World region changes require an exclusive revision"))?;
+        let (through, request) = request.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("World region changes require an inclusive upper revision"))?;
+        let (limit, request) = request.split_first_chunk::<2>()
+            .ok_or_else(|| invalid("World region changes require a group limit"))?;
+        let (lower, upper, valid, _bounds) = change_region_request(call, request)?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
+        let mut page = held.snapshot.changes(
+            std::slice::from_ref(&relation), Timestamp(i64::from_be_bytes(*after)),
+            Timestamp(i64::from_be_bytes(*through)), usize::from(u16::from_be_bytes(*limit)), false,
+        ).await.map_err(status)?.into_relation_page().map_err(status)?;
+        page.retain_identity_region(lower.as_ref(), upper.as_ref(), valid).map_err(status)?;
+        let reply = self.owned_changes_reply(&page, held.snapshot.present())?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
@@ -4374,6 +4390,26 @@ fn point_request(
         None
     };
     Ok((relation, id, valid, identity))
+}
+
+fn change_region_request(
+    call: &Call, request: &[u8],
+) -> Result<(Option<EntityId>, Option<EntityId>, Interval, Arc<MemoryReservation>), Status> {
+    let (from, tail) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change region has no valid start"))?;
+    let (to, tail) = tail.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change region has no valid end"))?;
+    let (lower, tail) = count_component(tail, 4096)?;
+    let (upper, tail) = count_component(tail, 4096)?;
+    if !tail.is_empty() {
+        return Err(invalid("Owned change region has trailing bytes"));
+    }
+    let valid = Interval::from_micros(i64::from_be_bytes(*from), i64::from_be_bytes(*to)).map_err(status)?;
+    let charge = call.reserve(8192 + lower.len() + upper.len())?;
+    let bound = |bytes: &[u8]| (!bytes.is_empty()).then(|| EntityId::from_handle_bytes(bytes)).transpose().map_err(status);
+    let (lower, upper) = (bound(lower)?, bound(upper)?);
+    if valid.is_empty() || lower.as_ref().zip(upper.as_ref()).is_some_and(|(lower, upper)| lower >= upper) {
+        return Err(invalid("Owned change region must have nonempty key and valid bounds"));
+    }
+    Ok((lower, upper, valid, charge))
 }
 
 fn point_identity(call: &Call, batch: &RecordBatch) -> Result<(EntityId, Arc<MemoryReservation>), Status> {

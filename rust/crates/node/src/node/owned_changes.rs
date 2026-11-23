@@ -37,6 +37,47 @@ impl OwnedMergedChanges {
             .map(|commit| commit.revision)
             .ok_or_else(change_feed_uncovered)
     }
+
+    /// A single-relation page carries its examined coverage independently of visible groups.
+    pub fn into_relation_page(self) -> Result<OwnedChangePage> {
+        let covered_through = self.covered_through()?;
+        let groups = self.commits.into_iter().map(|commit| {
+            let mut changes = commit.changes.into_iter();
+            let change = changes.next().ok_or_else(change_feed_uncovered)?;
+            if changes.next().is_some() {
+                return Err(change_feed_uncovered());
+            }
+            Ok(OwnedChangeGroup {
+                revision: change.sequence,
+                system_time: commit.revision,
+                touches: change.touches,
+            })
+        }).collect::<Result<_>>()?;
+        Ok(OwnedChangePage {
+            groups, covered_through,
+            retained_bytes: self.retained_bytes,
+            _reservations: self._reservations,
+        })
+    }
+}
+
+impl OwnedChangePage {
+    pub fn retain_identity_region(
+        &mut self, lower: Option<&EntityId>, upper: Option<&EntityId>, valid: Interval,
+    ) -> Result<()> {
+        if valid.is_empty() || lower.zip(upper).is_some_and(|(lower, upper)| lower >= upper) {
+            return Err(Anomaly::incorrect("rtdb.owned/change-region", "A change region requires nonempty identity and valid-time bounds"));
+        }
+        self.groups.retain_mut(|group| {
+            group.touches.retain(|touch| {
+                lower.is_none_or(|lower| &touch.id >= lower)
+                    && upper.is_none_or(|upper| &touch.id < upper)
+                    && touch.valid.intersects(valid)
+            });
+            !group.touches.is_empty()
+        });
+        Ok(())
+    }
 }
 
 pub struct OwnedChangeCommit {
@@ -118,29 +159,7 @@ impl OwnedReadSession {
         let page = self
             .merged_changes(std::slice::from_ref(relation), after, limit)
             .await?;
-        let covered_through = page.covered_through()?;
-        let groups = page
-            .commits
-            .into_iter()
-            .map(|commit| {
-                let change = commit
-                    .changes
-                    .into_iter()
-                    .next()
-                    .ok_or_else(change_feed_uncovered)?;
-                Ok(OwnedChangeGroup {
-                    revision: change.sequence,
-                    system_time: commit.revision,
-                    touches: change.touches,
-                })
-            })
-            .collect::<Result<_>>()?;
-        Ok(OwnedChangePage {
-            groups,
-            covered_through,
-            retained_bytes: page.retained_bytes,
-            _reservations: page._reservations,
-        })
+        page.into_relation_page()
     }
 
     /// Filters a covered journal page by complete identity and valid-time overlap.
@@ -149,18 +168,8 @@ impl OwnedReadSession {
         &self, relation: &OwnedRelation, after: Timestamp, limit: usize,
         lower: Option<&EntityId>, upper: Option<&EntityId>, valid: Interval,
     ) -> Result<OwnedChangePage> {
-        if valid.is_empty() || lower.zip(upper).is_some_and(|(lower, upper)| lower >= upper) {
-            return Err(Anomaly::incorrect("rtdb.owned/change-region", "A change region requires nonempty identity and valid-time bounds"));
-        }
         let mut page = self.changes(relation, after, limit).await?;
-        page.groups.retain_mut(|group| {
-            group.touches.retain(|touch| {
-                lower.is_none_or(|lower| &touch.id >= lower)
-                    && upper.is_none_or(|upper| &touch.id < upper)
-                    && touch.valid.intersects(valid)
-            });
-            !group.touches.is_empty()
-        });
+        page.retain_identity_region(lower, upper, valid)?;
         Ok(page)
     }
 
@@ -1161,4 +1170,33 @@ fn ordered_or_same(higher: i64, lower: i64, a: OwnedJournalHeader, b: OwnedJourn
     } else {
         a.committed_at > b.committed_at && a.through_events > b.through_events
     }
+}
+
+#[cfg(test)]
+#[test]
+fn filtered_relation_page_keeps_the_examined_world_boundary() {
+    let relation = OwnedRelation::new("facts").unwrap();
+    let valid = Interval::from_micros(10, 20).unwrap();
+    let page = OwnedMergedChanges {
+        commits: vec![OwnedChangeCommit {
+            revision: Timestamp(30),
+            changes: vec![OwnedRelationChanges {
+                relation,
+                sequence: 1,
+                touches: vec![OwnedChange {
+                    id: EntityId::String("fact".into()),
+                    kind: rtdb_types::OwnedChangeKind::Put,
+                    valid,
+                }],
+            }],
+        }],
+        retained_bytes: 0,
+        _reservations: Vec::new(),
+        complete: false,
+        complete_boundary: Timestamp(40),
+    };
+    let mut page = page.into_relation_page().unwrap();
+    page.retain_identity_region(None, None, Interval::from_micros(20, 21).unwrap()).unwrap();
+    assert!(page.groups.is_empty());
+    assert_eq!(page.covered_through, Timestamp(30));
 }

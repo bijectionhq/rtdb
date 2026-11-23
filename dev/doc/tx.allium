@@ -134,6 +134,7 @@
 -- Its coverage ends at the last returned group when truncated or at the reserved present when exhausted.
 -- A regional held feed retains touches whose complete identities and valid extents intersect the requested region.
 -- It advances coverage over all source groups it examined and can return an empty page with an advanced cursor.
+-- A regional held world feed selects one admitted local relation and anchors that coverage to the held world and the requested upper cut.
 -- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
 -- A held merged feed seeks the selected owner relations at one cut and groups their visible touches by ordered system time.
 -- A capped page publishes only whole visible commits, and a nonempty page resumes at its last visible commit.

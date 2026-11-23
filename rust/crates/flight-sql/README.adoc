@@ -668,6 +668,12 @@ It returns ordered local overlay groups after the supplied revision at or above 
 A retained Held child begins its journal at the inherited Held position and has no local writes. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
 
+`rtdb.owned.ReadHeldWorldRegionChanges.v1` reads one admitted relation on the held world.
+The request contains the held world handle, the relation, an exclusive lower and inclusive upper system microsecond as big-endian i64, and the big-endian u16 group limit.
+The region suffix has the same half-open valid and typed identity bounds as `ReadHeldChanges.v3`.
+The reply uses the single-relation change shape and can advance its coverage metadata while returning no group.
+The scope and inherited basis are checked by the held world owner.
+
 `rtdb.owned.PublishWorldCut.v1` registers an initial archived cut or moves a retained world to a newer verified Root cut.
 The request supplies 16-byte IDs for the original Root hold, world, minted pin, predecessor world hold, capture and suffix. A nil suffix selects the capture itself.
 An initial request uses the world ID as its pin and a nil predecessor. An advance supplies the original retained-world hold and a freshly minted pin.
