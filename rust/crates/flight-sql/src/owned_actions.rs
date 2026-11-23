@@ -3324,7 +3324,7 @@ impl Service {
             }
             Ok(reply)
         } else {
-            let schema = if path_columns.is_some() { Schema::empty() }
+            let schema = if path_columns.is_some() { wire::OwnedSchema::empty(memory)? }
                 else { wire::plan_schema(cursor.runtime_schema(), memory)? };
             let schema = with_point_witness(&schema, witness(None)?);
             self.owned_point_reply_in(memory, &schema, None, present, valid, None, None)
