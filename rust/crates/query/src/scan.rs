@@ -248,6 +248,18 @@ impl ActiveRows {
     fn header(&self, index: usize) -> Result<EventHeader> {
         match self { Self::Live { rows, .. } => Ok(rows.headers[index]), Self::File(batch) => batch.header(index) }
     }
+
+    fn after_iid(&self, head: Head, upper: Iid) -> Result<Option<Head>> {
+        let (mut low, mut high) = (head.ordinal + 1, self.len());
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.header(middle)?.iid <= head.header.iid { low = middle + 1; }
+            else { high = middle; }
+        }
+        if low == self.len() { return Ok(None); }
+        let header = self.header(low)?;
+        Ok((header.iid <= upper).then_some(Head { header, ordinal: low, ..head }))
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Head { header: EventHeader, active: usize, priority: usize, ordinal: usize }
@@ -1706,6 +1718,19 @@ impl PartitionScan {
                 group.push(ResolvedRow { source, valid_time, system_time });
                 Ok(())
             })?;
+            let entity = head.header.iid;
+            let covered = head.header.op == EventOp::Erase
+                || (head.header.system_from <= self.bounds.system_time.lower()
+                    && head.header.valid_time.lower() <= self.bounds.valid_time.lower()
+                    && head.header.valid_time.upper() >= self.bounds.valid_time.upper());
+            if covered && (!keyed || requested_key.is_some()) {
+                while let Some(pending) = next.filter(|pending| pending.header.iid == entity) {
+                    if let Some(following) = active[pending.active].after_iid(pending, range_upper)? {
+                        heads.push(following);
+                    }
+                    next = heads.pop();
+                }
+            }
         }
         if self.order == Some(IidOrder::Descending) && let Some(rows) = groups.first_mut() { rows.reverse(); }
         // A page is kept for the tasks still to come that read it: those above this one, or below it in a descending scan.
@@ -2113,6 +2138,44 @@ mod tests {
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
         (scan, execution, memory)
+    }
+
+    #[tokio::test]
+    async fn a_covered_point_seeks_past_older_rows_in_the_live_merge() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let table = TableRef::new("public", "docs");
+        let memory = MemoryBudget::new(1 << 27);
+        let first = Iid([0; 16]);
+        let second = Iid([1; 16]);
+        for (tx_id, (system_time, rows)) in [
+            (Timestamp(99), vec![(first, 1); 2048]),
+            (Timestamp(100), vec![(first, 2), (second, 3)]),
+        ].into_iter().enumerate() {
+            let mut write = TransactionBuffer::new(state.value().snapshot(),
+                TransactionKey { tx_id: TxId(tx_id as i64), system_time }, Arc::clone(&memory)).unwrap();
+            for (iid, value) in rows {
+                write.append(table.clone(), StoredEvent {
+                    origin: None, commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time: Interval::ALL,
+                    operation: StoredOperation::Put(StructFields::from([("v".into(), Value::I64(value))])), recency: None,
+                }).unwrap();
+            }
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let snapshot = state.value().snapshot();
+        let store = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, execution, _) = descriptor_scan(snapshot, table, store);
+        scan.system_time = TemporalFilter::Default;
+        let limits = audience_work::Limits { provider_requests: 0, provider_bytes: 0, scan_items: 2300, decode_bytes: 0 };
+        let mut values = audience_work::within(Some(limits), async {
+            let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+            let mut values = Vec::new();
+            while let Some(page) = cursor.next_page().await.unwrap() {
+                values.extend(page.rows().iter().map(|row| row.values[0].clone()));
+            }
+            values
+        }).await;
+        values.sort_by_key(|value| match value { Value::I64(value) => *value, other => panic!("{other:?}") });
+        assert_eq!(values, [Value::I64(2), Value::I64(3)]);
     }
 
     #[tokio::test]
