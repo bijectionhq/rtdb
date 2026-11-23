@@ -29,6 +29,7 @@ use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
 
 mod units;
 pub(crate) use units::JournalUnits;
+pub(crate) use units::commits_payload_reference;
 use units::OVERHEAD as UNIT_OVERHEAD;
 
 const SCAN_WINDOW: i64 = 256;

@@ -22,6 +22,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
+       rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE --config FILE [--ecs-cluster ARN]\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
        rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker UUID --serial N\n\
@@ -344,7 +345,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 127 } else { 13 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 128 } else { 14 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
         };
@@ -384,6 +385,24 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7001")?).await.map_err(io)?;
             eprintln!("directory listening on {}", listener.local_addr().map_err(io)?);
             rtdb_directory::serve(listener, directory, cancellation).await
+        }
+        "replay-broker" => {
+            let serving = CellStorage::parse(arguments.required("serving-storage-root")?)?;
+            let storage = CellStorage::parse(arguments.required("payload-storage-root")?)?;
+            let key_store = key_service(arguments.required("payload-keys")?).await?;
+            let settings = NodeConfiguration::from_yaml(
+                &std::fs::read_to_string(arguments.required("config")?).map_err(io)?,
+            )?;
+            let tls = settings.server.and_then(|server| server.ssl)
+                .ok_or_else(|| usage("The replay broker configuration must provide server.ssl".into()))?;
+            let tls = rtdb_server::tls::load(&tls, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
+            let service = rtdb_multi::replay_broker::Service::new(
+                directory(arguments.required("directory")?).await?, storage, &serving, key_store,
+                std::path::Path::new(arguments.required("token-file")?), hosted_task(&arguments)?,
+            )?;
+            let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:0")?)
+                .await.map_err(io)?;
+            service.serve(listener, tls, cancellation).await
         }
         "ordered-journal" | "initialize-ordered-journal" => {
             let failure = |error: Box<dyn std::error::Error + Send + Sync>| {

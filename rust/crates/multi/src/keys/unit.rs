@@ -52,6 +52,15 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
+    pub(crate) fn replay_objects(provider: [u8; 32], residence: &str, log_epoch: i32) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/replay-object-scope/v1\0");
+        digest.update(&provider);
+        digest.update(&log_epoch.to_be_bytes());
+        digest.update(residence.as_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {

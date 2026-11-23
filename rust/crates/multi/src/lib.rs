@@ -31,6 +31,7 @@ mod replay_deadline;
 mod member_probe;
 mod replay_admission;
 pub mod recovery;
+pub mod replay_broker;
 mod recovery_holds;
 pub mod reference;
 pub mod process;

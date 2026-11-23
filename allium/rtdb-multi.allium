@@ -686,6 +686,12 @@ contract LogService {
         -- A serving attachment acquires replay protection and waits for same-history application through the cut before capturing that exact snapshot.
         -- Fresh basis capture retains protection through execution and transfer. Raw staged tips do not constrain selection.
 
+    @invariant BrokeredDetachedBodyUsesTheCommittedPosition
+        -- A sealed directory journal frame commits the digest of its detached reference.
+        -- The broker admits one position under a current replay ticket and retains its own directory region through delivery and provider drain.
+        -- It matches the supplied reference to the quorum-certified frame and verifies the exact provider publication and body digest.
+        -- The detached storage namespace and unit-key vault belong to the broker.
+
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
         -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.

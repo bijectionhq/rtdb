@@ -5,9 +5,10 @@ use std::sync::Arc;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use ring::{
-    digest::{Context, SHA256},
+    digest::{Context, SHA256, digest},
     rand::{SecureRandom, SystemRandom},
 };
+use rtdb_format::envelope::ReplicaFrame;
 use rtdb_storage::{Error, IoRegion, Result, log::LogRecord};
 use rtdb_types::Result as DomainResult;
 
@@ -15,7 +16,8 @@ use crate::keys::{ArchiveKey, KeyService};
 
 type Publication = [u8; 32];
 const PUBLICATION_BYTES: usize = size_of::<Publication>();
-pub(super) const OVERHEAD: usize = PUBLICATION_BYTES + crate::cipher::SEALED_OVERHEAD;
+const HEADER_BYTES: usize = PUBLICATION_BYTES * 2;
+pub(super) const OVERHEAD: usize = HEADER_BYTES + crate::cipher::SEALED_OVERHEAD;
 
 pub(crate) struct JournalUnits {
     scope: Arc<str>,
@@ -35,11 +37,12 @@ impl JournalUnits {
         })
     }
 
-    fn associated(&self, publication: &Publication) -> String {
+    fn associated(&self, publication: &[u8], reference: &[u8]) -> String {
         format!(
-            "rtdb.multi/journal-unit/v1/{}/{}",
+            "rtdb.multi/journal-unit/v2/{}/{}/{}",
             self.scope,
-            URL_SAFE_NO_PAD.encode(publication)
+            URL_SAFE_NO_PAD.encode(publication),
+            URL_SAFE_NO_PAD.encode(reference)
         )
     }
 
@@ -62,12 +65,14 @@ impl JournalUnits {
     }
 
     async fn seal_unit(&self, publication: Publication, plaintext: Bytes) -> Result<Bytes> {
+        let reference = reference_digest(&plaintext);
         let ciphertext = self
             .keys
-            .seal(&self.associated(&publication), plaintext)
+            .seal(&self.associated(&publication, &reference), plaintext)
             .await?;
-        let mut frame = Vec::with_capacity(PUBLICATION_BYTES + ciphertext.len());
+        let mut frame = Vec::with_capacity(HEADER_BYTES + ciphertext.len());
         frame.extend_from_slice(&publication);
+        frame.extend_from_slice(&reference);
         frame.extend_from_slice(&ciphertext);
         Ok(frame.into())
     }
@@ -80,18 +85,19 @@ impl JournalUnits {
     }
 
     pub(crate) async fn decrypt(&self, sealed: Bytes) -> Result<Bytes> {
-        let publication = sealed
-            .get(..PUBLICATION_BYTES)
-            .and_then(|prefix| prefix.try_into().ok())
-            .ok_or_else(|| {
-                Error::Task("A sealed journal frame has no publication identity".into())
-            })?;
-        self.keys
+        let header = sealed.get(..HEADER_BYTES)
+            .ok_or_else(|| Error::Task("A sealed journal frame has no publication header".into()))?;
+        let (publication, reference) = header.split_at(PUBLICATION_BYTES);
+        let plaintext = self.keys
             .open(
-                &self.associated(&publication),
-                sealed.slice(PUBLICATION_BYTES..),
+                &self.associated(publication, reference),
+                sealed.slice(HEADER_BYTES..),
             )
-            .await
+            .await?;
+        if reference_digest(&plaintext).as_slice() != reference {
+            return Err(Error::Task("The sealed journal frame has a different detached reference".into()));
+        }
+        Ok(plaintext)
     }
 
     pub(super) async fn open_record(&self, record: LogRecord) -> Result<LogRecord> {
@@ -114,10 +120,55 @@ impl JournalUnits {
     }
 }
 
+/// A separate payload owner can match a delivered pointer to a certified
+/// frame without opening the journal frame or borrowing its key.
+pub(crate) fn commits_payload_reference(sealed: &[u8], reference: &[u8]) -> bool {
+    let supplied = reference_digest(reference);
+    sealed.len() >= OVERHEAD && supplied != [0; 32]
+        && sealed.get(PUBLICATION_BYTES..HEADER_BYTES) == Some(supplied.as_slice())
+}
+
+fn reference_digest(plaintext: &[u8]) -> [u8; 32] {
+    if !matches!(ReplicaFrame::has_external_payload(plaintext), Ok(true)) {
+        return [0; 32];
+    }
+    digest(&SHA256, plaintext).as_ref().try_into().expect("SHA-256 width")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keys::LocalKeyService;
+    use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::CURRENT_STORAGE_VERSION, log::proto::NoOp};
+    use rtdb_types::{BlockIndex, StorageEpoch, Term, TermSequence};
+
+    #[tokio::test]
+    async fn a_certified_frame_commits_only_its_exact_external_reference() -> DomainResult<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(directory.path())?;
+        keys.key("replica").await?;
+        let units = JournalUnits::open(&keys, "replica", "replica", IoRegion::new()).await?;
+        let inline = ReplicaEnvelope {
+            term: Term(1),
+            term_sequence: Some(TermSequence(0)),
+            message: ReplicaBody::NoOp(NoOp::default()),
+        };
+        let body = inline.encode();
+        let reference = |name| inline.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), name, &body).encode();
+        let chosen = reference("chosen".into());
+        let other = reference("other".into());
+        let sealed = units.seal(chosen.clone().into()).await?;
+
+        assert!(commits_payload_reference(&sealed, &chosen));
+        assert!(!commits_payload_reference(&sealed, &other));
+        assert_eq!(units.decrypt(sealed.clone()).await?.as_ref(), chosen.as_slice());
+
+        let mut substituted = sealed.to_vec();
+        substituted[PUBLICATION_BYTES..HEADER_BYTES].copy_from_slice(&reference_digest(&other));
+        assert!(units.decrypt(substituted.into()).await.is_err());
+        assert!(!commits_payload_reference(&units.seal(body.clone().into()).await?, &body));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn a_reseeded_frame_uses_only_its_destination_slot() -> DomainResult<()> {

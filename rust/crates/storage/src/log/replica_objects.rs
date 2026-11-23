@@ -24,10 +24,17 @@ pub struct ReplicaObjectScope {
 pub struct ReplicaObjectCustody {
     authority: ReplicaPayloadAuthority,
     position: LogOffset,
+    reference: ReplicaPayloadReference,
+    _hold: Arc<dyn Send + Sync>,
+}
+
+/// The exact body identified by a frame. This is identity evidence, so the
+/// caller still needs an admitted delivery to open it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReplicaPayloadReference {
     key: ObjectKey,
     digest: [u8; 32],
     publication: Option<PhysicalObjectVersion>,
-    _hold: Arc<dyn Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -60,19 +67,8 @@ impl ReplicaObjectCustody {
         authority: ReplicaPayloadAuthority, position: LogOffset, frame: &[u8],
         version: StorageVersion, epoch: StorageEpoch, hold: Arc<dyn Send + Sync>,
     ) -> Result<Option<Self>> {
-        let invalid = |error: rtdb_types::Anomaly| Error::Task(error.to_string());
-        if !ReplicaFrame::has_external_payload(frame).map_err(invalid)? { return Ok(None); }
-        let envelope = ReplicaEnvelope::decode(frame).map_err(invalid)?
-            .ok_or_else(|| Error::Task("A delivered replica pointer has no envelope".into()))?;
-        let ReplicaBody::OversizedMessage(reference) = &envelope.message else {
-            return Err(Error::Task("A delivered replica pointer has no exact body".into()));
-        };
-        let digest = reference.payload_sha256.as_deref().and_then(|digest| digest.try_into().ok())
-            .ok_or_else(|| Error::Task("A delivered replica pointer has no exact payload digest".into()))?;
-        let key = envelope.oversized_payload(version, epoch).map_err(invalid)?
-            .ok_or_else(|| Error::Task("A delivered replica pointer has no object".into()))?;
-        let publication = envelope.offload_publication().map_err(invalid)?.map(|(_, version)| version);
-        Ok(Some(Self { authority, position, key: ObjectKey::new(key)?, digest, publication, _hold: hold }))
+        let reference = ReplicaPayloadReference::from_frame(frame, version, epoch)?;
+        Ok(reference.map(|reference| Self { authority, position, reference, _hold: hold }))
     }
 
     pub fn installed_scope(&self) -> Option<ReplicaObjectScope> {
@@ -83,8 +79,8 @@ impl ReplicaObjectCustody {
     }
 
     pub fn position(&self) -> LogOffset { self.position }
-    pub fn object(&self) -> &ObjectKey { &self.key }
-    pub fn publication(&self) -> Option<&PhysicalObjectVersion> { self.publication.as_ref() }
+    pub fn object(&self) -> &ObjectKey { self.reference.object() }
+    pub fn publication(&self) -> Option<&PhysicalObjectVersion> { self.reference.publication() }
 
     pub async fn redeem(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
         let view = HeldView::recovery(Arc::new(self.clone()));
@@ -97,12 +93,12 @@ impl ReplicaObjectCustody {
     }
 
     pub fn matches(&self, position: LogOffset, key: &ObjectKey) -> bool {
-        self.position == position && &self.key == key
+        self.position == position && self.object() == key
     }
 
     /// The storage broker calls this only after validating the original scope.
     pub async fn read_from(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
-        self.read_publication(store, memory, self.publication.as_ref()).await
+        self.read_publication(store, memory, self.publication()).await
     }
 
     /// An authenticated transfer binds its own copy by the original body digest.
@@ -114,20 +110,58 @@ impl ReplicaObjectCustody {
         &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, publication: Option<&PhysicalObjectVersion>,
     ) -> Result<ReplicaPayload> {
         let view = HeldView::recovery(Arc::new(self.clone()));
-        IoRegion::reading(view, async {
-            let length = usize::try_from(store.head_fresh(&self.key).await?.size)
-                .map_err(|_| payload_size())?;
-            let allocation = store.exact_object_allocation(&self.key, length)?;
-            let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(payload_size)?;
-            let charge = memory.reserve(charge).map_err(|error| Error::Task(error.to_string()))?;
-            let observed = IoRegion::retaining(charge.clone(), store.observe_fresh_exact(&self.key, length)).await?;
-            if publication.is_some_and(|expected| observed.version.as_ref() != Some(expected))
-                || ring::digest::digest(&ring::digest::SHA256, &observed.value).as_ref() != self.digest.as_slice()
-            {
-                return Err(Error::ConflictingObject(self.key.to_string()));
-            }
-            Ok(ReplicaPayload { bytes: observed.value, _charge: charge })
-        }).await
+        IoRegion::reading(view, self.reference.read_publication(store, memory, publication)).await
+    }
+}
+
+impl ReplicaPayloadReference {
+    pub fn from_frame(frame: &[u8], version: StorageVersion, epoch: StorageEpoch) -> Result<Option<Self>> {
+        let invalid = |error: rtdb_types::Anomaly| Error::Task(error.to_string());
+        if !ReplicaFrame::has_external_payload(frame).map_err(invalid)? { return Ok(None); }
+        let envelope = ReplicaEnvelope::decode(frame).map_err(invalid)?
+            .ok_or_else(|| Error::Task("A delivered replica pointer has no envelope".into()))?;
+        let ReplicaBody::OversizedMessage(reference) = &envelope.message else {
+            return Err(Error::Task("A delivered replica pointer has no exact body".into()));
+        };
+        let digest = reference.payload_sha256.as_deref().and_then(|digest| digest.try_into().ok())
+            .ok_or_else(|| Error::Task("A delivered replica pointer has no exact payload digest".into()))?;
+        let key = envelope.oversized_payload(version, epoch).map_err(invalid)?
+            .ok_or_else(|| Error::Task("A delivered replica pointer has no object".into()))?;
+        let publication = envelope.offload_publication().map_err(invalid)?.map(|(_, version)| version);
+        Ok(Some(Self { key: ObjectKey::new(key)?, digest, publication }))
+    }
+
+    pub fn object(&self) -> &ObjectKey { &self.key }
+    pub fn publication(&self) -> Option<&PhysicalObjectVersion> { self.publication.as_ref() }
+
+    pub async fn read_at(
+        &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>,
+    ) -> Result<ReplicaPayload> {
+        self.read_publication(store, memory, self.publication()).await
+    }
+
+    async fn read_publication(
+        &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, publication: Option<&PhysicalObjectVersion>,
+    ) -> Result<ReplicaPayload> {
+        let length = usize::try_from(store.head_fresh(&self.key).await?.size).map_err(|_| payload_size())?;
+        let allocation = store.exact_object_allocation(&self.key, length)?;
+        let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(payload_size)?;
+        let charge = memory.reserve(charge).map_err(|error| Error::Task(error.to_string()))?;
+        let observed = IoRegion::retaining(charge.clone(), store.observe_fresh_exact(&self.key, length)).await?;
+        if publication.is_some_and(|expected| observed.version.as_ref() != Some(expected)) {
+            return Err(Error::ConflictingObject(self.key.to_string()));
+        }
+        self.verify_body(observed.value, charge)
+    }
+
+    pub fn verify_body(&self, bytes: Bytes, charge: Arc<MemoryReservation>) -> Result<ReplicaPayload> {
+        if charge.bytes() < bytes.len() {
+            return Err(payload_size());
+        }
+        if ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref() != self.digest.as_slice() {
+            return Err(Error::ConflictingObject(self.key.to_string()));
+        }
+        Ok(ReplicaPayload { bytes, _charge: charge })
     }
 }
 
@@ -149,8 +183,7 @@ impl PartialEq for ReplicaObjectCustody {
             (ReplicaPayloadAuthority::Brokered(left), ReplicaPayloadAuthority::Brokered(right)) => Arc::ptr_eq(left, right),
             _ => false,
         };
-        same_owner && self.position == other.position && self.key == other.key
-            && self.digest == other.digest && self.publication == other.publication
+        same_owner && self.position == other.position && self.reference == other.reference
     }
 }
 impl Eq for ReplicaObjectCustody {}
