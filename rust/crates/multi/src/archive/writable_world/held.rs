@@ -387,6 +387,20 @@ impl HeldCheckpointWorld {
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None).await
+    }
+
+    pub async fn ranked_search_at(
+        &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp, system: Timestamp, parent_only: bool,
+    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, Some((system, parent_only))).await
+    }
+
+    async fn ranked_search_on_cut(
+        &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp, earlier: Option<(Timestamp, bool)>,
+    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
             || query.len() > 4096
@@ -395,19 +409,40 @@ impl HeldCheckpointWorld {
             return Err(OwnedWorld::unavailable());
         }
         Interval::at(valid)?;
+        if let Some((system, parent_only)) = earlier {
+            if (parent_only && system != self.parent_basis().system_time)
+                || (!parent_only && !self.clock_mode().is_writable())
+                || partitions.iter().any(|(relation, _)| self.open.record.schemas.relation(relation)
+                    .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+            {
+                return Err(OwnedWorld::unavailable());
+            }
+            let relations = partitions.iter().map(|(relation, _)| relation.clone()).collect::<Vec<_>>();
+            self.require_accepted_archive_scope(&relations).await?;
+        }
         let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
-        let witnesses = self.open.snapshot.world_relation_witnesses(
-            self.open.record.id, partitions.iter().map(|(relation, _)| relation),
-        ).await?;
+        let witnesses = if earlier.is_some() {
+            let mut witnesses = Vec::with_capacity(partitions.len());
+            for (relation, _) in &partitions {
+                witnesses.push(self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?);
+            }
+            witnesses
+        } else {
+            self.open.snapshot.world_relation_witnesses(
+                self.open.record.id, partitions.iter().map(|(relation, _)| relation),
+            ).await?
+        };
         let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect::<Vec<_>>();
         let writable = self.clock_mode().is_writable();
-        let columns = if writable {
+        let use_overlay = writable && !earlier.is_some_and(|(_, parent_only)| parent_only);
+        let columns = if use_overlay || earlier.is_some() {
             self.search_columns(&partitions, &frontiers, &guard).await?
         } else {
             Vec::new()
         };
-        let overlay = if writable {
-            Some(self.search_overlay(&partitions, &columns, valid, &query, &guard).await?)
+        let overlay = if use_overlay {
+            Some(self.search_overlay(&partitions, &columns, valid, &query, &guard,
+                earlier.map(|(system, _)| system)).await?)
         } else {
             None
         };
@@ -419,7 +454,7 @@ impl HeldCheckpointWorld {
         let page = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = match page {
-            Err(error) if writable && error.code == "rtdb.owned/search-uncovered" => {
+            Err(error) if earlier.is_none() && writable && error.code == "rtdb.owned/search-uncovered" => {
                 self.rank_visible_documents(&partitions, &columns, &query, offset, limit, valid, &guard).await?
             }
             other => other?,
@@ -431,24 +466,49 @@ impl HeldCheckpointWorld {
 
     async fn search_overlay(
         &self, partitions: &[(OwnedRelation, OwnedRelation)], columns: &[String], valid: Timestamp,
-        query: &str, guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        query: &str, guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>, system: Option<Timestamp>,
     ) -> Result<rtdb_node::HeldTextCorpus> {
         let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
+        let mut remaining = 4096usize;
         for (partition, ((relation, _), column)) in partitions.iter().zip(columns).enumerate() {
+            let cut = if let Some(system) = system {
+                Some(self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?)
+            } else {
+                None
+            };
             let mut after = None;
             loop {
                 guard()?;
                 // This is the physical shadow relation: its typed tombstones
                 // are still present identities and also mask the archived row.
-                let candidates = self.open.snapshot.world_identity_candidates(
-                    self.open.record.id, relation, valid, after.as_deref(), 128,
-                ).await?;
+                let candidates = if let Some(cut) = &cut {
+                    cut.overlay_identities(valid, after.as_deref(), 128).await?
+                } else {
+                    self.open.snapshot.world_identity_candidates(
+                        self.open.record.id, relation, valid, after.as_deref(), 128,
+                    ).await?
+                };
+                if cut.is_some() {
+                    remaining = remaining.checked_sub(candidates.keys.len()).ok_or_else(OwnedWorld::unavailable)?;
+                }
                 for key in &candidates.keys {
                     let id = EntityId::String(key.clone());
-                    let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
-                    let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
-                    let text = shadow.as_ref().map(|fact| search_text(fact, column)).transpose()?.flatten();
-                    corpus.shadow(partition, id, text)?;
+                    if let Some(cut) = &cut {
+                        let shadow = cut.shadow(&id, valid).await?;
+                        let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?
+                            .ok_or_else(OwnedWorld::unavailable)?;
+                        let row = WorldShadow::from_record(fact.row)?;
+                        let text = match &row {
+                            WorldShadow::Deleted => None,
+                            WorldShadow::Present(row) => search_row_text(row, column)?,
+                        };
+                        corpus.shadow(partition, id, text)?;
+                    } else {
+                        let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
+                        let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
+                        let text = shadow.as_ref().map(|fact| search_text(fact, column)).transpose()?.flatten();
+                        corpus.shadow(partition, id, text)?;
+                    }
                 }
                 if candidates.keys.len() < 128 { break; }
                 after = Some(candidates.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
@@ -833,7 +893,11 @@ fn expired_lifetime() -> rtdb_types::Anomaly {
 }
 
 fn search_text<'a>(fact: &'a WorldFact, column: &str) -> Result<Option<&'a str>> {
-    match fact.row().get(column) {
+    search_row_text(fact.row(), column)
+}
+
+fn search_row_text<'a>(row: &'a StructFields<Value>, column: &str) -> Result<Option<&'a str>> {
+    match row.get(column) {
         Some(Value::Utf8(text)) => Ok(Some(text)),
         None | Some(Value::Null) => Ok(None),
         _ => Err(OwnedWorld::unavailable()),

@@ -219,6 +219,7 @@ pub(crate) const HELD_WORLD_OVERLAY_RANGE_AT_V1: &str = "rtdb.owned.ReadHeldWorl
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange, OverlayRangeAt }
+pub(crate) const SEARCH_HELD_WORLD_AT_V1: &str = "rtdb.owned.SearchHeldWorldAt.v1";
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
@@ -1866,9 +1867,19 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], historical: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
+        let (earlier, request) = if historical {
+            let (mode, rest) = request.split_first().ok_or_else(|| invalid("Missing historical world search selector"))?;
+            let parent_only = match *mode {
+                0 => true,
+                1 => false,
+                _ => return Err(invalid("Invalid historical world search selector")),
+            };
+            let (system, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing historical world search system revision"))?;
+            (Some((Timestamp(i64::from_be_bytes(*system)), parent_only)), rest)
+        } else { (None, request) };
         let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world search valid instant"))?;
         let valid = Timestamp(i64::from_be_bytes(*valid));
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
@@ -1877,12 +1888,19 @@ impl Service {
             return Err(Status::failed_precondition("Search requires evidence for every selected world partition"));
         }
         let relations = rank.partitions.iter().map(|(relation, _)| relation.clone()).collect::<Vec<_>>();
-        let scope = owned_rank_scope(b"rtdb.owned.search.world.v1\0", &body[..24 + rank.frame_len], rank.query);
-        let (page, witnesses) = held.snapshot.ranked_search(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid)
-            .await.map_err(status)?;
+        let scope = if historical {
+            owned_rank_scope(b"rtdb.owned.search.world-at.v1\0", &body[..33 + rank.frame_len], rank.query)
+        } else {
+            owned_rank_scope(b"rtdb.owned.search.world.v1\0", &body[..24 + rank.frame_len], rank.query)
+        };
+        let (page, witnesses) = if let Some((system, parent_only)) = earlier {
+            held.snapshot.ranked_search_at(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid, system, parent_only).await
+        } else {
+            held.snapshot.ranked_search(rank.partitions, rank.query.to_owned(), rank.offset, rank.limit, valid).await
+        }.map_err(status)?;
         if witnesses.len() != relations.len() { return Err(Status::internal("Incomplete retained search evidence")); }
         let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
-        let reply = self.owned_rank_reply(call, page, scope, nonces, held.snapshot.present(), valid)?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, earlier.map_or_else(|| held.snapshot.present(), |(system, _)| system), valid)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
