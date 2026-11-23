@@ -244,6 +244,7 @@ impl OpenTransaction<'_> {
             self.buffer.append(
                 relation.table(owner),
                 StoredEvent {
+                    commit_position: 0,
                     entity_key: Some(shadow.id.handle_bytes().into()),
                     iid: shadow.id.iid(),
                     system_from: self.tx_key().system_time,

@@ -306,6 +306,7 @@ mod tests {
             StoredOperation::Delete,
             StoredOperation::Erase,
         ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+            commit_position: 0,
             entity_key: Some(Arc::from(identities[index].handle_bytes())),
             iid: Iid([index as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,
         }).collect::<Vec<_>>();

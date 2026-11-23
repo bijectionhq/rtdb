@@ -11,6 +11,7 @@ fn page_events_encode_to_the_bytes_their_decoded_events_encode_to() {
         StoredOperation::Put(fields)
     };
     let events = (0..12i64).map(|id| StoredEvent {
+        commit_position: 0,
         entity_key: None,
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(10 + id), valid_time: Interval::new(Timestamp(id), Timestamp::MAX).unwrap(),
         operation: match id % 4 {
@@ -59,6 +60,7 @@ fn flat_columns_copied_from_several_pages_encode_to_the_bytes_their_decoded_even
     let page = |ids: std::ops::Range<i64>, columns: &[&str]| {
         let stored: StructFields<LogicalType> = full.iter().filter(|(name, _)| *name == "_id" || columns.contains(&name.as_str())).map(|(name, ty)| (name.clone(), ty.clone())).collect();
         let events = ids.map(|id| StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::new(Timestamp(id), Timestamp::MAX).unwrap(),
             operation: if id % 7 == 6 { StoredOperation::Delete } else {
@@ -110,6 +112,7 @@ fn compaction_copies_evolving_nested_layouts_from_selected_arrow_positions() {
         let mut document = StructFields::from([("_id".into(), Value::I64(id))]);
         if let Some(value) = value { document.insert("v".into(), value); }
         StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
             operation: StoredOperation::Put(document), recency: Some(Timestamp(100 + id)),
@@ -149,7 +152,7 @@ fn compaction_copies_evolving_nested_layouts_from_selected_arrow_positions() {
 
 #[test]
 fn compaction_admits_typed_null_padding_before_allocating_it() {
-    let event = StoredEvent { entity_key: None, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
+    let event = StoredEvent { commit_position: 0, entity_key: None, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
         operation: StoredOperation::Put(StructFields::new()), recency: None };
     let page = build_event_batch_with_recency(&[event], Some(StructFields::new()), None, false).unwrap();
     let page = EventBatch::new(page).unwrap().page_events().unwrap();
@@ -172,6 +175,7 @@ fn compaction_preserves_ipc_bytes_of_unions_below_null_parents() {
         ("fixed".into(), LogicalType::List { kind: ListKind::FixedSizeList(1), element: Box::new(union) }.maybe()),
     ]);
     let event = |id, record, fixed| StoredEvent {
+        commit_position: 0,
         entity_key: None,
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL, recency: None,
         operation: StoredOperation::Put(StructFields::from([("record".into(), record), ("fixed".into(), fixed)])),
@@ -202,6 +206,7 @@ fn compaction_preserves_bottom_fields_when_widening_a_visible_struct_to_a_union(
     let document = |ty| StructFields::from([("v".into(), LogicalType::Struct(StructFields::from([("x".into(), ty)])))]);
     let target = document(integer.join(&text).maybe());
     let event = |id, value| StoredEvent {
+        commit_position: 0,
         entity_key: None,
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL, recency: None,
         operation: StoredOperation::Put(StructFields::from([("v".into(), Value::Struct(StructFields::from([("x".into(), value)])))])),
@@ -232,6 +237,7 @@ fn compaction_retries_nested_undefined_encoding_without_allocating_inactive_unio
     let union = fixed.join(&integer).maybe();
     let fields = StructFields::from([("v".into(), LogicalType::Struct(StructFields::from([("x".into(), union)])).maybe())]);
     let event = |id, value| StoredEvent {
+        commit_position: 0,
         entity_key: None,
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL, recency: None,
         operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),

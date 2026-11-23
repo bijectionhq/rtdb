@@ -653,7 +653,7 @@ impl<'a> OpenTransaction<'a> {
                 let digest = hash.finalize();
                 let iid = Iid::from_slice(&digest[..16])?;
                 let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
-                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
+                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { commit_position: 0, entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
             }
         };
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
@@ -1099,6 +1099,9 @@ impl<'a> OpenTransaction<'a> {
         let retained_release = crate::hosted_control::retained_release_world(operations);
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
+        if proposal_land.is_some() {
+            self.buffer.retain_owned_positions()?;
+        }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
             Operation::Public(TxOp::OwnedPublishWorld { land_root: Some(_), .. })
@@ -1711,6 +1714,7 @@ impl<'a> OpenTransaction<'a> {
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         self.record_owned_change(relation, id.clone(), kind, Interval::ALL)?;
         self.buffer.append(table, StoredEvent {
+            commit_position: 0,
             entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Erase, recency: None,
@@ -1776,7 +1780,7 @@ impl<'a> OpenTransaction<'a> {
         self.track_unique_mutation(owner, relation, id, valid).await?;
         self.track_capacity_mutation(owner, relation, id, valid).await?;
         let system_from = self.tx_key().system_time;
-        self.buffer.append(relation.table(owner), StoredEvent { entity_key: Some(id.handle_bytes().into()),
+        self.buffer.append(relation.table(owner), StoredEvent { commit_position: 0, entity_key: Some(id.handle_bytes().into()),
             iid: id.iid(), system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
         })?;
         self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid)
@@ -2046,7 +2050,7 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            self.buffer.append_to(table, StoredEvent { entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
+            self.buffer.append_to(table, StoredEvent { commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
@@ -2158,7 +2162,7 @@ impl<'a> OpenTransaction<'a> {
                 None => documents.iid(row, id.as_ref(), memory)?,
             };
             let valid_time = interval(row_time(&row_from, row, from.unwrap_or(system_from))?, row_time(&row_to, row, to.unwrap_or(Timestamp::MAX))?)?;
-            Ok(EventHeader { iid, system_from, valid_time, op: EventOp::Put })
+            Ok(EventHeader { commit_position: 0, iid, system_from, valid_time, op: EventOp::Put })
         }).collect::<Result<Vec<_>>>()?;
         let (fields, columns): (Vec<_>, Vec<_>) = array.fields().iter().zip(array.columns())
             .filter(|(field, _)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
@@ -2391,6 +2395,7 @@ fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<
     let _scratch = memory.reserve(bound)?;
     let read_header = |row| -> Result<EventHeader> {
         Ok(EventHeader {
+            commit_position: 0,
             iid: iid.iid(row)?, system_from: system_time,
             valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
         })
@@ -2441,7 +2446,7 @@ fn mutation_events(batch: &RecordBatch, kind: MutationKind, system_time: Timesta
             (None, MutationKind::Delete) => StoredOperation::Delete,
             (None, _) => StoredOperation::Erase,
         };
-        append(StoredEvent { entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
+        append(StoredEvent { commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
     }
     Ok(())
 }
@@ -2702,7 +2707,7 @@ mod tests {
                 let Value::FixedSizeBinary(iid) = cell("_iid", row) else { panic!("an IID") };
                 let valid_time = match kind { MutationKind::Erase => Interval::ALL, _ => interval(timestamp(&cell("_valid_from", row), system_time).unwrap(), timestamp(&cell("_valid_to", row), Timestamp::MAX).unwrap()).unwrap() };
                 let operation = match kind { MutationKind::Put => { let Value::Struct(document) = cell("doc", row) else { panic!("a document") }; StoredOperation::Put(document) }, MutationKind::Delete => StoredOperation::Delete, MutationKind::Erase => StoredOperation::Erase };
-                events.push(StoredEvent { entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
+                events.push(StoredEvent { commit_position: 0, entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
             }
         }
         events

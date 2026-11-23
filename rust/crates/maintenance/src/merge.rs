@@ -100,6 +100,7 @@ impl OutputSchema {
         if !self.keyed { return Ok(schema); }
         let mut fields = schema.fields().to_vec();
         fields.push(Arc::new(rtdb_format::data::entity_key_field()));
+        fields.push(Arc::new(rtdb_format::data::commit_position_field()));
         Ok(Arc::new(arrow_schema::Schema::new(fields)))
     }
 }
@@ -254,6 +255,11 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
         let header = event.header();
         let resolved = if state.erased { None } else {
             state.calculator.visit(&header, |polygon| {
+                if header.commit_position != 0 {
+                    charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                    result.push(event.clone());
+                    return Ok(());
+                }
                 for (valid_from, valid_to, system_to) in polygon.ranges() {
                     if system_to > event.system_from {
                         charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
@@ -347,7 +353,10 @@ impl CompactionExecutor for SegmentCompactor {
             while let Some((stream, row)) = heap.next() {
                 let event = &rows[stream][row];
                 let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
-                let Some(recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                let Some(mut recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                if event.commit_position != 0 {
+                    recency = recency.max(event.system_from);
+                }
                 let target = if job.recency_mode == RecencyMode::Partition && recency != Timestamp::MAX {
                     let date = recency_partition(recency, self.config.recency_partition)?;
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
@@ -433,14 +442,15 @@ mod tests {
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
 
     #[test]
-    fn normalization_retains_governed_event_keys_in_the_output_file() {
+    fn normalization_retains_governed_event_keys_and_positions_in_the_output_file() {
         let directory = tempfile::tempdir().unwrap();
         let spill = directory.path().join("merge.arrow");
         let data = directory.path().join("data.arrow");
         let metadata = directory.path().join("meta.arrow");
         let memory = MemoryBudget::new(1 << 22);
         let config = MergeConfig::default();
-        let events = [b"world-a".as_slice(), b"world-b".as_slice()].map(|key| StoredEvent {
+        let events = [(b"world-a".as_slice(), 2), (b"world-b".as_slice(), 1)].map(|(key, commit_position)| StoredEvent {
+            commit_position,
             entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
             valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
         });
@@ -452,12 +462,45 @@ mod tests {
         let batch = EventBatch::new(read_page(&mut reader, 0, &memory).unwrap().batch().clone()).unwrap();
         assert_eq!(batch.entity_key(0).unwrap(), Some(b"world-a".as_slice()));
         assert_eq!(batch.entity_key(1).unwrap(), Some(b"world-b".as_slice()));
+        assert_eq!(batch.header(0).unwrap().commit_position, 2);
+        assert_eq!(batch.header(1).unwrap().commit_position, 1);
+    }
+
+    #[test]
+    fn same_time_compaction_keeps_fully_superseded_landing_assertions_until_erasure() {
+        let memory = MemoryBudget::new(1 << 20);
+        let assertions = [2, 1].map(|commit_position| StoredEvent {
+            commit_position,
+            entity_key: Some(Arc::from(b"entity".as_slice())),
+            iid: Iid([1; 16]),
+            system_from: Timestamp(100),
+            valid_time: Interval::from_micros(10, 20).unwrap(),
+            operation: StoredOperation::Delete,
+            recency: None,
+        });
+        let (surviving, _charges) = resolve_same_time(&page(&assertions), &memory).unwrap();
+        assert_eq!(
+            surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(),
+            assertions.iter().map(StoredEvent::header).collect::<Vec<_>>(),
+        );
+        let erased = StoredEvent {
+            system_from: Timestamp(101),
+            commit_position: 0,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Erase,
+            ..assertions[0].clone()
+        };
+        let erased_header = erased.header();
+        let [later, earlier] = assertions;
+        let (surviving, _charges) = resolve_same_time(&page(&[erased, later, earlier]), &memory).unwrap();
+        assert_eq!(surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [erased_header]);
     }
 
     #[test]
     fn same_time_compaction_keeps_temporal_state_separate_for_colliding_keys() {
         let memory = MemoryBudget::new(1 << 20);
         let events = [b"world-a".as_slice(), b"world-b".as_slice()].map(|key| StoredEvent {
+            commit_position: 0,
             entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
             valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
         });
@@ -472,6 +515,7 @@ mod tests {
     fn compaction_reserves_encoding_scratch_before_writing_a_page() {
         let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Binary))]);
         let input = build_event_batch(&[StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: Iid([1; 16]), system_from: Timestamp(100), valid_time: Interval::ALL, recency: None,
             operation: StoredOperation::Put(StructFields::from([("payload".into(), rtdb_types::Value::Binary(vec![7; 1 << 20]))])),
@@ -498,7 +542,7 @@ mod tests {
             Iid([128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         ];
         let events: Vec<_> = iids.into_iter().flat_map(|iid| {
-            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent { entity_key: None,
+            [i64::MAX - 1, i64::MIN + 1].map(|system_from| StoredEvent { commit_position: 0, entity_key: None,
                 iid,
                 system_from: Timestamp(system_from),
                 valid_time: Interval::from_micros(10, 20).unwrap(),
@@ -568,6 +612,7 @@ mod tests {
                         StoredOperation::Put(StructFields::from([("ordinal".into(), Value::I64(i64::from(ordinal)))]))
                     } else { StoredOperation::Delete };
                     StoredEvent {
+                        commit_position: 0,
                         entity_key: None,
                         iid: Iid([1; 16]),
                         system_from: Timestamp(100),
@@ -605,6 +650,7 @@ mod tests {
     #[test]
     fn same_time_compaction_resolves_a_lone_event_with_only_its_output_row() {
         let input = page(&[StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
@@ -630,6 +676,7 @@ mod tests {
     #[test]
     fn same_time_compaction_admits_the_ceiling_before_cloning_a_second_events_row() {
         let event = |lower, upper| StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: Iid([1; 16]),
             system_from: Timestamp(100),

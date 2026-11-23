@@ -91,6 +91,9 @@ impl RevisionRoots {
                 if matches!(order, EventOrder::OldestFirst) {
                     events.reverse();
                 }
+                if events.iter().any(|event| event.header.commit_position != 0) {
+                    events.sort_by_key(|event| std::cmp::Reverse(event.header.commit_position));
+                }
                 let before = tree.spans(&root, &address).await?;
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);
                 let after = resolve(address.iid, time, &before, &events, &tree.memory)?;
@@ -159,6 +162,7 @@ fn resolve(
     // The previous projection contains exactly the older intervals that can still win.
     for span in before {
         let header = EventHeader {
+            commit_position: 0,
             iid,
             system_from: Timestamp::MIN,
             valid_time: span.valid,
@@ -420,6 +424,7 @@ mod tests {
 
     fn put(id: i64, system: i64, valid: Interval, key: i64) -> StoredEvent {
         StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: Value::I64(id).entity_id().unwrap().iid(),
             system_from: Timestamp(system),
@@ -542,6 +547,7 @@ mod tests {
         row.insert("_id".into(), peer_id.as_value());
         peer.entity_key = Some(peer_id.handle_bytes().into());
         let erase = StoredEvent {
+            commit_position: 0,
             entity_key: first.entity_key.clone(), iid, system_from: Timestamp(1),
             valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None,
         };
@@ -576,7 +582,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let erase = StoredEvent { entity_key: None,
+        let erase = StoredEvent { commit_position: 0, entity_key: None,
             iid,
             system_from: Timestamp(1),
             valid_time: Interval::ALL,

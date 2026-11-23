@@ -1491,6 +1491,7 @@ fn stored_list_projection_uses_arrow_for_contiguous_and_sparse_rows() {
         data_type: logical.clone(),
     };
     let events: Vec<_> = (0..3).map(|number| StoredEvent {
+        commit_position: 0,
         entity_key: None,
         iid: Iid([number as u8; 16]),
         system_from: Timestamp(10),
@@ -1564,6 +1565,7 @@ fn stored_nested_union_projection_keeps_arrow_for_sparse_rows() {
         qualified_only: false, unnamed: false, data_type: logical.clone(),
     };
     let events = [record.clone(), Value::Null, list.clone()].into_iter().enumerate().map(|(row, value)| StoredEvent {
+        commit_position: 0,
         entity_key: None,
         iid: Iid([row as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
         operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
@@ -1627,7 +1629,7 @@ fn a_mixed_struct_selection_preserves_source_values_and_aligns_arrow_output() {
     let source = |id, value: Option<Value>| {
         let fields: StructFields<Value> = value.into_iter().map(|value| ("v".into(), value)).collect();
         let schema = fields.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
-        let event = StoredEvent { entity_key: None, iid: Iid([id; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+        let event = StoredEvent { commit_position: 0, entity_key: None, iid: Iid([id; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
             operation: StoredOperation::Put(fields), recency: None };
         IndexBatch::copy_events_with_put_schema(&[event], &schema, &memory).unwrap()
     };

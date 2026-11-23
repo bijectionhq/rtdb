@@ -101,7 +101,7 @@ fn stored_event_copy_keeps_decimal_metadata_and_rejects_relabeling() {
     for precision in [i32::MIN, 0, 1, 256, i32::MAX] {
         let (logical, value) = decimal(precision, i32::MIN, 128);
         let fields = BTreeMap::from([("value".into(), logical.clone())]);
-        let events = [StoredEvent { entity_key: None, iid: Iid([42; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+        let events = [StoredEvent { commit_position: 0, entity_key: None, iid: Iid([42; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("value".into(), value)])), recency: None }];
         if precision < 3 { assert!(build_event_batch(&events, Some(fields.clone().into()), None).is_err()); }
         let page = copy_event_batch(&events, Some(fields.clone().into()), Some(RunEndWidth::I32)).unwrap();

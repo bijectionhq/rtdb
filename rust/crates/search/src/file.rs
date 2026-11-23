@@ -158,7 +158,7 @@ impl Entity {
             }
             self.identity = Some(id);
         }
-        self.rows.push((ordinal, EventHeader { iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
+        self.rows.push((ordinal, EventHeader { commit_position: 0, iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
         for ((indices, distinct, seen), value) in self.values.iter_mut().zip(row.values) {
             indices.push(value.map(|tokens| *seen.entry(tokens.clone()).or_insert_with(|| { distinct.push(tokens); distinct.len() - 1 })));
         }

@@ -128,6 +128,13 @@ pub enum EventOp { Put, Delete, Erase }
 pub struct EventHeader {
     pub iid: Iid,
     pub system_from: Timestamp,
+    pub commit_position: u32,
     pub valid_time: Interval,
     pub op: EventOp,
+}
+
+impl EventHeader {
+    pub fn system_position(self) -> (Timestamp, u32) {
+        (self.system_from, self.commit_position)
+    }
 }

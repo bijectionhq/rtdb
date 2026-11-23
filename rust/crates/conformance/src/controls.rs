@@ -92,6 +92,7 @@ pub async fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
             for event in events {
                 let iid: [u8; 16] = hex_bytes(&event.iid)?.try_into().map_err(|_| "IID fixture must have 16 bytes")?;
                 let event = EventHeader {
+                    commit_position: 0,
                     iid: Iid(iid), system_from: Timestamp(event.system_from),
                     valid_time: Interval::from_micros(event.valid_from, event.valid_to)?,
                     op: match event.operation { Operation::Put => EventOp::Put, Operation::Delete => EventOp::Delete, Operation::Erase => EventOp::Erase },

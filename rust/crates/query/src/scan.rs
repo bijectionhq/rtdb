@@ -208,7 +208,7 @@ impl ActiveRows {
 struct Head { header: EventHeader, active: usize, priority: usize, ordinal: usize }
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.system_from.cmp(&other.header.system_from))
+        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.system_position().cmp(&other.header.system_position()))
             .then_with(|| other.priority.cmp(&self.priority)).then_with(|| other.ordinal.cmp(&self.ordinal))
             .then_with(|| other.active.cmp(&self.active))
     }
@@ -1125,8 +1125,8 @@ impl PartitionScan {
             let source = rows.row(index)?;
             let header = source.header()?;
             if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
-            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.system_from < header.system_from)) {
-                return Err(invalid("page-order", "Data page is not in IID and descending system-time order"));
+            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.system_position() < header.system_position())) {
+                return Err(invalid("page-order", "Data page is not in IID and descending system-position order"));
             }
             previous = Some(header);
         }
@@ -1523,6 +1523,7 @@ mod tests {
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
         let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
             StoredEvent {
+                commit_position: 0,
                 entity_key: None,
                 iid: Iid([prefix; 16]),
                 system_from: key.system_time,
@@ -2923,6 +2924,7 @@ mod tests {
         let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
         let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
         write.append(table.clone(), StoredEvent {
+            commit_position: 0,
             entity_key: None,
             iid: Iid([0xc0; 16]),
             system_from: key.system_time,

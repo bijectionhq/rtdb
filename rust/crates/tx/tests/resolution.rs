@@ -154,6 +154,7 @@ async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
             assert_eq!(self.0.used_bytes(), baseline);
 
             transaction.append(table(), rtdb_format::data::StoredEvent {
+                commit_position: 0,
                 entity_key: None,
                 iid: Value::I64(1).entity_id()?.iid(), system_from: transaction.tx_key().system_time,
                 valid_time: Interval::ALL, operation: StoredOperation::Put(document(7)), recency: None,
@@ -757,6 +758,7 @@ async fn external_event_writer_cannot_erase_private_replay_markers() {
     impl TransactionWriter for ExternalWriter {
         async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
             let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent {
+                commit_position: 0,
                 entity_key: None,
                 iid: Value::Utf8("00112233445566778899aabbccddeeff/0".into()).entity_id()?.iid(),
                 system_from: transaction.tx_key().system_time,
