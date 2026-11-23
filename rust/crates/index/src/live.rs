@@ -548,13 +548,17 @@ impl PendingTable {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct WritePosition { events: usize, batches: usize }
 
+enum OwnedCommitPositions {
+    Landing(u32),
+    Archive(std::vec::IntoIter<u32>),
+}
 
 pub struct TransactionBuffer {
     base: Snapshot,
     tx_key: TransactionKey,
     budget: Arc<MemoryBudget>,
     tables: BTreeMap<TableRef, PendingTable>,
-    owned_position: Option<u32>,
+    owned_positions: Option<OwnedCommitPositions>,
     /// Each table's transaction segment as last read, with the events and declarations it holds; a read appends only what was written since.
     segments: std::sync::Mutex<BTreeMap<TableRef, (Arc<LiveTable>, WritePosition, StructFields<LogicalType>)>>,
 }
@@ -562,17 +566,34 @@ pub struct TransactionBuffer {
 impl TransactionBuffer {
     pub fn new(base: Snapshot, tx_key: TransactionKey, budget: Arc<MemoryBudget>) -> Result<Self> {
         StagedWrite::new(tx_key, base.tx_basis(), base.block_index(), BTreeMap::new())?;
-        Ok(Self { base, tx_key, budget, tables: BTreeMap::new(), owned_position: None, segments: Default::default() })
+        Ok(Self { base, tx_key, budget, tables: BTreeMap::new(), owned_positions: None, segments: Default::default() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
     pub fn retain_owned_positions(&mut self) -> Result<()> {
-        if self.owned_position.is_some() || !self.tables.is_empty() {
-            return Err(invalid("Commit positions must be selected before staging a hosted landing"));
+        self.select_owned_positions(OwnedCommitPositions::Landing(0))
+    }
+    pub fn retain_archived_owned_positions(&mut self, positions: Vec<u32>) -> Result<()> {
+        if positions.first().is_none_or(|first| *first == 0)
+            || !positions.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(invalid("Archived commit positions must be positive and strictly ordered"));
         }
-        self.owned_position = Some(0);
+        self.select_owned_positions(OwnedCommitPositions::Archive(positions.into_iter()))
+    }
+    fn select_owned_positions(&mut self, positions: OwnedCommitPositions) -> Result<()> {
+        if self.owned_positions.is_some() || !self.tables.is_empty() {
+            return Err(invalid("Commit positions must be selected before staging owned effects"));
+        }
+        self.owned_positions = Some(positions);
         Ok(())
     }
-    pub fn retains_owned_positions(&self) -> bool { self.owned_position.is_some() }
+    pub fn retains_owned_positions(&self) -> bool { self.owned_positions.is_some() }
+    pub fn require_archived_positions_consumed(&self) -> Result<()> {
+        if matches!(&self.owned_positions, Some(OwnedCommitPositions::Archive(remaining)) if remaining.len() != 0) {
+            return Err(invalid("The archived transaction omitted positioned effects"));
+        }
+        Ok(())
+    }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> {
         let columns: Vec<_> = columns.into_iter().collect();
         let table_bytes = table.schema.capacity().checked_add(table.table.capacity()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Declared table size overflow"))?;
@@ -615,9 +636,19 @@ impl TransactionBuffer {
         if event.commit_position != 0 {
             return Err(invalid("The transaction buffer assigns owned commit positions"));
         }
-        let position = self.owned_position.filter(|_| table.is_owned_event_data())
-            .map(|previous| previous.checked_add(1).ok_or_else(|| invalid("Owned commit position overflow")))
-            .transpose()?;
+        let position = if table.is_owned_event_data() {
+            match &self.owned_positions {
+                Some(OwnedCommitPositions::Landing(previous)) => {
+                    Some(previous.checked_add(1).ok_or_else(|| invalid("Owned commit position overflow"))?)
+                },
+                Some(OwnedCommitPositions::Archive(remaining)) => {
+                    Some(*remaining.as_slice().first().ok_or_else(|| invalid("The archive contains an extra owned effect"))?)
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().for_each(Value::admit_object_dates); }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
         let bytes = document_bytes.checked_add(event.entity_key.as_ref().map_or(0, |key| key.len()))
@@ -628,14 +659,18 @@ impl TransactionBuffer {
         let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         if let Some(position) = position {
             event.commit_position = position;
-            self.owned_position = Some(position);
+            match &mut self.owned_positions {
+                Some(OwnedCommitPositions::Landing(previous)) => *previous = position,
+                Some(OwnedCommitPositions::Archive(remaining)) => { let _ = remaining.next(); },
+                None => return Err(invalid("The owned transaction lost its assertion order")),
+            }
         }
         pending.events.push(event);
         pending.reservations.push(reservation);
         Ok(())
     }
     pub fn append_batch(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
-        if self.owned_position.is_some() && table.is_owned_event_data() {
+        if self.retains_owned_positions() && table.is_owned_event_data() {
             return Err(invalid("An ordered landing stages governed events in assertion order"));
         }
         let batch = IndexBatch::from_owned(batch)?;
@@ -684,6 +719,7 @@ impl TransactionBuffer {
         self.base.with_transaction_segments(self.tx_key, &current)
     }
     pub fn stage(mut self) -> Result<StagedWrite> {
+        self.require_archived_positions_consumed()?;
         // The segments only served the transaction's own reads; the staged write supersedes them.
         if let Ok(segments) = self.segments.get_mut() { segments.clear(); }
         self.materialize()

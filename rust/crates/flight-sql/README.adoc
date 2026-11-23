@@ -706,6 +706,9 @@ The hosted batch must check the observed `bj_installation` authority row.
 The facts, counters and catalog changes commit together after the authority, catalog and capacity conditions all succeed.
 Held Original replay reinstalls complete-key capacity declarations at their recorded source transaction.
 The resolver checks that the replay reproduces the source relation's write frontier and exact counter effects before accepting the replay receipt.
+A held replay receipt carries `commit_positions` from the archived transaction.
+When the list is nonempty, the submitted governed events must follow that order, preserving sparse positions left by erased assertions.
+The resolver rejects extra or missing governed events before accepting the receipt.
 Successful declarations return the same transaction-key Arrow row as Create.
 Zero counts complete Binary keys. An empty complete key charges a single relation-wide bucket. Positive widths count prefixes of that length. Keys are limited to 4096 bytes.
 Each qualified projection and partition has its own counter. A row charges the rule only while all its predicates match. One shared relation frontier certifies all counters.

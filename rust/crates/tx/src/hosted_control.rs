@@ -69,6 +69,7 @@ pub struct HostedReplay {
     source: rtdb_types::TransactionKey,
     logical_at: u64,
     fingerprint: [u8; 32],
+    commit_positions: Vec<u32>,
     #[serde(skip)]
     lifetimes: Vec<ReplayLifetime>,
     #[serde(skip)]
@@ -170,6 +171,7 @@ pub fn hosted_replay_controls<'a>(
         || head.expected().is_some() != replay.previous.is_some()
         || receipt.expected().is_some() || replay_body(receipt) != Some(encoded)
         || !replay.has_original_prefix()
+        || !replay.positions_are_ordered()
         || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
         || u64::try_from(source.system_time.0).ok().and_then(|time| time.checked_mul(1_000))
             .is_none_or(|time| time < replay.logical_at || time > replay.through)
@@ -289,6 +291,7 @@ fn decode_accepted_replay(body: &[u8], binding: [u8; 32], archive_pin: &[u8]) ->
         archive == &replay.archive && cut == replay.through.to_be_bytes().as_slice()
     });
     if replay.binding != binding || !archive_matches || !replay.has_original_prefix()
+        || !replay.positions_are_ordered()
         || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
         || replay.logical_time() > replay.source.system_time
     {
@@ -341,6 +344,14 @@ fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]>
 }
 
 impl HostedReplay {
+    pub(crate) fn commit_positions(&self) -> &[u32] { &self.commit_positions }
+
+    fn positions_are_ordered(&self) -> bool {
+        self.commit_positions.len() <= 64
+            && self.commit_positions.first().is_none_or(|first| *first != 0)
+            && self.commit_positions.windows(2).all(|pair| pair[0] < pair[1])
+    }
+
     fn has_original_prefix(&self) -> bool {
         self.original_authority != [0; 16]
             && u64::try_from(self.captured.system_time.0).ok()
@@ -785,7 +796,7 @@ mod replay_tests {
             "handoff": {"handoff": ([5u8; 32]), "fence": {"tx_id": 1, "system_time": 2},
                 "through": {"tx_id": 2, "system_time": 3}},
             "previous": null, "source": {"tx_id": 3, "system_time": 4}, "logical_at": 3000,
-            "fingerprint": fingerprint});
+            "fingerprint": fingerprint, "commit_positions": [1, 3]});
         let body = receipt.to_string().into_bytes();
         let replace = |id: &str, expected, body: &[u8]| {
             let mut document = fields(id);
@@ -812,6 +823,7 @@ mod replay_tests {
             HostedControlWrite::check(hold.clone(), scope, Some(Timestamp(9)), fields("restore"))?,
         ];
         let replay = hosted_replay_controls(controls.iter())?.unwrap();
+        assert_eq!(replay.commit_positions(), &[1, 3]);
         assert_eq!(replay.source_time(), Timestamp(4));
         assert!(replay.check_order(Timestamp(4)).is_err());
         assert!(replay.check_order(Timestamp(5)).is_ok());

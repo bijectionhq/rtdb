@@ -28,9 +28,10 @@ mod replay_worlds;
 mod owned_capacity;
 use crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS;
 use owned_capacity::OwnedCapacityChanges;
-pub use owned_capacity::{ArchivedCapacityCheck, WorldConstraintArchive};
 mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
+mod world_constraints;
+pub use world_constraints::{ArchivedWorldConstraints, WorldConstraintArchive};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
@@ -300,11 +301,14 @@ impl TxResolver {
                 }
             }
             if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_final_capacity(primary).await;
+                outcome = tx.check_final_constraints(primary).await;
             }
             constraint_failed = evaluated && outcome.as_ref().err().is_some_and(constraint_receipt::may_settle);
             if outcome.is_ok() {
                 outcome = tx.write_owned_changes().await;
+            }
+            if outcome.is_ok() {
+                outcome = tx.buffer.require_archived_positions_consumed();
             }
             outcome.and_then(|()| match (replay, receipt) {
                 (Some(replay), _) => tx.write_replay_marker(replay),
@@ -1118,6 +1122,9 @@ impl<'a> OpenTransaction<'a> {
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
         }
+        if let Some(replay) = replay.as_ref().filter(|replay| !replay.commit_positions().is_empty()) {
+            self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
+        }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
             Operation::Public(TxOp::OwnedPublishWorld { land_root: Some(_), .. })
@@ -1918,11 +1925,11 @@ impl<'a> OpenTransaction<'a> {
             }
             if self.context.world_constraints.is_none() {
                 self.require_noncharging_world_write(owner, &root, schema, documents.rows()).await?;
-            }
-            if snapshot.contains_table(&root.unique_table(owner))
-                && !documents.rows().iter().all(rtdb_types::WorldShadow::is_tombstone)
-            {
-                return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
+                if snapshot.contains_table(&root.unique_table(owner))
+                    && !documents.rows().iter().all(rtdb_types::WorldShadow::is_tombstone)
+                {
+                    return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
+                }
             }
             return self.put_documents(&table, documents, iids, Some(from), Some(to),
                 DocumentWrite::Owned { relation, owner, create_only }).await;
@@ -2837,13 +2844,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_world_capacity_orders_current_caps_over_inherited_rows_and_local_shadows() -> Result<()> {
+    async fn native_world_constraints_combine_current_policy_with_inherited_rows_and_local_shadows() -> Result<()> {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, OwnedWorld, WorldClockMode, WorldSchemas, WorldShadow};
 
         struct Parent(Arc<QueryContext>);
         #[async_trait]
         impl WorldConstraintArchive for Parent {
-            async fn check_capacity(&self, check: ArchivedCapacityCheck<'_>) -> Result<()> {
+            async fn check(&self, check: ArchivedWorldConstraints<'_>) -> Result<()> {
                 check.validate(Arc::clone(&self.0)).await
             }
         }
@@ -2866,21 +2873,27 @@ mod tests {
         let state = rtdb_index::PartitionState::empty(Default::default())?;
         let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
         let relation = OwnedRelation::new("facts")?;
-        let schema = OwnedSchema::from_json(br#"{"fields":[{"name":"partition","type":{"kind":"binary"},"optional":false,"nullable":false}],"validity":"acceptance"}"#)?;
-        let fact = |id: &EntityId| StructFields::from([
+        let schema = OwnedSchema::from_json(br#"{"fields":[
+            {"name":"partition","type":{"kind":"binary"},"optional":false,"nullable":false},
+            {"name":"key","type":{"kind":"binary"},"optional":false,"nullable":false}
+        ],"validity":"acceptance"}"#)?;
+        let fact = |id: &EntityId, key: &[u8]| StructFields::from([
             ("_id".into(), id.as_value()), ("partition".into(), Value::Binary(b"bucket".to_vec())),
+            ("key".into(), Value::Binary(key.to_vec())),
         ]);
         let inherited = EntityId::String("inherited".into());
         let cut = TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) };
         let mut root = OpenTransaction::new(state.value().snapshot(), cut, &options, &context)?;
         root.declare_owned_relation(&relation, &schema).await?;
-        root.write_owned(&relation, &crate::Documents::new(vec![fact(&inherited)], &memory)?, None, None, None, false).await?;
+        root.declare_owned_unique_path(&relation, &OwnedRelation::new("by-key")?, "key").await?;
+        root.write_owned(&relation, &crate::Documents::new(vec![fact(&inherited, b"inherited")], &memory)?, None, None, None, false).await?;
+        root.finish_owned_unique().await?;
         let parent = root.snapshot()?;
         drop(root);
         let archived = context.query_context(parent.clone(), cut.system_time, "UTC", None)?;
         let context = ResolveContext { world_constraints: Some(Arc::new(Parent(archived))), ..context };
         let mut cap = OpenTransaction::new(
-            parent, TransactionKey { tx_id: TxId(2), system_time: Timestamp(200) }, &options, &context,
+            parent.clone(), TransactionKey { tx_id: TxId(2), system_time: Timestamp(200) }, &options, &context,
         )?;
         cap.declare_owned_capacity(&relation, "partition", 0, 2, &[]).await?;
         cap.finish_owned_capacity().await?;
@@ -2899,30 +2912,47 @@ mod tests {
             }))
         };
         let one = EntityId::String("one".into());
-        let first = [write(WorldShadow::Present(fact(&one)), &one)?];
+        let mut duplicate = OpenTransaction::new(
+            parent, TransactionKey { tx_id: TxId(2), system_time: Timestamp(150) }, &options, &context,
+        )?;
+        duplicate.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
+        let inherited_key = [write(WorldShadow::Present(fact(&one, b"inherited")), &one)?];
+        duplicate.apply(&inherited_key[0]).await?;
+        assert_eq!(duplicate.check_final_constraints(&inherited_key).await.unwrap_err().code, "rtdb.owned/unique-taken");
+
+        let first = [write(WorldShadow::Present(fact(&one, b"one")), &one)?];
         let mut accepted = OpenTransaction::new(
             cap.snapshot()?, TransactionKey { tx_id: TxId(3), system_time: Timestamp(300) }, &options, &context,
         )?;
         accepted.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
         accepted.apply(&first[0]).await?;
-        accepted.check_final_capacity(&first).await?;
+        accepted.check_final_constraints(&first).await?;
 
         let two = EntityId::String("two".into());
         let before = accepted.snapshot()?;
         let ordered = TransactionKey { tx_id: TxId(4), system_time: Timestamp(400) };
-        let claim = write(WorldShadow::Present(fact(&two)), &two)?;
+        let mut duplicate = OpenTransaction::new(before.clone(), ordered, &options, &context)?;
+        duplicate.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
+        let local_key = [write(WorldShadow::Present(fact(&two, b"one")), &two)?];
+        duplicate.apply(&local_key[0]).await?;
+        assert_eq!(duplicate.check_final_constraints(&local_key).await.unwrap_err().code, "rtdb.owned/unique-taken");
+
+        let claim = write(WorldShadow::Present(fact(&two, b"two")), &two)?;
         let mut overflow = OpenTransaction::new(before.clone(), ordered, &options, &context)?;
         overflow.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
         overflow.apply(&claim).await?;
         assert_eq!(
-            overflow.check_final_capacity(std::slice::from_ref(&claim)).await.unwrap_err().code,
+            overflow.check_final_constraints(std::slice::from_ref(&claim)).await.unwrap_err().code,
             "rtdb.owned/capacity-exceeded"
         );
-        let replacement = [claim, write(WorldShadow::Deleted, &inherited)?];
+        let replacement = [
+            write(WorldShadow::Present(fact(&two, b"inherited")), &two)?,
+            write(WorldShadow::Deleted, &inherited)?,
+        ];
         let mut accepted = OpenTransaction::new(before, ordered, &options, &context)?;
         accepted.owned_worlds.insert(world, (record, memory.reserve(4096)?));
         for write in &replacement { accepted.apply(write).await?; }
-        accepted.check_final_capacity(&replacement).await
+        accepted.check_final_constraints(&replacement).await
     }
 
     #[test]

@@ -3,15 +3,12 @@ use std::{collections::BTreeSet, num::NonZeroUsize};
 use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, WorldShadow};
 
 use super::{
-    owned_unique::{MAX_KEY_BYTES, occupancy_value_at, unique_id},
+    owned_unique::{MAX_KEY_BYTES, unique_id},
     replay_constraints::{ConstraintMember, ConstraintMembers},
     *,
 };
 
 use crate::hosted_control::ReplayConstraintKind;
-
-mod world;
-pub use world::{ArchivedCapacityCheck, WorldConstraintArchive};
 
 const RULE: &str = "!rule";
 const MAX_RULES: usize = 16;
@@ -44,11 +41,11 @@ impl RuleDeclaration {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct CapacityRule {
+pub(super) struct CapacityRule {
     column: String,
     prefix_bytes: Option<NonZeroUsize>,
-    cap: i64,
-    when: Vec<u8>,
+    pub(super) cap: i64,
+    pub(super) when: Vec<u8>,
 }
 
 impl CapacityRule {
@@ -102,7 +99,7 @@ impl CapacityRule {
         (&self.column, &self.when)
     }
 
-    fn admits(&self, schema: &rtdb_types::OwnedSchema) -> Result<bool> {
+    pub(super) fn admits(&self, schema: &rtdb_types::OwnedSchema) -> Result<bool> {
         Ok(
             schema.path_column_type(&self.column) == Some(ScalarType::Binary)
                 && predicates(&self.when)?
@@ -111,7 +108,7 @@ impl CapacityRule {
         )
     }
 
-    fn columns<'a>(&'a self, qualifiers: &[(&'a str, &[u8])]) -> Vec<&'a str> {
+    pub(super) fn columns<'a>(&'a self, qualifiers: &[(&'a str, &[u8])]) -> Vec<&'a str> {
         std::iter::once(self.column.as_str())
             .chain(
                 qualifiers
@@ -122,7 +119,7 @@ impl CapacityRule {
             .collect()
     }
 
-    fn key(
+    pub(super) fn key(
         &self, qualifiers: &[(&str, &[u8])], mut value: impl FnMut(&str) -> Result<Value>,
     ) -> Result<Option<Vec<u8>>> {
         for &(column, expected) in qualifiers {
@@ -167,7 +164,7 @@ fn valid_column(column: &str) -> bool {
     !column.is_empty() && column.len() <= 96 && !column.starts_with('_')
 }
 
-fn predicates(mut encoded: &[u8]) -> Result<Vec<(&str, &[u8])>> {
+pub(super) fn predicates(mut encoded: &[u8]) -> Result<Vec<(&str, &[u8])>> {
     let mut result = Vec::new();
     while let Some((&name_len, body)) = encoded.split_first() {
         let (name, body) = body
@@ -212,9 +209,9 @@ fn shadow_charges(row: &StructFields<Value>, qualifiers: &[(&str, &[u8])]) -> Re
 }
 
 #[derive(Clone, Default)]
-struct CapacityPolicy {
-    rules: Vec<CapacityRule>,
-    through_events: i64,
+pub(super) struct CapacityPolicy {
+    pub(super) rules: Vec<CapacityRule>,
+    pub(super) through_events: i64,
 }
 
 impl CapacityPolicy {
@@ -262,7 +259,7 @@ impl CapacityPolicy {
         })
     }
 
-    fn retained_bytes(&self) -> usize {
+    pub(super) fn retained_bytes(&self) -> usize {
         1024 + self
             .rules
             .iter()
@@ -434,9 +431,9 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
-    pub(super) async fn check_final_capacity(&self, operations: &[Operation]) -> Result<()> {
+    pub(super) async fn check_final_constraints(&self, operations: &[Operation]) -> Result<()> {
         if let Some(archive) = self.context.world_constraints.as_deref() {
-            self.check_inherited_capacity(operations, archive).await?;
+            self.check_world_constraints(operations, archive).await?;
         }
         let mut conditions = capacity_conditions(operations).peekable();
         if conditions.peek().is_none() {
@@ -1009,7 +1006,7 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
-    async fn capacity_policy(
+    pub(super) async fn capacity_policy(
         &self,
         snapshot: Snapshot,
         owner: &str,
@@ -1093,7 +1090,7 @@ fn invalid_key() -> Anomaly {
     )
 }
 
-fn uncovered() -> Anomaly {
+pub(super) fn uncovered() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Unavailable,
         "rtdb.owned/capacity-uncovered",

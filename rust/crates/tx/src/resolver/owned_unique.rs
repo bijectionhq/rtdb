@@ -343,7 +343,7 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
-    async fn unique_policy(
+    pub(super) async fn unique_policy(
         &self,
         snapshot: Snapshot,
         owner: &str,
@@ -372,8 +372,7 @@ impl OpenTransaction<'_> {
         let cursor = rtdb_query::open_owned_point(context, owner, relation, id, Some(valid), Some(&[column])).await?;
         match self.read_occupancy_cell(cursor, id, column, unique_uncovered).await? {
             None => Ok(None),
-            Some(Value::Binary(key)) if !key.is_empty() && key.len() <= MAX_KEY_BYTES => Ok(Some(key)),
-            Some(_) => Err(invalid_key()),
+            Some(value) => Ok(Some(unique_key(value)?)),
         }
     }
 
@@ -422,14 +421,21 @@ pub(super) fn occupancy_value_at(
     rtdb_columnar::read_value(field, column, row)
 }
 
-fn unique_taken() -> Anomaly {
+pub(super) fn unique_taken() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/unique-taken", "The owned unique key is already occupied")
 }
 
-fn unique_uncovered() -> Anomaly {
+pub(super) fn unique_uncovered() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/unique-uncovered", "The owned unique path cannot verify its occupancy")
 }
 
-fn invalid_key() -> Anomaly {
+pub(super) fn unique_key(value: Value) -> Result<Vec<u8>> {
+    match value {
+        Value::Binary(key) if (1..=MAX_KEY_BYTES).contains(&key.len()) => Ok(key),
+        _ => Err(invalid_key()),
+    }
+}
+
+pub(super) fn invalid_key() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/unique-key", "The unique path requires a nonempty Binary key of at most 4096 bytes")
 }
