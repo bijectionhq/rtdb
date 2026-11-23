@@ -511,6 +511,8 @@ contract LogService {
         -- Local and S3 checkpoint and serving-prefix retirement close their key namespace and settle its exact slot census.
         -- The S3 vault registers a slot before its key create can effect and freezes every registration shard before settling its slots.
         -- The terminal slot tombstone excludes delayed provider creates at that identity.
+        -- A checkpoint capture combines each independently held slot with its capture authority before opening a file or replay record.
+        -- Ordered transfer manifests, replica segments and detached bodies use distinct slots under destination custody.
         -- Serving storage releases bodies only within a journal-issued serving lease.
         -- A detached replica object reader uses the lease captured at its admission for cryptography.
 

@@ -320,7 +320,7 @@ async fn open_inventory(
     region: Arc<IoRegion>,
 ) -> Result<VerifiedStage> {
     let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
-    let bucket = storage.bucket(region).await?;
+    let bucket = storage.bucket(Arc::clone(&region)).await?;
     let files = PrefixedStore::new(Arc::clone(&bucket), &root);
     if files.get(&key(ROOT_MARKER)?).await?.as_ref() != record.id.as_bytes() {
         return Err(inconsistent(
@@ -379,7 +379,7 @@ async fn open_inventory(
     let extras = observed.difference(&expected).cloned().collect::<BTreeSet<_>>();
     if !extras.is_empty() {
         let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(Arc::clone(&bucket), root)), &material)?;
-        Box::pin(owned_inventory::verify_seeded_payloads(bucket.as_ref(), &serving, plaintext.as_ref(), keys, record, stage, extras)).await?;
+        Box::pin(owned_inventory::verify_seeded_payloads(bucket.as_ref(), &serving, plaintext.as_ref(), keys, record, stage, extras, region)).await?;
     }
     let point = CapturePoint {
         operation: stage.intent.capture,

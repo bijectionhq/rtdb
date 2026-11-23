@@ -4,7 +4,10 @@
 use futures::{StreamExt, TryStreamExt, stream};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
-use super::{Current, Precondition, S3KeyService, UnitScope, UnitSlot, malformed, unavailable};
+use super::{
+    Current, Precondition, S3KeyService, UnitScope, UnitSlot, key_error, malformed, new_key,
+    unavailable,
+};
 
 const MAX_SHARD_SLOTS: usize = 8192;
 const MAX_SHARD_BYTES: usize = 2 + MAX_SHARD_SLOTS * 32;
@@ -101,6 +104,30 @@ impl S3KeyService {
         }
     }
 
+    pub(super) async fn load_unit_slot(
+        &self,
+        slot: &UnitSlot,
+        provisions: bool,
+    ) -> rtdb_storage::Result<[u8; 32]> {
+        let path = format!("keys/{}", slot.id());
+        self.require_open_unit_scope(slot.scope)
+            .await
+            .map_err(key_error)?;
+        let mut current = self.current(&path).await.map_err(key_error)?;
+        if matches!(current, Current::Absent) && provisions {
+            self.register_unit(slot).await.map_err(key_error)?;
+            self.put(&path, &new_key().map_err(key_error)?, Precondition::Absent)
+                .await
+                .map_err(key_error)?;
+            current = self.current(&path).await.map_err(key_error)?;
+        }
+        match current {
+            Current::Live { key, .. } => Ok(key),
+            Current::Withdrawn => Err(rtdb_storage::Error::ErasedUnderView),
+            Current::Absent => Err(key_error(unavailable("confirm immutable-unit custody"))),
+        }
+    }
+
     async fn read_census(&self, name: &str, shard: u8) -> Result<(Census, Option<String>)> {
         match self.read_vault_object(name, MAX_SHARD_BYTES).await? {
             Some((encoded, etag)) => Ok((Census::decode(shard, &encoded)?, Some(etag))),
@@ -114,7 +141,7 @@ impl S3KeyService {
         }
     }
 
-    pub(super) async fn register_unit(&self, slot: &UnitSlot) -> Result<()> {
+    async fn register_unit(&self, slot: &UnitSlot) -> Result<()> {
         let shard = slot.digest[0];
         let name = shard_name(slot.scope, shard);
         for _ in 0..MUTATION_ATTEMPTS {

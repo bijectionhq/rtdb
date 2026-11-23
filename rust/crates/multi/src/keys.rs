@@ -233,15 +233,15 @@ impl LocalKeyService {
                 return Err(archive::revoked());
             }
             vault.read_or_create_key(&vault_path, provision)?;
-            return Ok(Arc::new(archive::LocalArchiveKey { vault, id, region }));
+            return Ok(Arc::new(archive::LocalArchiveKey { unit_vault: vault.clone(), vault, id, region }));
         }
-        let material = if provision {
+        if provision {
             drop(raw_lock);
-            self.key_at(&path, Some(&id))?
+            self.key_at(&path, Some(&id))?;
         } else {
-            read_key(&path, fs::read(&path).map_err(io)?)?
-        };
-        legacy_archive_key(&material)
+            read_key(&path, fs::read(&path).map_err(io)?)?;
+        }
+        Ok(Arc::new(archive::LocalArchiveKey { vault: self.clone(), unit_vault: self.archive_vault()?, id, region }))
     }
     fn region_path(&self, region: uuid::Uuid) -> PathBuf {
         self.directory.join(format!("{region}.storage-region"))
@@ -358,16 +358,21 @@ impl KeyService for LocalKeyService {
         }
     }
     async fn destroy(&self, deployment: &str) -> Result<()> {
-        let path = self.path(deployment)?;
-        let _lock = self.lock_key(&path)?;
-        self.require_raw_key(deployment)?;
-        match fs::read(&path) {
-            Ok(bytes) if is_destroyed(&bytes) => return self.sync_directory(),
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(io(error)),
+        {
+            let path = self.path(deployment)?;
+            let _lock = self.lock_key(&path)?;
+            self.require_raw_key(deployment)?;
+            match fs::read(&path) {
+                Ok(bytes) if is_destroyed(&bytes) => self.sync_directory()?,
+                Ok(_) => self.publish(&path, DESTROYED)?,
+                Err(error) if error.kind() == ErrorKind::NotFound => self.publish(&path, DESTROYED)?,
+                Err(error) => return Err(io(error)),
+            }
         }
-        self.publish(&path, DESTROYED)
+        if deployment.starts_with("stage-") {
+            self.withdraw_local_scope(UnitScope::archive(deployment), &IoRegion::new()).await?;
+        }
+        Ok(())
     }
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {
@@ -435,8 +440,9 @@ impl KeyService for LocalKeyService {
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         require_general_key_namespace(id)?;
         let vault = self.clone();
+        let scope = UnitScope::archive(id);
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
+        let withdrawal = tokio::task::spawn_blocking(move || {
             vault.require_service_root()?;
             let raw_path = vault.path(&id)?;
             let _raw_lock = vault.lock_key(&raw_path)?;
@@ -451,7 +457,9 @@ impl KeyService for LocalKeyService {
             let _lock = authority.lock_key(&path)?;
             archive::withdraw_locked(&authority, &path)?;
             Ok(ArchiveKeyWithdrawal::OperationAuthority)
-        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
+        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))??;
+        self.withdraw_local_scope(scope, &IoRegion::new()).await?;
+        Ok(withdrawal)
     }
 
     fn hold_local_storage_region(&self, region: uuid::Uuid) -> Result<Option<File>> {

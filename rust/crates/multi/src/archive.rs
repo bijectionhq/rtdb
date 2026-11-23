@@ -3156,7 +3156,7 @@ mod tests {
             Err(Error::ConflictingObject(_))));
         keys.withdraw_archive_key(id).await?;
         assert!(matches!(store.get_range(&name, range.start as u64..range.end as u64).await,
-            Err(Error::PermissionDenied { .. })));
+            Err(Error::ErasedUnderView)));
         Ok(())
     }
 

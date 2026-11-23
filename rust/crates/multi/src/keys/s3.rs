@@ -9,13 +9,15 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use uuid::Uuid;
 
 use super::{
-    AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
+    ArchiveKey, ArchiveKeyWithdrawal, AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
     KeyService, NAMESPACE_KEY_ID, UnitOperation, UnitOutput, UnitScope, UnitSlot, malformed, new_key,
     require_matching_key, journal::key_error, unit::{self, OPERATION_LIMIT},
 };
 
+mod captures;
 mod units;
 
+#[derive(Clone)]
 pub struct S3KeyService {
     client: Client,
     bucket: String,
@@ -192,27 +194,20 @@ impl KeyService for S3KeyService {
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {
-        self.withdraw_current(&object_path(id)?).await
+        self.withdraw_current(&object_path(id)?).await?;
+        if id.starts_with("stage-") {
+            self.withdraw_registered_scope(UnitScope::archive(id)).await?;
+        }
+        Ok(())
     }
 
     async fn use_unit_key(&self, slot: UnitSlot, name: rtdb_storage::ObjectKey, operation: UnitOperation,
         _io: &Arc<IoRegion>) -> rtdb_storage::Result<UnitOutput> {
-        let path = format!("keys/{}", slot.id());
         let deadline = Instant::now() + OPERATION_LIMIT;
         tokio::time::timeout_at(deadline.into(), async {
             self.require_never_versioned().await.map_err(key_error)?;
-            self.require_open_unit_scope(slot.scope).await.map_err(key_error)?;
-            let mut current = self.current(&path).await.map_err(key_error)?;
-            if matches!(current, Current::Absent) && operation.provisions() {
-                self.register_unit(&slot).await.map_err(key_error)?;
-                self.put(&path, &new_key().map_err(key_error)?, Precondition::Absent).await.map_err(key_error)?;
-                current = self.current(&path).await.map_err(key_error)?;
-            }
-            match current {
-                Current::Live { key, .. } => unit::with_material(key, deadline, |cipher| operation.apply(cipher, &name)),
-                Current::Withdrawn => Err(Error::ErasedUnderView),
-                Current::Absent => Err(key_error(unavailable("confirm immutable-unit custody"))),
-            }
+            let material = self.load_unit_slot(&slot, operation.provisions()).await?;
+            unit::with_material(material, deadline, |cipher| operation.apply(cipher, &name))
         }).await.map_err(|_| unit::expired())?
     }
 
@@ -223,6 +218,16 @@ impl KeyService for S3KeyService {
 
     async fn withdraw_unit_scope(&self, scope: UnitScope, _io: &Arc<IoRegion>) -> Result<()> {
         self.withdraw_registered_scope(scope).await
+    }
+
+    async fn archive_key(&self, id: &str, provision: bool, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        self.open_capture(id, provision, region).await
+    }
+
+    async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
+        self.destroy(id).await?;
+        self.withdraw_registered_scope(UnitScope::archive(id)).await?;
+        Ok(ArchiveKeyWithdrawal::Vault)
     }
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {

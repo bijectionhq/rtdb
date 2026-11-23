@@ -144,6 +144,7 @@ impl AssertionKeyService for LocalKeyService {
         let authority = self.clone();
         let vault = region.run_blocking(move || Ok(authority.archive_vault())).await??;
         let operation = archive::LocalArchiveKey {
+            unit_vault: vault.clone(),
             vault,
             id: stage.key_id(),
             region: Arc::clone(region),

@@ -59,7 +59,10 @@ Scope withdrawal closes the namespace and freezes each shard before tombstoning 
 A late conditional create for a registered slot races with the terminal tombstone on that same slot.
 The serving and checkpoint retirement owners invoke the same vault settlement after their existing admission and drain checks.
 
-Directory-managed Multi objects and several archive and transfer paths still use coarser keys or share encrypted bytes.
+Local and S3 checkpoint captures use separate slots for their objects and replica archive records.
+Capture cryptography combines the slot with an indispensable capture authority secret, so withdrawing the capture also disables any retained slot.
+An ordered checkpoint transfer stores the verified manifest, segments and detached payloads under the destination's slot namespace before seeding its live journal.
+Directory-managed Multi objects, primary staged objects, and live journal seeding still use coarser keys or share encrypted bytes.
 Classic storage and deployment-wide collection of installed unit slots remain open.
 Provider verification includes ranged reads, object naming, lost create replies, redundant compaction jobs, independent-copy isolation, cache fencing, and nonce uniqueness.
 

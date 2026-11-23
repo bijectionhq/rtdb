@@ -47,7 +47,14 @@ impl UnitScope {
         format!("{SLOT_PREFIX}{}", hex(&self.0))
     }
 
-    fn slot(self, object: &ObjectKey) -> UnitSlot {
+    pub(super) fn archive(id: &str) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/archive-unit-scope/v1\0");
+        digest.update(id.as_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
+    pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {
             scope: self,
@@ -82,11 +89,13 @@ pub enum UnitOperation {
     OpenRetained(RetainedBytes),
     Header(Bytes),
     Frames(FramedObject, Range<usize>, Bytes),
+    SealValue(String, Bytes),
+    OpenValue(String, Bytes),
 }
 
 impl UnitOperation {
     pub(super) fn provisions(&self) -> bool {
-        matches!(self, Self::Seal(_))
+        matches!(self, Self::Seal(_) | Self::SealValue(..))
     }
 
     pub(crate) fn apply(self, key: &Cipher, name: &ObjectKey) -> rtdb_storage::Result<UnitOutput> {
@@ -102,6 +111,12 @@ impl UnitOperation {
             Self::Frames(layout, frames, sealed) => layout
                 .open_frames(key, name, frames, &sealed)
                 .map(UnitOutput::Bytes),
+            Self::SealValue(associated, body) => key
+                .seal_deterministic(&associated, &body)
+                .map(UnitOutput::Bytes),
+            Self::OpenValue(associated, sealed) => {
+                key.open(&associated, &sealed).map(UnitOutput::Bytes)
+            }
         }
     }
 }
@@ -244,34 +259,46 @@ impl LocalKeyService {
         let result = io
             .run_blocking(move || {
                 let vault = service.archive_vault().map_err(key_error)?;
-                let scope = vault.path(&slot.scope.namespace()).map_err(key_error)?;
-                let _gate = File::options()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(scope.with_extension("lock"))
-                    .map_err(super::io)
-                    .map_err(key_error)?;
-                _gate.lock_shared().map_err(super::io).map_err(key_error)?;
-                if local_scope_closed(&scope).map_err(key_error)? {
-                    return Err(Error::ErasedUnderView);
-                }
-                let path = vault.path(&slot.id()).map_err(key_error)?;
-                let _lock = vault.lock_key(&path).map_err(key_error)?;
-                if Instant::now() >= deadline {
-                    return Err(expired());
-                }
-                let material = vault
-                    .read_or_create_key(&path, operation.provisions())
-                    .map_err(key_error)?;
-                with_material(material, deadline, |key| operation.apply(key, &name))
+                vault.with_local_slot(&slot, operation.provisions(), deadline, |material| {
+                    with_material(material, deadline, |key| operation.apply(key, &name))
+                })
             })
             .await;
         if Instant::now() >= deadline {
             return Err(expired());
         }
         result
+    }
+
+    pub(super) fn with_local_slot<T>(
+        &self,
+        slot: &UnitSlot,
+        provision: bool,
+        deadline: Instant,
+        operation: impl FnOnce([u8; KEY_BYTES]) -> rtdb_storage::Result<T>,
+    ) -> rtdb_storage::Result<T> {
+        let scope = self.path(&slot.scope.namespace()).map_err(key_error)?;
+        let gate = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(scope.with_extension("lock"))
+            .map_err(super::io)
+            .map_err(key_error)?;
+        gate.lock_shared().map_err(super::io).map_err(key_error)?;
+        if local_scope_closed(&scope).map_err(key_error)? {
+            return Err(Error::ErasedUnderView);
+        }
+        let path = self.path(&slot.id()).map_err(key_error)?;
+        let _lock = self.lock_key(&path).map_err(key_error)?;
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        let material = self
+            .read_or_create_key(&path, provision)
+            .map_err(key_error)?;
+        operation(material)
     }
 
     pub(super) async fn withdraw_local_scope(

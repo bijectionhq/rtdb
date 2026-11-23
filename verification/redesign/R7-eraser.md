@@ -52,7 +52,7 @@ Corpus-relative queries derive their statistics from the applicable admitted row
 ## Operation-only capture revocation
 
 The local archive broker gives checkpoint readers and exporters key operations under the original capture authority.
-The same key protects the captured root and its archived replica suffix.
+Each captured object and archived replica segment uses a separate slot, bound to the common capture authority.
 An independent stage reseals the verified plaintext with its own installation key.
 The broker orders irreversible vault closure against every active cryptographic operation.
 The directory publishes the revocation observation after that closure has completed.
