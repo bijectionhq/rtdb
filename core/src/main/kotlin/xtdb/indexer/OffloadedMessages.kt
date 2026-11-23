@@ -1,5 +1,6 @@
 package xtdb.indexer
 
+import com.google.protobuf.ByteString
 import kotlinx.coroutines.Deferred
 import xtdb.api.log.Log
 import xtdb.api.log.ReplicaMessage
@@ -8,6 +9,7 @@ import xtdb.database.PartitionState
 import xtdb.database.PartitionStorage
 import xtdb.storage.BufferPool
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.UUID.randomUUID
 
 /**
@@ -33,14 +35,16 @@ internal class OffloadingLogsDriver(
         } catch (e: Log.MessageTooLargeException) {
             val bufferPool = partitionStorage.bufferPoolOrNull ?: throw e
 
+            val bytes = msg.encode()
             val ref = ReplicaMessage.OversizedMessage(
                 Storage.VERSION, bufferPool.epoch,
                 (partitionState.tableCatalog.snap().blockIdx ?: -1) + 1,
                 randomUUID().toString(),
                 termId = msg.termId, termSeq = msg.termSeq,
+                payloadSha256 = ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(bytes)),
             )
 
-            bufferPool.putObject(ref.path, ByteBuffer.wrap(msg.encode()))
+            bufferPool.putObject(ref.path, ByteBuffer.wrap(bytes))
 
             delegate.enqueueToReplica(ref)
         }
@@ -66,8 +70,17 @@ internal fun BufferPool.resolveOversized(record: Log.Record<ReplicaMessage>): Lo
                 "migrating storage must copy the `oversized/` prefix along with the rest"
     }
 
-    val payload = ReplicaMessage.decode(getByteArray(msg.path))
+    val bytes = getByteArray(msg.path)
+    msg.payloadSha256?.let { expected ->
+        check(expected == ByteString.copyFrom(MessageDigest.getInstance("SHA-256").digest(bytes))) {
+            "oversized message payload differs from the replica reference at ${msg.path}"
+        }
+    }
+    val payload = ReplicaMessage.decode(bytes)
         ?: error("unreadable oversized message payload at ${msg.path}")
+    check(payload !is ReplicaMessage.OversizedMessage && payload.termId == msg.termId && payload.termSeq == msg.termSeq) {
+        "oversized message payload has a different term or sequence at ${msg.path}"
+    }
 
     return Log.Record(record.epoch, record.logOffset, record.logTimestamp, payload)
 }

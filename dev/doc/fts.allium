@@ -340,7 +340,14 @@ contract SearchCorrectness {
     -- What narrowing may and may not change about a query.
 
     @invariant RankedLimitKeepsTheFirstRows
-        -- Under a ranked LIMIT, the rows the scan hands on include every row among the first n by SEARCH_SCORE, ties at the n-th included.
+        -- Under a score-only ranked LIMIT, the scan retains candidates tied with the n-th score.
+        -- A bitemporal point scan on a single partition may also break ties for ORDER BY SEARCH_SCORE descending, _id ascending when the captured table has UUID IDs.
+        -- Publication records this relationship only after checking every put in the artefact's input files.
+        -- The live source also proves canonical entity IID derivation.
+        -- Older artefacts and in-process builds without a recorded witness use the score-only cutoff.
+        -- A scored candidate supplies its IID and an unread scoring window supplies the minimum IID of its documents.
+        -- A window with unknown tie evidence remains eligible at an equal score.
+        -- Ranked narrowing stops only when both remaining sources are strictly worse than the last verified row under the admitted comparator.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.

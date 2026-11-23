@@ -1,4 +1,4 @@
-use crate::production::{can_stop, score_key};
+use crate::production::{can_stop, can_stop_with_uuid, score_key};
 use vstd::prelude::*;
 
 verus! {
@@ -17,6 +17,21 @@ pub fn unread_tie_blocks_cutoff(score: u64)
 {
     let stop = can_stop(score, None, Some(score));
     assert(!stop);
+}
+
+pub fn known_uuid_ties_can_stop(score: u64, chosen: u128, later: u128)
+    requires score_key(score).is_some(), chosen < later,
+{
+    let stop = can_stop_with_uuid(score, chosen, Some((score, Some(later))), Some((score, Some(later))));
+    assert(stop);
+}
+
+pub fn unknown_or_earlier_uuid_ties_block_cutoff(score: u64, earlier: u128, chosen: u128)
+    requires score_key(score).is_some(), earlier <= chosen,
+{
+    let unknown = can_stop_with_uuid(score, chosen, None, Some((score, None)));
+    let eligible = can_stop_with_uuid(score, chosen, Some((score, Some(earlier))), None);
+    assert(!unknown && !eligible);
 }
 
 // LAW FTS-2-EXHAUSTED.

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -101,12 +102,12 @@ impl ArtefactBuilder for SearchBuilder {
         let definition = &job.definition;
         let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), owner: job.owner.clone(), artefact_id: definition.id.clone(), version: definition.version };
         let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
-        let record = |sections: &[crate::file::Section], size: u64| -> Result<ArtefactRecord> {
+        let record = |sections: &[crate::file::Section], size: u64, canonical_uuid_iids| -> Result<ArtefactRecord> {
             Ok(ArtefactRecord {
                 kind: Some(KIND.into()),
                 definition_id: Some(definition.id.clone()),
                 definition_version: Some(definition.version),
-                stats: Some(crate::file::encode_sections(sections)),
+                stats: Some(crate::file::encode_artefact_stats(sections, canonical_uuid_iids)),
                 scope: None,
                 file_size: Some(i64::try_from(size).map_err(fault)?),
                 published_version: None,
@@ -127,7 +128,7 @@ impl ArtefactBuilder for SearchBuilder {
             match self.runtime.file(&self.database, &self.storage, &key, &columns).await {
                 Ok(file) if file.matches_artefact(&identity, definition.version) => {
                     let size = self.store.head_fresh(&key).await?.size;
-                    let record = record(file.sections(), size)?;
+                    let record = record(file.sections(), size, false)?;
                     self.runtime.clear(&suspect);
                     return Ok(record);
                 }
@@ -171,19 +172,23 @@ impl ArtefactBuilder for SearchBuilder {
         let ceiling = crate::file::ceiling_of(recency);
         let version = definition.version;
         let owned = rtdb_types::TableRef::owned_schema(&definition.table.schema);
-        let sections = tokio::task::spawn_blocking(move || -> Result<Vec<crate::file::Section>> {
+        let (sections, canonical_uuid_iids) = tokio::task::spawn_blocking(move || -> Result<_> {
             let _indexing = indexing;
             let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
             let (readers, _reservations): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
             std::fs::create_dir(&segment).map_err(fault)?;
             let directory = tantivy::directory::MmapDirectory::open(&segment).map_err(fault)?;
             let output = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
-            let members = readers.into_iter().map(|reader| PageRows::new(reader, &columns, &memory, &token, owned));
-            write_versioned_group(&columns, members, &identity, version, ceiling, directory, output)
+            let canonical_uuid_iids = Cell::new(!owned);
+            let members = readers.into_iter().map(|reader| PageRows {
+                reader, columns: &columns, memory: &memory, cancellation: &token, page: 0, owned, canonical_uuid_iids: &canonical_uuid_iids,
+            });
+            let sections = write_versioned_group(&columns, members, &identity, version, ceiling, directory, output)?;
+            Ok((sections, canonical_uuid_iids.get()))
         }).await.map_err(|error| Anomaly::fault("rtdb.search/build", error.to_string()))??;
         if cancellation.is_cancelled() { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.search/cancelled", "Search build cancelled")); }
         let size = tokio::fs::metadata(&bundle).await.map_err(fault)?.len();
-        let mut record = record(&sections, size)?;
+        let mut record = record(&sections, size, canonical_uuid_iids)?;
         record.published_version = self.store.put_file_with_publication(&key, &bundle).await?.map(Into::into);
         if repairing { self.runtime.clear(&suspect); }
         Ok(record)
@@ -224,17 +229,36 @@ fn search_row(event: EventRef<'_>, columns: &[String], owned: bool, memory: &Arc
         valid_to: header.valid_time.upper().0, op: header.op, values })
 }
 
-fn search_batch(batch: &EventBatch, columns: &[String], owned: bool, memory: &Arc<MemoryBudget>) -> Result<Vec<SearchRow>> {
-    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, memory)).collect()
+fn uuid_id_matches_iid(event: &EventRef<'_>, memory: &Arc<MemoryBudget>) -> bool {
+    let header = event.header();
+    if header.op != EventOp::Put { return true; }
+    let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else { return false; };
+    let Ok(bytes) = rtdb_columnar::estimate_read_value_bytes(field, array, row) else { return false; };
+    let Ok(_scratch) = memory.reserve(bytes) else { return false; };
+    matches!(rtdb_columnar::read_execution_value(field, array, row), Ok(rtdb_types::Value::Uuid(id)) if id == header.iid.0)
+}
+
+fn search_batch(batch: &EventBatch, columns: &[String], owned: bool, memory: &Arc<MemoryBudget>, canonical_uuid_iids: Option<&Cell<bool>>) -> Result<Vec<SearchRow>> {
+    (0..batch.len()).map(|row| {
+        let event = batch.borrow_event(row)?;
+        if let Some(canonical) = canonical_uuid_iids
+            && canonical.get() && !uuid_id_matches_iid(&event, memory)
+        {
+            canonical.set(false);
+        }
+        search_row(event, columns, owned, memory)
+    }).collect()
 }
 
 /// A data file's pages of rows in order, each read under its memory reservation.
-struct PageRows<'a> { reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, page: usize, owned: bool }
-
-impl<'a> PageRows<'a> {
-    fn new(reader: ArrowFile, columns: &'a [String], memory: &'a Arc<MemoryBudget>, cancellation: &'a CancellationToken, owned: bool) -> Self {
-        Self { reader, columns, memory, cancellation, page: 0, owned }
-    }
+struct PageRows<'a> {
+    reader: ArrowFile,
+    columns: &'a [String],
+    memory: &'a Arc<MemoryBudget>,
+    cancellation: &'a CancellationToken,
+    page: usize,
+    owned: bool,
+    canonical_uuid_iids: &'a Cell<bool>,
 }
 
 impl Iterator for PageRows<'_> {
@@ -246,7 +270,7 @@ impl Iterator for PageRows<'_> {
         self.page += 1;
         Some(read_page(&mut self.reader, page, self.memory).and_then(|owned| {
             let batch = EventBatch::new(owned.batch().clone())?;
-            search_batch(&batch, self.columns, self.owned, self.memory)
+            search_batch(&batch, self.columns, self.owned, self.memory, Some(self.canonical_uuid_iids))
         }))
     }
 }
@@ -267,7 +291,7 @@ pub(crate) fn search_pages_with_budget<'a>(
         page += 1;
         Some(file.read_page(page - 1).and_then(|batch| {
             let batch = EventBatch::new(batch)?;
-            search_batch(&batch, columns, false, &memory)
+            search_batch(&batch, columns, false, &memory, None)
         }))
     }))
 }
@@ -277,6 +301,26 @@ mod tests {
     use super::*;
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
     use rtdb_types::{EntityId, Iid, Interval, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
+
+    #[test]
+    fn a_uuid_type_does_not_certify_a_mismatched_physical_iid() {
+        use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+        use rtdb_types::{Iid, Interval, ScalarType, StructFields, Timestamp, Value};
+
+        let id = [1; 16];
+        let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent {
+            iid, entity_key: None, system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Uuid(id))])),
+        });
+        let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::Uuid))]);
+        let batch = EventBatch::new(build_event_batch(&rows, Some(fields), None).unwrap()).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        assert!(uuid_id_matches_iid(&batch.borrow_event(0).unwrap(), &memory));
+        assert!(!uuid_id_matches_iid(&batch.borrow_event(1).unwrap(), &memory));
+        let evidence = Cell::new(true);
+        assert_eq!(search_batch(&batch, &[], false, &memory, Some(&evidence)).unwrap().len(), 2);
+        assert!(!evidence.get());
+    }
 
     #[test]
     fn arrow_search_rows_keep_token_presence_and_owned_identity() {
@@ -318,7 +362,7 @@ mod tests {
         assert!(matches!(batch.borrow_event(1).unwrap().put_text("encoded").unwrap(), PutText::Missing));
         let columns = ["body".into(), "title".into(), "missing".into(), "encoded".into()];
         let memory = MemoryBudget::new(1 << 20);
-        let result = search_batch(&batch, &columns, true, &memory).unwrap();
+        let result = search_batch(&batch, &columns, true, &memory, None).unwrap();
         let expected = (0..batch.len()).map(|row| {
             let event = batch.read_event(row).unwrap();
             let header = event.header();

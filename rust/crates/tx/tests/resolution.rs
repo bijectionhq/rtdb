@@ -15,7 +15,7 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
+    ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
@@ -238,7 +238,7 @@ async fn transaction_trace_contains_one_sql_span_per_operation_and_skipped_zero_
     let arguments = SqlArguments::from_rows(vec![vec![Value::Bool(true)], vec![Value::Bool(true)]], &context.memory).unwrap();
     let request = request(vec![TxOp::Sql { sql: "ASSERT ?".into(), args: Some(arguments) }], &context);
     assert!(resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request, &context).await.unwrap().result().committed());
-    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).await.unwrap();
     tracer.close();
     let mut spans = Vec::new(); while let Some(span) = receiver.next().await { spans.push(span); }
     assert_eq!(spans.len(), 3);
@@ -262,7 +262,7 @@ async fn ingestion_metrics_count_abort_and_invalid_time_but_exclude_skipped_tran
     let metrics = Arc::new(Metrics::default()); let mut context = context(); context.execution_observer = Some(metrics.clone());
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("ASSERT FALSE")], &context), &context).await.unwrap();
-    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), None, &context).await.unwrap();
     let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() }, &context.memory).unwrap();
     resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request, &context).await.unwrap();
     assert_eq!(metrics.0.load(std::sync::atomic::Ordering::Relaxed), 2);
@@ -286,7 +286,7 @@ async fn guarded_system_time_cannot_precede_the_source_log() {
     let aborted = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), guarded(99), &context).await.unwrap();
     assert_eq!(aborted.result().error().unwrap().code, "rtdb/ordered-system-time");
     assert_eq!(aborted.result().tx_key().system_time, Timestamp(100));
-    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")]);
 
     let committed = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), guarded(101), &context).await.unwrap();
     assert!(committed.result().committed());
@@ -300,7 +300,7 @@ async fn skipped_transaction_stages_only_its_aborted_row_and_smooths_time() {
     let context = context();
     let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
     let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 9, 0, i64::MAX)], &context), &context).await.unwrap();
-    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), None, &context).unwrap();
+    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), None, &context).await.unwrap();
     assert_eq!(skipped.result().error().unwrap().code, "xtdb/skipped-tx");
     assert_eq!(skipped.result().tx_key().system_time, Timestamp(101));
     assert_eq!(skipped.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
@@ -725,6 +725,105 @@ async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_
 }
 
 #[tokio::test]
+async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_projection_advances() {
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+    use rtdb_types::{OwnedRelation, TxId};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let owned = |revision, value| {
+        let source = SourceTransaction::new(
+            vec![TxOp::OwnedReplaceDocs {
+                relation: OwnedRelation::new("clocks").unwrap(),
+                documents: Documents::new(vec![document(value)], &context.memory).unwrap(),
+                valid_from: Some(Timestamp(0)), valid_to: None,
+            }],
+            SubmitOptions { user: Some("owner".into()), system_time: Some(Timestamp(revision)), ..Default::default() },
+            &context.memory,
+        ).unwrap();
+        let encoded = source.encode().unwrap();
+        SourceTransaction::decode(&SourceMessage::decode(encoded.as_slice()).unwrap().unwrap(), &context.memory).unwrap()
+    };
+    let results = TableRef::new("xt", "txs");
+    for (position, sample) in [(0, 100), (1, 100), (2, 99)] {
+        let snapshot = state.snapshot();
+        let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(position), Timestamp(sample), owned(sample, position), &context).await.unwrap();
+        assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+        let key = resolved.result().tx_key();
+        assert_eq!(key.tx_id, TxId(position));
+        assert_eq!(key.system_time, Timestamp(100 + position));
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("resolved transaction"); };
+        let replay = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
+        let events = replay.writes.tables()[&results].batch().unwrap();
+        let StoredOperation::Put(row) = events.view().read_event(0).unwrap().operation else { panic!("transaction row"); };
+        assert!(matches!(row["source_log_time"], Value::Timestamp { value, .. } if value == sample));
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    }
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(97, 3), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb/ordered-system-time");
+}
+
+#[tokio::test]
+async fn a_legacy_resolver_cannot_execute_a_bounded_retry_record() {
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let metadata = UserMetadata::new(Value::Struct(StructFields::from([
+        ("rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("a0000000000000000000000000000001".into())),
+            ("not_after_micros".into(), Value::I64(200)),
+        ]))),
+    ])), &context.memory).unwrap();
+    let source = SourceTransaction::new(vec![put(&context, 7, 0, i64::MAX)], SubmitOptions {
+        user_metadata: Some(metadata), ..Default::default()
+    }, &context.memory).unwrap();
+    let bytes = source.encode().unwrap();
+    let SourceMessage::Protobuf(SourceBody::Tx(mut command)) = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap() else {
+        panic!("expected a source transaction");
+    };
+    assert!(command.bounded_retry.take().is_some());
+    let legacy = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(command)), &context.memory).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), legacy, &context).await.unwrap();
+    assert_eq!(resolved.result().error().unwrap().code, "xtdb/assert-failed");
+    assert!(!resolved.writes().tables().contains_key(&table()));
+}
+
+#[tokio::test]
+async fn a_bounded_identity_survives_a_writer_epoch_change_but_is_local_to_its_placed_history() {
+    use rtdb_types::PlacedAttemptScope;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = UserMetadata::new(Value::Struct(StructFields::from([
+        ("rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("a0000000000000000000000000000001".into())),
+            ("not_after_micros".into(), Value::I64(200)),
+        ]))),
+    ])), &context.memory).unwrap();
+    let request = |history, epoch| {
+        SourceTransaction::new(vec![put(&context, 42, 0, i64::MAX)], SubmitOptions {
+            user: Some("alice".into()), user_metadata: Some(metadata.clone()), ..Default::default()
+        }, &context.memory).unwrap().with_placed_seed(Some(PlacedAttemptScope::new(history, epoch).unwrap().issue()))
+    };
+    let mut resolve = async |position, source| {
+        let resolved = resolver.resolve_source(state.snapshot(), SourcePosition(position), Timestamp(100), source, &context).await.unwrap();
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+        resolved
+    };
+    let original = resolve(0, request("original/history", 1)).await;
+    assert!(original.result().committed());
+    let duplicate = resolve(1, request("original/history", 2)).await;
+    assert_eq!(bounded_retry_original(duplicate.result().error().unwrap()).unwrap(), Some(original.result().tx_key()));
+    let fork = resolve(2, request("fork/history", 1)).await;
+    assert!(fork.result().committed());
+}
+
+#[tokio::test]
 async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_window() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();
@@ -749,13 +848,15 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
     let error = duplicate.result().error().unwrap();
     assert_eq!(error.code, "rtdb/idempotency-duplicate");
     assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
-    assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")], "a duplicate writes nothing but its own outcome");
+    assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")], "a duplicate writes only its own outcome and expiring metadata");
     let conflict = resolve(keyed("alice", 2), 300).await;
     assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
     assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
     let regressed = resolve(keyed("alice", 1), 99).await;
     assert_eq!(regressed.result().error().unwrap().code, "rtdb/idempotency-duplicate");
-    let after = resolve(keyed("alice", 3), 100 + RECEIPT_WINDOW_MICROS).await;
+    let cut = resolve(request(vec![], &context), 100 + RECEIPT_WINDOW_MICROS).await;
+    assert!(cut.result().committed());
+    let after = resolve(keyed("alice", 3), 99).await;
     assert!(after.result().committed(), "the identity is free again once the window has passed");
     let retried_after_regression = resolve(keyed("alice", 3), 99).await;
     let error = retried_after_regression.result().error().unwrap();
@@ -1011,6 +1112,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     let mut context = context();
     let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
     context.owned_witness_scope = Some(scope);
+    context.placed_receipt_retirement = true;
     let state = PartitionState::empty(Default::default()).unwrap();
     let facts = OwnedRelation::new("facts").unwrap();
     let control = OwnedRelation::new("bj_control").unwrap();
@@ -1064,7 +1166,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
         while let Some(staged) = resolver.take_head() { state.apply(staged.writes()).unwrap(); }
     };
     apply_staged(&mut resolver);
-    let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(104),
+    let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(50),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
         Some(WriterPublication { clock: &|| Timestamp(199), maximum_inline_bytes: Some(1 << 20) }),
     ).await.unwrap();
@@ -1072,6 +1174,13 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(expired.placed_attempt().is_some());
     assert!(!expired.writes().tables().contains_key(&table));
     assert!(!expired.writes().tables().contains_key(&facts.table("owner")));
+    let history = &expired.writes().tables()[&TableRef::new("xt", "txs")];
+    let StoredOperation::Put(history) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
+        panic!("expected rebuilt abort history");
+    };
+    assert!(matches!(history["source_log_time"], Value::Timestamp { value: 50, .. }));
+    assert!(matches!(history["receipt_time"], Value::Timestamp { value: 103, .. }));
+    assert!(matches!(history["system_time"], Value::Timestamp { value: 104, .. }));
 
     apply_staged(&mut resolver);
     let oversized = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(5), Timestamp(105),
@@ -1093,6 +1202,9 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(accepted.writes().tables().contains_key(&facts.table("owner")));
     assert_eq!(accepted.staging_clock_upper(), Some(Timestamp(199)));
     let Some(rtdb_format::envelope::ReplicaBody::ResolvedTx(message)) = accepted.inline_replica_body() else { panic!("expected an inline replica transaction"); };
+    let (attempt, retirement) = rtdb_format::envelope::decode_replica_outcome_attempt(message.placed_attempt.as_deref().unwrap()).unwrap();
+    assert_eq!(Some(attempt), accepted.placed_attempt());
+    assert!(retirement);
     let stage = message.checked_acceptance_stage().unwrap().unwrap();
     assert_eq!(stage.clock_upper, Timestamp(199));
     assert_eq!(stage.cutoff, Timestamp(200));
@@ -1114,4 +1226,188 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
         source(vec![deadline(), check(108)]), &context).await.unwrap();
     assert_eq!(refused_slice.result().error().unwrap().code, "rtdb.hosted/control-scope");
     assert!(!refused_slice.writes().tables().contains_key(&table));
+}
+
+struct ClocklessRecord;
+
+#[async_trait::async_trait]
+impl TransactionWriter for ClocklessRecord {
+    async fn write(&mut self, _: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+        Ok(WriterResult::Committed { user_metadata: None })
+    }
+}
+
+#[tokio::test]
+async fn a_clockless_successor_cannot_reopen_an_expired_bounded_retry() {
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = Value::Struct(StructFields::from([(
+        "rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("00112233445566778899aabbccddeeff".into())),
+            ("not_after_micros".into(), Value::I64(1_000_000)),
+        ])),
+    )]));
+    let source = || SourceTransaction::new(vec![put(&context, 1, 0, i64::MAX)], SubmitOptions {
+        user_metadata: Some(UserMetadata::new(metadata.clone(), &context.memory).unwrap()),
+        ..Default::default()
+    }, &context.memory).unwrap();
+    let original = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(), &context).await.unwrap();
+    assert!(original.result().committed());
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(1_000_000), request(vec![], &context), &context).await.unwrap();
+    let receipts = &cut.writes().tables()[&TableRef::new("xt", "bounded_retry_receipts")];
+    assert!(matches!(receipts.batch().unwrap().view().read_event(0).unwrap().operation, StoredOperation::Erase));
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let clockless = resolver.resolve_external(state.snapshot(), Timestamp(1_000_001), None, None, &mut ClocklessRecord, &context).await.unwrap();
+    let history = &clockless.writes().tables()[&TableRef::new("xt", "txs")];
+    let StoredOperation::Put(history) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
+        panic!("expected clockless transaction history");
+    };
+    assert_eq!(history.get("receipt_time"), Some(&Value::Null));
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+
+    let mut reopened = TxResolver::new(Some(clockless.result().tx_key()), SourcePosition(2), None, &context.memory).unwrap();
+    let retry = reopened.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(99), source(), &context).await.unwrap();
+    assert_eq!(retry.result().error().unwrap().code, "rtdb/idempotency-expired");
+}
+
+#[tokio::test]
+async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome_survives() {
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext};
+    use rtdb_types::EntityId;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = Value::Struct(StructFields::from([("note".into(), Value::Utf8("transient".into()))]));
+    let source = SourceTransaction::new(vec![], SubmitOptions {
+        user_metadata: Some(UserMetadata::new(metadata.clone(), &context.memory).unwrap()),
+        ..Default::default()
+    }, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source, &context).await.unwrap();
+    let history = &initial.writes().tables()[&TableRef::new("xt", "txs")];
+    let StoredOperation::Put(row) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
+        panic!("expected history");
+    };
+    assert_eq!(row["user_metadata"], Value::Null);
+    let body = initial.to_replica_body(&context.memory).unwrap();
+    let rtdb_format::envelope::ReplicaBody::ResolvedTx(mut copied) = body.body().clone() else {
+        panic!("expected copied replica frame");
+    };
+    copied.tx_id = Some(10);
+    copied.src_msg_id = Some(10);
+    let recovered = decode_replica(&copied, None, state.snapshot().block_index(), &context.memory).unwrap();
+    state.apply(&recovered.writes).unwrap();
+    let mut resolver = TxResolver::new(Some(recovered.result.tx_key()), SourcePosition(10), None, &context.memory).unwrap();
+
+    let query = async |snapshot: rtdb_index::Snapshot, text: &str| {
+        let snapshot = snapshot.with_system_time_cap(Some(Timestamp(100))).unwrap();
+        let catalog = CatalogSnapshot::new("xtdb", [(
+            "xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&context.storage) },
+        )].into(), false).unwrap();
+        let query_context = QueryContext::new(catalog, Arc::clone(&context.memory), Timestamp(100), "UTC", context.query_options.clone(), &context.cancellation).unwrap();
+        let sql = rtdb_sql::prepare_in(text, &query_context.catalog, &Default::default(), &context.memory).unwrap();
+        let mut result = PreparedQuery::from_prepared(sql, &context.memory).unwrap().execute(query_context, vec![]).await.unwrap();
+        let mut values = Vec::new();
+        while let Some(batch) = result.next_batch().await.unwrap() {
+            let page = batch.batch();
+            for row in 0..page.num_rows() {
+                values.push((0..page.num_columns()).map(|col| {
+                    rtdb_columnar::read_value(page.schema().field(col), page.column(col).as_ref(), row).unwrap()
+                }).collect::<Vec<_>>());
+            }
+        }
+        values
+    };
+    let history = "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0";
+    let predicate = "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0 AND user_metadata IS NOT NULL";
+    let clockless = resolver.resolve_external(state.snapshot(), Timestamp(101), None, None, &mut ClocklessRecord, &context).await.unwrap();
+    assert!(clockless.result().committed());
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    assert_eq!(query(state.snapshot(), predicate).await, [vec![Value::Bool(true), metadata]]);
+    let ordinals = "SELECT attname, attnum, atttypid FROM pg_catalog.pg_attribute         WHERE attrelid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = 'txs')         AND attname IN ('receipt_time', 'source_log_time', 'system_time') ORDER BY attnum";
+    assert_eq!(query(state.snapshot(), ordinals).await, [
+        vec![Value::Utf8("receipt_time".into()), Value::I32(8), Value::I32(1184)],
+        vec![Value::Utf8("source_log_time".into()), Value::I32(9), Value::I32(1184)],
+        vec![Value::Utf8("system_time".into()), Value::I32(10), Value::I32(1184)],
+    ]);
+    let expiry = 100 + RECEIPT_WINDOW_MICROS;
+    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(12), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
+    let sidecar = cut.writes().tables()[&TableRef::new("xt", "idempotency_receipts")].batch().unwrap();
+    let erased = sidecar.view().read_event(0).unwrap();
+    assert_eq!(erased.iid, EntityId::Integer(0).iid());
+    assert!(matches!(erased.operation, StoredOperation::Erase));
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    assert_eq!(query(state.snapshot(), history).await, [vec![Value::Bool(true), Value::Null]]);
+    assert!(query(state.snapshot(), predicate).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_current_proof() {
+    use rtdb_format::envelope::ReplicaBody;
+    use rtdb_types::{EntityId, PlacedAttempt, PlacedAttemptScope, PLACED_ATTEMPT_OUTCOME_TABLE};
+
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let placed = |epoch, context: &ResolveContext| {
+        request(vec![], context).with_placed_seed(Some(PlacedAttemptScope::new("same/history", epoch).unwrap().issue()))
+    };
+    let table = TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE);
+    let mut old = Vec::new();
+    let mut future = None;
+    for position in 0..3 {
+        let predecessor = state.snapshot().tx_basis();
+        let resolved = resolver.resolve_source(
+            state.snapshot(), SourcePosition(position), Timestamp(100 + position), placed(1, &context), &context,
+        ).await.unwrap();
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected legacy placed frame"); };
+        let attempt = PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).unwrap();
+        if position < 2 {
+            old.push(EntityId::String(attempt.outcome_key()).iid());
+        } else {
+            future = Some(attempt);
+        }
+        let recovered = decode_replica(tx, predecessor, state.snapshot().block_index(), &context.memory).unwrap();
+        state.apply(&recovered.writes).unwrap();
+        resolver.take_head().unwrap();
+    }
+
+    let predecessor = state.snapshot().tx_basis();
+    let mut resolver = TxResolver::new(predecessor, SourcePosition(2), None, &context.memory).unwrap();
+    context.placed_receipt_retirement = true;
+    let resolved = resolver.resolve_source(
+        state.snapshot(), SourcePosition(3), Timestamp(101 + RECEIPT_WINDOW_MICROS), placed(2, &context), &context,
+    ).await.unwrap();
+    let attempt = resolved.placed_attempt().unwrap();
+    let body = resolved.to_replica_body(&context.memory).unwrap();
+    let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected versioned placed frame"); };
+    assert!(PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).is_err());
+    let mut unmarked = tx.clone();
+    unmarked.placed_attempt = Some(attempt.encode().to_vec());
+    assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+    unmarked.placed_attempt = None;
+    assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+
+    let recovered = decode_replica(tx, predecessor, state.snapshot().block_index(), &context.memory).unwrap();
+    assert_eq!(recovered.placed_attempt, Some(attempt));
+    let rows = recovered.writes.tables()[&table].batch().unwrap();
+    let retired: std::collections::BTreeSet<_> = (0..rows.len()).filter_map(|row| {
+        let event = rows.view().read_event(row).unwrap();
+        matches!(event.operation, StoredOperation::Erase).then_some(event.iid)
+    }).collect();
+    assert_eq!(retired, old.into_iter().collect());
+    state.apply(&recovered.writes).unwrap();
+    let mut reopened = TxResolver::new(Some(recovered.result.tx_key()), SourcePosition(3), None, &context.memory).unwrap();
+    let assertion = format!(
+        "ASSERT (SELECT COUNT(*) FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id IN ('{}', '{}')) = 2 \
+            AND (SELECT COUNT(*) FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME) = 2",
+        attempt.outcome_key(), future.unwrap().outcome_key(),
+    );
+    let read = reopened.resolve_source(
+        state.snapshot(), SourcePosition(4), Timestamp(99), request(vec![sql(&assertion)], &context), &context,
+    ).await.unwrap();
+    assert!(read.result().committed(), "{:?}", read.result().error());
 }

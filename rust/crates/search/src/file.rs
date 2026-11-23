@@ -94,10 +94,25 @@ pub fn encode_sections(sections: &[Section]) -> Vec<u8> {
     bytes
 }
 
+const UUID_IID_EVIDENCE: &[u8] = b"rtdb.search/uuid-iids/1";
+
+pub(crate) fn encode_artefact_stats(sections: &[Section], canonical_uuid_iids: bool) -> Vec<u8> {
+    let mut stats = encode_sections(sections);
+    if canonical_uuid_iids { stats.extend_from_slice(UUID_IID_EVIDENCE); }
+    stats
+}
+
+pub(crate) fn has_uuid_iid_evidence(stats: &[u8]) -> bool {
+    let Some((&count, rest)) = stats.split_first() else { return false; };
+    rest.get(usize::from(count) * 49..) == Some(UUID_IID_EVIDENCE)
+}
+
 /// The sections a record's stats hold, or `None` for stats in no form this version wrote.
 pub fn decode_sections(bytes: &[u8]) -> Option<Vec<Section>> {
-    let (count, rest) = bytes.split_first()?;
-    if rest.len() != *count as usize * 49 { return None; }
+    let (&count, rest) = bytes.split_first()?;
+    let len = usize::from(count) * 49;
+    if rest.len() != len && !has_uuid_iid_evidence(bytes) { return None; }
+    let rest = &rest[..len];
     Some(rest.chunks_exact(49).map(|chunk| {
         let at = |index: usize| i64::from_le_bytes(chunk[1 + index * 8..9 + index * 8].try_into().unwrap_or_default());
         Section { class: chunk[0], valid_from: at(0), valid_to: at(1), system_from: at(2), system_to: at(3), birth: at(4), death: at(5) }
@@ -872,6 +887,13 @@ impl SearchFile {
 
     /// The documents matching `matching` and visible in `bounds`, best possible score for `scoring` first, a window of documents at a time.
     pub fn ranked(self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds) -> Result<Ranked> {
+        self.ranked_with_uuid_ties(column, matching, scoring, bounds, false)
+    }
+
+    pub(crate) fn ranked_with_uuid_ties(
+        self: &Arc<Self>, column: &str, matching: &Query, scoring: &RankScorer, bounds: TemporalBounds,
+        uuid_ties: bool,
+    ) -> Result<Ranked> {
         let (Some(column), Some(field)) = (self.column(column), self.field(column)) else { return Ok(Ranked(None)) };
         let Some(segment) = self.searcher.segment_readers().first() else { return Ok(Ranked(None)) };
         if matching.terms().is_empty() { return Ok(Ranked(None)); }
@@ -889,16 +911,28 @@ impl SearchFile {
             let held: Vec<u32> = impacts(term)?.into_iter().map(|impact| impact.window).collect();
             windows = Some(match windows { None => held, Some(previous) => previous.into_iter().filter(|window| held.binary_search(window).is_ok()).collect() });
         }
-        let mut ordered: Vec<(f64, u32)> = windows.unwrap_or_default().into_iter().map(|window| (0.0, window)).collect();
+        let mut ordered: Vec<_> = windows.unwrap_or_default().into_iter().map(|window| {
+            let first = if uuid_ties {
+                let (start, stop) = document_range(window);
+                (start..stop.min(self.sidecar.documents)).map(|doc| Iid(self.sidecar.doc_iid(doc))).min()
+            } else { None };
+            (0.0, window, first)
+        }).collect();
         for (term_index, term) in scoring.scorer().query().terms().iter().enumerate() {
             let impacts = impacts(term)?;
-            for (bound, window) in &mut ordered {
+            let exact = if uuid_ties {
+                let maximum = impacts.iter().map(|impact| impact.frequency).max().unwrap_or(0);
+                scoring.exact_document_local_bounds(term_index, maximum)
+            } else { Vec::new() };
+            for (bound, window, _) in &mut ordered {
                 if let Ok(index) = impacts.binary_search_by_key(window, |impact| impact.window) {
-                    *bound += scoring.term_bound(term_index, impacts[index].frequency, impacts[index].length);
+                    let impact = impacts[index];
+                    *bound += exact.get(impact.frequency as usize).copied()
+                        .unwrap_or_else(|| scoring.term_bound(term_index, impact.frequency, impact.length));
                 }
             }
         }
-        ordered.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+        ordered.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.2.cmp(&right.2)).then(left.1.cmp(&right.1)));
         Ok(Ranked(Some(Windows { file: Arc::clone(self), field, matching: matching.clone(), scoring: Arc::clone(scoring.scorer()), bounds, windows: ordered, next: 0, batch: 4 })))
     }
 
@@ -1032,11 +1066,16 @@ impl ExactScorer {
 pub struct Ranked(Option<Windows>);
 
 /// The windows holding every matching term, each with the best score a document in it can have, best first, and how far they have been handed out.
-struct Windows { file: Arc<SearchFile>, field: Field, matching: Query, scoring: Arc<Scorer>, bounds: TemporalBounds, windows: Vec<(f64, u32)>, next: usize, batch: usize }
+struct Windows { file: Arc<SearchFile>, field: Field, matching: Query, scoring: Arc<Scorer>, bounds: TemporalBounds, windows: Vec<(f64, u32, Option<Iid>)>, next: usize, batch: usize }
 
 impl Ranked {
     /// The highest score any document not yet handed out can have, or `None` once all are.
-    pub fn bound(&self) -> Option<f64> { self.0.as_ref().and_then(|windows| windows.windows.get(windows.next).map(|(bound, _)| *bound)) }
+    pub fn bound(&self) -> Option<f64> { self.rank_bound().map(|(score, _)| score) }
+
+    pub(crate) fn rank_bound(&self) -> Option<(f64, Option<Iid>)> {
+        let windows = self.0.as_ref()?;
+        windows.windows.get(windows.next).map(|&(score, _, minimum)| (score, minimum))
+    }
 
     /// The matching visible documents of the next windows, with their exact scores; twice as many windows as the time before.
     pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> { self.expand_in(None, &mut 0) }
@@ -1053,7 +1092,7 @@ impl Windows {
     fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<Vec<(DocMatch, f64)>> {
         use tantivy::{DocSet, query::Query as _};
         let end = self.next.saturating_add(self.batch).min(self.windows.len());
-        let mut windows: Vec<u32> = self.windows[self.next..end].iter().map(|(_, window)| *window).collect();
+        let mut windows: Vec<u32> = self.windows[self.next..end].iter().map(|(_, window, _)| *window).collect();
         self.next = end;
         self.batch = self.batch.saturating_mul(2);
         windows.sort_unstable();
@@ -1285,7 +1324,7 @@ mod tests {
                 let mut expected = file.scored("body", &matching, &scoring, Some(&corpus), bounds).unwrap();
                 let rank_scorer = Arc::new(Scorer::new(scoring.clone(), Some(&corpus))).for_ranking().unwrap();
                 let mut ranked = file.ranked("body", &matching, &rank_scorer, bounds).unwrap();
-                let windows: BTreeMap<u32, f64> = ranked.0.as_ref().map_or_else(BTreeMap::new, |windows| windows.windows.iter().map(|(bound, window)| (*window, *bound)).collect());
+                let windows: BTreeMap<u32, f64> = ranked.0.as_ref().map_or_else(BTreeMap::new, |windows| windows.windows.iter().map(|(bound, window, _)| (*window, *bound)).collect());
                 for (doc, score) in &expected {
                     let bound = windows.get(&window_of(doc.doc)).unwrap_or_else(|| panic!("{matching:?}: doc {} is in no window", doc.doc));
                     assert!(score <= bound, "{matching:?}: doc {} scores {score} above its window's bound {bound}", doc.doc);
@@ -1432,6 +1471,11 @@ mod tests {
         assert!(short.meets(later_valid), "visible at a far later valid time, as known during its one day");
         assert!(!open.meets(at(1000 * day, 1000 * day)), "the ceiling ends every version");
         assert_eq!(decode_sections(&encode_sections(&sections)), Some(sections.clone()));
+        assert!(!has_uuid_iid_evidence(&encode_sections(&sections)));
+        let certified = encode_artefact_stats(&sections, true);
+        assert_eq!(decode_sections(&certified), Some(sections.clone()));
+        assert!(has_uuid_iid_evidence(&certified));
+        assert!(!has_uuid_iid_evidence(&certified[..certified.len() - 1]));
         assert_eq!(decode_sections(&[1, 2, 3]), None);
     }
 }

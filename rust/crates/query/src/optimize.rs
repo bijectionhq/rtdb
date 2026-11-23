@@ -177,7 +177,13 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
                 let name = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
                 let evaluated: Vec<ColumnId> = scan.matches.iter().filter(|evaluated| Some(evaluated.column.as_str()) == name).map(|evaluated| evaluated.id).collect();
                 if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id, &evaluated)) { return Ok(None); }
-                scan.top_k = Some(rtdb_plan::ScanTopK { column: *id, query: query.clone(), limit: limit.clone() });
+                let ascending_uuid_id = if let [_, second] = order
+                    && !second.descending
+                    && let Expr::Column { id, .. } = second.expr
+                    && scan.columns.iter().any(|field| field.id == id && field.name == "_id"
+                        && field.data_type == rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid))
+                { Some(id) } else { None };
+                scan.top_k = Some(rtdb_plan::ScanTopK { column: *id, query: query.clone(), limit: limit.clone(), ascending_uuid_id });
             }
             return Ok(Some(Arc::new(Relation::scan(scan)?)));
         }

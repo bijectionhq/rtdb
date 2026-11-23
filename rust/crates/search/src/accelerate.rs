@@ -246,7 +246,8 @@ impl SearchAccelerator {
         let owner = ArtefactOwner::of(&trie.key, record)?;
         let member = owner.tries().iter().position(|key| key == &trie.key)
             .ok_or_else(|| Anomaly::fault("rtdb.search/artefact-owner", "Search artefact does not contain its recorded trie"))? as u32;
-        Ok(Some(Recorded { key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?, owner, member }))
+        let canonical_uuid_iids = record.stats.as_deref().is_some_and(crate::file::has_uuid_iid_evidence);
+        Ok(Some(Recorded { key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?, owner, member, canonical_uuid_iids }))
     }
 
     /// A trie's recorded search file, or `None` where it cannot be read; one that is missing or corrupt is reported to the lane.
@@ -291,7 +292,7 @@ impl SearchAccelerator {
                     }
                 };
                 if let Some(file) = file {
-                    files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_string(), file, member: recorded.member });
+                    files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_string(), file, member: recorded.member, canonical_uuid_iids: recorded.canonical_uuid_iids });
                     continue;
                 }
             }
@@ -334,7 +335,7 @@ impl SearchAccelerator {
 }
 
 /// Where a trie's recorded search file is, and which of its members the trie is.
-struct Recorded { key: ObjectKey, owner: ArtefactOwner, member: u32 }
+struct Recorded { key: ObjectKey, owner: ArtefactOwner, member: u32, canonical_uuid_iids: bool }
 
 /// A shared file's selected members and their positions in the scan's trie list.
 struct FileMembers<'a> { file: &'a Arc<SearchFile>, members: BTreeMap<u32, usize> }
@@ -419,7 +420,7 @@ async fn covered_owned_corpus(
         };
         if !file.has_full_event_keys() { return Err(uncovered_owned_search()); }
         let data = ObjectKey::new(entry.slug.data_key(&trie.key))?;
-        files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_owned(), file, member: recorded.member });
+        files.push(TrieFile { trie: trie.key.clone(), data, identity: recorded.key.as_str().to_owned(), file, member: recorded.member, canonical_uuid_iids: recorded.canonical_uuid_iids });
     }
 
     let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), runtime: &runtime, database, bounds };
@@ -676,7 +677,14 @@ impl Ord for Pending { fn cmp(&self, other: &Self) -> std::cmp::Ordering { desce
 
 /// The IIDs of the matching events that may be visible, each at its best event's score, best first.
 /// Search files are expanded a batch of windows at a time, only while one may hold an event above every event already scored.
-struct Candidates<'a> { files: Vec<(BTreeMap<u32, usize>, crate::file::Ranked)>, cutter: Cutter<'a>, pending: std::collections::BinaryHeap<Pending>, seen: BTreeSet<Iid>, scored: usize }
+struct Candidates<'a> {
+    files: Vec<(BTreeMap<u32, usize>, crate::file::Ranked)>,
+    cutter: Cutter<'a>,
+    pending: std::collections::BinaryHeap<Pending>,
+    seen: BTreeSet<Iid>,
+    scored: usize,
+    uuid_ties: bool,
+}
 
 /// Counts only distinct IIDs already nominated by the ranker.
 fn exceeds_retry_limit(
@@ -699,23 +707,30 @@ fn exceeds_retry_limit(
 impl Candidates<'_> {
     fn push(&mut self, iid: Iid, score: f64, exact: bool) { self.scored += 1; self.pending.push(Pending(score, iid, exact)); }
     fn drop_seen(&mut self) { while self.pending.peek().is_some_and(|top| self.seen.contains(&top.1)) { self.pending.pop(); } }
-    /// The file whose next windows may hold the best event not yet scored.
-    fn best_file(&self) -> Option<(usize, f64)> {
-        self.files.iter().enumerate().filter_map(|(index, (_, file))| file.bound().map(|bound| (index, bound))).max_by(|left, right| left.1.total_cmp(&right.1))
+    fn best_file(&self) -> Option<(usize, (f64, Option<Iid>))> {
+        self.files.iter().enumerate().filter_map(|(index, (_, file))| Some((index, file.rank_bound()?)))
+            .max_by(|(_, (left_score, left_id)), (_, (right_score, right_id))|
+                left_score.total_cmp(right_score).then_with(|| right_id.cmp(left_id)))
     }
-    /// Stop only when the kth verified score beats both remaining sources.
-    fn can_stop(&mut self, kth: f64) -> bool {
+
+    fn can_stop(&mut self, (kth, iid): (f64, Iid)) -> bool {
         self.drop_seen();
-        let pending = self.pending.peek().map(|top| top.0.to_bits());
-        let unread = self.best_file().map(|(_, bound)| bound.to_bits());
-        crate::rank_cutoff::can_stop(kth.to_bits(), pending, unread)
+        let pending = self.pending.peek().map(|top| (top.0.to_bits(), Some(u128::from_be_bytes(top.1.0))));
+        let unread = self.best_file().map(|(_, (score, id))| (score.to_bits(), id.map(|id| u128::from_be_bytes(id.0))));
+        if self.uuid_ties {
+            crate::rank_cutoff::can_stop_with_uuid(kth.to_bits(), u128::from_be_bytes(iid.0), pending, unread)
+        } else {
+            crate::rank_cutoff::can_stop(kth.to_bits(), pending.map(|(score, _)| score), unread.map(|(score, _)| score))
+        }
     }
+
     /// The next IID, best first, with its best event's score and whether that event is exactly visible.
     fn next(&mut self, scope: Option<&BTreeSet<Iid>>, work: &mut NarrowingWork) -> Result<Option<(f64, Iid, bool)>> {
         loop {
             self.drop_seen();
-            match (self.pending.peek().map(|top| top.0), self.best_file()) {
-                (pending, Some((index, bound))) if pending.is_none_or(|score| bound > score) => {
+            match self.best_file() {
+                Some((index, (bound, first))) if self.pending.peek().is_none_or(|pending|
+                    bound > pending.0 || (self.uuid_ties && bound == pending.0 && first.is_none_or(|id| id < pending.1))) => {
                     let scored = self.files[index].1.expand_in(scope, &mut work.postings_visited)?;
                     if cfg!(feature = "experiments") { work.score_evaluations += scored.len(); }
                     for (doc, score) in scored {
@@ -733,16 +748,32 @@ impl Candidates<'_> {
     }
 }
 
+async fn rank_count(request: &ScanRequest<'_>, count: &Expr) -> Option<usize> {
+    let count = match request.constants.constant(count).await.ok().flatten()? {
+        Value::I64(count) => count,
+        Value::I32(count) => i64::from(count),
+        Value::I16(count) => i64::from(count),
+        _ => return None,
+    };
+    usize::try_from(count).ok()
+}
+
+async fn rank_prefix_size(request: &ScanRequest<'_>, limit: &Expr) -> Option<usize> {
+    if let Expr::Binary { op: BinaryOp::Add, left, right } = limit {
+        let offset = rank_count(request, left).await?;
+        let fetch = rank_count(request, right).await?;
+        return offset.checked_add(fetch).filter(|&total| total <= i64::MAX as usize);
+    }
+    rank_count(request, limit).await
+}
+
 impl SearchAccelerator {
     /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified; a search file's events are scored only as far as that takes.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
-        let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
-            Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => { work.decline = Some("unsupported-limit"); return Ok(None); },
-        };
-        let Ok(limit) = usize::try_from(limit) else { work.decline = Some("unsupported-limit"); return Ok(None) };
+        let Some(limit) = rank_prefix_size(request, &top_k.limit).await else { work.decline = Some("unsupported-limit"); return Ok(None); };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition).await? else {
             work.decline = Some("coverage");
@@ -765,11 +796,16 @@ impl SearchAccelerator {
         }
         let scoring = Arc::new(rtdb_text::Scorer::new(Query::parse(&text), None));
         let Some(rank_scorer) = scoring.for_ranking() else { work.decline = Some("score-domain"); return Ok(None); };
+        let uuid_ties = request.partitions.len() == 1 && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point()
+            && top_k.ascending_uuid_id.is_some_and(|id| request.permits_ranked_uuid_id(id))
+            && skipped.is_empty() && files.iter().all(|file| file.canonical_uuid_iids);
         let ranked = by_file(&files).map(|selected| {
-            Ok((selected.members, selected.file.ranked(column, matching, &rank_scorer, request.bounds)?))
+            let ranked = selected.file.ranked_with_uuid_ties(column, matching, &rank_scorer, request.bounds, uuid_ties)?;
+            Ok((selected.members, ranked))
         }).collect::<Result<Vec<_>>>()?;
-        let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime), pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0 };
-        let trusted = match request.scan.predicates.as_slice() {
+        let mut candidates = Candidates { files: ranked, cutter: Cutter::new(&files, &skipped, request, &self.runtime),
+            pending: std::collections::BinaryHeap::new(), seen: BTreeSet::new(), scored: 0, uuid_ties };
+        let trusted = !uuid_ties && match request.scan.predicates.as_slice() {
             [Expr::Column { id, .. }] => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
             [Expr::Call { name, .. }] => name.eq_ignore_ascii_case("match"),
             _ => false,
@@ -795,7 +831,7 @@ impl SearchAccelerator {
         loop {
             if verified.len() >= limit {
                 verified.sort_by(descending);
-                if candidates.can_stop(verified[limit - 1].0) { break; }
+                if candidates.can_stop(verified[limit - 1]) { break; }
             }
             let mut iids = BTreeSet::new();
             let mut handed = 0;
@@ -825,6 +861,9 @@ impl SearchAccelerator {
             }
         }
         verified.sort_by(descending);
+        if uuid_ties {
+            return Ok(Some(verified.into_iter().take(limit).map(|(_, iid)| iid).collect()));
+        }
         let kth = verified.get(limit - 1).map_or(f64::NEG_INFINITY, |(score, _)| *score);
         Ok(Some(verified.into_iter().filter(|(score, _)| *score >= kth).map(|(_, iid)| iid).collect()))
     }
@@ -871,7 +910,7 @@ mod tests {
         let trie = |member: u32| TrieFile {
             trie: format!("l02-rc-p{member}-b00").parse().unwrap(),
             data: ObjectKey::new(format!("tables/docs/data/l02-rc-p{member}-b00.arrow")).unwrap(),
-            identity: "group".into(), file: Arc::clone(&file), member,
+            identity: "group".into(), file: Arc::clone(&file), member, canonical_uuid_iids: false,
         };
         let runtime = crate::SearchRuntime::new(1 << 20);
         let bounds = at(0, 0);
@@ -886,7 +925,7 @@ mod tests {
         let ranked = file.ranked("body", &query, &rank_scorer, bounds).unwrap();
         let mut candidates = Candidates {
             files: vec![(BTreeMap::from([(1, 0)]), ranked)], cutter,
-            pending: Default::default(), seen: BTreeSet::new(), scored: 0,
+            pending: Default::default(), seen: BTreeSet::new(), scored: 0, uuid_ties: false,
         };
         assert_eq!(candidates.next(None, &mut NarrowingWork::default()).unwrap().map(|(_, iid, exact)| (iid, exact)), Some((Iid([64; 16]), true)));
         assert!(candidates.next(None, &mut NarrowingWork::default()).unwrap().is_none());
@@ -922,6 +961,7 @@ mod tests {
                 identity: key.to_string(),
                 file: Arc::new(SearchFile::open(bytes, &columns).unwrap()),
                 member: 0,
+                canonical_uuid_iids: false,
             }
         };
         let files = [

@@ -99,7 +99,7 @@ type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
 
 /// A trie's search file as a scan reads it: the trie's data file, the identity the file's kept answers go by, the file, and which of its members the trie is.
 /// The tries of a partition group share one file, each its own member.
-pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile>, pub member: u32 }
+pub struct TrieFile { pub trie: rtdb_format::keys::TrieKey, pub data: rtdb_storage::ObjectKey, pub identity: String, pub file: Arc<SearchFile>, pub member: u32, pub(crate) canonical_uuid_iids: bool }
 
 pub struct SearchRuntime {
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
@@ -191,7 +191,7 @@ impl SearchRuntime {
         let identity = format!("{data}#{columns:?}");
         let cache_key = (database.to_string(), identity.clone());
         if let Some((pool, file)) = self.built.lock().get(&cache_key) {
-            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file, member: 0 }); }
+            if pool.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, storage)) { return Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file, member: 0, canonical_uuid_iids: false }); }
         }
         // A build that fails or whose query is cancelled leaves the cell empty, and the next caller builds.
         let cell = Arc::clone(self.building.lock().entry(cache_key.clone()).or_default());
@@ -216,7 +216,7 @@ impl SearchRuntime {
         let mut building = self.building.lock();
         if building.get(&cache_key).is_some_and(|current| Arc::ptr_eq(current, &cell)) { building.remove(&cache_key); }
         drop(building);
-        Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file: outcome?, member: 0 })
+        Ok(TrieFile { trie: trie.clone(), data: data.clone(), identity, file: outcome?, member: 0, canonical_uuid_iids: false })
     }
 
     pub fn forget_file(&self, database: &str, key: &rtdb_storage::ObjectKey) {

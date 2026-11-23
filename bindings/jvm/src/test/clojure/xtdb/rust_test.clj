@@ -711,7 +711,9 @@
 
 (deftest-original-api original-info-schema/columns-data-type-follows-postgres-spelling)
 
-(deftest-original-api original-info-schema/test-pg-attribute)
+(deftest test-pg-attribute
+  (binding [original-info-schema/*source-log-time-column?* true]
+    (run-original-api-case #'original-info-schema/test-pg-attribute)))
 
 (deftest-original-api original-node/test-mutable-data-buffer-bug)
 

@@ -765,6 +765,48 @@ impl rtdb_query::ScanAccelerator for Recording {
 }
 
 #[tokio::test]
+async fn a_uuid_tie_break_prunes_tied_posting_windows_and_preserves_the_sql_page() {
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON uuid_docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    let operations = (0..900).rev().map(|id| {
+        sql(&format!("INSERT INTO uuid_docs RECORDS {{_id: UUID '00000000-0000-0000-0000-{id:012x}', body: 'invoice'}}"))
+    }).collect();
+    assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let query = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM uuid_docs FOR VALID_TIME AS OF TIMESTAMP '1970-01-02Z' FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-02Z' WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id";
+    let everything = rows(session.query_sql(query, vec![]).await.unwrap()).await;
+    assert_eq!(everything.len(), 900);
+
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 30);
+    let mut accelerator = rtdb_search::SearchAccelerator::with_runtime(rtdb_search::SearchRuntime::new(64 << 20));
+    accelerator.max_candidates = 700;
+    let recording = Arc::new(Recording { inner: Arc::new(accelerator), sizes: Default::default() });
+    let catalog = rtdb_query::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(), rtdb_query::DatabaseSnapshot {
+        partitions: vec![database.snapshot()], storage: Arc::clone(database.storage()),
+    })]), false).unwrap();
+    let context = rtdb_query::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(i64::MAX / 2), "UTC",
+        rtdb_query::QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap()
+        .with_accelerators(Arc::from([Arc::clone(&recording) as Arc<dyn rtdb_query::ScanAccelerator>]));
+    let page = format!("{query} LIMIT 3 OFFSET 4");
+    let prepared = rtdb_sql::prepare_in(&page, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory).unwrap();
+    let cursor = rtdb_query::PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, Vec::new()).await.unwrap();
+    assert_eq!(rows(cursor).await, everything[4..7]);
+    assert_eq!(*recording.sizes.lock().unwrap(), [7]);
+
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking_everything() {
     let mut options = options();
     options.file_size_target = 1;

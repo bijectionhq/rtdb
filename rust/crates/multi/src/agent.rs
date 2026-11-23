@@ -52,6 +52,7 @@ pub struct AgentOptions {
     pub storage: CellStorage,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
+    pub replica_payload_reclamation: bool,
     /// How long an activation may take to reach a confirmed leadership before it is abandoned.
     pub activation_timeout: Duration,
     /// How many new deployment opens may start within one second.
@@ -85,7 +86,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { audience_journal_port: None, storage, world_archive: None, s3_write_role: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { audience_journal_port: None, storage, world_archive: None, s3_write_role: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
@@ -233,6 +234,7 @@ enum SubscriptionUse { Query, FreshQuery, Fragment }
 pub struct NodeAgent {
     storage_namespaces: rtdb_directory::StorageNamespaces,
     directory: Arc<dyn Directory>,
+    keys: Arc<dyn crate::keys::KeyService>,
     node: Node,
     lease: Arc<MemberLease>,
     address: String,
@@ -266,8 +268,8 @@ impl FlightEndpoints {
 }
 
 impl NodeAgent {
-    pub(crate) fn new(directory: Arc<dyn Directory>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoints: FlightEndpoints, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, node, lease, address, flight_endpoints, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoints: FlightEndpoints, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, keys, node, lease, address, flight_endpoints, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -1206,8 +1208,8 @@ impl NodeAgent {
         let Ok(Some((record, _))) = self.publish_checkpoint(&current.id, epoch, &database, &block).await else { return; };
         let Some(plan) = ReplicaTrimPlan::new(record, checkpoint.boundary, trimmed_through, now_ms()) else { return; };
         let Ok(members) = self.members().await else { return };
-        let Ok(Some(grant)) = plan.authorize(self.directory.as_ref(), &members).await else { return; };
-        if let Ok(through) = grant.apply().await
+        let Ok(Some(grant)) = Box::pin(plan.authorize(self.directory.as_ref(), &members, &self.options.storage, self.keys.as_ref(), self.options.replica_payload_reclamation)).await else { return; };
+        if let Ok(through) = grant.apply(self.directory.as_ref()).await
             && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)
         {
             holding.trimmed_through = Some(through);

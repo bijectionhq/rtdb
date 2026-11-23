@@ -23,6 +23,19 @@ verus! {
             },
         }
     }
+
+    pub open spec fn uuid_bound_loses(bound: Option<(u64, Option<u128>)>, score: u64, iid: u128) -> bool {
+        match bound {
+            None => true,
+            Some((bits, first)) => match score_key(bits) {
+                None => false,
+                Some(key) => key < score || (key == score && match first {
+                    None => false,
+                    Some(first) => iid < first,
+                }),
+            },
+        }
+    }
 }
 
 // The nonnegative binary64 encodings are ordered by their unsigned bits.
@@ -65,6 +78,37 @@ pub(crate) fn can_stop(kth: u64, pending: Option<u64>, unread: Option<u64>) -> b
     match rank_key(kth) {
         None => false,
         Some(key) => strictly_below(pending, key) && strictly_below(unread, key),
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == uuid_bound_loses(bound, kth, iid),
+))]
+fn worse_than_uuid(bound: Option<(u64, Option<u128>)>, kth: u64, iid: u128) -> bool {
+    match bound {
+        None => true,
+        Some((score, first)) => match rank_key(score) {
+            None => false,
+            Some(key) => key < kth || (key == kth && match first {
+                Some(first) => iid < first,
+                None => false,
+            }),
+        },
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == match score_key(kth) {
+        None => false,
+        Some(key) => uuid_bound_loses(pending, key, iid) && uuid_bound_loses(unread, key, iid),
+    },
+))]
+pub(crate) fn can_stop_with_uuid(
+    kth: u64, iid: u128, pending: Option<(u64, Option<u128>)>, unread: Option<(u64, Option<u128>)>,
+) -> bool {
+    match rank_key(kth) {
+        None => false,
+        Some(key) => worse_than_uuid(pending, key, iid) && worse_than_uuid(unread, key, iid),
     }
 }
 

@@ -136,11 +136,13 @@
               cat/*file-size-target* (* 16 1024)
               c/*ignore-signal-block?* true]
       (util/with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 10})]
-        (letfn [(submit! [xs]
-                  (last (for [batch (partition-all 6 xs)]
-                          (xt/submit-tx node [(into [:put-docs :foo]
-                                                    (for [x batch]
-                                                      {:xt/id x}))]))))
+        (letfn [(index! [xs]
+                  (let [{:keys [tx-id]}
+                        (last (for [batch (partition-all 6 xs)]
+                                (xt/submit-tx node
+                                              [(into [:put-docs :foo]
+                                                     (for [x batch] {:xt/id x}))])))]
+                    (xt-log/await-source (db/primary-db node) tx-id #xt/duration "PT60S")))
 
                 (q []
                   (->> (xt/q node
@@ -148,20 +150,17 @@
                                   (order-by id)))
                        (map :id)))]
 
-          (submit! (range 500))
-          (xt-log/sync-node node #xt/duration "PT2S")
+          (index! (range 500))
           (c/compact-all! node #xt/duration "PT60S")
 
           (t/is (= (set (range 500)) (set (q))))
 
-          (submit! (range 500 1000))
-          (xt-log/sync-node node #xt/duration "PT2S")
+          (index! (range 500 1000))
           (c/compact-all! node #xt/duration "PT60S")
 
           (t/is (= (set (range 1000)) (set (q))))
 
-          (submit! (range 1000 2000))
-          (xt-log/sync-node node #xt/duration "PT5S")
+          (index! (range 1000 2000))
           (c/compact-all! node #xt/duration "PT60S")
 
           (t/is (= (set (range 2000)) (set (q))))

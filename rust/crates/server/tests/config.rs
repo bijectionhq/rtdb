@@ -108,6 +108,17 @@ fn durations_keep_fractional_and_component_sign_semantics() {
 }
 
 #[test]
+fn scan_tie_order_uses_an_explicit_positive_naming_epoch() {
+    assert!(decode("").unwrap().compactor.scan_tie_order_from_naming_epoch.is_none());
+    for epoch in [0, -1] {
+        assert!(decode(&format!("compactor: {{scanTieOrderFromNamingEpoch: {epoch}}}")).is_err());
+    }
+    let config = decode("compactor: {scanTieOrderFromNamingEpoch: 7}").unwrap();
+    let options = config.node_options(1 << 20).unwrap();
+    assert_eq!(options.compaction.scan_tie_order_from_naming_epoch.unwrap().get(), 7);
+}
+
+#[test]
 fn node_options_apply_indexer_compactor_gc_and_shared_memory_settings() {
     let config = decode("memoryCache: {maxSizeBytes: 1024}\nindexer: {enabled: false, rowsPerBlock: 42, pageLimit: 16, logLimit: 8, skipTxs: [3, 9], flushDuration: PT5S}\ncompactor: {threads: 0, reeIids: true, withinFileRecencyBranching: true}\ngarbageCollector: {enabled: false, blocksToKeep: 4, garbageLifetime: PT12H, readerLease: PT30M, readerLeaseMargin: PT20S}\nreadOnlyDatabases: true").unwrap();
     let options = config.node_options(8192).unwrap();

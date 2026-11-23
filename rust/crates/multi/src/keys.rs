@@ -3,8 +3,9 @@
 use std::fs::{self, File, TryLockError};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -12,11 +13,23 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rtdb_directory::{DeletionFacts, DeletionRecord};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
+mod archive;
+pub use archive::ArchiveKey;
+pub use crate::cipher::object::FramedObject;
+pub(crate) use archive::legacy_archive_key;
+
 pub const KEY_BYTES: usize = 32;
 const NAMESPACE_KEY_ID: &str = ".rtdb-key-namespace";
 const DELETION_SIGNING_KEY_ID: &str = ".rtdb-deletion-signing-seed";
 const DESTROYED: &[u8] = b"RTDB-key-destroyed-v1";
+const ARCHIVE_VAULT_MARKER: &str = ".archive-operation-authority-v1";
 const DELETION_SIGNATURE_DOMAIN: &[u8] = b"rtdb.multi.deletion.v1\0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveKeyWithdrawal {
+    Vault,
+    OperationAuthority,
+}
 
 #[async_trait::async_trait]
 pub trait KeyService: Send + Sync {
@@ -52,6 +65,22 @@ pub trait KeyService: Send + Sync {
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
 
+    async fn archive_key(&self, id: &str, provision: bool) -> Result<Arc<dyn ArchiveKey>> {
+        let key = if provision { self.key(id).await? } else { self.existing(id).await? };
+        legacy_archive_key(&key)
+    }
+
+    async fn archive_key_is_operation_only(&self, _id: &str) -> Result<bool> { Ok(false) }
+
+    async fn schedule_archive_key(&self, _id: &str, _due_at_ms: i64) -> Result<bool> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault does not own scheduled revocation"))
+    }
+
+    async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
+        self.destroy(id).await?;
+        Ok(ArchiveKeyWithdrawal::Vault)
+    }
+
     /// The standalone key authority can witness the lifetime of a local I/O
     /// region. Providers without a local authority use explicit drain receipts.
     fn hold_local_storage_region(&self, _region: uuid::Uuid) -> Result<Option<File>> { Ok(None) }
@@ -60,15 +89,114 @@ pub trait KeyService: Send + Sync {
 }
 
 /// Keys kept as files in a directory apart from the objects they protect, standing in for a key-management service.
-pub struct LocalKeyService { directory: PathBuf }
+#[derive(Clone)]
+pub struct LocalKeyService {
+    directory: PathBuf,
+    provision_archive_keys: bool,
+}
 
 impl LocalKeyService {
     pub fn new(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
         std::fs::create_dir_all(&directory).map_err(io)?;
-        Ok(Self { directory })
+        let service = Self { directory, provision_archive_keys: false };
+        service.require_service_root()?;
+        Ok(service)
     }
-    fn path(&self, deployment: &str) -> PathBuf { self.directory.join(format!("{deployment}.key")) }
+    pub fn with_archive_broker(directory: impl Into<PathBuf>) -> Result<Self> {
+        let mut vault = Self::new(directory)?;
+        vault.archive_vault()?;
+        vault.provision_archive_keys = true;
+        Ok(vault)
+    }
+
+    fn path(&self, id: &str) -> Result<PathBuf> {
+        let mut components = Path::new(id).components();
+        if !matches!(components.next(), Some(Component::Normal(name)) if name == id)
+            || components.next().is_some()
+        {
+            return Err(Anomaly::incorrect("rtdb.multi/key-id", "Invalid local key identity"));
+        }
+        Ok(self.directory.join(format!("{id}.key")))
+    }
+
+    fn archive_directory(&self) -> PathBuf {
+        self.directory.join(".archive-vault")
+    }
+
+    fn archive_vault(&self) -> Result<Self> {
+        let directory = self.archive_directory();
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&directory) {
+            Ok(()) => self.sync_directory()?,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io(error)),
+        }
+        let metadata = fs::symlink_metadata(&directory).map_err(io)?;
+        if !metadata.is_dir() {
+            return Err(Anomaly::incorrect("rtdb.multi/archive-vault-path", "The operation vault requires its own directory"));
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Anomaly::incorrect("rtdb.multi/archive-vault-path", "The operation vault directory must be private"));
+        }
+        let vault = Self { directory, provision_archive_keys: false };
+        let marker = vault.directory.join(ARCHIVE_VAULT_MARKER);
+        let _lock = vault.lock_key(&marker)?;
+        match fs::read(&marker) {
+            Ok(binding) if binding == ARCHIVE_VAULT_MARKER.as_bytes() => (),
+            Err(error) if error.kind() == ErrorKind::NotFound => vault.publish(&marker, ARCHIVE_VAULT_MARKER.as_bytes())?,
+            Err(error) => return Err(io(error)),
+            Ok(_) => return Err(malformed()),
+        }
+        Ok(vault)
+    }
+
+    fn is_brokered(&self, id: &str) -> Result<bool> {
+        let broker = Self { directory: self.archive_directory(), provision_archive_keys: false };
+        broker.path(id)?.try_exists().map_err(io)
+    }
+
+    fn require_service_root(&self) -> Result<()> {
+        if self.directory.join(ARCHIVE_VAULT_MARKER).try_exists().map_err(io)? {
+            return Err(Anomaly::incorrect("rtdb.multi/archive-vault-path", "The operation vault cannot be opened as a raw key service"));
+        }
+        Ok(())
+    }
+
+    fn require_raw_key(&self, id: &str) -> Result<()> {
+        self.require_service_root()?;
+        if self.is_brokered(id)? {
+            return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/key-non-exportable",
+                "The archive key is confined to its operation authority"));
+        }
+        Ok(())
+    }
+
+    fn open_archive_key(&self, id: String, provision: bool) -> Result<Arc<dyn ArchiveKey>> {
+        self.require_service_root()?;
+        let path = self.path(&id)?;
+        let raw_lock = self.lock_key(&path)?;
+        if self.is_brokered(&id)? || provision && self.provision_archive_keys && !path.try_exists().map_err(io)? {
+            let vault = self.archive_vault()?;
+            let vault_path = vault.path(&id)?;
+            let _lock = vault.lock_key(&vault_path)?;
+            if archive::expire_locked(&vault, &vault_path)?.is_some() {
+                return Err(archive::revoked());
+            }
+            vault.read_or_create_key(&vault_path, provision)?;
+            return Ok(Arc::new(archive::LocalArchiveKey { vault, id }));
+        }
+        let material = if provision {
+            drop(raw_lock);
+            self.key_at(&path, Some(&id))?
+        } else {
+            read_key(&path, fs::read(&path).map_err(io)?)?
+        };
+        legacy_archive_key(&material)
+    }
     fn region_path(&self, region: uuid::Uuid) -> PathBuf {
         self.directory.join(format!("{region}.storage-region"))
     }
@@ -107,21 +235,26 @@ impl LocalKeyService {
     fn sync_directory(&self) -> Result<()> {
         rtdb_types::directory_io::open_for_sync(&self.directory).and_then(|directory| directory.sync_all()).map_err(io)
     }
-    async fn load_key(&self, path: PathBuf) -> Result<[u8; KEY_BYTES]> {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return self.key_at(&path); };
-        let authority = Self { directory: self.directory.clone() };
-        runtime.spawn_blocking(move || authority.key_at(&path)).await
+    async fn load_key(&self, path: PathBuf, raw_id: Option<String>) -> Result<[u8; KEY_BYTES]> {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return self.key_at(&path, raw_id.as_deref()); };
+        let authority = self.clone();
+        runtime.spawn_blocking(move || authority.key_at(&path, raw_id.as_deref())).await
             .map_err(|error| Anomaly::fault("rtdb.multi/local-key-task", error.to_string()))?
     }
-    fn key_at(&self, path: &Path) -> Result<[u8; KEY_BYTES]> {
+    fn key_at(&self, path: &Path, raw_id: Option<&str>) -> Result<[u8; KEY_BYTES]> {
         let _lock = self.lock_key(path)?;
+        if let Some(id) = raw_id { self.require_raw_key(id)?; }
+        self.read_or_create_key(path, true)
+    }
+
+    fn read_or_create_key(&self, path: &Path, provision: bool) -> Result<[u8; KEY_BYTES]> {
         match fs::read(path) {
             Ok(bytes) => {
                 let key = read_key(path, bytes)?;
                 self.sync_directory()?;
                 Ok(key)
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+            Err(error) if provision && error.kind() == ErrorKind::NotFound => {
                 let key = new_key()?;
                 self.publish(path, &key)?;
                 Ok(key)
@@ -133,18 +266,18 @@ impl LocalKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for LocalKeyService {
-    async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.load_key(self.directory.join(".namespace")).await }
+    async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.load_key(self.directory.join(".namespace"), None).await }
 
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
-        sign_deletion(self.load_key(self.directory.join(".deletion-signer")).await?, facts)
+        sign_deletion(self.load_key(self.directory.join(".deletion-signer"), None).await?, facts)
     }
 
     async fn deletion_verification_key(&self) -> Result<String> {
-        verification_key(self.load_key(self.directory.join(".deletion-signer")).await?)
+        verification_key(self.load_key(self.directory.join(".deletion-signer"), None).await?)
     }
 
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]> {
-        self.load_key(self.path(deployment)).await
+        self.load_key(self.path(deployment)?, Some(deployment.to_owned())).await
     }
 
     fn custody_namespace(&self) -> Result<String> {
@@ -152,7 +285,8 @@ impl KeyService for LocalKeyService {
     }
 
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>> {
-        let path = self.path(deployment);
+        self.require_raw_key(deployment)?;
+        let path = self.path(deployment)?;
         match fs::read(&path) {
             Ok(bytes) => read_key(&path, bytes).map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -165,8 +299,9 @@ impl KeyService for LocalKeyService {
     }
 
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()> {
-        let path = self.path(deployment);
+        let path = self.path(deployment)?;
         let _lock = self.lock_key(&path)?;
+        self.require_raw_key(deployment)?;
         match fs::read(&path) {
             Err(error) if error.kind() == ErrorKind::NotFound => self.publish(&path, &key),
             Err(error) => Err(io(error)),
@@ -177,8 +312,9 @@ impl KeyService for LocalKeyService {
         }
     }
     async fn destroy(&self, deployment: &str) -> Result<()> {
-        let path = self.path(deployment);
+        let path = self.path(deployment)?;
         let _lock = self.lock_key(&path)?;
+        self.require_raw_key(deployment)?;
         match fs::read(&path) {
             Ok(bytes) if is_destroyed(&bytes) => return self.sync_directory(),
             Ok(_) => {}
@@ -186,6 +322,56 @@ impl KeyService for LocalKeyService {
             Err(error) => return Err(io(error)),
         }
         self.publish(&path, DESTROYED)
+    }
+
+    async fn archive_key(&self, id: &str, provision: bool) -> Result<Arc<dyn ArchiveKey>> {
+        let vault = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || vault.open_archive_key(id, provision)).await
+            .map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
+    }
+
+    async fn archive_key_is_operation_only(&self, id: &str) -> Result<bool> {
+        self.require_service_root()?;
+        self.is_brokered(id)
+    }
+
+    async fn schedule_archive_key(&self, id: &str, due_at_ms: i64) -> Result<bool> {
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            service.require_service_root()?;
+            let raw_path = service.path(&id)?;
+            let _raw_lock = service.lock_key(&raw_path)?;
+            if !service.is_brokered(&id)? {
+                return Err(Anomaly::unsupported("rtdb.multi/archive-vault", "This archive key exports its material"));
+            }
+            let vault = service.archive_vault()?;
+            let path = vault.path(&id)?;
+            let _lock = vault.lock_key(&path)?;
+            archive::schedule_locked(&vault, &path, due_at_ms)
+        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
+    }
+
+    async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
+        let vault = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            vault.require_service_root()?;
+            let raw_path = vault.path(&id)?;
+            let _raw_lock = vault.lock_key(&raw_path)?;
+            let (authority, path) = if vault.is_brokered(&id)? {
+                let broker = vault.archive_vault()?;
+                let path = broker.path(&id)?;
+                (broker, path)
+            } else {
+                vault.publish(&raw_path, DESTROYED)?;
+                return Ok(ArchiveKeyWithdrawal::Vault);
+            };
+            let _lock = authority.lock_key(&path)?;
+            archive::withdraw_locked(&authority, &path)?;
+            Ok(ArchiveKeyWithdrawal::OperationAuthority)
+        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
     }
 
     fn hold_local_storage_region(&self, region: uuid::Uuid) -> Result<Option<File>> {
@@ -293,7 +479,7 @@ mod tests {
     async fn opening_a_key_does_not_block_the_executor_on_a_held_file_lock() {
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path()).unwrap();
-        let lock = keys.lock_key(&keys.path("shop")).unwrap();
+        let lock = keys.lock_key(&keys.path("shop").unwrap()).unwrap();
         let (release, released) = std::sync::mpsc::channel();
         let watchdog = std::thread::spawn(move || {
             let _ = released.recv_timeout(std::time::Duration::from_secs(1));
@@ -376,7 +562,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path()).unwrap();
         let key = keys.key("source").await.unwrap();
-        std::fs::hard_link(keys.path("source"), keys.path("copy")).unwrap();
+        std::fs::hard_link(keys.path("source").unwrap(), keys.path("copy").unwrap()).unwrap();
         keys.destroy("source").await.unwrap();
         keys.destroy("source").await.unwrap();
         assert_eq!(keys.key("copy").await.unwrap(), key);
@@ -401,7 +587,7 @@ mod tests {
         let key = keys.key("a").await.unwrap();
         assert_eq!(keys.key("a").await.unwrap(), key);
         keys.copy("a", "b").await.unwrap();
-        let interrupted = keys.path("a").with_extension("pending");
+        let interrupted = keys.path("a").unwrap().with_extension("pending");
         fs::write(&interrupted, key).unwrap();
         keys.destroy("a").await.unwrap();
         assert!(!interrupted.exists());

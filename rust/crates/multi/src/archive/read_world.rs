@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ArchivedObject, CellStorage, Cipher, KeyService, PrefixedStore, archive_witness,
+    ArchiveKey, ArchivedObject, CellStorage, KeyService, PrefixedStore, archive_witness,
     capture_receipt, inconsistent, key, read, read_object, replica_suffix, require_capture_open, stage,
     read_archive_lifetime_floors, unavailable, verified_archive,
 };
@@ -189,6 +189,7 @@ where
 
 pub(super) struct TerminalReplay<'a> {
     pub storage: &'a CellStorage,
+    pub source_io: Arc<rtdb_storage::IoRegion>,
     pub fence: &'a rtdb_directory::CheckpointTransferFence,
     pub stream: &'a rtdb_logkeeper::StreamConfig,
     pub certificate: Option<&'a rtdb_logkeeper::JournalDigest>,
@@ -273,7 +274,7 @@ where
                         "The archive belongs to another captured checkpoint",
                     ));
                 }
-                let (manifest, material) =
+                let (manifest, cipher) =
                     verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
                 let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
                     files: PrefixedStore::new(
@@ -288,7 +289,7 @@ where
                         .into_iter()
                         .map(|object| Ok((key(&object.name)?, object)))
                         .collect::<Result<_>>()?,
-                    cipher: Cipher::new(&material)?,
+                    cipher: Arc::clone(&cipher),
                 });
                 let memory = resources.node.query.query_memory(resources.memory);
                 let storage = Arc::new(BufferPool::with_metadata_budget(
@@ -347,7 +348,7 @@ where
                 match (selected.suffix, suffix) {
                     (Some(suffix), Some(pin)) => {
                         replica_suffix::apply_archived(
-                            bucket.as_ref(), selected.deployment, suffix, record.stream("replica"), &pin, &material,
+                            bucket.as_ref(), selected.deployment, suffix, record.stream("replica"), &pin, Arc::clone(&cipher),
                             &mut recovered, &memory,
                         ).await?;
                     }
@@ -356,7 +357,7 @@ where
                 }
                 let terminal_source = if let Some(terminal) = terminal {
                     Some(replica_suffix::replay_certified_terminal(
-                        &record, terminal.storage, region, keys, terminal.stream, terminal.certificate, terminal.fence,
+                        &record, terminal.storage, Arc::clone(&terminal.source_io), keys, terminal.stream, terminal.certificate, terminal.fence,
                         terminal.through, &mut recovered, &memory,
                     ).await?)
                 } else {
@@ -390,10 +391,10 @@ where
 }
 
 /// The accepted inventory is the only source of bytes for a world read.
-struct CapturedObjects {
-    files: PrefixedStore,
-    objects: BTreeMap<ObjectKey, ArchivedObject>,
-    cipher: Cipher,
+pub(super) struct CapturedObjects {
+    pub(super) files: PrefixedStore,
+    pub(super) objects: BTreeMap<ObjectKey, ArchivedObject>,
+    pub(super) cipher: Arc<dyn ArchiveKey>,
 }
 
 impl CapturedObjects {
@@ -418,16 +419,36 @@ impl ObjectStore for CapturedObjects {
     }
 
     async fn head(&self, name: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        let size = crate::cipher::object::plaintext_size(name, self.object(name)?.bytes)?;
+        let size = self.object(name)?.plaintext_bytes(name)?;
         Ok(StoredObject {
             key: name.clone(),
             size,
         })
     }
 
+    async fn observe_head(&self, name: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<StoredObject>> {
+        let object = self.object(name)?;
+        let mut observed = self.files.observe_head(name).await?;
+        if observed.value.size != object.bytes {
+            return Err(Error::ConflictingObject(name.to_string()));
+        }
+        observed.value.size = object.plaintext_bytes(name)?;
+        Ok(observed)
+    }
+
+    async fn observe_fresh_exact(&self, name: &ObjectKey, length: usize) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
+        let object = self.object(name)?;
+        if object.plaintext_bytes(name)? != length as u64 {
+            return Err(Error::ConflictingObject(name.to_string()));
+        }
+        let observed = super::observe_archive_object(&self.files, name, object).await?;
+        let value = object.open(self.cipher.as_ref(), name, observed.value).await?;
+        Ok(rtdb_storage::ObjectObservation { value, version: observed.version })
+    }
+
     async fn get(&self, name: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         let sealed = read_object(&self.files, name, self.object(name)?).await?;
-        self.cipher.open_object(name, &sealed)
+        self.object(name)?.open(self.cipher.as_ref(), name, sealed).await
     }
 
     async fn get_range(&self, name: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
@@ -484,8 +505,8 @@ mod tests {
         let material = [9; crate::keys::KEY_BYTES];
         let bytes = Bytes::from_static(b"checkpoint object");
         let files = PrefixedStore::new(archive.clone(), "world/objects");
-        let cipher = Cipher::new(&material)?;
-        let sealed = cipher.seal_deterministic(name.as_str(), &bytes)?;
+        let cipher = crate::keys::legacy_archive_key(&material)?;
+        let sealed = cipher.seal(name.as_str(), bytes.clone()).await?;
         files.put(&name, sealed.clone()).await?;
         files.put(&other, sealed.clone()).await?;
         let object = ArchivedObject {
@@ -511,7 +532,7 @@ mod tests {
         let reopened = CapturedObjects {
             files: PrefixedStore::new(archive, "world/objects"),
             objects: store.objects,
-            cipher: Cipher::new(&material)?,
+            cipher: crate::keys::legacy_archive_key(&material)?,
         };
         assert_eq!(reopened.get(&name).await?, bytes);
         Ok(())

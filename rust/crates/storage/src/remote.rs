@@ -106,6 +106,10 @@ impl RemoteStore {
 
     pub fn s3_namespace(&self) -> Option<&S3ObjectNamespace> { self.version_namespace.as_deref() }
 
+    pub fn s3_object_key(&self, key: &ObjectKey) -> Option<String> {
+        self.s3_namespace().map(|_| self.objects.path(key).to_string())
+    }
+
     pub fn with_terminal_allocation(mut self, allocation: uuid::Uuid) -> Self {
         self.terminal_allocation = Some(allocation);
         self

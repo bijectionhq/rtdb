@@ -34,6 +34,17 @@ pub struct ScanRequest<'a> {
     pub verifier: &'a dyn CandidateVerifier,
 }
 
+impl ScanRequest<'_> {
+    pub fn permits_ranked_uuid_id(&self, id: rtdb_plan::ColumnId) -> bool {
+        let table = &self.scan.table.name.table;
+        !table.is_owned_event_data()
+            && self.scan.columns.iter().any(|field| field.id == id && field.name == "_id"
+                && field.data_type == rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid))
+            && crate::scan::stores_uuid_ids(table, self.partitions)
+            && self.snapshot.live_has_canonical_entity_iids(table)
+    }
+}
+
 /// The rows the scan would return for a set of IIDs, after resolution and the scan's own predicates.
 #[async_trait]
 pub trait CandidateVerifier: Send + Sync {

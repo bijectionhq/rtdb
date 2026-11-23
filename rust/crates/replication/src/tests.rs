@@ -52,7 +52,7 @@ async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: 
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
+    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
     let effects = Arc::new(NoEffects);
     let cancellation = CancellationToken::new();
     let (handle, driver) = match clock {
@@ -746,7 +746,7 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
     fixture.driver.consume(record).await.unwrap();
     assert_eq!(fixture.driver.fence.position(), TermPosition::Expecting(TermSequence(1)));
     fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
-    let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()) });
+    let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()), ..Default::default() });
     fixture.driver.consume(raw(2, 1, 1, missing)).await.unwrap();
     assert_eq!(fixture.driver.read_position, rtdb_types::ReplicaPosition(2));
 }
@@ -770,6 +770,67 @@ async fn retained_replay_requires_the_offload_even_when_readback_cached_it() {
     fixture.store.delete(&rtdb_storage::ObjectKey::new(stored).unwrap()).await.unwrap();
     assert!(fixture.logs.resolve_oversized(record.clone()).await.is_ok());
     assert_eq!(fixture.logs.resolve_oversized_fresh(record).await.unwrap_err().code, "rtdb.storage/missing-object");
+}
+
+#[tokio::test]
+async fn cancelled_fresh_offload_read_keeps_its_delivery_until_provider_drain() {
+    use rtdb_storage::{IoRegion, ObjectKey, StoredObject};
+
+    struct HeldDelivery { bytes: Vec<u8>, _hold: Arc<()> }
+    impl AsRef<[u8]> for HeldDelivery {
+        fn as_ref(&self) -> &[u8] { &self.bytes }
+    }
+
+    struct Provider {
+        region: Arc<IoRegion>,
+        memory: Arc<MemoryStore>,
+        gate: Mutex<Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+    #[async_trait]
+    impl ObjectStore for Provider {
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.memory.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.memory.get(key).await }
+        async fn get_range(&self, key: &ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.memory.get_range(key, range).await }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.memory.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.memory.put_file(key, path).await }
+        async fn list(&self, key: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> { self.memory.list(key).await }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> { self.memory.delete(key).await }
+        async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
+            let bytes = self.memory.get_fresh_exact(key, length).await?;
+            let (started, release) = self.gate.lock().take().unwrap();
+            self.region.run_blocking(move || {
+                started.send(()).unwrap();
+                let _ = release.recv();
+                Ok(bytes)
+            }).await
+        }
+    }
+
+    let memory = Arc::new(MemoryStore::default());
+    let region = IoRegion::new();
+    let (started, entering) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let provider = Arc::new(Provider { region: Arc::clone(&region), memory: Arc::clone(&memory), gate: Mutex::new(Some((started, released))) });
+    let cache = Arc::new(BufferPool::new(provider.clone(), 1 << 20));
+    let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1024)), Arc::new(MemoryLog::new(1024)), StorageEpoch(0), StorageEpoch(0),
+        CURRENT_STORAGE_VERSION, StorageEpoch(0), provider, cache, MemoryBudget::new(1 << 20)).unwrap();
+    let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: resolved(0, 0) };
+    let bytes = envelope.encode();
+    let proxy = envelope.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(0), "held-read".into(), &bytes);
+    let key = proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap();
+    memory.put(&ObjectKey::new(key).unwrap(), Bytes::from(bytes)).await.unwrap();
+    let hold = Arc::new(());
+    let released_hold = Arc::downgrade(&hold);
+    let delivery = Bytes::from_owner(HeldDelivery { bytes: proxy.encode(), _hold: hold });
+    let record = logs.decode_replica(LogRecord { metadata: LogMetadata { offset: LogOffset(0), timestamp: Timestamp(0) }, payload: delivery }).unwrap().unwrap();
+    let waiter = tokio::spawn(async move { logs.resolve_oversized_fresh(record).await });
+    entering.await.unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(released_hold.upgrade().is_some());
+    release.send(()).unwrap();
+    region.close_and_wait().await;
+    assert!(released_hold.upgrade().is_none());
 }
 
 #[tokio::test]
@@ -912,7 +973,7 @@ async fn local_recovery_driver(
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
+    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
         scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
@@ -1718,7 +1779,7 @@ async fn queued_attach_readback(fixture: &mut Fixture, operation: &DbOp, positio
     let effects = Arc::clone(&fixture.driver.effects);
     let resolver = fixture.driver.leader.as_mut().unwrap().resolver_mut().unwrap();
     let verdict = super::check_db_op(effects.as_ref(), resolver, operation);
-    let staged = resolver.resolve_db_op(snapshot, position, Timestamp(100), operation.clone(), verdict, &resolve).unwrap();
+    let staged = resolver.resolve_db_op(snapshot, position, Timestamp(100), operation.clone(), verdict, &resolve).await.unwrap();
     let key = staged.result().tx_key();
     let (completion, receipt) = oneshot::channel();
     fixture.driver.enqueue_resolved(staged, Some(completion)).await.unwrap();
@@ -2018,11 +2079,11 @@ async fn confirmed_append_cannot_publish_without_its_staged_head() {
 async fn own_oversized_readback_checks_the_stored_transaction_bytes() {
     let substitutions: [Option<(&str, fn(&mut ReplicaEnvelope))>; 3] = [
         None,
-        Some(("xtdb.indexer/leader-read-back-mismatch", |frame| {
+        Some(("rtdb.format/oversized-payload-mismatch", |frame| {
             let ReplicaBody::ResolvedTx(message) = &mut frame.message else { panic!("expected a stored transaction"); };
             message.table_data.insert("public/forged".into(), vec![1, 2, 3]);
         })),
-        Some(("rtdb.format/oversized-term-mismatch", |frame| {
+        Some(("rtdb.format/oversized-payload-mismatch", |frame| {
             frame.term_sequence = Some(frame.term_sequence.unwrap().next().unwrap());
         })),
     ];
@@ -2342,7 +2403,7 @@ async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (R
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
+    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
     ReplicationDriver::new(config, logs, blocks, recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap()

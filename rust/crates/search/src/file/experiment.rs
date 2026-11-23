@@ -72,11 +72,11 @@ impl WindowSummary {
 impl Ranked {
     pub(crate) fn with_tie_bounds(&mut self, summary: &WindowSummary) {
         let Some(windows) = &mut self.0 else { return };
-        for (score, _) in &mut windows.windows { *score = 0.0; }
+        for (score, _, _) in &mut windows.windows { *score = 0.0; }
         for (index, term) in windows.scoring.query().terms().iter().enumerate() {
             let by_window = &summary.terms[term];
             let mut scores = BTreeMap::new();
-            for (score, window) in &mut windows.windows {
+            for (score, window, _) in &mut windows.windows {
                 let best = by_window[*window as usize].iter().map(|&(frequency, length)| {
                     *scores.entry((frequency, length)).or_insert_with(||
                         windows.scoring.term_score(index, frequency, length))
@@ -92,7 +92,7 @@ impl Ranked {
 
     pub(crate) fn experimental_bound(&self, summary: Option<&WindowSummary>) -> Option<Bound> {
         let windows = self.0.as_ref()?;
-        let &(score, window) = windows.windows.get(windows.next)?;
+        let &(score, window, _) = windows.windows.get(windows.next)?;
         let id = summary.map_or(i64::MIN, |summary| summary.minimum_ids[window as usize]);
         Some(Bound { score, id })
     }

@@ -99,8 +99,10 @@ fn inverse_frequency(term: &str, corpus: Option<&Corpus>) -> f64 {
 
 fn rounded_term_score(frequency: u32, length: u32, average: Option<f64>, idf: f64) -> f64 {
     let (frequency, length) = (f64::from(frequency), f64::from(length));
-    let average = average.unwrap_or(length);
-    let norm = if average > 0.0 { 1.0 - B + B * length / average } else { 1.0 };
+    let norm = match average {
+        Some(average) if average > 0.0 => 1.0 - B + B * length / average,
+        _ => 1.0,
+    };
     idf * frequency * (K1 + 1.0) / (frequency + K1 * norm)
 }
 
@@ -152,6 +154,18 @@ pub struct RankScorer(Arc<Scorer>);
 impl RankScorer {
     pub fn scorer(&self) -> &Arc<Scorer> { &self.0 }
 
+    /// Prefix maxima of the exact document-local term scores for the common low-frequency case.
+    /// The binary64 formula can round non-monotonically, so the maximum observed frequency alone is insufficient.
+    pub fn exact_document_local_bounds(&self, term: usize, maximum_frequency: u32) -> Vec<f64> {
+        const MAX_EXACT_FREQUENCY: u32 = 256;
+        if self.0.average.is_some() { return Vec::new(); }
+        let mut maximum = 0.0f64;
+        (0..=maximum_frequency.min(MAX_EXACT_FREQUENCY)).map(|frequency| {
+            maximum = maximum.max(self.0.term_score(term, frequency, 0));
+            maximum
+        }).collect()
+    }
+
     /// Bounds a term independently so adding the bounds in score order preserves the bound at each rounding step.
     /// For positive weights in the admitted range, the four operations after normalization are normal binary64.
     /// The selected padding covers rounding of both the row's score and the window's score. See verification/smt/rank-bound.smt2.
@@ -170,6 +184,24 @@ pub fn bm25(query: &Query, document: &[String], corpus: Option<&Corpus>) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_document_local_bounds_cover_every_admitted_frequency_and_length() {
+        let scoring = std::sync::Arc::new(Scorer::new(Query::parse("invoice"), None));
+        let rank = scoring.for_ranking().unwrap();
+        let bound = rank.exact_document_local_bounds(0, 257);
+        assert_eq!(bound.len(), 257);
+        let lengths = [0, 1, 40, 2048, 1 << 31, u32::MAX];
+        for frequency in 0..=256 {
+            let score = scoring.term_score(0, frequency, 0);
+            for length in lengths {
+                assert_eq!(scoring.term_score(0, frequency, length), score);
+            }
+            assert!(score <= bound[frequency as usize]);
+            assert_eq!(bound[frequency as usize], (0..=frequency)
+                .map(|n| scoring.term_score(0, n, 0)).fold(0.0f64, f64::max));
+        }
+    }
 
     #[test]
     fn tokens_split_on_non_alphanumerics_and_lowercase() {

@@ -11,6 +11,7 @@ use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{ArrowDocuments, Documents, EntityIds, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
+use crate::bounded_retry::{BOUNDED_RETRY_METADATA_KEY, BoundedRetry};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
 
 const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
@@ -57,6 +58,7 @@ pub struct SourceTransaction {
 pub(crate) enum SourceGuard {
     Application(IdempotencyGuard),
     Replay(ReplaySubmission),
+    Bounded(BoundedRetry),
 }
 
 pub(crate) struct IdempotencyGuard {
@@ -72,7 +74,7 @@ impl SourceTransaction {
 
     pub fn new(ops: Vec<TxOp>, options: SubmitOptions, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let operations = ops.into_iter().map(Operation::Public).collect();
-        Self::from_operations(operations, options, memory)
+        Self::from_operations(operations, options, memory)?.with_bounded_retry()
     }
     pub(crate) fn from_operations(operations: Vec<Operation>, options: SubmitOptions, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut bytes = operations.capacity().checked_mul(std::mem::size_of::<Operation>()).and_then(|size| size.checked_add(options.default_tz.capacity())).and_then(|size| size.checked_add(options.user.as_ref().map_or(0, String::capacity))).ok_or_else(overflow)?;
@@ -125,6 +127,11 @@ impl SourceTransaction {
         self
     }
 
+    pub(crate) fn with_bounded_retry(mut self) -> Result<Self> {
+        self.guard = BoundedRetry::from_metadata(self.options.user_metadata.as_ref())?.map(SourceGuard::Bounded);
+        Ok(self)
+    }
+
     pub fn with_placed_seed(mut self, seed: Option<PlacedAttemptSeed>) -> Self {
         self.placed_seed = seed;
         self
@@ -155,13 +162,13 @@ impl SourceTransaction {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
                 let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, system_time: tx.system_time_micros.map(Timestamp), user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
-                let guard = match (&tx.idempotency_guard, &tx.replay_submission) {
-                    (Some(guard), None) => {
+                let guard = match (&tx.idempotency_guard, &tx.replay_submission, &tx.bounded_retry) {
+                    (Some(guard), None, None) => {
                         let submitted_at = Timestamp(guard.submitted_at_micros.ok_or_else(|| invalid("Idempotency guard has no submission timestamp"))?);
                         let after_bootstrap = guard.after_bootstrap.ok_or_else(|| invalid("Idempotency guard has no operation position"))?;
                         Some(SourceGuard::Application(IdempotencyGuard { submitted_at, after_bootstrap }))
                     }
-                    (None, Some(replay)) => {
+                    (None, Some(replay), None) => {
                         let key = replay.key.as_deref().ok_or_else(|| invalid("Replay submission has no key"))?;
                         let submitted_at = Timestamp(replay.submitted_at_micros.ok_or_else(|| invalid("Replay submission has no submission timestamp"))?);
                         let not_after = Timestamp(replay.not_after_micros.ok_or_else(|| invalid("Replay submission has no cutoff"))?);
@@ -169,8 +176,17 @@ impl SourceTransaction {
                             .map_err(|error| invalid(format!("Invalid replay submission: {error}")))?;
                         Some(SourceGuard::Replay(replay))
                     }
-                    (None, None) => None,
-                    (Some(_), Some(_)) => return Err(invalid("Source transaction contains two replay guards")),
+                    (None, None, Some(retry)) => {
+                        let nonce = retry.nonce.as_deref().ok_or_else(|| invalid("Bounded retry has no nonce"))?;
+                        let cutoff = retry.not_after_micros.ok_or_else(|| invalid("Bounded retry has no cutoff"))?;
+                        let identity = BoundedRetry::new(nonce, cutoff)?;
+                        if BoundedRetry::from_metadata(options.user_metadata.as_ref())? != Some(identity) {
+                            return Err(invalid("Bounded retry disagrees with transaction metadata"));
+                        }
+                        Some(SourceGuard::Bounded(identity))
+                    }
+                    (None, None, None) => None,
+                    _ => return Err(invalid("Source transaction contains multiple retry guards")),
                 };
                 let abort_on_legacy_resolver = match tx.replay_submission.as_ref().and_then(|replay| replay.abort_on_legacy_resolver) {
                     Some(true) => true,
@@ -219,7 +235,7 @@ impl SourceTransaction {
             let source_bytes = page.reservation().bytes();
             for row in 0..union.len() { operations.push(reader.operation(union, row, source_bytes)?); }
         }
-        if abort_on_legacy_resolver {
+        if abort_on_legacy_resolver || matches!(guard, Some(SourceGuard::Bounded(_))) {
             if !matches!(operations.first(), Some(Operation::Public(TxOp::Sql { sql, args: None })) if sql == LEGACY_REPLAY_ABORT) {
                 return Err(invalid("Replay submission has no legacy resolver assertion"));
             }
@@ -257,13 +273,19 @@ impl SourceTransaction {
         if let Some(Value::Struct(fields)) = self.options.user_metadata.as_ref().map(UserMetadata::value) {
             let mut rest = fields.clone();
             rest.remove("idempotency_key");
+            if matches!(self.guard, Some(SourceGuard::Bounded(_))) { rest.remove(BOUNDED_RETRY_METADATA_KEY); }
             field(encode_metadata(&UserMetadata::new(Value::Struct(rest), &self.memory)?, &self.memory)?.as_slice());
         }
         Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     pub fn encode(&self) -> Result<RetainedBytes> {
-        let prefix = matches!(self.guard, Some(SourceGuard::Replay(_))).then(|| {
+        let bounded = BoundedRetry::from_metadata(self.options.user_metadata.as_ref())?;
+        let attached = match &self.guard { Some(SourceGuard::Bounded(retry)) => Some(*retry), _ => None };
+        if bounded != attached {
+            return Err(invalid("Bounded retry cannot share another retry guard"));
+        }
+        let prefix = matches!(self.guard, Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_))).then(|| {
             Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
         });
         let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
@@ -272,18 +294,22 @@ impl SourceTransaction {
         let body_size = bytes.as_slice().len().checked_add(metadata.as_ref().map_or(0, |bytes| bytes.as_slice().len())).and_then(|bytes| bytes.checked_add(self.options.default_tz.capacity())).and_then(|bytes| bytes.checked_add(self.options.user.as_ref().map_or(0, String::capacity))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let _body_reservation = self.memory.reserve(body_size)?;
         use rtdb_format::generated::xtdb::log::proto;
-        let (idempotency_guard, replay_submission) = match &self.guard {
+        let (idempotency_guard, replay_submission, bounded_retry) = match &self.guard {
             Some(SourceGuard::Application(guard)) => (Some(proto::IdempotencyGuard {
                 submitted_at_micros: Some(guard.submitted_at.0),
                 after_bootstrap: Some(guard.after_bootstrap),
-            }), None),
+            }), None, None),
             Some(SourceGuard::Replay(replay)) => (None, Some(proto::ReplaySubmission {
                 key: Some(replay.key().to_owned()),
                 submitted_at_micros: Some(replay.submitted_at().0),
                 not_after_micros: Some(replay.not_after().0),
                 abort_on_legacy_resolver: Some(true),
+            }), None),
+            Some(SourceGuard::Bounded(retry)) => (None, None, Some(proto::BoundedRetry {
+                nonce: Some(retry.nonce().as_bytes().to_vec()),
+                not_after_micros: Some(retry.cutoff().0),
             })),
-            None => (None, None),
+            None => (None, None, None),
         };
         let tx = rtdb_format::generated::xtdb::log::proto::Tx {
             tx_ops: Some(bytes.as_slice().to_vec()), system_time_micros: self.options.system_time.map(|time| time.0),
@@ -291,6 +317,7 @@ impl SourceTransaction {
             user_metadata: metadata.as_ref().map(|bytes| bytes.as_slice().to_vec()), external_source_token: None,
             idempotency_guard,
             replay_submission,
+            bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec()),
         };
         let wire = rtdb_format::generated::xtdb::log::proto::SourceLogMessage { message: Some(SourceBody::Tx(tx)) };
