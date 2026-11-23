@@ -317,7 +317,13 @@ impl OwnedReadSession {
             return Err(unavailable());
         }
         let purge_guard = point.map(|point| {
-            if !point.relation.is_root_data() || point.valid_at != self.present.system_time {
+            let audience_marker = self.applied_preparation.is_some()
+                && point.relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+                && matches!(&point.id, rtdb_types::EntityId::String(id) if id
+                    .strip_prefix("fact_partition_head:")
+                    .and_then(|relation| rtdb_types::OwnedRelation::new(relation).ok())
+                    .is_some_and(|relation| relation.is_root_data()));
+            if !(point.relation.is_root_data() || audience_marker) || point.valid_at != self.present.system_time {
                 return Err(unavailable());
             }
             self.relation_release_guard([&point.relation])

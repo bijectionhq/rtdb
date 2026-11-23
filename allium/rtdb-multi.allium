@@ -2263,6 +2263,7 @@ rule ConfirmHostedAppliedRead {
     requires: original.session = session
     requires: controls.all(CheckFromInstalledAllowlist)
     requires: point = null or OrdinaryRootPointAt(point, original.basis)
+              or (original.audience_preparation != null and RootPartitionMarkerAt(point, original.basis))
 
     ensures:
         let current = CaptureAppliedCatalog(holding)

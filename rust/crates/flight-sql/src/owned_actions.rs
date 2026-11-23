@@ -2110,6 +2110,10 @@ impl Service {
 
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let audience = call.session.audience_source().is_some();
+        if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
+            return Err(invalid("The audience page exceeds its carrier bounds"));
+        }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
@@ -2160,6 +2164,11 @@ impl Service {
                 descending: *descending,
                 limit,
             };
+            if audience && (!(1..=5).contains(&request.limit) || request.descending
+                || request.lower.is_some() || request.upper.is_some() || !relation.is_root_data())
+            {
+                return Err(invalid("The audience page requires a bounded forward Root scan"));
+            }
             if let (Some(system), Some(valid)) = (system, valid_at) {
                 held.snapshot.range_page_by_key_at_system(&relation, &path, request, system, valid)
                     .await.map(|page| (page, None, None))
