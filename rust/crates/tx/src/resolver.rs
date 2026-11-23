@@ -26,6 +26,7 @@ mod hosted_control;
 mod prepared_landing;
 pub(crate) use prepared_landing::PreparedLanding;
 mod constraint_receipt;
+mod schedule_order;
 mod retry;
 mod retention;
 pub use retention::installed_receipt_time;
@@ -1516,6 +1517,9 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::HostedControl(control)) => Some(control),
             _ => None,
         }))?;
+        if replay.is_none() {
+            schedule_order::validate(operations)?;
+        }
         let mut deadline = None;
         for operation in operations {
             if let Operation::Public(TxOp::OwnedDeadline { until, .. }) = operation {

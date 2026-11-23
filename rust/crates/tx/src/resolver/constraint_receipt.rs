@@ -402,8 +402,6 @@ fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<V
     }
     let path = if !clock {
         "/continuation/completion"
-    } else if original.get("previous_delivery").is_some() && original.get("delivered").is_none() {
-        "/previous_delivery/completion"
     } else {
         "/delivered"
     };
