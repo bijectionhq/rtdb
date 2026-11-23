@@ -167,6 +167,7 @@ pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_SCOPED_READ_V1: &str = "rtdb.owned.OpenOwnedScopedRead.v1";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
+pub(crate) const OPEN_APPLIED_OWNED_READ_V1: &str = "rtdb.owned.OpenAppliedRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
@@ -953,12 +954,37 @@ impl Service {
     pub(crate) async fn open_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if !body.is_empty() { return Err(invalid("Owned read open takes an empty body")); }
+        self.retain_new_owned_read(call, None).await
+    }
+
+    pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if call.session.placed_database() != Some(call.database.as_str()) {
+            return Err(Status::permission_denied("An applied owned read requires its placed owner session"));
+        }
+        let (offset, time) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Applied read requires a transaction floor"))?;
+        let time: [u8; 8] = time.try_into().map_err(|_| invalid("Applied read requires an exact floor time"))?;
+        let tx_id = i64::from_be_bytes(*offset);
+        if tx_id < 0 { return Err(invalid("Applied read requires a nonnegative transaction ID")); }
+        let minimum = rtdb_types::TransactionKey {
+            tx_id: rtdb_types::TxId(tx_id),
+            system_time: Timestamp(i64::from_be_bytes(time)),
+        };
+        self.retain_new_owned_read(call, Some(minimum)).await
+    }
+
+    async fn retain_new_owned_read(
+        &self, call: &Call, applied_floor: Option<rtdb_types::TransactionKey>,
+    ) -> Result<ActionResult, Status> {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
-        let snapshot = native.open_owned_read().await.map_err(status)?;
+        let snapshot = match applied_floor {
+            Some(minimum) => native.open_applied_owned_read(minimum).await,
+            None => native.open_owned_read().await,
+        }.map_err(status)?;
         self.retain_owned_read(call, snapshot, permit, true)
     }
 

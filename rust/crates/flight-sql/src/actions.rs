@@ -33,6 +33,7 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V1 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange).await?)]),

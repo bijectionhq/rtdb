@@ -52,7 +52,7 @@ async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agen
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     let connections = pgwire_connections();
-    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\n")).unwrap();
+    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\nflightSql: {{port: 0, ownedNativeActions: true}}\n")).unwrap();
     process::start_node(Arc::clone(directory), process::NodeSettings {
         hosted_task: None,
         advertise_host: None,

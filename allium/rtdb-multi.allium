@@ -2108,6 +2108,21 @@ rule ConfirmHostedSourceOwner {
             Replied(session, unavailable: true)
 }
 
+rule OpenHostedAppliedRead {
+    when: HostedAppliedReadRequested(holding, session, floor)
+
+    requires: session.deployment = holding.deployment.id
+    requires: ConfirmHostedSourceOwner(holding, session)
+
+    ensures:
+        let captured = CaptureAppliedCatalog(holding)
+        if CurrentCatalogLease(holding, captured)
+           and CoversTransaction(captured.basis, floor):
+            HeldReadOpened(session, captured, basis: captured.basis)
+        else:
+            Replied(session, unavailable: true)
+}
+
 rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 

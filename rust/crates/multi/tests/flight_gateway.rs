@@ -3,7 +3,7 @@ mod common;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use arrow_flight::{FlightDescriptor, HandshakeRequest, Ticket, flight_service_client::FlightServiceClient,
+use arrow_flight::{Action, FlightDescriptor, HandshakeRequest, Ticket, flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient}};
 use futures::TryStreamExt;
 use prost::Message;
@@ -16,6 +16,65 @@ use common::{Cell, control, secret};
 
 async fn channel(address: SocketAddr) -> Channel {
     Channel::from_shared(format!("http://{address}")).unwrap().connect().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applied_owned_read_reuses_the_catalog_and_refuses_an_unapplied_floor() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let pgwire = cell.connect("shop").await;
+    pgwire.simple_query("INSERT INTO orders (_id, total) VALUES (1, 77)").await.unwrap();
+    pgwire.simple_query("SELECT total FROM orders").await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancellation = CancellationToken::new();
+    let options = GatewayOptions { capabilities: Some(secret()), ..Default::default() };
+    let driver = tokio::spawn(flight_gateway::serve(listener, Arc::clone(&cell.directory), options, cancellation.clone()));
+    let mut flight = FlightSqlServiceClient::new(channel(address).await);
+    let selector = format!("shop@{}", id.simple());
+    flight.set_header("x-xtdb-database", &selector);
+    flight.handshake("xtdb", "cell-test").await.unwrap();
+    let route = flight.token().unwrap();
+    let action = |name: &str, body: Vec<u8>| {
+        let mut request = Request::new(Action { r#type: name.to_owned(), body: body.into() });
+        request.metadata_mut().insert("authorization", format!("Bearer {route}").parse().unwrap());
+        request.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
+        request
+    };
+
+    let node = cell.node(cell.holder("shop").await.unwrap()).server.node();
+    let floor = node.latest_completed_transactions().unwrap()["shop"][0].unwrap();
+    let mut request = floor.tx_id.0.to_be_bytes().to_vec();
+    request.extend_from_slice(&floor.system_time.0.to_be_bytes());
+    let mut raw = FlightServiceClient::new(channel(address).await);
+    for _ in 0..2 {
+        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v1", request.clone()))
+            .await.unwrap().into_inner();
+        let result = results.message().await.unwrap().unwrap();
+        assert!(results.message().await.unwrap().is_none());
+        assert_eq!(result.body.len(), 32);
+        assert_eq!(&result.body[16..24], &floor.system_time.0.to_be_bytes());
+        assert_eq!(&result.body[24..32], &floor.tx_id.0.to_be_bytes());
+        let mut closed = raw.do_action(action("rtdb.owned.CloseRead.v1", result.body[..16].to_vec()))
+            .await.unwrap().into_inner();
+        assert!(closed.message().await.unwrap().is_none());
+    }
+    assert_eq!(node.latest_completed_transactions().unwrap()["shop"][0], Some(floor));
+
+    request[..8].copy_from_slice(&(floor.tx_id.0 + 1).to_be_bytes());
+    request[8..].copy_from_slice(&(floor.system_time.0 + 1).to_be_bytes());
+    let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v1", request)).await {
+        Ok(response) => response.into_inner().message().await.unwrap_err(),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("does not cover"));
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+    cell.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

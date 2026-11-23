@@ -87,6 +87,13 @@ impl NodeServices {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CatalogReadCut {
+    Current,
+    Reserved(TransactionKey),
+    HostedApplied(TransactionKey),
+}
+
 #[derive(Clone)]
 pub struct Node {
     catalog: Arc<DatabaseCatalog>,
@@ -364,14 +371,24 @@ impl Node {
     }
 
     pub async fn query_context(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        self.query_context_in_placement(database, basis, identity, None, None, cancellation).await
+        self.query_context_in_placement(database, basis, identity, None, CatalogReadCut::Current, cancellation).await
     }
 
-    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, exact: Option<TransactionKey>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cut: CatalogReadCut, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
-        let held = (placed || exact.is_some()).then(|| self.attached_database(database, placement)).transpose()?;
-        if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+        let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
+        match cut {
+            CatalogReadCut::HostedApplied(_) => {
+                self.ensure_indexing()?;
+                let attached = held.as_ref().filter(|_| placed && placement.is_some()).ok_or_else(hosted_source_unavailable)?;
+                let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
+                fence.confirm_hosted(attached).await?;
+            }
+            CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
+                if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+            }
+        }
         if let Some(previous) = &held {
             let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
             if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
@@ -381,17 +398,40 @@ impl Node {
         let fragment_residence = held.as_ref().and_then(|database| database.fragment_residence().cloned());
         let mut snapshots = BTreeMap::new();
         let mut lease: Option<Arc<rtdb_storage::ReadLease>> = None;
+        let mut applied = None;
         let classic = if held.is_some() { BTreeMap::new() } else { self.catalog.open_databases() };
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
-            if let Some(database_lease) = self.catalog_read_lease(&database).await? {
+            let database_lease = match cut {
+                CatalogReadCut::HostedApplied(_) => Some(database.applied_read_lease(&self.factory.clock, &self.factory.options.garbage)?),
+                CatalogReadCut::Current | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
+            };
+            if let Some(database_lease) = database_lease {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
-            let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
-            let snapshot = if exact.is_some() { database.partition.snapshot() } else { database.partition.open_snapshot(head) };
-            if exact.is_some_and(|cut| snapshot.tx_basis() != Some(cut)) {
-                return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/capture-raced", "The exact reserved transaction is no longer the applied catalog head"));
-            }
+            let snapshot = match cut {
+                CatalogReadCut::Current => {
+                    let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
+                    database.partition.open_snapshot(head)
+                }
+                CatalogReadCut::Reserved(reserved) => {
+                    let snapshot = database.partition.snapshot();
+                    if snapshot.tx_basis() != Some(reserved) {
+                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/capture-raced", "The exact reserved transaction is no longer the applied catalog head"));
+                    }
+                    snapshot
+                }
+                CatalogReadCut::HostedApplied(minimum) => {
+                    crate::read_currency::require_current(&name, lease.as_deref())?;
+                    let snapshot = database.partition.snapshot();
+                    let selected = snapshot.tx_basis().filter(|selected| *selected == minimum
+                        || (selected.tx_id > minimum.tx_id && selected.system_time > minimum.system_time))
+                        .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-below-floor",
+                            "The local applied catalog does not cover the caller's transaction floor"))?;
+                    applied = Some(selected);
+                    snapshot
+                }
+            };
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
             if let Some(requested) = requested.filter(|requested| snapshot.tx_basis().is_none_or(|head| *requested > head.system_time.into())) {
                 return Err(rtdb_query::unindexed_tx(requested, snapshot.tx_basis()));
@@ -402,6 +442,13 @@ impl Node {
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }
         crate::read_currency::require_current(database, lease.as_deref())?;
+        let applied_basis = applied.map(|selected| QueryBasis {
+            snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(selected.system_time.into())])]) },
+            snapshot_time: Some(selected.system_time),
+            current_time: selected.system_time.into(),
+            timezone: basis.timezone.clone(),
+        });
+        let basis = applied_basis.as_ref().unwrap_or(basis);
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
@@ -504,7 +551,7 @@ impl Node {
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, None, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
         let options = rtdb_sql::PrepareOptions {
@@ -534,7 +581,7 @@ impl Node {
     }
     async fn placed_outcome_key(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, None, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let sql = "SELECT tx_id, tx_system_time FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
         let prepared = match prepare_query(sql, &context, &options) {
@@ -620,7 +667,7 @@ impl Node {
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
-        let context = self.query_context_in_placement(database, &basis, identity, placement, None, cancellation).await?;
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
             .execute(context, vec![Value::I64(tx_id.0)]).await?;
@@ -2599,6 +2646,13 @@ impl NativeSession {
     }
     /// Retains the exact applied catalog at one store-reserved transaction for repeated reads.
     pub async fn open_owned_read(&mut self) -> Result<OwnedReadSession> {
+        self.retain_owned_read(None).await
+    }
+    /// Retains the already-applied catalog from the current recovered hosted holder.
+    pub async fn open_applied_owned_read(&mut self, minimum: TransactionKey) -> Result<OwnedReadSession> {
+        self.retain_owned_read(Some(minimum)).await
+    }
+    async fn retain_owned_read(&mut self, applied_floor: Option<TransactionKey>) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
         let node = self.service.node.clone();
         let identity = Arc::clone(&self.service.identity);
@@ -2613,18 +2667,26 @@ impl NativeSession {
             _ => None,
         };
         let attached = Arc::downgrade(&attached);
-        let present = self.reserve_ordered_present().await?;
+        let (reserved, cut) = match applied_floor {
+            Some(minimum) => (None, CatalogReadCut::HostedApplied(minimum)),
+            None => {
+                let present = self.reserve_ordered_present().await?;
+                (Some(present.system_time), CatalogReadCut::Reserved(present))
+            }
+        };
         let basis = QueryBasis {
-            snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![Some(present.system_time.into())])]) },
-            snapshot_time: Some(present.system_time),
-            current_time: present.system_time.into(),
+            snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![reserved.map(Into::into)])]) },
+            snapshot_time: reserved,
+            current_time: reserved.map_or_else(|| node.query_instant(), Into::into),
             timezone: self.state.session_timezone().to_owned(),
         };
         let session_cancellation = self.state.cancellation().clone();
         let cancellation = session_cancellation.child_token();
         let context = node.query_context_in_placement(
-            &database, &basis, identity.as_ref(), Some(&attached), Some(present), &cancellation,
+            &database, &basis, identity.as_ref(), Some(&attached), cut, &cancellation,
         ).await?;
+        let present = context.catalog.database(&database)?.partitions.first().and_then(|partition| partition.tx_basis())
+            .ok_or_else(hosted_source_unavailable)?;
         let lease = context.catalog.read_lease();
         let witness_scope = witness_scope.filter(|_| lease.as_ref().and_then(|lease| lease.deadline()).is_some());
         let clock = Arc::clone(&node.factory.clock);
@@ -2743,7 +2805,7 @@ impl NativeSessionService {
     }
 
     pub(crate) async fn query_context(&self, database: &str, basis: &QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
-        self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), None, cancellation).await
+        self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation).await
     }
 
     pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<HostedSourceReceipt>> {
