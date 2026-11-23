@@ -159,10 +159,10 @@ impl OwnedWorldHost for PlacedWorldHost {
 }
 
 impl OwnedWorldRead for HeldCheckpointWorld {
-    fn prepare_overlay_cut<'a>(
+    fn retained_child_cut<'a>(
         &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>> {
-        Box::pin(HeldCheckpointWorld::prepare_overlay_cut(self, scope, system))
+        Box::pin(HeldCheckpointWorld::retained_child_cut(self, scope, system))
     }
 
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }

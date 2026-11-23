@@ -116,7 +116,7 @@ pub struct WorldParentVersions {
 
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
-    fn prepare_overlay_cut<'a>(
+    fn retained_child_cut<'a>(
         &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>>;
     fn present(&self) -> Timestamp;

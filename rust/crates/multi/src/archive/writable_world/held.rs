@@ -267,10 +267,15 @@ impl HeldCheckpointWorld {
     pub fn initial_clock(&self) -> Timestamp { self.open.record.initial_clock() }
     pub fn clock_mode(&self) -> WorldClockMode { self.open.record.mode }
 
-    pub async fn prepare_overlay_cut(
+    pub async fn retained_child_cut(
         &self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> Result<rtdb_node::OwnedForkCut> {
         self.check()?;
+        if self.open.record.ancestor.is_none() && system == self.open.record.basis.system_time {
+            let cut = self.open.snapshot.fork_inherited_root_cut(scope, &self.open.record).await?;
+            self.check()?;
+            return Ok(cut);
+        }
         let archived = if self.open.record.ancestor.is_some() {
             let relations = self.open.record.schemas.relations().map(|(name, _)| OwnedRelation::new(name))
                 .collect::<Result<Vec<_>>>()?;

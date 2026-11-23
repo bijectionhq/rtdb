@@ -1316,7 +1316,7 @@ impl OwnedReadSession {
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
             publication: false,
-            overlay: None,
+            retained_world: None,
             renewal: false,
             until: self.fork_until,
             scope,
@@ -1362,7 +1362,30 @@ impl OwnedReadSession {
         self.check_overlay_standing(world).await?;
         cut.live = None;
         cut.basis = system;
-        cut.overlay = Some((world.id, world.pin, clock));
+        cut.retained_world = Some(RetainedWorldCut::Overlay(world.id, world.pin, clock));
+        cut.until = cut.until.min(world.until);
+        Ok(cut)
+    }
+
+    pub async fn fork_inherited_root_cut(
+        &self,
+        scope: rtdb_types::PlacedAttemptScope,
+        world: &rtdb_types::OwnedWorld,
+    ) -> Result<OwnedForkCut> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let mut cut = self.fork_cut(scope).await?;
+        if cut.live.is_none_or(|live| world.basis.system_time >= live.system_time || world.basis.tx_id >= live.tx_id)
+            || world.ancestor.is_some() || world.dropped
+            || world.mode == rtdb_types::WorldClockMode::Proposal
+            || world.parent_publication.is_none()
+            || !(1..=32).contains(&world.schemas.relations().count())
+        {
+            return Err(unavailable());
+        }
+        self.check_overlay_standing(world).await?;
+        cut.live = Some(world.basis);
+        cut.basis = world.basis.system_time;
+        cut.retained_world = Some(RetainedWorldCut::Parent(world.id, world.pin));
         cut.until = cut.until.min(world.until);
         Ok(cut)
     }
@@ -2585,17 +2608,34 @@ pub struct OwnedForkCut {
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
     publication: bool,
-    overlay: Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)>,
+    retained_world: Option<RetainedWorldCut>,
     renewal: bool,
     until: Timestamp,
     scope: rtdb_types::PlacedAttemptScope,
+}
+
+#[derive(Clone, Copy)]
+enum RetainedWorldCut {
+    Parent(rtdb_types::Iid, rtdb_types::Iid),
+    Overlay(rtdb_types::Iid, rtdb_types::Iid, Timestamp),
 }
 
 impl OwnedForkCut {
     pub fn basis(&self) -> Timestamp { self.basis }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
     pub fn is_publication(&self) -> bool { self.publication }
-    pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> { self.overlay }
+    pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> {
+        match self.retained_world {
+            Some(RetainedWorldCut::Overlay(world, pin, clock)) => Some((world, pin, clock)),
+            Some(RetainedWorldCut::Parent(..)) | None => None,
+        }
+    }
+    pub fn retained_parent(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid)> {
+        match self.retained_world {
+            Some(RetainedWorldCut::Parent(world, pin)) => Some((world, pin)),
+            Some(RetainedWorldCut::Overlay(..)) | None => None,
+        }
+    }
     pub fn is_renewal(&self) -> bool { self.renewal }
     pub fn matches_basis(&self, basis: TransactionKey) -> bool {
         self.basis == basis.system_time && self.live.is_none_or(|live| live == basis)
@@ -2603,7 +2643,7 @@ impl OwnedForkCut {
             && ((basis.tx_id == self.issued_on.tx_id) == (basis.system_time == self.issued_on.system_time))
     }
     pub fn admits_overlay(&self, media: TransactionKey, system: Timestamp) -> bool {
-        self.overlay.is_some() && self.basis == system && system <= media.system_time
+        self.overlay().is_some() && self.basis == system && system <= media.system_time
             && media.system_time <= self.issued_on.system_time && media.tx_id <= self.issued_on.tx_id
             && ((media.tx_id == self.issued_on.tx_id) == (media.system_time == self.issued_on.system_time))
     }
@@ -2777,12 +2817,14 @@ impl NativeSession {
             .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
             .saturating_add(3 + usize::from(requires_tip));
         let overlay_source = fork.cut.overlay();
+        let parent_source = fork.cut.retained_parent();
+        let retaining_child = root == OwnedForkRoot::None && fork.previous.is_none()
+            && fork.sibling.is_none() && requested == rtdb_types::WorldClockMode::Retained;
         let matches_archive = match (&record.ancestor, overlay_source) {
-            (None, None) => fork.cut.matches_basis(record.basis),
+            (None, None) => fork.cut.matches_basis(record.basis)
+                && parent_source.is_none_or(|(source, _)| retaining_child && record.id != source),
             (Some(ancestor), Some((source, _, clock))) => record.id != source && ancestor.logical == clock
-                && root == OwnedForkRoot::None && fork.previous.is_none() && fork.sibling.is_none()
-                && requested == rtdb_types::WorldClockMode::Retained
-                && fork.cut.admits_overlay(ancestor.basis, ancestor.system),
+                && retaining_child && fork.cut.admits_overlay(ancestor.basis, ancestor.system),
             _ => false,
         };
         if record.id != fork.world || record.pin != fork.pin || !matches_archive
@@ -2836,7 +2878,7 @@ impl NativeSession {
             });
         }
         ops.push(TxOp::OwnedForkWorld { record: record.record(), previous: fork.previous, sibling: fork.sibling,
-            overlay_source: overlay_source.map(|(world, pin, _)| (world, pin)),
+            overlay_source: parent_source.or_else(|| overlay_source.map(|(world, pin, _)| (world, pin))),
             attempt: fork.attempt, fingerprint: fork.fingerprint, root });
         self.state.execute_tx(ops, Default::default()).await
     }
