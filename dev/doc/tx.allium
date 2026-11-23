@@ -109,10 +109,11 @@
 -- An empty relation is covered through the reserved present, and a request crossing untracked events or a missing group is refused.
 -- A held merged feed seeks the selected owner relations at one cut and groups their visible touches by ordered system time.
 -- A capped page publishes only whole visible commits, and a nonempty page resumes at its last visible commit.
--- An owned root relation may declare an immutable cap for each distinct fixed-length prefix of its binary fact key.
+-- An owned root relation may declare a cap for each distinct fixed-length prefix of its binary fact key.
 -- A populated relation can initialize its first cap when validity always begins at acceptance and has an open end.
 -- The declaration initializes each covered counter from the transaction's final visible membership at its ordering point.
 -- A prefix already above the proposed maximum aborts the declaration and the transaction's other writes.
+-- Redeclaration can change a projection's maximum while retaining its bucket identities and coverage. Tightening checks every bucket against the transaction's final state.
 -- A hosted Root commit can declare capacity alongside catalog effects, guarded by the checked installation authority.
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.

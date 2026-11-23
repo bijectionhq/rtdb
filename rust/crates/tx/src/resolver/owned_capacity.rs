@@ -23,9 +23,21 @@ pub(super) struct OwnedCapacityChanges {
 
 struct TouchedRule {
     policy: CapacityPolicy,
-    added: Vec<(String, Vec<u8>)>,
+    declarations: Vec<RuleDeclaration>,
     ids: BTreeSet<EntityId>,
     writes: i64,
+}
+
+struct RuleDeclaration {
+    column: String,
+    when: Vec<u8>,
+    previous_cap: Option<i64>,
+}
+
+impl RuleDeclaration {
+    fn matches(&self, rule: &CapacityRule) -> bool {
+        rule.identity() == (self.column.as_str(), self.when.as_slice())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -393,21 +405,24 @@ impl OpenTransaction<'_> {
         if !policy.rules.is_empty() && policy.through_events != base_frontier {
             return Err(uncovered());
         }
-        let index = match policy
+        let (index, previous_cap) = match policy
             .rules
             .binary_search_by(|prior| prior.identity().cmp(&rule.identity()))
         {
             Ok(index) if policy.rules[index] == rule => {
                 return Ok(());
             }
+            Ok(index) if policy.rules[index].prefix_bytes == rule.prefix_bytes => {
+                (index, Some(policy.rules[index].cap))
+            }
             Ok(_) => {
                 return Err(Anomaly::new(
                     AnomalyCategory::Conflict,
                     "rtdb.owned/capacity-exists",
-                    "The owned projection already has a different capacity rule",
+                    "A declared capacity projection retains its prefix width",
                 ));
             }
-            Err(index) => index,
+            Err(index) => (index, None),
         };
         let schema = self.read_owned_schema(owner, relation).await?;
         if let Some((schema, _)) = &schema
@@ -428,15 +443,25 @@ impl OpenTransaction<'_> {
                 "A populated relation needs acceptance validity to declare its first capacity rule",
             ));
         }
-        if policy.rules.len() >= MAX_RULES {
+        if previous_cap.is_none() && policy.rules.len() >= MAX_RULES {
             return Err(invalid_rule());
         }
-        let identity = (rule.column.clone(), rule.when.clone());
-        policy.rules.insert(index, rule);
+        let declaration = RuleDeclaration {
+            column: rule.column.clone(),
+            when: rule.when.clone(),
+            previous_cap,
+        };
+        if previous_cap.is_some() {
+            policy.rules[index] = rule;
+        } else {
+            policy.rules.insert(index, rule);
+        }
         policy.through_events = base_frontier;
+        let bytes = policy.retained_bytes()
+            + declaration.column.capacity() + declaration.when.capacity() + 128;
         self.capacity_changes
             .reservations
-            .push(self.context.memory.reserve(policy.retained_bytes())?);
+            .push(self.context.memory.reserve(bytes)?);
         let writes = frontier
             .checked_sub(base_frontier)
             .filter(|writes| *writes >= 0)
@@ -450,12 +475,18 @@ impl OpenTransaction<'_> {
             if touched.writes != writes {
                 return Err(uncovered());
             }
+            if touched.declarations.iter().any(|prior| prior.matches(&policy.rules[index])) {
+                return Err(Anomaly::incorrect(
+                    "rtdb.owned/capacity-repeat",
+                    "An owned capacity projection can change once per transaction",
+                ));
+            }
             touched.policy = policy;
-            touched.added.push(identity);
+            touched.declarations.push(declaration);
         } else {
             *slot = Some(TouchedRule {
                 policy,
-                added: vec![identity],
+                declarations: vec![declaration],
                 ids: BTreeSet::new(),
                 writes,
             });
@@ -488,7 +519,7 @@ impl OpenTransaction<'_> {
                 .push(self.context.memory.reserve(policy.retained_bytes())?);
             let rule = (!policy.rules.is_empty()).then_some(TouchedRule {
                 policy,
-                added: Vec::new(),
+                declarations: Vec::new(),
                 ids: BTreeSet::new(),
                 writes: 0,
             });
@@ -532,7 +563,7 @@ impl OpenTransaction<'_> {
             .relations
             .values()
             .flatten()
-            .all(|touched| touched.writes == 0 && touched.added.is_empty())
+            .all(|touched| touched.writes == 0 && touched.declarations.is_empty())
         {
             return Ok(());
         }
@@ -548,14 +579,14 @@ impl OpenTransaction<'_> {
         for (relation, touched) in changes.relations {
             let Some(TouchedRule {
                 mut policy,
-                added,
+                declarations,
                 ids,
                 writes,
             }) = touched
             else {
                 continue;
             };
-            if writes == 0 && added.is_empty() {
+            if writes == 0 && declarations.is_empty() {
                 continue;
             }
             let target = relation.table(&owner);
@@ -575,18 +606,35 @@ impl OpenTransaction<'_> {
             let mut locators = BTreeSet::from([EntityId::String(RULE.into()).iid()]);
             let mut proof = self.hosted_replay.as_ref().map(|_| ConstraintMembers::default());
             for rule in &policy.rules {
-                if added
-                    .iter()
-                    .any(|(column, when)| rule.identity() == (column.as_str(), when.as_slice()))
-                {
-                    self.bootstrap_capacity_rule(
-                        &owner, &relation, rule, &next, &mut locators, proof.as_mut(),
-                    ).await?;
-                } else if writes != 0 {
+                let previous_cap = match declarations.iter().find(|declaration| declaration.matches(rule)) {
+                    Some(RuleDeclaration { previous_cap: None, .. }) => {
+                        let counts = self.scan_capacity_counts(&owner, &relation, rule, &next).await?;
+                        let storage = relation.capacity_table(&owner);
+                        for (id, (count, _charge)) in counts {
+                            if !locators.insert(id.iid()) {
+                                return Err(uncovered());
+                            }
+                            if let Some(proof) = proof.as_mut() {
+                                proof.insert(&id, ConstraintMember::Count(count), &self.context.memory)?;
+                            }
+                            self.buffer.put(storage.clone(), count_document(&id, count), Interval::ALL)?;
+                        }
+                        continue;
+                    }
+                    Some(RuleDeclaration { previous_cap: Some(cap), .. }) => {
+                        if rule.cap < *cap {
+                            self.scan_capacity_counts(&owner, &relation, rule, &next).await?;
+                        }
+                        *cap
+                    }
+                    None => rule.cap,
+                };
+                if writes != 0 {
                     self.apply_capacity_rule(
                         &owner,
                         &relation,
                         rule,
+                        previous_cap,
                         &ids,
                         &base,
                         &next,
@@ -603,7 +651,7 @@ impl OpenTransaction<'_> {
                     writes,
                     through,
                     proof.finish(),
-                    added.len(),
+                    declarations.len(),
                 )?;
             }
             policy.through_events = through;
@@ -616,15 +664,13 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
-    async fn bootstrap_capacity_rule(
-        &mut self,
+    async fn scan_capacity_counts(
+        &self,
         owner: &str,
         relation: &OwnedRelation,
         rule: &CapacityRule,
         snapshot: &Snapshot,
-        locators: &mut BTreeSet<Iid>,
-        mut proof: Option<&mut ConstraintMembers>,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<EntityId, (i64, Arc<MemoryReservation>)>> {
         let qualifiers = predicates(&rule.when)?;
         let columns = rule.columns(&qualifiers);
         let context = self
@@ -645,7 +691,7 @@ impl OpenTransaction<'_> {
         )
         .await?
         else {
-            return Ok(());
+            return Ok(BTreeMap::new());
         };
         let mut counts = BTreeMap::new();
         while let Some(rows) = rows.next_batch().await? {
@@ -659,9 +705,6 @@ impl OpenTransaction<'_> {
                 let count = match counts.entry(id) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        if !locators.insert(entry.key().iid()) {
-                            return Err(uncovered());
-                        }
                         let charge = self.context.memory.reserve(
                             (prefix.len() + rule.column.len() + rule.when.len()) * 4 + 512,
                         )?;
@@ -678,15 +721,7 @@ impl OpenTransaction<'_> {
                 count.0 += 1;
             }
         }
-        let storage = relation.capacity_table(owner);
-        for (id, (count, _charge)) in counts {
-            if let Some(proof) = proof.as_deref_mut() {
-                proof.insert(&id, ConstraintMember::Count(count), &self.context.memory)?;
-            }
-            self.buffer
-                .put(storage.clone(), count_document(&id, count), Interval::ALL)?;
-        }
-        Ok(())
+        Ok(counts)
     }
 
     async fn apply_capacity_rule(
@@ -694,6 +729,7 @@ impl OpenTransaction<'_> {
         owner: &str,
         relation: &OwnedRelation,
         rule: &CapacityRule,
+        previous_cap: i64,
         ids: &BTreeSet<EntityId>,
         base: &Snapshot,
         next: &Snapshot,
@@ -753,7 +789,7 @@ impl OpenTransaction<'_> {
                 .await?
             {
                 None => 0,
-                Some(Value::I64(count)) if (1..=rule.cap).contains(&count) => count,
+                Some(Value::I64(count)) if (1..=previous_cap).contains(&count) => count,
                 Some(_) => return Err(uncovered()),
             };
             if delta.releases > count {

@@ -845,17 +845,32 @@ async fn populated_capacity_is_installed_at_the_final_relation_frontier() {
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(initial.committed(), "{:?}", initial.error());
 
-    let rule = || TxOp::OwnedDeclareCapacity {
-        relation: relation.clone(), column: "canonical".into(), prefix_bytes: 1, cap: 2, when: Vec::new(),
+    let rule = |cap| TxOp::OwnedDeclareCapacity {
+        relation: relation.clone(), column: "canonical".into(), prefix_bytes: 1, cap, when: Vec::new(),
     };
-    let refused = writer.state_mut().execute_tx(vec![rule()], AutonomousTxOptions::default()).await.unwrap();
+    let delete = |id| TxOp::OwnedDelete {
+        relation: relation.clone(), id: EntityId::Integer(id), valid_from: None, valid_to: None,
+    };
+    let refused = writer.state_mut().execute_tx(vec![rule(2)], AutonomousTxOptions::default()).await.unwrap();
     assert_eq!(refused.error().unwrap().code, "rtdb.owned/capacity-already-exceeded");
     let applied = writer.state_mut().execute_tx(vec![
-        TxOp::OwnedDelete { relation: relation.clone(), id: EntityId::Integer(1), valid_from: None, valid_to: None },
-        rule(),
+        delete(1), rule(2),
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(applied.committed(), "{:?}", applied.error());
     let next = writer.state_mut().execute_tx(vec![insert(4)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(next.error().unwrap().code, "rtdb.owned/capacity-exceeded");
+
+    let refused = writer.state_mut().execute_tx(vec![rule(1)], AutonomousTxOptions::default()).await.unwrap();
+    assert_eq!(refused.error().unwrap().code, "rtdb.owned/capacity-already-exceeded");
+    let swap = writer.state_mut().execute_tx(vec![delete(2), insert(4)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(swap.committed(), "{:?}", swap.error());
+    let raised = writer.state_mut().execute_tx(vec![rule(3), insert(5)], AutonomousTxOptions::default()).await.unwrap();
+    assert!(raised.committed(), "{:?}", raised.error());
+    let lowered = writer.state_mut().execute_tx(vec![
+        rule(1), delete(3), delete(4),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(lowered.committed(), "{:?}", lowered.error());
+    let next = writer.state_mut().execute_tx(vec![insert(6)], AutonomousTxOptions::default()).await.unwrap();
     assert_eq!(next.error().unwrap().code, "rtdb.owned/capacity-exceeded");
 
     drop(writer);
