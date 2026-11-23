@@ -430,6 +430,20 @@ impl LocalStore {
         }).await
     }
 
+    /// Retains local recovery media while startup opens its checkpoint and replica cursor.
+    pub async fn hold_recovery_open(&self) -> rtdb_types::Result<Arc<dyn Send + Sync>> {
+        let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
+        Ok(Arc::new(self.io.run(move || Ok(ledger.hold_recovery_open())).await??))
+    }
+
+    pub(crate) async fn try_lock_recovery_deletion(&self) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
+        let gate = self.io.run(move || Ok(ledger.try_lock_recovery_deletion())).await??;
+        Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
+    }
+
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
     pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
         let ledger = crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch());

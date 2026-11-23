@@ -102,6 +102,10 @@ The rebuild can select the persisted anchor directly under the original journal 
 The native replay rejects a persisted boundary that disagrees with the checked base export, and the harness rejects a program that skips that comparison.
 The filesystem lock, synchronization calls, and binding of the receipt to the actual journal media remain runtime premises.
 
+Coordinated native local startup holds a shared filesystem recovery gate while it discovers its checkpoint, loads table metadata and admits its replica cursor.
+Trie deletion grants and collection of old local checkpoint files or detached payloads require exclusive use of the gate through provider completion.
+The startup gate protects the selection interval. Long-lived holds for complete recovery closures remain a separate obligation.
+
 ## Retirement after an adopted compactor reset
 
 The coordinated reset stages the exact compacted trie pairs and the required successor block and naming epoch in the retirement journal before publication.

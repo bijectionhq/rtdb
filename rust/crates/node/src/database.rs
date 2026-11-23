@@ -315,6 +315,8 @@ impl DatabaseFactory {
         let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let checkpoint_metadata = resources.checkpoint_metadata.take();
+        let recovery_storage = Arc::clone(&resources.store);
+        let local_recovery = recovery_storage.local_maintenance_store().filter(|store| store.defers_trie_releases());
         let assembly = async {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
@@ -442,10 +444,17 @@ impl DatabaseFactory {
                 artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };
-        let opened = match checkpoint_metadata {
-            Some(hold) => IoRegion::retaining(hold, assembly).await,
-            None => assembly.await,
-        };
+        let opened = async {
+            let hold = match (checkpoint_metadata, local_recovery) {
+                (Some(hold), _) => Some(hold),
+                (None, Some(store)) => Some(store.hold_recovery_open().await?),
+                (None, None) => None,
+            };
+            match hold {
+                Some(hold) => IoRegion::retaining(hold, assembly).await,
+                None => assembly.await,
+            }
+        }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
     }

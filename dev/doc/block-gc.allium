@@ -11,7 +11,9 @@
 -- trie_catalog.clj). Followers do not reference them during online query
 -- execution, so a concurrent delete by the leader cannot break a running
 -- read path. As a result this collector needs NO replica-log coordination —
--- the leader just DELETEs its garbage and moves on.
+-- the leader checks the storage owner's startup hold and repair anchor before deleting old metadata.
+-- Coordinated native startup retains a shared recovery gate while choosing a checkpoint and admitting the replica cursor.
+-- Native metadata collection needs exclusive access to that gate through unlink.
 --
 -- Multi records a logical release first. For a versioned or enrolled terminal S3 block pack,
 -- the release names the owned pack and the exact publication observed for the member.

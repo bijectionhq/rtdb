@@ -1,12 +1,15 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use rtdb_format::trie_retirement::InstalledRetirement;
 use rtdb_types::{Anomaly, Result};
 
-use crate::{ObjectKey, ObjectStore};
+use crate::{IoRegion, ObjectKey, ObjectStore};
 
 struct TrieDeletionGrant<'a> {
     store: &'a dyn ObjectStore,
     files: Vec<ObjectKey>,
+    recovery_gate: Option<Arc<dyn Send + Sync>>,
 }
 
 impl<'a> TrieDeletionGrant<'a> {
@@ -23,15 +26,26 @@ impl<'a> TrieDeletionGrant<'a> {
         let files = selected.into_iter().map(|file| ObjectKey::new(&file.key))
             .collect::<crate::Result<Vec<_>>>()?;
 
+        let recovery_gate = if let Some(local) = store.local_maintenance_store() {
+            let Some(gate) = local.try_lock_recovery_deletion().await? else { return Ok(None); };
+            Some(gate)
+        } else { None };
+
         // The current conservative predicate uses the installed cut. Admission
         // and this grant can evolve independently once holds carry reachability.
         if !store.advance_catalog_floor(installed.cut()).await? { return Ok(None); }
-        Ok(Some(Self { store, files }))
+        Ok(Some(Self { store, files, recovery_gate }))
     }
 
     async fn erase(self) -> Result<()> {
-        for file in self.files { self.store.delete(&file).await?; }
-        Ok(())
+        let erase = async {
+            for file in self.files { self.store.delete(&file).await?; }
+            Ok(())
+        };
+        match self.recovery_gate {
+            Some(gate) => IoRegion::retaining(gate, erase).await,
+            None => erase.await,
+        }
     }
 }
 

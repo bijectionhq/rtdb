@@ -35,6 +35,18 @@ async fn a_local_trie_release_waits_for_held_catalogs_and_refuses_stale_reopens(
     forged[7] = 3;
     assert_eq!(collector.release_trie_files(&receipt, forged.into()).await.unwrap_err().code, "rtdb.storage/trie-release");
     assert!(reader.retain_catalog(Some(selected)).await?.is_some());
+
+    let recovery = reader.hold_recovery_open().await?;
+    let old_catalog = ObjectKey::new("blocks/b00.binpb")?;
+    collector.put(&old_catalog, Bytes::from_static(b"protected checkpoint metadata")).await?;
+    assert!(!collector.release_trie_files(&receipt, bytes.clone()).await?);
+    collector.collect_recovery_file(&old_catalog).await?;
+    assert_eq!(reader.get(&old_catalog).await?, Bytes::from_static(b"protected checkpoint metadata"));
+    assert!(reader.head(&file).await.is_ok());
+    drop(recovery);
+
+    collector.collect_recovery_file(&old_catalog).await?;
+    assert!(matches!(reader.head(&old_catalog).await, Err(Error::MissingObject(_))));
     assert!(collector.release_trie_files(&receipt, bytes.clone()).await?);
     let new_reader = open();
     assert_eq!(new_reader.retain_catalog(Some(selected)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
