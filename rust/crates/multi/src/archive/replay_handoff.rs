@@ -16,6 +16,13 @@ pub(super) fn may_install(
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(promotes =>
+    ensures promotes == (!selected_replay && completed_repair_matches),
+))]
+pub(super) fn promotes_completed_repair(selected_replay: bool, completed_repair_matches: bool) -> bool {
+    !selected_replay && completed_repair_matches
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(retained =>
     ensures retained <==> (selected.is_some() && selected.unwrap() == capture)
         || (repair.is_some() && repair.unwrap().0 == capture

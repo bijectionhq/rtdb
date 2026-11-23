@@ -1,8 +1,26 @@
 {
-  "summary": "Serving replay source selection requires an exact parked checkpoint, unchanged selection, a strictly advancing replacement, and retention of pending restore inputs.",
+  "summary": "Serving replay source selection requires an exact parked checkpoint, unchanged selection, a strictly advancing replacement of an existing selection, and retention of pending restore inputs.",
   "flags": ["--no-external-by-default", "--verify-module", "handoff", "--verify-root"],
-  "min_verified_functions": 9,
+  "min_verified_functions": 10,
   "controls": {
+    "promote_after_replay_selection": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/archive/replay_handoff.rs",
+        "find": "    !selected_replay && completed_repair_matches\n",
+        "replace": "    completed_repair_matches\n"
+      }],
+      "expect": [{"file": "rust/crates/multi/src/archive/replay_handoff.rs", "function": "promotes_completed_repair", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    },
+    "promote_repair_from_another_cut": {
+      "mutate": [{
+        "file": "rust/crates/multi/src/archive/replay_handoff.rs",
+        "find": "    !selected_replay && completed_repair_matches\n",
+        "replace": "    !selected_replay\n"
+      }],
+      "expect": [{"file": "rust/crates/multi/src/archive/replay_handoff.rs", "function": "promotes_completed_repair", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    },
     "switch_on_a_running_holder": {
       "defect": "A writer that opened the earlier physical source is still admitted during selection.",
       "mutate": [

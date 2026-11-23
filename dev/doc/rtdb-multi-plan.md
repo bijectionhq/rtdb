@@ -70,6 +70,10 @@ Hosted protocol 64 adds durable replay pack retirement for versioned serving buc
 Hosted protocol 65 extends it to enrolled never-versioned buckets using conditional tombstones with a durable upload journal.
 Upgrade all direct directory clients before enabling this reaper on a cell.
 The reaper uses its installed ECS task identity to hold the independent archive while checking the original pack.
+For a parked installation with a certified checkpoint from before trie framing, capture that checkpoint to independent archive storage and select its replay archive before reopening the installation.
+The capture authenticates the original complete members, writes framed archive objects, and keeps the published checkpoint and its original packs intact.
+A parked completed repair can select the new framed archive at the same certified checkpoint.
+Before fencing the source for a cell move, the mover verifies that originals covered by the selected archive use framed trie envelopes wherever those originals are still present.
 
 Nodes and logkeepers bound to a wildcard address require `--advertise-host` with their reachable DNS name or IP.
 Each durable logkeeper stores its member ID in the journal directory.

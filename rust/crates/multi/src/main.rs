@@ -845,6 +845,8 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     .ok_or_else(|| usage("The capture's installation is unavailable".into()))?;
                 if original.checkpoint_captures.contains_key(&operation) {
                     None
+                } else if original.holder.is_none() && original.checkpoint.is_some() {
+                    Some(original)
                 } else {
                     Some(admin::flush_checkpoint(directory.as_ref(), &original,
                         &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?)

@@ -151,6 +151,29 @@ impl Cipher {
         if !framed(key) { return self.open(key.as_str(), sealed); }
         let head = sealed.get(..SEALED_HEADER_BYTES).ok_or_else(|| invalid(key))?;
         let header = FramedObject::open_header(self, key, head)?;
+        self.open_framed_object(key, sealed, header)
+    }
+
+    pub(crate) fn open_retained_object(&self, key: &ObjectKey, sealed: &[u8]) -> Result<Bytes> {
+        if framed(key) && let Some(header) = self.retained_frame_header(key, sealed) {
+            return self.open_framed_object(key, sealed, header);
+        }
+        self.open(key.as_str(), sealed)
+    }
+
+    pub(crate) fn retained_plaintext_size(&self, key: &ObjectKey, stored: usize, header: &[u8]) -> Result<usize> {
+        if framed(key) && let Some(layout) = self.retained_frame_header(key, header) {
+            if sealed_size(key, layout.length())? != stored { return Err(invalid(key)); }
+            return Ok(layout.length());
+        }
+        stored.checked_sub(SEALED_OVERHEAD).ok_or_else(|| invalid(key))
+    }
+
+    fn retained_frame_header(&self, key: &ObjectKey, sealed: &[u8]) -> Option<FramedObject> {
+        FramedObject::open_header(self, key, sealed.get(..SEALED_HEADER_BYTES)?).ok()
+    }
+
+    fn open_framed_object(&self, key: &ObjectKey, sealed: &[u8], header: FramedObject) -> Result<Bytes> {
         let plaintext = header.open_frames(self, key, 0..header.frame_count(), &sealed[SEALED_HEADER_BYTES..])?;
         if FramedObject::new(&plaintext).identity != header.identity { return Err(invalid(key)); }
         Ok(plaintext)
@@ -174,6 +197,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn retained_envelopes_require_the_authentic_logical_key_and_complete_body() {
+        let cipher = Cipher::new(&[7; 32]).unwrap();
+        let name = ObjectKey::new("tables/orders/data/l00-rc-b00.arrow").unwrap();
+        let other = ObjectKey::new("tables/orders/data/l00-rc-b01.arrow").unwrap();
+        let data = vec![3; FRAME_BYTES + 1];
+        let legacy = cipher.seal_deterministic(name.as_str(), &data).unwrap();
+        assert!(cipher.open_retained_object(&other, &legacy).is_err());
+        assert_eq!(cipher.retained_plaintext_size(&name, legacy.len(), &legacy[..SEALED_HEADER_BYTES]).unwrap(), data.len());
+        assert_eq!(cipher.open_retained_object(&name, &legacy).unwrap().as_ref(), data.as_slice());
+        let framed = cipher.seal_object(&name, &data).unwrap();
+        assert_eq!(cipher.retained_plaintext_size(&name, framed.len(), &framed[..SEALED_HEADER_BYTES]).unwrap(), data.len());
+        assert!(cipher.retained_plaintext_size(&name, framed.len() - 1, &framed[..SEALED_HEADER_BYTES]).is_err());
+        let mut corrupt = framed.to_vec();
+        corrupt[SEALED_HEADER_BYTES] ^= 1;
+        assert!(cipher.open_retained_object(&name, &corrupt).is_err());
+    }
 
     #[test]
     fn a_frame_cannot_move_between_files_contents_or_positions() {

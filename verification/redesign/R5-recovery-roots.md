@@ -139,6 +139,12 @@ Hosted recovery can select an independently verified replay capture of the exact
 The directory publishes the capture and the recovery digest for its archive custody together, and each startup retains the selected capture before verifying that digest.
 [Verus](../verus/serving_replay_handoff/proof.rs) checks the production selection guard against a live holder, a changed checkpoint, a competing selection, and a replacement at the same block.
 The capture format preserves the existing encrypted replay closure, including the original ordered inputs by logical name.
+A new capture can authenticate the exact members of a pre-framing serving pack and write the same logical contents in the current framed format.
+The copy checks publication identity and envelope size before funding the complete framed inventory.
+Each body must match its inspected publication and plaintext length, and catalog digests are checked on the plaintext.
+The [copy proofs](../lean/CheckpointCopyEvidence.lean) cover inventory agreement and show that the ciphertext preflight admits every legacy member whose framed encoding fits.
+The existing handoff adopts the independent framed archive for the same parked checkpoint, while the original pack stays immutable.
+A parked complete repair can promote a framed replay archive of the same independently authenticated cut.
 Later captures can read those inputs from an admitted archive after their original packs disappear.
 The local Multi reaper can erase older original block packs for a parked root once it verifies their exact L0 members in the independent archive of the published checkpoint.
 It holds the local maintenance lock, lineage reservation and archive region while verifying the pack and unlinking it.

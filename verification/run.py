@@ -1500,8 +1500,12 @@ def verify_checkpoint_copy_evidence(args, scratch):
             "then charge (remaining - cost) tail else none", "then charge remaining tail else none",
             ["successful_plan_conserves_budget", "a_funded_inventory_uses_its_exact_cost"],
         ),
+        "exclude-legacy-overhead": (
+            "(headerCoversLegacy : legacyOverhead ≤ header)", "(headerCoversLegacy : True)",
+            ["a_funded_framed_copy_fits_the_source_preflight"],
+        ),
     }
-    verify_lean_model(args, scratch, path, "checkpoint-copy-evidence", controls, 4)
+    verify_lean_model(args, scratch, path, "checkpoint-copy-evidence", controls, 5)
 
 
 def verify_exact_retirement_retry(args, scratch):

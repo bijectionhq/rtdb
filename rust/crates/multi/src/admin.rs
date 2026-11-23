@@ -1230,7 +1230,7 @@ async fn prepare_cell_move(
     }
 
     let serving_archive = if current.lifecycle == Lifecycle::Live {
-        Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.keys, &current, hosted_task.as_ref())).await?
+        Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.storage, from.keys, &current, hosted_task.as_ref())).await?
     } else {
         crate::archive::serving_archive_operation(&current)?
     };

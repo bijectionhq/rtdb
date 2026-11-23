@@ -73,9 +73,16 @@ theorem a_funded_inventory_uses_its_exact_cost {costs : List Nat} {remaining : N
     have debit : remaining - cost - tail.sum = remaining - (cost + tail.sum) := by omega
     simp [charge, fits, rest tailFits, debit]
 
+theorem a_funded_framed_copy_fits_the_source_preflight {payload legacyOverhead header frameOverhead frameCount remaining : Nat}
+    (headerCoversLegacy : legacyOverhead ≤ header)
+    (funded : payload + header + frameCount * frameOverhead ≤ remaining) :
+    payload + legacyOverhead ≤ remaining := by
+  omega
+
 #print axioms copy_covers_the_inventory
 #print axioms copied_members_match_the_plan
 #print axioms successful_plan_conserves_budget
 #print axioms a_funded_inventory_uses_its_exact_cost
+#print axioms a_funded_framed_copy_fits_the_source_preflight
 
 end RTDB.CheckpointCopyEvidence

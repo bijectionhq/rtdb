@@ -2897,6 +2897,9 @@ rule RetainServingReplayArchive {
     -- A new region opens that source under its own admission before rechecking the published inventory.
     -- A retained capture preserves its accepted manifest and envelope for each object.
     -- A capture with whole-object authenticated trie data supplies the same logical contents through a bounded whole-object read after framed writes begin.
+    -- A fresh capture authenticates whole-object trie data in an older serving pack under its original logical key.
+    -- The fresh capture publishes authenticated frames over the same logical bytes at the original checkpoint.
+    -- A completed repair can be replaced by an independently verified replay archive of the same exact checkpoint before any replay archive has been selected.
     -- The source retains its residence while its selected capture still requires an envelope conversion for cell transfer.
     -- A held stage can serve whole-object reads before conversion, and requires the current serving envelope before terminal transfer.
     -- Later captures can inherit the admitted source and a newer verified checkpoint can replace it.
@@ -3059,6 +3062,7 @@ rule BeginCellMove {
     -- The source and target have distinct object and key namespaces.
     -- Each cell's object namespace lies outside the other's cleanup prefix for the deployment.
     -- An incomplete copy can be retried at a fresh destination prefix.
+    -- A source whose selected replay archive still overlays unframed original members reports the envelope mismatch before fencing.
     -- Only the attempt recorded as prepared can be published.
     when: CellMoveRequested(record, target_cell)
 

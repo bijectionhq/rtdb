@@ -363,7 +363,7 @@ impl CheckpointCustody {
             self.put(custody, &name, body).await?;
             let reader = self.reader(custody).await?;
             let written = reader.observe_head(&name).await?;
-            if written.value.key != name || written.value.size != member.logical_bytes as u64 {
+            if written.value.key != name || written.value.size != member.observed_bytes as u64 {
                 return Err(invalid(
                     "The copied checkpoint member has a different publication",
                 ));
