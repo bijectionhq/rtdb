@@ -52,7 +52,7 @@ impl OwnedWorldHost for PlacedWorldHost {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             let source = self.capture_source.as_ref().ok_or_else(OwnedWorld::unavailable)?;
-            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade)
+            let agent = self.agent.agent.get().and_then(std::sync::Weak::upgrade)
                 .ok_or_else(OwnedWorld::unavailable)?;
             crate::archive::prepare_checkpoint_world_overlay(
                 Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
@@ -71,7 +71,7 @@ impl OwnedWorldHost for PlacedWorldHost {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             let source = self.capture_source.as_ref().ok_or_else(OwnedWorld::unavailable)?;
-            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade)
+            let agent = self.agent.agent.get().and_then(std::sync::Weak::upgrade)
                 .ok_or_else(OwnedWorld::unavailable)?;
             prepare_checkpoint_replay_parent(
                 Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
@@ -101,7 +101,7 @@ impl OwnedWorldHost for PlacedWorldHost {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             let source = self.capture_source.as_ref().ok_or_else(OwnedWorld::unavailable)?;
-            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade)
+            let agent = self.agent.agent.get().and_then(std::sync::Weak::upgrade)
                 .ok_or_else(OwnedWorld::unavailable)?;
             retain_replayed_checkpoint_world(
                 Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
@@ -137,7 +137,7 @@ impl OwnedWorldHost for PlacedWorldHost {
                 node: &self.options, memory: call.node.memory(),
                 cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
             };
-            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade);
+            let agent = self.agent.agent.get().and_then(std::sync::Weak::upgrade);
             fork_checkpoint_world_selected(Arc::clone(&self.directory), &self.archive,
                 self.capture_source.as_ref(), agent.as_deref(), self.keys.as_ref(),
                 self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, fork).await

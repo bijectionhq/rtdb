@@ -4914,6 +4914,7 @@ dependencies = [
  "tokio-rustls 0.26.6",
  "tokio-util",
  "tonic",
+ "tracing",
  "uuid",
 ]
 

@@ -56,6 +56,7 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-rustls = "=0.26.6"
 tokio-util.workspace = true
+tracing = "=0.1.44"
 
 [dev-dependencies]
 openssl = { version = "=0.10.81", features = ["vendored"] }
