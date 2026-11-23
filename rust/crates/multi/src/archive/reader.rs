@@ -42,6 +42,7 @@ use crate::{
 };
 
 mod owned_inventory;
+mod transfer_artifact;
 pub(crate) use owned_inventory::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, inspect_staged_owned_relations, stream_staged_owned_event_files};
 
 pub struct StagedReaderSettings {

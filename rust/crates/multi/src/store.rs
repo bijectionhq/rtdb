@@ -550,7 +550,7 @@ impl PublicationJournal for DirectoryPublications {
                         let intent = &fence.destination.intent;
                         intent.operation == operation && intent.destination.to_string() == record.id
                             && record.checkpoint_stage.as_deref() == Some(&fence.destination)
-                            && key.as_str() == crate::archive::checkpoint_transfer_object(record, operation)
+                            && crate::archive::admits_checkpoint_transfer_object(record, &fence.destination, key.as_str())
                     }),
                 PublicationOwner::HostedFork => record.lifecycle == Lifecycle::Restoring
                     && record.hosted_fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),

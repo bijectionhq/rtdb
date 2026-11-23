@@ -181,12 +181,16 @@ where
     F: FnOnce(Arc<QueryContext>, TransactionKey) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    with_registered_capture_replay(directory, archive, keys, hosted_task, selected, resources, None, run).await
+    with_registered_capture_replay(directory, archive, keys, hosted_task, selected, resources, None,
+        |context, basis, _| run(context, basis),
+    ).await
 }
 
 pub(super) struct TerminalReplay<'a> {
     pub fence: &'a rtdb_directory::CheckpointTransferFence,
-    pub entries: &'a [rtdb_logkeeper::ArchivedReplicaEntry],
+    pub stream: &'a rtdb_logkeeper::StreamConfig,
+    pub certificate: Option<&'a rtdb_logkeeper::JournalDigest>,
+    pub through: i64,
 }
 
 pub(super) async fn with_registered_capture_replay<T, F, Fut>(
@@ -200,7 +204,7 @@ pub(super) async fn with_registered_capture_replay<T, F, Fut>(
     run: F,
 ) -> Result<T>
 where
-    F: FnOnce(Arc<QueryContext>, TransactionKey) -> Fut,
+    F: FnOnce(Arc<QueryContext>, TransactionKey, Option<i64>) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     if !resources.node.owned_relations {
@@ -348,11 +352,14 @@ where
                     (None, None) => (),
                     _ => return Err(inconsistent("The selected archived suffix is unavailable")),
                 }
-                if let Some(terminal) = terminal {
-                    replica_suffix::apply_terminal(
-                        terminal.entries, terminal.fence, &mut recovered, &memory,
-                    )?;
-                }
+                let terminal_source = if let Some(terminal) = terminal {
+                    Some(replica_suffix::replay_certified_terminal(
+                        &record, keys, terminal.stream, terminal.certificate, terminal.fence,
+                        terminal.through, &mut recovered, &memory,
+                    ).await?)
+                } else {
+                    None
+                };
                 let snapshot = recovered.partition.snapshot();
                 let basis = snapshot.tx_basis().ok_or_else(|| inconsistent("The retained checkpoint has no transaction basis"))?;
                 if selected.expected_basis.is_some_and(|expected| basis != expected) {
@@ -373,7 +380,7 @@ where
                         }
                     }
                 }
-                run(context, basis).await
+                run(context, basis, terminal_source).await
             }).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
         },
     )
