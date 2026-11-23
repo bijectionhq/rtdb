@@ -65,6 +65,11 @@ pub trait ReadFence: Send + Sync {
         Err(hosted_source_unavailable())
     }
 }
+
+pub(crate) struct HostedSourceReceipt {
+    pub(crate) history: String,
+    pub(crate) applied: Option<TransactionKey>,
+}
 fn default_search() -> SearchServices {
     #[cfg(feature = "search")] {
         let runtime = rtdb_search::SearchRuntime::new(256 << 20);
@@ -286,7 +291,7 @@ impl Node {
 
     async fn await_durable_source(
         &self, database: &str, identity: &dyn SessionIdentity, hosted: bool, placement: Option<&Weak<Database>>, cancellation: &CancellationToken,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<HostedSourceReceipt>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         self.ensure_indexing()?;
         let database = self.attached_database(database, placement)?;
@@ -297,11 +302,12 @@ impl Node {
             } else {
                 None
             };
-            database.await_durable_source(cancellation).await?;
-            if hosted && !Arc::ptr_eq(&database, &self.catalog.database(database.name())?) {
+            let applied = database.await_durable_source(cancellation).await?;
+            let Some(history) = history else { return Ok(None); };
+            if !Arc::ptr_eq(&database, &self.catalog.database(database.name())?) {
                 return Err(hosted_source_unavailable());
             }
-            Ok(history)
+            Ok(Some(HostedSourceReceipt { history, applied }))
         });
         tokio::time::timeout(Duration::from_secs(60), barrier)
             .await.map_err(|_| timeout_error())?.ok_or_else(cancelled)?
@@ -2743,7 +2749,7 @@ impl NativeSessionService {
         self.node.query_context_in_placement(database, basis, self.identity.as_ref(), self.placement.as_ref(), None, cancellation).await
     }
 
-    pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<String>> {
+    pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<HostedSourceReceipt>> {
         self.node.await_durable_source(database, self.identity.as_ref(), hosted, self.placement.as_ref(), cancellation).await
     }
 

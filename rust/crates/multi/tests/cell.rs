@@ -728,6 +728,17 @@ async fn a_deployment_is_served_through_the_gateway_and_survives_its_holder_dyin
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     let basis = values(&client, "SELECT _system_from FROM orders WHERE _id = 1").await.remove(0);
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    let submitted = values(&client, "SHOW latest_submitted_tx").await.remove(0);
+    let barrier = client.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap();
+    let receipt = barrier.iter().find_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+        _ => None,
+    }).unwrap();
+    assert_eq!(receipt.len(), 3);
+    assert_eq!(receipt.get("rtdb_hosted_source_barrier"), Some(history.to_string().as_str()));
+    assert_eq!(receipt.get("tx_id"), Some(submitted.as_str()));
+    let ordered_time = values(&client, "SELECT _system_from FROM orders WHERE _id = 2").await.remove(0);
+    assert_eq!(receipt.get("system_time"), Some(ordered_time.as_str()));
     drop(client);
 
     let first = cell.holder("shop").await.expect("the first connection placed the deployment");

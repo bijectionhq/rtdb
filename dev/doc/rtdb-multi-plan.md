@@ -58,7 +58,9 @@ A PostgreSQL startup database of `NAME@UUID`, with the UUID in lowercase 32-digi
 The gateway confirms the matched UUID in the startup parameter `rtdb_installation_id` after the backend checks its attached database.
 A replacement backend must verify the same installation before the gateway replays session state.
 Deploy nodes with the cell secret and this protocol support before routing gateways that require installation verification.
-`SHOW rtdb_hosted_source_barrier` returns the deployment ID after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+`SHOW rtdb_hosted_source_barrier` returns the deployment ID, applied transaction ID and ordered system time after the holder confirms the current directory assignment, confirms its epoch with the logkeeper quorum, and applies the sampled source cut.
+The transaction ID and time are both null before any transaction is applied.
+Hosted protocol 17 includes this barrier, the source owner read and both held-world valid window sources.
 The holder must recover the checkpoint published in the directory or an authenticated successor before answering.
 A gateway reconnect keeps the original deployment ID.
 Restoring an older node or object copy requires a recoverable checkpoint and tail from the live directory and logkeeper ensemble.

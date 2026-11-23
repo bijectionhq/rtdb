@@ -2076,7 +2076,8 @@ rule ConfirmHostedSource {
         if not SealedIn(round, holding.deployment):
             let cut = SampleSource(holding)
             AwaitApplied(holding, cut)
-            HostedSourceConfirmed(session, history: holding.deployment.id, cut: cut)
+            let applied = LatestAppliedTransaction(holding)
+            HostedSourceConfirmed(session, history: holding.deployment.id, applied_transaction: applied)
         else:
             Replied(session, unavailable: true)
 }

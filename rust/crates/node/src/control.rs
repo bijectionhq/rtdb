@@ -10,6 +10,12 @@ use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, ScalarType, Time
 use tokio_util::sync::CancellationToken;
 
 use crate::{AccessSettings, CommitMode, CommitResult, LastSubmittedTx, NativeSession, OptionUpdate, ReadOnlySettings, ReadWriteSettings, TransactionSettings, TransactionStatus};
+use crate::node::HostedSourceReceipt;
+
+enum SourceInspection {
+    Owner(String),
+    Barrier(HostedSourceReceipt),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ControlFrontend { #[default] Native, PostgreSql, Adbc, FlightSql }
@@ -38,7 +44,8 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
         "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier"
-        | "rtdb_hosted_source_barrier" | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
+        | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
+        "rtdb_hosted_source_barrier" => vec![(name.as_str(), text), ("tx_id", integer), ("system_time", instant.maybe())],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
         "latest_submitted_tx" => vec![("tx_id", integer), ("system_time", instant.maybe()), ("committed", LogicalType::Scalar(ScalarType::Bool).maybe()), ("error", LogicalType::Scalar(ScalarType::Transit).maybe()), ("await_token", text.maybe())],
         "latest_completed_txs" => vec![("db_name", text), ("part", LogicalType::Scalar(ScalarType::I32)), ("tx_id", integer), ("system_time", instant.maybe())],
@@ -210,19 +217,20 @@ impl NativeSession {
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
             ControlStatement::Show { name } => {
-                let hosted_history = if name == "rtdb_hosted_source_owner" {
-                    Some(self.service.confirm_hosted_source_owner(self.state.database(), cancellation).await?)
+                let source = if name == "rtdb_hosted_source_owner" {
+                    let history = self.service.confirm_hosted_source_owner(self.state.database(), cancellation).await?;
+                    Some(SourceInspection::Owner(history))
                 } else if matches!(name.as_str(), "rtdb_source_barrier" | "rtdb_hosted_source_barrier") {
                     if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction {
                         return Err(Anomaly::incorrect("rtdb/source-barrier-in-transaction", "Complete the transaction before awaiting a source barrier"));
                     }
                     self.service.await_durable_source(
                         self.state.database(), name == "rtdb_hosted_source_barrier", cancellation,
-                    ).await?
+                    ).await?.map(SourceInspection::Barrier)
                 } else {
                     None
                 };
-                self.show(name, statement.requires_read_transaction(), hosted_history, cancellation).await.map(ControlResult::Rows)
+                self.show(name, statement.requires_read_transaction(), source, cancellation).await.map(ControlResult::Rows)
             },
             ControlStatement::Prepare { name, source } => {
                 allocation.reserve(size(name.len(), source.len())?)?;
@@ -276,7 +284,7 @@ impl NativeSession {
         Ok(())
     }
 
-    async fn show(&mut self, name: &str, checked: bool, hosted_history: Option<String>, cancellation: &CancellationToken) -> Result<QueryCursor> {
+    async fn show(&mut self, name: &str, checked: bool, source: Option<SourceInspection>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
         let context = self.service.query_context(self.state.database(), &basis, cancellation).await?
             .with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None);
@@ -305,9 +313,21 @@ impl NativeSession {
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "rtdb_ordered_system_time" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
-            "rtdb_hosted_source_barrier" | "rtdb_hosted_source_owner" => {
-                let history = hosted_history.ok_or_else(|| Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source confirmation has no history"))?;
+            "rtdb_hosted_source_owner" => {
+                let Some(SourceInspection::Owner(history)) = source else {
+                    return Err(Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source confirmation has no history"));
+                };
                 (vec![(name, text.clone())], vec![vec![Value::Utf8(history)]])
+            },
+            "rtdb_hosted_source_barrier" => {
+                let Some(SourceInspection::Barrier(receipt)) = source else {
+                    return Err(Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source barrier has no receipt"));
+                };
+                let fields = vec![(name, text.clone()), ("tx_id", integer.clone().maybe()), ("system_time", instant.clone().maybe())];
+                let (offset, time) = receipt.applied.map_or((Value::Null, Value::Null), |key| {
+                    (Value::I64(key.tx_id.0), timestamp(key.system_time))
+                });
+                (fields, vec![vec![Value::Utf8(receipt.history), offset, time]])
             },
             "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),

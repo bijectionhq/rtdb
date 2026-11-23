@@ -10,7 +10,7 @@ use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, Artefac
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, SourcePosition, TableRef, Term};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, SourcePosition, TableRef, Term, TransactionKey};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -101,13 +101,14 @@ impl Database {
         }
     }
 
-    pub(crate) async fn await_durable_source(&self, cancellation: &CancellationToken) -> Result<()> {
+    pub(crate) async fn await_durable_source(&self, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
         if self.external_source() {
             return Err(Anomaly::incorrect("rtdb/source-barrier", "The database ingests transactions outside its source log"));
         }
         let logs = Arc::clone(&self.logs);
         let position = self.io.run_blocking(move || Ok(logs.latest_source_position())).await??;
-        self.replication.await_source(position, cancellation).await
+        self.replication.await_source(position, cancellation).await?;
+        Ok(self.progress().current().tx_key)
     }
 
     /// The lease for a snapshot of this database captured after this returns.
