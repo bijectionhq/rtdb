@@ -92,14 +92,20 @@ pub struct ResolvedTx {
     input: ResolvedInput,
     external_token: Option<Vec<u8>>,
     db_op: Option<DbOp>,
-    inline_body: Option<OwnedReplicaBody>,
+    inline_replica: Option<InlineReplica>,
     _reservation: Arc<MemoryReservation>,
 }
+
+struct InlineReplica {
+    body: OwnedReplicaBody,
+    staging_clock_upper: Timestamp,
+}
+
 impl ResolvedTx {
     fn new(writes: StagedWrite, result: TransactionResult, input: ResolvedInput, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Self> {
         let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
         let reservation = context.memory.reserve(bound)?;
-        Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_body: None, _reservation: reservation })
+        Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, _reservation: reservation })
     }
 
     pub fn writes(&self) -> &Arc<StagedWrite> { &self.writes }
@@ -110,7 +116,8 @@ impl ResolvedTx {
     }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
-    pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_body.as_ref().map(OwnedReplicaBody::body) }
+    pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_replica.as_ref().map(|replica| replica.body.body()) }
+    pub fn staging_clock_upper(&self) -> Option<Timestamp> { self.inline_replica.as_ref().map(|replica| replica.staging_clock_upper) }
 
     fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let (writer, maximum) = writer.and_then(|writer| writer.maximum_inline_bytes.map(|maximum| (writer, maximum)))
@@ -121,10 +128,10 @@ impl ResolvedTx {
         }
         // The effect and receipt are encoded, and the candidate can still be discarded.
         // Round up the sampled clock because its microsecond coordinate was truncated.
-        if (writer.clock)().0.checked_add(1).is_none_or(|upper| upper >= until.0) {
+        let Some(upper) = (writer.clock)().0.checked_add(1).filter(|upper| *upper < until.0) else {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before staging"));
-        }
-        self.inline_body = Some(body);
+        };
+        self.inline_replica = Some(InlineReplica { body, staging_clock_upper: Timestamp(upper) });
         Ok(())
     }
 

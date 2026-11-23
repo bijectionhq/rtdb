@@ -78,24 +78,34 @@ pub(crate) struct ReplicaAppender {
     durable_commit_observer: Option<DurableCommitObserver>,
 }
 
-type DurableCommitObserver = Arc<dyn Fn(Option<Duration>) + Send + Sync>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitLagBasis { Ordered, Staged }
+
+type DurableCommitObserver = Arc<dyn Fn(CommitLagBasis, Option<Duration>) + Send + Sync>;
 
 struct DurableCommitObservation {
     ordered_at: Timestamp,
+    staging_clock_upper: Option<Timestamp>,
     clock: ReplicationClock,
     observer: DurableCommitObserver,
 }
 
 impl DurableCommitObservation {
     fn record(self) {
-        let observed_at = (self.clock)();
-        let lag = observed_at.0.checked_sub(self.ordered_at.0)
+        let observed = (self.clock)();
+        let observed_upper = observed.0.checked_add(1);
+        let lag_since = |start: Timestamp| observed_upper
+            .and_then(|upper| upper.checked_sub(start.0))
             .filter(|micros| *micros >= 0)
-            // The wall clock is truncated to microseconds. Round the observation up and
-            // keep the result representable in the registry's signed nanosecond timer.
-            .and_then(|micros| micros.checked_add(1)?.checked_mul(1_000))
+            .and_then(|micros| micros.checked_mul(1_000))
             .map(|nanos| Duration::from_nanos(nanos as u64));
-        (self.observer)(lag);
+        // An ordered timestamp can lead this wall clock. The stage sample already
+        // includes rounding, so it can equal the observation's upper tick.
+        let ordered = if observed < self.ordered_at { None } else { lag_since(self.ordered_at) };
+        (self.observer)(CommitLagBasis::Ordered, ordered);
+        if let Some(staged) = self.staging_clock_upper {
+            (self.observer)(CommitLagBasis::Staged, lag_since(staged));
+        }
     }
 }
 
@@ -105,7 +115,7 @@ impl ReplicaAppender {
         (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation, clock, heartbeat: true, durable_commit_observer: None })
     }
     pub fn with_heartbeat(mut self, heartbeat: bool) -> Self { self.heartbeat = heartbeat; self }
-    pub fn with_durable_commit_observer(mut self, observer: impl Fn(Option<Duration>) + Send + Sync + 'static) -> Self {
+    pub fn with_durable_commit_observer(mut self, observer: impl Fn(CommitLagBasis, Option<Duration>) + Send + Sync + 'static) -> Self {
         self.durable_commit_observer = Some(Arc::new(observer));
         self
     }
@@ -114,6 +124,7 @@ impl ReplicaAppender {
         let WriteBody::Resolved(tx) = body else { return None; };
         (tx.result().committed() && tx.placed_attempt().is_some()).then(|| DurableCommitObservation {
             ordered_at: tx.result().tx_key().system_time,
+            staging_clock_upper: tx.staging_clock_upper(),
             clock: Arc::clone(&self.clock),
             observer: Arc::clone(observer),
         })
@@ -278,16 +289,27 @@ mod tests {
         let samples = Arc::new(Mutex::new(Vec::new()));
         let observer: DurableCommitObserver = {
             let samples = Arc::clone(&samples);
-            Arc::new(move |lag| samples.lock().push(lag))
+            Arc::new(move |basis, lag| samples.lock().push((basis, lag)))
         };
-        let observation = |ordered, observed| DurableCommitObservation {
-            ordered_at: Timestamp(ordered), clock: Arc::new(move || Timestamp(observed)), observer: Arc::clone(&observer),
+        let observation = |ordered, staged: Option<i64>, observed| DurableCommitObservation {
+            ordered_at: Timestamp(ordered), staging_clock_upper: staged.map(Timestamp),
+            clock: Arc::new(move || Timestamp(observed)), observer: Arc::clone(&observer),
         };
-        assert!(track_receipt(receipt, None, None, Some(observation(100, 120))).await.is_err());
+        assert!(track_receipt(receipt, None, None, Some(observation(100, Some(115), 120))).await.is_err());
         assert!(samples.lock().is_empty());
-        observation(100, 120).record();
-        observation(100, 99).record();
-        assert_eq!(samples.lock().as_slice(), [Some(Duration::from_micros(21)), None]);
+        observation(100, Some(115), 120).record();
+        observation(100, Some(121), 120).record();
+        observation(100, Some(101), 99).record();
+        observation(100, None, 120).record();
+        assert_eq!(samples.lock().as_slice(), [
+            (CommitLagBasis::Ordered, Some(Duration::from_micros(21))),
+            (CommitLagBasis::Staged, Some(Duration::from_micros(6))),
+            (CommitLagBasis::Ordered, Some(Duration::from_micros(21))),
+            (CommitLagBasis::Staged, Some(Duration::ZERO)),
+            (CommitLagBasis::Ordered, None),
+            (CommitLagBasis::Staged, None),
+            (CommitLagBasis::Ordered, Some(Duration::from_micros(21))),
+        ]);
     }
 
     #[tokio::test]

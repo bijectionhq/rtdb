@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedReplayedPrimary, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
-use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
+use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
 use crate::logs::{DecodedReplica, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
@@ -655,7 +655,10 @@ impl ReplicationDriver {
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         let pump = match self.resolve.execution_observer.clone() {
-            Some(observer) => pump.with_durable_commit_observer(move |lag| observer.record_durable_commit_lag(lag)),
+            Some(observer) => pump.with_durable_commit_observer(move |basis, lag| match basis {
+                CommitLagBasis::Ordered => observer.record_durable_commit_lag(lag),
+                CommitLagBasis::Staged => observer.record_staged_commit_lag(lag),
+            }),
             None => pump,
         };
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };

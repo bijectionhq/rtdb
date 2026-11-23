@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionTimer { Query, TxAwait, TxSubmit, TxExecute, PgwireTransaction, TxOp, CompactorJob, DurableCommitLag }
+pub enum ExecutionTimer { Query, TxAwait, TxSubmit, TxExecute, PgwireTransaction, TxOp, CompactorJob, DurableCommitLag, StagedCommitLag }
 impl ExecutionTimer {
-    pub fn name(self) -> &'static str { match self { Self::Query => "query.timer", Self::TxAwait => "node.tx.await", Self::TxSubmit => "node.tx.submit", Self::TxExecute => "node.tx.execute", Self::PgwireTransaction => "pgwire.tx.latency", Self::TxOp => "tx.op.timer", Self::CompactorJob => "compactor.job.timer", Self::DurableCommitLag => "rtdb.replica.commit.ordered_to_durable" } }
+    pub fn name(self) -> &'static str { match self { Self::Query => "query.timer", Self::TxAwait => "node.tx.await", Self::TxSubmit => "node.tx.submit", Self::TxExecute => "node.tx.execute", Self::PgwireTransaction => "pgwire.tx.latency", Self::TxOp => "tx.op.timer", Self::CompactorJob => "compactor.job.timer", Self::DurableCommitLag => "rtdb.replica.commit.ordered_to_durable", Self::StagedCommitLag => "rtdb.replica.commit.staged_to_durable" } }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,11 @@ pub trait ExecutionObserver: Send + Sync {
     /// `None` reports that the ordered and observed wall-clock coordinates could not be compared.
     fn record_durable_commit_lag(&self, lag: Option<Duration>) {
         if let Some(lag) = lag { self.record_duration(ExecutionTimer::DurableCommitLag, lag); }
+    }
+    /// An acknowledged strict commit, measured from its rounded writer cutoff sample.
+    /// `None` reports an incomparable clock sample.
+    fn record_staged_commit_lag(&self, lag: Option<Duration>) {
+        if let Some(lag) = lag { self.record_duration(ExecutionTimer::StagedCommitLag, lag); }
     }
 }
 
