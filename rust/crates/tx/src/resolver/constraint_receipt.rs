@@ -380,8 +380,26 @@ fn admission_json(document: &StructFields<Value>) -> Option<serde_json::Value> {
     serde_json::from_slice(body).ok()
 }
 
+fn clock_command_matches(record: &serde_json::Value) -> bool {
+    use sha2::{Digest, Sha256};
+
+    match record.pointer("/task/command") {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(command)) => {
+            let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
+            command.starts_with("[\"bijection.task.emit.v2\",")
+                && record.pointer("/task/digest").and_then(serde_json::Value::as_str)
+                    == Some(digest.as_str())
+        }
+        Some(_) | None => false,
+    }
+}
+
 fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<Value>, clock: bool) -> bool {
     let (Some(mut original), Some(refusal)) = (admission_json(original), admission_json(refusal)) else { return false; };
+    if clock && !clock_command_matches(&original) {
+        return false;
+    }
     let path = if !clock {
         "/continuation/completion"
     } else if original.get("previous_delivery").is_some() && original.get("delivered").is_none() {
@@ -397,7 +415,7 @@ fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<V
 
 fn refused_run_followup(document: &StructFields<Value>) -> bool {
     admission_json(document).is_some_and(|body| {
-        body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
+        clock_command_matches(&body) && body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
             outcome.get("status").and_then(serde_json::Value::as_str) == Some("refused")
                 && outcome.get("reason").and_then(serde_json::Value::as_str) == Some("ConstraintRefused")
         })
