@@ -2269,6 +2269,35 @@ mod tests {
     use super::{CellStorage, DeploymentRecord, Directory, ErasureAuthority, KeyService, Lifecycle, ResidenceErasure, create_deployment, delete_deployment, erase_and_sign_local_disposal};
     use crate::keys::LocalKeyService;
 
+    async fn publish_test_fork_cut(
+        directory: &dyn Directory, bucket: &crate::reference::Bucket, mut record: DeploymentRecord,
+        keys: &LocalKeyService, block: i64,
+    ) -> DeploymentRecord {
+        use rtdb_format::{block::proto, catalog::BlockCatalog, keys::block_key};
+        use rtdb_types::{BlockIndex, ReplicaPosition, SourcePosition, StorageEpoch};
+
+        let root = format!("{}/{}", record.storage_prefix(), crate::archive::checkpoint_storage_root().unwrap());
+        let store = crate::reference::PrefixedStore::new(bucket.clone(), root);
+        crate::store::check_root(&store, &record.id, true).await.unwrap();
+        let packed = crate::packing::PackingStore::open(std::sync::Arc::new(store), crate::packing::PackDiscovery::List).await.unwrap();
+        let material = keys.key(&record.key_id()).await.unwrap();
+        let plaintext = crate::store::EncryptingStore::new(packed, &material).unwrap();
+        let epoch = StorageEpoch(record.log_epoch);
+        let mut catalog = BlockCatalog::from_proto(proto::Block {
+            block_index: Some(block),
+            boundary_replica_msg_id: Some(ReplicaPosition::from_epoch_offset(epoch, 0).unwrap().0),
+            latest_processed_msg_id: Some(SourcePosition::from_epoch_offset(epoch, 0).unwrap().0),
+            latest_completed_tx: Some(proto::TxKey { tx_id: Some(0), system_time: Some(1) }),
+            ..Default::default()
+        }).unwrap();
+        plaintext.put(&ObjectKey::new(block_key(BlockIndex(block)).unwrap()).unwrap(), catalog.encode_for_publication().into()).await.unwrap();
+        record.checkpoint = Some(rtdb_directory::Checkpoint {
+            block, boundary: 0, source: 0, system_time: 1, root_sha256: catalog.publication_sha256(),
+        });
+        let version = record.version;
+        directory.replace_deployment(record, version).await.unwrap().applied().unwrap()
+    }
+
     #[tokio::test]
     async fn a_new_deployment_rejects_an_organisation_with_multiple_path_components() {
         let directory = MemoryDirectory::new();
@@ -2390,7 +2419,7 @@ mod tests {
         let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
         source.storage_namespaces = Some(namespaces);
         let source = directory.create_deployment(source).await.unwrap();
-        keys.key(&source.key_id()).await.unwrap();
+        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
         let source_prefix = source.storage_prefix();
         let source_store = format!("{source_prefix}/v06");
         for name in ["old", "shared"] {
@@ -2419,7 +2448,9 @@ mod tests {
             let copied = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
             assert_eq!(bucket.get(&copied).await.unwrap(), name.as_bytes());
         }
-        let effects = watched.effects.into_inner();
+        let effects: Vec<_> = watched.effects.into_inner().into_iter()
+            .filter(|(_, path)| path.ends_with("/old") || path.ends_with("/shared"))
+            .collect();
         assert_eq!(effects.len(), 4, "each publication is copied and removed once");
         if let Some(path) = std::env::var_os("RTDB_RESIDENCE_DISPOSAL_TRACE_PATH") {
             let trace = serde_json::json!({ "source_store": source_store, "fork_store": fork_store, "effects": effects });
@@ -2570,6 +2601,7 @@ mod tests {
         let mut source = DeploymentRecord::new("shop", "acme", vec![], 0);
         source.storage_namespaces = Some(super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
         let source = directory.create_deployment(source).await.unwrap();
+        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
         let key = keys.key(&source.key_id()).await.unwrap();
         let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
         bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
@@ -2614,7 +2646,7 @@ mod tests {
         let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
         source.storage_namespaces = Some(namespaces);
         let source = directory.create_deployment(source).await.unwrap();
-        keys.key(&source.key_id()).await.unwrap();
+        let source = publish_test_fork_cut(directory.as_ref(), &bucket, source, &keys, 0).await;
         let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
         let bytes = Bytes::from_static(b"rows");
         bucket.put(&object, bytes.clone()).await.unwrap();
@@ -2650,6 +2682,7 @@ mod tests {
         let copied = ObjectKey::new(format!("{}/v06/rows", child.storage_prefix())).unwrap();
         assert_eq!(bucket.get(&copied).await.unwrap(), bytes);
 
+        let child = publish_test_fork_cut(directory.as_ref(), &bucket, child, &keys, 1).await;
         let grandchild = super::with_fork_access(directory.as_ref(), &storage, &keys, &child, None, |access|
             super::fork_with_tail(directory.clone(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
         let child_store = format!("{}/v06", child.storage_prefix());
