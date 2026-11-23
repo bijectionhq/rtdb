@@ -305,6 +305,8 @@ The holder sets aside 12 MiB per reserved connection outside body accounting, wi
 The gateway sets aside 2 MiB per reserved peer connection and 2 MiB per forwarded call.
 Its audience upstream has bounded HTTP/2 windows and keeps no idle routes.
 An audience session can read a forward live Root range of up to five nominations through ReadHeldRange.v2 on its prepared hold.
+It can also read that range at a retained system cut less than 60 seconds before the hold through ReadHeldRange.v4, with the valid instant equal to the system cut.
+The historical scan verifies relation coverage and spends the original hold's aggregate work allowance.
 Its range request permits an exclusive continuation and has a 16 KiB carrier ceiling.
 Applied confirmation on the same prepared session can check the exact partition publication marker against both catalogs.
 The gateway resolves the placement at handshake, then forwards authenticated session actions to the sealed holder address.

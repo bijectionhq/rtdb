@@ -282,6 +282,11 @@ pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
 
+fn audience_history_cut(present: Timestamp, system: Timestamp, valid: Option<Timestamp>) -> bool {
+    valid == Some(system) && system.0 >= 0 && system < present
+        && present.0.saturating_sub(system.0) < 60_000_000
+}
+
 pub(crate) const HELD_OWNED_RANGE_V3: &str = "rtdb.owned.ReadHeldRange.v3";
 pub(crate) const HELD_OWNED_RANGE_V4: &str = "rtdb.owned.ReadHeldRange.v4";
 pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
@@ -2286,7 +2291,7 @@ impl Service {
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let audience = call.session.audience_source().is_some();
-        if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
+        if audience && (!matches!(version, HeldRangeFormat::Full | HeldRangeFormat::Historical) || body.len() > 16 * 1024) {
             return Err(invalid("The audience page exceeds its carrier bounds"));
         }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
@@ -2332,6 +2337,12 @@ impl Service {
             };
             Some(Timestamp(*system))
         } else { None };
+        if let Some(system) = system.filter(|_| audience) {
+            let present = held.snapshot.present().system_time;
+            if !audience_history_cut(present, system, valid_at) {
+                return Err(invalid("The audience page requires a recent exact historical cut"));
+            }
+        }
         let (page, evidence, expiry) = if !matches!(version, HeldRangeFormat::Leading) {
             let Some(Value::Bool(descending)) = row.get("descending") else {
                 return Err(invalid("Owned range requires a boolean descending field"));
@@ -4645,6 +4656,22 @@ fn owned_capacity_declaration(relation: OwnedRelation, row: &StructFields<Value>
 
 #[cfg(test)]
 mod commit_tests;
+
+#[cfg(test)]
+mod audience_history_tests {
+    use super::*;
+
+    #[test]
+    fn a_reserved_page_uses_a_recent_cut_at_the_same_valid_instant() {
+        let present = Timestamp(90_000_000);
+        let inside = Timestamp(30_000_001);
+        let boundary = Timestamp(30_000_000);
+        assert!(audience_history_cut(present, inside, Some(inside)));
+        assert!(!audience_history_cut(present, boundary, Some(boundary)));
+        assert!(!audience_history_cut(present, present, Some(present)));
+        assert!(!audience_history_cut(present, inside, Some(boundary)));
+    }
+}
 
 fn owned_touches_type() -> rtdb_types::LogicalType {
     use rtdb_types::{LogicalType, ScalarType};
