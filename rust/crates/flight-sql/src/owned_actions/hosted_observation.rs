@@ -63,6 +63,9 @@ impl Service {
         let (handle, body) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Applied confirmation requires a held handle"))?;
         let (floor, body) = applied_read_floor(body)?;
+        if call.session.audience_source.is_some_and(|source| floor.history() != source) {
+            return Err(Status::permission_denied("The applied confirmation belongs to another audience source"));
+        }
         let (deadline, body) = body.split_first_chunk::<8>()
             .ok_or_else(|| invalid("Applied confirmation requires a deadline"))?;
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;

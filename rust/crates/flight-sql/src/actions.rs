@@ -10,6 +10,13 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
+        if call.session.audience_source.is_some() && !matches!(action.r#type.as_str(),
+            OPEN_APPLIED_OWNED_READ_V3 | CONFIRM_APPLIED_HOSTED_V5 | HELD_OWNED_POINT_V2
+                | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 | CLOSE_OWNED_READ_V1
+        ) {
+            return Err(call.error(Status::permission_denied("The reserved Flight session only admits audience observations")));
+        }
         let work = async {
             match action.r#type.as_str() {
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),

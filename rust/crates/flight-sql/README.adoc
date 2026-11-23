@@ -268,6 +268,14 @@ An inexact floor, foreign history, or a cut that cannot be retained is refused w
 The handle admits held point, historical point and hosted control reads and applied confirmation.
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
+On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder.
+The authenticated hosted owner sends that value as `x-rtdb-audience-flight` during the handshake.
+The gateway and holder must acknowledge the exact source and turn count.
+The sealed route then uses its own gateway call permits, backend connection pool, holder call permits and retained-read permits.
+Each pool has two permits per turn and two for preparation and cleanup.
+The reservation admits applied open and confirmation, held point and historical point reads, hosted control reads, and held close.
+The gateway routes only action RPCs on a reserved session.
+
 `rtdb.owned.ConfirmAppliedHosted.v5` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
 The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
 An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.

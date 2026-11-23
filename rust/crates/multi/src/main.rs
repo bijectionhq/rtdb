@@ -377,10 +377,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         }
         "node" => {
             let directory = directory(arguments.required("directory")?).await?;
-            let configuration = match arguments.optional("config") {
+            let mut configuration = match arguments.optional("config") {
                 Some(path) => NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?,
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
+            if arguments.present("flight-audience") {
+                let audience = rtdb_flight_sql::AudienceFlightConfig::parse(arguments.required("flight-audience")?)?;
+                configuration.flight_sql.as_mut().filter(|flight| flight.port >= 0)
+                    .ok_or_else(|| usage("--flight-audience requires a Flight SQL listener".into()))?.audience = Some(audience);
+            }
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
             if arguments.present("s3-write-role") {
@@ -440,6 +445,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None
             };
             let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), ..Default::default() };
+            if arguments.present("flight-audience") {
+                if !arguments.present("flight-listen") {
+                    return Err(usage("--flight-audience requires --flight-listen".into()));
+                }
+                options.flight_audience = Some(rtdb_flight_sql::AudienceFlightConfig::parse(arguments.required("flight-audience")?)?);
+            }
             options.maximum_connections = arguments.number("max-connections", options.maximum_connections)?;
             options.maximum_connections_per_deployment = arguments.number("max-connections-per-deployment", options.maximum_connections_per_deployment)?;
             options.maximum_buffered_bytes = arguments.number("max-buffered-bytes", options.maximum_buffered_bytes)?;
