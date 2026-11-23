@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rtdb_directory::{Cas, DeploymentRecord, Directory, JournalAnchor, MemberId, MemberRecord, ReplicaPayloadTrim};
-use rtdb_format::{CURRENT_STORAGE_VERSION, envelope::ReplicaEnvelope};
+use rtdb_format::{envelope::ReplicaEnvelope, keys::CURRENT_STORAGE_VERSION};
 use rtdb_logkeeper::{JournalDigest, StreamConfig};
 use rtdb_storage::{Error, IoRegion, log::LogOffset};
 use rtdb_types::{JournalEndpoint, Result, StorageEpoch};

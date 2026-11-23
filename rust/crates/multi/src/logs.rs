@@ -621,7 +621,7 @@ mod tests {
         let claim = ReplicaEnvelope { term: Term(1), term_sequence: None, message: ReplicaBody::NoOp(Default::default()) };
         replica.enqueue(Bytes::from(claim.encode()), Timestamp(0)).await.unwrap().durable().await.unwrap();
         let mut tail = replica.recovery_tail(LogOffset(-1)).await.unwrap().unwrap();
-        let proxy = claim.offloaded(rtdb_format::CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "paused".into(), &claim.encode());
+        let proxy = claim.offloaded(rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "paused".into(), &claim.encode());
         replica.enqueue(Bytes::from(proxy.encode()), Timestamp(1)).await.unwrap().durable().await.unwrap();
         let mut records = tail.poll(Duration::from_secs(1)).await.unwrap();
         assert_eq!(records.len(), 2);

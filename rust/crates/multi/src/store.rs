@@ -1040,7 +1040,7 @@ struct ReplicaPayloadRelease {
 
 impl ReplicaPayloadRelease {
     fn permits(&self, owner: &DeploymentRecord, store: &str) -> bool {
-        let Ok(root) = StorageRoot::new(rtdb_format::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0)) else { return false; };
+        let Ok(root) = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0)) else { return false; };
         let now = rtdb_directory::now_ms();
         self.incarnation == owner.incarnation && self.log_epoch == owner.log_epoch && self.position >= 0
             && self.record.key.starts_with("oversized/")
@@ -1057,7 +1057,7 @@ impl ReplicaPayloadRelease {
 
 pub(crate) async fn publish_replica_payload_release(bucket: &dyn ObjectStore, owner: &DeploymentRecord, relative: String,
     position: i64, version: PhysicalObjectVersion) -> Result<()> {
-    let root = StorageRoot::new(rtdb_format::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0))?.key();
+    let root = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0))?.key();
     let hash = ring::digest::digest(&ring::digest::SHA256, relative.as_bytes());
     let suffix = hash.as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let path = ObjectKey::new(format!("{}/{root}/{GARBAGE_DIRECTORY}/0-replica-{position}-{suffix}", owner.storage_prefix()))?;
