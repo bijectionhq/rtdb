@@ -78,16 +78,12 @@ impl JournalUnits {
     }
 
     pub(crate) fn retirement_label(&self, sealed: &[u8]) -> Result<String> {
-        let publication = sealed.get(..PUBLICATION_BYTES)
-            .and_then(|prefix| prefix.try_into().ok())
-            .ok_or_else(|| Error::Task("A certified journal frame has no publication identity".into()))?;
-        Ok(self.associated(&publication))
+        let (publication, reference) = split_header(sealed)?;
+        Ok(self.associated(publication, reference))
     }
 
     pub(crate) async fn decrypt(&self, sealed: Bytes) -> Result<Bytes> {
-        let header = sealed.get(..HEADER_BYTES)
-            .ok_or_else(|| Error::Task("A sealed journal frame has no publication header".into()))?;
-        let (publication, reference) = header.split_at(PUBLICATION_BYTES);
+        let (publication, reference) = split_header(&sealed)?;
         let plaintext = self.keys
             .open(
                 &self.associated(publication, reference),
@@ -118,6 +114,12 @@ impl JournalUnits {
         });
         Ok(LogRecord { payload, ..record })
     }
+}
+
+fn split_header(sealed: &[u8]) -> Result<(&[u8], &[u8])> {
+    let header = sealed.get(..HEADER_BYTES)
+        .ok_or_else(|| Error::Task("A sealed journal frame has no publication header".into()))?;
+    Ok(header.split_at(PUBLICATION_BYTES))
 }
 
 /// A separate payload owner can match a delivered pointer to a certified
