@@ -2297,6 +2297,17 @@ pub struct OwnedWorldAcceptedCut<'a> {
 }
 
 impl OwnedWorldAcceptedCut<'_> {
+    pub fn system_time(&self) -> Timestamp { self.system }
+
+    pub async fn boundaries(
+        &self, id: &rtdb_types::EntityId, valid: rtdb_types::Interval,
+    ) -> Result<Option<QueryCursor>> {
+        rtdb_query::open_owned_valid_boundaries(
+            self.held.relation_context(self.relation)?, &self.held.owner,
+            &self.relation.in_world(self.world)?, id, valid, self.system,
+        ).await
+    }
+
     pub async fn overlay_range(
         &self, path: &rtdb_types::OwnedRelation, request: crate::OwnedRangeRequest<'_>, valid: Timestamp,
     ) -> Result<crate::OwnedRangePage> {
