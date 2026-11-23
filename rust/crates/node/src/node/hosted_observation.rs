@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, OwnedRelation, PlacedAttemptScope, Result, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
 
-use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction};
+use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, prepare_query, read_value};
 use rtdb_query::QueryContext;
 
 /// Exact original ordinary Root point condition. Absence is a condition.
@@ -12,6 +12,65 @@ pub struct AppliedOwnedPoint {
     pub id: EntityId,
     pub valid_at: Timestamp,
     pub expected: Option<Timestamp>,
+}
+
+pub struct AppliedReadFloor {
+    history: uuid::Uuid,
+    transactions: Vec<TransactionKey>,
+    minimum: TransactionKey,
+}
+
+impl AppliedReadFloor {
+    pub fn new(history: uuid::Uuid, mut transactions: Vec<TransactionKey>) -> Result<Self> {
+        if history.is_nil() || !(1..=3).contains(&transactions.len())
+            || transactions.iter().any(|key| key.tx_id.0 < 0)
+        {
+            return Err(Anomaly::incorrect("rtdb.owned/applied-floor", "Invalid applied read history or transaction floor"));
+        }
+        transactions.sort_unstable_by_key(|key| key.tx_id.0);
+        transactions.dedup();
+        let minimum = transactions.iter().copied().try_fold(transactions[0], confirmation_floor)?;
+        Ok(Self { history, transactions, minimum })
+    }
+
+    pub(super) fn cut(&self, original: Option<TransactionKey>) -> Result<CatalogReadCut> {
+        let minimum = match original {
+            Some(original) => confirmation_floor(original, self.minimum)?,
+            None => self.minimum,
+        };
+        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history })
+    }
+
+    pub(super) async fn require_transactions(
+        &self, context: &Arc<QueryContext>, head: TransactionKey, original: Option<TransactionKey>,
+    ) -> Result<()> {
+        let original = original.filter(|key| !self.transactions.contains(key));
+        let mut needed = self.transactions.iter().copied().chain(original).filter(|expected| *expected != head).peekable();
+        if needed.peek().is_none() { return Ok(()); }
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: [(0, LogicalType::Scalar(ScalarType::I64))].into(),
+            default_timezone: context.timezone.clone(),
+            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
+            ..Default::default()
+        };
+        let query = prepare_query("SELECT system_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", context, &options)?;
+        for expected in needed {
+            let mut cursor = query.execute(Arc::clone(context), vec![Value::I64(expected.tx_id.0)]).await?;
+            let mut seen = false;
+            while let Some(batch) = cursor.next_batch().await? {
+                let batch = batch.batch();
+                if batch.num_rows() == 0 { continue; }
+                if seen || batch.num_rows() != 1 { return Err(unavailable()); }
+                let value = read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?;
+                if !matches!(value, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == expected.system_time.0) {
+                    return Err(unavailable());
+                }
+                seen = true;
+            }
+            if !seen { return Err(unavailable()); }
+        }
+        Ok(())
+    }
 }
 
 fn unavailable() -> Anomaly {
@@ -160,7 +219,7 @@ impl OwnedReadSession {
     pub async fn confirm_applied_hosted_read(
         &self,
         scope: PlacedAttemptScope,
-        floor: TransactionKey,
+        floor: &AppliedReadFloor,
         until: Timestamp,
         controls: &[HostedControlWrite],
         point: Option<&AppliedOwnedPoint>,
@@ -194,7 +253,6 @@ impl OwnedReadSession {
         if attachment.await_authority.codec().map(|codec| codec.scope()) != Some(scope) {
             return Err(unavailable());
         }
-        let minimum = confirmation_floor(self.present, floor)?;
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
             snapshot_time: None,
@@ -203,7 +261,7 @@ impl OwnedReadSession {
         };
         let current = self.node.query_context_in_placement(
             &self.database, &basis, self.identity.as_ref(), Some(&self.attachment),
-            CatalogReadCut::HostedApplied(minimum), &self.cancellation,
+            floor.cut(Some(self.present))?, &self.cancellation,
         ).await?;
         let database = current.catalog.database(&self.database)?;
         let [captured] = database.partitions.as_slice() else {
@@ -211,6 +269,7 @@ impl OwnedReadSession {
         };
         let head = captured.tx_basis().filter(|head| head.system_time < until)
             .ok_or_else(unavailable)?;
+        floor.require_transactions(&current, head, Some(self.present)).await?;
         let mut matches = compare_controls(&self.context, &current, controls).await?;
         if let Some(point) = point {
             let valid = Interval::at(point.valid_at)?;

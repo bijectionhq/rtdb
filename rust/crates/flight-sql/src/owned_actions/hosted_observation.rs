@@ -2,7 +2,25 @@ use super::*;
 use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
-pub(crate) const CONFIRM_APPLIED_HOSTED_V3: &str = "rtdb.owned.ConfirmAppliedHosted.v3";
+pub(crate) const CONFIRM_APPLIED_HOSTED_V4: &str = "rtdb.owned.ConfirmAppliedHosted.v4";
+
+pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadFloor, &[u8]), Status> {
+    let (history, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Applied read requires a history"))?;
+    let (&count, mut body) = body.split_first().ok_or_else(|| invalid("Applied read requires a transaction count"))?;
+    if !(1..=3).contains(&count) { return Err(invalid("Invalid applied read transaction count")); }
+    let mut transactions = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let (offset, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Applied read requires a floor transaction"))?;
+        let (time, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Applied read requires an exact floor time"))?;
+        transactions.push(rtdb_types::TransactionKey {
+            tx_id: rtdb_types::TxId(i64::from_be_bytes(*offset)),
+            system_time: Timestamp(i64::from_be_bytes(*time)),
+        });
+        body = rest;
+    }
+    let floor = rtdb_node::AppliedReadFloor::new(Uuid::from_bytes(*history), transactions).map_err(status)?;
+    Ok((floor, body))
+}
 
 fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Status> {
     let (kind, body) = body.split_first().ok_or_else(|| invalid("Applied confirmation requires a point flag"))?;
@@ -44,18 +62,9 @@ impl Service {
         let policy = self.hosted_control_policy(call)?;
         let (handle, body) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Applied confirmation requires a held handle"))?;
-        let (offset, body) = body.split_first_chunk::<8>()
-            .ok_or_else(|| invalid("Applied confirmation requires a floor transaction"))?;
-        let (time, body) = body.split_first_chunk::<8>()
-            .ok_or_else(|| invalid("Applied confirmation requires an exact floor time"))?;
+        let (floor, body) = applied_read_floor(body)?;
         let (deadline, body) = body.split_first_chunk::<8>()
             .ok_or_else(|| invalid("Applied confirmation requires a deadline"))?;
-        let offset = i64::from_be_bytes(*offset);
-        if offset < 0 { return Err(invalid("Applied confirmation requires a nonnegative transaction ID")); }
-        let floor = rtdb_types::TransactionKey {
-            tx_id: rtdb_types::TxId(offset),
-            system_time: Timestamp(i64::from_be_bytes(*time)),
-        };
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512 + 8192)?;
         let (point, body) = applied_point(body)?;
@@ -66,7 +75,7 @@ impl Service {
         let (controls, _control_charges) =
             self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
         let until = Timestamp(i64::from_be_bytes(*deadline));
-        let covered = held.snapshot.confirm_applied_hosted_read(scope, floor, until, &controls, point.as_ref())
+        let covered = held.snapshot.confirm_applied_hosted_read(scope, &floor, until, &controls, point.as_ref())
             .await.map_err(status)?;
         let bytes = match covered {
             Some(covered) => {
