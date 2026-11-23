@@ -286,7 +286,7 @@ async fn guarded_system_time_cannot_precede_the_source_log() {
     let aborted = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), guarded(99), &context).await.unwrap();
     assert_eq!(aborted.result().error().unwrap().code, "rtdb/ordered-system-time");
     assert_eq!(aborted.result().tx_key().system_time, Timestamp(100));
-    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")]);
 
     let committed = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), guarded(101), &context).await.unwrap();
     assert!(committed.result().committed());
@@ -835,7 +835,7 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
     let error = duplicate.result().error().unwrap();
     assert_eq!(error.code, "rtdb/idempotency-duplicate");
     assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
-    assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")], "a duplicate writes nothing but its own outcome");
+    assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")], "a duplicate writes only its own outcome and expiring metadata");
     let conflict = resolve(keyed("alice", 2), 300).await;
     assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
     assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
@@ -1171,4 +1171,56 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
         source(vec![deadline(), check(106)]), &context).await.unwrap();
     assert_eq!(refused_slice.result().error().unwrap().code, "rtdb.hosted/control-scope");
     assert!(!refused_slice.writes().tables().contains_key(&table));
+}
+
+#[tokio::test]
+async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome_survives() {
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext};
+    use rtdb_types::EntityId;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = Value::Struct(StructFields::from([("note".into(), Value::Utf8("transient".into()))]));
+    let source = SourceTransaction::new(vec![], SubmitOptions {
+        user_metadata: Some(UserMetadata::new(metadata.clone(), &context.memory).unwrap()),
+        ..Default::default()
+    }, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source, &context).await.unwrap();
+    let history = &initial.writes().tables()[&TableRef::new("xt", "txs")];
+    let StoredOperation::Put(row) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
+        panic!("expected history");
+    };
+    assert_eq!(row["user_metadata"], Value::Null);
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+
+    let projection = async |snapshot: rtdb_index::Snapshot, check_predicate: bool| {
+        let snapshot = snapshot.with_system_time_cap(Some(Timestamp(100))).unwrap();
+        let catalog = CatalogSnapshot::new("xtdb", [(
+            "xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&context.storage) },
+        )].into(), false).unwrap();
+        let query_context = QueryContext::new(catalog, Arc::clone(&context.memory), Timestamp(100), "UTC", context.query_options.clone(), &context.cancellation).unwrap();
+        let text = if check_predicate {
+            "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0 AND user_metadata IS NOT NULL"
+        } else {
+            "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0"
+        };
+        let sql = rtdb_sql::prepare_in(text, &query_context.catalog, &Default::default(), &context.memory).unwrap();
+        let mut result = PreparedQuery::from_prepared(sql, &context.memory).unwrap().execute(query_context, vec![]).await.unwrap();
+        let owned = result.next_batch().await.unwrap()?;
+        let page = owned.batch();
+        Some((0..page.num_columns()).map(|col| {
+            rtdb_columnar::read_value(page.schema().field(col), page.column(col).as_ref(), 0).unwrap()
+        }).collect::<Vec<_>>())
+    };
+    assert_eq!(projection(state.snapshot(), true).await, Some(vec![Value::Bool(true), metadata]));
+    let expiry = 100 + RECEIPT_WINDOW_MICROS;
+    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
+    let sidecar = cut.writes().tables()[&TableRef::new("xt", "idempotency_receipts")].batch().unwrap();
+    let erased = sidecar.view().read_event(0).unwrap();
+    assert_eq!(erased.iid, EntityId::Integer(0).iid());
+    assert!(matches!(erased.operation, StoredOperation::Erase));
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    assert_eq!(projection(state.snapshot(), false).await, Some(vec![Value::Bool(true), Value::Null]));
+    assert_eq!(projection(state.snapshot(), true).await, None);
 }

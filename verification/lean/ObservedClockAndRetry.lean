@@ -75,9 +75,34 @@ theorem same_body_redeems_the_original_terminal_outcome
     (admit cutoff sample body state).2 = .existing original.outcome := by
   simp [admit, recorded, same, Int.not_le.mpr before]
 
+structure RetainedPayload where
+  coordinate : Nat
+  expiresAt : Int
+  value : Nat
+
+def retained (clock : Int) (row : RetainedPayload) : Bool :=
+  decide (clock < row.expiresAt)
+
+def retire (clock : Int) (rows : List RetainedPayload) : List RetainedPayload :=
+  rows.filter (retained clock)
+
+theorem retirement_selects_exactly_open_payloads
+    (clock : Int) (rows : List RetainedPayload) (row : RetainedPayload) :
+    row ∈ retire clock rows ↔ row ∈ rows ∧ clock < row.expiresAt := by
+  simp [retire, retained]
+
+theorem installed_retirement_survives_clock_regression
+    (clock sample : Int) (rows : List RetainedPayload) (row : RetainedPayload)
+    (expired : row.expiresAt ≤ clock) :
+    row ∉ retire (max clock sample) rows := by
+  rw [retirement_selects_exactly_open_payloads]
+  omega
+
 #print axioms ordered_projection_preserves_the_unsmoothed_observation
 #print axioms observing_expiry_is_irreversible
 #print axioms the_first_terminal_outcome_survives_all_other_attempts
 #print axioms same_body_redeems_the_original_terminal_outcome
+#print axioms retirement_selects_exactly_open_payloads
+#print axioms installed_retirement_survives_clock_regression
 
 end RTDB.ObservedClockAndRetry

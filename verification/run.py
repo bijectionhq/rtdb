@@ -1815,8 +1815,12 @@ def verify_lean(args, scratch):
                 "then ({ withClock with receipt := some body }, .applied body.outcome)",
                 ["same_body_redeems_the_original_terminal_outcome", "the_first_terminal_outcome_survives_all_other_attempts"],
             ),
+            "keep-expired-rows": (
+                "rows.filter (retained clock)", "rows",
+                ["retirement_selects_exactly_open_payloads"],
+            ),
         },
-        4,
+        6,
     )
     path = Path("verification/lean/History.lean")
     controls = {

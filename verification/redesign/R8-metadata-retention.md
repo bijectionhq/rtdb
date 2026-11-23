@@ -80,3 +80,27 @@ It rejects reporting a smoothed observation, using a regressed clock, and replac
 Verus checks that expiry uses the exclusive boundary and that a regressed append observation cannot reopen an identity.
 The native node test flushes the first terminal results, reopens the database, redeems the abort and commit, then verifies that expiry survives a second restart and clock rollback.
 The resolver tests cover the compatibility assertion and reuse of a placed identity after writer turnover, with an independent fork history as a control.
+
+## Ordered retirement and storage custody
+
+The durable transaction row stores both the raw source append timestamp and the receipt clock carried forward from its exact predecessor.
+The receipt clock is local to the installed history and survives replay, a writer change, and a clock regression.
+A bounded application retry remains expired at its exclusive cutoff even when the next append clock sample is earlier.
+Its identity remains scoped by principal and, in a placed deployment, the history fingerprint across writer epochs.
+Legacy application keys remain reusable after their window ends.
+Placed attempt redemption checks the installed receipt clock.
+An applied prefix remains a causal token independently of the attempt receipt.
+
+New source-log submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
+The immutable result row keeps the transaction coordinate, commit flag and structured result error.
+Current reads of `xt.txs.user_metadata` select the payload at the installed receipt clock, including when the requested system time is earlier.
+Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
+The collector retains a legacy key's predecessors while a newer interval of that key is still active.
+Formerly embedded metadata and metadata from external writers lack the new source admission record and need migration.
+The current placed outcome proof remains materialized for replica validation and still needs a physical retirement transition.
+
+The durable receipt clock and erase events identify logical retirement and its ordered point.
+They grant no authority to delete an immutable source-log segment, a replica segment, a checkpoint, an archive, a skipped payload, or a held trie.
+A physically retired scope requires an exact successor checkpoint, release of every recovery reference and entitlement, and settlement by each copy's custodian.
+An archive's recorded key withdrawal or empty-inventory receipt only attests its own authority and provider scope.
+A report on R8 must retain the physical-closure gap until all copy classes, versions and recovery holds are accounted for.

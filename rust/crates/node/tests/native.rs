@@ -4006,12 +4006,29 @@ async fn bounded_retries_preserve_terminal_aborts_and_do_not_reopen_after_clock_
     stop(&node, driver).await;
 
     clock.0.store(999_999, Ordering::Relaxed);
-    let (node, driver) = running(settings, fresh_local_services(&runtime)).await;
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let late = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
     assert_eq!(late.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
     assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME ORDER BY _id", vec![]).await.unwrap()).await,
         [vec![Value::I64(0)], vec![Value::I64(1)]]);
+    let retirement = 1_000_000 + rtdb_tx::RECEIPT_WINDOW_MICROS;
+    clock.0.store(retirement, Ordering::Relaxed);
+    assert!(session.state_mut().execute_tx(vec![put(&node, 0, 0)], Default::default()).await.unwrap().committed());
+    node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    drop(session);
+    stop(&node, driver).await;
+
+    clock.0.store(999_999, Ordering::Relaxed);
+    let (node, driver) = running(settings, fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let history = format!("SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = {}", committed.tx_key().tx_id.0);
+    assert_eq!(rows(session.query_sql(&history, vec![]).await.unwrap()).await, [vec![Value::Bool(true), Value::Null]]);
+    let resident = "SELECT _id FROM xt.bounded_retry_receipts FOR ALL VALID_TIME";
+    assert!(rows(session.query_sql(resident, vec![]).await.unwrap()).await.is_empty());
+    let original = node.await_transaction("xtdb", committed.tx_key().tx_id, &Authority, &CancellationToken::new()).await.unwrap();
+    assert_eq!(original, committed);
     drop(session);
     stop(&node, driver).await;
 }

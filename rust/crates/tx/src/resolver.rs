@@ -186,7 +186,9 @@ impl TxResolver {
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
         let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
-        let receipt_time = tx.observe_retention_clock(log_time).await?;
+        let clock = tx.observe_retention_clock(log_time).await?;
+        let receipt_time = clock.time;
+        tx.retire_expired_receipts(clock).await?;
         tx.write_result(&result, None, Some((log_time, receipt_time)))?;
         if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?; }
         self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
@@ -220,7 +222,8 @@ impl TxResolver {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
         };
-        let receipt_time = tx.observe_retention_clock(log_time).await?;
+        let clock = tx.observe_retention_clock(log_time).await?;
+        let receipt_time = clock.time;
         let bounded_receipt = if let Some(SourceGuard::Bounded(retry)) = &request.guard {
             let scope = retry::RetryScope::new(attempt.map(PlacedAttempt::scope));
             tx.admit_bounded_retry(&scope, &request, *retry, receipt_time).await?
@@ -358,6 +361,7 @@ impl TxResolver {
             Err(error) => return Err(error),
         };
         if let Some(receipt) = bounded_receipt { tx.write_bounded_receipt(receipt, receipt_time)?; }
+        if !has_owned_operations { tx.retire_expired_receipts(clock).await?; }
         tx.write_result(&result, request.options.user_metadata.as_ref(), Some((log_time, receipt_time)))?;
         if let Some(attempt) = attempt {
             let selected = if settled { refusal } else { primary };
@@ -408,7 +412,9 @@ impl TxResolver {
         };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
-        let receipt_time = tx.observe_retention_clock(log_time).await?;
+        let clock = tx.observe_retention_clock(log_time).await?;
+        let receipt_time = clock.time;
+        tx.retire_expired_receipts(clock).await?;
         tx.write_result(&result, None, Some((log_time, receipt_time)))?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
@@ -2280,16 +2286,33 @@ impl<'a> OpenTransaction<'a> {
         let table = TableRef::new("xt", "txs");
         let error_column = "error".to_owned();
         let metadata_column = "user_metadata".to_owned();
+        let metadata_type = metadata.map_or_else(
+            || LogicalType::Struct(StructFields::new()).maybe(),
+            |metadata| metadata.value().logical_type().maybe(),
+        );
+        let embedded_metadata = match (source_times, metadata) {
+            (Some((_, observed)), Some(metadata)) => {
+                let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
+                let retained = StructFields::from([
+                    ("_id".into(), Value::I64(key.tx_id.0)),
+                    (metadata_column.clone(), metadata.value().clone()),
+                ]);
+                self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
+                Value::Null
+            }
+            (None, Some(metadata)) => metadata.value().clone(),
+            (_, None) => Value::Null,
+        };
         let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
             ("source_log_time".into(), source_times.map(|(appended, _)| time_value(appended)).unwrap_or(Value::Null)),
             ("receipt_time".into(), source_times.map(|(_, observed)| time_value(observed)).unwrap_or(Value::Null)),
             ("committed".into(), Value::Bool(result.committed())),
-            (metadata_column.clone(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
+            (metadata_column.clone(), embedded_metadata),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
-        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(StructFields::new()).maybe())])
+        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &metadata_type)])
     }
 }
 
