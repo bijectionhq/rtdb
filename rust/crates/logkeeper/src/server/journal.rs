@@ -178,6 +178,7 @@ struct Current {
 }
 
 pub(crate) struct Journal {
+    pub(super) signer: rtdb_storage::attestation::SigningKey,
     segments: PathBuf,
     fsync: bool,
     _lock: File,
@@ -309,18 +310,24 @@ fn read_identity(path: &Path, length: usize) -> Result<Option<String>> {
     Ok(Some(identity))
 }
 
-fn write_identity(data_dir: &Path, path: &Path, identity: &str, fsync: bool) -> Result<()> {
+fn write_identity(data_dir: &Path, path: &Path, contents: &[u8], fsync: bool) -> Result<()> {
     let temporary = path.with_extension("tmp");
-    let mut file = OpenOptions::new().create(true).truncate(true).write(true)
-        .open(&temporary).map_err(|error| io_error(&temporary, error))?;
-    file.write_all(identity.as_bytes()).map_err(|error| io_error(&temporary, error))?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|error| io_error(&temporary, error))?;
+    file.write_all(contents).map_err(|error| io_error(&temporary, error))?;
     if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&temporary, error))?; }
     fs::rename(&temporary, path).map_err(|error| io_error(path, error))?;
     sync_directory(data_dir, fsync)
 }
 
 pub(super) enum MemberIdentity {
-    Open(String),
+    Open,
     Reopen(String),
 }
 
@@ -342,23 +349,42 @@ impl Journal {
         let files = list_segments(&segments, true)?;
         let member_path = data_dir.join("MEMBER");
         let local_path = data_dir.join("JOURNAL_ID");
-        let (identity_path, candidate) = match member.as_ref() {
-            Some(MemberIdentity::Open(candidate) | MemberIdentity::Reopen(candidate)) => {
+        let identity_path = match member.as_ref() {
+            Some(MemberIdentity::Open | MemberIdentity::Reopen(_)) => {
                 if local_path.try_exists().map_err(|error| io_error(&local_path, error))? {
                     return Err(corrupt(&local_path, "an anonymous journal cannot register as a member"));
                 }
-                (&member_path, candidate.clone())
+                &member_path
             }
             None => {
                 if member_path.try_exists().map_err(|error| io_error(&member_path, error))? {
                     return Err(corrupt(&member_path, "a member journal requires its member configuration"));
                 }
-                (&local_path, uuid::Uuid::new_v4().to_string())
+                &local_path
             }
         };
-        let identity = read_identity(identity_path, candidate.len())?;
-        if matches!(member, Some(MemberIdentity::Reopen(_))) && identity.as_deref() != Some(candidate.as_str()) {
+        let identity = read_identity(identity_path, 36)?;
+        if let Some(MemberIdentity::Reopen(expected)) = &member
+            && identity.as_deref() != Some(expected.as_str())
+        {
             return Err(corrupt(identity_path, "the original journal member identity is missing or different"));
+        }
+        let private_key = data_dir.join("JOURNAL_SIGNING_KEY");
+        let encoded = match fs::read(&private_key) {
+            Ok(encoded) => encoded,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && identity.is_none() => {
+                let key = rtdb_storage::attestation::SigningKey::generate()
+                    .map_err(|error| io_error(&private_key, error))?;
+                write_identity(data_dir, &private_key, &key, fsync)?;
+                key
+            }
+            Err(error) => return Err(io_error(&private_key, error)),
+        };
+        let signer = rtdb_storage::attestation::SigningKey::open(&encoded)
+            .map_err(|error| io_error(&private_key, error))?;
+        let candidate = crate::attestation::journal_id(&signer.public_key()).to_string();
+        if identity.as_ref().is_some_and(|retained| retained != &candidate) {
+            return Err(corrupt(identity_path, "the journal signing key does not own its retained identity"));
         }
         if identity.is_some() && files.is_empty() {
             return Err(corrupt(identity_path, "the installed journal has lost its segments"));
@@ -409,10 +435,11 @@ impl Journal {
         } else {
             if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&path, error))?; }
             sync_directory(&segments, fsync)?;
-            write_identity(data_dir, identity_path, &candidate, fsync)?;
+            write_identity(data_dir, identity_path, candidate.as_bytes(), fsync)?;
             candidate
         };
         let journal = Self {
+            signer,
             segments,
             fsync,
             _lock: lock,
@@ -936,12 +963,10 @@ mod tests {
     #[test]
     fn an_installed_member_rejects_missing_segments() {
         let directory = tempfile::tempdir().unwrap();
-        let first = "c2a4eba6-83a7-455d-a1c1-b80c5cf5f2ba";
-        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open(first.into()))).unwrap();
-        assert_eq!(identity, first);
+        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open)).unwrap();
         drop(journal);
         fs::remove_dir_all(directory.path().join("segments")).unwrap();
-        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(first.into()))).is_err());
+        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(identity))).is_err());
     }
 
     #[test]

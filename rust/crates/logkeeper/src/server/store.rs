@@ -140,6 +140,11 @@ impl Store {
         Self { journal, streams: Mutex::new(streams), authorities: Mutex::new(authorities), queue, pending_writes: Arc::new(Semaphore::new(PENDING_WRITE_BYTES)), digest_pages: Semaphore::new(CONCURRENT_DIGEST_PAGES) }
     }
 
+    pub(super) fn prove_identity(&self, nonce: &[u8; 16]) -> ([u8; 32], [u8; 64]) {
+        let signer = &self.journal.signer;
+        (signer.public_key(), crate::attestation::sign_challenge(signer, nonce))
+    }
+
     fn slot(&self, name: &str) -> Arc<Slot> {
         let mut streams = self.streams.lock();
         if let Some(slot) = streams.get(name) { return Arc::clone(slot); }

@@ -373,7 +373,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
         data_dir: settings.data_dir,
         fsync: settings.fsync,
         cache_bytes: settings.cache_bytes,
-    }, MemberId::fresh().0).await?;
+    }).await?;
     if !uuid::Uuid::parse_str(&identity).is_ok_and(|id| !id.is_nil() && id.to_string() == identity) {
         return Err(Anomaly::incorrect("rtdb.multi/logkeeper-identity", "The retained journal member ID is invalid"));
     }

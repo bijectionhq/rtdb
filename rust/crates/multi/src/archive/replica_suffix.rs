@@ -1054,7 +1054,6 @@ mod custody_tests {
         let address = listener.local_addr().unwrap().to_string();
         let (journal, journal_id) = rtdb_logkeeper::PreparedJournal::open_for_member(
             rtdb_logkeeper::ServerOptions { data_dir: location.path().join("journal"), fsync: true, cache_bytes: 1 << 20 },
-            Uuid::new_v4().to_string(),
         ).await?;
         let stream = rtdb_logkeeper::StreamConfig {
             servers: vec![rtdb_logkeeper::JournalEndpoint::Member { address: address.clone(), journal: journal_id.clone() }],

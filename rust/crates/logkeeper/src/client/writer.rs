@@ -1073,7 +1073,7 @@ mod tests {
         for _ in 0..4 {
             let directory = tempfile::tempdir().unwrap();
             let options = ServerOptions { data_dir: directory.path().to_owned(), fsync: true, cache_bytes: 0 };
-            let (provider, journal) = PreparedJournal::open_for_member(options, uuid::Uuid::new_v4().to_string()).await.unwrap();
+            let (provider, journal) = PreparedJournal::open_for_member(options).await.unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             endpoints.push(JournalEndpoint::Member { address: listener.local_addr().unwrap().to_string(), journal });
             servers.push(tokio::spawn(provider.serve(listener, cancellation.clone())));

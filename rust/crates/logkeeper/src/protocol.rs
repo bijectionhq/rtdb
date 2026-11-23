@@ -280,12 +280,19 @@ pub(crate) struct DigestPage {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct Identify {}
+pub(crate) struct Identify {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub nonce: Bytes,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct JournalIdentity {
     #[prost(string, tag = "1")]
     pub journal: String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub public_key: Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub signature: Bytes,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]

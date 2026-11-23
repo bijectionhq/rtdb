@@ -4,6 +4,7 @@
 //! It seals a write quorum of the stream's servers at that epoch, recovers the committed history onto them, and only then appends; a server accepts an append only from the writer it is synced to at its promised epoch, so a deposed writer cannot commit.
 //! An entry is committed once a write quorum holds it durably; readers see committed entries only.
 
+mod attestation;
 mod client;
 mod history;
 mod protocol;

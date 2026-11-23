@@ -68,9 +68,7 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
         private_mkdir(&root.join(directory))?;
     }
 
-    let candidate = MemberId::fresh();
-    let (journal, journal_id) =
-        PreparedJournal::open_for_member(journal_options(root), candidate.0).await?;
+    let (journal, journal_id) = PreparedJournal::open_for_member(journal_options(root)).await?;
     let journal_id = MemberId(journal_id);
     record.ensemble = vec![journal_id.clone()];
 
