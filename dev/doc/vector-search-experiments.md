@@ -450,6 +450,11 @@ The first full run on implementation commit `e69f116926` passed 5,886 Rust works
 The Gradle unit, property, and integration suites passed 3,243, 3,348, and 5,629 tests respectively, with one PostgreSQL source skip.
 This run covered Arrow COPY followed by flush and vector ranking, Flight ticket compatibility, native C Data buffer custody, delegated Arrow predicate frames, and temporal ranking.
 
+The final full rerun at `6ab9092e87` included the SQL CASE guard fix and passed 5,901 Rust workspace tests and seven doctests, with 15 Rust tests ignored.
+Gradle passed 3,243 unit, 3,348 property, and 5,629 integration tests, with the same PostgreSQL source skip and no reflection or boxed-math warnings.
+The guard regression verifies that a false or null guard leaves zero-norm vectors unread and that a selected zero-norm vector returns the expected error.
+On the published commit `f908864281`, the Rust all-targets workspace check passed, along with 33 Flight SQL integration tests and 102 distributed cell tests.
+
 The paired release measurement used the same 100,000 100-dimensional GloVe vectors and 12 query vectors, with in-memory primary storage on an Apple M4 Max.
 The baseline was the pre-audit release binary at `fa969b755`.
 The candidate included the CASE guard fix on the `5191a9f0ed` tree, which also incorporates later RTDB main work.
