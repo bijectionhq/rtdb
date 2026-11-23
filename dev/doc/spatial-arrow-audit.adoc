@@ -18,6 +18,10 @@ Existing declarations keep their original tagged WKB carrier.
 Continuation actions carry the filter capability, complete identity, bound, and observation flag.
 Older wire versions accept their original stateless Arrow requests.
 
+| Nearest radius expansion
+| The fallback encoded the same query geometry and partition again when widening the radius.
+| Bijection retains the Arrow geometry, partition, and projection arrays and replaces the radius cell at the same held cut.
+
 | Held nearest pagination
 | Every ranked continuation reopened candidate pages and refined the same geometries.
 | A held capability retains complete keys, physical IIDs and exact distances in Arrow.
@@ -74,6 +78,11 @@ The application result materializes after the row is selected.
 | Create and commit converted geometry and partition columns to document maps before rebuilding the source Arrow vectors.
 | Compatible payload columns pass from the upload through source IPC and ordered resolution into the Arrow event batch.
 Transaction resolution still orders admission, locality, and final-state checks.
+
+| Hosted Root catalog replacement
+| The Flight decoder materializes the hosted catalog payload as generic document fields.
+| The ordered source encoder and resolver rebuild Arrow from those fields.
+The hosted control path still uses a row representation between Arrow boundaries.
 
 | Spatial path declaration and removal
 | Declaration and catalog checks materialized generic row and list values for path names and columns.
