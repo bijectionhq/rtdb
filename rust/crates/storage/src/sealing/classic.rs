@@ -20,6 +20,7 @@ use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
 const OWNER: &str = "~rtdb-classic-key-lineage";
 const KEY_BYTES: usize = 32;
+pub const KAFKA_LOG_SEAL_OVERHEAD: usize = LOG_SEAL_OVERHEAD;
 pub(crate) const LOG_SEAL_OVERHEAD: usize = 16 + super::cipher::SEALED_OVERHEAD;
 
 #[derive(Clone)]
@@ -184,6 +185,27 @@ impl ClassicKeyVault {
         }))
     }
 
+    /// Kafka's immutable topic ID selects a vault lineage. Only the caller
+    /// that created the still-empty topic may enroll its vault namespace.
+    pub fn kafka_log_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>) -> Result<Arc<ClassicObjectKeys>> {
+        let topic = Uuid::from_bytes(topic);
+        if topic.is_nil() {
+            return Err(invalid("A Classic Kafka log must have a broker topic identity"));
+        }
+        let path = self.0.join(format!("kafka-{}", topic.simple()));
+        if enroll {
+            match fs::create_dir(&path) {
+                Ok(()) => sync_directory(&self.0).map_err(io(&self.0))?,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io(&path)(error).into()),
+            }
+        }
+        if !path.is_dir() {
+            return Err(invalid("The Classic Kafka topic requires its original enrolled key vault"));
+        }
+        Ok(Arc::new(ClassicObjectKeys { path: path.into(), region }))
+    }
+
     pub fn require_unsealed_log(path: &Path) -> Result<()> {
         if path
             .with_extension("key-lineage")
@@ -286,6 +308,26 @@ impl ObjectCipher for ClassicObjectKeys {
 }
 
 impl ClassicObjectKeys {
+    pub async fn seal_kafka_record(&self, plaintext: Bytes) -> crate::Result<Bytes> {
+        let publication = Uuid::new_v4();
+        let name = ObjectKey::new(format!("frames/{publication}"))?;
+        let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
+        let ciphertext = self.operate(&name, UnitOperation::SealValue(associated, plaintext)).await?.bytes()?;
+        let mut frame = Vec::with_capacity(16 + ciphertext.len());
+        frame.extend_from_slice(publication.as_bytes());
+        frame.extend_from_slice(&ciphertext);
+        Ok(frame.into())
+    }
+
+    pub async fn open_kafka_record(&self, frame: Bytes) -> crate::Result<Bytes> {
+        let publication = frame.get(..16).and_then(|prefix| Uuid::from_slice(prefix).ok())
+            .filter(|publication| !publication.is_nil())
+            .ok_or_else(|| Error::Task("Kafka frame has no sealed publication identity".into()))?;
+        let name = ObjectKey::new(format!("frames/{publication}"))?;
+        let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
+        self.operate(&name, UnitOperation::OpenValue(associated, frame.slice(16..))).await?.bytes()
+    }
+
     pub(crate) fn seal_record(
         &self,
         offset: i64,
@@ -404,6 +446,25 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
 mod tests {
     use super::*;
     use crate::MemoryStore;
+
+    #[tokio::test]
+    async fn kafka_frames_require_the_enrolled_topic_and_original_vault() -> Result<()> {
+        let original = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let vault = ClassicKeyVault::open(original.path())?;
+        let other = ClassicKeyVault::open(other.path())?;
+        let topic = Uuid::new_v4().into_bytes();
+        let io = IoRegion::new();
+        let keys = vault.kafka_log_keys(topic, true, Arc::clone(&io))?;
+        let body = Bytes::from_static(b"sealed Kafka record");
+        let frame = keys.seal_kafka_record(body.clone()).await?;
+        assert_ne!(frame, body);
+        assert!(other.kafka_log_keys(topic, false, Arc::clone(&io)).is_err());
+        let different = vault.kafka_log_keys(Uuid::new_v4().into_bytes(), true, Arc::clone(&io))?;
+        assert!(different.open_kafka_record(frame.clone()).await.is_err());
+        assert_eq!(vault.kafka_log_keys(topic, false, io)?.open_kafka_record(frame).await?, body);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn an_enrolled_root_requires_its_original_vault_and_a_withdrawn_slot_stays_closed()

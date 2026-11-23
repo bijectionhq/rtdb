@@ -25,7 +25,8 @@ impl NativeResources {
     /// Registers Kafka resources with the supplied topic-creation policy and node allocation budget.
     /// Opens no clients and returns an error if the Kafka log configuration type is already registered.
     pub fn with_kafka_topic_creation(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool, memory: Arc<rtdb_columnar::MemoryBudget>) -> Result<Self> {
-        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer, auto_create_topic, memory }))
+        let vault = self.classic_vault.clone();
+        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer, auto_create_topic, memory, vault }))
     }
     #[cfg(feature = "s3")]
     pub fn with_s3(self, remotes: Arc<dyn rtdb_s3::S3CredentialResolver>) -> Result<Self> {
@@ -79,7 +80,7 @@ impl RemoteStorageFactory for GcsFactory {
 }
 
 #[cfg(feature = "kafka")]
-struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool, memory: Arc<rtdb_columnar::MemoryBudget> }
+struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool, memory: Arc<rtdb_columnar::MemoryBudget>, vault: Option<rtdb_storage::sealing::ClassicKeyVault> }
 #[cfg(feature = "kafka")]
 #[async_trait]
 impl crate::LogFactory for KafkaFactory {
@@ -100,8 +101,13 @@ impl crate::LogFactory for KafkaFactory {
         replica_options.read_only = access.replica_read_only();
         replica_options.auto_create_topic = self.auto_create_topic;
         replica_options.pipelined = true;
-        let source = KafkaLog::open(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory)).await?;
-        let replica = KafkaLog::open(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory)).await?;
+        let vault = self.vault.clone().ok_or_else(|| invalid("Classic Kafka logs require RTDB_CLASSIC_KEY_VAULT"))?;
+        let source = KafkaLog::open_classic(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault.clone()).await?;
+        let replica = KafkaLog::open_classic(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault).await?;
+        if source.log.topic_id() == replica.log.topic_id() {
+            return Err(invalid("Source and replica Kafka logs resolve to the same physical topic"));
+        }
+
         let mut drivers = Vec::new();
         for driver in source.driver.into_iter().chain(replica.driver) {
             let token = cancellation.clone();
@@ -128,7 +134,9 @@ mod kafka_tests {
         let memory = rtdb_columnar::MemoryBudget::new(0);
         let mut cluster = rtdb_kafka::KafkaClusterConfig::new("unused.invalid:9092");
         cluster.properties_map.insert("security.protocol".into(), "SSL".into());
-        let factory = KafkaFactory { clusters: std::collections::BTreeMap::from([("remote".into(), cluster)]), observer: Arc::new(Observer), auto_create_topic: false, memory: Arc::clone(&memory) };
+        let directory = tempfile::tempdir().unwrap();
+        let vault = rtdb_storage::sealing::ClassicKeyVault::open(directory.path()).unwrap();
+        let factory = KafkaFactory { clusters: std::collections::BTreeMap::from([("remote".into(), cluster)]), observer: Arc::new(Observer), auto_create_topic: false, memory: Arc::clone(&memory), vault: Some(vault) };
         let configuration = Any { type_url: "xtdb.kafka.proto.KafkaLogConfig".into(), value: rtdb_kafka::KafkaLogConfig::new("remote", "source").to_proto().encode_to_vec() };
         let result = factory.open(&configuration, crate::LogAccess::ReadWrite, tokio_util::sync::CancellationToken::new()).await;
         assert_eq!(result.err().unwrap().code, "rtdb/memory-budget-exceeded");

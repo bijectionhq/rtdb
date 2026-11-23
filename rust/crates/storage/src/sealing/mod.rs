@@ -5,7 +5,7 @@ mod classic;
 mod delivery;
 pub use delivery::{PlaintextDelivery, PlaintextView, drain_unit_delivery};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
-pub use classic::{ClassicKeyVault, ClassicObjectKeys};
+pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD};
 
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 

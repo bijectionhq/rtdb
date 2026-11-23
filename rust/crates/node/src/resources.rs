@@ -168,7 +168,7 @@ pub struct NativeResources {
     log_factories: BTreeMap<String, Arc<dyn LogFactory>>,
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
     disk_cache: Option<Arc<DiskCache>>,
-    classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
+    pub(crate) classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,

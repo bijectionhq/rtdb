@@ -69,7 +69,8 @@ The immutable provider marker selects the vault lineage and refuses enrollment o
 The coordinated trie release authority authenticates the installed receipt and drains the eligible root before it asks the vault to withdraw the selected slots.
 Classic local source and replica logs seal each frame under a fresh publication slot, with the physical offset and sampled timestamp authenticated.
 Reopening a configured sealed log requires its original key lineage.
-Classic sealed-log retirement, Kafka logs, non-trie remote key retirement and deployment-wide collection of installed unit slots remain open.
+Classic Kafka database logs use the same vault with a namespace bound to the broker's topic UUID. Only the writer that confirms creation of an empty topic can enroll it. A reader or replacement must open that original namespace. The broker orders the resulting publication IDs at their physical offsets.
+Classic sealed-log retirement, non-trie remote key retirement and deployment-wide collection of installed unit slots remain open.
 Provider verification includes ranged reads, object naming, lost create replies, redundant compaction jobs, independent-copy isolation, cache fencing, and nonce uniqueness.
 
 [Current cipher](../../rust/crates/storage/src/sealing/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

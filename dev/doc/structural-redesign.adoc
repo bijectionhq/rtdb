@@ -209,7 +209,8 @@ Classic local source and replica logs use independent publication slots under th
 Coordinated Classic trie retirement withdraws slots behind its exact release authority.
 Primary staged files and staged manifests use independent slots in the destination stage vault. Stage disposal withdraws the namespace through its existing custody owner.
 Directory-managed replica journal frames use independently registered slots. A cross-cell move or transfer seed verifies the source pages and reseals them at their original offsets under destination slots. Journal retirement withdraws the slot census at residence disposal.
-Directory-managed Multi serving objects, Classic sealed-log retirement and Kafka logs, and per-unit retirement outside coordinated trie releases remain open.
+Classic Kafka database logs seal frames before enqueueing and use the original vault lineage bound to the broker topic ID.
+Directory-managed Multi serving objects, Classic sealed-log retirement, and other per-unit retirement outside coordinated trie releases remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
