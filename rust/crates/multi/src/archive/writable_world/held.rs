@@ -143,7 +143,15 @@ enum ArchiveRead {
         reply: oneshot::Sender<Result<()>>,
     },
     Point(ArchivePoint),
-    AncestorPoint(ArchivePoint),
+    Ancestor {
+        relation: OwnedRelation,
+        id: EntityId,
+        valid: Interval,
+        schema: rtdb_types::OwnedSchema,
+        schedule: bool,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<AncestorResult>>,
+    },
     PathColumns {
         relation: OwnedRelation,
         path: OwnedRelation,
@@ -198,6 +206,11 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_query::OwnedIdentityCandidates>>,
     },
+}
+
+enum AncestorResult {
+    Point(Option<WorldFact>),
+    Schedule(Vec<(Interval, Timestamp)>),
 }
 
 enum OrderedRead {
@@ -586,9 +599,9 @@ impl HeldCheckpointWorld {
         Ok((fact, shadowed))
     }
 
-    async fn ancestor_point(
-        &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool,
-    ) -> Result<WorldPoint> {
+    async fn read_ancestor(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, schedule: bool,
+    ) -> Result<(AncestorResult, OwnedWorldWitness)> {
         self.check_relation(relation)?;
         let schema = self.historical_parent_schema(relation)?.clone();
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
@@ -596,16 +609,23 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.parent_point_release_guard(
             relation, id, self.open.retained.basis.system_time,
         ).await?;
-        let valid = Interval::at(valid_at)?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::AncestorPoint(ArchivePoint {
-            relation: relation.clone(), id: id.clone(), valid, lifetime: None, expected_schema: Some(schema),
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ancestor {
+            relation: relation.clone(), id: id.clone(), valid, schema, schedule,
             guard: Arc::clone(&guard), reply,
-        }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-        let fact = self.cancellation.run_until_cancelled(result).await
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let read = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         guard()?;
         self.check_relation(relation)?;
+        Ok((read, witness))
+    }
+
+    async fn ancestor_point(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, observed: bool,
+    ) -> Result<WorldPoint> {
+        let (result, witness) = self.read_ancestor(relation, id, Interval::at(valid)?, false).await?;
+        let AncestorResult::Point(fact) = result else { return Err(OwnedWorld::unavailable()); };
         Ok(WorldPoint { present: self.present(), fact, until: None, shadowed: false, witness: observed.then_some(witness) })
     }
 
@@ -1065,6 +1085,12 @@ impl HeldCheckpointWorld {
     ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
         self.check_relation(relation)?;
         if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
+        if self.ancestor().is_some() {
+            if system.is_some() { return Err(OwnedWorld::unavailable()); }
+            let (result, witness) = self.read_ancestor(relation, id, valid, true).await?;
+            let AncestorResult::Schedule(timeline) = result else { return Err(OwnedWorld::unavailable()); };
+            return Ok((timeline, Some(witness)));
+        }
         if parent_only && self.open.snapshot.lifetime_point_policy(relation).await?.is_some() {
             return Err(OwnedWorld::unavailable());
         }
@@ -1314,42 +1340,98 @@ fn search_row_text<'a>(row: &'a StructFields<Value>, column: &str) -> Result<Opt
     }
 }
 
-async fn read_ancestor_shadow(
-    context: Arc<rtdb_query::QueryContext>, owner: &str, ancestor: &rtdb_directory::CheckpointWorldAncestor,
-    relation: &OwnedRelation, id: &EntityId, valid: Interval, memory: &Arc<MemoryBudget>, schema: &rtdb_types::OwnedSchema,
-) -> Result<Option<Option<WorldFact>>> {
-    let unavailable = OwnedWorld::unavailable;
-    let world = Iid(*ancestor.world.as_bytes());
-    check_archive_coverage(&context, owner, [(relation, 0)])?;
-    let (record, _charge) = rtdb_query::read_owned_world(Arc::clone(&context), owner, world)
-        .await?.ok_or_else(unavailable)?;
-    let clock = rtdb_query::read_owned_world_clock_revision(Arc::clone(&context), owner, world).await?;
-    if record.dropped || record.ancestor.is_some() || record.pin.0 != *ancestor.pin.as_bytes()
-        || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
-        || clock != Some((ancestor.logical, ancestor.basis.system_time))
-    {
-        return Err(unavailable());
-    }
-    let overlay = relation.in_world(world)?;
-    let mut shadow = None;
-    if let Some(mut rows) = rtdb_query::open_owned_point(Arc::clone(&context), owner, &overlay, id, Some(valid), None).await? {
-        while let Some(batch) = rows.next_batch().await? {
-            if batch.batch().num_rows() == 0 { continue; }
-            if shadow.is_some() { return Err(unavailable()); }
-            shadow = decode_point(vec![batch], id, memory, None)?;
+struct InheritedRelation<'a> {
+    root: Arc<rtdb_query::QueryContext>,
+    overlay: Arc<rtdb_query::QueryContext>,
+    owner: &'a str,
+    relation: &'a OwnedRelation,
+    shadow: OwnedRelation,
+    overlay_basis: Timestamp,
+    schema: &'a rtdb_types::OwnedSchema,
+    memory: &'a Arc<MemoryBudget>,
+}
+
+impl<'a> InheritedRelation<'a> {
+    async fn open(
+        root: Arc<rtdb_query::QueryContext>, overlay: Arc<rtdb_query::QueryContext>, owner: &'a str,
+        relation: &'a OwnedRelation, ancestor: &rtdb_directory::CheckpointWorldAncestor,
+        schema: &'a rtdb_types::OwnedSchema, memory: &'a Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let unavailable = OwnedWorld::unavailable;
+        check_archive_coverage(&root, owner, [(relation, 0)])?;
+        check_archive_coverage(&overlay, owner, [(relation, 0)])?;
+        let world = Iid(*ancestor.world.as_bytes());
+        let (record, _charge) = rtdb_query::read_owned_world(Arc::clone(&overlay), owner, world)
+            .await?.ok_or_else(unavailable)?;
+        let clock = rtdb_query::read_owned_world_clock_revision(Arc::clone(&overlay), owner, world).await?;
+        let root_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&root), owner, relation).await?;
+        if record.dropped || record.ancestor.is_some() || record.pin.0 != *ancestor.pin.as_bytes()
+            || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
+            || record.basis.system_time != root.current_time.as_micros()?
+            || clock != Some((ancestor.logical, ancestor.basis.system_time))
+            || !root_schema.is_some_and(|(actual, _)| &actual == schema)
+        {
+            return Err(unavailable());
         }
+        let shadow = relation.in_world(world)?;
+        Ok(Self { root, overlay, owner, relation, shadow, overlay_basis: ancestor.basis.system_time, schema, memory })
     }
-    context.check_cancelled()?;
-    let Some(shadow) = shadow else { return Ok(None); };
-    if shadow.revision > ancestor.basis.system_time { return Err(unavailable()); }
-    let fact = match WorldShadow::from_record(shadow.row)? {
-        WorldShadow::Deleted => None,
-        WorldShadow::Present(row) => {
-            schema.validate_row(&row)?;
-            Some(WorldFact { row, revision: shadow.revision, lifetime: None, _reservation: shadow._reservation })
+
+    async fn point(&self, id: &EntityId, valid: Interval) -> Result<Option<WorldFact>> {
+        let unavailable = OwnedWorld::unavailable;
+        let mut shadow = None;
+        if let Some(mut rows) = rtdb_query::open_owned_point(
+            Arc::clone(&self.overlay), self.owner, &self.shadow, id, Some(valid), None,
+        ).await? {
+            while let Some(batch) = rows.next_batch().await? {
+                if batch.batch().num_rows() == 0 { continue; }
+                if shadow.is_some() { return Err(unavailable()); }
+                shadow = decode_point(vec![batch], id, self.memory, None)?;
+            }
         }
-    };
-    Ok(Some(fact))
+        self.overlay.check_cancelled()?;
+        if let Some(shadow) = shadow {
+            if shadow.revision > self.overlay_basis { return Err(unavailable()); }
+            let fact = match WorldShadow::from_record(shadow.row)? {
+                WorldShadow::Deleted => None,
+                WorldShadow::Present(row) => {
+                    self.schema.validate_row(&row)?;
+                    Some(WorldFact { row, revision: shadow.revision, lifetime: None, _reservation: shadow._reservation })
+                }
+            };
+            return Ok(fact);
+        }
+        let batches = read_checkpoint_point_in_context(Arc::clone(&self.root), CheckpointPoint {
+            owner: self.owner, relation: self.relation, id, valid: Some(valid),
+        }, None).await?;
+        let fact = decode_point(batches.unwrap_or_default(), id, self.memory, None)?;
+        if let Some(fact) = &fact {
+            if fact.revision > self.root.current_time.as_micros()? { return Err(unavailable()); }
+            self.schema.validate_row(&fact.row)?;
+        }
+        self.root.check_cancelled()?;
+        Ok(fact)
+    }
+
+    async fn schedule(&self, id: &EntityId, valid: Interval) -> Result<Vec<(Interval, Timestamp)>> {
+        let root_boundaries = rtdb_query::open_owned_valid_boundaries(
+            Arc::clone(&self.root), self.owner, self.relation, id, valid, self.root.current_time.as_micros()?,
+        ).await?;
+        let overlay_boundaries = rtdb_query::open_owned_valid_boundaries(
+            Arc::clone(&self.overlay), self.owner, &self.shadow, id, valid, self.overlay_basis,
+        ).await?;
+        let boundaries = merge_boundaries(
+            read_boundaries(root_boundaries, valid).await?,
+            read_boundaries(overlay_boundaries, valid).await?, valid,
+        )?;
+        let mut timeline = Vec::with_capacity(boundaries.len().saturating_sub(1));
+        for span in boundaries.windows(2) {
+            if let Some(fact) = self.point(id, Interval::at(span[0])?).await? {
+                timeline.push((Interval::new(span[0], span[1])?, fact.revision));
+            }
+        }
+        Ok(timeline)
+    }
 }
 
 fn check_archive_coverage<'a>(
@@ -1553,43 +1635,31 @@ pub(crate) async fn open_held_checkpoint_world(
                                 point = pending.recv() => match point { Some(point) => point, None => break },
                             };
                             match request {
-                                ArchiveRead::AncestorPoint(point) => {
-                                    let ArchivePoint { relation, id, valid, guard, expected_schema, mut reply, .. } = point;
+                                ArchiveRead::Ancestor { relation, id, valid, schema, schedule, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         let ancestor = ancestor.as_ref().ok_or_else(OwnedWorld::unavailable)?;
-                                        let schema = expected_schema.as_ref().ok_or_else(OwnedWorld::unavailable)?;
-                                        let overlay = ancestor_media(deployment, ancestor);
-                                        let shadow = with_checkpoint_context(
+                                        let media = ancestor_media(deployment, ancestor);
+                                        with_checkpoint_context(
                                             archive.directory.as_ref(), &archive.storage, archive.keys.as_ref(),
-                                            archive.hosted_task.as_ref(), &overlay,
+                                            archive.hosted_task.as_ref(), &media,
                                             CheckpointReadResources {
                                                 node: &archive.options, memory, cache: Arc::clone(&ancestor_cache), cancellation: scope,
                                             },
-                                            |overlay| read_ancestor_shadow(
-                                                overlay.with_owned_read_guard(Arc::clone(&guard)), &owner, ancestor,
-                                                &relation, &id, valid, memory, schema,
-                                            ),
-                                        ).await?;
-                                        if let Some(shadow) = shadow {
-                                            return Ok(shadow);
-                                        }
-                                        let root = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
-                                        check_archive_coverage(&root, &owner, [(&relation, 0)])?;
-                                        let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&root), &owner, &relation).await?;
-                                        if !actual.is_some_and(|(actual, _)| &actual == schema) {
-                                            return Err(OwnedWorld::unavailable());
-                                        }
-                                        let batches = read_checkpoint_point_in_context(root, CheckpointPoint {
-                                            owner: &owner, relation: &relation, id: &id, valid: Some(valid),
-                                        }, None).await?;
-                                        let fact = decode_point(batches.unwrap_or_default(), &id, memory, None)?;
-                                        if let Some(fact) = &fact {
-                                            if fact.revision > parent_time { return Err(OwnedWorld::unavailable()); }
-                                            schema.validate_row(&fact.row)?;
-                                        }
-                                        guard()?;
-                                        Ok(fact)
+                                            |overlay| {
+                                                let root = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                                let overlay = overlay.with_owned_read_guard(Arc::clone(&guard));
+                                                let (owner, relation, schema, id) = (&owner, &relation, &schema, &id);
+                                                async move {
+                                                    let read = InheritedRelation::open(root, overlay, owner, relation, ancestor, schema, memory).await?;
+                                                    if schedule {
+                                                        Ok(AncestorResult::Schedule(read.schedule(id, valid).await?))
+                                                    } else {
+                                                        Ok(AncestorResult::Point(read.point(id, valid).await?))
+                                                    }
+                                                }
+                                            },
+                                        ).await
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
@@ -2014,4 +2084,19 @@ pub(crate) async fn open_held_checkpoint_world(
     held.check()?;
     let _ = opening.disarm();
     Ok(held)
+}
+
+#[cfg(test)]
+mod ancestor_boundaries_tests {
+    use super::*;
+
+    #[test]
+    fn retained_overlay_masks_parent_boundaries_inside_its_extent() -> Result<()> {
+        let parent = [0, 4, 7, 10].into_iter().map(Timestamp).collect();
+        let overlay = [1, 8].into_iter().map(Timestamp).collect();
+        let valid = Interval::new(Timestamp(0), Timestamp(10))?;
+        assert_eq!(merge_boundaries(parent, overlay, valid)?,
+            [0, 1, 8, 10].into_iter().map(Timestamp).collect::<Vec<_>>());
+        Ok(())
+    }
 }
