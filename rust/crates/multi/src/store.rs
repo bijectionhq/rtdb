@@ -1068,6 +1068,7 @@ struct ReplicaPayloadRelease {
     incarnation: u64,
     log_epoch: i32,
     position: i64,
+    frame_sha256: [u8; 32],
 }
 
 impl ReplicaPayloadRelease {
@@ -1084,19 +1085,20 @@ impl ReplicaPayloadRelease {
                 && trim.applied && !trim.journals.is_empty() && trim.through >= self.position
                 && trim.journals.iter().all(|endpoint| endpoint.journal().is_some())
                 && trim.candidates.iter().any(|candidate| candidate.position == self.position
-                    && candidate.key == self.record.key && &candidate.version == version))
-            && owner.required_replica_offsets(now).all(|from| from > self.position)
+                    && candidate.key == self.record.key && candidate.frame_sha256 == self.frame_sha256
+                    && &candidate.version == version))
+            && !owner.requires_replica_offset(self.position, now)
     }
 }
 
 async fn publish_replica_payload_release(bucket: &dyn ObjectStore, owner: &DeploymentRecord, relative: String,
-    position: i64, version: PhysicalObjectVersion) -> Result<()> {
+    position: i64, frame_sha256: [u8; 32], version: PhysicalObjectVersion) -> Result<()> {
     let root = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0))?.key();
     let hash = ring::digest::digest(&ring::digest::SHA256, relative.as_bytes());
     let suffix = hash.as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let path = ObjectKey::new(format!("{}/{root}/{GARBAGE_DIRECTORY}/0-replica-{position}-{suffix}", owner.storage_prefix()))?;
     let replica = ReplicaPayloadRelease { record: GarbageRecord { key: relative, released_at_ms: 0, trie_floor: None },
-        incarnation: owner.incarnation, log_epoch: owner.log_epoch, position };
+        incarnation: owner.incarnation, log_epoch: owner.log_epoch, position, frame_sha256 };
     let marker = serde_json::to_vec(&StoredRelease::Replica { replica, version })
         .map_err(|error| Error::Task(error.to_string()))?;
     bucket.put(&path, Bytes::from(marker)).await?;
@@ -2908,7 +2910,7 @@ mod tests {
         let stopped_witness = keys.hold_local_storage_region(stopped).unwrap().unwrap();
         let running_witness = keys.hold_local_storage_region(running).unwrap().unwrap();
         for id in [stopped, running] {
-            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required: 5, custody: rtdb_directory::ReplayCustody::Local });
+            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required: 5, through: 5, custody: rtdb_directory::ReplayCustody::Local });
         }
         let record = directory.create_deployment(record).await.unwrap();
         drop(stopped_witness);

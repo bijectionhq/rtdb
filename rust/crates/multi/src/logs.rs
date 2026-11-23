@@ -18,7 +18,7 @@ use rtdb_logkeeper::{QuorumLog, StreamConfig};
 use rtdb_node::{AwaitAuthority, ClosedEpochRecovery, LogAccess, LogFactory, OpenedLogs, PlacedReceiptCodec, ReplicaReadIndex};
 use rtdb_replication::{TermFence, Verdict};
 use rtdb_storage::log::{AppendReceipt, GuardedAppend, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
-use rtdb_storage::{ObjectKey, ObjectStore, object_store::ReadReservation};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, object_store::ReadReservation};
 use rtdb_types::{Anomaly, BlockIndex, JournalEndpoint, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
@@ -406,8 +406,11 @@ pub(crate) async fn transactions_until(
             if fence.admit(frame.term, frame.term_sequence)?.verdict != Verdict::Apply { continue; }
             let envelope = frame.into_envelope().ok_or_else(gap)?;
             let envelope = if let Some(key) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? {
-                let bytes = store.get_fresh(&ObjectKey::new(key)?).await?;
-                envelope.unwrap_payload(&bytes)?
+                let key = ObjectKey::new(key)?;
+                IoRegion::retaining(Arc::new(record), async {
+                    let bytes = store.get_fresh(&key).await?;
+                    Ok::<_, Anomaly>(envelope.unwrap_payload(&bytes)?)
+                }).await?
             } else { envelope };
             if let ReplicaBody::ResolvedTx(tx) = envelope.message {
                 tx.checked_acceptance_stage()?;

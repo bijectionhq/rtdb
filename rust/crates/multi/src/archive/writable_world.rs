@@ -178,14 +178,14 @@ async fn copy_fork_suffix(
                 }).ok_or_else(OwnedWorld::unavailable)?;
             Ok(Some(crate::hosted_recovery::replay_start(current, selected.checkpoint.boundary)?))
         },
-        |current, _, io| async move {
+        |current, region, io| async move {
             let (point, manifest) = capture_receipt(&current, archive, deployment, capture)?
                 .ok_or_else(OwnedWorld::unavailable)?;
             let (base, _) = replica_suffix::read_base_catalog(
                 archive.bucket(Arc::clone(&io)).await?, &point, &manifest, keys, Arc::clone(&io),
             ).await?;
             agent.pin_held_fork_suffix(
-                &source.name, deployment, capture, cut, keys, &base, io, expires_at_ms,
+                &source.name, deployment, capture, cut, keys, &base, region, io, expires_at_ms,
             ).await
         },
     ).await?;

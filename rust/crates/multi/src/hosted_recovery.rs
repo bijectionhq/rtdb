@@ -205,7 +205,9 @@ async fn offload_candidates(record: &DeploymentRecord, stream: &StreamConfig, st
             let Some((_, version)) = envelope.offload_publication()? else { continue; };
             let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
                 .ok_or_else(|| Error::Task("A replica publication has no payload key".into()))?;
-            candidates.push(ReplicaPayloadCandidate { key: relative, position: entry.lsn, version });
+            let frame_sha256 = ring::digest::digest(&ring::digest::SHA256, &entry.payload);
+            let frame_sha256 = frame_sha256.as_ref().try_into().expect("SHA-256 is 32 bytes");
+            candidates.push(ReplicaPayloadCandidate { key: relative, position: entry.lsn, frame_sha256, version });
         }
     }
     if candidates.is_empty() { return Ok(candidates); }
@@ -241,7 +243,7 @@ mod tests {
         let mut record = candidate();
         let hold = uuid::Uuid::new_v4();
         let pin = uuid::Uuid::new_v4();
-        record.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 7, custody: ReplayCustody::Local });
+        record.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 7, through: 7, custody: ReplayCustody::Local });
         record.checkpoint_suffix_pins.insert(pin, CheckpointSuffixPin {
             capture: uuid::Uuid::new_v4(), manifest_sha256: "root".into(), checkpoint: checkpoint(4),
             custody: rtdb_directory::CheckpointSuffixCustody::Capture,

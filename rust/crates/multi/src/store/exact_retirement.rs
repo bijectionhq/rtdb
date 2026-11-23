@@ -298,14 +298,15 @@ async fn publish_settled_replica_candidates(directory: &dyn Directory, bucket: &
     for candidate in &plan.candidates {
         let release = super::ReplicaPayloadRelease {
             record: super::GarbageRecord { key: candidate.key.clone(), released_at_ms: 0, trie_floor: None },
-            incarnation: plan.incarnation, log_epoch: plan.log_epoch, position: candidate.position,
+            incarnation: plan.incarnation, log_epoch: plan.log_epoch, position: candidate.position, frame_sha256: candidate.frame_sha256,
         };
         if !release.permits(owner, &store, &candidate.version) { continue; }
         let target = ObjectKey::new(format!("{store}/{}", candidate.key))?;
         if provider.absent(&target, &candidate.version).await? {
             forget_settled_replica_candidate(directory, &owner.id, &target, &candidate.version).await?;
         } else {
-            super::publish_replica_payload_release(bucket, owner, candidate.key.clone(), candidate.position, candidate.version.clone()).await?;
+            super::publish_replica_payload_release(bucket, owner, candidate.key.clone(), candidate.position,
+                candidate.frame_sha256, candidate.version.clone()).await?;
         }
     }
     Ok(())
@@ -691,22 +692,22 @@ mod tests {
             key: format!("cell/{target}"), version: "retired".into(),
         }, attempts: AtomicUsize::new(0), markers: AtomicUsize::new(0) };
         record.replica_payload_trim.as_mut().unwrap().candidates.push(ReplicaPayloadCandidate {
-            key: relative.into(), position: 6, version: provider.version.clone(),
+            key: relative.into(), position: 6, frame_sha256: [4; 32], version: provider.version.clone(),
         });
         let record = directory.create_deployment(record).await.unwrap();
-        super::super::publish_replica_payload_release(&bucket, &record, relative.into(), 6, provider.version.clone()).await.unwrap();
+        super::super::publish_replica_payload_release(&bucket, &record, relative.into(), 6, [4; 32], provider.version.clone()).await.unwrap();
         let future = "oversized/b01-future.binpb";
         let future_key = ObjectKey::new(format!("{}/{root}/{future}", record.storage_prefix())).unwrap();
         bucket.put(&future_key, Bytes::from_static(b"still referenced")).await.unwrap();
         let forged = PhysicalObjectVersion { key: format!("cell/{future_key}"), ..provider.version.clone() };
-        super::super::publish_replica_payload_release(&bucket, &record, future.into(), 6, forged).await.unwrap();
+        super::super::publish_replica_payload_release(&bucket, &record, future.into(), 6, [4; 32], forged).await.unwrap();
 
         reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
         assert_eq!(provider.attempts.load(Ordering::Relaxed), 0);
         let hold = Uuid::new_v4();
         let record = crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
             record.replica_payload_trim.as_mut().unwrap().applied = true;
-            record.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 6, custody: ReplayCustody::Local });
+            record.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 6, through: 6, custody: ReplayCustody::Local });
             Ok(())
         }).await.unwrap();
         reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
@@ -890,7 +891,7 @@ mod tests {
         assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
         let parent = crate::admin::update_installation(directory.as_ref(), &parent.id, |record| {
             record.recovery_manifest_sha256 = Some([2; 32]);
-            record.storage_regions.insert(recovery, StorageRegion::ReplicaReplay { first_required: 2, custody: ReplayCustody::Local });
+            record.storage_regions.insert(recovery, StorageRegion::ReplicaReplay { first_required: 2, through: 2, custody: ReplayCustody::Local });
             Ok(())
         }).await.unwrap();
         reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();
@@ -1483,7 +1484,7 @@ mod tests {
         current.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 1, source: 0, system_time: 0, root_sha256: Some([1; 32]) });
         current.recovery_manifest_sha256 = Some([1; 32]);
         let hold = Uuid::new_v4();
-        current.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 1, custody: ReplayCustody::Local });
+        current.storage_regions.insert(hold, StorageRegion::ReplicaReplay { first_required: 1, through: 1, custody: ReplayCustody::Local });
         let version = current.version;
         let current = directory.replace_deployment(current, version).await.unwrap().applied().unwrap();
         reap(directory.as_ref(), &bucket, &provider, &current, 0, None, None).await.unwrap();

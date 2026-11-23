@@ -27,7 +27,7 @@ enum SuffixCut<'a> {
     Tip(TransactionKey),
     HeldPublication(
         &'a rtdb_node::OwnedForkCut, &'a dyn crate::keys::KeyService,
-        &'a BlockCatalog, Arc<rtdb_storage::IoRegion>,
+        &'a BlockCatalog, uuid::Uuid, Arc<rtdb_storage::IoRegion>,
     ),
 }
 
@@ -812,11 +812,11 @@ impl NodeAgent {
     pub(crate) async fn pin_held_fork_suffix(
         &self, name: &str, deployment: uuid::Uuid,
         capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, keys: &dyn crate::keys::KeyService,
-        base: &BlockCatalog, io: Arc<rtdb_storage::IoRegion>, expires_at_ms: i64,
+        base: &BlockCatalog, region: uuid::Uuid, io: Arc<rtdb_storage::IoRegion>, expires_at_ms: i64,
     ) -> Result<(uuid::Uuid, CheckpointSuffixPin)> {
         self.pin_suffix_at(
             name, deployment, uuid::Uuid::new_v4(), capture,
-            SuffixCut::HeldPublication(cut, keys, base, io), expires_at_ms,
+            SuffixCut::HeldPublication(cut, keys, base, region, io), expires_at_ms,
         ).await
     }
 
@@ -935,10 +935,10 @@ impl NodeAgent {
             // Discovery streams the quorum-certified applied interval. Its
             // target is the original held publication, not the driver tip.
             let _charge = self.node.memory().reserve(32 << 20)?;
-            let SuffixCut::HeldPublication(cut, keys, base, io) = &cutoff else { return Err(unavailable()); };
+            let SuffixCut::HeldPublication(cut, keys, base, region, io) = &cutoff else { return Err(unavailable()); };
             let (basis, replica, source) = crate::archive::find_held_publication(
                 &stream, &proof, &record, &self.options.storage, *keys, cut,
-                base, Arc::clone(io), self.node.memory(),
+                base, *region, Arc::clone(io), self.node.memory(),
             ).await?;
             if source <= checkpoint.source || source > source_through || replica > replica_through {
                 return Err(unavailable());

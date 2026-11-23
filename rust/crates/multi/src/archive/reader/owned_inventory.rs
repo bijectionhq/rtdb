@@ -135,7 +135,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                     let (replay, recovered, memory, artifact, chain) = (&mut replay, &mut recovered, &memory, &artifact, &mut chain);
                     replica_suffix::with_terminal_source(
                         owner, storage, keys, hosted, fence, held_terminal.replica_through, Some(held_terminal),
-                        |source, source_io| async move {
+                        |source, source_region, source_io| async move {
                             let stream = administration_stream(owner, &source, 4 << 20).await?;
                             let first = transfer_first(&fence.destination)?;
                             let certificate = rtdb_logkeeper::JournalDigest::from_digest_bytes(
@@ -144,7 +144,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                             let _pages = memory.reserve(32 << 20)?;
                             let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                             let source_cipher = replica_suffix::TerminalReplicaCipher::open(&source, keys).await?;
-                            let payloads = replica_suffix::ServingPayloads::new(&source, storage, keys, source_io, memory);
+                            let payloads = replica_suffix::ServingPayloads::new(&source, source_region, &certificate, storage, keys, source_io, memory)?;
                             while let Some(mut entries) = segments.next().await? {
                                 let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
                                 let through = entries.last().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
@@ -156,7 +156,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                                 for entry in entries {
                                     let Some(envelope) = replay.admit(&entry, fence, recovered)? else { continue; };
                                     if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                        let (resolved, payload) = payloads.resolve_verified(&envelope).await?;
+                                        let (resolved, payload) = payloads.resolve_verified(entry.lsn, &envelope).await?;
                                         replay.apply(resolved, recovered, memory)?;
                                         artifact.put_payload(entry.lsn, &payload.bytes, chain).await?;
                                     } else {

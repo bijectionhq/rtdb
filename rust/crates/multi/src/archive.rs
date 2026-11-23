@@ -2206,7 +2206,7 @@ pub(crate) async fn seal_checkpoint_transfer(
     let cancellation = tokio_util::sync::CancellationToken::new();
     let (basis, source_through, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
         directory, storage, keys, hosted_task, fence, sealed, None,
-        |_, source_io| async move {
+        |_, source_region, source_io| async move {
             let first = stage.checkpoint.boundary.checked_add(1)
                 .ok_or_else(|| inconsistent("The checkpoint has no replica successor"))?;
             let certificate = if sealed >= first {
@@ -2227,7 +2227,7 @@ pub(crate) async fn seal_checkpoint_transfer(
                     manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None, require_replay: false,
                 },
                 CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-                Some(read_world::TerminalReplay { storage, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+                Some(read_world::TerminalReplay { storage, source_region, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
                 |context, basis, source_through| async move {
                     let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
                     Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))

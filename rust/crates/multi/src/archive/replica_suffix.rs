@@ -37,6 +37,7 @@ const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
 
 pub(super) struct ServingPayloads<'a> {
     record: &'a DeploymentRecord,
+    interval: [i64; 2],
     storage: &'a CellStorage,
     keys: &'a dyn KeyService,
     io: Arc<IoRegion>,
@@ -46,13 +47,25 @@ pub(super) struct ServingPayloads<'a> {
 
 impl<'a> ServingPayloads<'a> {
     pub(super) fn new(
-        record: &'a DeploymentRecord, storage: &'a CellStorage, keys: &'a dyn KeyService,
-        io: Arc<IoRegion>, memory: &'a Arc<MemoryBudget>,
-    ) -> Self {
-        Self { record, storage, keys, io, memory, store: tokio::sync::OnceCell::new() }
+        record: &'a DeploymentRecord, region: Uuid, proof: &JournalDigest, storage: &'a CellStorage,
+        keys: &'a dyn KeyService, io: Arc<IoRegion>, memory: &'a Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let [first, through] = proof.interval;
+        if first < 0 || through < first || proof.stream != record.stream("replica")
+            || proof.digest_bytes().is_none()
+            || !record.storage_regions.get(&region).is_some_and(|hold| {
+                hold.requires_replica_offset(first) && hold.requires_replica_offset(through)
+            })
+        {
+            return Err(suffix_unavailable());
+        }
+        Ok(Self { record, interval: proof.interval, storage, keys, io, memory, store: tokio::sync::OnceCell::new() })
     }
 
-    pub(super) async fn read(&self, envelope: &ReplicaEnvelope) -> Result<PayloadBytes> {
+    async fn read(&self, position: i64, envelope: &ReplicaEnvelope) -> Result<PayloadBytes> {
+        if !(self.interval[0]..=self.interval[1]).contains(&position) {
+            return Err(suffix_unavailable());
+        }
         let name = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
             .ok_or_else(suffix_unavailable)?;
         let store = self.store.get_or_try_init(|| async {
@@ -77,12 +90,12 @@ impl<'a> ServingPayloads<'a> {
         PayloadBytes::read(store, &key(&name)?, self.memory).await
     }
 
-    pub(super) async fn resolve_verified(&self, envelope: &ReplicaEnvelope) -> Result<(ReplicaEnvelope, PayloadBytes)> {
+    pub(super) async fn resolve_verified(&self, position: i64, envelope: &ReplicaEnvelope) -> Result<(ReplicaEnvelope, PayloadBytes)> {
         let ReplicaBody::OversizedMessage(reference) = &envelope.message else { return Err(suffix_unavailable()); };
         if self.record.storage_namespaces.is_none() || reference.payload_sha256.as_ref().is_none_or(|digest| digest.len() != 32) {
             return Err(suffix_unavailable());
         }
-        let body = self.read(envelope).await?;
+        let body = self.read(position, envelope).await?;
         let resolved = envelope.unwrap_payload(&body.bytes)?;
         Ok((resolved, body))
     }
@@ -108,10 +121,10 @@ pub(super) async fn read_base_catalog(
 pub(crate) async fn find_held_publication(
     stream: &rtdb_logkeeper::StreamConfig, proof: &JournalDigest,
     record: &DeploymentRecord, storage: &CellStorage, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
-    base: &BlockCatalog, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
+    base: &BlockCatalog, region: Uuid, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
 ) -> Result<(TransactionKey, i64, i64)> {
     let cipher = TerminalReplicaCipher::open(record, keys).await?;
-    let payloads = ServingPayloads::new(record, storage, keys, io, memory);
+    let payloads = ServingPayloads::new(record, region, proof, storage, keys, io, memory)?;
     let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, proof)?;
     let log_epoch = StorageEpoch(record.log_epoch);
     let mut fence = rtdb_replication::TermFence::from_catalog(base)?;
@@ -126,7 +139,7 @@ pub(crate) async fn find_held_publication(
             let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
             let _payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                let (resolved, body) = payloads.resolve_verified(&envelope).await?;
+                let (resolved, body) = payloads.resolve_verified(entry.lsn, &envelope).await?;
                 _payload = body;
                 resolved
             } else {
@@ -185,7 +198,7 @@ pub(crate) async fn capture(
                     let materialize = async {
                         let _pages = memory.reserve(32 << 20)?;
                         let cipher = TerminalReplicaCipher::open(&record, keys).await?;
-                        let payloads = ServingPayloads::new(&record, storage, keys, io, memory);
+                        let payloads = ServingPayloads::new(&record, region, &certificate, storage, keys, io, memory)?;
                         let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                         let mut progress = SuffixProgress::new(pin, &catalog)?;
                         let mut chain = artifact.chain();
@@ -201,7 +214,7 @@ pub(crate) async fn capture(
                             for entry in entries {
                                 let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
                                 if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                    let (resolved, payload) = payloads.resolve_verified(&envelope).await?;
+                                    let (resolved, payload) = payloads.resolve_verified(entry.lsn, &envelope).await?;
                                     progress.apply(resolved, pin, |_| Ok(()))?;
                                     artifact.put_payload(entry.lsn, &payload.bytes, &mut chain).await?;
                                 } else {
@@ -421,7 +434,7 @@ pub(super) async fn with_terminal_source<T, F, Fut>(
     fence: &CheckpointTransferFence, through: i64, expected: Option<&CheckpointTransferTerminal>, run: F,
 ) -> Result<T>
 where
-    F: FnOnce(DeploymentRecord, Arc<IoRegion>) -> Fut,
+    F: FnOnce(DeploymentRecord, Uuid, Arc<IoRegion>) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     let stage = &fence.destination;
@@ -429,7 +442,7 @@ where
     Box::pin(with_region(
         directory, keys, &deployment, storage, hosted_task, Some((stage.intent.capture, None)), None,
         |source| terminal_replay_floor(source, fence, through, expected),
-        |source, _, io| run(source, io),
+        run,
     )).await
 }
 
@@ -456,7 +469,7 @@ fn terminal_replay_floor(
 
 /// Reopen the original certified source interval without accumulating its raw bytes.
 pub(super) async fn replay_certified_terminal(
-    source: &DeploymentRecord, storage: &CellStorage, io: Arc<IoRegion>,
+    source: &DeploymentRecord, storage: &CellStorage, region: Uuid, io: Arc<IoRegion>,
     keys: &dyn KeyService, stream: &rtdb_logkeeper::StreamConfig,
     certificate: Option<&JournalDigest>, fence: &rtdb_directory::CheckpointTransferFence, through: i64,
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
@@ -469,7 +482,7 @@ pub(super) async fn replay_certified_terminal(
     if let Some(certificate) = certificate {
         if certificate.interval != [first, through] { return Err(suffix_unavailable()); }
         let cipher = TerminalReplicaCipher::open(source, keys).await?;
-        let payloads = ServingPayloads::new(source, storage, keys, io, memory);
+        let payloads = ServingPayloads::new(source, region, certificate, storage, keys, io, memory)?;
         let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, certificate)?;
         while let Some(mut entries) = pages.next_page().await? {
             let bytes = entries.iter().try_fold(0usize, |total, entry|
@@ -481,7 +494,7 @@ pub(super) async fn replay_certified_terminal(
                 let Some(envelope) = progress.admit(&entry, fence, recovered)? else { continue; };
                 let _payload;
                 let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                    let (resolved, body) = payloads.resolve_verified(&envelope).await?;
+                    let (resolved, body) = payloads.resolve_verified(entry.lsn, &envelope).await?;
                     _payload = body;
                     resolved
                 } else {
@@ -821,23 +834,29 @@ mod custody_tests {
         let material = keys.key(&record.key_id()).await?;
         let objects = EncryptingStore::new(Arc::new(files), &material)?;
         let memory = MemoryBudget::new(1 << 20);
-        let payloads = ServingPayloads::new(&record, &storage, &keys, io, &memory);
+        let region = Uuid::new_v4();
+        record.storage_regions.insert(region, rtdb_directory::StorageRegion::ReplicaReplay {
+            first_required: 9, through: 9, custody: rtdb_directory::ReplayCustody::Local,
+        });
+        let proof = JournalDigest::from_digest_bytes(record.stream("replica"), [9, 9], [7; 32]);
+        let payloads = ServingPayloads::new(&record, region, &proof, &storage, &keys, io, &memory)?;
         let original = ReplicaEnvelope {
             term: Term(2), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(17) }),
         };
         let body = original.encode();
         let proxy = original.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "payload".into(), &body);
         let path = key(&proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap())?;
-        assert!(payloads.resolve_verified(&proxy).await.is_err());
+        assert!(payloads.resolve_verified(8, &proxy).await.is_err());
+        assert!(payloads.resolve_verified(9, &proxy).await.is_err());
         let wrong = ReplicaEnvelope { message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(18) }), ..original.clone() };
         objects.put(&path, wrong.encode().into()).await?;
-        assert_eq!(payloads.resolve_verified(&proxy).await.err().unwrap().code, "rtdb.format/oversized-payload-mismatch");
+        assert_eq!(payloads.resolve_verified(9, &proxy).await.err().unwrap().code, "rtdb.format/oversized-payload-mismatch");
         objects.delete(&path).await?;
         objects.put(&path, body.into()).await?;
-        assert_eq!(payloads.resolve_verified(&proxy).await?.0, original);
+        assert_eq!(payloads.resolve_verified(9, &proxy).await?.0, original);
         let mut legacy = proxy;
         if let ReplicaBody::OversizedMessage(reference) = &mut legacy.message { reference.payload_sha256 = None; }
-        assert!(payloads.resolve_verified(&legacy).await.is_err());
+        assert!(payloads.resolve_verified(9, &legacy).await.is_err());
         Ok(())
     }
 

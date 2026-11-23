@@ -72,7 +72,7 @@ impl RecoveryAdmission {
                 }
             } else { None };
             let mut attempted = false;
-            let outcome = worker.register(id, after, &mut attempted).await;
+            let outcome = worker.register(id, after, through, &mut attempted).await;
             let opened = outcome.is_ok();
             if ready.send(outcome).is_ok() && opened {
                 let _ = closed.await;
@@ -149,16 +149,16 @@ impl RecoveryAdmission {
         Ok((record, first_required))
     }
 
-    async fn register(&self, id: Uuid, after: LogOffset, attempted: &mut bool) -> Result<()> {
+    async fn register(&self, id: Uuid, after: LogOffset, through: LogOffset, attempted: &mut bool) -> Result<()> {
         for _ in 0..8 {
             let (mut record, first_required) = self.checked_record(after).await?;
             let version = record.version;
-            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, custody: self.holds.custody.clone() });
+            record.storage_regions.insert(id, StorageRegion::ReplicaReplay { first_required, through: through.0, custody: self.holds.custody.clone() });
             *attempted = true;
             if let Cas::Applied(stored) = self.holds.directory.replace_deployment(record, version).await.map_err(|error| self.directory_error(error))? {
                 crate::residence_trace::record("admit-recovery", || serde_json::json!({
                     "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
-                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "first_required": first_required,
+                    "stream": self.stream, "epoch": self.log_epoch, "hold": id, "first_required": first_required, "through": through.0,
                 }));
                 return Ok(());
             }
