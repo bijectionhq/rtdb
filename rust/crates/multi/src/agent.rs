@@ -1399,7 +1399,7 @@ impl NodeAgent {
         let Some(plan) = ReplicaTrimPlan::new(record, checkpoint.boundary, trimmed_through, now_ms()) else { return; };
         let Ok(members) = self.members().await else { return };
         let Ok(Some(grant)) = Box::pin(plan.authorize(self.directory.as_ref(), &members, &self.options.storage, self.keys.as_ref(), self.options.replica_payload_reclamation)).await else { return; };
-        if let Ok(through) = grant.apply(self.directory.as_ref()).await
+        if let Ok(through) = grant.apply(self.directory.as_ref(), self.keys.as_ref()).await
             && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)
         {
             holding.trimmed_through = Some(through);

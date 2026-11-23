@@ -749,7 +749,7 @@ mod tests {
         record.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim { incarnation: record.incarnation, log_epoch: record.log_epoch,
             through: 6, journals: [rtdb_types::JournalEndpoint::Member {
                 address: "127.0.0.1:1".into(), journal: Uuid::new_v4().to_string(),
-            }].into(), applied: false, candidates: Vec::new() }));
+            }].into(), applied: false, candidates: Vec::new(), journal_units: Vec::new() }));
         let relative = "oversized/b00-published.binpb";
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
         let target = ObjectKey::new(format!("{}/{root}/{relative}", record.storage_prefix())).unwrap();

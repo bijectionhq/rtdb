@@ -1735,6 +1735,7 @@ rule PublishCheckpoint {
 }
 
 rule TrimCertifiedReplicaPrefix {
+    -- The prefix owner retains its authenticated journal unit census before trim and withdraws those slots through the original vault.
     -- The checkpoint's boundary record supplies the intake position on reopen.
     -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
     -- A separately captured suffix retains its capture until explicit archive retirement.

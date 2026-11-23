@@ -30,6 +30,19 @@ pub use archive::ArchiveKey;
 pub use crate::cipher::object::FramedObject;
 pub(crate) use archive::{legacy_archive_key, tracked_deployment_archive_key};
 
+/// The trim owner recorded these names before the certified ciphertext disappeared.
+pub(crate) async fn withdraw_archive_records(
+    keys: &dyn KeyService, residence: &str, records: &[String], region: &Arc<IoRegion>,
+) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt, stream};
+    let scope = UnitScope::archive(residence);
+    stream::iter(records.iter().map(|record| async move {
+        let name = archive::associated_unit(record)?;
+        keys.withdraw_unit_key(scope.slot(&name), region).await
+    })).buffer_unordered(16).try_collect::<Vec<()>>().await?;
+    Ok(())
+}
+
 pub const KEY_BYTES: usize = 32;
 const NAMESPACE_KEY_ID: &str = ".rtdb-key-namespace";
 const DELETION_SIGNING_KEY_ID: &str = ".rtdb-deletion-signing-seed";

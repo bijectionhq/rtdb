@@ -72,6 +72,13 @@ impl JournalUnits {
         Ok(frame.into())
     }
 
+    pub(crate) fn retirement_label(&self, sealed: &[u8]) -> Result<String> {
+        let publication = sealed.get(..PUBLICATION_BYTES)
+            .and_then(|prefix| prefix.try_into().ok())
+            .ok_or_else(|| Error::Task("A certified journal frame has no publication identity".into()))?;
+        Ok(self.associated(&publication))
+    }
+
     pub(crate) async fn decrypt(&self, sealed: Bytes) -> Result<Bytes> {
         let publication = sealed
             .get(..PUBLICATION_BYTES)

@@ -907,6 +907,16 @@ pub struct ReplicaPayloadTrim {
     pub journals: BTreeSet<JournalEndpoint>,
     pub applied: bool,
     pub candidates: Vec<ReplicaPayloadCandidate>,
+    /// One authenticated publication for each frame in this new trim interval.
+    pub journal_units: Vec<ReplicaJournalUnit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaJournalUnit {
+    pub position: i64,
+    pub frame_sha256: [u8; 32],
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

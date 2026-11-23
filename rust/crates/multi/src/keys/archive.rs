@@ -338,7 +338,7 @@ impl ArchiveKey for TrackedArchiveKey {
     }
 }
 
-fn associated_unit(associated: &str) -> rtdb_storage::Result<ObjectKey> {
+pub(super) fn associated_unit(associated: &str) -> rtdb_storage::Result<ObjectKey> {
     use std::fmt::Write;
     let mut name = String::from("archive-records/");
     for byte in digest(&SHA256, associated.as_bytes()).as_ref() {
