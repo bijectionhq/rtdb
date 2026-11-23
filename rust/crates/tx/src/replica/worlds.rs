@@ -230,12 +230,13 @@ pub(super) fn verify(
         } else if kind == Kind::RootRetainedDrop {
             hosted = HostedEffects::RetainedWrite;
         }
-        for relation in relations.scalar_values().ok_or_else(mismatch)? {
-            let Value::Utf8(name) = relation else { return Err(mismatch()); };
-            let relation = OwnedRelation::from_source(name.clone()).map_err(|_| mismatch())?;
-            if relation.is_world_catalog() || matches!(name.as_str(), OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION)
+        if relations.is_empty() { return Err(mismatch()); }
+        for index in 0..relations.len() {
+            let name = relations.view().utf8(index).ok_or_else(mismatch)?;
+            let relation = OwnedRelation::from_source(name.to_owned()).map_err(|_| mismatch())?;
+            if relation.is_world_catalog() || matches!(name, OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION)
                 || relation.world().unwrap_or(ROOT) != kind.relation_world(world)
-                || !expected_data.insert(name.as_str()) || expected_data.len() > 4096
+                || !expected_data.insert(name) || expected_data.len() > 4096
             {
                 return Err(mismatch());
             }

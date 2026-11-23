@@ -555,6 +555,7 @@ pub fn validate_projection_value(value: &Value) -> Result<()> {
         Value::List(values) | Value::FixedSizeList(values) => match values.view() {
             rtdb_types::ListView::Values(values) => values.iter().try_for_each(validate_projection_value),
             rtdb_types::ListView::Numeric(values) => rtdb_columnar::validate_projected_decimals(values.field(), values.array().as_ref()),
+            rtdb_types::ListView::Scalars(values) => rtdb_columnar::validate_projected_decimals(values.field(), values.array().as_ref()),
             _ => Ok(()),
         },
         Value::Struct(fields) => fields.values().try_for_each(validate_projection_value),

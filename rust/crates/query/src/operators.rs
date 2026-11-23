@@ -1308,10 +1308,9 @@ pub(crate) fn equality_hash(values: &[Value], timezone: &str) -> u32 {
             Value::Set(values) => values.iter().any(temporal),
             Value::List(values) | Value::FixedSizeList(values) => match values.view() {
                 rtdb_types::ListView::Values(values) => values.iter().any(temporal),
-                rtdb_types::ListView::Scalars(values) => {
-                    matches!(values.field().data_type(), arrow_schema::DataType::Timestamp(..) | arrow_schema::DataType::Date32 | arrow_schema::DataType::Date64)
-                        && values.array().null_count() < values.array().len()
-                }
+                rtdb_types::ListView::Scalars(_) => values.element_type().legs().iter().any(|leg|
+                    matches!(leg, LogicalType::Scalar(rtdb_types::ScalarType::Timestamp { .. }
+                        | rtdb_types::ScalarType::DateDay | rtdb_types::ScalarType::DateMilli))),
                 _ => false,
             },
             Value::Struct(fields) => fields.values().any(temporal),

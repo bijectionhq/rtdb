@@ -2,7 +2,7 @@ use bigdecimal::{BigDecimal, RoundingMode};
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed, Zero};
 use rtdb_plan::BinaryOp;
-use rtdb_types::{Anomaly, DecimalValue, Result};
+use rtdb_types::{Anomaly, DecimalValue, NumericCell, Result, decimal_arrow::DecimalParameters};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use crate::numeric::{division_by_zero, inapplicable, overflow};
@@ -250,10 +250,25 @@ fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, output_digits: us
 }
 
 pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    let result = arithmetic_parts(op, (coefficient(left), left.scale), (coefficient(right), right.scale), DecimalParameters {
+        precision, scale, bit_width,
+    })?;
+    from_coefficient(result, precision, scale, bit_width)
+}
+
+pub(crate) fn arithmetic_cells(
+    op: BinaryOp, left: ([u8; 32], i32), right: ([u8; 32], i32), params: DecimalParameters,
+) -> Result<NumericCell> {
+    let (left, right) = ((BigInt::from_signed_bytes_be(&left.0), left.1), (BigInt::from_signed_bytes_be(&right.0), right.1));
+    let result = arithmetic_parts(op, left, right, params)?;
+    cast_coefficient(BigDecimal::new(result, i64::from(params.scale)), params).map(|bytes| NumericCell::Decimal(bytes, params))
+}
+
+fn arithmetic_parts(op: BinaryOp, (a, ls): (BigInt, i32), (b, rs): (BigInt, i32), params: DecimalParameters) -> Result<BigInt> {
+    let DecimalParameters { precision, scale, bit_width } = params;
     let output_digits = physical_digits(bit_width)?;
-    let (a, b) = (coefficient(left), coefficient(right));
-    let (ls, rs, target) = (i64::from(left.scale), i64::from(right.scale), i64::from(scale));
-    let result = match op {
+    let (ls, rs, target) = (i64::from(ls), i64::from(rs), i64::from(scale));
+    Ok(match op {
         BinaryOp::Add | BinaryOp::Subtract => {
             let maximum = digits(&a).max(digits(&b)).max(output_digits) + 1;
             let (a, b) = (align(a, target - ls, maximum)?, align(b, target - rs, maximum)?);
@@ -280,6 +295,5 @@ pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue
             modulo(a, ls, b, rs, target, output_digits)?
         }
         _ => return Err(inapplicable("decimal arithmetic", &[])),
-    };
-    from_coefficient(result, precision, scale, bit_width)
+    })
 }

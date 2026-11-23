@@ -29,16 +29,11 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 Ok(Value::I64(i64::from(stored_length(tokens.len()))))
             }
             ("search_corpus_fingerprint", [Value::List(ids), Value::List(bodies)]) => {
-                if ids.len() != bodies.len() {
+                if ids.is_empty() || ids.len() != bodies.len() {
                     return Err(invalid_documents());
                 }
-                let (Some(ids), Some(bodies)) = (ids.scalar_values(), bodies.scalar_values()) else {
-                    return Err(invalid_documents());
-                };
-                let pairs = ids.iter().zip(bodies).map(|(id, body)| match (id, body) {
-                    (Value::Utf8(id), Value::Utf8(body)) => Ok((id.as_str(), body.as_str())),
-                    _ => Err(invalid_documents()),
-                });
+                let (ids, bodies) = (ids.view(), bodies.view());
+                let pairs = (0..ids.len()).map(|i| ids.utf8(i).zip(bodies.utf8(i)).ok_or_else(invalid_documents));
                 Ok(Value::Binary(text_pair_fingerprint(pairs)?.into()))
             }
             ("match", [text, Value::Utf8(query)]) => {
@@ -127,4 +122,24 @@ fn explicit_corpus(
         tokens,
         frequencies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn corpus_fingerprint_reads_packed_text() {
+        use std::sync::Arc;
+        use arrow_array::StringArray;
+        use arrow_schema::{DataType, Field};
+        use rtdb_types::{ListValue, Value};
+
+        let arguments = [Value::list(vec![Value::Utf8("id".into())]), Value::list(vec![Value::Utf8("document".into())])];
+        let context = crate::EvalContext::default();
+        let expected = crate::scalar_call("search_corpus_fingerprint", &arguments, &context).unwrap();
+        let packed = ["id", "document"].map(|value| Value::List(ListValue::from_scalar_arrow(
+            Arc::new(Field::new("value", DataType::Utf8, false)),
+            Arc::new(StringArray::from(vec![value])),
+        ).unwrap()));
+        assert_eq!(crate::scalar_call("search_corpus_fingerprint", &packed, &context).unwrap(), expected);
+    }
 }

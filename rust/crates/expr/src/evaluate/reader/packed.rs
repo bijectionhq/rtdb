@@ -46,7 +46,7 @@ pub(super) fn cast(
                     return Ok(Some(list));
                 }
             }
-            if let Some(span) = cell.numeric_list_span().and_then(|span| span.slice(selection.start, selection.len()))
+            if let Some(span) = cell.numeric_list_span_range(selection.clone())
                 && let Some(list) = list_cast::numeric(list_cast::Input::Opened(span), target, projection, reserve)?
             {
                 return Ok(Some(list));
@@ -55,7 +55,7 @@ pub(super) fn cast(
         }
         _ => return Ok(None),
     };
-    scalar_list_cast::cast_list(source, target, context.timezone, projection, reserve)
+    scalar_list_cast::cast_list(source, target, context.timezone, Some(context.current_time), projection, reserve)
 }
 
 fn target_is_float(target: &CastTarget) -> bool {

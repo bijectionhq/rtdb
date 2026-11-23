@@ -69,6 +69,14 @@ impl<'a> ListView<'a> {
         })
     }
 
+    pub fn utf8(self, index: usize) -> Option<&'a str> {
+        match self {
+            Self::Values(values) => match values.get(index)? { Value::Utf8(text) => Some(text), _ => None },
+            Self::Scalars(values) if index < self.len() => values.utf8(index),
+            _ => None,
+        }
+    }
+
     pub fn is_packed_numeric(self) -> bool { !matches!(self, Self::Values(_) | Self::Scalars(_)) }
 
     pub fn numeric_component(self, index: usize) -> NumericCell {
@@ -177,7 +185,7 @@ impl ListValue {
             Storage::Numeric(values) => Some(Self(Storage::Numeric(values.slice(offset, length)))),
             Storage::Scalars(values) => {
                 let slice = values.slice(offset, length);
-                if slice.array().null_count() == length { Self::from_numeric_arrow(Arc::new(Field::new("null", DataType::Null, true)), Arc::new(arrow_array::NullArray::new(length))) }
+                if !matches!(slice.array().data_type(), DataType::Union(..)) && slice.array().null_count() == length { Self::from_numeric_arrow(Arc::new(Field::new("null", DataType::Null, true)), Arc::new(arrow_array::NullArray::new(length))) }
                 else { Some(Self(Storage::Scalars(slice))) }
             },
             Storage::Values(_) => None,
@@ -212,7 +220,11 @@ impl ListValue {
     }
 
     pub fn admit_signed(&mut self) {
-        if let Storage::Numeric(values) = &mut self.0 { values.admit_signed(); }
+        match &mut self.0 {
+            Storage::Numeric(values) => values.admit_signed(),
+            Storage::Scalars(values) => values.admit_signed(),
+            _ => (),
+        }
     }
 
     pub fn scalar_values(&self) -> Option<&[Value]> {

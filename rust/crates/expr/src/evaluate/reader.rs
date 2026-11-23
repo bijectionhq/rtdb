@@ -443,6 +443,20 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
     let end = offset.checked_add(count).ok_or_else(overflow)?;
     match reader.as_ref() {
         ListReader::Stored(items) if end <= items.len() => {
+            if let rtdb_types::ListView::Scalars(values) = items.view()
+                && matches!(values.array().data_type(), arrow_schema::DataType::Union(..))
+            {
+                let field = values.field();
+                let array = values.array().as_ref();
+                let mut rows = offset..end;
+                return rtdb_columnar::repack_scalar_list(field, array, rows.clone(), false, || {
+                    let bound = rows.try_fold(4096usize, |bytes, row| {
+                        rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
+                            .and_then(|size| bytes.checked_add(size)).ok_or_else(overflow)
+                    })?;
+                    context.reserve(bound)
+                });
+            }
             let Some(slice) = items.slice_packed(offset, count) else { return Ok(None); };
             context.reserve(slice.retained_payload_bytes()?)?;
             Ok(Some(slice))
@@ -450,20 +464,24 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: 
         ListReader::Arrow(cell) => {
             let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
             if end > range.len() { return Ok(None); }
-            let is_packed = rtdb_types::ListValue::supports_numeric_arrow(field);
-            if !is_packed && cell.numeric_list_span().is_none() { return Ok(None); }
             let rows = (range.start + offset)..(range.start + end);
-            let bound = rows.clone().try_fold(4096usize, |bytes, row| {
-                rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
-                    .and_then(|size| bytes.checked_add(size))
-                    .and_then(|size| size.checked_add(std::mem::size_of::<(usize, usize)>()))
-                    .ok_or_else(overflow)
-            })?;
-            context.reserve(bound)?;
-            if !is_packed {
-                let span = rtdb_types::NumericSpan::new(field, array, rows).expect("validated numeric child");
-                return Ok(rtdb_columnar::repack_numeric_list(&span, true));
+            let reserve = || {
+                let bound = rows.clone().try_fold(4096usize, |bytes, row| {
+                    rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
+                        .and_then(|size| bytes.checked_add(size))
+                        .and_then(|size| size.checked_add(std::mem::size_of::<(usize, usize)>()))
+                        .ok_or_else(overflow)
+                })?;
+                context.reserve(bound)
+            };
+            if !rtdb_types::ListValue::supports_numeric_arrow(field) {
+                if let Some(span) = cell.numeric_list_span_range(offset..end) {
+                    reserve()?;
+                    return Ok(rtdb_columnar::repack_numeric_list(&span, true));
+                }
+                return rtdb_columnar::repack_scalar_list(field, array, rows.clone(), true, reserve);
             }
+            reserve()?;
             let selection = rows.map(|row| (0, row)).collect::<Vec<_>>();
             let array = rtdb_columnar::copy_selected_cells(&[array], &selection)?;
             let values = rtdb_types::ListValue::from_numeric_arrow(Arc::new(field.clone()), array);
@@ -487,12 +505,12 @@ async fn append_list_element<'a>(
         computed::element(&items[index], frame).await?
     } else { None };
     let mut cell = match computed {
-        Some(computed::Element::Number(number)) => {
+        Some(computed::Output::Number(number)) => {
             if projection { crate::list_cast::validate_output(number)?; }
             builder.push_numeric(number);
             return Ok(());
         }
-        Some(computed::Element::Scalar(cell)) => cell,
+        Some(computed::Output::Value(cell)) => materialize(box_cell(cell)?, frame)?.await?,
         None => materialize(nth(clone_value(value, frame)?, index, frame)?.await?, frame)?.await?,
     };
     if projection {
@@ -539,6 +557,13 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                         if let Some(list) = rtdb_columnar::repack_numeric_list(&span, true) {
                             return Ok(if kind == Kind::Fixed { Value::FixedSizeList(list) } else { Value::List(list) });
                         }
+                    }
+                    if let Some((field, array, range)) = cell.sequence_range()
+                        && let Some(list) = rtdb_columnar::repack_scalar_list(field, array, range, true, || {
+                            frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)
+                        })?
+                    {
+                        return Ok(if kind == Kind::Fixed { Value::FixedSizeList(list) } else { Value::List(list) });
                     }
                 }
                 if let EvalValue::List(Kind::List, reader) = &value

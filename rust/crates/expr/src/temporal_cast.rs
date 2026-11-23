@@ -1,5 +1,5 @@
 use rtdb_plan::{TemporalCast, TemporalKind, fractional_precision};
-use rtdb_types::{Anomaly, LogicalType, Result, Value};
+use rtdb_types::{Anomaly, Instant, LogicalType, Result, TimeUnit, Value};
 use crate::{numeric::overflow, temporal::IntervalParts};
 
 pub(crate) fn with_context(value: &Value, target: &TemporalCast, context: &crate::EvalContext<'_>) -> Result<Value> {
@@ -10,21 +10,26 @@ pub(crate) fn with_context(value: &Value, target: &TemporalCast, context: &crate
 pub(crate) fn with_context_resolved(value: &Value, target: &TemporalCast, context: &crate::EvalContext<'_>) -> Result<Value> {
     if let Value::Time { value, unit, .. } = value {
         if matches!(target.kind, TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_)) {
-            let zone = crate::timezone::zone(context.timezone)?;
-            let today = zone.local_datetime(context.current_time)?.date();
-            let hz = i128::from(target.unit.units_per_second());
-            let local_raw = i128::from(today.epoch_day()) * 86_400 * hz + i128::from(*value) * hz / i128::from(unit.units_per_second());
-            let local_raw = i64::try_from(local_raw).map_err(|_| overflow())?;
             let LogicalType::Scalar(rtdb_types::ScalarType::Timestamp { timezone, .. }) = target.data_type(context.timezone) else { unreachable!() };
-            let raw = if timezone.is_none() { local_raw } else {
-                let seconds = local_raw.div_euclid(target.unit.units_per_second());
-                let offset = zone.offset_for_local(seconds, None)?;
-                local_raw.checked_sub(i64::from(offset.seconds()).checked_mul(target.unit.units_per_second()).ok_or_else(overflow)?).ok_or_else(overflow)?
-            };
+            let raw = time_to_timestamp(*value, *unit, target.unit, timezone.is_some(), context.timezone, context.current_time)?;
             return Ok(Value::Timestamp { value: raw, unit: target.unit, timezone });
         }
     }
     cast_resolved(value,target,context.timezone)
+}
+
+pub(crate) fn time_to_timestamp(
+    value: i64, source: TimeUnit, target: TimeUnit, zoned: bool, timezone: &str, current_time: Instant,
+) -> Result<i64> {
+    let zone = crate::timezone::zone(timezone)?;
+    let today = zone.local_datetime(current_time)?.date();
+    let hz = i128::from(target.units_per_second());
+    let local_raw = i128::from(today.epoch_day()) * 86_400 * hz + i128::from(value) * hz / i128::from(source.units_per_second());
+    let local_raw = i64::try_from(local_raw).map_err(|_| overflow())?;
+    if !zoned { return Ok(local_raw); }
+    let seconds = local_raw.div_euclid(target.units_per_second());
+    let offset = zone.offset_for_local(seconds, None)?;
+    local_raw.checked_sub(i64::from(offset.seconds()).checked_mul(target.units_per_second()).ok_or_else(overflow)?).ok_or_else(overflow)
 }
 
 pub(crate) fn precision(nanos: i128, precision: Option<i64>) -> Result<i128> {

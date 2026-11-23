@@ -381,10 +381,16 @@ impl<'a> ArrowCell<'a> {
     }
 
     pub fn numeric_list_span(self) -> Option<rtdb_types::NumericSpan<'a>> {
+        let (_, _, range) = self.sequence_range()?;
+        self.numeric_list_span_range(0..range.len())
+    }
+
+    pub fn numeric_list_span_range(self, selection: std::ops::Range<usize>) -> Option<rtdb_types::NumericSpan<'a>> {
         if !matches!(self.sequence_kind()?, ListKind::List | ListKind::FixedSizeList(_)) { return None; }
         let (field, array, range) = self.sequence_range()?;
-        let element = crate::from_field(field).ok()?;
-        crate::values::numeric_list_span(field, array, range, &element)
+        if selection.start > selection.end || selection.end > range.len() { return None; }
+        crate::from_field(field).ok()?;
+        rtdb_types::NumericSpan::selected(field, array, range.start + selection.start..range.start + selection.end)
     }
 
     /// Borrows a floating-point list's child array and the positions used by this cell.

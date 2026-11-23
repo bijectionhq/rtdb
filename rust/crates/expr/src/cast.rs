@@ -24,7 +24,7 @@ fn shift_zone(value: i64, unit: TimeUnit, timezone: &str, to_local: bool) -> Res
 }
 
 /// Floors to seconds before shifting, so an instant within an offset of the unit's limit still has a local reading.
-fn local_seconds(value: i64, unit: TimeUnit, timezone: Option<&str>) -> Result<i64> {
+pub(crate) fn local_seconds(value: i64, unit: TimeUnit, timezone: Option<&str>) -> Result<i64> {
     let seconds = value.div_euclid(unit.units_per_second());
     match timezone { None => Ok(seconds), Some(timezone) => shift_zone(seconds, TimeUnit::Second, timezone, true) }
 }
@@ -133,6 +133,19 @@ pub(crate) fn timestamp_raw(value: i64, source: TimeUnit, source_zoned: bool, un
     i64::try_from(scaled).map_err(|_| overflow())
 }
 
+pub(crate) fn date_to_timestamp(days: i64, unit: TimeUnit, zoned: bool, timezone: &str) -> Result<i64> {
+    let seconds = if zoned { zone(timezone)?.start_of_day(CivilDate::from_epoch_day(days)?)? }
+        else { days.checked_mul(86_400).ok_or_else(overflow)? };
+    seconds.checked_mul(unit.units_per_second()).ok_or_else(overflow)
+}
+
+pub(crate) fn timestamp_to_time(value: i64, source: TimeUnit, unit: TimeUnit, timezone: Option<&str>) -> Result<i64> {
+    let seconds = local_seconds(value, source, timezone)?;
+    let nanos = seconds.rem_euclid(86_400) * 1_000_000_000
+        + value.rem_euclid(source.units_per_second()) * (1_000_000_000 / source.units_per_second());
+    Ok(nanos / (1_000_000_000 / unit.units_per_second()))
+}
+
 pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Value> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
     let data_type = data_type.unencoded();
@@ -213,9 +226,8 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
                 return Ok(Value::Timestamp { value, unit: *unit, timezone: target_zone.clone() });
             }
             if let Some(days) = crate::temporal::date_days(value) {
-                let seconds = if target_zone.is_some() { zone(timezone)?.start_of_day(CivilDate::from_epoch_day(days)?)? }
-                    else { days.checked_mul(86_400).ok_or_else(overflow)? };
-                return Ok(Value::Timestamp { value: seconds.checked_mul(unit.units_per_second()).ok_or_else(overflow)?, unit: *unit, timezone: target_zone.clone() });
+                let value = date_to_timestamp(days, *unit, target_zone.is_some(), timezone)?;
+                return Ok(Value::Timestamp { value, unit: *unit, timezone: target_zone.clone() });
             }
             if let Value::Utf8(text) = value {
                 let value = timestamp_text_raw(text, *unit, target_zone.is_some())?;
@@ -231,19 +243,19 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             };
             Ok(Value::calendar_date(CivilDate::from_epoch_day(days)?, if *target == S::DateDay { DateUnit::Day } else { DateUnit::Millisecond }))
         }
-        S::Time { unit, bit_width } => {
+        S::Time { unit: target_unit, bit_width } => {
             if let Value::Time { value, unit: source_unit, .. } = value {
-                return Ok(Value::Time { value: rescale_units(*value, *source_unit, *unit)?, unit: *unit, bit_width: *bit_width });
+                return Ok(Value::Time { value: rescale_units(*value, *source_unit, *target_unit)?, unit: *target_unit, bit_width: *bit_width });
             }
             let nanos = match value {
                 Value::Utf8(text) => rtdb_types::parse_iso_local_time(text)? as i64,
                 Value::Timestamp { value, unit, timezone: source_zone } => {
-                    let seconds = local_seconds(*value, *unit, source_zone.as_ref().map(|_| timezone))?;
-                    seconds.rem_euclid(86_400) * 1_000_000_000 + value.rem_euclid(unit.units_per_second()) * (1_000_000_000 / unit.units_per_second())
+                    let value = timestamp_to_time(*value, *unit, *target_unit, source_zone.as_ref().map(|_| timezone))?;
+                    return Ok(Value::Time { value, unit: *target_unit, bit_width: *bit_width });
                 }
                 _ => return Err(inapplicable("time", &[value])),
             };
-            Ok(Value::Time { value: nanos / (1_000_000_000 / unit.units_per_second()), unit: *unit, bit_width: *bit_width })
+            Ok(Value::Time { value: nanos / (1_000_000_000 / target_unit.units_per_second()), unit: *target_unit, bit_width: *bit_width })
         }
         S::Duration(unit) => match value {
             Value::Duration { value, unit: source } | Value::Time { value, unit: source, .. } => {
@@ -341,7 +353,7 @@ pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str
                 _ => return Err(inapplicable("list", &[value])),
             };
             if let Some(list) = crate::scalar_list_cast::cast_list(
-                crate::scalar_list_cast::Source::Stored(values), element, timezone, false, |_| Ok(()),
+                crate::scalar_list_cast::Source::Stored(values), element, timezone, None, false, |_| Ok(()),
             )? {
                 return Ok(Value::List(list));
             }

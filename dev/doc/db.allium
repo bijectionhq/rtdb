@@ -416,6 +416,7 @@ variant TxMessage : SourceMessage {
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
+    -- Replica replay can validate hosted control and world inventories from selected UTF-8 child positions.
     -- PATCH replay binds compatible document and IID vectors to the mutation plan as one list of records.
     -- Put and create-only insert replay retain their Arrow document vectors.
     -- Governed Arrow writes fill acceptance-relative binary slots in the selected columns during staging.
@@ -2057,10 +2058,17 @@ surface QueryAccess {
         -- A literal table with stable scalar columns builds one Arrow batch before its consumers run.
         -- Literal tables and stacked scalar projections gather output up to the configured transport row limit before encoding it.
         -- A list expression over inputs with a shared compatible layout interleaves the child values in Arrow.
-        -- Materializing a selected numeric list with compatible child annotations packs its active components and validity into Arrow.
-        -- Computed primitive arithmetic and random list elements append to typed children in expression order.
-        -- Supported list casts write typed child buffers using the scalar conversion rules and preserve nullable element remapping.
+        -- Materializing a selected numeric list packs its active components and validity from compatible primitive, union and run-end children into Arrow.
+        -- A list selection over compatible scalar types copies its active child positions into Arrow in first-observed leg order.
+        -- Supported logical extensions keep their logical types through this selection.
+        -- Nested integer, floating-point and decimal arithmetic can pass its numeric components directly to the list builder in expression order.
+        -- Numeric casts and selected conditional branches can pass numeric components directly to that builder.
+        -- Supported mathematical functions use the same binary64 operations for scalar and list evaluation.
+        -- A reached random expression draws once for each selected element.
+        -- Supported list casts write typed child buffers using scalar conversion rules, including mixed numeric and text inputs and session-clock time-to-timestamp casts.
+        -- Nullable element targets preserve union remapping.
         -- Numeric list predicates read the active child buffers and apply scalar equality and ordering in list order.
+        -- Integer and decimal pairs compare exactly, pairs that include a float use scalar binary64 comparison, and strict equality preserves numeric categories.
         -- A struct expression over compatible Arrow fields retains the child arrays.
         -- Selecting a compatible struct child combines its validity with the parent validity in Arrow.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.

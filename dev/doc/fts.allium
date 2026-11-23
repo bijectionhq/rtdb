@@ -280,6 +280,7 @@ rule RepairUnreadableSearchFile {
 -- The frequency vector follows the distinct term order returned by SEARCH_TERMS.
 -- SEARCH_LENGTH gives the stored length of a UTF-8 document for aggregation over the admitted rows and null for any other input.
 -- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.
+-- Its Arrow inputs supply each pair from the selected UTF-8 positions.
 -- Each id and body is prefixed with its byte length so the input has one spelling.
 -- Ranked pruning applies to the two-argument form.
 --

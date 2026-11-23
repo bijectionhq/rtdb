@@ -1,4 +1,6 @@
 use super::*;
+use super::computed::Output;
+use rtdb_types::NumericCell;
 
 pub(super) fn ordinary_call(name: &str) -> bool {
     let matches = |candidate: &str| name.bytes().map(|byte| if byte == b'-' { b'_' } else { byte.to_ascii_lowercase() }).eq(candidate.bytes());
@@ -10,14 +12,34 @@ pub(super) fn ordinary_call(name: &str) -> bool {
             .into_iter().any(|candidate| name.strip_suffix('?').unwrap_or(name).bytes().map(|byte| if byte == b'-' { b'_' } else { byte.to_ascii_lowercase() }).eq(candidate.bytes()))
 }
 
-pub(super) struct Continuation<'a> { ty: LogicalType, payload: Pending<'a,EvalValue<'a>> }
+pub(super) struct Continuation<'a> { ty: LogicalType, payload: Pending<'a,Output<'a>> }
 impl<'a> Continuation<'a> {
     pub(super) fn is_null(&self) -> bool { self.ty == LogicalType::Null }
     pub(super) fn is_list(&self) -> bool { matches!(self.ty, LogicalType::List { kind: ListKind::List | ListKind::Set | ListKind::FixedSizeList(_), .. }) }
-    pub(super) async fn demand(self) -> Result<EvalValue<'a>> { self.payload.await }
+    pub(super) async fn demand(self) -> Result<EvalValue<'a>> { self.demand_output().await.map(Output::into_value) }
+    pub(super) async fn demand_output(self) -> Result<Output<'a>> { self.payload.await }
 }
 fn deferred<'a>(ty: LogicalType,payload: impl Future<Output=Result<EvalValue<'a>>> + Send + 'a,frame: &EvaluationFrame<'_>) -> Result<Continuation<'a>> {
+    deferred_output(ty, async move { payload.await.map(Output::Value) }, frame)
+}
+fn deferred_output<'a>(ty: LogicalType,payload: impl Future<Output=Result<Output<'a>>> + Send + 'a,frame: &EvaluationFrame<'_>) -> Result<Continuation<'a>> {
     Ok(Continuation { ty,payload: boxed(payload,frame)? })
+}
+fn ready_output<'a>(value: Output<'a>, frame: &EvaluationFrame<'_>) -> Result<Continuation<'a>> {
+    match value {
+        Output::Value(value) => ready(value, frame),
+        Output::Number(number) => {
+            frame.context.reserve(4096 + number_value_bytes(number) * 8)?;
+            let ty = number.scalar_type().map_or(LogicalType::Null, LogicalType::Scalar);
+            deferred_output(ty, async move { Ok(Output::Number(number)) }, frame)
+        }
+    }
+}
+fn number_value_bytes(number: NumericCell) -> usize {
+    std::mem::size_of::<Value>() + match number {
+        NumericCell::Decimal(_, params) => usize::from(params.bit_width / 8),
+        _ => 0,
+    }
 }
 fn ready<'a>(value: EvalValue<'a>,frame: &EvaluationFrame<'_>) -> Result<Continuation<'a>> {
     deferred(value_type(&value,frame)?,async move { Ok(value) },frame)
@@ -126,7 +148,12 @@ pub(super) fn prepare<'a>(expr: &'a Expr,frame: &'a EvaluationFrame<'a>) -> Resu
         let ty = emitted_type(expr,frame)?;
         let boxed_return = ty.legs().len() > 1;
         let continuation = prepare_inner(expr,ty,frame)?.await?;
-        if boxed_return { ready(box_cell(continuation.demand().await?)?,frame) } else { Ok(continuation) }
+        if !boxed_return { return Ok(continuation); }
+        let output = match continuation.demand_output().await? {
+            Output::Value(value) => Output::Value(box_cell(value)?),
+            output => output,
+        };
+        ready_output(output, frame)
     },frame)
 }
 
@@ -175,7 +202,18 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 target.validate_source(&emitted_type(input,frame)?)?;
                 let input = prepare(input,frame)?.await?;
                 if input.is_null() { return nil(frame); }
-                deferred(ty,async move { cast_value(input.demand().await?,Target::Cast(target),frame)?.await },frame)
+                deferred_output(ty,async move {
+                    let input = input.demand_output().await?;
+                    if let (Some(target_type), Some(number)) = (crate::list_cast::scalar_target(target), input.number())
+                        && let Some(source) = number.scalar_type()
+                    {
+                        frame.context.reserve(4096 + number_value_bytes(number) * 8)?;
+                        target.validate_source(&LogicalType::Scalar(source.clone()))?;
+                        frame.context.reserve(4096 + number_value_bytes(number) * 64)?;
+                        return crate::list_cast::cast_number(number, &source, target_type).map(Output::Number);
+                    }
+                    cast_value(input.into_value(),Target::Cast(target),frame)?.await.map(Output::Value)
+                },frame)
             }
             Expr::Unary { op,expr: input } => {
                 let input = prepare(input,frame)?.await?;
@@ -184,9 +222,20 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 }
                 if matches!(op,UnaryOp::IsTrue | UnaryOp::IsFalse) && input.ty != LogicalType::Scalar(rtdb_types::ScalarType::Bool) { return ready(scalar(Value::Bool(false)),frame); }
                 if input.is_null() { return nil(frame); }
-                deferred(ty,async move {
-                    let input = materialize(input.demand().await?,frame)?.await?;
-                    from_value(super::super::unary_value(*op,input)?,frame)
+                deferred_output(ty,async move {
+                    let input = input.demand_output().await?;
+                    if *op == UnaryOp::Negate && let Some(number) = input.number() {
+                        if number == NumericCell::Null { return Ok(Output::Number(number)); }
+                        let ty = number.scalar_type().expect("present number");
+                        if let Some(integer) = number.integer() {
+                            return crate::numeric::integer_cell(integer.checked_neg().ok_or_else(overflow)?, &ty).map(Output::Number);
+                        }
+                        if !matches!(number, NumericCell::Decimal(..)) {
+                            return Ok(Output::Number(computed::floating(-number.as_f64().unwrap(), &ty)));
+                        }
+                    }
+                    let input = materialize(input.into_value(),frame)?.await?;
+                    from_value(super::super::unary_value(*op,input)?,frame).map(Output::Value)
                 },frame)
             }
             Expr::Binary { op: BinaryOp::And | BinaryOp::Or,left,right } => {
@@ -217,6 +266,13 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                 if null_safe && (left.is_null() || right.is_null()) {
                     let equal = left.is_null() == right.is_null();
                     return ready(scalar(Value::Bool(if *op == BinaryOp::IsNotDistinctFrom { equal } else { !equal })),frame);
+                }
+                if matches!(op, BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo) {
+                    return deferred_output(ty, async move {
+                        let left = left.demand_output().await?;
+                        let right = right.demand_output().await?;
+                        computed::arithmetic(*op, left, right, frame).await
+                    }, frame);
                 }
                 deferred(ty,async move {
                     let mut left = if left.is_null() { scalar(Value::Null) } else { left.demand().await? };
@@ -280,7 +336,16 @@ fn prepare_inner<'a>(expr: &'a Expr,ty: LogicalType,frame: &'a EvaluationFrame<'
                     pattern.search(scalar_ref(&input)?,*negated,&context).map(scalar)
                 },frame)
             }
-            Expr::Literal(_) | Expr::DurationLiteral(_) | Expr::In {..} => deferred(ty,async move { evaluate(expr,frame)?.await },frame),
+            Expr::Literal(value) => {
+                if let Some(number) = NumericCell::from_value(value) {
+                    return deferred_output(ty, async move {
+                        frame.context.reserve(value.retained_bytes()?)?;
+                        Ok(Output::Number(number))
+                    }, frame);
+                }
+                deferred(ty,async move { evaluate(expr,frame)?.await },frame)
+            }
+            Expr::DurationLiteral(_) | Expr::In {..} => deferred(ty,async move { evaluate(expr,frame)?.await },frame),
         }
     },frame)
 }
@@ -308,7 +373,7 @@ fn coalesce<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pendi
         for (index,expr) in args.iter().enumerate() {
             let value = prepare(expr,frame)?.await?;
             if index + 1 == args.len() { return Ok(value); }
-            if !value.is_null() { return ready(value.demand().await?,frame); }
+            if !value.is_null() { return ready_output(value.demand_output().await?,frame); }
         }
         nil(frame)
     },frame)
@@ -373,6 +438,12 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
             let source = prepare(&args[1],frame)?.await?;
             if source.is_null() { return nil(frame); }
             return deferred(ty,async move { calls::apply(name,vec![stride,source.demand().await?,origin],frame)?.await },frame);
+        }
+        if name == "random" && args.is_empty() {
+            return deferred_output(ty, async move {
+                frame.context.reserve(4096)?;
+                crate::volatile::random().map(|value| Output::Number(NumericCell::F64(value)))
+            }, frame);
         }
         let shortcut_null = !matches!(name.as_str(),"is_true" | "is_false" | "is_null" | "true?" | "false?" | "nil?" | "boolean" | "===" | "null_eq" | "compare_nulls_first" | "compare_nulls_last" | "distinct_from" | "period" | "str" | "_patch" | "string_to_array" | "format_type" | "format");
         frame.context.reserve(args.len().checked_mul(std::mem::size_of::<Continuation<'_>>()).ok_or_else(overflow)?)?;
@@ -464,14 +535,37 @@ fn call<'a>(name: String,args: &'a [Expr],ty: LogicalType,frame: &'a EvaluationF
                 calls::apply(name,vec![input,scale.demand().await?],frame)?.await
             },frame);
         }
-        if name == "log" && arguments.len() == 2 {
-            let input = arguments.pop().expect("validated input");
-            let base = arguments.pop().expect("validated base");
-            return deferred(ty,async move {
-                let input = input.demand().await?;
-                frame.context.reserve(2 * std::mem::size_of::<EvalValue<'_>>())?;
-                calls::apply(name,vec![base.demand().await?,input],frame)?.await
-            },frame);
+        if crate::functions::is_float_math(&name) && matches!(arguments.len(), 1 | 2) {
+            let second = if arguments.len() == 2 { arguments.pop() } else { None };
+            let first = arguments.pop().expect("validated numeric argument");
+            return deferred_output(ty, async move {
+                let (left, right) = if name == "log" && second.is_some() {
+                    let right = second.unwrap().demand_output().await?;
+                    (first.demand_output().await?, Some(right))
+                } else {
+                    let left = first.demand_output().await?;
+                    let right = match second { Some(value) => Some(value.demand_output().await?), None => None };
+                    (left, right)
+                };
+                let count = 1 + usize::from(right.is_some());
+                frame.context.reserve(count * std::mem::size_of::<EvalValue<'_>>())?;
+                let numbers = [left.number(), right.as_ref().and_then(Output::number)];
+                let types = numbers.map(|number| number.and_then(NumericCell::scalar_type).map(LogicalType::Scalar));
+                if types[..count].iter().all(Option::is_some) {
+                    frame.context.reserve(count * std::mem::size_of::<Value>())?;
+                    let bytes = numbers[..count].iter().flatten().copied().map(number_value_bytes).sum::<usize>();
+                    frame.context.reserve((bytes + 256) * 16)?;
+                    let types = types.map(|ty| ty.unwrap_or(LogicalType::Null));
+                    rtdb_plan::function_type(&name, &types[..count])?;
+                    let x = numbers[0].and_then(NumericCell::as_f64).unwrap();
+                    let y = numbers[1].and_then(NumericCell::as_f64);
+                    return crate::functions::float_math(&name, x, y).map(|value| Output::Number(NumericCell::F64(value)));
+                }
+                let mut values = Vec::with_capacity(count);
+                values.push(left.into_value());
+                if let Some(right) = right { values.push(right.into_value()); }
+                calls::apply(name, values, frame)?.await.map(Output::Value)
+            }, frame);
         }
         let selects_element = name == "nth";
         if selects_element { rtdb_plan::function_type("nth", &[arguments[0].ty.clone(),arguments[1].ty.clone()])?; }

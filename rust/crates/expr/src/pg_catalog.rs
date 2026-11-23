@@ -100,7 +100,7 @@ pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>
                 _ => return crate::cast::cast_target(value, target, context.timezone),
             };
             if let Some(list) = crate::scalar_list_cast::cast_list(
-                crate::scalar_list_cast::Source::Stored(values), element, context.timezone, false, |bytes| context.reserve(bytes),
+                crate::scalar_list_cast::Source::Stored(values), element, context.timezone, Some(context.current_time), false, |bytes| context.reserve(bytes),
             )? {
                 return Ok(Value::List(list));
             }

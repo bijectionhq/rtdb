@@ -3,6 +3,8 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{
     Array, ArrayRef, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, Float16Array,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray,
+    cast::AsArray,
+    types::{Int16Type, Int32Type, Int64Type},
     builder::{
         ArrayBuilder, Decimal32Builder, Decimal64Builder, Decimal128Builder, Decimal256Builder,
         Float16Builder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
@@ -51,7 +53,7 @@ impl NumericList {
     }
 }
 
-fn signed_layout(field: &Field, array: &ArrayRef) -> Option<(Field, ArrayRef)> {
+pub(crate) fn signed_layout(field: &Field, array: &ArrayRef) -> Option<(Field, ArrayRef)> {
     macro_rules! reinterpret {
         ($source:ty, $target:ty) => {
             {
@@ -113,10 +115,11 @@ fn supported_scalar(field: &Field, allow_annotations: bool) -> bool {
 }
 
 pub(crate) fn numeric_input(field: &Field) -> bool {
-    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
-        return inert_metadata(field) && fields.iter().all(|(_, field)| supported_scalar(field, true));
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => inert_metadata(field) && fields.iter().all(|(_, field)| numeric_input(field)),
+        DataType::RunEndEncoded(_, child) => inert_metadata(field) && numeric_input(child),
+        _ => supported_scalar(field, true),
     }
-    supported_scalar(field, true)
 }
 
 fn inert_metadata(field: &Field) -> bool {
@@ -127,27 +130,34 @@ fn inert_metadata(field: &Field) -> bool {
 pub(crate) fn observed_numeric_type(field: &Field, array: &dyn Array) -> LogicalType {
     let mut types = Vec::new();
     if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
-        let array = array.as_any().downcast_ref::<UnionArray>().expect("numeric union");
-        let mut present = [false; 128];
-        let mut absent = false;
-        let mut remaining = fields.iter().filter(|(_, field)| field.data_type() != &DataType::Null).count();
-        for (&tag, &offset) in array.type_ids().iter().zip(array.offsets().expect("dense offsets").iter()) {
-            let id = tag as usize;
-            if present[id] && absent { continue; }
-            let child = array.child(tag);
-            if child.data_type() == &DataType::Null || child.is_null(offset as usize) {
-                if !std::mem::replace(&mut absent, true) { types.push(LogicalType::Null); }
-            } else if !std::mem::replace(&mut present[id], true) {
-                let (_, field) = fields.iter().find(|(id, _)| *id == tag).expect("numeric union tag");
-                types.push(scalar_type(field));
-                remaining -= 1;
-            }
-            if remaining == 0 && absent { break; }
-        }
+        return observed_union_type(fields, array.as_union(), scalar_type);
     } else if !array.is_empty() {
         let nulls = if array.data_type() == &DataType::Null { array.len() } else { array.null_count() };
         if nulls < array.len() { types.push(scalar_type(field)); }
         if nulls > 0 { types.push(LogicalType::Null); }
+    }
+    LogicalType::join_all(&types)
+}
+
+pub(crate) fn observed_union_type(
+    fields: &UnionFields, array: &UnionArray, leg_type: impl Fn(&Field) -> LogicalType,
+) -> LogicalType {
+    let mut types = Vec::new();
+    let mut present = [false; 128];
+    let mut absent = false;
+    let mut remaining = fields.iter().filter(|(_, field)| field.data_type() != &DataType::Null).count();
+    for (&tag, &offset) in array.type_ids().iter().zip(array.offsets().expect("dense offsets").iter()) {
+        let id = tag as usize;
+        if present[id] && absent { continue; }
+        let child = array.child(tag);
+        if child.data_type() == &DataType::Null || child.is_null(offset as usize) {
+            if !std::mem::replace(&mut absent, true) { types.push(LogicalType::Null); }
+        } else if !std::mem::replace(&mut present[id], true) {
+            let (_, field) = fields.iter().find(|(id, _)| *id == tag).expect("union tag");
+            types.push(leg_type(field));
+            remaining -= 1;
+        }
+        if remaining == 0 && absent { break; }
     }
     LogicalType::join_all(&types)
 }
@@ -252,6 +262,21 @@ impl<'a> NumericSpan<'a> {
             .then_some(Self { field, array, range })
     }
 
+    /// Opens the selected numeric positions of a child that also has other logical legs.
+    pub fn selected(field: &'a Field, array: &'a dyn Array, range: Range<usize>) -> Option<Self> {
+        if let Some(span) = Self::new(field, array, range.clone()) { return Some(span); }
+        if field.data_type() != array.data_type() || range.start > range.end || range.end > array.len()
+            || !matches!(field.data_type(), DataType::Union(_, UnionMode::Dense) | DataType::RunEndEncoded(..))
+            || !inert_metadata(field)
+        {
+            return None;
+        }
+        range.clone().all(|index| {
+            let (field, _, _) = numeric_position(field, array, index);
+            supported_scalar(field, true)
+        }).then_some(Self { field, array, range })
+    }
+
     pub fn len(&self) -> usize { self.range.len() }
 
     pub fn is_empty(&self) -> bool { self.range.is_empty() }
@@ -272,7 +297,7 @@ impl<'a> NumericSpan<'a> {
     }
 }
 
-fn scalar_type(field: &Field) -> LogicalType {
+pub(crate) fn scalar_type(field: &Field) -> LogicalType {
     let scalar = match field.data_type() {
         DataType::Null => return LogicalType::Null,
         DataType::Int8 => ScalarType::I8,
@@ -294,8 +319,37 @@ fn scalar_type(field: &Field) -> LogicalType {
     LogicalType::Scalar(scalar)
 }
 
+fn numeric_position<'a>(mut field: &'a Field, mut array: &'a dyn Array, mut index: usize) -> (&'a Field, &'a dyn Array, usize) {
+    loop {
+        (field, array, index) = match field.data_type() {
+            DataType::Union(fields, UnionMode::Dense) => {
+                let union = array.as_union();
+                let id = union.type_id(index);
+                let (_, field) = fields.iter().find(|(tag, _)| *tag == id).expect("validated numeric union tag");
+                (field, union.child(id).as_ref(), union.value_offset(index))
+            }
+            DataType::RunEndEncoded(ends, child) => {
+                macro_rules! run {
+                    ($ty:ty) => {{
+                        let run = array.as_run::<$ty>();
+                        (child.as_ref(), run.values().as_ref(), run.get_physical_index(index))
+                    }};
+                }
+                match ends.data_type() {
+                    DataType::Int16 => run!(Int16Type),
+                    DataType::Int32 => run!(Int32Type),
+                    DataType::Int64 => run!(Int64Type),
+                    _ => unreachable!("validated run ends"),
+                }
+            }
+            _ => return (field, array, index),
+        };
+    }
+}
+
 fn read_number(field: &Field, array: &dyn Array, index: usize) -> NumericCell {
     use NumericCell as N;
+    let (field, array, index) = numeric_position(field, array, index);
     if array.is_null(index) { return N::Null; }
     macro_rules! cell {
         ($array:ty) => { array.as_any().downcast_ref::<$array>().expect("validated numeric storage").value(index) };
@@ -313,12 +367,6 @@ fn read_number(field: &Field, array: &dyn Array, index: usize) -> NumericCell {
         DataType::Float16 => N::F16(cell!(Float16Array).to_bits()),
         DataType::Float32 => N::F32(cell!(Float32Array)),
         DataType::Float64 => N::F64(cell!(Float64Array)),
-        DataType::Union(fields, UnionMode::Dense) => {
-            let union = array.as_any().downcast_ref::<UnionArray>().expect("validated numeric union");
-            let id = union.type_id(index);
-            let (_, field) = fields.iter().find(|(tag, _)| *tag == id).expect("validated numeric union tag");
-            read_number(field, union.child(id).as_ref(), union.value_offset(index))
-        }
         ty => {
             let params = decimal_field_parameters(field).expect("validated numeric decimal").expect("numeric decimal");
             let unscaled = match ty {

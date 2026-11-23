@@ -12,7 +12,7 @@ use arrow_array::{
 use rtdb_columnar::ArrowCell;
 use rtdb_plan::{CastTarget, TemporalCast};
 use rtdb_types::{
-    CivilDate, ListBuilder, ListValue, ListView, LogicalType, NumericCell, Result, ScalarList, ScalarType,
+    CivilDate, Instant, ListBuilder, ListValue, ListView, LogicalType, NumericCell, Result, ScalarList, ScalarType,
     TimeUnit, Value,
 };
 
@@ -27,6 +27,7 @@ pub(crate) fn cast_list(
     source: Source<'_>,
     target: &CastTarget,
     timezone: &str,
+    current_time: Option<Instant>,
     projection: bool,
     mut reserve: impl FnMut(usize) -> Result<()>,
 ) -> Result<Option<ListValue>> {
@@ -36,7 +37,7 @@ pub(crate) fn cast_list(
     let Some(cells) = Cells::new(source) else {
         return Ok(None);
     };
-    let Some((ty, temporal)) = target_type(target, timezone) else {
+    let Some(ty) = target_type(target, timezone) else {
         return Ok(None);
     };
     let count = cells.len();
@@ -47,7 +48,7 @@ pub(crate) fn cast_list(
         return render(&cells, target, reserve);
     }
     if let Some(ty) = list_cast::scalar_target(target)
-        && cells.is_text()
+        && cells.all(|cell| matches!(cell, Cell::Null | Cell::Number(_) | Cell::Text(_)))
     {
         let source_type = LogicalType::Scalar(ScalarType::Utf8);
         reserve(count.checked_mul(192).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)?)?;
@@ -60,7 +61,12 @@ pub(crate) fn cast_list(
                     target.validate_source(&source_type)?;
                     list_cast::cast_text_number(text, ty)?
                 }
-                _ => unreachable!("text list"),
+                Cell::Number(number) => {
+                    let source_type = number.scalar_type().expect("present number");
+                    target.validate_source(&LogicalType::Scalar(source_type.clone()))?;
+                    list_cast::cast_number(number, &source_type, ty)?
+                }
+                _ => unreachable!("text or numeric list"),
             };
             if projection {
                 list_cast::validate_output(cell)?;
@@ -71,7 +77,14 @@ pub(crate) fn cast_list(
         }
         return Ok(Some(builder.finish()));
     }
-    if !is_temporal(&ty) || !cells.supports_temporal(&ty) {
+    let temporal = temporal_target(target);
+    if !is_temporal(&ty) || !cells.all(|cell| supports_temporal(cell, &ty, temporal, current_time)) {
+        return Ok(None);
+    }
+    // The standalone scalar cast returns calendar objects before Arrow date admission.
+    if current_time.is_none() && matches!(ty, ScalarType::DateDay | ScalarType::DateMilli)
+        && !cells.all(|cell| matches!(cell, Cell::Null) || matches!(cell, Cell::Temporal(_, source) if source == ty))
+    {
         return Ok(None);
     }
     let logical = LogicalType::Scalar(ty.clone());
@@ -91,14 +104,19 @@ pub(crate) fn cast_list(
                 reserve(text.len().checked_mul(64).ok_or_else(overflow)?)?;
                 (ScalarType::Utf8, TemporalValue::Text(text))
             }
-            Cell::Temporal(value, ty) => (ty.clone(), TemporalValue::Raw(value)),
+            Cell::Temporal(value, ty) => (ty, TemporalValue::Raw(value)),
             Cell::Number(NumericCell::F64(value)) => (ScalarType::F64, TemporalValue::Seconds(value)),
             _ => return Ok(None),
         };
-        target.validate_source(&LogicalType::Scalar(source_type.clone()))?;
-        let Some(value) = cast_temporal(value, &source_type, &ty, temporal, timezone)? else {
+        let source = LogicalType::Scalar(source_type.clone());
+        target.validate_source(&source)?;
+        let temporal = temporal_options(target, &source)?;
+        let Some(value) = cast_temporal(value, &source_type, &ty, temporal.as_deref(), timezone, current_time)? else {
             return Ok(None);
         };
+        if matches!(ty, ScalarType::Time { bit_width: 32, .. }) && i32::try_from(value).is_err() {
+            return Ok(None);
+        }
         raw.push(Some(value));
     }
     if raw.iter().all(Option::is_none) {
@@ -118,7 +136,7 @@ fn render(
     target: &CastTarget,
     mut reserve: impl FnMut(usize) -> Result<()>,
 ) -> Result<Option<ListValue>> {
-    if !cells.is_text() && !matches!(cells, Cells::Numeric(_)) {
+    if !cells.all(|cell| matches!(cell, Cell::Null | Cell::Text(_) | Cell::Number(_))) {
         return Ok(None);
     }
     reserve(cells.len().checked_mul(160).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)?)?;
@@ -180,13 +198,15 @@ enum Cells<'a> {
     Text(&'a StringArray, Range<usize>),
     Temporal(&'a dyn Array, Range<usize>, ScalarType),
     Values(&'a [Value]),
+    Selected(&'a arrow_schema::Field, &'a dyn Array, Range<usize>),
 }
 
 enum Cell<'a> {
     Null,
     Text(&'a str),
     Number(NumericCell),
-    Temporal(i64, &'a ScalarType),
+    Temporal(i64, ScalarType),
+    Unsupported,
 }
 
 impl<'a> Cells<'a> {
@@ -198,10 +218,8 @@ impl<'a> Cells<'a> {
             }
             Source::Stored(view) => Some(Self::Numeric(list_cast::Input::Stored(view))),
             Source::Arrow(cell, selection) => {
-                if let Some(span) = cell.numeric_list_span() {
-                    return Some(Self::Numeric(list_cast::Input::Opened(
-                        span.slice(selection.start, selection.len())?,
-                    )));
+                if let Some(span) = cell.numeric_list_span_range(selection.clone()) {
+                    return Some(Self::Numeric(list_cast::Input::Opened(span)));
                 }
                 let (field, array, range) = cell.sequence_range()?;
                 if selection.end > range.len() {
@@ -212,7 +230,7 @@ impl<'a> Cells<'a> {
         }
     }
 
-    fn arrow(field: &arrow_schema::Field, array: &'a dyn Array, range: Range<usize>) -> Option<Self> {
+    fn arrow(field: &'a arrow_schema::Field, array: &'a dyn Array, range: Range<usize>) -> Option<Self> {
         let ty = rtdb_columnar::from_field(field).ok()?;
         let ty = match ty {
             LogicalType::Maybe(inner) => *inner,
@@ -221,41 +239,20 @@ impl<'a> Cells<'a> {
         match ty {
             LogicalType::Scalar(ScalarType::Utf8) => Some(Self::Text(array.as_any().downcast_ref()?, range)),
             LogicalType::Scalar(ty) if is_temporal(&ty) => Some(Self::Temporal(array, range, ty)),
-            _ => None,
+            _ => Some(Self::Selected(field, array, range)),
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Self::Numeric(values) => values.len(),
-            Self::Text(_, range) | Self::Temporal(_, range, _) => range.len(),
+            Self::Text(_, range) | Self::Temporal(_, range, _) | Self::Selected(_, _, range) => range.len(),
             Self::Values(values) => values.len(),
         }
     }
 
-    fn is_text(&self) -> bool {
-        match self {
-            Self::Text(..) => true,
-            Self::Values(values) => values.iter().all(|value| matches!(value, Value::Null | Value::Utf8(_))),
-            _ => false,
-        }
-    }
-
-    fn supports_temporal(&self, target: &ScalarType) -> bool {
-        match self {
-            Self::Numeric(values) => {
-                matches!(target, ScalarType::Duration(_))
-                    && (0..values.len())
-                        .all(|row| matches!(values.get(row), NumericCell::Null | NumericCell::F64(_)))
-            }
-            Self::Temporal(_, _, source) => matches!(
-                (source, target),
-                (ScalarType::Timestamp { .. }, ScalarType::Timestamp { .. })
-                    | (ScalarType::Time { .. }, ScalarType::Time { .. } | ScalarType::Duration(_))
-                    | (ScalarType::Duration(_), ScalarType::Duration(_))
-            ),
-            _ => self.is_text(),
-        }
+    fn all(&self, mut accepts: impl FnMut(Cell<'_>) -> bool) -> bool {
+        (0..self.len()).all(|i| accepts(self.get(i)))
     }
 
     fn get(&self, row: usize) -> Cell<'_> {
@@ -273,15 +270,63 @@ impl<'a> Cells<'a> {
                 if array.is_null(row) {
                     Cell::Null
                 } else {
-                    Cell::Temporal(ScalarList::temporal_raw(*array, row).expect("temporal array"), ty)
+                    Cell::Temporal(ScalarList::temporal_raw(*array, row).expect("temporal array"), ty.clone())
                 }
             }
-            Self::Values(values) => match &values[row] {
-                Value::Null => Cell::Null,
-                Value::Utf8(text) => Cell::Text(text),
-                _ => unreachable!("text list"),
-            },
+            Self::Values(values) => {
+                use ScalarType as S;
+                match &values[row] {
+                    Value::Null | Value::Undefined => Cell::Null,
+                    Value::Utf8(text) => Cell::Text(text),
+                    Value::DateDay(value) => Cell::Temporal(i64::from(*value), S::DateDay),
+                    Value::DateMilli(value) => Cell::Temporal(*value, S::DateMilli),
+                    Value::Time { value, unit, bit_width } => {
+                        Cell::Temporal(*value, S::Time { unit: *unit, bit_width: *bit_width })
+                    }
+                    Value::Timestamp { value, unit, timezone } => {
+                        Cell::Temporal(*value, S::Timestamp { unit: *unit, timezone: timezone.clone() })
+                    }
+                    Value::Duration { value, unit } => Cell::Temporal(*value, S::Duration(*unit)),
+                    value => NumericCell::from_value(value).map_or(Cell::Unsupported, Cell::Number),
+                }
+            }
+            Self::Selected(field, array, range) => {
+                let row = range.start + row;
+                let Ok(cell) = (ArrowCell { field, array, row }).physical() else { return Cell::Unsupported; };
+                if !matches!(cell.is_undefined(), Ok(false)) { return Cell::Unsupported; }
+                if matches!(cell.is_null(), Ok(true)) { return Cell::Null; }
+                if let Some(span) = rtdb_types::NumericSpan::new(cell.field, cell.array, cell.row..cell.row + 1) {
+                    return Cell::Number(span.get(0).expect("selected cell").signed());
+                }
+                match cell.logical_type() {
+                    Ok(LogicalType::Scalar(ScalarType::Utf8)) => Cell::Text(
+                        cell.array.as_any().downcast_ref::<StringArray>().expect("string array").value(cell.row),
+                    ),
+                    Ok(LogicalType::Scalar(ty)) if is_temporal(&ty) => {
+                        ScalarList::temporal_raw(cell.array, cell.row)
+                            .map_or(Cell::Unsupported, |value| Cell::Temporal(value, ty))
+                    }
+                    _ => Cell::Unsupported,
+                }
+            }
         }
+    }
+}
+
+fn supports_temporal(cell: Cell<'_>, target: &ScalarType, temporal: bool, clock: Option<Instant>) -> bool {
+    use ScalarType as S;
+    match cell {
+        Cell::Null | Cell::Text(_) => true,
+        Cell::Number(NumericCell::F64(_)) => matches!(target, S::Duration(_)),
+        Cell::Temporal(_, source) => match (&source, target) {
+            (S::Time { .. }, S::Timestamp { .. }) => temporal && clock.is_some(),
+            (S::DateDay | S::DateMilli, S::DateDay | S::DateMilli | S::Timestamp { .. })
+            | (S::Timestamp { .. }, S::Timestamp { .. } | S::DateDay | S::DateMilli | S::Time { .. })
+            | (S::Time { .. }, S::Time { .. } | S::Duration(_))
+            | (S::Duration(_), S::Duration(_)) => true,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -296,22 +341,46 @@ fn is_temporal(ty: &ScalarType) -> bool {
     )
 }
 
-fn target_type<'a>(target: &'a CastTarget, timezone: &str) -> Option<(ScalarType, Option<&'a TemporalCast>)> {
+fn target_type(target: &CastTarget, timezone: &str) -> Option<ScalarType> {
     if target.union_target().is_some() {
         return None;
     }
     match target {
         CastTarget::Checked { target, .. } => target_type(target, timezone),
-        CastTarget::Fixed(LogicalType::Scalar(ty)) => Some((ty.clone(), None)),
-        CastTarget::DecimalDefault => {
-            Some((ScalarType::Decimal { precision: 64, scale: 9, bit_width: 256 }, None))
-        }
+        CastTarget::Fixed(LogicalType::Scalar(ty)) => Some(ty.clone()),
+        CastTarget::DecimalDefault => Some(ScalarType::Decimal { precision: 64, scale: 9, bit_width: 256 }),
         CastTarget::Temporal(target) => match target.data_type(timezone) {
-            LogicalType::Scalar(ty) => Some((ty, Some(target))),
+            LogicalType::Scalar(ty) => Some(ty),
+            _ => None,
+        },
+        CastTarget::Deferred(rtdb_plan::DeferredCast::Temporal { kind, unit, .. }) => {
+            let target = TemporalCast { kind: kind.clone(), unit: *unit, precision: None };
+            let LogicalType::Scalar(ty) = target.data_type(timezone) else { unreachable!() };
+            Some(ty)
+        }
+        _ => None,
+    }
+}
+
+fn temporal_target(target: &CastTarget) -> bool {
+    match target {
+        CastTarget::Checked { target, .. } => temporal_target(target),
+        CastTarget::Temporal(_) | CastTarget::Deferred(rtdb_plan::DeferredCast::Temporal { .. }) => true,
+        _ => false,
+    }
+}
+
+fn temporal_options<'a>(target: &'a CastTarget, source: &LogicalType) -> Result<Option<std::borrow::Cow<'a, TemporalCast>>> {
+    use std::borrow::Cow;
+    Ok(match target {
+        CastTarget::Checked { target, .. } => return temporal_options(target, source),
+        CastTarget::Temporal(target) => Some(Cow::Borrowed(target)),
+        CastTarget::Deferred(target) => match target.resolve_value(source)? {
+            CastTarget::Temporal(target) => Some(Cow::Owned(target)),
             _ => None,
         },
         _ => None,
-    }
+    })
 }
 
 enum TemporalValue<'a> {
@@ -326,9 +395,15 @@ fn cast_temporal(
     target: &ScalarType,
     temporal: Option<&TemporalCast>,
     timezone: &str,
+    current_time: Option<Instant>,
 ) -> Result<Option<i64>> {
     use ScalarType as S;
     use TimeUnit::Nanosecond;
+    let date_raw = |days| -> Result<Option<i64>> {
+        let days = CivilDate::from_epoch_day(days)?.epoch_day();
+        Ok(if *target == S::DateDay { i32::try_from(days).ok().map(i64::from) }
+            else { days.checked_mul(rtdb_types::java_date::MILLIS_PER_DAY) })
+    };
     let raw = match (value, source, target) {
         (TemporalValue::Text(text), _, _) if temporal.is_some() => {
             crate::temporal_cast::text_raw(text, temporal.unwrap())?
@@ -346,12 +421,28 @@ fn cast_temporal(
             let days = CivilDate::parse_iso(text)
                 .map_err(|_| crate::temporal_cast::invalid_temporal_text(text, "date"))?
                 .epoch_day();
-            if *target == S::DateDay {
-                return Ok(i32::try_from(days).ok().map(i64::from));
-            }
-            return Ok(days.checked_mul(rtdb_types::java_date::MILLIS_PER_DAY));
+            return date_raw(days);
         }
         (TemporalValue::Seconds(value), _, S::Duration(unit)) => cast::duration_seconds(value, *unit)?,
+        (TemporalValue::Raw(value), _, _) if source == target => value,
+        (TemporalValue::Raw(value), S::DateDay | S::DateMilli, _) => {
+            let days = if *source == S::DateDay { value } else { value.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY) };
+            match target {
+                S::Timestamp { unit, timezone: target_zone } => cast::date_to_timestamp(days, *unit, target_zone.is_some(), timezone)?,
+                _ => return date_raw(days),
+            }
+        }
+        (TemporalValue::Raw(value), S::Time { unit: source, .. }, S::Timestamp { unit, timezone: target_zone }) => {
+            crate::temporal_cast::time_to_timestamp(value, *source, *unit, target_zone.is_some(), timezone, current_time.expect("clock-aware cast"))?
+        }
+        (TemporalValue::Raw(value), S::Timestamp { unit, timezone: source_zone }, S::DateDay | S::DateMilli) => {
+            let days = cast::local_seconds(value, *unit, source_zone.as_ref().map(|_| timezone))?.div_euclid(86_400);
+            return date_raw(days);
+        }
+        (TemporalValue::Raw(value), S::Timestamp { unit: source, timezone: source_zone }, S::Time { unit, .. }) => {
+            cast::timestamp_to_time(value, *source, *unit, source_zone.as_ref().map(|_| timezone))?
+        }
+
         (
             TemporalValue::Raw(value),
             S::Timestamp { unit: source, timezone: source_zone },

@@ -396,15 +396,13 @@ fn verify_hosted_controls(
     let Some(Value::List(names)) = proof.get(CONTROL_TABLES) else {
         return Err(mismatch());
     };
-    if names.len() != controls.len() || names.len() > 32 {
+    if names.is_empty() || names.len() != controls.len() || names.len() > 32 {
         return Err(mismatch());
     }
     let mut expected = BTreeSet::new();
-    for name in names.scalar_values().ok_or_else(mismatch)? {
-        let Value::Utf8(name) = name else {
-            return Err(mismatch());
-        };
-        if !admits_name(name) || !expected.insert(name.as_str()) {
+    for index in 0..names.len() {
+        let name = names.view().utf8(index).ok_or_else(mismatch)?;
+        if !admits_name(name) || !expected.insert(name) {
             return Err(mismatch());
         }
     }

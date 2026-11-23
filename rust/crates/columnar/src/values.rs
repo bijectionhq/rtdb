@@ -414,9 +414,7 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
         if item.metadata().is_empty() && let Some(array) = build_float_lists(item, width, values)? {
             return Ok(array);
         }
-        let packed_scalars = matches!(item.data_type(), DataType::Utf8 | DataType::Date32 | DataType::Date64
-            | DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(..) | DataType::Duration(_))
-            && values.iter().any(|value| matches!(value.list_view(), Some(ListView::Scalars(_))));
+        let packed_scalars = values.iter().any(|value| matches!(value.list_view(), Some(ListView::Scalars(_))));
         if (ListValue::supports_numeric_arrow(item) || packed_scalars)
             && let Some(array) = build_packed_lists(item, width, values, check_precision)?
         {
@@ -529,9 +527,7 @@ fn build_packed_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], c
                     ListView::F32(array) => (Field::new(item.name(), DataType::Float32, array.null_count() != 0), Arc::new(array.clone())),
                     ListView::F64(array) => (Field::new(item.name(), DataType::Float64, array.null_count() != 0), Arc::new(array.clone())),
                     ListView::Union(array) => (Field::new(item.name(), array.data_type().clone(), false), Arc::new(array.clone())),
-                    ListView::Scalars(values) if values.field().data_type() == item.data_type()
-                        && values.field().metadata() == item.metadata() => (values.field().as_ref().clone(), Arc::clone(values.array())),
-                    ListView::Scalars(_) => return Ok(None),
+                    ListView::Scalars(values) => (values.field().as_ref().clone(), Arc::clone(values.array())),
                     ListView::Values(_) if list.is_empty() => (item.as_ref().clone(), arrow_array::new_empty_array(item.data_type())),
                     ListView::Values(_) => return Ok(None),
                 };
@@ -816,6 +812,13 @@ fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn 
     {
         return Ok(if matches!(kind, ListKind::List) { Value::List(list) } else { Value::FixedSizeList(list) });
     }
+    if matches!(kind, ListKind::List | ListKind::FixedSizeList(_))
+        && from_field(child_field).ok().as_ref() == Some(element)
+        && numeric_aliases_agree(child_field, values.as_ref(), 0..values.len(), element) == Some(true)
+        && let Some(list) = repack_scalar_list(child_field, values.as_ref(), 0..values.len(), false, || Ok(()))?
+    {
+        return Ok(if matches!(kind, ListKind::List) { Value::List(list) } else { Value::FixedSizeList(list) });
+    }
     let values = (0..values.len()).map(|index| read_typed(element, child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
     match kind {
         ListKind::List => Ok(Value::list(values)),
@@ -843,19 +846,55 @@ fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn 
 pub(crate) fn numeric_list_span<'a>(
     field: &'a Field, array: &'a dyn Array, range: std::ops::Range<usize>, element: &LogicalType,
 ) -> Option<rtdb_types::NumericSpan<'a>> {
-    let span = rtdb_types::NumericSpan::new(field, array, range)?;
     if &from_field(field).ok()? != element { return None; }
-    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
-        if let LogicalType::Union(legs) = element {
-            for (_, child) in fields.iter() {
+    if !numeric_aliases_agree(field, array, range.clone(), element)? { return None; }
+    rtdb_types::NumericSpan::selected(field, array, range)
+}
+
+fn numeric_aliases_agree(
+    field: &Field, array: &dyn Array, range: std::ops::Range<usize>, element: &LogicalType,
+) -> Option<bool> {
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => {
+            let union = array.as_any().downcast_ref::<UnionArray>()?;
+            for (tag, child) in fields.iter() {
                 let actual = from_field(child).ok()?;
-                if legs.iter().any(|leg| leg_name(leg).is_ok_and(|name| &name == child.name()) && actual.legs().iter().all(|ty| ty != leg)) {
-                    return None;
+                let reinterpreted = matches!(element, LogicalType::Union(legs) if legs.iter().any(|leg|
+                    leg_name(leg).is_ok_and(|name| &name == child.name()) && !actual.legs().contains(leg)));
+                let nested = matches!(child.data_type(), DataType::Union(..));
+                if !reinterpreted && !nested { continue; }
+                let values = union.child(tag).as_ref();
+                for i in range.clone().filter(|&i| union.type_id(i) == tag) {
+                    let offset = union.value_offset(i);
+                    if nested {
+                        if reinterpreted || !numeric_aliases_agree(child, values, offset..offset + 1, &actual)? { return Some(false); }
+                    } else if !values.is_null(offset) {
+                        return Some(false);
+                    }
                 }
             }
+            Some(true)
         }
+        DataType::RunEndEncoded(ends, child) if matches!(child.data_type(), DataType::Union(..)) => {
+            let LogicalType::RunEndEncoded { value, .. } = element else { return None; };
+            macro_rules! run {
+                ($ty:ty) => {{
+                    let runs = array.as_any().downcast_ref::<RunArray<$ty>>()?;
+                    if range.is_empty() { return Some(true); }
+                    let start = runs.get_physical_index(range.start);
+                    let end = runs.get_physical_index(range.end - 1);
+                    numeric_aliases_agree(child, runs.values().as_ref(), start..end + 1, value)
+                }};
+            }
+            match ends.data_type() {
+                DataType::Int16 => run!(Int16Type),
+                DataType::Int32 => run!(Int32Type),
+                DataType::Int64 => run!(Int64Type),
+                _ => None,
+            }
+        }
+        _ => Some(true),
     }
-    Some(span)
 }
 
 pub fn repack_numeric_list(span: &rtdb_types::NumericSpan<'_>, signed: bool) -> Option<ListValue> {
@@ -864,6 +903,127 @@ pub fn repack_numeric_list(span: &rtdb_types::NumericSpan<'_>, signed: bool) -> 
         if !builder.try_push_numeric(if signed { value.signed() } else { value }) { return None; }
     }
     Some(builder.finish())
+}
+
+pub fn repack_scalar_list(
+    field: &Field, array: &dyn Array, range: std::ops::Range<usize>, signed: bool, reserve: impl FnOnce() -> Result<()>,
+) -> Result<Option<ListValue>> {
+    use rtdb_types::ScalarList;
+    if field.data_type() != array.data_type() || range.start > range.end || range.end > array.len()
+        || (ScalarList::supported_type(field).is_none()
+            && !matches!(field.data_type(), DataType::Union(_, UnionMode::Dense) | DataType::RunEndEncoded(..)))
+    {
+        return Ok(None);
+    }
+    let mut representative: Option<&Field> = None;
+    for row in range.clone() {
+        let cell = (crate::ArrowCell { field, array, row }).physical()?;
+        if cell.is_undefined()? { return Ok(None); }
+        if cell.is_null()? { continue; }
+        if let Some(first) = representative {
+            if first.data_type() != cell.field.data_type()
+                || first.metadata() != cell.field.metadata() && ScalarList::supported_type(first) != ScalarList::supported_type(cell.field)
+            {
+                return repack_mixed_scalar_list(field, array, range, signed, reserve);
+            }
+        } else {
+            if ScalarList::supported_type(cell.field).is_none() {
+                return repack_mixed_scalar_list(field, array, range, signed, reserve);
+            }
+            representative = Some(cell.field);
+        }
+    }
+    let Some(representative) = representative else { return Ok(None); };
+    reserve()?;
+    let mut inputs = Vec::<&dyn Array>::new();
+    let mut cells = Vec::with_capacity(range.len());
+    for row in range {
+        let cell = (crate::ArrowCell { field, array, row }).physical()?;
+        let slot = if cell.is_null()? { None } else {
+            let source = inputs.iter().position(|&source| std::ptr::eq(source, cell.array)).unwrap_or_else(|| {
+                inputs.push(cell.array);
+                inputs.len() - 1
+            });
+            Some((source, cell.row))
+        };
+        cells.push(slot);
+    }
+    let copied = crate::copy_nullable_cells(&inputs, &cells)?;
+    let output = to_field("value", &LogicalType::Scalar(ScalarList::supported_type(representative).unwrap()))?;
+    Ok(ListValue::from_scalar_arrow(Arc::new(output.with_nullable(copied.null_count() != 0)), copied))
+}
+
+struct ScalarListLeg<'a> {
+    ty: LogicalType,
+    inputs: Vec<(&'a dyn Array, Option<ArrayRef>)>,
+    picks: Vec<(usize, usize)>,
+}
+
+fn repack_mixed_scalar_list(
+    field: &Field, array: &dyn Array, range: std::ops::Range<usize>, signed: bool, reserve: impl FnOnce() -> Result<()>,
+) -> Result<Option<ListValue>> {
+    use rtdb_types::ScalarList;
+    for row in range.clone() {
+        let cell = (crate::ArrowCell { field, array, row }).physical()?;
+        if cell.is_undefined()? || !cell.is_null()? && ScalarList::leaf_type(cell.field).is_none() { return Ok(None); }
+    }
+    reserve()?;
+    let mut legs = Vec::<ScalarListLeg<'_>>::new();
+    let mut rows = Vec::with_capacity(range.len());
+    let mut nulls = 0;
+    for row in range {
+        let cell = (crate::ArrowCell { field, array, row }).physical()?;
+        let raw_type = if cell.is_null()? { LogicalType::Null }
+            else { ScalarList::leaf_type(cell.field).expect("validated selected scalar") };
+        let ty = if signed { crate::execution_type(&raw_type) } else { raw_type.clone() };
+        let tag = legs.iter().position(|leg| leg.ty == ty).unwrap_or_else(|| {
+            legs.push(ScalarListLeg { ty: ty.clone(), inputs: Vec::new(), picks: Vec::new() });
+            legs.len() - 1
+        });
+        let leg = &mut legs[tag];
+        if ty == LogicalType::Null {
+            rows.push((tag, nulls));
+            nulls += 1;
+            continue;
+        }
+        let source = if let Some(source) = leg.inputs.iter().position(|(input, _)| std::ptr::eq(*input, cell.array)) {
+            source
+        } else {
+            let converted = if ty != raw_type {
+                let source = Arc::new(to_field("value", &raw_type)?);
+                let mut list = ListValue::from_numeric_arrow(source, make_array(cell.array.to_data())).ok_or_else(layout_error)?;
+                list.admit_signed();
+                Some(list.packed_column().expect("signed numeric child").1)
+            } else { None };
+            leg.inputs.push((cell.array, converted));
+            leg.inputs.len() - 1
+        };
+        rows.push((tag, leg.picks.len()));
+        leg.picks.push((source, cell.row));
+    }
+    let logical = LogicalType::join_all(legs.iter().map(|leg| &leg.ty));
+    let output = Arc::new(to_field("value", &logical)?);
+    let DataType::Union(fields, _) = output.data_type() else {
+        let Some(leg) = legs.iter().find(|leg| leg.ty != LogicalType::Null) else { return Ok(None); };
+        let inputs = leg.inputs.iter().map(|(input, converted)| converted.as_deref().unwrap_or(*input)).collect::<Vec<_>>();
+        let picks = rows.into_iter().map(|(tag, offset)| (legs[tag].ty != LogicalType::Null).then(|| leg.picks[offset]))
+            .collect::<Vec<_>>();
+        let array = crate::copy_nullable_cells(&inputs, &picks)?;
+        return Ok(if ListValue::supports_numeric_arrow(&output) {
+            ListValue::from_numeric_arrow(output, array)
+        } else {
+            ListValue::from_scalar_arrow(output, array)
+        });
+    };
+    let tags = rows.iter().map(|(tag, _)| i8::try_from(*tag).map_err(|_| layout_error())).collect::<Result<Vec<_>>>()?;
+    let offsets = rows.iter().map(|(_, offset)| i32::try_from(*offset).map_err(|_| layout_error())).collect::<Result<Vec<_>>>()?;
+    let children = legs.iter().map(|leg| {
+        if leg.ty == LogicalType::Null { return Ok(Arc::new(NullArray::new(nulls)) as ArrayRef); }
+        let inputs = leg.inputs.iter().map(|(input, converted)| converted.as_deref().unwrap_or(*input)).collect::<Vec<_>>();
+        crate::copy_selected_cells(&inputs, &leg.picks)
+    }).collect::<Result<Vec<_>>>()?;
+    let array = UnionArray::try_new(fields.clone(), tags.into(), Some(offsets.into()), children).map_err(super::arrow_error)?;
+    Ok(ListValue::from_scalar_arrow(output, Arc::new(array)))
 }
 
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
@@ -948,6 +1108,84 @@ mod tests {
         let Value::List(actual) = read_value(&field, &list, 1).unwrap() else { panic!("expected list"); };
         assert_eq!(actual.element_type(), expected.element_type());
         assert_eq!(actual.array().unwrap().to_data(), expected.array().unwrap().to_data());
+    }
+
+    #[test]
+    fn selected_numeric_runs_unpack_without_reading_other_union_legs() {
+        let fields = arrow_schema::UnionFields::try_new([3, 6, 2], [
+            Field::new("utf8", DataType::Utf8, false),
+            Field::new("u32", DataType::UInt32, true),
+            Field::new("f64", DataType::Float64, true),
+        ]).unwrap();
+        let child = UnionArray::try_new(fields, vec![3, 6, 2, 6].into(), Some(vec![0, 0, 0, 1].into()), vec![
+            Arc::new(StringArray::from(vec!["unused"])),
+            Arc::new(UInt32Array::from(vec![Some(u32::MAX), None])),
+            Arc::new(Float64Array::from(vec![-0.0])),
+        ]).unwrap();
+        let runs = RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 5, 7, 8]), &child).unwrap();
+        let item = Arc::new(Field::new("item", runs.data_type().clone(), false));
+        let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 3, 8].into()), Arc::new(runs), None).unwrap();
+        let field = Field::new("v", list.data_type().clone(), false);
+        let first = crate::ArrowCell { field: &field, array: &list, row: 0 };
+        assert!(first.numeric_list_span().is_none());
+        assert_eq!(first.numeric_list_span_range(2..3).unwrap().get(0), Some(rtdb_types::NumericCell::U32(u32::MAX)));
+
+        let expected = Value::list(vec![Value::U32(u32::MAX), Value::U32(u32::MAX), Value::F64(-0.0), Value::F64(-0.0), Value::Null]);
+        let decoded = read_value(&field, &list, 1).unwrap();
+        assert_eq!(decoded, expected);
+        let span = crate::ArrowCell { field: &field, array: &list, row: 1 }.numeric_list_span().unwrap();
+        assert!(matches!(span.get(2), Some(rtdb_types::NumericCell::F64(v)) if v.to_bits() == (-0.0_f64).to_bits()));
+        assert_eq!(span.get(4), Some(rtdb_types::NumericCell::Null));
+    }
+
+    #[test]
+    fn selected_keyword_and_null_legs_repack_to_the_logical_extension() {
+        let keyword = to_field("named-keyword", &LogicalType::Scalar(ScalarType::Keyword)).unwrap();
+        let fields = arrow_schema::UnionFields::try_new([2, 4, 7], [
+            keyword, Field::new("null", DataType::Null, true), Field::new("i32", DataType::Int32, false),
+        ]).unwrap();
+        let child = UnionArray::try_new(fields, vec![7, 2, 4, 2].into(), Some(vec![0, 1, 0, 0].into()), vec![
+            Arc::new(StringArray::from(vec!["a", "b"])), Arc::new(NullArray::new(1)), Arc::new(Int32Array::from(vec![3])),
+        ]).unwrap();
+        let item = Arc::new(Field::new("item", child.data_type().clone(), false));
+        let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 1, 4].into()), Arc::new(child), None).unwrap();
+        let field = Field::new("v", list.data_type().clone(), false);
+        let value = read_value(&field, &list, 1).unwrap();
+        let expected = Value::list(vec![Value::Keyword(rtdb_types::Keyword::from_name("b")), Value::Null,
+            Value::Keyword(rtdb_types::Keyword::from_name("a"))]);
+        assert_eq!(value, expected);
+        let Value::List(packed) = &value else { panic!("expected list"); };
+        let (child, _) = packed.packed_column().expect("expected Arrow child");
+        assert_eq!(child.metadata()[crate::EXTENSION_NAME_KEY], "xt/clj-keyword");
+        assert_eq!(copy_array(&expected.logical_type(), &[value]).unwrap().to_data(),
+            copy_array(&expected.logical_type(), &[expected]).unwrap().to_data());
+    }
+
+    #[test]
+    fn mixed_scalar_children_repack_to_the_observed_union_and_keep_execution_bits() {
+        let keyword = to_field("keyword", &LogicalType::Scalar(ScalarType::Keyword)).unwrap();
+        let fields = arrow_schema::UnionFields::try_new([2, 4, 7], [
+            keyword, Field::new("null", DataType::Null, true), Field::new("u32", DataType::UInt32, false),
+        ]).unwrap();
+        let child = UnionArray::try_new(fields, vec![7, 4, 2, 7].into(), Some(vec![0, 0, 0, 1].into()), vec![
+            Arc::new(StringArray::from(vec!["tag"])), Arc::new(NullArray::new(1)), Arc::new(UInt32Array::from(vec![u32::MAX, 4])),
+        ]).unwrap();
+        let item = Arc::new(Field::new("item", child.data_type().clone(), false));
+        let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 4].into()), Arc::new(child), None).unwrap();
+        let field = Field::new("v", list.data_type().clone(), false);
+        let keyword = Value::Keyword(rtdb_types::Keyword::from_name("tag"));
+        let expected = Value::list(vec![Value::U32(u32::MAX), Value::Null, keyword.clone(), Value::U32(4)]);
+        let logical = expected.logical_type();
+        let raw = read_value(&field, &list, 0).unwrap();
+        assert_eq!(raw, expected);
+        let Value::List(packed) = &raw else { panic!("expected list"); };
+        let (child, _) = packed.packed_column().expect("expected typed mixed children");
+        assert_eq!(from_field(&child).unwrap(), packed.element_type());
+        assert_eq!(copy_array(&logical, &[raw]).unwrap().to_data(), copy_array(&logical, &[expected]).unwrap().to_data());
+
+        let (field, array, range) = (crate::ArrowCell { field: &field, array: &list, row: 0 }).sequence_range().unwrap();
+        let executed = repack_scalar_list(field, array, range, true, || Ok(())).unwrap().unwrap();
+        assert_eq!(Value::List(executed), Value::list(vec![Value::I32(-1), Value::Null, keyword, Value::I32(4)]));
     }
 
     #[test]

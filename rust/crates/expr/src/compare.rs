@@ -77,11 +77,7 @@ impl<'a> NumericListInput<'a> {
             if a == NumericCell::Null || b == NumericCell::Null {
                 if strict && a != b { return Some(false); }
                 unknown |= !strict;
-            } else if numeric_category(a) != numeric_category(b) {
-                if strict || sql_eq_value(&a.into_value(), &b.into_value(), "UTC", None).expect("numeric equality") != Some(true) {
-                    return Some(false);
-                }
-            } else if !numeric_equal(a, b) {
+            } else if (strict && numeric_category(a) != numeric_category(b)) || !numeric_equal(a, b) {
                 return Some(false);
             }
         }
@@ -95,9 +91,6 @@ impl<'a> NumericListInput<'a> {
                 (NumericCell::Null, NumericCell::Null) => Ordering::Equal,
                 (NumericCell::Null, _) => null_order,
                 (_, NumericCell::Null) => null_order.reverse(),
-                (a, b) if numeric_category(a) != numeric_category(b) => {
-                    compare(&a.into_value(), &b.into_value(), nulls_first).expect("numeric ordering")
-                }
                 (a, b) => exact_number_order(a, b).unwrap_or_else(|| float_order(a.as_f64().unwrap(), b.as_f64().unwrap())),
             };
             if order != Ordering::Equal { return order; }
@@ -434,6 +427,26 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
 mod numeric_lists {
     use super::*;
     use rtdb_types::{DecimalValue, ListValue};
+
+    #[test]
+    fn cross_category_numeric_lists_follow_scalar_comparison_rules() {
+        let decimal = |n: i128, scale| Value::Decimal(DecimalValue::new(n.to_be_bytes().to_vec(), 32, scale, 128).unwrap());
+        let memory = rtdb_types::MemoryBudget::new(1 << 20);
+        let scope = EvaluationScope::new(&memory).unwrap();
+        for (left, right) in [
+            (decimal(9_007_199_254_740_993, 0), Value::I64(9_007_199_254_740_992)),
+            (decimal(9_007_199_254_740_993, 0), Value::F64(9_007_199_254_740_992.0)),
+            (decimal(-1, 400), Value::F32(-0.0)),
+            (Value::U64(u64::MAX), Value::F64(f64::NAN)),
+        ] {
+            let equal = sql_eq(&left, &right, &scope).unwrap();
+            let order = compare(&left, &right, false).unwrap();
+            let (left, right) = (Value::list(vec![left]), Value::list(vec![right]));
+            assert_eq!(sql_eq(&left, &right, &scope).unwrap(), equal);
+            assert_eq!(compare(&left, &right, false).unwrap(), order);
+            assert!(!strict_eq(&left, &right, &scope).unwrap());
+        }
+    }
 
     #[test]
     fn typed_comparison_preserves_exact_decimals_and_nulls() {

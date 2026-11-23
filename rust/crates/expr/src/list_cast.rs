@@ -117,7 +117,7 @@ pub(crate) fn scalar_target(target: &CastTarget) -> Option<Target<'_>> {
     }
 }
 
-fn cast_number(input: NumericCell, ty: &ScalarType, target: Target<'_>) -> Result<NumericCell> {
+pub(crate) fn cast_number(input: NumericCell, ty: &ScalarType, target: Target<'_>) -> Result<NumericCell> {
     use NumericCell as N;
     use ScalarType as S;
     let target = match target {

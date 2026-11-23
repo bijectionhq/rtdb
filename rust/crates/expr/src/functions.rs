@@ -237,18 +237,26 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             Ok(floating_value(x.abs(), &ty))
         }
         "mod" => crate::arithmetic(rtdb_plan::BinaryOp::Modulo, &args[0], &args[1]),
-        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh" | "double" | "asin" | "acos" | "atan" => {
-            let x = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
-            let y = args.get(1).map(|value| number(value).ok_or_else(|| inapplicable(&name, &[value]))).transpose()?;
-            let value = match name.as_str() {
-                "sqrt" => x.sqrt(), "exp" => x.exp(), "ln" => x.ln(),
-                "log10" => x.log10(), "sinh" => x.sinh(), "cosh" => x.cosh(), "tanh" => x.tanh(), "double" => x,
-                "log" => y.map_or_else(|| x.log10(), |y| y.log(x)), "power" => x.powf(y.ok_or_else(|| inapplicable(&name, &[]))?),
-                "sin" => x.sin(), "cos" => x.cos(), "tan" => x.tan(), "asin" => x.asin(), "acos" => x.acos(),
-                "atan" => x.atan(), _ => return Err(inapplicable(&name, &[])),
-            };
-            Ok(Value::F64(value))
+        name if is_float_math(name) => {
+            let x = number(&args[0]).ok_or_else(|| inapplicable(name, &[&args[0]]))?;
+            let y = args.get(1).map(|value| number(value).ok_or_else(|| inapplicable(name, &[value]))).transpose()?;
+            float_math(name, x, y).map(Value::F64)
         }
         _ => Err(Anomaly::unsupported("xtdb/unknown-function", format!("Unknown scalar function: {name}"))),
     }
+}
+
+pub(crate) fn is_float_math(name: &str) -> bool {
+    matches!(name, "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "sin" | "cos" | "tan"
+        | "sinh" | "cosh" | "tanh" | "double" | "asin" | "acos" | "atan")
+}
+
+pub(crate) fn float_math(name: &str, x: f64, y: Option<f64>) -> Result<f64> {
+    Ok(match name {
+        "sqrt" => x.sqrt(), "exp" => x.exp(), "ln" => x.ln(),
+        "log10" => x.log10(), "sinh" => x.sinh(), "cosh" => x.cosh(), "tanh" => x.tanh(), "double" => x,
+        "log" => y.map_or_else(|| x.log10(), |y| y.log(x)), "power" => x.powf(y.ok_or_else(|| inapplicable(name, &[]))?),
+        "sin" => x.sin(), "cos" => x.cos(), "tan" => x.tan(), "asin" => x.asin(), "acos" => x.acos(),
+        "atan" => x.atan(), _ => return Err(inapplicable(name, &[])),
+    })
 }

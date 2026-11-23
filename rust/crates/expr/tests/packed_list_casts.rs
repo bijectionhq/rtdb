@@ -96,8 +96,10 @@ fn packed_text_and_temporal_casts_match_scalar_cells_and_arrow_layout() {
         (V::list(vec![V::Utf8("2000-02-29".into()), V::Null]), CastTarget::Fixed(L::Scalar(S::DateDay))),
         (V::list(vec![V::F64(-0.25), V::Null]), CastTarget::Fixed(L::Scalar(S::Duration(TimeUnit::Millisecond)))),
     ] {
-        let expected = V::list(source.list_view().unwrap().iter()
+        let expected_scalar = V::list(source.list_view().unwrap().iter()
             .map(|value| rtdb_expr::cast_target(&value, &target, "UTC").unwrap()).collect());
+        let mut expected = expected_scalar.clone();
+        expected.admit_expression_dates().unwrap();
         let target = CastTarget::List(Box::new(target));
         let expr = Expr::Cast { expr: Box::new(Expr::Literal(source.clone())), target: target.clone() };
         let output = evaluate(&expr, &Schema::default(), &[], &EvalContext::default()).unwrap();
@@ -108,7 +110,10 @@ fn packed_text_and_temporal_casts_match_scalar_cells_and_arrow_layout() {
         let expected = rtdb_columnar::copy_array(&ty, &[V::Null, expected]).unwrap();
         assert_eq!(actual.to_data(), expected.to_data());
         let direct = rtdb_expr::cast_target(&source, &target, "UTC").unwrap();
-        assert!(matches!(direct.list_view(), Some(rtdb_types::ListView::Scalars(_))));
+        assert_eq!(direct, expected_scalar);
+        if !direct.has_calendar_object() {
+            assert!(matches!(direct.list_view(), Some(rtdb_types::ListView::Scalars(_))));
+        }
     }
 }
 
@@ -141,4 +146,44 @@ async fn list_cursor_emits_packed_cast_pages_before_later_element_errors() {
     assert_eq!(first.values().iter().map(std::borrow::Cow::into_owned).collect::<Vec<_>>(), [V::DateDay(11016), V::Null]);
     let error = pages.next_batch().await.err().expect("later page contains an invalid date");
     assert_eq!(error.code, "xtdb.expression/invalid-temporal-string");
+}
+
+#[test]
+fn mixed_text_and_numeric_casts_write_one_typed_child() {
+    let inputs = [V::Utf8("12".into()), V::Null, V::I64(-23), V::F32(4.75)];
+    let source = V::list(inputs.to_vec());
+    for ty in [S::I16, S::F64, S::Utf8] {
+        let element = CastTarget::Fixed(L::Scalar(ty));
+        let expected = V::list(inputs.iter().map(|value| rtdb_expr::cast_target(value, &element, "UTC").unwrap()).collect());
+        let expr = Expr::Cast { expr: Box::new(Expr::Literal(source.clone())), target: CastTarget::List(Box::new(element)) };
+        let output = evaluate(&expr, &Schema::default(), &[], &EvalContext::default()).unwrap();
+        let V::List(list) = &output else { panic!("expected list"); };
+        assert!(list.packed_column().is_some());
+        assert_eq!(output, expected);
+    }
+}
+
+#[test]
+fn time_list_cast_uses_the_query_clock_and_keeps_the_result_in_arrow() {
+    use rtdb_plan::{CastTimezone, TemporalCast, TemporalKind};
+    use rtdb_types::{Instant, TimeUnit};
+    let input = [
+        V::Time { value: 9_000_123, unit: TimeUnit::Millisecond, bit_width: 32 },
+        V::Null,
+        V::DateDay(0),
+        V::Utf8("2024-03-09 09:44:23-05:00".into()),
+    ];
+    let target = CastTarget::Temporal(TemporalCast {
+        kind: TemporalKind::TimestampZone(CastTimezone::Session), unit: TimeUnit::Microsecond, precision: Some(4),
+    });
+    let context = EvalContext {
+        timezone: "America/New_York", current_time: Instant::new(1_710_045_000, 0).unwrap(), ..EvalContext::default()
+    };
+    let schema = Schema::default();
+    let scalar = |value| Expr::Cast { expr: Box::new(Expr::Literal(value)), target: target.clone() };
+    let expected = V::list(input.iter().cloned().map(|value| evaluate(&scalar(value), &schema, &[], &context).unwrap()).collect());
+    let list = Expr::Cast { expr: Box::new(Expr::Literal(V::list(input.to_vec()))), target: CastTarget::List(Box::new(target)) };
+    let output = evaluate(&list, &schema, &[], &context).unwrap();
+    assert!(matches!(output.list_view(), Some(rtdb_types::ListView::Scalars(_))));
+    assert_eq!(output, expected);
 }
