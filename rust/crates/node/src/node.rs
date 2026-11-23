@@ -1237,6 +1237,11 @@ pub struct OwnedReadSession {
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
+pub struct HeldSpatialNearest {
+    held_context: std::sync::Weak<QueryContext>,
+    ranking: rtdb_spatial::PreparedNearest,
+}
+
 pub struct OwnedReplayWorld {
     pub world: rtdb_types::OwnedWorld,
     pub source_cut: Timestamp,
@@ -2134,6 +2139,16 @@ impl OwnedReadSession {
         self.range_page(&relation.in_world(world)?, path, crate::ordered_index::RowBounds::Compound(request), Some(valid)).await
     }
 
+    pub async fn spatial_path_ready(&self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation) -> Result<bool> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let work = rtdb_spatial::path_ready(Arc::clone(&context), &self.owner, relation, path);
+        let ready = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        self.check_relation(relation)?;
+        Ok(ready)
+    }
+
     /// Evaluates a spatial path at this held cut.
     pub async fn spatial(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
@@ -2166,6 +2181,43 @@ impl OwnedReadSession {
             }
         };
         let page = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((page, witness))
+    }
+
+    pub async fn open_spatial_nearest(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
+    ) -> Result<(HeldSpatialNearest, rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let limit = request.limit;
+        let work = async {
+            let ranking = rtdb_spatial::PreparedNearest::prepare(Arc::clone(&context), &self.owner, relation, path, request).await?;
+            let page = ranking.page(Arc::clone(&context), &self.owner, None, limit, projection).await?;
+            Ok::<_, Anomaly>((ranking, page))
+        };
+        let (ranking, page) = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((HeldSpatialNearest { held_context: Arc::downgrade(&self.context), ranking }, page, witness))
+    }
+
+    pub async fn next_spatial_nearest(
+        &self, held: &HeldSpatialNearest, after: rtdb_spatial::NearestPosition<'_>,
+        limit: usize, observe: bool, projection: rtdb_spatial::Projection<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        if !held.held_context.upgrade().is_some_and(|original| Arc::ptr_eq(&original, &self.context)) {
+            return Err(Anomaly::incorrect("rtdb.owned/spatial-hold", "Spatial ranking belongs to another read"));
+        }
+        self.admit_read().await?;
+        let relation = held.ranking.relation();
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let work = held.ranking.page(Arc::clone(&context), &self.owner, Some(after), limit, projection);
+        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))

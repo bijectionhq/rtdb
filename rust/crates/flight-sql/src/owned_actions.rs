@@ -16,7 +16,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_array, entity_id_type, read_entity_id, selected_cell};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::{HeldSpatialNearest, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedRelativePeriod, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -41,14 +41,27 @@ pub(crate) const SPATIAL_HELD_OWNED_V2: &str = "rtdb.owned.SpatialHeld.v2";
 pub(crate) const SPATIAL_OPEN_OWNED: &str = "rtdb.owned.SpatialOpen.v1";
 pub(crate) const SPATIAL_NEXT_OWNED: &str = "rtdb.owned.SpatialNext.v1";
 pub(crate) const SPATIAL_CLOSE_OWNED: &str = "rtdb.owned.SpatialClose.v1";
+pub(crate) const SPATIAL_RANK_OPEN_OWNED: &str = "rtdb.owned.SpatialRankOpen.v1";
+pub(crate) const SPATIAL_RANK_NEXT_OWNED: &str = "rtdb.owned.SpatialRankNext.v1";
 const SPATIAL_FILTER_TOKEN: &str = "rtdb.owned.spatial_filter";
 const MAX_SPATIAL_FILTERS: usize = 32;
 pub(crate) const SPATIAL_HELD_OWNED_V3: &str = "rtdb.owned.SpatialHeld.v3";
 
 #[derive(Clone, Copy)]
-pub(crate) enum SpatialHeldWire { V1, V2, V3, Open }
+pub(crate) enum SpatialHeldWire { V1, V2, V3, Open, RankOpen }
 pub(crate) const DROP_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DropSpatialPath.v1";
+pub(crate) const DROP_OWNED_SPATIAL_PATH_V2: &str = "rtdb.owned.DropSpatialPath.v2";
 pub(crate) const DECLARE_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DeclareSpatialPath.v1";
+pub(crate) const DECLARE_OWNED_SPATIAL_PATH_V2: &str = "rtdb.owned.DeclareSpatialPath.v2";
+pub(crate) const OWNED_SPATIAL_READINESS_V1: &str = "rtdb.owned.SpatialPathReadiness.v1";
+
+#[derive(Clone, Copy)]
+pub(crate) enum PathDeclarationWire {
+    Ordered,
+    TaggedSpatial,
+    EncodedSpatial,
+}
+
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
@@ -306,11 +319,15 @@ pub(crate) struct OwnedReadResource {
 
 struct RetainedSpatialFilter {
     relation: OwnedRelation,
-    path: OwnedRelation,
     batch: OwnedBatch,
-    region: rtdb_spatial::PreparedRegion,
+    query: RetainedSpatialQuery,
     valid_at: Timestamp,
     _reservation: Arc<MemoryReservation>,
+}
+
+enum RetainedSpatialQuery {
+    Range { path: OwnedRelation, region: rtdb_spatial::PreparedRegion },
+    Nearest(HeldSpatialNearest),
 }
 
 struct RetainedRangeWitness {
@@ -700,29 +717,58 @@ impl Service {
         self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }]).await
     }
 
-    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &Bytes, spatial: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn drop_owned_spatial_path_batch_action(
+        &self, call: &Call, body: Bytes,
+    ) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let batch = decode_retained_batch(call, body)?;
+        let batch = batch.batch();
+        if batch.num_rows() != 1 || batch.num_columns() != 2 {
+            return Err(invalid("Owned spatial path removal requires one row with relation and name"));
+        }
+        let text = |field| ArrowCell::named(batch, field, 0).and_then(ArrowCell::utf8)
+            .ok_or_else(|| invalid("Owned spatial path removal requires a text relation and name"));
+        let relation = OwnedRelation::new(text("relation")?).map_err(status)?;
+        let name = OwnedRelation::new(text("name")?).map_err(status)?;
+        self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }]).await
+    }
+
+    pub(crate) async fn declare_owned_path_action(
+        &self, call: &Call, body: &Bytes, wire: PathDeclarationWire,
+    ) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = decode_retained_batch(call, body.slice_ref(arrow))?;
         let batch = batch.batch();
-        if batch.num_rows() != 1 || batch.num_columns() != 2 {
-            return Err(invalid("Owned path declaration requires one row with _id and columns"));
+        let encoded = matches!(wire, PathDeclarationWire::EncodedSpatial);
+        if batch.num_rows() != 1 || batch.num_columns() != 2 + usize::from(encoded) {
+            return Err(invalid("Owned path declaration has an invalid Arrow layout"));
         }
         let name = ArrowCell::named(batch, "_id", 0).and_then(ArrowCell::utf8)
             .ok_or_else(|| invalid("Owned path declaration requires a text name"))?;
         let name = OwnedRelation::new(name).map_err(status)?;
         let columns = ArrowCell::named(batch, "columns", 0).and_then(ArrowCell::list)
-            .filter(|columns| columns.len() <= 16)
-            .ok_or_else(|| invalid("Owned path declaration requires a bounded text column list"))?;
-        let columns = columns.map(|column| column.utf8()
-            .ok_or_else(|| invalid("Owned path key column is not text"))).collect::<Result<Vec<_>, _>>()?;
-        let bytes = columns.iter().try_fold(1024, |bytes, column| wire::add(bytes, wire::add(column.len(), 128)?))?;
-        let _charge = call.reserve(bytes)?;
-        let columns = columns.into_iter().map(str::to_owned).collect();
-        let declaration = if spatial {
-            TxOp::OwnedDeclareSpatialPath { relation, name, columns }
-        } else {
-            TxOp::OwnedDeclarePath { relation, name, columns }
+            .ok_or_else(|| invalid("Owned path declaration requires a text column list"))?;
+        if columns.len() > 16 {
+            return Err(invalid("Owned path declaration exceeds its column limit"));
+        }
+        let names = columns.map(|cell| cell.utf8()
+            .ok_or_else(|| invalid("Owned path key column is not text")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = names.iter().try_fold(1024, |bytes, name| wire::add(bytes, wire::add(name.len(), 128)?))?;
+        let _retained = call.reserve(bytes)?;
+        let columns = names.into_iter().map(str::to_owned).collect();
+        let declaration = match wire {
+            PathDeclarationWire::Ordered => TxOp::OwnedDeclarePath { relation, name, columns },
+            PathDeclarationWire::TaggedSpatial => TxOp::OwnedDeclareSpatialPath { relation, name, columns },
+            PathDeclarationWire::EncodedSpatial => {
+                let encoding = ArrowCell::named(batch, "geometry_encoding", 0).and_then(ArrowCell::utf8)
+                    .ok_or_else(|| invalid("Owned spatial path requires a text geometry encoding"))?;
+                TxOp::OwnedDeclareEncodedSpatialPath {
+                    relation, name, columns,
+                    encoding: rtdb_types::SpatialGeometryEncoding::parse(encoding).map_err(status)?,
+                }
+            }
         };
         self.owned_write_reply(call, vec![declaration]).await
     }
@@ -780,7 +826,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = require_identity(decode_retained_batch(call, body.slice_ref(arrow))?)?;
-        if relation.is_root_data() && batch.batch().column_by_name("_ordered_micros").is_none() {
+        if relation.is_root_data() {
             if batch.batch().column_by_name("_absent").is_none() {
                 if let Some(documents) = ArrowDocuments::from_owned_payload(&batch, self.memory()).map_err(status)? {
                     return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs {
@@ -1159,7 +1205,6 @@ impl Service {
             "_op", "_read_valid_micros", "_read_system_micros", "_valid_from", "_valid_to",
             "_valid_from_offset_micros", "_valid_to_offset_micros",
         ];
-        if source.column_by_name("_ordered_micros").is_some() { return Ok(false); }
         let positions = owned_payload_columns(source, row, &controls)?;
         let cell = |name| ArrowCell::named(source, name, row);
         let id = {
@@ -1171,6 +1216,25 @@ impl Service {
             Ok(id.into_owned())
         };
         let operation = cell("_op").and_then(ArrowCell::utf8).ok_or_else(|| invalid("Owned commit _op must be Utf8"))?;
+        if operation == "require-spatial-path" && matches!(effects, CommitEffects::HostedRoot) {
+            let EntityIdRef::String(name) = id else { return Err(invalid("Spatial readiness needs a path name")); };
+            if source.num_columns() != 4 { return Err(invalid("Invalid spatial readiness condition")); }
+            let columns = cell("columns").and_then(ArrowCell::list)
+                .filter(|columns| (1..=16).contains(&columns.len()))
+                .ok_or_else(|| invalid("Spatial readiness requires a bounded column list"))?;
+            let columns = columns.map(|column| column.utf8().ok_or_else(|| invalid("Spatial readiness column is not text")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let bytes = columns.iter().try_fold(name.len() + 1024, |bytes, column| wire::add(bytes, column.len() + 64))?;
+            charge.grow_to(wire::add(charge.bytes(), bytes)?).map_err(status)?;
+            let encoding = cell("geometry_encoding").and_then(ArrowCell::utf8)
+                .ok_or_else(|| invalid("Spatial readiness needs a geometry encoding"))?;
+            writes.push(TxOp::OwnedRequireSpatialPath {
+                relation: relation.clone(), name: OwnedRelation::new(name).map_err(status)?,
+                columns: columns.into_iter().map(str::to_owned).collect(),
+                encoding: rtdb_types::SpatialGeometryEncoding::parse(encoding).map_err(status)?,
+            });
+            return Ok(true);
+        }
         let optional = |name| cell(name).map(optional_bound).transpose().map(Option::flatten);
         let signed = |name| -> Result<Option<Timestamp>, Status> {
             optional(name)?.map(|cell| cell.int64().map(Timestamp)
@@ -2256,6 +2320,28 @@ impl Service {
         Ok(reply)
     }
 
+    pub(crate) async fn spatial_path_readiness_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Spatial path readiness has no held handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        let request = decode_retained_batch(call, body.slice_ref(request))?;
+        let request = request.batch();
+        if request.num_rows() != 1 || request.num_columns() != 2 {
+            return Err(invalid("Spatial path readiness requires one row"));
+        }
+        let name = |field| ArrowCell::named(request, field, 0).and_then(ArrowCell::utf8)
+            .ok_or_else(|| invalid("Spatial path readiness requires a text relation and name"));
+        let relation = OwnedRelation::new(name("relation")?).map_err(status)?;
+        let path = OwnedRelation::new(name("name")?).map_err(status)?;
+        let ready = held.snapshot.spatial_path_ready(&relation, &path).await.map_err(status)?;
+        let batch = RecordBatch::try_from_iter([("ready", Arc::new(BooleanArray::from(vec![ready])) as ArrayRef)])
+            .map_err(arrow)?;
+        let present = held.snapshot.system_time();
+        self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)
+    }
+
     pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held spatial read has no handle"))?;
@@ -2264,8 +2350,8 @@ impl Service {
         let (relation, request) = split_relation(request)?;
         let (path, request) = split_relation(request)?;
         let batch = decode_retained_batch(call, body.slice_ref(request))?;
-        let selected_documents = matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open);
-        let expected_columns = if selected_documents { 10 } else { 9 };
+        let selected_documents = matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::RankOpen);
+        let expected_columns = 9 + usize::from(selected_documents);
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_columns {
             return Err(invalid("Owned held spatial read requires one request row"));
         }
@@ -2274,7 +2360,7 @@ impl Service {
         let projection = match wire {
             SpatialHeldWire::V1 => rtdb_spatial::Projection::Identities,
             SpatialHeldWire::V2 => rtdb_spatial::Projection::Documents,
-            SpatialHeldWire::V3 | SpatialHeldWire::Open => {
+            SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::RankOpen => {
                 document_columns = spatial_document_columns(input)?;
                 rtdb_spatial::Projection::SelectedDocuments(&document_columns)
             }
@@ -2296,18 +2382,32 @@ impl Service {
                 .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose()?,
             None => None,
         };
+        use rtdb_spatial::{PageOrder, Predicate};
+        let page = if matches!(predicate, Predicate::Nearest { .. }) {
+            if after.is_some() { return Err(invalid("Nearest continuation requires a held ranking")); }
+            PageOrder::NearestOnce
+        } else {
+            PageOrder::Identity { after }
+        };
         let valid_at = Timestamp(valid_at.value(valid_row));
         let limit = usize::try_from(limit.value(limit_row)).map_err(|_| invalid("Invalid spatial limit"))?;
         let observe = observe.value(observe_row);
-        let prepared = if matches!(wire, SpatialHeldWire::Open) {
-            held.snapshot.check_relation(&relation).map_err(status)?;
-            Some(rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?)
+        let request = rtdb_spatial::Request { partition, region: region.into(), predicate, valid_at, page, limit };
+        let (page, witness, prepared) = if matches!(wire, SpatialHeldWire::RankOpen) {
+            let (ranking, page, witness) = held.snapshot.open_spatial_nearest(&relation, &path, request, observe, projection)
+                .await.map_err(status)?;
+            (page, witness, Some(RetainedSpatialQuery::Nearest(ranking)))
         } else {
-            None
+            let prepared = if matches!(wire, SpatialHeldWire::Open) {
+                held.snapshot.check_relation(&relation).map_err(status)?;
+                Some(rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?)
+            } else {
+                None
+            };
+            let (page, witness) = held.snapshot.spatial_page(&relation, &path, request, observe, projection, prepared.as_ref())
+                .await.map_err(status)?;
+            (page, witness, prepared.map(|region| RetainedSpatialQuery::Range { path, region }))
         };
-        let (page, witness) = held.snapshot.spatial_page(&relation, &path, rtdb_spatial::Request {
-            partition, region: region.into(), predicate, valid_at, after, limit,
-        }, observe, projection, prepared.as_ref()).await.map_err(status)?;
         let mut retained = None;
         let mut token = None;
         if prepared.is_some() && page.more {
@@ -2319,33 +2419,47 @@ impl Service {
             token = Some(nonce);
         }
         let reply = self.spatial_reply(call, &held, &relation, valid_at, page, witness, selected_documents, token)?;
-        if let (Some((mut filters, reservation)), Some(token), Some(region)) = (retained, token, prepared) {
+        if let (Some((mut filters, reservation)), Some(token), Some(query)) = (retained, token, prepared) {
             filters.insert(token, Arc::new(RetainedSpatialFilter {
-                relation, path, batch, region, valid_at, _reservation: reservation,
+                relation, batch, query, valid_at, _reservation: reservation,
             }));
         }
         Ok(reply)
     }
 
-    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8], ranked: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (held, token, body) = self.spatial_capability(call, body)?;
         let (header, after) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Spatial continuation has no page controls"))?;
         let limit = usize::from(header[0]);
         let observe = match header[1] { 0 => false, 1 => true, _ => return Err(invalid("Invalid spatial continuation observation flag")) };
+        let (distance, after) = if ranked {
+            let (distance, after) = after.split_first_chunk::<8>()
+                .ok_or_else(|| invalid("Ranked spatial continuation has no distance"))?;
+            (Some(f64::from_be_bytes(*distance)), after)
+        } else {
+            (None, after)
+        };
         let after = EntityIdRef::from_handle_bytes(after).map_err(status)?;
         let filter = held.spatial_filters.lock().map_err(|_| spatial_filters_unavailable())?
             .get(&token).cloned().ok_or_else(|| Status::not_found("Unknown held spatial filter"))?;
         let columns = spatial_document_columns(filter.batch.batch())?;
-        let request = rtdb_spatial::Request {
-            partition: spatial_partition(filter.batch.batch())?,
-            region: Default::default(), predicate: rtdb_spatial::Predicate::All,
-            valid_at: filter.valid_at, after: Some(after), limit,
-        };
-        let (page, witness) = held.snapshot.spatial_page(
-            &filter.relation, &filter.path, request, observe,
-            rtdb_spatial::Projection::SelectedDocuments(&columns), Some(&filter.region),
-        ).await.map_err(status)?;
+        let projection = rtdb_spatial::Projection::SelectedDocuments(&columns);
+        let (page, witness) = match (&filter.query, distance) {
+            (RetainedSpatialQuery::Range { path, region }, None) => {
+                let request = rtdb_spatial::Request {
+                    partition: spatial_partition(filter.batch.batch())?,
+                    region: Default::default(), predicate: rtdb_spatial::Predicate::All,
+                    valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
+                };
+                held.snapshot.spatial_page(&filter.relation, path, request, observe, projection, Some(region)).await
+            }
+            (RetainedSpatialQuery::Nearest(ranking), Some(distance_m)) => {
+                held.snapshot.next_spatial_nearest(ranking, rtdb_spatial::NearestPosition { distance_m, id: after },
+                    limit, observe, projection).await
+            }
+            _ => return Err(invalid("Spatial continuation uses another query order")),
+        }.map_err(status)?;
         self.spatial_reply(call, &held, &filter.relation, filter.valid_at, page, witness, true, Some(token))
     }
 
@@ -2376,6 +2490,9 @@ impl Service {
         if let Some(token) = token.filter(|_| page.more) {
             metadata.insert(SPATIAL_FILTER_TOKEN.into(), token.simple().to_string());
         }
+        if let Some(distance) = page.next_distance_m {
+            metadata.insert("rtdb.owned.spatial_next_distance_m".into(), distance.to_string());
+        }
         if let Some(witness) = witness {
             let nonce = held.remember(call, relation, witness)?;
             metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
@@ -2395,7 +2512,7 @@ impl Service {
         }
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         let mut charge = None;
-        let output = if let Some(rows) = page.rows() {
+        let output = if let Some(rows) = page.rows().filter(|rows| rows.batch().num_rows() != 0) {
             let batch = rows.batch();
             let (source, target) = (batch.schema_ref().field(0), schema.field(0));
             let array = batch.column(0);
@@ -2416,7 +2533,7 @@ impl Service {
                     entity_id_array(ids).map_err(status)?
                 }
             };
-            let distances = Arc::new(Float64Array::from_iter(page.hits.iter().map(|hit| hit.distance_m)));
+            let distances = Arc::new(page.distance_column());
             let mut columns = vec![ids, distances];
             if let Some(document) = document {
                 columns.push(Arc::new(document));

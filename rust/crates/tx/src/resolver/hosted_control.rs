@@ -40,6 +40,7 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedCheckRange { .. }
                         | TxOp::OwnedCheckCapacity { .. }
                         | TxOp::OwnedDeclareCapacity { .. }
+                        | TxOp::OwnedRequireSpatialPath { .. }
                         | TxOp::OwnedInsertDocs { .. }
                         | TxOp::OwnedReplaceDocs { .. }
                         | TxOp::OwnedArrowDocs { .. }

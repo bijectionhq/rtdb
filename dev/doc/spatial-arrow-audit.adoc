@@ -9,13 +9,19 @@ This inventory follows the native geospatial path from Bijection's clear Root in
 | Bijection write admission
 | The admission check serialized admitted geometry to WKB and discarded the bytes.
 | Admission checks the geometry model.
-The writer appends WKB into the location carrier after its tag and optional position accuracy.
+New paths index the canonical Binary document field directly.
+Existing declarations keep their original tagged WKB carrier.
 
 | Bijection spatial pagination
 | Every page encoded the same query geometry and canonical scalar partition values and rebuilt Arrow filters.
 | The first page sends the Arrow filter and the held read retains the parsed region.
 Continuation actions carry the filter capability, complete identity, bound, and observation flag.
 Older wire versions accept their original stateless Arrow requests.
+
+| Held nearest pagination
+| Every ranked continuation reopened candidate pages and refined the same geometries.
+| A held capability retains complete keys, physical IIDs and exact distances in Arrow.
+Each page gathers only its selected documents at the original held cut.
 
 | Spatial Flight request decode
 | The stream reader copied each message body into a new allocation after Flight had already received it.
@@ -58,6 +64,12 @@ The projected reply carries the identity once and associates the document by its
 | Bijection held reply decode
 | Message decoding copied the returned IPC body, and document identity checks and pagination re-encoded the received addresses.
 | The decoder consumes the owned reply buffer, and the spatial page validates and reuses the original canonical address text.
+
+| Bijection spatial row filtering
+| A held result was rebuilt as a fact image and then as a complete document before filters or staged effects could reject it.
+| Bijection measures the logical charge directly from the canonical Arrow cells and decodes only the fields each filter reaches.
+The application result materializes after the row is selected.
+
 | Clear Root geometry writes
 | Create and commit converted geometry and partition columns to document maps before rebuilding the source Arrow vectors.
 | Compatible payload columns pass from the upload through source IPC and ordered resolution into the Arrow event batch.

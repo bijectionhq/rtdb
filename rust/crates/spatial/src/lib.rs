@@ -1,12 +1,16 @@
+mod bijection_geometry;
 mod definition;
 mod kernel;
 mod lane;
+mod nearest;
 mod postings;
 mod read;
 
+pub use definition::path_geometry_encoding;
 pub use kernel::{Classification, Predicate};
 pub use lane::SpatialArtefacts;
-pub use read::{Hit, Page, PreparedRegion, Request, read_held, read_prepared};
+pub use nearest::PreparedNearest;
+pub use read::{Hit, NearestPosition, Page, PageOrder, PreparedRegion, Request, path_ready, read_held, read_prepared, require_path_ready};
 pub use rtdb_query::OwnedSpatialProjection as Projection;
 
 #[cfg(test)]

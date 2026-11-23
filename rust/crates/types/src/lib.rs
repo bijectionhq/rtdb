@@ -80,3 +80,6 @@ pub use duration_text::{DurationLiteral, format_iso_duration};
 
 mod fixed_range;
 pub use fixed_range::{FixedRangeEvidence, FixedRangeKey, FixedRangeRule, FIXED_RANGE_COMPONENT_BYTES, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS};
+
+mod spatial_geometry;
+pub use spatial_geometry::SpatialGeometryEncoding;

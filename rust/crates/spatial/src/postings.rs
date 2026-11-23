@@ -78,8 +78,10 @@ pub(crate) fn event_keys(
     let partition = Partition::from_event(event, definition)?;
     let keys = match event_binary(event, &definition.geometry)? {
         Some(binary) => work.scoped(|work| {
-            let location = Location::decode(binary, work)?;
-            location.keys(work)
+            match Location::decode_stored(binary, definition.encoding, work)? {
+                Some(location) => location.keys(work),
+                None => Ok(vec![i64::MIN]),
+            }
         })?,
         None => vec![i64::MIN],
     };

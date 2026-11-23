@@ -34,8 +34,11 @@ impl Service {
                 crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::DECLARE_OWNED_RELATION_V1 => Ok(vec![Ok(self.declare_owned_relation_action(&call, &action.body).await?)]),
                 crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.drop_owned_spatial_path_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V2 => Ok(vec![Ok(self.drop_owned_spatial_path_batch_action(&call, action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::TaggedSpatial).await?)]),
+                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V2 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::EncodedSpatial).await?)]),
+                crate::owned_actions::OWNED_SPATIAL_READINESS_V1 => Ok(vec![Ok(self.spatial_path_readiness_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered).await?)]),
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_COUNTED_V2 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
@@ -55,7 +58,11 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SPATIAL_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::Open).await?)]),
-                crate::owned_actions::SPATIAL_NEXT_OWNED => Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
+                    let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
+                    Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body, ranked).await?)])
+                }
+                crate::owned_actions::SPATIAL_RANK_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::RankOpen).await?)]),
                 crate::owned_actions::SPATIAL_CLOSE_OWNED => {
                     self.close_spatial_owned_action(&call, &action.body)?;
                     Ok(Vec::new())

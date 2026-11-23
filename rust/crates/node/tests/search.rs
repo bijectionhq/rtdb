@@ -305,7 +305,7 @@ fn spatial_point(x: f64, y: f64) -> Vec<u8> {
 
 #[tokio::test]
 async fn held_spatial_reads_resolve_moved_rows_and_replaced_generations_across_compaction() {
-    use rtdb_spatial::{Predicate, Request};
+    use rtdb_spatial::{PageOrder, Predicate, Request};
     use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, StructFields};
     let mut options = options();
     options.owned_relations = true;
@@ -322,7 +322,7 @@ async fn held_spatial_reads_resolve_moved_rows_and_replaced_generations_across_c
     };
     let request = |after, limit| Request {
         partition: vec![vec![1].into()], region: spatial_point(179.999, 0.0).into(), predicate: Predicate::WithinDistance(500.0),
-        valid_at: Timestamp(25), after, limit,
+        valid_at: Timestamp(25), page: PageOrder::Identity { after }, limit,
     };
     let document = |id: EntityId, tenant, x| StructFields::from([
         ("_id".into(), id.as_value()), ("tenant".into(), Value::Binary(vec![tenant])),
@@ -400,7 +400,7 @@ async fn held_spatial_reads_resolve_moved_rows_and_replaced_generations_across_c
 
 #[tokio::test]
 async fn unindexed_spatial_reads_decode_only_geometry_visible_at_the_held_cut() {
-    use rtdb_spatial::{Predicate, Request};
+    use rtdb_spatial::{PageOrder, Predicate, Request};
     use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, StructFields};
 
     let mut options = options();
@@ -435,7 +435,7 @@ async fn unindexed_spatial_reads_decode_only_geometry_visible_at_the_held_cut() 
     let held = session.open_owned_read().await.unwrap();
     let request = |valid_at| Request {
         partition: vec![], region: spatial_point(1.0, 2.0).into(), predicate: Predicate::WithinDistance(1.0),
-        valid_at: Timestamp(valid_at), after: None, limit: 2,
+        valid_at: Timestamp(valid_at), page: PageOrder::Identity { after: None }, limit: 2,
     };
     let (recent, _) = held.spatial(&relation, &path, request(25), false).await.unwrap();
     assert_eq!(recent.hits.len(), 1);
@@ -443,6 +443,85 @@ async fn unindexed_spatial_reads_decode_only_geometry_visible_at_the_held_cut() 
     let error = held.spatial(&relation, &path, request(5), false).await.err().unwrap();
     assert_eq!(error.code, "rtdb.spatial/invalid");
     drop(held);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn spatial_path_backfills_original_values_across_live_writes() {
+    use rtdb_spatial::{PageOrder, Predicate, Request};
+    use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, SpatialGeometryEncoding, StructFields};
+
+    fn canonical_point(x: f64, y: f64) -> Vec<u8> {
+        let mut bytes = b"\x0dcoordinates\0\x01\x0c".to_vec();
+        for value in [x, y] {
+            let bits = value.to_bits();
+            let ordered = if bits < (1 << 63) { bits ^ (1 << 63) } else { !bits };
+            bytes.push(5);
+            bytes.extend(ordered.to_be_bytes());
+        }
+        bytes.extend(b"\0\0type\0\x01\x09Point\0\x01\0\0");
+        bytes
+    }
+
+    let mut options = options();
+    options.owned_relations = true;
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("original-places").unwrap();
+    let path = OwnedRelation::new("by-location").unwrap();
+    let schema = OwnedSchema::from_json(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#).unwrap();
+    let document = |id, x| rtdb_tx::Documents::new(vec![StructFields::from([
+        ("_id".into(), Value::I64(id)), ("location".into(), Value::Binary(canonical_point(x, 0.0))),
+    ])], node.memory()).unwrap();
+    let opts = AutonomousTxOptions::default;
+    let original = session.state_mut().execute_tx(vec![
+        TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+        TxOp::OwnedInsertDocs {
+            relation: relation.clone(), documents: document(1, -1.0),
+            valid_from: Some(Timestamp(0)), valid_to: None,
+        },
+    ], opts()).await.unwrap();
+    assert!(original.committed(), "{:?}", original.error());
+    let db = node.catalog().database("xtdb").unwrap();
+    db.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    db.compaction().unwrap().compact_all().await.unwrap();
+    let before = session.open_owned_read().await.unwrap();
+
+    let declaration = TxOp::OwnedDeclareEncodedSpatialPath {
+        relation: relation.clone(), name: path.clone(), columns: vec!["location".into()],
+        encoding: SpatialGeometryEncoding::BijectionGeometry,
+    };
+    let result = session.state_mut().execute_tx(vec![declaration], opts()).await.unwrap();
+    assert!(result.committed(), "{:?}", result.error());
+    assert!(before.spatial_path_ready(&relation, &path).await.is_err());
+    let pending = session.open_owned_read().await.unwrap();
+    assert!(!pending.spatial_path_ready(&relation, &path).await.unwrap());
+    let concurrent = session.state_mut().execute_tx(vec![TxOp::OwnedInsertDocs {
+        relation: relation.clone(), documents: document(2, -1.0),
+        valid_from: Some(Timestamp(0)), valid_to: None,
+    }], opts()).await.unwrap();
+    assert!(concurrent.committed(), "{:?}", concurrent.error());
+    db.build_artefacts().await.unwrap();
+
+    let latest = session.open_owned_read().await.unwrap();
+    assert!(latest.spatial_path_ready(&relation, &path).await.unwrap());
+    let request = Request {
+        partition: vec![], region: spatial_point(-1.0, 0.0).into(), predicate: Predicate::WithinDistance(25.0),
+        valid_at: Timestamp(25), page: PageOrder::Identity { after: None }, limit: 8,
+    };
+    let (page, _) = latest.spatial_projected(&relation, &path, request, false, rtdb_spatial::Projection::Documents).await.unwrap();
+    assert_eq!(page.hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(), [EntityId::Integer(1), EntityId::Integer(2)]);
+    let documents = page.documents().unwrap().batch();
+    let revisions = documents.column_by_name("_system_from").unwrap().as_any()
+        .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+    assert_eq!([revisions.value(0), revisions.value(1)], [original.tx_key().system_time.0, concurrent.tx_key().system_time.0]);
+    assert!(!pending.spatial_path_ready(&relation, &path).await.unwrap());
+    drop((before, pending, latest));
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

@@ -1,16 +1,17 @@
 use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
 
-use arrow_array::RecordBatch;
+use arrow_array::{Float64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use geometry::{GeometryWork, KeyRange};
 use rtdb_columnar::{
-    BatchBuilder, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell,
+    BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell,
     copy_selected_cells, estimate_copy_cell_bytes, read_entity_id,
 };
 use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_storage::ObjectKey;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, OwnedRelation, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
 
 use crate::{
     Predicate, Projection, definition,
@@ -29,31 +30,50 @@ pub struct Request<'a> {
     pub region: Cow<'a, [u8]>,
     pub predicate: Predicate,
     pub valid_at: Timestamp,
-    pub after: Option<EntityIdRef<'a>>,
+    pub page: PageOrder<'a>,
     pub limit: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum PageOrder<'a> {
+    Identity { after: Option<EntityIdRef<'a>> },
+    NearestOnce,
+}
+
+#[derive(Clone, Copy)]
+pub struct NearestPosition<'a> {
+    pub distance_m: f64,
+    pub id: EntityIdRef<'a>,
 }
 
 pub struct Hit {
     pub id: EntityId,
     pub distance_m: Option<f64>,
-    _reservation: Arc<MemoryReservation>,
+    pub(super) _reservation: Arc<MemoryReservation>,
 }
 
-struct SelectedHit {
-    hit: Hit,
-    source: Arc<OwnedBatch>,
-    row: usize,
+pub(super) struct SelectedHit {
+    pub(super) hit: Hit,
+    pub(super) source: Arc<OwnedBatch>,
+    pub(super) row: usize,
 }
 
 pub struct Page {
     pub hits: Vec<Hit>,
     pub more: bool,
-    rows: Option<OwnedBatch>,
-    includes_documents: bool,
-    _reservation: Arc<MemoryReservation>,
+    pub next_distance_m: Option<f64>,
+    pub(super) rows: Option<OwnedBatch>,
+    pub(super) includes_documents: bool,
+    pub(super) ranked_distances: Option<Float64Array>,
+    pub(super) _reservation: Arc<MemoryReservation>,
 }
 
 impl Page {
+    pub fn distance_column(&self) -> Float64Array {
+        self.ranked_distances.clone()
+            .unwrap_or_else(|| Float64Array::from_iter(self.hits.iter().map(|hit| hit.distance_m)))
+    }
+
     pub fn documents(&self) -> Option<&OwnedBatch> {
         self.rows.as_ref().filter(|_| self.includes_documents)
     }
@@ -63,9 +83,9 @@ impl Page {
     }
 }
 
-fn gather_selected(
+pub(super) fn gather_selected(
     hits: &[SelectedHit],
-    projection: Projection<'_>,
+    indices: &[usize],
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<OwnedBatch>> {
     let Some(first) = hits.first() else { return Ok(None); };
@@ -90,12 +110,6 @@ fn gather_selected(
             });
         positions.push((index, hit.row));
     }
-    let indices: Vec<_> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, field)| (index == 0 || projection.includes(field.name())).then_some(index))
-        .collect();
     let mut output = BatchBuilder::new(4096 + hits.len() * 64 + indices.len() * 128, memory)?;
     let columns = indices
         .iter()
@@ -119,13 +133,100 @@ fn gather_selected(
     let projection_error = |error: arrow_schema::ArrowError| {
         Anomaly::fault("rtdb.spatial/projection", error.to_string())
     };
-    let schema = if indices.len() == schema.fields().len() {
+    let schema = if indices.iter().copied().eq(0..schema.fields().len()) {
         Arc::clone(schema)
     } else {
-        Arc::new(schema.project(&indices).map_err(projection_error)?)
+        Arc::new(schema.project(indices).map_err(projection_error)?)
     };
     let batch = RecordBatch::try_new(schema, columns).map_err(projection_error)?;
     output.finish(batch).map(Some)
+}
+
+pub(super) fn empty_projected_documents(
+    projection: Projection<'_>,
+    schema: Option<(&rtdb_plan::Schema, &[usize])>,
+    memory: &Arc<MemoryBudget>,
+) -> Result<Option<OwnedBatch>> {
+    if !matches!(projection, Projection::SelectedDocuments(_)) {
+        return Ok(None);
+    }
+    let schema = match schema {
+        Some((schema, columns)) => Schema::new(columns.iter().map(|&column| {
+            let field = schema.fields().get(column).ok_or_else(inconsistent_projection)?;
+            rtdb_columnar::to_field(&field.name, &field.data_type)
+        }).collect::<Result<Vec<_>>>()?),
+        None => Schema::new(vec![
+            rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type())?,
+            Field::new("_system_from", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+        ]),
+    };
+    let scratch = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+    let arrays = RecordBatch::new_empty(Arc::new(schema));
+    OwnedBatch::with_reservation(arrays, scratch).map(Some)
+}
+
+pub async fn path_ready(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
+) -> Result<bool> {
+    let definition = definition::held_definition(Arc::clone(&context), owner, relation, path).await?;
+    definition_ready(context, &definition).await
+}
+
+pub async fn require_path_ready(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
+    columns: &[String], encoding: SpatialGeometryEncoding,
+) -> Result<()> {
+    let refused = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/spatial-not-ready",
+        "The spatial path changed or lacks coverage at the ordered cut");
+    let definition = definition::held_definition(Arc::clone(&context), owner, relation, path).await
+        .map_err(|error| if error.code == "rtdb.owned/spatial-path" { refused() } else { error })?;
+    if columns.split_first().is_none_or(|(geometry, partition)| {
+        geometry != &definition.geometry || partition != definition.partition.as_slice()
+    }) || definition.encoding != encoding || !definition_ready(context, &definition).await? {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+async fn definition_ready(context: Arc<QueryContext>, definition: &definition::Definition) -> Result<bool> {
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Ok(false); };
+    let Some(table) = snapshot.table_entry(&definition.table) else { return Ok(true); };
+    let artefact = definition.artefact();
+    let mut uncovered_bytes = 0u64;
+    let mut uncovered = Vec::new();
+    for trie in snapshot.trie_entries(&definition.table) {
+        context.check_cancelled()?;
+        let available = trie.artefact(&artefact.kind, &artefact.id, artefact.version).is_some_and(|record| {
+            record.file_size.and_then(|size| u64::try_from(size).ok())
+                .is_some_and(|size| (1..=postings::MAX_FILE_BYTES).contains(&size))
+                && record.stats.as_ref().is_some_and(|digest| digest.len() == 32)
+        });
+        if available { continue; }
+        if rtdb_maintenance::wants(&artefact, &trie.key, trie.data_file_size, snapshot.trie_catalog().file_size_target()) {
+            return Ok(false);
+        }
+        let size = u64::try_from(trie.data_file_size).map_err(|_| postings::work_limit())?;
+        uncovered_bytes = uncovered_bytes.saturating_add(size);
+        if uncovered_bytes > MAX_UNINDEXED_BYTES { return Ok(false); }
+        uncovered.push(trie);
+    }
+
+    let mut unindexed_rows = snapshot.iter_segments(&definition.table)
+        .flat_map(|segment| segment.batches())
+        .fold(0usize, |count, batch| count.saturating_add(batch.view().len()));
+    if unindexed_rows > MAX_UNINDEXED_ROWS { return Ok(false); }
+    for trie in uncovered {
+        let result = rtdb_query::visit_trie_iids(
+            &context, Arc::clone(&database.storage), &table.slug, &trie.key, |_| {
+                unindexed_rows += 1;
+                if unindexed_rows > MAX_UNINDEXED_ROWS { Err(postings::work_limit()) } else { Ok(()) }
+            },
+        ).await;
+        if unindexed_rows > MAX_UNINDEXED_ROWS { return Ok(false); }
+        result?;
+    }
+    Ok(true)
 }
 
 pub async fn read_held(
@@ -196,16 +297,88 @@ pub async fn read_prepared(
     request: Request<'_>,
     projection: Projection<'_>,
 ) -> Result<Page> {
-    if !(1..=128).contains(&request.limit)
-        || (matches!(region.predicate, Predicate::Nearest { .. }) && request.after.is_some())
-    {
-        return Err(kernel::invalid(
-            "Invalid spatial page size or nearest continuation",
-        ));
+    let nearest = matches!(region.predicate, Predicate::Nearest { .. });
+    let valid_order = match request.page {
+        PageOrder::Identity { .. } => !nearest,
+        PageOrder::NearestOnce => nearest,
+    };
+    if !(1..=128).contains(&request.limit) || !valid_order {
+        return Err(kernel::invalid("Invalid spatial page size or continuation"));
     }
+    let capacity = request.limit;
     let reservation = context
         .memory
-        .reserve(request.limit * std::mem::size_of::<Hit>())?;
+        .reserve(capacity * std::mem::size_of::<Hit>())?;
+    let _selection = context
+        .memory
+        .reserve(capacity * std::mem::size_of::<SelectedHit>())?;
+    let mut selected = Vec::<SelectedHit>::with_capacity(capacity);
+    let mut more = false;
+    let projection_layout =
+        visit_matches(Arc::clone(&context), owner, relation, path, region, &request, projection, false, |source, row, id, _, distance_m| {
+                let index = selected
+                    .partition_point(|previous| order(&previous.hit, id, distance_m).is_lt());
+                if index < capacity {
+                    if selected.len() == capacity {
+                        selected.pop();
+                        more = true;
+                    }
+                    let reservation = context.memory.reserve(id.owned_payload_bytes().saturating_add(128))?;
+                    let hit = Hit {
+                        id: id.into_owned(),
+                        distance_m,
+                        _reservation: reservation,
+                    };
+                    selected.insert(index, SelectedHit { hit, source: Arc::clone(source), row });
+                } else {
+                    more = true;
+                }
+                Ok(())
+        }).await?;
+    if matches!(request.page, PageOrder::NearestOnce) {
+        more = false;
+    }
+    context.check_cancelled()?;
+    let rows = if selected.is_empty() {
+        empty_projected_documents(
+            projection, projection_layout.as_ref().map(|(schema, columns)| (schema, columns.as_slice())), &context.memory,
+        )?
+    } else {
+        let identities = [0];
+        let columns = if projection.has_documents() {
+            projection_layout.as_ref().ok_or_else(inconsistent_projection)?.1.as_slice()
+        } else {
+            &identities
+        };
+        gather_selected(&selected, columns, &context.memory)?
+    };
+    let hits = selected.into_iter().map(|selected| selected.hit).collect();
+    Ok(Page {
+        hits,
+        more,
+        next_distance_m: None,
+        rows,
+        includes_documents: projection.has_documents(),
+        ranked_distances: None,
+        _reservation: reservation,
+    })
+}
+
+fn inconsistent_projection() -> Anomaly {
+    Anomaly::fault("rtdb.spatial/projection", "Spatial matches have no projection")
+}
+
+pub(super) async fn visit_matches(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    path: &OwnedRelation,
+    region: &PreparedRegion,
+    request: &Request<'_>,
+    projection: Projection<'_>,
+    include_iid: bool,
+    mut visit: impl FnMut(&Arc<OwnedBatch>, usize, EntityIdRef<'_>, Option<Iid>, Option<f64>) -> Result<()>,
+) -> Result<Option<(rtdb_plan::Schema, Vec<usize>)>> {
     let definition =
         definition::held_definition(Arc::clone(&context), owner, relation, path).await?;
     if request.partition.len() > definition.partition.len() {
@@ -308,27 +481,23 @@ pub async fn read_prepared(
         request.valid_at,
         candidates.ids,
         projection,
+        include_iid,
     )
     .await?;
-    let Some(mut cursor) = cursor else {
-        return Ok(Page {
-            hits: Vec::new(),
-            more: false,
-            rows: None,
-            includes_documents: projection.has_documents(),
-            _reservation: reservation,
-        });
+    let Some(rtdb_query::OwnedSpatialScan { mut cursor, document_columns }) = cursor else {
+        return Ok(None);
     };
-    let _selection = context
-        .memory
-        .reserve(request.limit * std::mem::size_of::<SelectedHit>())?;
-    let mut selected = Vec::<SelectedHit>::with_capacity(request.limit);
-    let mut more = false;
     let mut refined = 0;
     let partition_start = 1 + usize::from(geometry.is_some());
     while let Some(source) = cursor.next_batch().await? {
         let source = Arc::new(source);
         let batch = source.batch();
+        let iids = if include_iid {
+            let column = batch.column_by_name("_iid").ok_or_else(inconsistent_projection)?;
+            Some(IidView::new(column.as_ref())?)
+        } else {
+            None
+        };
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
             if !partition_matches(batch, row, partition_start, &request.partition)? {
@@ -339,7 +508,9 @@ pub async fn read_prepared(
                 return Err(postings::work_limit());
             }
             let id = read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
-            if request.after.is_some_and(|after| id <= after) {
+            if let PageOrder::Identity { after: Some(after) } = request.page
+                && id <= after
+            {
                 continue;
             }
             let exact = if let Some(location_filter) = &region.location {
@@ -349,46 +520,20 @@ pub async fn read_prepared(
                     continue;
                 };
                 work.scoped(|work| {
-                    let location = Location::decode(bytes, work)?;
+                    let Some(location) = Location::decode_stored(bytes, definition.encoding, work)? else {
+                        return Ok(None);
+                    };
                     region.predicate.evaluate(&location, location_filter, work)
                 })?
             } else {
                 Some(None)
             };
             if let Some(distance_m) = exact {
-                let index = selected
-                    .partition_point(|previous| order(&previous.hit, id, distance_m).is_lt());
-                if index < request.limit {
-                    if selected.len() == request.limit {
-                        selected.pop();
-                        more = true;
-                    }
-                    let reservation = context.memory.reserve(id.owned_payload_bytes().saturating_add(128))?;
-                    let hit = Hit {
-                        id: id.into_owned(),
-                        distance_m,
-                        _reservation: reservation,
-                    };
-                    selected.insert(index, SelectedHit { hit, source: Arc::clone(&source), row });
-                } else {
-                    more = true;
-                }
+                visit(&source, row, id, iids.as_ref().map(|iids| iids.get(row)).transpose()?, distance_m)?;
             }
         }
     }
-    if matches!(region.predicate, Predicate::Nearest { .. }) {
-        more = false;
-    }
-    context.check_cancelled()?;
-    let rows = gather_selected(&selected, projection, &context.memory)?;
-    let hits = selected.into_iter().map(|selected| selected.hit).collect();
-    Ok(Page {
-        hits,
-        more,
-        rows,
-        includes_documents: projection.has_documents(),
-        _reservation: reservation,
-    })
+    Ok(Some((cursor.runtime_schema().clone(), document_columns)))
 }
 
 fn partition_matches(
@@ -412,11 +557,13 @@ fn partition_matches(
 
 fn order(hit: &Hit, id: EntityIdRef<'_>, distance: Option<f64>) -> std::cmp::Ordering {
     match (hit.distance_m, distance) {
-        (Some(left), Some(right)) => left
-            .total_cmp(&right)
-            .then_with(|| EntityIdRef::from(&hit.id).cmp(&id)),
+        (Some(left), Some(right)) => compare_nearest(left, EntityIdRef::from(&hit.id), right, id),
         _ => EntityIdRef::from(&hit.id).cmp(&id),
     }
+}
+
+fn compare_nearest(left: f64, left_id: EntityIdRef<'_>, right: f64, right_id: EntityIdRef<'_>) -> std::cmp::Ordering {
+    left.total_cmp(&right).then_with(|| left_id.cmp(&right_id))
 }
 
 struct Candidates {

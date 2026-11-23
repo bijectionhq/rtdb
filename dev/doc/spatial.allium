@@ -7,6 +7,7 @@ entity SpatialPath {
     name: String
     generation: Integer
     geometry_column: String
+    geometry_encoding: String
     partition_columns: List<String>
 }
 
@@ -19,6 +20,12 @@ entity SpatialPostings {
 -- An exact retry preserves the path generation.
 -- Dropping a path withdraws its declaration at the ordered system cut and retires the generation's artefacts.
 -- A declaration after a drop has a fresh generation.
+-- A path can index original Bijection geometry or position images in an existing Binary document column.
+-- The encoding is part of the path declaration and stays fixed for its generation.
+-- Readiness at a held cut requires current-generation postings on the durable sources scheduled for spatial indexing.
+-- The live tail and unscheduled durable sources must fit the fallback scan limits at that cut.
+-- An ordered Root catalog publication can require the exact staged path definition and check its coverage at the ordered cut.
+-- A failed readiness condition prevents publication of the revised catalog.
 -- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.
 -- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.
 -- The builder appends covering keys to typed Arrow columns and sorts their row positions.
@@ -42,9 +49,16 @@ entity SpatialPostings {
 -- Only visible rows supply geometry to the read's exact predicate.
 -- A range page advances in complete typed identity order at the original hold.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
+-- The held nearest capability retains complete keys, physical IIDs, and exact distances in ranked Arrow columns.
+-- A ranked continuation anchors on the exact previous distance and complete identity.
+-- Each ranked page resolves only its selected IIDs against the original held cut and validates complete identity before gathering the document columns.
+-- The next ranked row's distance bounds the remaining results.
+-- A paged nearest read advances exclusively past the last exact distance and complete typed identity at the original hold.
+-- When a nearest page has a successor, the page carries the exact distance of the first omitted hit.
 -- A document projection includes the resolved document and its system revision in hit order at the original hold.
 -- Selection retains the winning row positions until it gathers the final identities and requested document projection.
 -- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
+-- An empty selected document page carries the same projection schema as a populated page at the same hold.
 -- An observed read with an admitted placed witness scope, including an empty page, binds the relation frontier for ordered validation.
 -- Erasure orders against the held admission, and its newly compacted source carries no erased posting.
 -- Superseded source tries and their derived files follow trie-cat.allium and gc.allium.

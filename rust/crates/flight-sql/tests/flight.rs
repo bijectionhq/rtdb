@@ -861,8 +861,15 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
 }
 
 
-#[tokio::test]
-async fn owned_spatial_flight_pages_share_the_original_cut() {
+#[test]
+fn owned_spatial_flight_pages_share_the_original_cut() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(check_spatial_pages_at_the_original_cut());
+    }).unwrap().join().unwrap();
+}
+
+async fn check_spatial_pages_at_the_original_cut() {
     use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, UnionArray, builder::{BinaryBuilder, Int64Builder, ListBuilder, StringBuilder}};
     use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
     use rtdb_format::ipc::write_arrow_stream;
@@ -935,14 +942,16 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
             ("_id", Arc::new(StringArray::from(vec![path])) as ArrayRef),
             ("columns", select(&[geometry, "borough"])),
         ]);
-        client.action("rtdb.owned.DeclareSpatialPath.v1", declaration.into()).await.unwrap();
+        let declaration = Bytes::from(declaration);
+        client.action("rtdb.owned.DeclareSpatialPath.v1", declaration.clone()).await.unwrap();
+        client.action("rtdb.owned.DeclareSpatialPath.v1", declaration).await.unwrap();
     }
 
     let mut insert = relation.clone();
     ipc(&mut insert, [
-        ("_id", Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef),
-        ("location", Arc::new(BinaryArray::from_iter_values([point(1.0), point(2.0), point(1.0)]))),
-        ("borough", Arc::new(BinaryArray::from_vec(vec![b"montrouge", b"montrouge", b"elsewhere"]))),
+        ("_id", Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef),
+        ("location", Arc::new(BinaryArray::from_iter_values([point(1.0), point(2.0), point(1.0), point(1.0)]))),
+        ("borough", Arc::new(BinaryArray::from_vec(vec![b"montrouge", b"montrouge", b"elsewhere", b"montrouge"]))),
     ]);
     client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
 
@@ -960,6 +969,12 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
         ("_absent", select(&["never_written"])),
     ]);
     client.action("rtdb.owned.Commit.v1", replace.into()).await.unwrap();
+    let mut drop = Vec::new();
+    ipc(&mut drop, [
+        ("relation", Arc::new(StringArray::from(vec!["places"])) as ArrayRef),
+        ("name", Arc::new(StringArray::from(vec![path]))),
+    ]);
+    client.action("rtdb.owned.DropSpatialPath.v2", drop.into()).await.unwrap();
     frame(&mut relation, path);
     client.action("rtdb.owned.DropSpatialPath.v1", relation.into()).await.unwrap();
 
@@ -969,7 +984,7 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
         ("rtdb.owned.SpatialHeld.v2", true, None),
         (projected, true, Some(select(&["borough", "never_written"]))),
     ] {
-        for (after, expected, more, longitude) in [(None, "a", "1", 1.0), (Some("a"), "b", "0", 2.0)] {
+        for (after, expected, more, longitude) in [(None, "a", "1", 1.0), (Some("a"), "b", "1", 2.0)] {
             let request = query(hold, path, valid, after, &[], "all", selected.clone());
             let replies = client.action(action, request).await.unwrap();
             let mut stream = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap();
@@ -1001,7 +1016,16 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
         let request = query(hold, path, valid, None, &point(20.0), "intersects", selected);
         let replies = client.action(action, request).await.unwrap();
         let mut empty = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap();
-        assert_eq!(empty.schema().metadata()["rtdb.owned.spatial_more"], "0");
+        let schema = empty.schema();
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
+        if action == projected {
+            let document = schema.field_with_name("document").unwrap();
+            let DataType::Struct(fields) = document.data_type() else { panic!("Expected a document projection"); };
+            assert_eq!(
+                fields.iter().map(|field| field.name().as_str()).collect::<Vec<_>>(),
+                ["borough", "_system_from"],
+            );
+        }
         assert!(empty.next().is_none());
     }
     let request = query(hold, path, valid, None, &point(2.0), "intersects", Some(select(&[])));
@@ -1053,14 +1077,79 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
         let mut resumed = StreamReader::try_new(resumed[0].body.as_ref(), None).unwrap();
         let schema = resumed.schema();
         assert_eq!(schema.metadata()["rtdb.owned.present_micros"], valid.to_string());
-        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
-        assert!(!schema.metadata().contains_key("rtdb.owned.spatial_filter"));
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "1");
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_filter"], token.simple().to_string());
         let resumed = resumed.next().unwrap().unwrap();
         assert_eq!(rtdb_columnar::read_entity_id(resumed.schema_ref().field(0), resumed.column(0).as_ref(), 0).unwrap(),
             rtdb_columnar::EntityIdRef::String("b"));
     }
+    let mut last = capability.clone();
+    last.extend_from_slice(&[1, 0, 0, b'b']);
+    let last = client.action("rtdb.owned.SpatialNext.v1", last.into()).await.unwrap();
+    let mut last = StreamReader::try_new(last[0].body.as_ref(), None).unwrap();
+    let schema = last.schema();
+    assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
+    assert!(!schema.metadata().contains_key("rtdb.owned.spatial_filter"));
+    let last = last.next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(last.schema_ref().field(0), last.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("d"));
     client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
     assert_eq!(client.action("rtdb.owned.SpatialNext.v1", next.into()).await.unwrap_err().code(), tonic::Code::NotFound);
+    let mut rank_capability = hold.to_vec();
+    let mut continuation: Option<Bytes> = None;
+    let mut previous_distance = None;
+    for (expected, more) in [("a", true), ("d", true), ("b", false)] {
+        let replies = if let Some(next) = &continuation {
+            client.action("rtdb.owned.SpatialRankNext.v1", next.clone()).await.unwrap()
+        } else {
+            let open = query(hold, path, valid, None, &point(0.0), "nearest", Some(select(&["borough"])));
+            client.action("rtdb.owned.SpatialRankOpen.v1", open).await.unwrap()
+        };
+        let mut stream = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap();
+        let schema = stream.schema();
+        assert_eq!(schema.metadata()["rtdb.owned.present_micros"], valid.to_string());
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], if more { "1" } else { "0" });
+        let batch = stream.next().unwrap().unwrap();
+        let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+        assert_eq!(ids.value(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), expected);
+        let distance = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
+        if let Some(bound) = schema.metadata().get("rtdb.owned.spatial_next_distance_m") {
+            assert!(bound.parse::<f64>().unwrap() >= distance);
+            assert!(more);
+        } else {
+            assert!(!more);
+        }
+        if expected == "d" { assert_eq!(Some(distance), previous_distance); }
+        if more {
+            let token = uuid::Uuid::parse_str(&schema.metadata()["rtdb.owned.spatial_filter"]).unwrap();
+            if continuation.is_none() {
+                rank_capability.extend_from_slice(token.as_bytes());
+            } else {
+                assert_eq!(&rank_capability[16..], token.as_bytes());
+            }
+            let mut next = rank_capability.clone();
+            next.extend_from_slice(&[1, 0]);
+            next.extend_from_slice(&distance.to_be_bytes());
+            next.extend_from_slice(&[0]);
+            next.extend_from_slice(expected.as_bytes());
+            if expected == "a" {
+                let mut malformed = next.clone();
+                malformed[34..42].copy_from_slice(&0.0_f64.to_be_bytes());
+                assert_eq!(client.action("rtdb.owned.SpatialRankNext.v1", malformed.into()).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+            }
+            continuation = Some(next.into());
+        } else {
+            assert!(!schema.metadata().contains_key("rtdb.owned.spatial_filter"));
+        }
+        previous_distance = Some(distance);
+    }
+    let last = continuation.unwrap();
+    let retried = client.action("rtdb.owned.SpatialRankNext.v1", last.clone()).await.unwrap();
+    let batch = StreamReader::try_new(retried[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("b"));
+    client.action("rtdb.owned.SpatialClose.v1", rank_capability.into()).await.unwrap();
+    assert_eq!(client.action("rtdb.owned.SpatialRankNext.v1", last).await.unwrap_err().code(), tonic::Code::NotFound);
 
     let mut wrong_type = ListBuilder::new(Int64Builder::new());
     wrong_type.append(true);
