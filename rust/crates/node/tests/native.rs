@@ -3923,7 +3923,7 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
 
         clock.0.store(1_000_000 + rtdb_tx::RECEIPT_WINDOW_MICROS, Ordering::Relaxed);
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
-        assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], Default::default()).await.unwrap().committed());
+        assert!(session.state_mut().execute_tx(vec![TxOp::Sql { sql: "ASSERT TRUE".into(), args: None }], Default::default()).await.unwrap().committed());
         node.catalog().database("xtdb").unwrap().flush().await.unwrap();
         node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
         drop(session);
@@ -3936,7 +3936,7 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
         assert!(result.committed());
         assert_eq!(result.tx_key(), original.tx_key());
         let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
-        assert_eq!(rows(session.query_sql("SELECT _id FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+        assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
         let projection = format!("SELECT user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = {}", ids[1].0);
         assert_eq!(rows(session.query_sql(&projection, vec![]).await.unwrap()).await, [vec![Value::Null]]);
         drop(session);
@@ -4009,7 +4009,7 @@ async fn bounded_retries_preserve_terminal_aborts_and_do_not_reopen_after_clock_
     assert_eq!(conflict.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-conflict"));
 
     clock.0.store(cutoff, Ordering::Relaxed);
-    assert!(session.state_mut().execute_tx(vec![put(&node, 0, 0)], Default::default()).await.unwrap().committed());
+    assert!(session.state_mut().execute_tx(vec![TxOp::Sql { sql: "ASSERT TRUE".into(), args: None }], Default::default()).await.unwrap().committed());
     clock.0.store(cutoff - 1, Ordering::Relaxed);
     let expired = session.state_mut().execute_tx(vec![put(&node, 3, 30)], retry_options(&node, 2)).await.unwrap();
     assert_eq!(expired.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
@@ -4025,7 +4025,7 @@ async fn bounded_retries_preserve_terminal_aborts_and_do_not_reopen_after_clock_
         [vec![Value::I64(0)], vec![Value::I64(1)]]);
     let retirement = 1_000_000 + rtdb_tx::RECEIPT_WINDOW_MICROS;
     clock.0.store(retirement, Ordering::Relaxed);
-    assert!(session.state_mut().execute_tx(vec![put(&node, 0, 0)], Default::default()).await.unwrap().committed());
+    assert!(session.state_mut().execute_tx(vec![TxOp::Sql { sql: "ASSERT TRUE".into(), args: None }], Default::default()).await.unwrap().committed());
     node.catalog().database("xtdb").unwrap().flush().await.unwrap();
     node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
     drop(session);
