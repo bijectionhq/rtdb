@@ -17,7 +17,7 @@ const MAX_REPLAY_LIFETIME_BYTES: usize = 16 * 1024;
 const MAX_REPLAY_EXPIRIES: usize = 64;
 const MAX_REPLAY_EXPIRY_BYTES: usize = 32 * 1024;
 const MAX_REPLAY_CONSTRAINTS: usize = 64;
-const MAX_REPLAY_CONSTRAINT_BYTES: usize = 32 * 1024;
+const MAX_REPLAY_CONSTRAINT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

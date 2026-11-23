@@ -113,6 +113,7 @@
 -- A populated relation can initialize its first cap when validity always begins at acceptance and has an open end.
 -- The declaration initializes each covered counter from the transaction's final visible membership at its ordering point.
 -- A prefix already above the proposed maximum aborts the declaration and the transaction's other writes.
+-- A hosted Root commit can declare capacity alongside catalog effects, guarded by the checked installation authority.
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
 -- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.

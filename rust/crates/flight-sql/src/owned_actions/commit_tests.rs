@@ -59,3 +59,24 @@ fn single_commit_produces_the_same_group_view() {
     assert_eq!(request.groups[0].0.name(), "items");
     assert_eq!(request.groups[0].1, b"first");
 }
+
+#[test]
+fn capacity_declaration_decodes_one_exact_root_projection() {
+    let root = OwnedRelation::new("items").unwrap();
+    let mut fields = StructFields::from([
+        ("column".into(), Value::Utf8("partition".into())),
+        ("prefix_bytes".into(), Value::I64(0)),
+        ("cap".into(), Value::I64(3)),
+        ("when".into(), Value::Binary(vec![])),
+    ]);
+    assert!(matches!(
+        owned_capacity_declaration(root.clone(), &fields).unwrap(),
+        TxOp::OwnedDeclareCapacity { relation, column, prefix_bytes: 0, cap: 3, when }
+            if relation == root && column == "partition" && when.is_empty()
+    ));
+    fields.insert("extra".into(), Value::I64(1));
+    assert!(owned_capacity_declaration(root.clone(), &fields).is_err());
+    fields.remove("extra");
+    fields.insert("cap".into(), Value::Utf8("3".into()));
+    assert!(owned_capacity_declaration(root, &fields).is_err());
+}

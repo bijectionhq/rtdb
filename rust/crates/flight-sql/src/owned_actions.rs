@@ -61,6 +61,13 @@ pub(crate) enum CommitFormat {
     Ordered,
 }
 
+#[derive(Clone, Copy)]
+enum CommitEffects {
+    Facts,
+    HostedRoot,
+    Replay,
+}
+
 struct CommitRequest<'a> {
     deadline: Timestamp,
     groups: Vec<(OwnedRelation, &'a [u8])>,
@@ -582,13 +589,8 @@ impl Service {
             return Err(invalid("Owned capacity declaration requires one row with column, prefix_bytes, cap and when"));
         }
         let (rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
-        let row = &rows[0];
-        let (Some(Value::Utf8(column)), Some(Value::I64(prefix_bytes)), Some(Value::I64(cap)), Some(Value::Binary(when))) =
-            (row.get("column"), row.get("prefix_bytes"), row.get("cap"), row.get("when"))
-        else { return Err(invalid("Owned capacity declaration has invalid field types")); };
-        self.owned_write_reply(call, vec![TxOp::OwnedDeclareCapacity {
-            relation, column: column.clone(), prefix_bytes: *prefix_bytes, cap: *cap, when: when.clone(),
-        }]).await
+        let operation = owned_capacity_declaration(relation, &rows[0])?;
+        self.owned_write_reply(call, vec![operation]).await
     }
 
     pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &[u8], unique: bool) -> Result<ActionResult, Status> {
@@ -751,7 +753,14 @@ impl Service {
         if replay && (counted || !worlds.is_empty()) {
             return Err(invalid("Native replay admits an original effect batch"));
         }
-        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, replay)?;
+        let effects = if replay {
+            CommitEffects::Replay
+        } else if !counted && worlds.is_empty() && !controls.is_empty() {
+            CommitEffects::HostedRoot
+        } else {
+            CommitEffects::Facts
+        };
+        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         self.owned_write_reply_with_reads(call, writes, witnesses, worlds).await
     }
@@ -819,13 +828,14 @@ impl Service {
         };
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
         writes.extend(conditions);
-        let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, erase_allowed)?;
+        let effects = if erase_allowed { CommitEffects::Replay } else { CommitEffects::Facts };
+        let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, effects)?;
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
 
     fn decode_owned_commit_groups(
         &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, writes: &mut Vec<TxOp>,
-        rows_left: &mut usize, erase_allowed: bool,
+        rows_left: &mut usize, effects: CommitEffects,
     ) -> Result<Vec<(Arc<MemoryReservation>, Arc<MemoryReservation>)>, Status> {
         let mut retained = Vec::with_capacity(groups.len());
         for (relation, arrow) in groups {
@@ -838,7 +848,7 @@ impl Service {
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
             let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
-            self.append_owned_commit_group(writes, &relation, rows, erase_allowed)?;
+            self.append_owned_commit_group(writes, &relation, rows, effects)?;
             retained.push((operations_charge, documents_charge));
         }
         Ok(retained)
@@ -849,7 +859,7 @@ impl Service {
         writes: &mut Vec<TxOp>,
         relation: &OwnedRelation,
         rows: Vec<rtdb_types::StructFields<Value>>,
-        erase_allowed: bool,
+        effects: CommitEffects,
     ) -> Result<(), Status> {
         for mut row in rows {
             strip_owned_absence(&mut row)?;
@@ -883,11 +893,19 @@ impl Service {
                     if has_payload(&row) { return Err(invalid("Owned delete carries document values")); }
                     TxOp::OwnedDelete { relation: relation.clone(), id, valid_from, valid_to }
                 }
-                "erase" if erase_allowed => {
+                "erase" if matches!(effects, CommitEffects::Replay) => {
                     if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
                         return Err(invalid("Owned erase requires only a typed identity and optional observation"));
                     }
                     TxOp::OwnedErase { relation: relation.clone(), id }
+                }
+                "declare-capacity" if matches!(effects, CommitEffects::HostedRoot) => {
+                    if valid_at.is_some() || valid_from.is_some() || valid_to.is_some()
+                        || row.remove("_id").as_ref() != row.get("column")
+                    {
+                        return Err(invalid("Hosted capacity declaration requires an unqualified projection identity"));
+                    }
+                    owned_capacity_declaration(relation.clone(), &row)?
                 }
                 _ => return Err(invalid("Unknown owned commit operation")),
             };
@@ -2436,7 +2454,7 @@ impl Service {
             let mut operations = Vec::new();
             let mut fact_rows_left = rows_left;
             root_batches = Some(self.decode_owned_commit_groups(
-                call, owned_groups(facts, false, true)?, &mut operations, &mut fact_rows_left, false,
+                call, owned_groups(facts, false, true)?, &mut operations, &mut fact_rows_left, CommitEffects::Facts,
             )?);
             rows_left = rows_left.checked_sub(operations.len() + witnesses.len())
                 .ok_or_else(|| invalid("Fork exceeds its effect limit"))?;
@@ -2664,7 +2682,7 @@ impl Service {
         let _root_framing = call.reserve(ordered_group_count(root)? * 512)?;
         let mut root_ops = Vec::new();
         let _root_groups = self.decode_owned_commit_groups(
-            call, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, false,
+            call, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, CommitEffects::Facts,
         )?;
         let mut root = rtdb_node::OwnedRootSection::default();
         let mut root_writes = Vec::new();
@@ -3092,6 +3110,18 @@ fn valid_endpoint(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
 
 fn has_payload(row: &rtdb_types::StructFields<Value>) -> bool {
     row.iter().any(|(name, value)| name != "_id" && !matches!(value, Value::Null | Value::Undefined))
+}
+
+fn owned_capacity_declaration(relation: OwnedRelation, row: &StructFields<Value>) -> Result<TxOp, Status> {
+    let (Some(Value::Utf8(column)), Some(Value::I64(prefix_bytes)), Some(Value::I64(cap)), Some(Value::Binary(when))) =
+        (row.get("column"), row.get("prefix_bytes"), row.get("cap"), row.get("when"))
+    else { return Err(invalid("Owned capacity declaration has invalid field types")); };
+    if row.len() != 4 || !relation.is_root_data() {
+        return Err(invalid("Owned capacity declaration requires a Root projection"));
+    }
+    Ok(TxOp::OwnedDeclareCapacity {
+        relation, column: column.clone(), prefix_bytes: *prefix_bytes, cap: *cap, when: when.clone(),
+    })
 }
 
 #[cfg(test)]

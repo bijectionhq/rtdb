@@ -38,6 +38,7 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedForkWorld { .. }
                         | TxOp::OwnedCheckRange { .. }
                         | TxOp::OwnedCheckCapacity { .. }
+                        | TxOp::OwnedDeclareCapacity { .. }
                         | TxOp::OwnedInsertDocs { .. }
                         | TxOp::OwnedReplaceDocs { .. }
                         | TxOp::OwnedDelete { .. }
@@ -53,6 +54,14 @@ impl OpenTransaction<'_> {
         }
         let validating_world = !self.owned_worlds.is_empty();
         let hosted_world_reads = validating_world && crate::hosted_control::hosted_root_world_reads(operations);
+        if operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedDeclareCapacity { .. })))
+            && (validating_world || !controls.clone().any(|control| {
+                control.name() == "bj_installation" && control.is_check() && control.expected().is_some()
+                    && matches!(control.id(), EntityId::String(id) if id == "authority")
+            }))
+        {
+            return Err(unavailable());
+        }
         if readmission.is_some() && (replay.is_some() || validating_world || operations.iter().any(|operation| {
             !matches!(operation, Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::HostedControl(_)))
         })) {
@@ -77,7 +86,7 @@ impl OpenTransaction<'_> {
         ) {
             return Err(unavailable());
         }
-        let mut has_fact_write = false;
+        let mut has_native_effect = false;
         for operation in operations {
             if !hosted_world_reads {
                 if validating_world {
@@ -97,8 +106,8 @@ impl OpenTransaction<'_> {
                     return Err(unavailable());
                 }
             }
-            has_fact_write |= match operation {
-                Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. }) => true,
+            has_native_effect |= match operation {
+                Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedDeclareCapacity { .. }) => true,
                 Operation::Public(
                     TxOp::OwnedInsertDocs { documents, .. }
                     | TxOp::OwnedReplaceDocs { documents, .. },
@@ -112,7 +121,7 @@ impl OpenTransaction<'_> {
         ));
         // An exact native replay transaction can consist entirely of source
         // effects whose Original key was withdrawn. Its clock still advances.
-        if !has_fact_write && replay.is_none() && readmission.is_none()
+        if !has_native_effect && replay.is_none() && readmission.is_none()
             && !fork_with_controls && !retained_release && !proposal_overlay
             && controls.clone().any(|control| !control.is_check())
         {
