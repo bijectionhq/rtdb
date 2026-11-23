@@ -288,21 +288,25 @@ impl Node {
     }
 
     /// Opens a placed audience session backed by the holder's prepaid execution and cache allocations.
-    pub fn audience_session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>, cache: Arc<CacheBudget>) -> Result<NativeSession> {
+    pub fn audience_session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>, source: uuid::Uuid, memory: Arc<MemoryBudget>, cache: Arc<CacheBudget>) -> Result<NativeSession> {
         if !self.catalog.is_placed() || !memory.prepaid_by(self.memory()) || !cache.prepaid_by(self.memory()) {
             return Err(Anomaly::incorrect("rtdb.node/unfunded-session", "A placed audience session requires this holder's prepaid execution and cache allocations"));
         }
-        self.session_in_memory(database.into(), identity, memory, Some(cache))
+        self.session_in_memory(database.into(), identity, memory, Some((source, cache)))
     }
 
-    fn session_in_memory(&self, database: String, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>, audience_cache: Option<Arc<CacheBudget>>) -> Result<NativeSession> {
+    fn session_in_memory(&self, database: String, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>, audience: Option<(uuid::Uuid, Arc<CacheBudget>)>) -> Result<NativeSession> {
         self.ensure_open()?;
         identity.authorize_database(&database, DatabaseAccess::Read)?;
         let local = self.catalog.database(&database)?;
         let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
-        let audience_storage = audience_cache.map(|cache| Arc::new(BufferPool::with_metadata_budget(
-            Arc::clone(local.storage.object_store()), cache, Arc::clone(&memory),
-        )));
+        let audience_storage = if let Some((source, cache)) = audience {
+            let storage = local.audience_storage.as_ref().filter(|storage| storage.source == source)
+                .ok_or_else(hosted_source_unavailable)?;
+            Some(Arc::new(BufferPool::with_metadata_budget(Arc::clone(&storage.store), cache, Arc::clone(&memory))))
+        } else {
+            None
+        };
         let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory, audience_storage });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
         Ok(NativeSession { state, service, applied_preparation: None })
@@ -492,7 +496,9 @@ impl Node {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
                 let permit = match admission {
                     AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
-                    AppliedCatalogAdmission::Ordinary | AppliedCatalogAdmission::PrepareAudience(_) =>
+                    AppliedCatalogAdmission::PrepareAudience(storage) =>
+                        storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
+                    AppliedCatalogAdmission::Ordinary =>
                         database.storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
                 };
                 let history = match admission {

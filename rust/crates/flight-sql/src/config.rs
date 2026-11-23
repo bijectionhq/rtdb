@@ -3,7 +3,7 @@ use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
-pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v8";
+pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v9";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudienceFlightConfig {
