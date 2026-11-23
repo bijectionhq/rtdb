@@ -132,11 +132,7 @@ pub(crate) fn frozen_checkpoint(
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/checkpoint-boundary", "Invalid frozen checkpoint boundary"));
     let replica = Arc::new(MemoryLog::starting_at(maximum_message_bytes, LogOffset(end(checkpoint.boundary)?)));
     let start = end(checkpoint.source)?;
-    let intake = Arc::new(IntakeLog {
-        log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(start)),
-        consumed: AtomicI64::new(start - 1),
-        start,
-    });
+    let intake = Arc::new(IntakeLog::new(maximum_message_bytes, start));
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
         await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
 }
@@ -158,10 +154,7 @@ pub(crate) async fn ordered_opened(
         replica_through: block.boundary, source_through: block.source,
     });
     let next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
-    let intake = Arc::new(IntakeLog {
-        log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(next)),
-        consumed: AtomicI64::new(next - 1), start: next,
-    });
+    let intake = Arc::new(IntakeLog::new(maximum_message_bytes, next));
     let trimming = {
         let intake = Arc::clone(&intake);
         async move {
@@ -265,7 +258,7 @@ impl LogFactory for LogkeeperLogFactory {
             next = next.max(floor);
         }
         if config.transfer_intake_cut.is_some() { SourcePosition::from_epoch_offset(epoch, next)?; }
-        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: AtomicI64::new(next - 1), start: next });
+        let intake = Arc::new(IntakeLog::new(self.maximum_message_bytes, next));
         let trimming = {
             let intake = Arc::clone(&intake);
             async move {
@@ -572,6 +565,15 @@ impl LogRange for SealedRange {
 pub struct IntakeLog { log: MemoryLog, consumed: AtomicI64, start: i64 }
 
 impl IntakeLog {
+    fn new(maximum_message_bytes: usize, start: i64) -> Self {
+        let capacity = maximum_message_bytes.saturating_mul(2).max(16 * 1024 * 1024);
+        Self {
+            log: MemoryLog::bounded_starting_at(maximum_message_bytes, LogOffset(start), capacity),
+            consumed: AtomicI64::new(start - 1),
+            start,
+        }
+    }
+
     fn trim(&self) {
         let boundary = self.consumed.load(Ordering::Acquire).saturating_add(1);
         if boundary > self.log.first_retained().0 { let _ = self.log.truncate_before(LogOffset(boundary)); }
@@ -580,7 +582,10 @@ impl IntakeLog {
 
 #[async_trait]
 impl Log for IntakeLog {
-    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> { self.log.enqueue(payload, timestamp).await }
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+        self.trim();
+        self.log.enqueue(payload, timestamp).await
+    }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
     fn record_applied(&self, through: LogOffset) {
         self.consumed.fetch_max(through.0, Ordering::AcqRel);
@@ -850,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_intake_releases_applied_records_and_keeps_pending_records() {
-        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: AtomicI64::new(9), start: 10 };
+        let intake = IntakeLog::new(1 << 20, 10);
         for payload in [b"applied".as_slice(), b"pending".as_slice()] {
             intake.enqueue(Bytes::from_static(payload), Timestamp(0)).await.unwrap().durable().await.unwrap();
         }
