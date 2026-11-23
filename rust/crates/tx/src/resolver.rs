@@ -261,7 +261,7 @@ impl TxResolver {
         self.resolve_source_for_writer(durable, position, log_time, request, context, None).await
     }
 
-    pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext,
+    pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, mut request: SourceTransaction, context: &ResolveContext,
         writer: Option<WriterPublication<'_>>,
     ) -> Result<Arc<ResolvedTx>> {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
@@ -290,6 +290,13 @@ impl TxResolver {
         let attempt = request.placed_attempt(position)?;
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
+        let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
+            && context.owned_witness_scope.is_some() && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
+        let placement = if selected_time.is_ok() {
+            request.place_owned_periods(key.system_time, placed_periods)
+        } else {
+            Ok(())
+        };
         let replay = match &request.guard {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
@@ -319,7 +326,7 @@ impl TxResolver {
             _ => None,
         });
         let mut constraint_failed = false;
-        let mut outcome = if let Some(error) = plan_error.or(retry_error) {
+        let mut outcome = if let Some(error) = placement.err().or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
             Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
@@ -1000,6 +1007,9 @@ impl<'a> OpenTransaction<'a> {
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
                 self.write_owned(relation, documents, None, *valid_from, *valid_to, true).await,
+            Operation::Public(TxOp::OwnedRelativePeriod { .. }) => Err(Anomaly::incorrect(
+                "rtdb.owned/validity-policy", "The Root period must be placed before staging",
+            )),
             Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) =>
                 self.write_owned(relation, documents, None, *valid_from, *valid_to, false).await,
             Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } =>
