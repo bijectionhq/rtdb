@@ -195,7 +195,8 @@ Goal: accelerated MATCH returns the reference scan's rows, and ranked early term
 Goal: every production effect passes through its owning admission and decision.
 
 For placed audit coverage, model provisional intake, durable scope-owned credit, exact receiver admission, terminal effect or fence, and authentic succession.
-Exercise reader expiry with pending receiver debt and fair settlement when the ordered receiver recovers.
+The source model [PlacedReceiverSlots](tla/PlacedReceiverSlots.tla) covers expiry with pending receiver debt and fair settlement after recovery.
+Its configurations are unexecuted.
 Fail controls for use of volatile admission, split terminal append, late copies after a fence, reclaim of pending credit on expiry, and reissue from a stale cut.
 Trace native and hosted paths through intake, the resolver, replica decoding and apply, checkpoint installation, status and causal redemption.
 A parent or exporter's offer supplies evidence only for its own boundary.
