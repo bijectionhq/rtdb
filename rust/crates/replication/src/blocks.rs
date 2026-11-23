@@ -6,7 +6,7 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use sha2::{Digest, Sha256};
@@ -237,15 +237,6 @@ impl BlockStore {
         TrieCatalog::new(file_size_target)?;
         Ok(Arc::new(Self { store, cache, memory, file_size_target }))
     }
-    async fn reading_recovery<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        // Classic's recovery gate excludes deletion of checkpoint metadata while the selected
-        // root and its table blocks are read. Hosted callers carry their directory registration.
-        match self.store.local_maintenance_store().filter(|store| store.defers_trie_releases()) {
-            Some(store) => IoRegion::reading(HeldView::recovery(store.hold_recovery_open().await?), work).await,
-            None => work.await,
-        }
-    }
-
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
         let published = match discovery {
             BlockDiscovery::FromPublished(checkpoint) | BlockDiscovery::AtPublished(checkpoint) => Some(checkpoint),
@@ -257,7 +248,7 @@ impl BlockStore {
 
     /// Restore an exact published business checkpoint without opening its receipt tables.
     pub async fn recover_held(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, checkpoint: PublishedCheckpoint) -> Result<RecoveredPartition> {
-        self.reading_recovery(async {
+        IoRegion::reading_recovery(self.store.as_ref(), async {
             let block = self.load_fresh_catalog(checkpoint.block).await?;
             if checkpoint.root_sha256.is_none() || block.publication_sha256() != checkpoint.root_sha256 || !checkpoint.accepts(&block) {
                 return Err(invalid("The held checkpoint does not match its exact published root"));
@@ -334,7 +325,7 @@ impl BlockStore {
     }
     async fn load_selected_checkpoint(&self, discovery: BlockDiscovery, previous: Option<BlockIndex>,
         published: Option<PublishedCheckpoint>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
-        self.reading_recovery(async {
+        IoRegion::reading_recovery(self.store.as_ref(), async {
             let latest = self.latest_block(discovery).await?;
             let selected = match previous {
                 Some(previous) => crate::checkpoint_discovery::newer_checkpoint(previous.0, latest.map(|index| index.0)).map(BlockIndex),
@@ -429,7 +420,7 @@ impl BlockStore {
     }
 
     pub(crate) async fn retained_catalogs(&self, selected: &BlockCatalog, replica_epoch: StorageEpoch, cancellation: &CancellationToken) -> Result<Vec<HistoricalCatalog>> {
-        self.reading_recovery(async {
+        IoRegion::reading_recovery(self.store.as_ref(), async {
             let Some(mut next_boundary) = selected.boundary_replica_position() else { return Ok(Vec::new()); };
             let mut retained = Vec::new();
             for index in (0..selected.block_index().0).rev().map(BlockIndex) {
@@ -462,7 +453,7 @@ impl BlockStore {
     }
 
     pub(crate) async fn require_confirmation_files(&self, confirmation: &RecoveredBlockConfirmation, cancellation: &CancellationToken) -> Result<()> {
-        self.reading_recovery(async {
+        IoRegion::reading_recovery(self.store.as_ref(), async {
             let index = confirmation.catalog.block_index();
             let key = TrieKey::l0(index)?;
             let ReplicaBody::BlockUploaded(upload) = &confirmation.body else { return Err(invalid("Recovered confirmation has no upload body")); };
@@ -485,7 +476,7 @@ impl BlockStore {
     pub(crate) fn object_store(&self) -> &dyn ObjectStore { self.store.as_ref() }
 
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
-        self.reading_recovery(async {
+        IoRegion::reading_recovery(self.store.as_ref(), async {
             let block = self.load_fresh_catalog(index).await?;
             let tables = self.load_tables(&block).await?;
             Ok((block, tables))

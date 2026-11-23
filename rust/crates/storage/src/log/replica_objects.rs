@@ -5,7 +5,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame};
 use rtdb_types::{PhysicalObjectVersion, StorageEpoch, StorageVersion};
 
-use crate::{Error, IoRegion, ObjectKey, ObjectStore, Result};
+use crate::{Error, HeldView, IoRegion, ObjectKey, ObjectStore, Result};
 
 use super::LogOffset;
 
@@ -27,7 +27,7 @@ pub struct ReplicaObjectCustody {
     key: ObjectKey,
     digest: [u8; 32],
     publication: Option<PhysicalObjectVersion>,
-    hold: Arc<dyn Send + Sync>,
+    _hold: Arc<dyn Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl ReplicaObjectCustody {
         let key = envelope.oversized_payload(version, epoch).map_err(invalid)?
             .ok_or_else(|| Error::Task("A delivered replica pointer has no object".into()))?;
         let publication = envelope.offload_publication().map_err(invalid)?.map(|(_, version)| version);
-        Ok(Some(Self { authority, position, key: ObjectKey::new(key)?, digest, publication, hold }))
+        Ok(Some(Self { authority, position, key: ObjectKey::new(key)?, digest, publication, _hold: hold }))
     }
 
     pub fn installed_scope(&self) -> Option<ReplicaObjectScope> {
@@ -85,7 +85,8 @@ impl ReplicaObjectCustody {
     pub fn position(&self) -> LogOffset { self.position }
 
     pub async fn redeem(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
-        IoRegion::retaining(Arc::clone(&self.hold), async {
+        let view = HeldView::recovery(Arc::new(self.clone()));
+        IoRegion::reading(view, async {
             match &self.authority {
                 ReplicaPayloadAuthority::Installed(_) => store.read_replica_payload(self, memory).await,
                 ReplicaPayloadAuthority::Brokered(broker) => broker.read(self, memory).await,
@@ -110,7 +111,8 @@ impl ReplicaObjectCustody {
     async fn read_publication(
         &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, publication: Option<&PhysicalObjectVersion>,
     ) -> Result<ReplicaPayload> {
-        IoRegion::retaining(Arc::clone(&self.hold), async {
+        let view = HeldView::recovery(Arc::new(self.clone()));
+        IoRegion::reading(view, async {
             let length = usize::try_from(store.head_fresh(&self.key).await?.size)
                 .map_err(|_| payload_size())?;
             let allocation = store.exact_object_allocation(&self.key, length)?;

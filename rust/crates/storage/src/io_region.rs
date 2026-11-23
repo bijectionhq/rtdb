@@ -94,6 +94,17 @@ impl IoRegion {
         scope_io_owner!(HELD_VIEW, view, work; combine)
     }
 
+    /// Classic recovery selects a checkpoint while holding the storage owner's deletion gate.
+    /// Hosted callers supply their directory-issued registration through `reading`.
+    pub async fn reading_recovery<T>(
+        store: &dyn crate::ObjectStore, work: impl std::future::Future<Output = rtdb_types::Result<T>>,
+    ) -> rtdb_types::Result<T> {
+        match store.local_maintenance_store().filter(|store| crate::ObjectStore::defers_trie_releases(*store)) {
+            Some(store) => Self::reading(HeldView::recovery(store.hold_recovery_open().await?), work).await,
+            None => work.await,
+        }
+    }
+
     /// Checks the lease when each provider operation is admitted while polling the work.
     /// A nested lease narrows the one in scope where `leased` is called.
     /// Returns the work itself or its scoped future, so a lease adds no copy of the work to the caller's future.

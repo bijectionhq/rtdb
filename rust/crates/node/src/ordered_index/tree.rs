@@ -627,7 +627,7 @@ impl Tree {
 
     async fn admitted<T>(&self, work: impl Future<Output = T>) -> T {
         match &self.permit {
-            Some(permit) => IoRegion::retaining(permit.clone(), work).await,
+            Some(permit) => IoRegion::reading(rtdb_storage::HeldView::recovery(permit.clone()), work).await,
             None => work.await,
         }
     }

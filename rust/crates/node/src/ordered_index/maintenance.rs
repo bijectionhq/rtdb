@@ -12,7 +12,7 @@ use rtdb_maintenance::{
     input::{open_input, read_page},
 };
 use rtdb_replication::{PartitionLogs, RetainedTableReplay};
-use rtdb_storage::{ObjectKey, cache::BufferPool};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
@@ -223,8 +223,12 @@ impl OrderedIndexMaintenance {
 #[async_trait::async_trait]
 impl CycleWorker for OrderedIndexMaintenance {
     async fn collect(&self, cancellation: &CancellationToken) -> Result<()> {
-        self.refresh(&self.snapshots.snapshot().snapshot(), cancellation)
-            .await
+        let partition = self.snapshots.snapshot();
+        let snapshot = partition.snapshot();
+        let cut = snapshot.catalog_cut();
+        let paths = cut.and_then(|_| snapshot.compacted_primary_paths());
+        let view = HeldView::catalog(self.storage.object_store().as_ref(), partition, cut, paths).await?;
+        IoRegion::reading(view, self.refresh(&snapshot, cancellation)).await
     }
 }
 
