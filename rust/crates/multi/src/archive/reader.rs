@@ -72,6 +72,7 @@ struct Ready<'a> {
     port: u16,
 }
 
+#[derive(Clone)]
 pub(crate) struct StageSelector {
     pub destination: Uuid,
     pub operation: Uuid,

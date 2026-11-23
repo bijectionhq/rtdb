@@ -60,6 +60,11 @@ enum Action {
     RecoverCheckpoint {
         manifest_sha256: String,
     },
+    TransferCheckpoint {
+        source_manifest_sha256: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+    },
     StageCheckpointTransfer {
         source_manifest_sha256: String,
         destination: Uuid,
@@ -169,6 +174,21 @@ enum Reply {
         destination: Uuid,
         stage_operation: Uuid,
         disposal: DisposalReceipt,
+    },
+    Transferred {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        source_manifest_sha256: String,
+        database: String,
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+        replica_through: i64,
+        source_through: i64,
+        basis: rtdb_types::TransactionKey,
+        lifetime_floors_sha256: [u8; 32],
+        recovery_manifest_sha256: [u8; 32],
     },
     TransferTargetActivated {
         activation: rtdb_directory::CheckpointTransferActivation,
@@ -506,6 +526,67 @@ impl RecoveryService {
                     destination,
                     stage_operation,
                     staged_manifest_sha256,
+                })
+            }
+            Action::TransferCheckpoint { source_manifest_sha256, destination, stage_operation } => {
+                if installation.checkpoint_stage.is_some() || destination.is_nil()
+                    || destination == request.authority || stage_operation.is_nil()
+                    || !valid_manifest(&source_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let database = format!("checkpoint-stage-{destination}");
+                let stage = archive::stage_checkpoint_transfer(
+                    Arc::clone(&directory), &self.archive, &self.storage, self.keys.as_ref(),
+                    CheckpointStageIntent {
+                        operation: stage_operation,
+                        source: request.authority,
+                        capture: request.capture,
+                        source_manifest_sha256: source_manifest_sha256.clone(),
+                        destination,
+                        name: database.clone(),
+                        org: self.org.clone(),
+                    },
+                    self.hosted_task.clone(),
+                ).await?;
+                let staged_manifest_sha256 = stage.staged_manifest_sha256
+                    .filter(|digest| valid_manifest(digest))
+                    .ok_or_else(|| Anomaly::incorrect(
+                        "rtdb.multi/recovery-endpoint", "The private transfer stage has no exact inventory",
+                    ))?;
+                let selector = archive::StageSelector {
+                    destination, operation: stage_operation,
+                    manifest_sha256: staged_manifest_sha256.clone(),
+                    source: Some((request.authority, request.capture, self.org.clone())),
+                    transfer_only: true,
+                };
+                let sealed = archive::issue_checkpoint_transfer(
+                    Arc::clone(&directory), &self.storage, &self.archive, self.keys.as_ref(),
+                    selector.clone(), self.hosted_task.clone(),
+                ).await?;
+                let activation = archive::activate_checkpoint_transfer_target(
+                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                ).await?;
+                let terminal = activation.replica.bootstrap.terminal;
+                if terminal != sealed {
+                    return Err(Anomaly::incorrect(
+                        "rtdb.multi/recovery-endpoint", "The target activation has another terminal receipt",
+                    ));
+                }
+                Ok(Reply::Transferred {
+                    name: installation.name,
+                    authority: request.authority,
+                    capture: request.capture,
+                    source_manifest_sha256,
+                    database,
+                    destination,
+                    stage_operation,
+                    staged_manifest_sha256,
+                    replica_through: terminal.replica_through,
+                    source_through: terminal.source_through,
+                    basis: terminal.basis,
+                    lifetime_floors_sha256: terminal.lifetime_floors_sha256,
+                    recovery_manifest_sha256: activation.recovery_manifest_sha256,
                 })
             }
             Action::SealCheckpointTransferSource {

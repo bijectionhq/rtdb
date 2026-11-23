@@ -298,6 +298,8 @@ fn staged(
     let retained = record
         .checkpoint_stage
         .as_deref()
+        .or_else(|| record.checkpoint_transfer_activation.as_deref()
+            .map(|activation| &activation.replica.bootstrap.terminal.fence.destination))
         .filter(|stage| {
             &stage.intent == request
                 && &stage.media == media
