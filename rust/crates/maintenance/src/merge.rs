@@ -468,6 +468,10 @@ mod tests {
     #[test]
     fn same_time_compaction_keeps_fully_superseded_landing_assertions_until_erasure() {
         let memory = MemoryBudget::new(1 << 20);
+        let page = |events: &[StoredEvent]| {
+            let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Utf8))]);
+            EventBatch::new(build_event_batch(events, Some(fields), None).unwrap()).unwrap().page_events().unwrap()
+        };
         let assertions = [2, 1].map(|commit_position| StoredEvent {
             commit_position,
             entity_key: Some(Arc::from(b"entity".as_slice())),
