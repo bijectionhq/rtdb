@@ -2,7 +2,13 @@
 
 An installed journal owns the writer roster and grant, append decisions, protected read cuts, checkpoint selection, and the replay floor for one deployment. Keep the logical deployment, incarnation, group and generation fixed during worker and voter replacement. The physical voter digest changes only during independently funded cohort repair.
 
-Use a fresh deployment ID and Logkeeper placement for a cutover. The ordered application, command, and compact recovery-image formats require matching workers and voters. Version 4 of the ordered command and compact image admits every read as a fresh invocation and releases a read with a lost outcome by its identity. It keeps custodian-owned checkpoint and trim commands and exact trim credits. Version 7 of the application wire protocol carries the version 4 read outcomes and keeps the custodian's bounded inspection of a retained suffix and its newest retained maintenance cut. An existing RTDB directory record and its log offsets do not certify a Logkeeper history. Route the installation through the installed manifest when the initial group, storage and keys are ready.
+Use a fresh deployment ID and Logkeeper placement for a cutover.
+The ordered application, command, and compact recovery-image formats require matching workers and voters.
+The ordered command and compact image admit reads as fresh invocations and release a read with a lost outcome by its identity.
+They retain exact mutation receipts, custodian-owned checkpoint and trim commands, and exact trim credits.
+Application wire version 9 adds the custodian's bounded query of withdrawn hold owners and their eligibility for expiry disposal.
+An existing RTDB directory record and its log offsets do not certify a Logkeeper history.
+Route the installation through the installed manifest when the initial group, storage and keys are ready.
 
 ## Provision the journal and storage
 
@@ -102,15 +108,20 @@ The S3 operations are covered by an HTTP fixture and, when `RTDB_S3_ENDPOINT` na
 Read and recovery holds left by a disconnected worker can delay trim.
 Do not withdraw a worker merely because a gateway stopped reaching it.
 When retiring the worker, withdraw its exact enrollment with `logkeeper ordered withdraw CONTROL_JSON WORKER_UUID SERIAL`.
-Use the same administrator control manifest to release its remaining holds by expiry.
+On each maintenance pass the installed custodian checks bounded pages of withdrawn enrollments that still own holds, even while the writer grant is vacant.
+The journal derives each enrollment's eligibility from its selected state.
+The journal permits expiry disposal once the chosen decision time reaches the last serving lease end plus `clock_drift`, or immediately after withdrawal if the enrollment never held a lease.
+The custodian issues due disposals before trim and uses its local clock to attempt a decision when an idle journal's selected time has yet to advance.
+It retries a lost outcome with the same invocation and uses a fresh invocation after a chosen `Unavailable`.
+Trim can advance once all overlapping holds are released.
+
+An administrator can also request expiry disposal manually with the same control manifest.
 
 ```sh
 rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker WORKER_UUID --serial SERIAL
 ```
 
-The journal permits expiry disposal when its decision time reaches the enrollment's last lease end plus `clock_drift`, or immediately after withdrawal if the enrollment never held a lease.
 If the command reports `Unavailable`, rerun it after the deadline.
-The custodian can advance trim on a subsequent maintenance pass once all overlapping holds have been released.
 For earlier disposal, use `logkeeper ordered dispose-worker` only after verifying that the exact enrollment's processes and effect scope have permanently shut down, and keep the external disposition digest with the deployment's custody records.
 
 ## Journal payload keys and erasure rotation

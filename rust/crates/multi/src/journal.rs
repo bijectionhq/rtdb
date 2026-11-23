@@ -9,7 +9,7 @@ use ordered_logkeeper::ordered::{
     Hold, Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
     daemon::{ApplicationRoute, Client, Credentials},
     service::{
-        ReplayHead, ReplayPage, Route,
+        ReplayHead, ReplayPage, Route, WithdrawnWorker,
         wire::{self, Operation, Reply, SignedBarrier},
     },
 };
@@ -384,6 +384,16 @@ impl InstalledJournal {
         match self.call(Operation::CheckpointCut { next }).await? {
             Reply::CheckpointCut(cut) if cut.next_lsn == next => Ok(cut),
             _ => Err(mismatch("The peer selected a different checkpoint cut")),
+        }
+    }
+
+    pub(super) async fn withdrawn_workers(
+        &self,
+        after: Option<Enrollment>,
+    ) -> Result<Vec<WithdrawnWorker>> {
+        match self.call(Operation::WithdrawnWorkers { after }).await? {
+            Reply::WithdrawnWorkers(workers) => Ok(workers),
+            _ => Err(mismatch("The peer did not return withdrawn hold owners")),
         }
     }
 

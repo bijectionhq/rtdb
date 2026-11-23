@@ -19,7 +19,7 @@ use ordered_logkeeper::ordered::daemon::{
     ApplicationRoute, Client, Credentials, Manifest, SuccessorRoute,
 };
 use ordered_logkeeper::ordered::service::{
-    Route,
+    Route, WithdrawnWorker,
     wire::{self, Decision, Operation, Reply, WireError},
 };
 use ordered_logkeeper::ordered::{
@@ -495,7 +495,17 @@ async fn reconcile(client: &Client, grant: Grant, original: Request) -> AppendRe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim() {
-    let mut authority = Authority::new(Uuid::new_v4(), 4096, 1024, 1);
+    withdrawn_worker_disposal_and_trim(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_worker_hold_blocks_trim_past_the_deadline_without_disposal() {
+    withdrawn_worker_disposal_and_trim(false).await;
+}
+
+async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
+    let deployment = DeploymentRecord::new("shop", "acceptance", Vec::new(), now_ms());
+    let mut authority = Authority::new(deployment.id.parse().unwrap(), 4096, 1024, 1);
     authority.group_spec["limits"]["serving_lease"] = json!(3_000);
     authority.group_spec["limits"]["clock_drift"] = json!(5_000);
     let cohort = authority.start("disposal").await;
@@ -556,22 +566,6 @@ async fn expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim() 
         .receipt
         .outcome
     };
-    assert_eq!(
-        custody(Command::PrepareCheckpoint { preparation }).await,
-        Ok(Outcome::CheckpointPrepared(preparation)),
-    );
-    assert_eq!(
-        custody(Command::Publish {
-            checkpoint: selected
-        })
-        .await,
-        Ok(Outcome::Published(selected)),
-    );
-    assert_eq!(
-        custody(Command::DisposeExpired { enrollment }).await,
-        Err(Refusal::Stale),
-    );
-
     let lease = execute(
         &worker,
         request(route(&worker).await, principal, Command::Lease { grant }),
@@ -594,13 +588,25 @@ async fn expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim() 
         .outcome,
         Ok(Outcome::Withdrawn),
     );
-    let trim = Command::Trim {
-        selected,
-        through: selected.cut,
-    };
-    assert_eq!(custody(trim.clone()).await, Err(Refusal::Unavailable));
-
     let deadline = lease_end + initial.clock_drift;
+    let withdrawn = route(&custodian).await;
+    assert!(withdrawn.writer.grant.is_none());
+    assert!(withdrawn.time < lease_end);
+    let node = start_disposal_node(&authority, &cohort, deployment, automatic_disposal).await;
+    let pending = async || {
+        let Reply::WithdrawnWorkers(workers) = custodian
+            .call(Operation::WithdrawnWorkers { after: None })
+            .await
+            .unwrap()
+        else {
+            panic!("the journal did not report withdrawn hold owners");
+        };
+        workers
+    };
+    let expected_worker = WithdrawnWorker {
+        enrollment,
+        eligible_at: Some(deadline),
+    };
     let wait_until = async |time: u64| {
         tokio::time::sleep(Duration::from_millis(
             time.saturating_sub(now_ms().try_into().unwrap()),
@@ -608,61 +614,133 @@ async fn expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim() 
         .await;
     };
     wait_until(lease_end).await;
-    assert_eq!(
-        custody(Command::DisposeExpired { enrollment }).await,
-        Err(Refusal::Unavailable),
-    );
-    let during_drift = route(&custodian).await;
-    assert!((lease_end..deadline).contains(&during_drift.time));
-    assert_eq!(during_drift.floor, initial.floor);
+    assert_eq!(pending().await, [expected_worker]);
+    let idle = route(&custodian).await;
+    assert_eq!(idle.position, withdrawn.position);
+    assert_eq!(idle.time, withdrawn.time);
+    assert_eq!(idle.floor, initial.floor);
 
-    wait_until(deadline).await;
-    assert_eq!(custody(trim.clone()).await, Err(Refusal::Unavailable));
-    assert!(route(&custodian).await.time >= deadline);
+    if automatic_disposal {
+        tokio::time::timeout(DEADLINE, async {
+            while !pending().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the custodian did not dispose the expired enrollment on the idle journal");
+        let disposed = route(&custodian).await;
+        assert!(disposed.time >= deadline);
+        assert_eq!(disposed.position, idle.position + 1);
+        assert_eq!(disposed.checkpoint, initial.checkpoint);
+        assert_eq!(disposed.floor, initial.floor);
+    } else {
+        wait_until(deadline + 250).await;
+        assert_eq!(pending().await, [expected_worker]);
+        assert_eq!(route(&custodian).await.time, idle.time);
+    }
 
-    let control = authority.data.path().join("dispose-control.json");
-    write_json(
-        &control,
-        &json!({
-            "route": cohort.route,
-            "credentials": authority.administrator.credentials,
-        }),
-    );
-    let disposed = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_rtdb-multi"))
-            .arg("ordered-dispose-expired-worker")
-            .arg("--manifest")
-            .arg(control)
-            .args([
-                "--worker",
-                &enrollment.worker.to_string(),
-                "--serial",
-                &enrollment.serial.to_string(),
-            ])
-            .output()
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        disposed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&disposed.stderr)
+    assert_eq!(
+        custody(Command::PrepareCheckpoint { preparation }).await,
+        Ok(Outcome::CheckpointPrepared(preparation)),
     );
     assert_eq!(
-        serde_json::from_slice::<Enrollment>(&disposed.stdout).unwrap(),
-        enrollment
+        custody(Command::Publish {
+            checkpoint: selected
+        })
+        .await,
+        Ok(Outcome::Published(selected)),
     );
-    assert_eq!(
-        custody(trim).await,
-        Ok(Outcome::Trimmed(TrimResult {
-            from: initial.floor,
+    if automatic_disposal {
+        eventually(async || (route(&custodian).await.floor == selected.cut).then_some(())).await;
+    } else {
+        let trim = Command::Trim {
+            selected,
             through: selected.cut,
-            ordinary_bytes: record.byte_end - record.byte_start,
-            maintenance_bytes: 0,
-        })),
+        };
+        assert_eq!(custody(trim).await, Err(Refusal::Unavailable));
+        let blocked = route(&custodian).await;
+        assert!(blocked.time > deadline);
+        assert_eq!(blocked.floor, initial.floor);
+        assert_eq!(pending().await, [expected_worker]);
+    }
+    node.shutdown().await.unwrap();
+}
+
+async fn start_disposal_node(
+    authority: &Authority,
+    cohort: &Cohort,
+    deployment: DeploymentRecord,
+    automatic_disposal: bool,
+) -> process::RunningNode {
+    let root = authority.data.path();
+    let keys = Arc::new(LocalKeyService::new(root.join("keys")).unwrap());
+    let storage = CellStorage::Local {
+        root: root.join("serving"),
+    };
+    let archive = CellStorage::Local {
+        root: root.join("archive"),
+    };
+    admin::initialize_storage(&storage, keys.as_ref())
+        .await
+        .unwrap();
+    admin::initialize_storage(&archive, keys.as_ref())
+        .await
+        .unwrap();
+    let pgwire = reserve_port();
+    let control = reserve_port();
+    let pgwire_address = pgwire.local_addr().unwrap();
+    let control_address = control.local_addr().unwrap();
+    let installed = |identity: &Identity, role: Value| {
+        json!({
+            "incarnation": deployment.incarnation,
+            "log_epoch": deployment.log_epoch,
+            "authority": role,
+            "route": cohort.route,
+            "credentials": identity.credentials,
+        })
+    };
+    let standby = authority.enrollments[1];
+    let manifest = root.join("disposal-node.json");
+    write_json(
+        &manifest,
+        &json!([{
+            "deployment": deployment,
+            "worker": installed(&authority.workers[1], json!({"kind": "worker", "enrollment": standby})),
+            "custody": automatic_disposal.then(|| installed(&authority.custodian, json!({"kind": "custody"}))),
+            "endpoints": [{ "enrollment": standby, "control": control_address, "pgwire": pgwire_address }],
+            "archive": archive,
+            "archive_prefix": "checkpoints",
+        }]),
     );
-    assert_eq!(route(&custodian).await.floor, selected.cut);
+    let pgwire_port = pgwire_address.port();
+    let configuration = rtdb_server::config::NodeConfiguration::from_yaml(&format!(
+        "authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: {pgwire_port}\n  numThreads: 4\nflightSql: {{port: 0}}\n",
+    )).unwrap();
+    let mut agent = AgentOptions::new(storage);
+    agent.installed_journal_manifest = Some(manifest);
+    agent.watch_interval = Duration::from_millis(50);
+    let settings = process::NodeSettings {
+        configuration,
+        allocation_limit_bytes: 1 << 30,
+        control: control_address,
+        advertise_host: Some("127.0.0.1".into()),
+        hosted_task: None,
+        availability_zone: "custody-zone".into(),
+        engine_version: None,
+        agent,
+        lease: common::lease(),
+        pool: MemberPool::General,
+        claim_wait: Duration::from_millis(2),
+        keys,
+        cache_dir: root.join("cache"),
+        local_compaction: false,
+        capabilities: Some(common::secret()),
+    };
+    drop(pgwire);
+    drop(control);
+    process::start_node(MemoryDirectory::new(), settings)
+        .await
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

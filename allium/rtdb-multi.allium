@@ -541,6 +541,14 @@ contract LogService {
         -- A withdrawn enrollment that never held a lease is immediately eligible for expiry disposal.
         -- The disposal decision releases the holds of that exact enrollment.
 
+    @invariant CustodianDisposesExpiredWorkerHoldsBeforeTrim
+        -- The journal exposes a custodian-only bounded page of exact withdrawn enrollments that own holds in the selected state and their expiry disposal eligibility.
+        -- The custodian checks those enrollments before attempting trim on its maintenance pass.
+        -- The custodian attempts a fresh disposal when its clock or the selected journal time reaches the eligibility time, including while the journal is idle.
+        -- The journal stamps a fresh decision with its own time and rechecks eligibility.
+        -- A lost outcome within the retry horizon keeps the same invocation.
+        -- A chosen Unavailable allows a fresh invocation on a later pass.
+
     @invariant QuorumsCountDistinctJournals
         -- Each loglet slot names a distinct durable journal.
         -- The client verifies the journal on each session before sending a journal operation.

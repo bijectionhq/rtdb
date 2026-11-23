@@ -11,11 +11,12 @@ use super::{
 use crate::keys::{JournalKey, KeyService};
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
-    Checkpoint, Command, Cut, Enrollment, Grant, Hold, Request, Window, service::Route,
+    Checkpoint, Command, Cut, Enrollment, Hold, Outcome, Refusal, Request, Window,
+    service::Route,
 };
 use prost_types::Any;
 use rtdb_columnar::MemoryBudget;
-use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord};
+use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord, now_ms};
 use rtdb_format::{
     catalog::BlockCatalog,
     database::proto::{DatabaseConfig, RemoteStorage, database_config},
@@ -71,6 +72,7 @@ pub(crate) struct Placement {
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
     nomination: tokio::sync::Mutex<Option<Request>>,
+    worker_disposal: tokio::sync::Mutex<Option<Request>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
     publication: tokio::sync::Mutex<Option<(Checkpoint, Cut)>>,
 }
@@ -224,6 +226,7 @@ impl Routes {
                 archive_prefix: ObjectKey::new(entry.archive_prefix)?,
                 journal_window_bytes: entry.journal_window_bytes,
                 nomination: Default::default(),
+                worker_disposal: Default::default(),
                 checkpoint_reservations,
                 publication: Default::default(),
             });
@@ -575,6 +578,67 @@ impl Placement {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) async fn dispose_withdrawn_workers(&self) -> Result<()> {
+        let Some(custodian) = &self.custodian else {
+            return Ok(());
+        };
+        let mut pending = self.worker_disposal.lock().await;
+        Self::settle_worker_disposal(custodian, &mut pending).await?;
+        let mut after = None;
+        loop {
+            let workers = custodian.withdrawn_workers(after).await?;
+            let Some(last) = workers.last() else {
+                return Ok(());
+            };
+            after = Some(last.enrollment);
+            let mut route = custodian.route().await?;
+            for worker in workers {
+                let now = u64::try_from(now_ms()).unwrap_or_default();
+                if worker
+                    .eligible_at
+                    .is_some_and(|eligible| eligible <= now.max(route.time))
+                {
+                    *pending = Some(custodian.request(
+                        &route,
+                        Command::DisposeExpired {
+                            enrollment: worker.enrollment,
+                        },
+                    )?);
+                    Self::settle_worker_disposal(custodian, &mut pending).await?;
+                    route = custodian.route().await?;
+                }
+            }
+        }
+    }
+
+    async fn settle_worker_disposal(
+        custodian: &InstalledJournal,
+        pending: &mut Option<Request>,
+    ) -> Result<()> {
+        let Some(request) = pending.as_ref() else {
+            return Ok(());
+        };
+        let Command::DisposeExpired { enrollment } = request.command else {
+            return Err(invalid("The pending request is not an expiry disposal"));
+        };
+        let result = custodian.execute(request).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == "rtdb.multi/ordered-journal")
+        {
+            return result.map(|_| ());
+        }
+        *pending = None;
+        match result?.receipt.outcome {
+            Ok(Outcome::WorkerDisposed(disposed)) if disposed == enrollment => Ok(()),
+            Err(Refusal::Unavailable | Refusal::Expired) => Ok(()),
+            Err(reason) => Err(super::refused(reason)),
+            Ok(_) => Err(invalid(
+                "The journal disposed a different worker enrollment",
+            )),
+        }
     }
 
     pub(crate) async fn retain_selected(&self) -> Result<()> {

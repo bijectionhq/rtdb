@@ -1614,9 +1614,9 @@ impl NodeAgent {
             }
         }
 
-        // The custodian owns publication and trim even when this node has no
-        // journal grant and no database is ready to serve.
+        // The custodian can maintain retention even with no grant or running database.
         for (name, placement) in self.ordered.custody_placements() {
+            let _ = placement.dispose_withdrawn_workers().await;
             let _ = placement.retain_selected().await;
             let publish = placement.publish_checkpoint(self.keys.as_ref(), offered.remove(name),
                 &self.options.storage, self.node.memory());
