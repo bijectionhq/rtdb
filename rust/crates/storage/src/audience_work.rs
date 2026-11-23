@@ -65,7 +65,7 @@ pub fn current_turn() -> Option<TurnAllowance> {
 
 pub fn is_bounded() -> bool { CURRENT.try_with(|_| ()).is_ok() }
 
-pub(crate) fn current() -> Option<Budget> { CURRENT.try_with(Arc::clone).ok() }
+pub(crate) fn current() -> Option<Budget> { CURRENT.try_with(Budget::clone).ok() }
 
 pub(crate) async fn inherit<T>(budget: Option<Budget>, work: impl Future<Output = T>) -> T {
     match budget {
