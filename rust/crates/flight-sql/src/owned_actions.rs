@@ -187,6 +187,7 @@ pub(crate) const HELD_OWNED_POSITION_POINT_V1: &str = "rtdb.owned.ReadHeldPositi
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
+pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
@@ -211,9 +212,10 @@ const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
 pub(crate) const HELD_WORLD_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_COUNT_V1: &str = "rtdb.owned.CountHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_MEASURE_V1: &str = "rtdb.owned.MeasureHeldWorldRange.v1";
+pub(crate) const HELD_WORLD_OVERLAY_RANGE_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRangeAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
 #[derive(Clone, Copy)]
-pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange }
+pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange, OverlayRangeAt }
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
@@ -1703,6 +1705,10 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (system, request) = if matches!(order, WorldOrder::OverlayRangeAt) {
+            let (system, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world range has no revision"))?;
+            (Some(Timestamp(i64::from_be_bytes(*system))), rest)
+        } else { (None, request) };
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, arrow)?;
         let count = matches!(order, WorldOrder::ParentCount | WorldOrder::ParentMeasure);
@@ -1728,7 +1734,7 @@ impl Service {
                 let (count, witness) = held.snapshot.count(relation.clone(), path, request).await.map_err(status)?;
                 (count_batch(count)?, witness)
             };
-            (rows.schema(), None, witness, Some(rows))
+            (rows.schema(), None, Some(witness), Some(rows))
         } else {
             let (Some(after), Some(Value::Bool(descending)), Some(Value::I64(limit))) =
                 (row.get("after"), row.get("descending"), row.get("limit"))
@@ -1737,20 +1743,27 @@ impl Service {
                 lower, upper, after: compound_bound(Some(after))?, descending: *descending,
                 limit: usize::try_from(*limit).map_err(|_| invalid("Invalid held world range limit"))?,
             };
-            let (page, witness) = if matches!(order, WorldOrder::OverlayRange) {
-                held.snapshot.overlay_range(relation.clone(), path, request, valid_at).await
+            let (page, witness) = if let Some(system) = system {
+                (held.snapshot.overlay_range_at(relation.clone(), path, request, valid_at, system).await.map_err(status)?, None)
             } else {
-                held.snapshot.range(relation.clone(), path, request, valid_at).await
-            }.map_err(status)?;
+                let (page, witness) = if matches!(order, WorldOrder::OverlayRange) {
+                    held.snapshot.overlay_range(relation.clone(), path, request, valid_at).await
+                } else {
+                    held.snapshot.range(relation.clone(), path, request, valid_at).await
+                }.map_err(status)?;
+                (page, Some(witness))
+            };
             (page.schema, page.batch, witness, None)
         };
         let _charge = call.reserve(wire::add(wire::schema_bound(&schema)?, 256)?)?;
-        let nonce = held.remember(call, witness, false)?;
         let mut metadata = schema.metadata().clone();
-        metadata.insert(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string());
+        if let Some(witness) = witness {
+            let nonce = held.remember(call, witness, false)?;
+            metadata.insert(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string());
+        }
         let schema = schema.as_ref().clone().with_metadata(metadata);
         let rows = count_rows.as_ref().or_else(|| page.as_ref().map(OwnedBatch::batch));
-        let reply = self.owned_point_reply(&schema, rows, held.snapshot.present(), valid_at, None)?;
+        let reply = self.owned_point_reply(&schema, rows, system.unwrap_or_else(|| held.snapshot.present()), valid_at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2391,11 +2404,15 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], overlay: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], overlay: bool, historical: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         held.snapshot.check().map_err(status)?;
+        let (system, body) = if historical {
+            let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world identities have no revision"))?;
+            (Some(Timestamp(i64::from_be_bytes(*system))), rest)
+        } else { (None, body) };
         let (relation, arrow_bytes) = split_relation(body)?;
         let request = decode_batch(call, arrow_bytes)?;
         let request = request.batch();
@@ -2411,7 +2428,9 @@ impl Service {
             .filter(|_| field.metadata().is_empty())
             .ok_or_else(|| invalid("Owned world identity bound must be nullable Utf8"))?;
         let after = (!after.is_null(0)).then(|| after.value(0));
-        let page = if overlay {
+        let page = if let Some(system) = system {
+            held.snapshot.overlay_identities_at(&relation, valid, after, limit, system).await
+        } else if overlay {
             held.snapshot.overlay_identities(&relation, valid, after, limit).await
         } else {
             held.snapshot.identity_page(&relation, valid, after, limit).await
@@ -2423,7 +2442,7 @@ impl Service {
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
-        let reply = self.owned_point_reply(&schema, Some(&rows), held.snapshot.present(), valid, None)?;
+        let reply = self.owned_point_reply(&schema, Some(&rows), system.unwrap_or_else(|| held.snapshot.present()), valid, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }

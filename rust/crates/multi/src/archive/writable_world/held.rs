@@ -252,6 +252,11 @@ impl HeldCheckpointWorld {
     pub async fn preflight_accepted_scope(&self, relations: &[OwnedRelation], system: Timestamp) -> Result<Timestamp> {
         self.check()?;
         let clock = self.open.snapshot.certify_world_accepted_scope(&self.open.record, relations, system).await?;
+        self.require_accepted_archive_scope(relations).await?;
+        Ok(clock)
+    }
+
+    async fn require_accepted_archive_scope(&self, relations: &[OwnedRelation]) -> Result<()> {
         let guard = self.open.snapshot.relation_release_guard(relations)?;
         let mut schemas = Vec::with_capacity(relations.len());
         for relation in relations {
@@ -265,8 +270,7 @@ impl HeldCheckpointWorld {
         self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         guard()?;
-        self.check()?;
-        Ok(clock)
+        self.check()
     }
 
     pub async fn accepted_point(
@@ -509,6 +513,20 @@ impl HeldCheckpointWorld {
         Ok((page, witness))
     }
 
+    pub async fn overlay_range_at(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>,
+        valid: Timestamp, system: Timestamp,
+    ) -> Result<OwnedRangePage> {
+        self.check_relation(&relation)?;
+        let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, &relation, system).await?;
+        self.require_accepted_archive_scope(std::slice::from_ref(&relation)).await?;
+        let page = cut.overlay_range(&path, request, valid).await?;
+        let columns = page.schema.fields().iter().map(|field| field.name().clone()).collect::<Vec<_>>();
+        self.require_parent_path(&relation, &path, &columns, None).await?;
+        self.check_relation(&relation)?;
+        Ok(page)
+    }
+
     async fn require_overlay_coverage(&self, relation: &OwnedRelation, witness: &OwnedWorldWitness) -> Result<()> {
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         self.require_archive_coverage(vec![(relation.clone(), witness.purge_frontier())], guard).await
@@ -741,6 +759,23 @@ impl HeldCheckpointWorld {
         let candidates = self.open.snapshot.world_identity_candidates(
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;
+        self.finish_overlay_identities(relation, candidates, limit)
+    }
+
+    pub async fn overlay_identities_at(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize, system: Timestamp,
+    ) -> Result<WorldIdentityPage> {
+        self.check_relation(relation)?;
+        if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
+        let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
+        self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
+        let candidates = cut.overlay_identities(valid, after, limit + 1).await?;
+        self.finish_overlay_identities(relation, candidates, limit)
+    }
+
+    fn finish_overlay_identities(
+        &self, relation: &OwnedRelation, candidates: rtdb_query::OwnedIdentityCandidates, limit: usize,
+    ) -> Result<WorldIdentityPage> {
         let (mut keys, reservations) = candidates.into_parts();
         let more = keys.len() > limit;
         keys.truncate(limit);

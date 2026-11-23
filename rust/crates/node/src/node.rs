@@ -2197,6 +2197,26 @@ pub struct OwnedWorldAcceptedCut<'a> {
 }
 
 impl OwnedWorldAcceptedCut<'_> {
+    pub async fn overlay_range(
+        &self, path: &rtdb_types::OwnedRelation, request: crate::OwnedRangeRequest<'_>, valid: Timestamp,
+    ) -> Result<crate::OwnedRangePage> {
+        let context = self.held.relation_context(self.relation)?;
+        let context = context.with_owned_system_cut(self.system, &context.cancellation)?;
+        let overlay = self.relation.in_world(self.world)?;
+        let result = crate::ordered_index::owned_range(
+            context, &self.held.owner, &overlay, path,
+            crate::ordered_index::RowBounds::Compound(request), Some(valid),
+        ).await?;
+        self.held.check_relation(self.relation)?;
+        Ok(result)
+    }
+
+    pub async fn overlay_identities(
+        &self, valid: Timestamp, after: Option<&str>, fetch: usize,
+    ) -> Result<rtdb_query::OwnedIdentityCandidates> {
+        self.held.world_identity_candidates_at(self.world, self.relation, self.system, valid, after, fetch).await
+    }
+
     pub async fn shadow(
         &self, id: &rtdb_types::EntityId, valid: Timestamp,
     ) -> Result<OwnedWorldShadowRead> {

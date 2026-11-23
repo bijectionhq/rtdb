@@ -104,6 +104,10 @@ pub trait OwnedWorldRead: Send + Sync {
     fn overlay_range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
+    fn overlay_range_at<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<OwnedRangePage>>;
     fn parent_pin(&self) -> rtdb_types::Iid;
     fn until(&self) -> Timestamp;
     fn evidence_until(&self) -> Timestamp;
@@ -121,6 +125,10 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn overlay_identities<'a>(
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+    ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn overlay_identities_at<'a>(
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>,
+        limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn version<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId,
