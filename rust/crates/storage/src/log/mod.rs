@@ -20,6 +20,28 @@ pub trait AppendTimestampSource: Send + Sync {
     fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> Result<Timestamp>;
 }
 
+/// The provider samples this clock after preparing the local append and before allocating its position.
+pub struct GuardedAppend<'a> {
+    clock: &'a (dyn Fn() -> Timestamp + Sync),
+    staged_upper: Timestamp,
+    cutoff: Timestamp,
+}
+
+impl<'a> GuardedAppend<'a> {
+    pub fn new(clock: &'a (dyn Fn() -> Timestamp + Sync), staged_upper: Timestamp, cutoff: Timestamp) -> Self {
+        Self { clock, staged_upper, cutoff }
+    }
+
+    pub fn sample(self) -> Result<Timestamp> {
+        let now = (self.clock)();
+        let upper = now.0.checked_add(1).map(Timestamp);
+        if upper.is_none_or(|upper| upper.0 <= 0 || upper < self.staged_upper || upper >= self.cutoff) {
+            return Err(Error::GuardedAppendCutoff);
+        }
+        Ok(now)
+    }
+}
+
 struct SuppliedTimestamp;
 impl AppendTimestampSource for SuppliedTimestamp {
     fn timestamp(&self, _: &[u8], supplied: Timestamp) -> Result<Timestamp> { Ok(supplied) }
@@ -130,8 +152,14 @@ pub trait Log: Send + Sync {
     /// The provider's fixed size limit for one append, before any provider-specific wrapping.
     /// Absence means callers cannot admit an inline-only write using this provider.
     fn maximum_append_bytes(&self) -> Option<usize> { None }
+    /// The provider also implements guarded admission for an append of this size.
+    fn maximum_guarded_append_bytes(&self) -> Option<usize> { None }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
+    /// Fixes append order only if the provider's final admission sample is inside the guard.
+    async fn enqueue_guarded(&self, _payload: Bytes, _guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
+        Err(Error::GuardedAppendUnsupported)
+    }
     fn latest(&self) -> Result<LogOffset>;
     /// Reports a prefix floor without opening a cursor. This applies to providers where the first
     /// requested replay offset is the preceding offset plus one. An observation does not reserve records.

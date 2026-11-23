@@ -1,4 +1,4 @@
-use super::{AppendReceipt, AppendTimestampSource, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
+use super::{AppendReceipt, AppendTimestampSource, GuardedAppend, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
 use crate::{Error, Result, object_store::ReadReservation};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -77,6 +77,25 @@ impl MemoryLog {
         let _records = self.shared.records.lock();
         self.shared.progress.close();
     }
+
+    fn enqueue_at(&self, payload: Bytes, sample: impl FnOnce(&[u8]) -> Result<Timestamp>) -> Result<AppendReceipt> {
+        if payload.len() > self.shared.maximum_message_bytes {
+            return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.shared.maximum_message_bytes });
+        }
+        let mut records = self.shared.records.lock();
+        self.shared.progress.latest()?;
+        let next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        // Release the producer's allocation charge once this log owns the payload.
+        let payload = Bytes::copy_from_slice(&payload);
+        let timestamp = sample(&payload)?;
+        let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
+        records.next = next;
+        records.values.push_back(LogRecord { metadata, payload });
+        self.shared.progress.advance(metadata.offset);
+        let (sender, durable) = oneshot::channel();
+        let _ = sender.send(Ok(metadata));
+        Ok(AppendReceipt::new(durable))
+    }
 }
 
 fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
@@ -89,23 +108,14 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
 #[async_trait]
 impl Log for MemoryLog {
     fn maximum_append_bytes(&self) -> Option<usize> { Some(self.shared.maximum_message_bytes) }
+    fn maximum_guarded_append_bytes(&self) -> Option<usize> { self.maximum_append_bytes() }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        if payload.len() > self.shared.maximum_message_bytes {
-            return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.shared.maximum_message_bytes });
-        }
-        let mut records = self.shared.records.lock();
-        self.shared.progress.latest()?;
-        let next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
-        let timestamp = self.shared.timestamps.timestamp(&payload, timestamp)?;
-        let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
-        records.next = next;
-        // The log owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
-        records.values.push_back(LogRecord { metadata, payload: Bytes::copy_from_slice(&payload) });
-        self.shared.progress.advance(metadata.offset);
-        let (sender, durable) = oneshot::channel();
-        let _ = sender.send(Ok(metadata));
-        Ok(AppendReceipt::new(durable))
+        self.enqueue_at(payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
+    }
+
+    async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
+        self.enqueue_at(payload, |_| guard.sample())
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.progress.latest() }

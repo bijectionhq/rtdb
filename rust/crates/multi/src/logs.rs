@@ -16,7 +16,7 @@ use prost_types::Any;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope};
 use rtdb_logkeeper::{QuorumLog, StreamConfig};
 use rtdb_node::{AwaitAuthority, ClosedEpochRecovery, LogAccess, LogFactory, OpenedLogs, PlacedReceiptCodec, ReplicaReadIndex};
-use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
+use rtdb_storage::log::{AppendReceipt, GuardedAppend, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, BlockIndex, JournalEndpoint, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -354,9 +354,15 @@ impl Log for SealedLog {
     fn maximum_append_bytes(&self) -> Option<usize> {
         self.inner.maximum_append_bytes()?.checked_sub(SEALED_OVERHEAD)
     }
+    fn maximum_guarded_append_bytes(&self) -> Option<usize> {
+        self.inner.maximum_guarded_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+    }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+    }
+    async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
+        self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }

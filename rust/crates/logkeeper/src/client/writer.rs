@@ -416,16 +416,19 @@ impl Writer {
         }
     }
 
-    pub fn enqueue(self: &Arc<Self>, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+    pub fn enqueue(self: &Arc<Self>, payload: Bytes, sample: impl FnOnce() -> Result<Timestamp>) -> Result<AppendReceipt> {
         let mut state = self.state.lock();
         let pipeline = match &mut *state {
             State::Open(pipeline) => pipeline,
             State::Deposed { promised } => return Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
         };
         let lsn = pipeline.next_lsn;
-        pipeline.next_lsn = lsn.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        let next = lsn.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
         // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
-        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, payload: Bytes::copy_from_slice(&payload) };
+        let payload = Bytes::copy_from_slice(&payload);
+        let timestamp = sample()?;
+        pipeline.next_lsn = next;
+        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, payload };
         pipeline.history.push(lsn, self.epoch);
         let (receipt, durable) = oneshot::channel();
         pipeline.buffered_bytes += entry.payload.len();

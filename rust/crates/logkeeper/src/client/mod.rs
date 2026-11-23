@@ -11,7 +11,7 @@ use bytes::Bytes;
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message;
-use rtdb_storage::log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead};
+use rtdb_storage::log::{AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::{Error, Result};
 use rtdb_types::{Anomaly, JournalEndpoint, Timestamp, valid_journal_identity};
@@ -293,6 +293,15 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
 }
 
 impl QuorumLog {
+    fn enqueue_at(&self, payload: Bytes, sample: impl FnOnce() -> Result<Timestamp>) -> Result<AppendReceipt> {
+        let maximum = self.shared.ensemble.config.maximum_message_bytes;
+        if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }
+        self.shared.check_open()?;
+        match &self.shared.role {
+            Role::Writer(writer) => writer.enqueue(payload, sample),
+            Role::Reader(_) => Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream))),
+        }
+    }
     /// Bounds writes completed before this call on the exact active ensemble.
     /// The caller must wait for committed application through the returned position.
     pub async fn read_index(&self, epoch: u64) -> Result<LogOffset> {
@@ -505,15 +514,14 @@ impl Log for QuorumLog {
     fn maximum_append_bytes(&self) -> Option<usize> {
         matches!(&self.shared.role, Role::Writer(_)).then_some(self.shared.ensemble.config.maximum_message_bytes)
     }
+    fn maximum_guarded_append_bytes(&self) -> Option<usize> { self.maximum_append_bytes() }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        let maximum = self.shared.ensemble.config.maximum_message_bytes;
-        if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }
-        self.shared.check_open()?;
-        match &self.shared.role {
-            Role::Writer(writer) => writer.enqueue(payload, timestamp),
-            Role::Reader(_) => Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream))),
-        }
+        self.enqueue_at(payload, || Ok(timestamp))
+    }
+
+    async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
+        self.enqueue_at(payload, || guard.sample())
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.latest().map(LogOffset) }

@@ -1274,7 +1274,7 @@ impl ReplicationDriver {
         let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
         let context = Arc::clone(&self.resolve);
         let clock = Arc::clone(&self.clock);
-        let maximum_inline_bytes = self.logs.replica_inline_limit();
+        let maximum_inline_bytes = self.logs.replica_guarded_append_limit();
         leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
             let SourceInput { position, log_time, work, _decode_charge } = source;
             let result = match work {
