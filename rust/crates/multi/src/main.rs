@@ -384,7 +384,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             logkeeper.run_until(cancellation).await
         }
         "node" => {
-            let directory = directory(arguments.required("directory")?).await?;
             let mut configuration = match arguments.optional("config") {
                 Some(path) => NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?,
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
@@ -393,8 +392,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 configuration.flight_sql.as_mut().filter(|flight| flight.port >= 0)
                     .ok_or_else(|| usage("--flight-audience requires a Flight SQL configuration".into()))?.audience = Some(audience);
             }
+            let audience = configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
+            let directory = open_directory(arguments.required("directory")?, audience).await?;
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
-            if configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some()) {
+            if audience {
                 agent.audience_journal_port = Some(arguments.required("audience-journal-port")?.parse::<u16>().ok()
                     .filter(|port| *port != 0).ok_or_else(|| usage("--audience-journal-port must be a positive port".into()))?);
             } else if arguments.present("audience-journal-port") {
@@ -1017,8 +1018,15 @@ async fn dynamo_cell_map(_: &str) -> Result<Arc<dyn CellMap>> {
 }
 
 async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
-    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false).await; }
-    if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true).await; }
+    open_directory(spec, false).await
+}
+
+async fn open_directory(spec: &str, audience: bool) -> Result<Arc<dyn Directory>> {
+    if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false, audience).await; }
+    if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true, audience).await; }
+    if audience {
+        return Err(Anomaly::unsupported("rtdb.multi/audience-directory", "An audience holder requires a directory with a dedicated read transport"));
+    }
     let mut attempts = 0;
     loop {
         match RemoteDirectory::connect(spec).await {
@@ -1030,24 +1038,35 @@ async fn directory(spec: &str) -> Result<Arc<dyn Directory>> {
 }
 
 #[cfg(feature = "dynamodb")]
-async fn dynamodb(prefix: &str, pack_parked: bool) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(prefix: &str, pack_parked: bool, audience: bool) -> Result<Arc<dyn Directory>> {
     let tables = rtdb_directory::DynamoTables::with_prefix(prefix);
     let directory = match std::env::var("RTDB_DYNAMODB_ENDPOINT") {
         Ok(endpoint) => {
             let directory = rtdb_directory::DynamoDirectory::local(&endpoint, tables);
             directory.create_tables().await?;
-            directory
+            if audience { directory.with_audience_reader(rtdb_directory::DynamoDirectory::local_client(&endpoint))? }
+            else { directory }
         }
-        Err(_) => rtdb_directory::DynamoDirectory::from_sdk_config(
-            &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await, tables,
-        ),
+        Err(_) => {
+            let load = || aws_config::load_defaults(aws_config::BehaviorVersion::latest());
+            if audience {
+                let (ordinary, reader) = tokio::join!(load(), load());
+                if ordinary.endpoint_url() != reader.endpoint_url() {
+                    return Err(Anomaly::incorrect("rtdb.multi/audience-directory", "Both clients must name the same directory endpoint"));
+                }
+                rtdb_directory::DynamoDirectory::from_sdk_config(&ordinary, tables)
+                    .with_audience_reader(aws_sdk_dynamodb::Client::new(&reader))?
+            } else {
+                rtdb_directory::DynamoDirectory::from_sdk_config(&load().await, tables)
+            }
+        }
     };
     let directory = if pack_parked { directory.with_packed_parked_records() } else { directory };
     Ok(Arc::new(directory))
 }
 
 #[cfg(not(feature = "dynamodb"))]
-async fn dynamodb(_: &str, _: bool) -> Result<Arc<dyn Directory>> {
+async fn dynamodb(_: &str, _: bool, _: bool) -> Result<Arc<dyn Directory>> {
     Err(Anomaly::unsupported("rtdb.multi/dynamodb", "This binary was built without the dynamodb feature"))
 }
 

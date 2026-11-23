@@ -71,7 +71,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
             "An audience Flight listener and its read-only journal port must be installed together"));
     }
-    if audience.is_some() { directory.prepare_audience_reads()?; }
+    if audience.is_some() { directory.require_audience_reads()?; }
     if let Some(archive) = &settings.agent.world_archive {
         crate::archive::require_independent_world_archive(&settings.agent.storage, archive)?;
     }
