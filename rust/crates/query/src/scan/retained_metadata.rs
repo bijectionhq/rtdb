@@ -79,27 +79,40 @@ impl PartitionScan {
     ) -> Result<Option<Value>> {
         let clock_id = rtdb_types::EntityId::Integer(head.tx_id.0).iid();
         for iids in [Some([clock_id].into()), None] {
+            let complete_history = iids.is_none();
             let Some(mut clock) = self.retention_scan(
                 snapshot, TableRef::new("xt", "txs"), iids, &["system_time", "receipt_time"], TemporalFilter::All,
             ).await? else { return Ok(None); };
-            let mut observed = None;
+            let mut exact = None;
+            let mut prior = None;
             while let Some(page) = Box::pin(clock.next_batch()).await? {
                 for row in 0..page.len {
                     let time = page.columns[0].value(row)?;
-                    if !matches!(time, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == head.system_time.0) {
-                        continue;
-                    }
-                    if observed.is_some() {
-                        return Err(invalid("transaction-metadata", "Multiple clocks for the captured transaction"));
-                    }
-                    observed = Some(match page.columns[1].value(row)? {
-                        time @ Value::Timestamp { unit: TimeUnit::Microsecond, .. } => Some(time),
+                    let Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } = time else {
+                        return Err(invalid("transaction-metadata", "A transaction has no system time"));
+                    };
+                    if value > head.system_time.0 || (!complete_history && value != head.system_time.0) { continue; }
+                    let observed = match page.columns[1].value(row)? {
+                        Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Some(value),
                         Value::Null | Value::Undefined => None,
                         _ => return Err(invalid("transaction-metadata", "The retained clock has no timestamp")),
-                    });
+                    };
+                    if value == head.system_time.0 {
+                        if exact.replace(observed).is_some() {
+                            return Err(invalid("transaction-metadata", "Multiple clocks for the captured transaction"));
+                        }
+                    } else if let Some(observed) = observed {
+                        prior = Some(prior.map_or(observed, |prior: i64| prior.max(observed)));
+                    }
                 }
             }
-            if let Some(observed) = observed { return Ok(observed); }
+            if let Some(exact) = exact
+                && (exact.is_some() || complete_history)
+            {
+                return Ok(exact.or(prior).map(|value| Value::Timestamp {
+                    value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+                }));
+            }
         }
         Err(invalid("transaction-metadata", "The retained clock cannot be matched to the captured transaction"))
     }

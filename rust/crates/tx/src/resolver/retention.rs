@@ -38,8 +38,7 @@ impl OpenTransaction<'_> {
 pub async fn installed_receipt_time(
     context: std::sync::Arc<rtdb_query::QueryContext>, head: rtdb_types::TransactionKey,
 ) -> Result<Option<Timestamp>> {
-    use rtdb_query::PreparedQuery;
-    use rtdb_types::{LogicalType, ScalarType, TableRef};
+    use rtdb_types::TableRef;
 
     let database = rtdb_plan::Catalog::default_database(&context.catalog);
     let [snapshot] = context.catalog.database(database)?.partitions.as_slice() else {
@@ -47,39 +46,54 @@ pub async fn installed_receipt_time(
     };
     if !snapshot.column_names(&TableRef::new("xt", "txs")).contains("receipt_time") { return Ok(None); }
     let system_time = || super::time_value(head.system_time);
-    for (sql, arguments) in [
-        ("SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ?",
-            vec![Value::I64(head.tx_id.0), system_time()]),
-        ("SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE system_time = ?", vec![system_time()]),
-    ] {
-        let options = rtdb_sql::PrepareOptions {
-            parameter_types: arguments.iter().enumerate().map(|(slot, value)| {
-                let ty = match value { Value::I64(_) => LogicalType::Scalar(ScalarType::I64), _ => value.logical_type() };
-                (slot, ty)
-            }).collect(),
-            default_timezone: context.timezone.clone(),
-            generate_series_end_exclusive: context.options.generate_series_end_exclusive,
-            ..Default::default()
-        };
-        let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
-        let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context.clone(), arguments).await?;
-        let mut observed = None;
-        while let Some(page) = cursor.next_batch().await? {
-            let batch = page.batch();
-            if batch.num_rows() == 0 { continue; }
-            if batch.num_rows() != 1 || observed.is_some() {
-                return Err(clock_error("The durable receipt clock has multiple predecessors"));
-            }
-            let value = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
-            observed = Some(match value {
-                Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Some(Timestamp(value)),
-                Value::Null | Value::Undefined => None,
-                _ => return Err(clock_error("The durable receipt clock has no timestamp")),
-            });
+    let point = read_receipt_clock_row(&context,
+        "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ?",
+        vec![Value::I64(head.tx_id.0), system_time()],
+    ).await?;
+    let exact = match point {
+        Some(clock) => Some(clock),
+        None => read_receipt_clock_row(&context,
+            "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE system_time = ?",
+            vec![system_time()],
+        ).await?,
+    }.ok_or_else(|| clock_error("The installed transaction predecessor is missing"))?;
+    if let Some(exact) = exact { return Ok(Some(exact)); }
+
+    // A pre-retention resolver can install a successor without carrying the clock.
+    Ok(read_receipt_clock_row(&context,
+        "SELECT MAX(receipt_time) FROM xt.txs FOR ALL VALID_TIME WHERE system_time <= ?",
+        vec![system_time()],
+    ).await?.flatten())
+}
+
+async fn read_receipt_clock_row(
+    context: &std::sync::Arc<rtdb_query::QueryContext>, sql: &str, arguments: Vec<Value>,
+) -> Result<Option<Option<Timestamp>>> {
+    use rtdb_query::PreparedQuery;
+
+    let options = rtdb_sql::PrepareOptions {
+        parameter_types: arguments.iter().enumerate().map(|(slot, value)| (slot, value.logical_type())).collect(),
+        default_timezone: context.timezone.clone(),
+        generate_series_end_exclusive: context.options.generate_series_end_exclusive,
+        ..Default::default()
+    };
+    let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
+    let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context.clone(), arguments).await?;
+    let mut observed = None;
+    while let Some(page) = cursor.next_batch().await? {
+        let batch = page.batch();
+        if batch.num_rows() == 0 { continue; }
+        if batch.num_rows() != 1 || observed.is_some() {
+            return Err(clock_error("The durable receipt clock has multiple predecessors"));
         }
-        if let Some(observed) = observed { return Ok(observed); }
+        let value = read_value(batch.schema().field(0), batch.column(0).as_ref(), 0)?;
+        observed = Some(match value {
+            Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Some(Timestamp(value)),
+            Value::Null | Value::Undefined => None,
+            _ => return Err(clock_error("The durable receipt clock has no timestamp")),
+        });
     }
-    Err(clock_error("The installed transaction predecessor is missing"))
+    Ok(observed)
 }
 
 fn clock_error(message: &str) -> Anomaly { Anomaly::fault("rtdb.tx/retention-clock", message) }

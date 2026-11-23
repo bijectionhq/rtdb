@@ -85,6 +85,7 @@ The resolver tests cover the compatibility assertion and reuse of a placed ident
 
 The durable transaction row stores both the raw source append timestamp and the receipt clock carried forward from its exact predecessor.
 The receipt clock is local to the installed history and survives replay, a writer change, and a clock regression.
+If a pre-retention writer installs a newer result without a clock, resumed readers and writers carry forward the last observed clock from the same history.
 A bounded application retry remains expired at its exclusive cutoff even when the next append clock sample is earlier.
 Its identity remains scoped by principal and, in a placed deployment, the history fingerprint across writer epochs.
 Legacy application keys remain reusable after their window ends.

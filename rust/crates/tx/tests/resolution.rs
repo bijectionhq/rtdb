@@ -1173,6 +1173,50 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(!refused_slice.writes().tables().contains_key(&table));
 }
 
+struct ClocklessRecord;
+
+#[async_trait::async_trait]
+impl TransactionWriter for ClocklessRecord {
+    async fn write(&mut self, _: &mut OpenTransaction<'_>) -> Result<WriterResult> {
+        Ok(WriterResult::Committed { user_metadata: None })
+    }
+}
+
+#[tokio::test]
+async fn a_clockless_successor_cannot_reopen_an_expired_bounded_retry() {
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = Value::Struct(StructFields::from([(
+        "rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("00112233445566778899aabbccddeeff".into())),
+            ("not_after_micros".into(), Value::I64(1_000_000)),
+        ])),
+    )]));
+    let source = || SourceTransaction::new(vec![put(&context, 1, 0, i64::MAX)], SubmitOptions {
+        user_metadata: Some(UserMetadata::new(metadata.clone(), &context.memory).unwrap()),
+        ..Default::default()
+    }, &context.memory).unwrap();
+    let original = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(), &context).await.unwrap();
+    assert!(original.result().committed());
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(1_000_000), request(vec![], &context), &context).await.unwrap();
+    let receipts = &cut.writes().tables()[&TableRef::new("xt", "bounded_retry_receipts")];
+    assert!(matches!(receipts.batch().unwrap().view().read_event(0).unwrap().operation, StoredOperation::Erase));
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    let clockless = resolver.resolve_external(state.snapshot(), Timestamp(1_000_001), None, None, &mut ClocklessRecord, &context).await.unwrap();
+    let history = &clockless.writes().tables()[&TableRef::new("xt", "txs")];
+    let StoredOperation::Put(history) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
+        panic!("expected clockless transaction history");
+    };
+    assert_eq!(history.get("receipt_time"), Some(&Value::Null));
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
+
+    let mut reopened = TxResolver::new(Some(clockless.result().tx_key()), SourcePosition(2), None, &context.memory).unwrap();
+    let retry = reopened.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(99), source(), &context).await.unwrap();
+    assert_eq!(retry.result().error().unwrap().code, "rtdb/idempotency-expired");
+}
+
 #[tokio::test]
 async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome_survives() {
     use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext};
@@ -1223,6 +1267,9 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
     };
     let history = "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0";
     let predicate = "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0 AND user_metadata IS NOT NULL";
+    let clockless = resolver.resolve_external(state.snapshot(), Timestamp(101), None, None, &mut ClocklessRecord, &context).await.unwrap();
+    assert!(clockless.result().committed());
+    state.apply(resolver.take_head().unwrap().writes()).unwrap();
     assert_eq!(query(state.snapshot(), predicate).await, [vec![Value::Bool(true), metadata]]);
     let ordinals = "SELECT attname, attnum, atttypid FROM pg_catalog.pg_attribute         WHERE attrelid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = 'txs')         AND attname IN ('receipt_time', 'source_log_time', 'system_time') ORDER BY attnum";
     assert_eq!(query(state.snapshot(), ordinals).await, [
@@ -1231,7 +1278,7 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
         vec![Value::Utf8("system_time".into()), Value::I32(10), Value::I32(1184)],
     ]);
     let expiry = 100 + RECEIPT_WINDOW_MICROS;
-    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(11), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
+    let cut = resolver.resolve_source(state.snapshot(), SourcePosition(12), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
     let sidecar = cut.writes().tables()[&TableRef::new("xt", "idempotency_receipts")].batch().unwrap();
     let erased = sidecar.view().read_event(0).unwrap();
     assert_eq!(erased.iid, EntityId::Integer(0).iid());
