@@ -57,7 +57,7 @@ pub fn prepare_submission_with_sql_options(operations: Vec<TxOp>, options: Submi
         };
         match expanded { Some(operations) => output.extend(operations), None => output.push(Operation::Public(operation)) }
     }
-    SourceTransaction::from_operations(output, options, memory)
+    SourceTransaction::from_operations(output, options, memory)?.with_bounded_retry()
 }
 
 fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, database: &str, memory: &Arc<MemoryBudget>, sql_options: &rtdb_sql::PrepareOptions) -> Result<Option<Vec<Operation>>> {

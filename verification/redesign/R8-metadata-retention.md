@@ -53,3 +53,30 @@ Metadata naming an erased unit is erased with it before the window ends.
 ## Open questions
 
 - Which `xt.txs` columns survive the window.
+
+## Bounded application retry identities
+
+Native clients can set `rtdb_retry_v1: {nonce: '0123456789abcdef0123456789abcdef', not_after_micros: 123456789}` in transaction metadata.
+The deadline is exclusive UTC microseconds and at most one hour ahead of the admission clock.
+PgWire clients require `SHOW rtdb_bounded_retry` to return `1` on each connection before submitting this format.
+The identity includes version, nonce and deadline under the authenticated principal and database history.
+Timeouts and disconnects are retried under the same identity with the same body.
+A new operation needs a new identity.
+Classic databases scope the receipt table to the database storage.
+Placed history fingerprints retain identity across writer epochs and exclude receipts inherited from a parent history.
+
+A source transaction's versioned retry field must agree with its metadata.
+The encoded transaction starts with a refusal assertion for readers that do not understand the field.
+An upgraded resolver removes that assertion once it has verified the field.
+It chooses the maximum of the previous durable retry clock and the exact source timestamp, independently of the projected SQL system time.
+An accepted transition publishes the new clock and original outcome with its effects or after discarding an aborted batch.
+The same body receives the original durable transaction result until the deadline, including an abort.
+A different body receives `rtdb/idempotency-conflict`, and an elapsed identity always receives `rtdb/idempotency-expired`, including after later clock regressions.
+Clock progress follows bounded retry log observations.
+The physical retention obligations in M1 still apply to the new receipt rows and their original outcomes.
+
+Lean checks the separation between append observation and commit order, irreversible observed expiry, preservation of the first terminal result, and same-body redemption for both commits and aborts.
+It rejects reporting a smoothed observation, using a regressed clock, and replacing a terminal receipt.
+Verus checks that expiry uses the exclusive boundary and that a regressed append observation cannot reopen an identity.
+The native node test flushes the first terminal results, reopens the database, redeems the abort and commit, then verifies that expiry survives a second restart and clock rollback.
+The resolver tests cover the compatibility assertion and reuse of a placed identity after writer turnover, with an independent fork history as a control.

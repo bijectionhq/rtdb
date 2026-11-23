@@ -3940,6 +3940,81 @@ impl Clock for ReplayTestClock {
 }
 
 #[tokio::test]
+async fn bounded_retries_preserve_terminal_aborts_and_do_not_reopen_after_clock_rollback() {
+    let directory = tempfile::tempdir().unwrap();
+    let primary = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog {
+            path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0),
+        })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+            path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0),
+        })),
+        ..Default::default()
+    };
+    let mut settings = options();
+    settings.membership = Membership::Durable { primary, skipped: BTreeSet::new() };
+    let clock = Arc::new(ReplayTestClock(AtomicI64::new(1_000_000)));
+    let runtime = NodeServices { clock: clock.clone(), ..services() };
+    let cutoff = 2_000_000;
+    let retry_options = |node: &Node, nonce| AutonomousTxOptions {
+        user_metadata: Some(rtdb_tx::UserMetadata::new(Value::Struct(StructFields::from([
+            ("rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+                ("nonce".into(), Value::Utf8(format!("{nonce:032x}"))),
+                ("not_after_micros".into(), Value::I64(cutoff)),
+            ]))),
+        ])), node.memory()).unwrap()),
+        ..Default::default()
+    };
+    let conditional_write = |node| vec![
+        TxOp::Sql { sql: "ASSERT EXISTS (SELECT 1 FROM docs WHERE _id = 1)".into(), args: None },
+        put(node, 2, 20),
+    ];
+
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let show = rtdb_sql::parse_control("SHOW rtdb_bounded_retry", &Default::default()).unwrap().unwrap();
+    let ControlResult::Rows(reply) = session.execute_control(&show, &[], &CancellationToken::new()).await.unwrap() else {
+        panic!("expected bounded retry capability");
+    };
+    assert_eq!(rows(reply).await, [vec![Value::Utf8("1".into())]]);
+    assert!(session.state_mut().execute_tx(vec![put(&node, 0, 0)], Default::default()).await.unwrap().committed());
+    let aborted = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
+    assert_eq!(aborted.error().map(|error| error.code.as_str()), Some("xtdb/assert-failed"));
+    let committed = session.state_mut().execute_tx(vec![put(&node, 1, 10)], retry_options(&node, 2)).await.unwrap();
+    assert!(committed.committed());
+    node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    drop(session);
+    stop(&node, driver).await;
+
+    clock.0.store(999_999, Ordering::Relaxed);
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let aborted_retry = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
+    assert_eq!(aborted_retry, aborted);
+    let committed_retry = session.state_mut().execute_tx(vec![put(&node, 1, 10)], retry_options(&node, 2)).await.unwrap();
+    assert_eq!(committed_retry, committed);
+    let conflict = session.state_mut().execute_tx(vec![put(&node, 3, 30)], retry_options(&node, 2)).await.unwrap();
+    assert_eq!(conflict.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-conflict"));
+
+    clock.0.store(cutoff, Ordering::Relaxed);
+    let expired = session.state_mut().execute_tx(vec![put(&node, 3, 30)], retry_options(&node, 2)).await.unwrap();
+    assert_eq!(expired.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
+    drop(session);
+    stop(&node, driver).await;
+
+    clock.0.store(999_999, Ordering::Relaxed);
+    let (node, driver) = running(settings, fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let late = session.state_mut().execute_tx(conditional_write(&node), retry_options(&node, 1)).await.unwrap();
+    assert_eq!(late.error().map(|error| error.code.as_str()), Some("rtdb/idempotency-expired"));
+    assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME ORDER BY _id", vec![]).await.unwrap()).await,
+        [vec![Value::I64(0)], vec![Value::I64(1)]]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_present_is_applied_and_advances_when_the_append_clock_retreats() {
     let clock = Arc::new(ReplayTestClock(AtomicI64::new(1_000_000)));
     let log_clock = Arc::clone(&clock);

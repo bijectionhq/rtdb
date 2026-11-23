@@ -4,6 +4,7 @@ mod source;
 mod guard_attribution;
 mod idempotency_window;
 mod replay_submission;
+mod bounded_retry;
 mod resolver;
 mod system_time;
 mod replica;
@@ -19,6 +20,7 @@ pub use replica::{ReplayedTransaction, decode_replica};
 
 pub use idempotency_window::expiration as idempotency_expiration;
 pub use replay_submission::{ReplaySubmission, private_replay_original};
+pub use bounded_retry::{BOUNDED_RETRY_METADATA_KEY, bounded_retry_original};
 
 mod hosted_control;
 pub use hosted_control::{HostedControlWrite, MAX_PROPOSAL_LAND_ROWS, proposal_close_controls, proposal_land_controls, proposal_overlay_controls, retained_delete_controls, retained_release_controls};

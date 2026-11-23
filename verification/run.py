@@ -1798,6 +1798,26 @@ def verify_gateway_replay_lean(args, scratch):
 
 def verify_lean(args, scratch):
     verify_gateway_replay_lean(args, scratch)
+    verify_lean_model(
+        args, scratch, Path("verification/lean/ObservedClockAndRetry.lean"), "observed-clock-and-retry",
+        {
+            "report-projected-time": (
+                "⟨position, sample, max sample (previous.projected + 1)⟩",
+                "⟨position, max sample (previous.projected + 1), max sample (previous.projected + 1)⟩",
+                ["ordered_projection_preserves_the_unsmoothed_observation"],
+            ),
+            "allow-regressed-clock": (
+                "let observed := max state.clock sample", "let observed := sample",
+                ["observing_expiry_is_irreversible", "same_body_redeems_the_original_terminal_outcome"],
+            ),
+            "rerun-original": (
+                "then (withClock, .existing original.outcome)",
+                "then ({ withClock with receipt := some body }, .applied body.outcome)",
+                ["same_body_redeems_the_original_terminal_outcome", "the_first_terminal_outcome_survives_all_other_attempts"],
+            ),
+        },
+        4,
+    )
     path = Path("verification/lean/History.lean")
     controls = {
         "baseline": None,

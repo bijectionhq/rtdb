@@ -698,6 +698,11 @@ impl Node {
             {
                 return Ok(TransactionResult::Committed { tx_key: original });
             }
+            if !db.external_source()
+                && let Some(original) = result.error().map(rtdb_tx::bounded_retry_original).transpose()?.flatten()
+            {
+                return self.read_bounded_outcome(database, tx_id, original, identity, placement, cancellation).await;
+            }
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
@@ -734,6 +739,12 @@ impl Node {
                 }
                 if !db.external_source()
                     && let Some(error) = &error
+                    && let Some(original) = rtdb_tx::bounded_retry_original(error)?
+                {
+                    return self.read_bounded_outcome(database, tx_id, original, identity, placement, cancellation).await;
+                }
+                if !db.external_source()
+                    && let Some(error) = &error
                     && is_historical_guard_abort(error)
                     && let Some(key) = idempotency_key(&cell("user_metadata")?)
                     && let Some(submitted_at) = historical_guard_sample(error)
@@ -746,6 +757,40 @@ impl Node {
             }
             _ => Err(Anomaly::fault("rtdb.node/tx-result-status", "Stored transaction result has no commit status")),
         }
+    }
+    async fn read_bounded_outcome(&self, database: &str, retry: TxId, original: TransactionKey, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
+        let invalid = || Anomaly::fault("rtdb.node/bounded-retry-outcome", "The bounded retry has no matching original outcome");
+        if original.tx_id >= retry { return Err(invalid()); }
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
+        let options = rtdb_sql::PrepareOptions {
+            parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]),
+            default_timezone: context.timezone.clone(),
+            ..Default::default()
+        };
+        let mut cursor = prepare_query("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
+            .execute(context, vec![Value::I64(original.tx_id.0)]).await?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            if batch.num_rows() == 0 { continue; }
+            let cell = |index: usize| read_value(batch.schema().field(index), batch.column(index).as_ref(), 0);
+            if !matches!(cell(0)?, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == original.system_time.0) {
+                return Err(invalid());
+            }
+            return match cell(1)? {
+                Value::Bool(true) => Ok(TransactionResult::Committed { tx_key: original }),
+                Value::Bool(false) => {
+                    let error = match cell(2)? {
+                        Value::Null | Value::Undefined => None,
+                        Value::Transit(bytes) => Some(RetainedAnomaly::from_transit(&bytes, &self.factory.memory)?),
+                        _ => return Err(invalid()),
+                    };
+                    Ok(TransactionResult::Aborted { tx_key: original, error })
+                }
+                _ => Err(invalid()),
+            };
+        }
+        Err(invalid())
     }
     pub async fn attach_database(&self, name: String, configuration: DatabaseConfig, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<TransactionResult> {
         self.admit("xtdb", DatabaseAccess::Write, identity, cancellation).await?;
@@ -3189,7 +3234,8 @@ pub const IDEMPOTENCY_KEY_PARAMETER: &str = "rtdb_idempotency_key";
 
 pub(crate) fn with_idempotency_key(metadata: Option<rtdb_tx::UserMetadata>, key: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_tx::UserMetadata> {
     let mut fields = match metadata.as_ref().map(|metadata| metadata.value()) {
-        Some(value) if idempotency_key(value).is_some() => return Ok(metadata.expect("present")),
+        Some(value) if idempotency_key(value).is_some()
+            || matches!(value, Value::Struct(fields) if fields.contains_key(rtdb_tx::BOUNDED_RETRY_METADATA_KEY)) => return Ok(metadata.expect("present")),
         Some(Value::Struct(fields)) => fields.clone(),
         _ => rtdb_types::StructFields::new(),
     };

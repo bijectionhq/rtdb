@@ -962,6 +962,12 @@ rule LeaderProcessesTx {
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
         -- A transaction with rtdb_ordered_system_time enabled in user metadata aborts before evaluating mutations if its requested system time precedes the source message timestamp.
         -- The refused transaction uses the normally assigned system time, so it still advances the resolved head.
+        -- A version-one bounded application retry carries an exclusive cutoff and a nonce in a dedicated source field.
+        -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
+        -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.
+        -- The first admitted terminal outcome installs its receipt in the same replica frame as its transaction result, including an abort.
+        -- A same-body retry links to that exact outcome; a different body fails with a conflict.
+        -- A reader using the first receipt returns the original committed or aborted result.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.

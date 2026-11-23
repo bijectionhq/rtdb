@@ -753,6 +753,64 @@ async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_proje
 }
 
 #[tokio::test]
+async fn a_legacy_resolver_cannot_execute_a_bounded_retry_record() {
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let metadata = UserMetadata::new(Value::Struct(StructFields::from([
+        ("rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("a0000000000000000000000000000001".into())),
+            ("not_after_micros".into(), Value::I64(200)),
+        ]))),
+    ])), &context.memory).unwrap();
+    let source = SourceTransaction::new(vec![put(&context, 7, 0, i64::MAX)], SubmitOptions {
+        user_metadata: Some(metadata), ..Default::default()
+    }, &context.memory).unwrap();
+    let bytes = source.encode().unwrap();
+    let SourceMessage::Protobuf(SourceBody::Tx(mut command)) = SourceMessage::decode(bytes.as_slice()).unwrap().unwrap() else {
+        panic!("expected a source transaction");
+    };
+    assert!(command.bounded_retry.take().is_some());
+    let legacy = SourceTransaction::decode(&SourceMessage::Protobuf(SourceBody::Tx(command)), &context.memory).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), legacy, &context).await.unwrap();
+    assert_eq!(resolved.result().error().unwrap().code, "xtdb/assert-failed");
+    assert!(!resolved.writes().tables().contains_key(&table()));
+}
+
+#[tokio::test]
+async fn a_bounded_identity_survives_a_writer_epoch_change_but_is_local_to_its_placed_history() {
+    use rtdb_types::PlacedAttemptScope;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let metadata = UserMetadata::new(Value::Struct(StructFields::from([
+        ("rtdb_retry_v1".into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("a0000000000000000000000000000001".into())),
+            ("not_after_micros".into(), Value::I64(200)),
+        ]))),
+    ])), &context.memory).unwrap();
+    let request = |history, epoch| {
+        SourceTransaction::new(vec![put(&context, 42, 0, i64::MAX)], SubmitOptions {
+            user: Some("alice".into()), user_metadata: Some(metadata.clone()), ..Default::default()
+        }, &context.memory).unwrap().with_placed_seed(Some(PlacedAttemptScope::new(history, epoch).unwrap().issue()))
+    };
+    let mut resolve = async |position, source| {
+        let resolved = resolver.resolve_source(state.snapshot(), SourcePosition(position), Timestamp(100), source, &context).await.unwrap();
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+        resolved
+    };
+    let original = resolve(0, request("original/history", 1)).await;
+    assert!(original.result().committed());
+    let duplicate = resolve(1, request("original/history", 2)).await;
+    assert_eq!(bounded_retry_original(duplicate.result().error().unwrap()).unwrap(), Some(original.result().tx_key()));
+    let fork = resolve(2, request("fork/history", 1)).await;
+    assert!(fork.result().committed());
+}
+
+#[tokio::test]
 async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_window() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();

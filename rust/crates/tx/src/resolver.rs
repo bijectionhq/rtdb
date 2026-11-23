@@ -15,6 +15,7 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::bounded_retry::is_bounded_receipts_table;
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
 use crate::system_time::{SourceTime, TimeRejection};
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
@@ -22,6 +23,7 @@ use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult,
 
 mod hosted_control;
 mod constraint_receipt;
+mod retry;
 mod fixed_range;
 mod ordered_micros;
 mod replay_constraints;
@@ -215,6 +217,27 @@ impl TxResolver {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
         };
+        let (retry_clock, bounded_receipt) = if let Some(SourceGuard::Bounded(retry)) = &request.guard {
+            let scope = retry::RetryScope::new(attempt.map(PlacedAttempt::scope));
+            match tx.bounded_retry_clock(&scope, log_time).await {
+                Ok(clock) => {
+                    let receipt = match tx.admit_bounded_retry(&scope, &request, *retry, clock).await {
+                        Ok(receipt) => receipt,
+                        Err(error) if error.is_caller_error() => Err(error),
+                        Err(error) => return Err(error),
+                    };
+                    (Some((scope, clock)), receipt)
+                }
+                Err(error) if error.is_caller_error() => (None, Err(error)),
+                Err(error) => return Err(error),
+            }
+        } else {
+            (None, Ok(None))
+        };
+        let (bounded_receipt, retry_error) = match bounded_receipt {
+            Ok(receipt) => (receipt, None),
+            Err(error) => (None, Some(error)),
+        };
         let plan = constraint_receipt::split(
             &request.operations,
             attempt.is_some() && request.guard.is_none() && request.idempotency_key().is_none(),
@@ -224,8 +247,10 @@ impl TxResolver {
             Err(error) => (request.operations.as_slice(), &[][..], Some(error)),
         };
         let mut constraint_failed = false;
-        let mut outcome = if let Some(error) = plan_error {
+        let mut outcome = if let Some(error) = plan_error.or(retry_error) {
             Err(error)
+        } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
+            Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
         } else if has_owned_operations
             && !request.operations.iter().all(Operation::is_owned)
         {
@@ -279,7 +304,7 @@ impl TxResolver {
                                 let guard_time = crate::guard_attribution::guard_time_at(index, guard.after_bootstrap, guard.submitted_at.0);
                                 error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into))
                             }
-                            Some(SourceGuard::Replay(_)) => error.with_context(IDEMPOTENCY_GUARD_RESULT, false.into()),
+                            Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_)) => error.with_context(IDEMPOTENCY_GUARD_RESULT, false.into()),
                             None => error,
                         }
                     } else { error };
@@ -339,6 +364,10 @@ impl TxResolver {
             }
             Err(error) => return Err(error),
         };
+        if let Some((scope, clock)) = retry_clock {
+            if let Some(receipt) = bounded_receipt { tx.write_bounded_receipt(receipt, clock.observed)?; }
+            if clock.changed { tx.write_bounded_retry_clock(&scope, clock.observed)?; }
+        }
         tx.write_result(&result, request.options.user_metadata.as_ref(), Some(log_time))?;
         if let Some(attempt) = attempt {
             let selected = if settled { refusal } else { primary };
@@ -473,7 +502,9 @@ impl<'a> OpenTransaction<'a> {
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;
-        if is_replay_table(&table) || table == receipts_table() || TableRef::owned_schema(&table.schema) { check_table(&table)?; }
+        if is_replay_table(&table) || table == receipts_table() || is_bounded_receipts_table(&table) || TableRef::owned_schema(&table.schema) {
+            check_table(&table)?;
+        }
         self.buffer.append(table, event)
     }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
