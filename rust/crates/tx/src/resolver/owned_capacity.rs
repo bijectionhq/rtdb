@@ -78,6 +78,10 @@ impl CapacityRule {
         ]))
     }
 
+    pub(super) fn matches_prefix_assertion(&self, column: &str, prefix: &[u8]) -> bool {
+        self.column == column && self.when.is_empty() && self.bucket(prefix) == Some(prefix)
+    }
+
     fn bucket<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
         if key.len() > MAX_KEY_BYTES {
             return None;

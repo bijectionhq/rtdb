@@ -204,7 +204,7 @@ mod tests {
             ("body", 8, -7),
             ("key", SYSTEM_REVISION_SLOT | SORT_KEY_SLOT, 0),
         ]);
-        fill_row(&mut row, &recipe, Timestamp(123), |column| column == "key").unwrap();
+        fill_row(&mut row, &recipe, Timestamp(123), |column| column == "key", false).unwrap();
         let Value::Binary(bytes) = &row["body"] else { panic!("Expected binary payload"); };
         assert_eq!(&bytes[..8], &123_000u64.to_be_bytes());
         assert_eq!(&bytes[8..], &116i64.to_be_bytes());

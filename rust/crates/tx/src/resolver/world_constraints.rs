@@ -405,8 +405,7 @@ impl OpenTransaction<'_> {
                 && (world.mode != WorldClockMode::Proposal || !schema.has_acceptance_validity()
                     || schema.has_opaque_columns() || schema.lifetime_micros().is_some()
                     || asserted.iter().any(|bound| !policy.rules.iter().any(|rule| {
-                        rule.column == bound.column && rule.when.is_empty()
-                            && rule.bucket(bound.prefix) == Some(bound.prefix)
+                        rule.matches_prefix_assertion(bound.column, bound.prefix)
                     })))
             {
                 return Err(uncovered());
@@ -416,8 +415,7 @@ impl OpenTransaction<'_> {
                 if !rule.admits(schema)? { return Err(uncovered()); }
                 let mut counts = RuleCounts { rule, qualifiers: predicates(&rule.when)?,
                     buckets: BTreeMap::new(), final_bounds: BTreeMap::new() };
-                for bound in asserted.iter().filter(|bound| rule.column == bound.column
-                    && rule.when.is_empty() && rule.bucket(bound.prefix) == Some(bound.prefix))
+                for bound in asserted.iter().filter(|bound| rule.matches_prefix_assertion(bound.column, bound.prefix))
                 {
                     reservations.push(self.context.memory.reserve(bound.prefix.len().saturating_add(192))?);
                     counts.buckets.entry(bound.prefix.to_vec()).or_insert([0, 0]);
