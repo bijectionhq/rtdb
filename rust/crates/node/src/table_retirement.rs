@@ -11,7 +11,7 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-/// Reads the principals' retired catalogs for relations past their retention that no undropped world still names (gc.allium: RetireDueTables).
+/// Reads the principals' retired catalogs for relations past their retention that no undropped world forked before the retirement still names (gc.allium: RetireDueTables).
 pub(crate) struct RetiredRelations {
     pub(crate) database: String,
     pub(crate) partition: Arc<PartitionState>,
@@ -41,8 +41,10 @@ impl TableRetirements for RetiredRelations {
                 Some(worlds) if snapshot.contains_table(&worlds) => rtdb_query::read_owned_worlds(Arc::clone(&context), worlds).await?,
                 _ => Vec::new(),
             };
-            for (relation, _) in ready {
-                if worlds.iter().any(|world| !world.dropped && world.schemas.relation(&relation).is_some()) { continue; }
+            for (relation, retirement) in ready {
+                if worlds.iter().any(|world| !world.dropped && world.basis.system_time < retirement.retired_at
+                    && world.schemas.relation(&relation).is_some())
+                { continue; }
                 let Some(tables) = relation.physical_tables(&retired) else { continue; };
                 due.extend(tables.into_iter().filter(|table| {
                     value.table_catalog().entry(table).is_some() && value.trie_catalog().retired_as_of(table).is_none()

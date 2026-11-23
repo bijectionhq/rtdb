@@ -833,10 +833,11 @@ An empty covered page has no rows and carries the already-known held present in 
 
 An admitted Root `rtdb.owned.CommitHosted.v1` can retire Root relations together with its catalog changes.
 Send one row in the retired relation's fact group with `_op: Utf8` equal to `retire-relation`, `_id: Utf8` equal to the relation name, and `retain_micros: Int64`, the 0 to 100-year history the relation keeps after retirement.
-The transaction records the retirement in the principal's retired catalog and deletes the relation's declaration and its ordered, search and spatial paths from their catalogs, so only system-time history still resolves them.
+The transaction records the retirement in the principal's retired catalog and deletes the relation's ordered, search and spatial paths from their catalogs.
+The declaration stays, so historical reads keep resolving the relation's schema until collection reclaims it.
 Any later write, declaration or path naming the relation, and any other operation on it in the same transaction, aborts with `rtdb.owned/relation-retired`.
 Retiring a relation again with the same retention changes nothing; another retention conflicts.
-Once `retain_micros` has passed and no undropped world names the relation, trie collection reclaims its data, journal and constraint tables.
+Once `retain_micros` has passed and no undropped world forked before the retirement names the relation, trie collection reclaims its data, journal and constraint tables.
 
 === Declaring owned partition capacity
 

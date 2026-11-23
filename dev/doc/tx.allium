@@ -149,7 +149,7 @@
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
 -- A hosted Root commit can retire owned Root relations alongside its catalog effects.
 -- Retirement records the relation, its retirement transaction and a retention of at most one hundred years in the principal's retired catalog.
--- It deletes the relation's declaration and the ordered, search and spatial paths naming it from their catalogs, so only system-time history resolves them.
+-- It deletes the ordered, search and spatial paths naming the relation from their catalogs, and keeps its declaration for historical reads within the retention.
 -- Every later write, declaration or path naming a retired relation aborts its transaction, as does any other operation on a relation the same transaction retires.
 -- Retiring again with the same retention changes nothing; another retention conflicts.
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.

@@ -1219,7 +1219,8 @@ impl<'a> OpenTransaction<'a> {
         Ok(())
     }
 
-    /// Fences the relation at this transaction: its declaration and paths leave the current catalogs, so their system-time history alone resolves them.
+    /// Fences the relation at this transaction: its paths leave the current catalogs, so no index serves it again.
+    /// Its declaration stays, so historical reads inside the retention keep resolving its schema.
     /// Collection reclaims its tables once the retention has passed (gc.allium).
     async fn retire_owned_relation(&mut self, relation: &rtdb_types::OwnedRelation, retain_micros: i64) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
@@ -1236,9 +1237,6 @@ impl<'a> OpenTransaction<'a> {
             };
         }
         let id = |name: &str| rtdb_types::EntityId::String(name.into());
-        if self.read_owned_schema(owner, relation).await?.is_some() {
-            self.buffer.delete(rtdb_types::OwnedRelation::relation_catalog(owner), &id(relation.name()), Interval::ALL)?;
-        }
         let target = relation.table(owner);
         for catalog in [
             rtdb_types::OwnedRelation::path_catalog(owner),

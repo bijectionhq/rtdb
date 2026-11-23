@@ -469,7 +469,7 @@ entity TablesRetiredMessage {
 rule RetireDueTables {
     -- A hosted Root commit retires an owned relation at a transaction, with a retention (tx.allium).
     -- At the start of each cycle, before selecting garbage, the collector reads every principal's retired catalog at the applied present.
-    -- A relation is due once its retirement time plus its retention is at or before that present, and no undropped world in the same principal's world catalog names it in its schemas.
+    -- A relation is due once its retirement time plus its retention is at or before that present, and no undropped world in the same principal's world catalog with a basis before the retirement names it in its schemas.
     -- Its tables are its data, change journal, unique, capacity, fixed-range, purge, purge-floor and lifetime tables that the table catalog holds and that are not retired yet.
     -- World overlays of the relation stay outside: they go with their world.
     -- The collector publishes the due tables in chunks of tries_deleted_chunk_size, each with the applied present as its retirement time, and awaits each record's application.
