@@ -18,8 +18,14 @@ async fn channel(address: SocketAddr) -> Channel {
     Channel::from_shared(format!("http://{address}")).unwrap().connect().await.unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_present() {
+// Owned reads plan SQL on a runtime worker, so the test gives its workers the stack the server binaries configure.
+#[test]
+fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_present() {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
+        .enable_all().build().unwrap().block_on(check_applied_owned_read_pins_the_catalog());
+}
+
+async fn check_applied_owned_read_pins_the_catalog() {
     let cell = Cell::start(1, None).await;
     let id = uuid::Uuid::new_v4();
     let deployment = admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
