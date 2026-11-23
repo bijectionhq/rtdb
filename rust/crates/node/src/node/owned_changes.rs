@@ -117,14 +117,13 @@ impl OwnedReadSession {
         &self, relation: &OwnedRelation, after: Timestamp, groups: usize,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<ExpiryCandidatePage> {
-        const REPLAY_DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
         const MAX_CANDIDATES: usize = 64;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || !(1..=8).contains(&groups) {
             return Err(change_feed_uncovered());
         }
         let policy = self.lifetime_point_policy(relation).await?.ok_or_else(change_feed_uncovered)?;
-        let cutoff = Timestamp(self.present.system_time.0.saturating_sub(REPLAY_DAY_MICROS));
+        let cutoff = rtdb_types::OwnedLifetimeFloor::expiry_replay_cutoff(self.present.system_time);
         let page = self.changes(relation, after, groups).await?;
         let context = self.journal_context(relation)?;
         let mut candidates = Vec::new();
