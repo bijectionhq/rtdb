@@ -6,6 +6,7 @@ use crate::{CatalogAdmissionFloor, Checkpoint, DeploymentRecord, JournalAnchor, 
 
 const WIRE_VERSION: u8 = 1;
 const BOUND_JOURNAL_VERSION: u8 = 2;
+const PLACED_RECEIPT_VERSION: u8 = 3;
 
 #[derive(Clone, PartialEq, Message)]
 struct ParkedDeployment {
@@ -41,7 +42,7 @@ struct ParkedDeployment {
     s3_write_lease_until_ms: Option<i64>,
     #[prost(string, optional, tag = "16")]
     engine_pin: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[prost(bool, tag = "22")]
     placed_receipt_retirement: bool,
     #[prost(string, repeated, tag = "17")]
     replica_journals: Vec<String>,
@@ -154,7 +155,13 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
             JournalEndpoint::Address(address) => unbound_journals.push(address.clone()),
         }
     }
-    let wire_version = if bound_journals.is_empty() { WIRE_VERSION } else { BOUND_JOURNAL_VERSION };
+    let wire_version = if *placed_receipt_retirement {
+        PLACED_RECEIPT_VERSION
+    } else if bound_journals.is_empty() {
+        WIRE_VERSION
+    } else {
+        BOUND_JOURNAL_VERSION
+    };
     let packed = ParkedDeployment {
         org: org.clone(),
         lineage: (lineage != id).then(|| lineage.clone()),
@@ -203,10 +210,13 @@ fn invalid(message: impl Into<String>) -> Anomaly {
 }
 
 pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Version) -> Result<DeploymentRecord> {
-    let Some((&wire_version @ (WIRE_VERSION | BOUND_JOURNAL_VERSION), body)) = bytes.split_first() else {
+    let Some((&wire_version @ (WIRE_VERSION | BOUND_JOURNAL_VERSION | PLACED_RECEIPT_VERSION), body)) = bytes.split_first() else {
         return Err(invalid("Unknown parked record version"));
     };
     let packed = ParkedDeployment::decode(body).map_err(|error| invalid(error.to_string()))?;
+    if packed.placed_receipt_retirement != (wire_version == PLACED_RECEIPT_VERSION) {
+        return Err(invalid("Placed receipt retirement requires parked record version 3"));
+    }
     if wire_version == WIRE_VERSION && !packed.bound_journals.is_empty() {
         return Err(invalid("Bound journals require parked record version 2"));
     }
@@ -369,7 +379,10 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
         record.engine_pin = Some("rtdb-2026.11.2".into());
         record.placed_receipt_retirement = true;
-        let bytes = encode(&record).unwrap();
+        let mut bytes = encode(&record).unwrap();
+        assert_eq!(bytes[0], PLACED_RECEIPT_VERSION);
         assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
+        bytes[0] = BOUND_JOURNAL_VERSION;
+        assert!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).is_err());
     }
 }
