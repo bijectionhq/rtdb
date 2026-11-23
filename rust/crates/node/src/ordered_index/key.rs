@@ -1,5 +1,5 @@
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray, Float32Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RunArray, StringArray,
     TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray,
     types::{Int16Type, Int32Type, Int64Type},
@@ -23,6 +23,7 @@ pub(super) enum Scalar<Text, Binary> {
     Day(i64),
     InstantMicros(i64),
     FloatOrder(u64),
+    Decimal128(u8, i8, i128),
     Unordered,
     Null,
 }
@@ -40,6 +41,7 @@ pub(super) enum Family {
     Day,
     InstantMicros,
     Float,
+    Decimal128(u8, i8),
 }
 
 impl Atom {
@@ -66,6 +68,13 @@ impl Atom {
             Value::Utf8(value) => Self::Text(value.clone()),
             Value::Binary(value) => Self::Binary(value.clone()),
             Value::Uuid(value) => Self::Uuid(*value),
+            Value::Decimal(value) if value.bit_width == 128 => {
+                let precision = value.precision.try_into().ok()?;
+                let scale = value.scale.try_into().ok()?;
+                let coefficient = i128::from_be_bytes(value.unscaled.as_slice().try_into().ok()?);
+                if !decimal_coefficient_fits(precision, coefficient) { return None; }
+                Self::Decimal128(precision, scale, coefficient)
+            },
             Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => {
                 Self::Day(value.date_days()?)
             }
@@ -88,6 +97,7 @@ impl Atom {
             Self::Day(value) => Scalar::Day(*value),
             Self::InstantMicros(value) => Scalar::InstantMicros(*value),
             Self::FloatOrder(value) => Scalar::FloatOrder(*value),
+            Self::Decimal128(precision, scale, value) => Scalar::Decimal128(*precision, *scale, *value),
             Self::Unordered => Scalar::Unordered,
             Self::Null => Scalar::Null,
         }
@@ -105,6 +115,7 @@ impl<'a> AtomRef<'a> {
             Self::Day(value) => Scalar::Day(value),
             Self::InstantMicros(value) => Scalar::InstantMicros(value),
             Self::FloatOrder(value) => Scalar::FloatOrder(value),
+            Self::Decimal128(precision, scale, value) => Scalar::Decimal128(precision, scale, value),
             Self::Unordered => Scalar::Unordered,
             Self::Null => Scalar::Null,
         }
@@ -164,6 +175,13 @@ impl<'a> AtomRef<'a> {
             DataType::Int16 => Self::Integer(value!(Int16Array).into()),
             DataType::Int32 => Self::Integer(value!(Int32Array).into()),
             DataType::Int64 => Self::Integer(value!(Int64Array).into()),
+            DataType::Decimal128(precision, scale) => {
+                let coefficient = value!(Decimal128Array);
+                if !decimal_coefficient_fits(*precision, coefficient) {
+                    return Err(format_error("Decimal128 coefficient exceeds its path declaration"));
+                }
+                Self::Decimal128(*precision, *scale, coefficient)
+            },
             DataType::UInt8 => Self::Integer(i128::from(value!(UInt8Array) as i8)),
             DataType::UInt16 => Self::Integer(i128::from(value!(UInt16Array) as i16)),
             DataType::UInt32 => Self::Integer(i128::from(value!(UInt32Array) as i32)),
@@ -180,6 +198,10 @@ impl<'a> AtomRef<'a> {
             _ => Self::Unordered,
         })
     }
+}
+
+fn decimal_coefficient_fits(precision: u8, coefficient: i128) -> bool {
+    (1..=38).contains(&precision) && coefficient.unsigned_abs() < 10_u128.pow(u32::from(precision))
 }
 
 pub(super) const FLOAT_NAN_ORDER: u64 = u64::MAX;
@@ -214,6 +236,7 @@ impl<Text, Binary> Scalar<Text, Binary> {
             Self::Day(_) => Family::Day,
             Self::InstantMicros(_) => Family::InstantMicros,
             Self::FloatOrder(_) => Family::Float,
+            Self::Decimal128(precision, scale, _) => Family::Decimal128(*precision, *scale),
         })
     }
 }
@@ -229,6 +252,14 @@ impl<Text: AsRef<str>, Binary: AsRef<[u8]>> Scalar<Text, Binary> {
 }
 
 pub(super) fn family(logical: &LogicalType) -> Option<Family> {
+    scalar_family(logical, false)
+}
+
+pub(super) fn owned_family(logical: &LogicalType) -> Option<Family> {
+    scalar_family(logical, true)
+}
+
+fn scalar_family(logical: &LogicalType, owned: bool) -> Option<Family> {
     use ScalarType as S;
     let mut family = None;
     for leg in logical.legs() {
@@ -239,6 +270,8 @@ pub(super) fn family(logical: &LogicalType) -> Option<Family> {
                 S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64,
             ) => Family::Integer,
             LogicalType::Scalar(S::F32 | S::F64) => Family::Float,
+            LogicalType::Scalar(S::Decimal { bit_width: 128, precision, scale }) if owned =>
+                Family::Decimal128(precision.try_into().ok()?, scale.try_into().ok()?),
             LogicalType::Scalar(S::Utf8) => Family::Text,
             LogicalType::Scalar(S::Binary) => Family::Binary,
             LogicalType::Scalar(S::Uuid) => Family::Uuid,

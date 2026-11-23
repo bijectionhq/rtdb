@@ -40,9 +40,10 @@ enum Kind {
     Null = 7,
     InstantMicros = 8,
     FloatOrder = 9,
+    Decimal128 = 10,
 }
 
-const KINDS: [Kind; 10] = [
+const KINDS: [Kind; 11] = [
     Kind::Bool,
     Kind::Integer,
     Kind::Text,
@@ -53,6 +54,7 @@ const KINDS: [Kind; 10] = [
     Kind::Null,
     Kind::InstantMicros,
     Kind::FloatOrder,
+    Kind::Decimal128,
 ];
 const VALID_LAYOUT_BITS: u16 = (1 << KINDS.len()) - 1;
 
@@ -67,6 +69,7 @@ impl Kind {
             AtomRef::Day(_) => Self::Day,
             AtomRef::InstantMicros(_) => Self::InstantMicros,
             AtomRef::FloatOrder(_) => Self::FloatOrder,
+            AtomRef::Decimal128(..) => Self::Decimal128,
             AtomRef::Unordered => Self::Unordered,
             AtomRef::Null => Self::Null,
         }
@@ -83,6 +86,7 @@ impl Kind {
             Self::Text => DataType::Utf8,
             Self::Binary => DataType::Binary,
             Self::Uuid => DataType::FixedSizeBinary(16),
+            Self::Decimal128 => DataType::FixedSizeBinary(18),
             Self::Day | Self::InstantMicros => DataType::Int64,
             Self::FloatOrder => DataType::UInt64,
             Self::Unordered | Self::Null => DataType::Null,
@@ -127,6 +131,21 @@ impl Kind {
                         .with_precision_and_scale(INTEGER_PRECISION, 0)
                         .map_err(format_error)?,
                 )
+            }
+            Self::Decimal128 => {
+                let mut builder = FixedSizeBinaryBuilder::with_capacity(cells.len(), 18);
+                for cell in cells {
+                    if let AtomRef::Decimal128(precision, scale, coefficient) = cell {
+                        let mut bytes = [0; 18];
+                        bytes[0] = precision;
+                        bytes[1] = scale as u8;
+                        bytes[2..].copy_from_slice(&coefficient.to_be_bytes());
+                        builder.append_value(bytes).map_err(format_error)?;
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Arc::new(builder.finish())
             }
             Self::Text => {
                 let mut builder = StringBuilder::with_capacity(cells.len(), 0);
@@ -180,6 +199,11 @@ impl Kind {
         match self {
             Self::Bool => cell!(BooleanArray, Bool),
             Self::Integer => cell!(Decimal128Array, Integer),
+            Self::Decimal128 => {
+                let bytes = arrow::<FixedSizeBinaryArray>(array).expect("validated decimal posting").value(row);
+                AtomRef::Decimal128(bytes[0], bytes[1] as i8,
+                    i128::from_be_bytes(bytes[2..].try_into().expect("validated decimal coefficient")))
+            },
             Self::Text => cell!(StringArray, Text),
             Self::Binary => cell!(BinaryArray, Binary),
             Self::Uuid => AtomRef::Uuid(fixed(array, row)),

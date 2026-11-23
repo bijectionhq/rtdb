@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
-use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
+use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey, WorldClockMode};
 use uuid::Uuid;
 
@@ -143,7 +143,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
     fn measure<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
-    ) -> BoxFuture<'a, Result<(u64, i128, OwnedWorldWitness)>> {
+    ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::measure(self, relation, path, request))
     }
     fn overlay_range<'a>(

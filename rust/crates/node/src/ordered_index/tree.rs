@@ -203,40 +203,75 @@ impl Entry {
     }
 }
 
-/// Exact weight of postings whose last field before the identity is a signed Int64.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum MeasureDomain {
+    #[default]
+    Empty,
+    Int64,
+    Decimal128(u8, i8),
+    Mixed,
+}
+
+impl MeasureDomain {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Empty, domain) | (domain, Self::Empty) => domain,
+            (left, right) if left == right => left,
+            _ => Self::Mixed,
+        }
+    }
+}
+
+/// Exact per-subtree coefficient weight for a single declared domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Measure {
     pub count: u64,
-    // Fixed width survives JSON storage even outside its ordinary numeric range.
-    sum: [u8; 16],
+    domain: MeasureDomain,
+    sum: [u8; 32],
 }
 
 impl Measure {
-    pub fn sum(self) -> i128 { i128::from_be_bytes(self.sum) }
+    fn sum(self) -> arrow_buffer::i256 { arrow_buffer::i256::from_be_bytes(self.sum) }
+
+    pub fn coefficient(self, expected: MeasureDomain) -> Result<arrow_buffer::i256> {
+        if self.domain == expected || (self.count == 0 && self.domain == MeasureDomain::Empty) {
+            Ok(self.sum())
+        } else {
+            Err(super::uncovered_owned_range())
+        }
+    }
 
     pub fn checked_add(self, other: Self) -> Result<Self> {
-        Ok(Self {
-            count: self.count.checked_add(other.count).ok_or_else(cardinality_overflow)?,
-            sum: self.sum().checked_add(other.sum()).ok_or_else(cardinality_overflow)?.to_be_bytes(),
-        })
+        let domain = self.domain.combine(other.domain);
+        let count = self.count.checked_add(other.count).ok_or_else(cardinality_overflow)?;
+        let sum = if domain == MeasureDomain::Mixed {
+            [0; 32]
+        } else {
+            self.sum().checked_add(other.sum()).ok_or_else(cardinality_overflow)?.to_be_bytes()
+        };
+        Ok(Self { count, domain, sum })
     }
 
     pub fn checked_sub(self, other: Self) -> Result<Self> {
-        Ok(Self {
-            count: self.count.checked_sub(other.count).ok_or_else(cardinality_overflow)?,
-            sum: self.sum().checked_sub(other.sum()).ok_or_else(cardinality_overflow)?.to_be_bytes(),
-        })
+        let domain = self.domain.combine(other.domain);
+        let count = self.count.checked_sub(other.count).ok_or_else(cardinality_overflow)?;
+        let sum = if domain == MeasureDomain::Mixed {
+            [0; 32]
+        } else {
+            self.sum().checked_sub(other.sum()).ok_or_else(cardinality_overflow)?.to_be_bytes()
+        };
+        Ok(Self { count, domain, sum })
     }
 
     fn at(key: KeyRef<'_>) -> Self {
-        if let KeyRef::Posting(_, tuple, _) = key
-            && let Some(last) = tuple.len().checked_sub(2)
-            && let Some(AtomRef::Integer(value)) = tuple.get(last)
-            && i64::try_from(value).is_ok()
-        {
-            return Self { count: 1, sum: value.to_be_bytes() };
-        }
-        Self::default()
+        let KeyRef::Posting(_, tuple, _) = key else { return Self::default(); };
+        let Some(last) = tuple.len().checked_sub(2) else { return Self::default(); };
+        let (domain, value) = match tuple.get(last) {
+            Some(AtomRef::Integer(value)) if i64::try_from(value).is_ok() => (MeasureDomain::Int64, value),
+            Some(AtomRef::Decimal128(precision, scale, value)) => (MeasureDomain::Decimal128(precision, scale), value),
+            _ => return Self::default(),
+        };
+        Self { count: 1, domain, sum: arrow_buffer::i256::from_i128(value).to_be_bytes() }
     }
 }
 

@@ -8,7 +8,7 @@ pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
@@ -297,11 +297,23 @@ fn count_batch(count: u64) -> Result<RecordBatch, Status> {
     RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![count]))]).map_err(arrow)
 }
 
-fn measure_batch(count: u64, sum: i128) -> Result<RecordBatch, Status> {
-    let sum = sum.to_be_bytes();
+fn measure_batch(measured: &rtdb_node::OwnedRangeCount) -> Result<RecordBatch, Status> {
+    let (name, sum): (&str, ArrayRef) = match (measured.sum, &measured.decimal_sum) {
+        (Some(sum), None) => {
+            let bytes = sum.to_be_bytes();
+            ("sum_i128", Arc::new(BinaryArray::from_iter_values([bytes.as_slice()])))
+        }
+        (None, Some(sum)) => {
+            let coefficient = arrow_buffer::i256::from_be_bytes(sum.coefficient);
+            let values = Decimal256Array::from(vec![coefficient])
+                .with_precision_and_scale(76, sum.scale).map_err(arrow)?;
+            ("sum_decimal", Arc::new(values))
+        }
+        _ => return Err(invalid("Owned measure has no covered sum")),
+    };
     RecordBatch::try_from_iter([
-        ("count", Arc::new(UInt64Array::from(vec![count])) as arrow_array::ArrayRef),
-        ("sum_i128", Arc::new(BinaryArray::from_iter_values([sum.as_slice()]))),
+        ("count", Arc::new(UInt64Array::from(vec![measured.count])) as ArrayRef),
+        (name, sum),
     ]).map_err(arrow)
 }
 
@@ -1385,7 +1397,7 @@ impl Service {
             held.snapshot.count_range_observed(&relation, &path, request).await
         }.map_err(status)?;
         let batch = if measured {
-            measure_batch(counted.count, counted.sum.ok_or_else(|| invalid("Owned measure has no covered sum"))?)?
+            measure_batch(&counted)?
         } else {
             count_batch(counted.count)?
         };
@@ -1425,8 +1437,8 @@ impl Service {
         let (schema, page, witness, count_rows) = if count {
             let request = OwnedCountRequest { lower, upper, valid_at };
             let (rows, witness) = if matches!(order, WorldOrder::ParentMeasure) {
-                let (count, sum, witness) = held.snapshot.measure(relation.clone(), path, request).await.map_err(status)?;
-                (measure_batch(count, sum)?, witness)
+                let (measured, witness) = held.snapshot.measure(relation.clone(), path, request).await.map_err(status)?;
+                (measure_batch(&measured)?, witness)
             } else {
                 let (count, witness) = held.snapshot.count(relation.clone(), path, request).await.map_err(status)?;
                 (count_batch(count)?, witness)

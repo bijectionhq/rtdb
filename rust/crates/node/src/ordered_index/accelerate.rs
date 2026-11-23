@@ -25,10 +25,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     Definition, OwnedProjection, checkpoint, definitions,
-    key::{Atom, AtomRef, Bucket, Family, family},
+    key::{Atom, AtomRef, Bucket, Family, family, owned_family},
     maintenance::{cancelled, read_root, source_frontier, source_rows},
     postings::Tuple,
-    tree::{Cursor, Hit, KeyRef, Measure, Root, Tree, cardinality_overflow},
+    tree::{Cursor, Hit, KeyRef, Measure, MeasureDomain, Root, Tree, cardinality_overflow},
 };
 
 const BATCH_ROWS: usize = 128;
@@ -835,10 +835,24 @@ pub(super) async fn owned_count(
     projection: OwnedProjection,
     request: super::OwnedCountRequest<'_>,
     lifetime: Option<i64>,
-    measured: bool,
+    domain: Option<MeasureDomain>,
 ) -> Result<super::OwnedRangeCount> {
     let OwnedProjection { fields, empty } = projection;
-    let positions: Vec<_> = (0..fields.len()).collect();
+    let measured = domain.is_some();
+    let decimal = match domain {
+        Some(MeasureDomain::Decimal128(precision, scale)) => Some((precision, scale)),
+        _ => None,
+    };
+    let measure_position = fields.len().checked_sub(2);
+    if let Some((precision, scale)) = decimal {
+        if measure_position.and_then(|position| owned_family(&fields[position].data_type))
+            != Some(Family::Decimal128(precision, scale))
+        {
+            return Err(super::uncovered_owned_range());
+        }
+    }
+    let positions: Vec<_> = (0..fields.len())
+        .filter(|position| decimal.is_none() || Some(*position) != measure_position).collect();
     Covered::bind(&fields, definition, &positions)?.ok_or_else(super::uncovered_owned_range)?;
     let mut range = Range::default();
     compound_bound(&mut range, &fields, request.lower, true, false)?;
@@ -849,7 +863,12 @@ pub(super) async fn owned_count(
         return Err(super::uncovered_owned_range());
     }
     if empty {
-        return Ok(super::OwnedRangeCount { count: 0, sum: measured.then_some(0), present, valid_at: request.valid_at, expiry: None });
+        return Ok(super::OwnedRangeCount {
+            count: 0,
+            sum: (domain == Some(MeasureDomain::Int64)).then_some(0),
+            decimal_sum: decimal.map(|(_, scale)| super::OwnedDecimalSum { coefficient: [0; 32], scale }),
+            present, valid_at: request.valid_at, expiry: None,
+        });
     }
     let (tree, root) = covered_root(context, snapshot, storage, definition, present).await?;
     let (count, measure) = rank_owned_range(
@@ -858,7 +877,16 @@ pub(super) async fn owned_count(
     if measured && measure.count != count {
         return Err(super::uncovered_owned_range());
     }
-    let sum = measured.then(|| measure.sum());
+    let (sum, decimal_sum) = match domain {
+        Some(MeasureDomain::Int64) => (
+            Some(measure.coefficient(MeasureDomain::Int64)?.to_i128().ok_or_else(cardinality_overflow)?), None,
+        ),
+        Some(expected @ MeasureDomain::Decimal128(_, scale)) => (
+            None, Some(super::OwnedDecimalSum { coefficient: measure.coefficient(expected)?.to_be_bytes(), scale }),
+        ),
+        None => (None, None),
+        _ => return Err(super::uncovered_owned_range()),
+    };
     let expiry = if let Some(duration) = lifetime.filter(|_| count != 0) {
         let mut live = present.0;
         let mut expired = live.checked_add(duration).filter(|until| *until > live && *until < i64::MAX)
@@ -879,7 +907,7 @@ pub(super) async fn owned_count(
     } else {
         None
     };
-    Ok(super::OwnedRangeCount { count, sum, present, valid_at: request.valid_at, expiry })
+    Ok(super::OwnedRangeCount { count, sum, decimal_sum, present, valid_at: request.valid_at, expiry })
 }
 
 async fn rank_owned_range(
@@ -939,7 +967,7 @@ fn invalid_bound() -> rtdb_types::Anomaly {
 }
 
 fn bound_atom(field: &Field, value: &rtdb_types::Value) -> Result<Atom> {
-    let expected = family(&field.data_type).ok_or_else(invalid_bound)?;
+    let expected = owned_family(&field.data_type).ok_or_else(invalid_bound)?;
     Atom::of(value)
         .filter(|atom| {
             atom.family() == Some(expected)
