@@ -261,49 +261,64 @@ impl<T: CaptureCryptography> ObjectCipher for T {
 }
 
 pub(super) fn tracked_archive_key(key: impl CaptureCryptography + 'static) -> Arc<dyn ArchiveKey> {
-    Arc::new(TrackedArchiveKey(Arc::new(key)))
+    let key = Arc::new(key);
+    Arc::new(TrackedArchiveKey { inner: key.clone(), delivery: key })
 }
 
-struct TrackedArchiveKey(Arc<dyn ArchiveKey>);
+pub(crate) fn tracked_deployment_archive_key(
+    keys: &dyn super::KeyService, id: String, material: &[u8; KEY_BYTES],
+) -> Result<Arc<dyn ArchiveKey>> {
+    let inner = legacy_archive_key(material)?;
+    let delivery = keys.retain_deployment_delivery(id, material)?;
+    Ok(Arc::new(TrackedArchiveKey { inner, delivery }))
+}
+
+struct TrackedArchiveKey {
+    inner: Arc<dyn ArchiveKey>,
+    delivery: Arc<dyn ObjectCipher>,
+}
 
 impl TrackedArchiveKey {
     fn track(&self, name: &ObjectKey) -> rtdb_storage::Result<()> {
-        let owner: Arc<dyn ObjectCipher> = self.0.clone();
-        PlaintextView::track(&owner, name)
+        PlaintextView::track(&self.delivery, name)
     }
 }
 
 #[async_trait::async_trait]
 impl ObjectCipher for TrackedArchiveKey {
     async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
-        self.0.operate(name, operation).await
+        if matches!(operation, UnitOperation::Grant) {
+            self.delivery.operate(name, operation).await
+        } else {
+            self.inner.operate(name, operation).await
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl ArchiveKey for TrackedArchiveKey {
     async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.0.seal(associated, plaintext).await
+        self.inner.seal(associated, plaintext).await
     }
 
     async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
-        let plaintext = self.0.open(associated, ciphertext).await?;
+        let plaintext = self.inner.open(associated, ciphertext).await?;
         self.track(&associated_unit(associated)?)?;
         Ok(plaintext)
     }
 
     async fn seal_object(&self, name: &ObjectKey, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
-        self.0.seal_object(name, plaintext).await
+        self.inner.seal_object(name, plaintext).await
     }
 
     async fn open_object(&self, name: &ObjectKey, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
-        let plaintext = self.0.open_object(name, ciphertext).await?;
+        let plaintext = self.inner.open_object(name, ciphertext).await?;
         self.track(name)?;
         Ok(plaintext)
     }
 
     async fn open_frame_header(&self, name: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<FramedObject> {
-        let header = self.0.open_frame_header(name, sealed).await?;
+        let header = self.inner.open_frame_header(name, sealed).await?;
         self.track(name)?;
         Ok(header)
     }
@@ -311,13 +326,13 @@ impl ArchiveKey for TrackedArchiveKey {
     async fn open_frames(
         &self, name: &ObjectKey, layout: FramedObject, frames: Range<usize>, sealed: Bytes,
     ) -> rtdb_storage::Result<Bytes> {
-        let plaintext = self.0.open_frames(name, layout, frames, sealed).await?;
+        let plaintext = self.inner.open_frames(name, layout, frames, sealed).await?;
         self.track(name)?;
         Ok(plaintext)
     }
 
     async fn matches(&self, candidate: [u8; KEY_BYTES]) -> Result<bool> {
-        self.0.matches(candidate).await
+        self.inner.matches(candidate).await
     }
 }
 

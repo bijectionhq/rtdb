@@ -385,7 +385,7 @@ async fn open_inventory(
     let legacy_trie_data = objects.iter().any(|(name, object)| object.is_legacy_trie(name));
     let cipher = match &material {
         None => stage_key,
-        Some(material) => crate::keys::legacy_archive_key(material)?,
+        Some(material) => crate::keys::tracked_deployment_archive_key(keys, media_id, material)?,
     };
     let plaintext = Arc::new(CapturedObjects { files, objects, cipher });
     let extras = observed.difference(&expected).cloned().collect::<BTreeSet<_>>();

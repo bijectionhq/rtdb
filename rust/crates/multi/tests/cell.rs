@@ -3166,6 +3166,11 @@ impl KeyService for InterruptedInstall {
     async fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment).await }
     async fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment).await }
     async fn existing_key(&self, deployment: &str) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_key(deployment).await }
+    fn retain_deployment_delivery(&self, id: String, material: &[u8; 32])
+        -> rtdb_types::Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
+    {
+        self.keys.retain_deployment_delivery(id, material)
+    }
     async fn grant_deployment_key(&self, deployment: &str, binding: [u8; 32]) -> rtdb_storage::Result<rtdb_multi::keys::UnitOutput> {
         self.keys.grant_deployment_key(deployment, binding).await
     }
