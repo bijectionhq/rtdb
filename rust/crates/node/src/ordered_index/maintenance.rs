@@ -9,11 +9,11 @@ use rtdb_format::data::EventBatch;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::{
     CycleWorker, SnapshotSource,
-    input::{open_input, read_page},
+    input::read_page,
 };
 use rtdb_replication::{PartitionLogs, RetainedTableReplay};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -61,7 +61,7 @@ impl OrderedIndexMaintenance {
         let now = snapshot
             .tx_basis()
             .map_or_else(|| self.clock.now(), |basis| basis.system_time);
-        let mut active = definitions(
+        let definitions = definitions(
             &self.database,
             snapshot,
             &self.storage,
@@ -70,11 +70,11 @@ impl OrderedIndexMaintenance {
             cancellation,
         )
         .await?;
-        active.extend(super::owned_definitions(
+        let owned = super::owned_definitions(
             &self.database, snapshot, &self.storage, &self.memory, now.into(), cancellation,
-        ).await?);
-        let directories = active
-            .iter()
+        ).await?;
+        let active = definitions.iter().chain(&owned);
+        let directories = active.clone()
             .map(Definition::directory)
             .collect::<Result<BTreeSet<_>>>()?;
         if let Some(basis) = snapshot
@@ -85,7 +85,7 @@ impl OrderedIndexMaintenance {
         }
         for definition in active {
             let directory = definition.directory()?;
-            self.refresh_index(snapshot, &definition, &directory, cancellation)
+            self.refresh_index(snapshot, definition, &directory, cancellation)
                 .await?;
         }
         Ok(())
@@ -137,7 +137,7 @@ impl OrderedIndexMaintenance {
                 let sources =
                     source_files(snapshot, &definition.table, checkpoint.through, through)?;
                 let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
-                if cuts.scope == 0 {
+                if cuts.cuts.scope == 0 {
                     let mut roots = checkpoint.roots();
                     let advanced =
                         replay_flushed(&tree, definition, &sources, &cuts, &mut roots, cancellation).await;
@@ -163,7 +163,7 @@ impl OrderedIndexMaintenance {
         }
         let sources = source_files(snapshot, &definition.table, -1, through)?;
         let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
-        let mut tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
+        let mut tree = Tree::new(&self.storage, directory, &self.memory, cuts.cuts.scope).await?;
         tree.arrow_references = self.arrow_references;
         checkpoint::request_collection(&tree, through).await?;
         let mut roots = RevisionRoots::default();
@@ -237,7 +237,7 @@ async fn read_flushed(
     memory: &Arc<MemoryBudget>,
     source: &SourceFile,
     cancellation: &CancellationToken,
-    mut visit: impl FnMut(&EventBatch) -> Result<()> + Send,
+    mut visit: impl FnMut(EventBatch, &Arc<MemoryReservation>, &Arc<MemoryReservation>) -> Result<()> + Send,
 ) -> Result<i64> {
     if cancellation.is_cancelled() {
         return Err(cancelled());
@@ -246,12 +246,15 @@ async fn read_flushed(
     if store.head_fresh(&source.object).await.map_err(source_read_error)?.size != source.size as u64 {
         return Err(format_error("An ordered index source differs from the adopted file"));
     }
-    let _input_bytes = memory.reserve(source.size)?;
+    let input_bytes = memory.reserve(source.size)?;
     let bytes = store.get_fresh(&source.object).await.map_err(source_read_error)?;
     if bytes.len() != source.size {
         return Err(format_error("An ordered index source file changed length"));
     }
-    let (mut input, _footer) = open_input(Cursor::new(bytes), memory)?;
+    let layout = rtdb_format::ipc::inspect_file_reserved(&mut Cursor::new(&bytes), |bytes| memory.reserve(bytes))?;
+    let _footer = memory.reserve(layout.opening_allocation_bound()?)?;
+    let buffer = rtdb_columnar::retain_buffer_with_owner(&arrow_buffer::Buffer::from(bytes), input_bytes);
+    let mut input = rtdb_format::ipc::ArrowFile::from_inspected_buffer(buffer, None, layout)?;
     let mut rows = 0_i64;
     for page in 0..input.page_count() {
         if cancellation.is_cancelled() {
@@ -262,7 +265,7 @@ async fn read_flushed(
         rows = rows
             .checked_add(i64::try_from(batch.len()).map_err(format_error)?)
             .ok_or_else(incomplete_source)?;
-        visit(&batch)?;
+        visit(batch, page.reservation(), &_footer)?;
     }
     Ok(rows)
 }
@@ -277,19 +280,22 @@ fn source_read_error(error: rtdb_storage::Error) -> Anomaly {
 #[derive(Default)]
 struct ErasureCuts {
     scope: u64,
-    by_address: BTreeMap<Address, ((Timestamp, i128), Arc<MemoryReservation>)>,
+    by_address: BTreeMap<Address, EraseCut>,
 }
+
+type EraseCut = ((Timestamp, i128), Arc<MemoryReservation>);
 
 impl ErasureCuts {
     fn record(&mut self, block: i64, batch: &EventBatch, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<()> {
-        for row in 0..batch.len() {
-            if cancellation.is_cancelled() { return Err(cancelled()); }
-            let header = batch.header(row)?;
-            if header.op == EventOp::Erase {
+        batch.visit_erasures(|| {
+            if cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
+        }, |row, erased| {
+            if erased.is_some() {
+                let header = batch.header(row)?;
                 self.scope = (block as u64 + 1).max(self.scope);
                 let key = batch.entity_key(row)?.unwrap_or_default();
                 let _scratch = memory.reserve(key.len().saturating_add(128))?;
-                if !key.is_empty() { rtdb_types::EntityId::from_handle_bytes(key)?; }
+                if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(key)?; }
                 let address = AddressRef { iid: header.iid, key };
                 match self.by_address.entry(address.owned()) {
                     Entry::Occupied(mut entry) => {
@@ -301,8 +307,8 @@ impl ErasureCuts {
                     }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn retains(&self, header: rtdb_types::EventHeader, address: AddressRef<'_>) -> bool {
@@ -310,17 +316,55 @@ impl ErasureCuts {
     }
 }
 
+struct ReplayInputs {
+    cuts: ErasureCuts,
+    decoded: Option<Vec<(i64, Vec<EventBatch>)>>,
+    _charges: Vec<Arc<MemoryReservation>>,
+}
+
 async fn erase_cuts(
     storage: &BufferPool,
     memory: &Arc<MemoryBudget>,
     sources: &[SourceFile],
     cancellation: &CancellationToken,
-) -> Result<ErasureCuts> {
-    let mut cuts = ErasureCuts::default();
+) -> Result<ReplayInputs> {
+    let mut inputs = ReplayInputs { cuts: ErasureCuts::default(), decoded: Some(Vec::new()), _charges: Vec::new() };
+    let budget = (memory.available_bytes() / 8).min(32 << 20);
+    let mut retained = 0usize;
     for source in sources {
-        read_flushed(storage, memory, source, cancellation, |batch| cuts.record(source.block, batch, memory, cancellation)).await?;
+        let mut pages = Vec::new();
+        let mut footer = None;
+        retained = retained.saturating_add(source.size);
+        if retained > budget {
+            inputs.decoded = None;
+            inputs._charges.clear();
+        }
+        let mut visit = |batch, page: &Arc<MemoryReservation>, opening: &Arc<MemoryReservation>| {
+            inputs.cuts.record(source.block, &batch, memory, cancellation)?;
+            if inputs.decoded.is_some() {
+                retained = retained.saturating_add(page.bytes());
+                if footer.is_none() {
+                    retained = retained.saturating_add(opening.bytes());
+                    footer = Some(Arc::clone(opening));
+                }
+                if retained <= budget {
+                    pages.push(batch);
+                } else {
+                    inputs.decoded = None;
+                    inputs._charges.clear();
+                    pages.clear();
+                    footer = None;
+                }
+            }
+            Ok(())
+        };
+        let rows = read_flushed(storage, memory, source, cancellation, &mut visit).await?;
+        if let Some(decoded) = &mut inputs.decoded {
+            decoded.push((rows, pages));
+            inputs._charges.extend(footer);
+        }
     }
-    Ok(cuts)
+    Ok(inputs)
 }
 
 async fn flushed_changes(
@@ -331,9 +375,9 @@ async fn flushed_changes(
     retain: impl Fn(rtdb_types::EventHeader, AddressRef<'_>) -> bool + Send + Sync,
 ) -> Result<(i64, Changes)> {
     let mut changes = Changes::default();
-    let rows = read_flushed(&tree.storage, &tree.memory, source, cancellation, |batch| {
+    let rows = read_flushed(&tree.storage, &tree.memory, source, cancellation, |batch, _, _| {
         changes.add_batch(
-            batch,
+            &batch,
             0,
             &definition.columns,
             &tree.memory,
@@ -350,13 +394,24 @@ async fn replay_flushed(
     tree: &Tree,
     definition: &Definition,
     sources: &[SourceFile],
-    cuts: &ErasureCuts,
+    inputs: &ReplayInputs,
     roots: &mut RevisionRoots,
     cancellation: &CancellationToken,
 ) -> Result<i64> {
     let mut rows = 0_i64;
-    for source in sources {
-        let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header, address| cuts.retains(header, address)).await?;
+    let retain = |header: rtdb_types::EventHeader, address: AddressRef<'_>| inputs.cuts.retains(header, address);
+    for (file, source) in sources.iter().enumerate() {
+        let (count, changes) = if let Some(decoded) = &inputs.decoded {
+            let (count, pages) = &decoded[file];
+            let mut changes = Changes::default();
+            for batch in pages {
+                changes.add_batch(batch, 0, &definition.columns, &tree.memory, cancellation,
+                    KeyLayout::for_table(&definition.table), retain)?;
+            }
+            (*count, changes)
+        } else {
+            flushed_changes(tree, definition, source, cancellation, retain).await?
+        };
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         apply_block(tree, source.block, roots, changes, cancellation).await?;
     }
@@ -372,6 +427,49 @@ async fn apply_block(tree: &Tree, block: i64, roots: &mut RevisionRoots, changes
 }
 
 const MAX_TAIL_FILES: usize = 8;
+
+type TailKey = (Definition, usize, Option<i64>);
+type TailEntry = Arc<tokio::sync::OnceCell<(i64, Arc<Changes>)>>;
+
+#[derive(Default)]
+struct TailCache(parking_lot::Mutex<BTreeMap<TailKey, TailEntry>>);
+
+async fn tail_changes(
+    tree: &Tree, definition: &Definition, snapshot: &Snapshot, source: Option<&SourceFile>,
+    cancellation: &CancellationToken,
+) -> Result<(i64, Arc<Changes>)> {
+    let load = || async {
+        if let Some(source) = source {
+            let (rows, changes) = flushed_changes(tree, definition, source, cancellation, |_, _| true).await?;
+            return Ok((rows, Arc::new(changes)));
+        }
+        let mut changes = Changes::default();
+        for segment in snapshot.segments(&definition.table).iter().rev() {
+            for (batch, skip) in segment.batches_from(0) {
+                changes.add_batch(batch.view(), skip, &definition.columns, &tree.memory, cancellation,
+                    KeyLayout::for_table(&definition.table), |_, _| true)?;
+            }
+        }
+        Ok((0, Arc::new(changes)))
+    };
+    if cancellation.is_cancelled() { return Err(cancelled()); }
+    let Some(budget) = tree.memory.snapshot_budget() else { return load().await; };
+    let cache = snapshot.memo::<TailCache>();
+    let key = (definition.clone(), Arc::as_ptr(budget) as usize, source.map(|source| source.block));
+    let entry = {
+        let mut entries = cache.0.lock();
+        if !entries.contains_key(&key) && entries.len() >= MAX_TAIL_FILES + 1 {
+            entries.pop_first();
+        }
+        Arc::clone(entries.entry(key).or_default())
+    };
+    let result = cancellation.run_until_cancelled(entry.get_or_try_init(load)).await.ok_or_else(cancelled)?;
+    let (rows, changes) = result?;
+    if budget.available_bytes() < budget.limit_bytes() / 2 || changes.is_empty() {
+        cache.0.lock().retain(|_, cached| !Arc::ptr_eq(cached, &entry));
+    }
+    Ok((*rows, Arc::clone(changes)))
+}
 
 pub(super) async fn read_root(
     tree: &Tree,
@@ -391,20 +489,7 @@ pub(super) async fn read_root(
     else {
         return Ok(None);
     };
-    let mut live = Changes::default();
-    for segment in snapshot.segments(&definition.table).iter().rev() {
-        for (batch, skip) in segment.batches_from(0) {
-            live.add_batch(
-                batch.view(),
-                skip,
-                &definition.columns,
-                &tree.memory,
-                cancellation,
-                KeyLayout::for_table(&definition.table),
-                |_, _| true,
-            )?;
-        }
-    }
+    let (_, live) = tail_changes(tree, definition, snapshot, None, cancellation).await?;
     live.read(tree, root, through, EventOrder::OldestFirst, cancellation)
         .await
         .map(Some)
@@ -440,7 +525,7 @@ async fn read_flushed_root(
     let files = source_files(snapshot, &definition.table, after, through)?;
     for source in files {
         let (count, changes) =
-            flushed_changes(tree, definition, &source, cancellation, |_, _| true).await?;
+            tail_changes(tree, definition, snapshot, Some(&source), cancellation).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         root = changes
             .read(tree, root, revision, EventOrder::NewestFirst, cancellation)
@@ -571,4 +656,38 @@ pub(super) fn cancelled() -> Anomaly {
         "rtdb.ordered-index/cancelled",
         "Ordered index work was cancelled",
     )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn erase_discovery_retains_the_decoded_pages_for_small_replays() -> Result<()> {
+        use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+        use rtdb_types::{Iid, Interval};
+
+        let memory = MemoryBudget::new(32 << 20);
+        let storage = BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20);
+        let event = StoredEvent { iid: Iid([4; 16]), operation: StoredOperation::Erase,
+            system_from: Timestamp(123), commit_position: 0, entity_key: None, valid_time: Interval::ALL,
+            origin: None, position: None, recency: None };
+        let batch = build_event_batch(std::slice::from_ref(&event), None, None)?;
+        let bytes = rtdb_format::ipc::write_file(batch.schema_ref(), &[batch.clone()])?;
+        let object = ObjectKey::new("test/order-index/input")?;
+        let source = SourceFile { block: 4, object, size: bytes.len(), rows: Some(1) };
+        storage.object_store().put(&source.object, bytes.into()).await?;
+        let inputs = erase_cuts(&storage, &memory, &[source], &CancellationToken::new()).await?;
+        assert_eq!(inputs.cuts.scope, 5);
+        let address = AddressRef { iid: event.iid, key: &[] }.owned();
+        assert_eq!(inputs.cuts.by_address[&address].0, event.header().precedence());
+        let decoded = inputs.decoded.as_ref().expect("the selected replay fits the retention budget");
+        assert_eq!(decoded[0].0, 1);
+        assert_eq!(decoded[0].1[0].arrow(), &batch);
+        assert!(memory.used_bytes() > 128);
+        drop(inputs);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 }

@@ -145,6 +145,7 @@ pub trait RemoteStorageFactory: Send + Sync {
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
     fn table_history(&self, _configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
+    fn has_private_storage(&self, _configuration: &DatabaseConfig) -> bool { false }
 
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()>;
     /// Opens a fresh database storage region without opening logs; partial failures drain that region.
@@ -285,6 +286,10 @@ impl ResourceFactory for NativeResources {
         let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
         let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
         factory.table_history(configuration)
+    }
+
+    fn has_private_storage(&self, configuration: &DatabaseConfig) -> bool {
+        matches!(configuration.storage, None | Some(database_config::Storage::InMemoryStorage(_)))
     }
 
     async fn close(&self) -> Result<()> { if let Some(cache) = &self.disk_cache { cache.close_and_wait().await; } self.io.close_and_wait().await; Ok(()) }

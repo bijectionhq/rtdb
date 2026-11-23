@@ -4,8 +4,8 @@ use std::{
     sync::Arc,
 };
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::data::{EncodedEvent, EventBatch, PutColumn};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
+use rtdb_format::data::{EncodedEvent, EventBatch, PageEvent};
 use rtdb_temporal::HistoryResolver;
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
 use tokio_util::sync::CancellationToken;
@@ -14,7 +14,7 @@ use super::{
     format_error,
     key::{AtomRef, Bucket},
     maintenance::cancelled,
-    postings::{BatchKind, KeyBatch, KeyRow, ProjectedKeys, Tuple},
+    postings::{BatchKind, KeyBatch, KeyColumn, KeyRow, ProjectedKeys, Tuple},
     tree::{Address, AddressRef, Cursor, Hit, IndexRevision, Item, Key, KeyRef, Link, Root, Span, Tree},
 };
 
@@ -135,11 +135,11 @@ fn archived_revision(hit: Hit) -> Result<(IndexRevision, Root)> {
     }
 }
 
-fn resolve(
+fn resolve<'a>(
     iid: Iid,
     time: Timestamp,
     before: &[Span],
-    events: &[Event],
+    events: impl IntoIterator<Item = &'a Event>,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Vec<Span>> {
     let bounds = TemporalBounds {
@@ -252,18 +252,20 @@ pub(super) struct Changes {
 }
 
 impl Changes {
+    pub fn is_empty(&self) -> bool { self.revisions.is_empty() }
+
     /// A read keeps only its selected root. Later erasures still remove older facts from it.
     pub async fn read(
-        self,
+        &self,
         tree: &Tree,
         mut root: Root,
         through: IndexRevision,
         order: EventOrder,
         cancellation: &CancellationToken,
     ) -> Result<Root> {
-        for (revision, rows) in self.revisions {
+        for (&revision, rows) in &self.revisions {
             let mut edits = BTreeMap::new();
-            for (address, mut events) in rows {
+            for (address, events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
@@ -271,20 +273,24 @@ impl Changes {
                 {
                     continue;
                 }
-                let before = tree.spans(&root, &address).await?;
+                let before = tree.spans(&root, address).await?;
                 let after = if revision > through {
                     Vec::new()
-                } else {
+                } else if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
+                    let _scratch = tree.memory.reserve(events.len().saturating_mul(2 * size_of::<&Event>()))?;
+                    let mut ordered: Vec<_> = events.iter().collect();
                     if matches!(order, EventOrder::OldestFirst) {
-                        events.reverse();
+                        ordered.reverse();
                     }
-                    if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
-                        events.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
-                    }
-                    resolve(address.iid, revision.time, &before, &events, &tree.memory)?
+                    ordered.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
+                    resolve(address.iid, revision.time, &before, ordered, &tree.memory)?
+                } else if matches!(order, EventOrder::OldestFirst) {
+                    resolve(address.iid, revision.time, &before, events.iter().rev(), &tree.memory)?
+                } else {
+                    resolve(address.iid, revision.time, &before, events, &tree.memory)?
                 };
                 if before.as_ref() != after.as_slice() {
-                    project(&mut edits, &address, &before, after.into());
+                    project(&mut edits, address, &before, after.into());
                 }
             }
             root = tree.edit(root, edits.into_iter().collect()).await?;
@@ -308,6 +314,13 @@ impl Changes {
         }
         let _headers = memory.reserve(batch.len().saturating_mul(256))?;
         let events = batch.page_events()?;
+        let document = batch.put_document()?;
+        let column = |name: &str| document.and_then(|document| document.fields().iter().zip(document.columns())
+            .find(|(field, _)| field.name() == name))
+            .map(|(field, array)| (field.as_ref(), array.as_ref()));
+        let projection: Vec<_> = columns.iter().map(|name| KeyColumn::new(column(name))).collect();
+        let identity = keyed.then(|| column("_id")).flatten();
+        let marker = matches!(layout, KeyLayout::World).then(|| column(WorldShadow::FIELDS)).flatten();
         for events in events[skip.min(events.len())..].chunks(128) {
             let _cells = memory.reserve(
                 events
@@ -318,7 +331,6 @@ impl Changes {
             )?;
             let mut retained = Vec::new();
             let mut rows = Vec::new();
-            let mut payload = 0usize;
             for event in events {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
@@ -327,7 +339,7 @@ impl Changes {
                 let address = AddressRef { iid: header.iid, key: event.entity_key().unwrap_or_default() };
                 let _key = memory.reserve(address.key.len().saturating_add(128))?;
                 let id = if keyed {
-                    Some(rtdb_types::EntityId::from_handle_bytes(address.key)?)
+                    Some(rtdb_columnar::EntityIdRef::from_handle_bytes(address.key)?)
                 } else {
                     None
                 };
@@ -335,47 +347,28 @@ impl Changes {
                 if header.op == EventOp::Redacted {
                     return Err(Anomaly::unsupported("rtdb.owned/redaction-uncovered", "Ordered indexes require coverage for redacted assertions"));
                 }
-                if header.op == EventOp::Put {
+                let row = if header.op == EventOp::Put {
+                    let offset = event.put_offset().ok_or_else(|| format_error("An indexed put has no Arrow document"))?;
                     if let Some(id) = id {
-                        let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {
+                        let Some((field, array)) = identity else {
                             return Err(format_error("Governed ordered put omitted its identity"));
                         };
-                        let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
-                        if event.put_cell("_id", &rtdb_types::LogicalType::Null)?.entity_id()? != id {
+                        let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, offset)?)?;
+                        let matches = match rtdb_columnar::read_entity_id(field, array, offset) {
+                            Ok(borrowed) => borrowed == id,
+                            Err(_) => event.put_cell("_id", &LogicalType::Null)?.entity_id()? == id.into_owned(),
+                        };
+                        if !matches {
                             return Err(format_error("Governed ordered put differs from its physical identity"));
                         }
                     }
-                }
-                let local_tombstone = if matches!(layout, KeyLayout::World) && header.op == EventOp::Put {
-                    let Some(PutColumn::Stored(field, array, row)) = event.put_column(WorldShadow::FIELDS) else {
-                        return Err(format_error("Ordered world shadow omitted its field marker"));
-                    };
-                    let _charge = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
-                    match event.put_cell(WorldShadow::FIELDS, &LogicalType::Null)?.as_ref() {
-                        Value::Null => true,
-                        Value::List(_) => false,
-                        _ => return Err(format_error("Invalid ordered world shadow field marker")),
+                    if matches!(layout, KeyLayout::World) && world_tombstone(event, marker, offset, memory)? {
+                        None
+                    } else {
+                        let row = rows.len();
+                        rows.push(u32::try_from(offset).map_err(format_error)?);
+                        Some(row)
                     }
-                } else {
-                    false
-                };
-                let row = if header.op == EventOp::Put && !local_tombstone {
-                    let cells = columns
-                        .iter()
-                        .map(|name| match event.put_column(name) {
-                            Some(PutColumn::Stored(field, array, row)) => {
-                                AtomRef::from_arrow(field, array, row)
-                            }
-                            Some(PutColumn::Absent) => Ok(AtomRef::Null),
-                            None => Err(format_error("An indexed put has no Arrow document")),
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    payload = cells.iter().fold(payload, |bytes, cell| {
-                        bytes.saturating_add(cell.retained_bytes())
-                    });
-                    let row = rows.len();
-                    rows.push(cells);
-                    Some(row)
                 } else {
                     None
                 };
@@ -384,6 +377,8 @@ impl Changes {
             let keys = if rows.is_empty() {
                 None
             } else {
+                let selected = projection.iter().map(|column| column.select(&rows)).collect::<Result<Vec<_>>>()?;
+                let payload = selected.iter().map(|column| column.payload()).fold(0usize, usize::saturating_add);
                 let mut allocation = memory.reserve(
                     payload
                         .saturating_mul(3)
@@ -392,11 +387,7 @@ impl Changes {
                             rows.len().saturating_mul(columns.len()).saturating_mul(64),
                         ),
                 )?;
-                let views = rows
-                    .iter()
-                    .map(|cells| Tuple::Cells(cells))
-                    .collect::<Vec<_>>();
-                let keys = KeyBatch::build(&views, BatchKind::Keys, Vec::new())?;
+                let keys = KeyBatch::project(selected, rows)?;
                 Arc::get_mut(&mut allocation)
                     .expect("key builder owns its reservation")
                     .shrink_to(keys.retained_bytes())?;
@@ -418,6 +409,33 @@ impl Changes {
             }
         }
         Ok(())
+    }
+}
+
+fn world_tombstone(
+    event: &PageEvent,
+    marker: Option<(&arrow_schema::Field, &dyn arrow_array::Array)>,
+    row: usize,
+    memory: &Arc<MemoryBudget>,
+) -> Result<bool> {
+    use arrow_schema::DataType;
+    let Some((field, array)) = marker else {
+        return Err(format_error("Ordered world shadow omitted its field marker"));
+    };
+    let _charge = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?)?;
+    let cell = ArrowCell { field, array, row }.physical()?;
+    if !cell.is_undefined()? && cell.is_null()? { return Ok(true); }
+    if cell.field.extension_type_name().is_none()
+        && let DataType::List(item) = cell.field.data_type()
+        && item.extension_type_name().is_none()
+        && matches!(item.data_type(), DataType::Utf8 | DataType::Null)
+    {
+        return Ok(false);
+    }
+    match event.put_cell(WorldShadow::FIELDS, &LogicalType::Null)?.as_ref() {
+        Value::Null => Ok(true),
+        Value::List(_) => Ok(false),
+        _ => Err(format_error("Invalid ordered world shadow field marker")),
     }
 }
 

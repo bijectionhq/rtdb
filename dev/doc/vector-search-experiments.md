@@ -522,6 +522,21 @@ The release workload on the 100,000-vector GloVe fixture passed result-order and
 Its p50 latencies stayed within a few percent of the candidate before this pass for every filter, as its measured routes do not use the casts and adapters this pass changes.
 The Gradle suites did not run, because this host has JDK 21 and 26 but not the JDK 25 toolchain the build requires.
 
+### Ordered-index Arrow follow-up
+
+| Path | Arrow route | Retained boundary |
+| --- | --- | --- |
+| Event key projection | Resolve the put leg and columns once per page, then select rows and convert each plain column in Arrow. | Extension, mixed-union, and run-end keys can still require selected-cell interpretation. |
+| Governed identity and world shadows | Borrow the complete typed identity and read the shadow marker's logical null state. | Nonstandard fields use existing validation to preserve their errors. |
+| Tail replay and definitions | Capture typed definitions and projected tail changes on the snapshot, and borrow uncompressed source page bodies from retained IPC bytes. | Cache reuse follows the captured read time, ordinary allocation budget, and source block. |
+| Posting and correction edits | Interleave matching Arrow columns and size text and binary builders from their selected payload lengths. | The canonical builder combines inputs with incompatible masks. |
+| Covered seeks | Share selected contiguous text, binary, Boolean, UUID, microsecond instant, and validity buffers, and convert integer and date widths with typed kernels. | Hosted Arrow outputs that escape the encoder retain independent result buffers. |
+| Checkpoint references | Verify canonical JSON manifest bytes directly and default private in-memory writers to Arrow references. | Durable and shared stores require the rollout gate, and legacy definition addresses retain the JSON hash. |
+| Entity handle validation | Validate borrowed handle bytes while reading postings, corrections, and covered results. | The durable handle encoding still identifies the complete entity. |
+| Erase discovery | Scan operation tags with one IID view and retain decoded pages through bounded rebuilds. | Larger rebuilds and journal recovery discover future cuts before streaming the historical projections. |
+| Candidate and payload handling | Sort and deduplicate candidate IIDs before building the Arrow membership column, and reuse the payload cursor and join storage for each batch. | Legacy accelerator interfaces still accept IID sets. |
+| Query constants | Cache projected constants across range, cursor and residual binding for each seek. | DDL and system catalog compatibility paths retain their existing representations. |
+
 ### Pre-integration non-Arrow inventory at `fa969b755`
 
 This source audit covers RTDB vector search at `fa969b755`, from client input and primary storage through exact SQL, the experimental ANN workload, and result export.

@@ -29,7 +29,7 @@ const ALIGNMENT: usize = 16;
 
 // Bit positions in the leaf layout and type IDs in mixed Arrow columns.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Bool = 0,
     Integer = 1,
     Text = 2,
@@ -101,7 +101,7 @@ impl Kind {
         }
     }
 
-    fn build<'a>(self, cells: impl ExactSizeIterator<Item = AtomRef<'a>>) -> Result<ArrayRef> {
+    fn build<'a>(self, cells: impl ExactSizeIterator<Item = AtomRef<'a>>, bytes: usize) -> Result<ArrayRef> {
         macro_rules! primitive {
             ($array:ty, $variant:ident) => {
                 Arc::new(
@@ -148,7 +148,7 @@ impl Kind {
                 Arc::new(builder.finish())
             }
             Self::Text => {
-                let mut builder = StringBuilder::with_capacity(cells.len(), 0);
+                let mut builder = StringBuilder::with_capacity(cells.len(), bytes);
                 for cell in cells {
                     match cell {
                         AtomRef::Text(value) => builder.append_value(value),
@@ -158,7 +158,7 @@ impl Kind {
                 Arc::new(builder.finish())
             }
             Self::Binary => {
-                let mut builder = BinaryBuilder::with_capacity(cells.len(), 0);
+                let mut builder = BinaryBuilder::with_capacity(cells.len(), bytes);
                 for cell in cells {
                     match cell {
                         AtomRef::Binary(value) => builder.append_value(value),
@@ -216,7 +216,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Layout(u16);
 
 impl Layout {
@@ -264,30 +264,84 @@ impl Layout {
         ))
     }
 
-    fn build(self, field: &Field, cells: Vec<AtomRef<'_>>) -> Result<ArrayRef> {
+    fn build(self, field: &Field, cells: Vec<AtomRef<'_>>, bytes: usize) -> Result<ArrayRef> {
         if let Some(kind) = self.plain() {
-            return kind.build(cells.into_iter());
+            return kind.build(cells.into_iter(), bytes);
         }
         let DataType::Union(fields, UnionMode::Dense) = field.data_type() else {
             return Err(invalid());
         };
         let mut legs: [Vec<_>; KINDS.len()] = std::array::from_fn(|_| Vec::new());
+        let mut payloads = [0usize; KINDS.len()];
         let mut ids = Vec::with_capacity(cells.len());
         let mut offsets = Vec::with_capacity(cells.len());
         for cell in cells {
             let kind = Kind::of(cell) as usize;
             ids.push(kind as i8);
             offsets.push(i32::try_from(legs[kind].len()).map_err(format_error)?);
+            payloads[kind] = payloads[kind].saturating_add(cell.retained_bytes());
             legs[kind].push(cell);
         }
         let children = self
             .kinds()
-            .map(|kind| kind.build(legs[kind as usize].drain(..)))
+            .map(|kind| kind.build(legs[kind as usize].iter().copied(), payloads[kind as usize]))
             .collect::<Result<_>>()?;
         Ok(Arc::new(
             UnionArray::try_new(fields.clone(), ids.into(), Some(offsets.into()), children)
                 .map_err(format_error)?,
         ))
+    }
+
+    fn interleave(self, arrays: &[&dyn Array], indices: &[(usize, usize)], slot: usize) -> Result<(Self, ArrayRef)> {
+        if let Some(kind) = self.plain() {
+            if self.0 == kind.bit() {
+                return Ok((self, interleave_array(arrays, indices)?));
+            }
+            let chosen = indices.iter().map(|&(array, row)| {
+                let kind = if arrays[array].is_null(row) { Kind::Null } else { kind };
+                (kind, array, row)
+            }).collect::<Vec<_>>();
+            return interleave_plain(kind, arrays, &chosen);
+        }
+
+        let unions = arrays.iter().map(|array| arrow::<UnionArray>(*array)).collect::<Result<Vec<_>>>()?;
+        let chosen = indices.iter().map(|&(array, row)| {
+            let union = unions[array];
+            let tag = union.type_id(row);
+            let row = union.value_offset(row);
+            let kind = if union.child(tag).is_null(row) { Kind::Null } else { KINDS[tag as usize] };
+            (kind, array, row)
+        }).collect::<Vec<_>>();
+        let layout = Self(chosen.iter().fold(0, |mask, (kind, _, _)| mask | kind.bit()));
+        let children = |kind: Kind| unions.iter().map(|union| union.child(kind as i8).as_ref()).collect::<Vec<_>>();
+        if let Some(kind) = layout.plain() {
+            if matches!(kind, Kind::Null | Kind::Unordered) {
+                return Ok((layout, Arc::new(NullArray::new(chosen.len()))));
+            }
+            return interleave_plain(kind, &children(kind), &chosen);
+        }
+
+        let field = layout.field(slot)?;
+        let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return Err(invalid()); };
+        let mut selected: [Vec<_>; KINDS.len()] = std::array::from_fn(|_| Vec::new());
+        let mut tags = Vec::with_capacity(chosen.len());
+        let mut offsets = Vec::with_capacity(chosen.len());
+        for (kind, array, row) in chosen {
+            let rows = &mut selected[kind as usize];
+            tags.push(kind as i8);
+            offsets.push(i32::try_from(rows.len()).map_err(format_error)?);
+            rows.push((array, row));
+        }
+        let children = layout.kinds().map(|kind| {
+            let rows = &selected[kind as usize];
+            if matches!(kind, Kind::Null | Kind::Unordered) {
+                Ok(Arc::new(NullArray::new(rows.len())) as ArrayRef)
+            } else {
+                interleave_array(&children(kind), rows)
+            }
+        }).collect::<Result<Vec<_>>>()?;
+        let union = UnionArray::try_new(fields.clone(), tags.into(), Some(offsets.into()), children).map_err(format_error)?;
+        Ok((layout, Arc::new(union)))
     }
 
     fn cell(self, array: &dyn Array, row: usize) -> AtomRef<'_> {
@@ -298,6 +352,32 @@ impl Layout {
         let tag = union.type_id(row);
         KINDS[tag as usize].cell(union.child(tag).as_ref(), union.value_offset(row))
     }
+}
+
+fn interleave_array(arrays: &[&dyn Array], indices: &[(usize, usize)]) -> Result<ArrayRef> {
+    arrow_select::interleave::interleave(arrays, indices).map_err(|error| match error {
+        arrow_schema::ArrowError::OffsetOverflowError(_) => invalid(),
+        _ => format_error(error),
+    })
+}
+
+fn interleave_plain(kind: Kind, arrays: &[&dyn Array], chosen: &[(Kind, usize, usize)]) -> Result<(Layout, ArrayRef)> {
+    if matches!(kind, Kind::Null | Kind::Unordered) {
+        return Ok((Layout(kind.bit()), Arc::new(NullArray::new(chosen.len()))));
+    }
+    let mask = chosen.iter().fold(0, |mask, (kind, _, _)| mask | kind.bit());
+    if mask == Kind::Null.bit() {
+        return Ok((Layout(mask), Arc::new(NullArray::new(chosen.len()))));
+    }
+    // Canonical posting bytes leave no source payload behind a null.
+    let null = arrow_array::new_null_array(&kind.data_type(), 1);
+    let mut arrays = arrays.to_vec();
+    let null_array = arrays.len();
+    arrays.push(null.as_ref());
+    let indices = chosen.iter().map(|&(kind, array, row)| {
+        if kind == Kind::Null { (null_array, 0) } else { (array, row) }
+    }).collect::<Vec<_>>();
+    Ok((Layout(mask), interleave_array(&arrays, &indices)?))
 }
 
 #[derive(Debug)]
@@ -331,7 +411,7 @@ impl Postings {
             identities.append_value(address.key);
         }
         let tuples = keys.iter().map(|(_, tuple, _)| *tuple).collect::<Vec<_>>();
-        KeyBatch::build(
+        KeyBatch::gather(
             &tuples,
             BatchKind::Posting,
             vec![
@@ -342,6 +422,13 @@ impl Postings {
             ],
         )
         .map(Self)
+    }
+
+    pub fn interleave(rows: &[(&Self, usize)]) -> Result<Option<Self>> {
+        let selection: Vec<_> = rows.iter().map(|&(postings, row)| (&postings.0, row)).collect();
+        let Some((layouts, arrays)) = KeyBatch::interleave(&selection, true)? else { return Ok(None); };
+        let batch = RecordBatch::try_new(schema(BatchKind::Posting, &layouts)?, arrays).map_err(format_error)?;
+        Ok(Some(Self(KeyBatch::new(layouts, batch, BatchKind::Posting.prefix())?)))
     }
 
     pub fn len(&self) -> usize {
@@ -386,7 +473,7 @@ impl Postings {
         for row in 0..postings.len() {
             let (bucket, _, address) = postings.at(row);
             if (!address.key.is_empty()
-                && rtdb_types::EntityId::from_handle_bytes(address.key).is_err())
+                && rtdb_columnar::EntityIdRef::from_handle_bytes(address.key).is_err())
                 || bucket.level > 64
                 || super::domain::bucket_start(bucket.start.into(), bucket.level) != bucket.start
             {
@@ -430,6 +517,166 @@ impl BatchKind {
     }
 }
 
+pub(super) enum KeyColumn<'a> {
+    Missing,
+    Typed(Kind, &'a dyn Array),
+    Cells(&'a Field, &'a dyn Array),
+}
+
+impl<'a> KeyColumn<'a> {
+    pub fn new(column: Option<(&'a Field, &'a dyn Array)>) -> Self {
+        let Some((field, array)) = column else { return Self::Missing; };
+        let kind = if field.extension_type_name().is_some() {
+            return Self::Cells(field, array);
+        } else {
+            match field.data_type() {
+                DataType::Union(..) | DataType::RunEndEncoded(..) =>
+                    return Self::Cells(field, array),
+                DataType::Boolean => Kind::Bool,
+                DataType::Decimal128(..) => Kind::Decimal128,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => Kind::Integer,
+                DataType::Utf8 => Kind::Text,
+                DataType::Binary => Kind::Binary,
+                DataType::Date32 | DataType::Date64 => Kind::Day,
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)) => Kind::InstantMicros,
+                DataType::Float32 | DataType::Float64 => Kind::FloatOrder,
+                DataType::Null => Kind::Null,
+                _ => Kind::Unordered,
+            }
+        };
+        Self::Typed(kind, array)
+    }
+
+    pub fn select(&self, rows: &[u32]) -> Result<SelectedColumn<'a>> {
+        let byte_count = |offsets: &[i32], array: &dyn Array| {
+            rows.iter().copied().map(|row| row as usize)
+                .filter(|&row| array.is_valid(row))
+                .fold(0usize, |bytes, row| bytes.saturating_add((offsets[row + 1] - offsets[row]) as usize))
+        };
+        Ok(match *self {
+            Self::Missing => SelectedColumn::Typed(Kind::Null, None, 0),
+            Self::Typed(kind, array) => {
+                let bytes = match kind {
+                    Kind::Text => byte_count(arrow::<StringArray>(array)?.value_offsets(), array),
+                    Kind::Binary => byte_count(arrow::<BinaryArray>(array)?.value_offsets(), array),
+                    _ => 0,
+                };
+                SelectedColumn::Typed(kind, Some(array), bytes)
+            }
+            Self::Cells(field, array) => SelectedColumn::Cells(rows.iter().map(|&row| {
+                AtomRef::from_arrow(field, array, row as usize)
+            }).collect::<Result<_>>()?),
+        })
+    }
+}
+
+pub(super) enum SelectedColumn<'a> {
+    Typed(Kind, Option<&'a dyn Array>, usize),
+    Cells(Vec<AtomRef<'a>>),
+}
+
+impl SelectedColumn<'_> {
+    pub fn payload(&self) -> usize {
+        match self {
+            Self::Typed(_, _, bytes) => *bytes,
+            Self::Cells(cells) => cells.iter().map(AtomRef::retained_bytes).fold(0, usize::saturating_add),
+        }
+    }
+
+    fn build(self, slot: usize, rows: &arrow_array::UInt32Array) -> Result<(Layout, ArrayRef)> {
+        let bytes = self.payload();
+        if bytes > i32::MAX as usize { return Err(invalid()); }
+        match self {
+            Self::Typed(Kind::Null, _, _) => Ok((Layout(Kind::Null.bit()), Arc::new(NullArray::new(rows.len())))),
+            Self::Typed(kind, Some(array), _) => {
+                let nulls = rows.values().iter().filter(|&&row| array.is_null(row as usize)).count();
+                let layout = Layout(if nulls == rows.len() {
+                    Kind::Null.bit()
+                } else {
+                    kind.bit() | if nulls == 0 { 0 } else { Kind::Null.bit() }
+                });
+                if layout.plain() == Some(Kind::Null) || kind == Kind::Unordered {
+                    let values = if layout.plain().is_some() {
+                        Arc::new(NullArray::new(rows.len())) as ArrayRef
+                    } else {
+                        let field = layout.field(slot)?;
+                        let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return Err(invalid()); };
+                        let mut counts = [0i32; 2];
+                        let (tags, offsets): (Vec<_>, Vec<_>) = rows.values().iter().map(|&row| {
+                            let tag = usize::from(array.is_null(row as usize));
+                            let offset = counts[tag];
+                            counts[tag] += 1;
+                            ((Kind::Unordered as i8) + tag as i8, offset)
+                        }).unzip();
+                        let children = counts.map(|count| Arc::new(NullArray::new(count as usize)) as ArrayRef);
+                        Arc::new(UnionArray::try_new(fields.clone(), tags.into(), Some(offsets.into()), children.into()).map_err(format_error)?)
+                    };
+                    return Ok((layout, values));
+                }
+                let selected = arrow_select::take::take(array, rows, None).map_err(format_error)?;
+                Ok((layout, kind.execution_array(selected)?))
+            }
+            Self::Typed(_, None, _) => unreachable!("a missing column has null type"),
+            Self::Cells(cells) => {
+                let layout = Layout(cells.iter().fold(0, |mask, &cell| mask | Kind::of(cell).bit()));
+                let values = layout.build(&layout.field(slot)?, cells, bytes)?;
+                Ok((layout, values))
+            }
+        }
+    }
+}
+
+impl Kind {
+    fn execution_array(self, array: ArrayRef) -> Result<ArrayRef> {
+        use arrow_array::{types::*, Date32Array, Date64Array, Float32Array, Float64Array,
+            Int8Array, Int16Array, Int32Array, TimestampMicrosecondArray, UInt16Array, UInt32Array};
+        macro_rules! unary {
+            ($array:ty, $output:ty, $convert:expr) => {
+                Arc::new(arrow::<$array>(array.as_ref())?.unary::<_, $output>($convert))
+            };
+        }
+        Ok(match self {
+            Self::Integer => {
+                let values = match array.data_type() {
+                    DataType::Int8 => arrow::<Int8Array>(array.as_ref())?.unary(i128::from),
+                    DataType::Int16 => arrow::<Int16Array>(array.as_ref())?.unary(i128::from),
+                    DataType::Int32 => arrow::<Int32Array>(array.as_ref())?.unary(i128::from),
+                    DataType::Int64 => arrow::<Int64Array>(array.as_ref())?.unary(i128::from),
+                    DataType::UInt8 => arrow::<UInt8Array>(array.as_ref())?.unary(|value| i128::from(value as i8)),
+                    DataType::UInt16 => arrow::<UInt16Array>(array.as_ref())?.unary(|value| i128::from(value as i16)),
+                    DataType::UInt32 => arrow::<UInt32Array>(array.as_ref())?.unary(|value| i128::from(value as i32)),
+                    DataType::UInt64 => arrow::<UInt64Array>(array.as_ref())?.unary(|value| i128::from(value as i64)),
+                    _ => return Err(invalid()),
+                };
+                Arc::new(Decimal128Array::with_precision_and_scale(values, INTEGER_PRECISION, 0).map_err(format_error)?)
+            }
+            Self::Decimal128 => {
+                let values = arrow::<Decimal128Array>(array.as_ref())?;
+                let (precision, scale) = (values.precision(), values.scale());
+                let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 18);
+                for coefficient in values {
+                    let Some(coefficient) = coefficient else { builder.append_null(); continue; };
+                    if !super::key::decimal_coefficient_fits(precision, coefficient) {
+                        return Err(format_error("Decimal128 coefficient exceeds its path declaration"));
+                    }
+                    let mut bytes = [precision; 18];
+                    bytes[1] = scale as u8;
+                    bytes[2..].copy_from_slice(&coefficient.to_be_bytes());
+                    builder.append_value(bytes).map_err(format_error)?;
+                }
+                Arc::new(builder.finish())
+            }
+            Self::Day if array.data_type() == &DataType::Date32 => unary!(Date32Array, Int64Type, i64::from),
+            Self::Day => unary!(Date64Array, Int64Type, |millis| millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
+            Self::InstantMicros => Arc::new(arrow::<TimestampMicrosecondArray>(array.as_ref())?.reinterpret_cast::<Int64Type>()),
+            Self::FloatOrder if array.data_type() == &DataType::Float32 => unary!(Float32Array, UInt64Type, |value| super::key::float_order(f64::from(value))),
+            Self::FloatOrder => unary!(Float64Array, UInt64Type, super::key::float_order),
+            _ => array,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct KeyBatch {
     layouts: Vec<Layout>,
@@ -439,6 +686,60 @@ pub(super) struct KeyBatch {
 }
 
 impl KeyBatch {
+    pub fn gather(tuples: &[Tuple<'_>], kind: BatchKind, mut prefix: Vec<ArrayRef>) -> Result<Self> {
+        let selection = tuples.iter().map(|tuple| match tuple {
+            Tuple::Arrow(keys, row) => Some((*keys, *row)),
+            _ => None,
+        }).collect::<Option<Vec<_>>>();
+        if let Some(selection) = selection
+            && let Some((layouts, keys)) = Self::interleave(&selection, false)?
+        {
+            prefix.extend(keys);
+            let batch = RecordBatch::try_new(schema(kind, &layouts)?, prefix).map_err(format_error)?;
+            return Self::new(layouts, batch, kind.prefix());
+        }
+        Self::build(tuples, kind, prefix)
+    }
+
+    fn interleave(selection: &[(&Self, usize)], prefix: bool) -> Result<Option<(Vec<Layout>, Vec<ArrayRef>)>> {
+        let Some(&(first, _)) = selection.first() else { return Ok(None); };
+        let mut sources = Vec::new();
+        let mut positions = HashMap::new();
+        let mut indices = Vec::with_capacity(selection.len());
+        for &(batch, row) in selection {
+            if batch.layouts != first.layouts { return Ok(None); }
+            let source = *positions.entry(std::ptr::from_ref(batch)).or_insert_with(|| {
+                sources.push(batch);
+                sources.len() - 1
+            });
+            indices.push((source, row));
+        }
+        let mut output = Vec::new();
+        if prefix {
+            for column in 0..first.prefix {
+                let values = sources.iter().map(|source| source.batch.column(column).as_ref()).collect::<Vec<_>>();
+                output.push(interleave_array(&values, &indices)?);
+            }
+        }
+        let mut layouts = Vec::with_capacity(first.layouts.len());
+        for (slot, layout) in first.layouts.iter().enumerate() {
+            let values = sources.iter().map(|source| source.batch.column(slot + source.prefix).as_ref()).collect::<Vec<_>>();
+            let (layout, array) = layout.interleave(&values, &indices, slot)?;
+            layouts.push(layout);
+            output.push(array);
+        }
+        Ok(Some((layouts, output)))
+    }
+
+    pub fn project(columns: Vec<SelectedColumn<'_>>, rows: Vec<u32>) -> Result<Self> {
+        if columns.is_empty() { return Err(invalid()); }
+        let rows = arrow_array::UInt32Array::from(rows);
+        let (layouts, arrays) = columns.into_iter().enumerate().map(|(slot, column)| column.build(slot, &rows))
+            .collect::<Result<Vec<_>>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        let batch = RecordBatch::try_new(schema(BatchKind::Keys, &layouts)?, arrays).map_err(format_error)?;
+        Self::new(layouts, batch, 0)
+    }
+
     pub fn build(tuples: &[Tuple<'_>], kind: BatchKind, mut arrays: Vec<ArrayRef>) -> Result<Self> {
         let width = tuples.first().ok_or_else(invalid)?.len();
         if width == 0
@@ -466,7 +767,7 @@ impl KeyBatch {
             if bytes > i32::MAX as usize {
                 return Err(invalid());
             }
-            arrays.push(layout.build(schema.field(slot + kind.prefix()), cells)?);
+            arrays.push(layout.build(schema.field(slot + kind.prefix()), cells, bytes)?);
         }
         let batch = RecordBatch::try_new(schema, arrays).map_err(format_error)?;
         Self::new(layouts, batch, kind.prefix())
@@ -495,7 +796,8 @@ impl KeyBatch {
             );
             let name = format!("{slot}_{:x}", layout.0);
             let field = layout.field(slot)?.with_name(name);
-            arrays.push(layout.build(&field, cells)?);
+            let bytes = cells.iter().map(AtomRef::retained_bytes).fold(0, usize::saturating_add);
+            arrays.push(layout.build(&field, cells, bytes)?);
             fields.push(field);
             layouts.push(layout);
         }
@@ -736,6 +1038,7 @@ fn invalid() -> rtdb_types::Anomaly {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Tuple<'a> {
     Owned(&'a [Atom]),
+    #[cfg(test)]
     Cells(&'a [AtomRef<'a>]),
     Nulls(usize),
     Arrow(&'a KeyBatch, usize),
@@ -745,6 +1048,7 @@ impl<'a> Tuple<'a> {
     pub fn len(self) -> usize {
         match self {
             Self::Owned(atoms) => atoms.len(),
+            #[cfg(test)]
             Self::Cells(cells) => cells.len(),
             Self::Nulls(width) => width,
             Self::Arrow(postings, _) => postings.layouts.len(),
@@ -754,6 +1058,7 @@ impl<'a> Tuple<'a> {
     pub fn get(self, slot: usize) -> Option<AtomRef<'a>> {
         match self {
             Self::Owned(atoms) => atoms.get(slot).map(Atom::borrowed),
+            #[cfg(test)]
             Self::Cells(cells) => cells.get(slot).copied(),
             Self::Nulls(width) => (slot < width).then_some(AtomRef::Null),
             Self::Arrow(postings, row) => postings.layouts.get(slot).map(|layout| {
@@ -859,6 +1164,76 @@ impl<'de> Deserialize<'de> for KeyRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_key_projection_matches_the_scalar_codec_for_selected_rows() {
+        use arrow_array::{Date64Array, Float64Array};
+        let integers = UInt64Array::from(vec![Some(1), Some(u64::MAX), None, Some(1 << 63)]);
+        let days = Date64Array::from(vec![Some(0), Some(-1), None, Some(-86_400_001)]);
+        let floats = Float64Array::from(vec![Some(0.0), Some(-0.0), None, Some(f64::from_bits(0xfff8_0000_0000_0123))]);
+        let text = StringArray::from(vec![Some("unused"), Some("abc"), None, Some("def")]);
+        let arrays: [&dyn Array; 4] = [&integers, &days, &floats, &text];
+        let fields = arrays.iter().map(|array| Field::new("test", array.data_type().clone(), true)).collect::<Vec<_>>();
+        let selection = vec![3, 2, 1, 0, 3];
+        let columns = fields.iter().zip(arrays).map(|(field, array)| {
+            let column = KeyColumn::new(Some((field, array)));
+            assert!(matches!(column, KeyColumn::Typed(..)));
+            column.select(&selection).unwrap()
+        }).collect();
+        let scalar = selection.iter().map(|&row| {
+            fields.iter().zip(arrays).map(|(field, array)| AtomRef::from_arrow(field, array, row as usize).unwrap())
+                .collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let typed = KeyBatch::project(columns, selection).unwrap();
+        let legacy = KeyBatch::build(&scalar.iter().map(|row| Tuple::Cells(row)).collect::<Vec<_>>(), BatchKind::Keys, Vec::new()).unwrap();
+        for row in 0..typed.batch().num_rows() {
+            assert_eq!(Tuple::Arrow(&typed, row).compare(Tuple::Arrow(&legacy, row)), Ordering::Equal);
+        }
+        let independently_gathered = KeyBatch::gather(
+            &[Tuple::Arrow(&typed, 0), Tuple::Arrow(&typed, 2)],
+            BatchKind::Correction, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(Int64Array::from(vec![3, 4]))],
+        ).unwrap();
+        assert_eq!(Tuple::Arrow(&independently_gathered, 1).compare(Tuple::Arrow(&legacy, 2)), Ordering::Equal);
+    }
+
+    #[test]
+    fn interleaving_correction_keys_preserves_dense_tags_and_canonical_null_bytes() {
+        let mixed = [
+            [AtomRef::Text("one"), AtomRef::Integer(1)],
+            [AtomRef::Integer(2), AtomRef::Null],
+            [AtomRef::Null, AtomRef::Integer(3)],
+        ];
+        let batch = KeyBatch::build(&mixed.iter().map(|row| Tuple::Cells(row)).collect::<Vec<_>>(),
+            BatchKind::Keys, Vec::new()).unwrap();
+        for selection in [&[2, 1, 0][..], &[2, 0][..], &[1][..]] {
+            let keys = selection.iter().map(|&row| Tuple::Arrow(&batch, row)).collect::<Vec<_>>();
+            let scalar = selection.iter().map(|&row| Tuple::Cells(&mixed[row])).collect::<Vec<_>>();
+            let prefix: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..selection.len() as i64)),
+                Arc::new(Int64Array::from_iter_values(1..=selection.len() as i64))];
+            let typed = KeyBatch::gather(&keys, BatchKind::Correction, prefix.clone()).unwrap();
+            let canonical = KeyBatch::build(&scalar, BatchKind::Correction, prefix).unwrap();
+            assert_eq!(typed.encode(b"", b"").unwrap(), canonical.encode(b"", b"").unwrap());
+        }
+    }
+
+    #[test]
+    fn interleaving_posting_edits_preserves_the_exact_leaf_bytes() {
+        let first = [
+            (Bucket { level: 0, start: 1 }, [AtomRef::Text("one"), AtomRef::Integer(1)], Iid([1; 16])),
+            (Bucket { level: 0, start: 3 }, [AtomRef::Text("three"), AtomRef::Integer(3)], Iid([3; 16])),
+        ];
+        let edit = [(Bucket { level: 0, start: 2 }, [AtomRef::Text("two"), AtomRef::Integer(2)], Iid([2; 16]))];
+        fn key<'a>((bucket, tuple, iid): &'a (Bucket, [AtomRef<'static>; 2], Iid)) -> (Bucket, Tuple<'a>, AddressRef<'a>) {
+            (*bucket, Tuple::Cells(tuple), AddressRef { iid: *iid, key: b"\0hello" })
+        }
+        let first_keys = first.iter().map(key).collect::<Vec<_>>();
+        let edit_keys = edit.iter().map(key).collect::<Vec<_>>();
+        let existing = Postings::build(&first_keys).unwrap();
+        let edits = Postings::build(&edit_keys).unwrap();
+        let result = Postings::interleave(&[(&existing, 0), (&edits, 0), (&existing, 1)]).unwrap().unwrap();
+        let scalar = Postings::build(&[first_keys[0], edit_keys[0], first_keys[1]]).unwrap();
+        assert_eq!(result.encode(b"header", b"suffix").unwrap(), scalar.encode(b"header", b"suffix").unwrap());
+    }
 
     #[test]
     fn a_schema_bound_batch_round_trips_ordered_mixed_cells_with_its_suffix() {

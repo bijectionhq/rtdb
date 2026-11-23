@@ -60,6 +60,16 @@ impl MemoryBudget {
 
     pub fn is_prepaid(&self) -> bool { self.funding.is_some() }
 
+    /// Derived snapshot data can share ordinary reservations within the same root budget.
+    pub fn snapshot_budget(self: &Arc<Self>) -> Option<&Arc<Self>> {
+        let mut root = self;
+        while let Some(parent) = &root.parent {
+            if root.limit_bytes != parent.limit_bytes { return None; }
+            root = parent;
+        }
+        (!root.is_prepaid()).then_some(root)
+    }
+
     pub fn prepaid_by(&self, budget: &Arc<Self>) -> bool {
         self.funding.as_ref().is_some_and(|funding| Arc::ptr_eq(funding.budget(), budget))
     }
@@ -223,4 +233,14 @@ impl MemoryReservation {
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) { self.budget.release_chain(self.bytes); }
+}
+
+
+#[test]
+fn ordered_index_snapshot_budget_shares_only_ordinary_equal_limit_scopes() {
+    let root = MemoryBudget::new(8192);
+    let request = root.scope().quantized(4096).scope();
+    assert!(Arc::ptr_eq(&root, request.snapshot_budget().unwrap()));
+    assert!(root.scope_with_limit(4096).scope().snapshot_budget().is_none());
+    assert!(root.prepay(4096).unwrap().scope().snapshot_budget().is_none());
 }

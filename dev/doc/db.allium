@@ -2054,6 +2054,7 @@ surface QueryAccess {
     @guarantee ExecutionReadsOneSnapshot
         -- A single query execution opens one snapshot of this database and derives from it every answer it gives about this database: the schema it resolves names against, the oids `::regclass` resolves through, and the rows it reads.
         -- An execution spanning several databases holds one such snapshot per database.
+        -- Derived ordered-index state belongs to the captured snapshot and observes the same catalog, system-time cap, and staged writes.
 
     @guarantee ColumnarScanProjection
         -- Native relational operators consume and produce column batches that retain compatible payloads as Arrow arrays and selections.

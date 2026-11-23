@@ -79,6 +79,7 @@ pub struct NodeConfiguration {
     pub modules: Vec<ModuleSettings>,
     pub read_only_databases: bool,
     pub ordered_index_arrow_references: bool,
+    pub ordered_index_arrow_references_on_private_storage: bool,
     pub skipped_databases: BTreeSet<String>,
     pub node_id: String,
     pub local_log_uses_clock: bool,
@@ -128,7 +129,9 @@ impl NodeConfiguration {
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
         let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").as_deref().and_then(join_threshold).unwrap_or(100_000);
         let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
-        let ordered_index_arrow_references = fields.boolean("orderedIndexArrowReferences")?.unwrap_or(false);
+        let references = fields.boolean("orderedIndexArrowReferences")?;
+        let ordered_index_arrow_references = references.unwrap_or(false);
+        let ordered_index_arrow_references_on_private_storage = references.is_none();
         let configuration = if ingest {
             let fixed_databases = match fields.take("databases") {
                 Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
@@ -136,7 +139,7 @@ impl NodeConfiguration {
             };
             Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, ordered_index_arrow_references, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -152,7 +155,7 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, ordered_index_arrow_references, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
+            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)

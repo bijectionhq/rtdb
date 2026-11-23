@@ -1,24 +1,24 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, BinaryHeap},
+    collections::{BTreeSet, BinaryHeap, HashMap},
     ops::Range as RowRange,
 };
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, GenericByteArray, Int8Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, GenericByteArray, Int8Array,
     Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
     types::ByteArrayType,
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, OffsetBuffer};
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use rtdb_columnar::{
     BatchBuilder, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
 };
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, UnaryOp};
-use rtdb_query::{OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
+use rtdb_query::{CandidateIids, ConstantEvaluator, ScanSelection, OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit, Timestamp};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -37,26 +37,43 @@ const MAX_OWNED_REPLAY_ROWS: i64 = 4_096;
 
 pub(crate) struct OrderedIndexAccelerator;
 
+async fn collect_candidates(request: &ScanRequest<'_>) -> Result<Option<Vec<Iid>>> {
+    let Some(OrderedScan::Payload { mut candidates, .. }) = exact(request, None, &[]).await? else {
+        return Ok(None);
+    };
+    let mut selected = Vec::new();
+    loop {
+        match candidates.next_iids(BATCH_ROWS).await {
+            Ok(batch) if batch.is_empty() => break,
+            Ok(batch) => {
+                selected.extend(batch);
+                if selected.len() > MAX_CANDIDATES {
+                    selected.sort_unstable();
+                    selected.dedup();
+                    if selected.len() > MAX_CANDIDATES { return Ok(None); }
+                }
+            }
+            Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+            Err(_) => return Ok(None),
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    Ok(Some(selected))
+}
+
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        let Some(OrderedScan::Payload { mut candidates, .. }) = exact(request, None, &[]).await?
-        else {
-            return Ok(None);
-        };
-        let mut selected = BTreeSet::new();
-        loop {
-            match candidates.next_iids(BATCH_ROWS).await {
-                Ok(batch) if batch.is_empty() => return Ok(Some(selected)),
-                Ok(batch) => {
-                    selected.extend(batch);
-                    if selected.len() > MAX_CANDIDATES {
-                        return Ok(None);
-                    }
-                }
-                Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
-                Err(_) => return Ok(None),
-            }
+        Ok(collect_candidates(request).await?.map(|ids| ids.into_iter().collect()))
+    }
+
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+        let Some(ids) = collect_candidates(request).await? else { return Ok(None); };
+        match CandidateIids::from_sorted(&ids, request.memory) {
+            Ok(iids) => Ok(Some(ScanSelection { iids, scores: None })),
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -108,6 +125,7 @@ async fn seek(
         request.cancellation,
     )
     .await?;
+    let constants = Constants { evaluator: request.constants, atoms: Default::default() };
     for definition in definitions
         .iter()
         .filter(|definition| definition.table == request.scan.table.name.table)
@@ -123,7 +141,7 @@ async fn seek(
                     .find(|field| &field.name == column)
             })
             .collect();
-        let range = Range::bind(request, &fields).await?;
+        let range = Range::bind(request, &fields, &constants).await?;
         let top = if let Some(window) = &window {
             let Some((reverse, distinct)) = order(request, &fields, &range) else {
                 continue;
@@ -140,12 +158,27 @@ async fn seek(
             }
             None
         };
-        if let Some(found) = use_index(request, definition, &fields, range, top, projection).await?
+        if let Some(found) = use_index(request, definition, &fields, range, top, projection, &constants).await?
         {
             return Ok(Some(found));
         }
     }
     Ok(None)
+}
+
+struct Constants<'a> {
+    evaluator: &'a dyn ConstantEvaluator,
+    atoms: parking_lot::Mutex<HashMap<usize, Option<Atom>>>,
+}
+
+impl Constants<'_> {
+    async fn atom(&self, expression: &Expr) -> Result<Option<Atom>> {
+        let key = std::ptr::from_ref(expression) as usize;
+        if let Some(value) = self.atoms.lock().get(&key) { return Ok(value.clone()); }
+        let value = self.evaluator.constant(expression).await?.as_ref().and_then(Atom::of);
+        self.atoms.lock().insert(key, value.clone());
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -164,7 +197,7 @@ impl Range {
             && self.cursors.is_empty()
     }
 
-    async fn bind(request: &ScanRequest<'_>, fields: &[Option<&Field>]) -> Result<Self> {
+    async fn bind(request: &ScanRequest<'_>, fields: &[Option<&Field>], constants: &Constants<'_>) -> Result<Self> {
         let mut conjuncts = Vec::new();
         for predicate in &request.scan.predicates {
             collect_conjuncts(predicate, &mut conjuncts);
@@ -190,10 +223,7 @@ impl Range {
                 let Some((op, constant)) = operands(field.id, *op, left, right) else {
                     continue;
                 };
-                let Some(value) = request.constants.constant(constant).await? else {
-                    continue;
-                };
-                let Some(atom) = Atom::of(&value).filter(|atom| atom.family() == Some(family))
+                let Some(atom) = constants.atom(constant).await?.filter(|atom| atom.family() == Some(family))
                 else {
                     continue;
                 };
@@ -226,7 +256,7 @@ impl Range {
         }
         let suffix = &fields[range.prefix.len()..];
         for predicate in conjuncts {
-            if let Some(cursor) = CursorBound::bind(request, predicate, suffix).await? {
+            if let Some(cursor) = CursorBound::bind(constants, predicate, suffix).await? {
                 range.cursors.push(cursor);
             }
         }
@@ -277,7 +307,7 @@ struct CursorBound {
 
 impl CursorBound {
     async fn bind(
-        request: &ScanRequest<'_>,
+        constants: &Constants<'_>,
         predicate: &Expr,
         fields: &[Option<&Field>],
     ) -> Result<Option<Self>> {
@@ -293,10 +323,7 @@ impl CursorBound {
             let Some(expected) = family(&field.data_type) else {
                 return Ok(None);
             };
-            let Some(value) = request.constants.constant(constant).await? else {
-                return Ok(None);
-            };
-            let Some(atom) = Atom::of(&value).filter(|atom| atom.family() == Some(expected)) else {
+            let Some(atom) = constants.atom(constant).await?.filter(|atom| atom.family() == Some(expected)) else {
                 return Ok(None);
             };
             key.push(atom);
@@ -499,7 +526,7 @@ enum Predicate {
 
 impl Predicate {
     fn bind<'a>(
-        request: &'a ScanRequest<'_>,
+        constants: &'a Constants<'_>,
         fields: &'a [Option<&Field>],
         expression: &'a Expr,
     ) -> futures::future::BoxFuture<'a, Result<Option<Self>>> {
@@ -523,10 +550,10 @@ impl Predicate {
             };
             match op {
                 BinaryOp::And | BinaryOp::Or => {
-                    let Some(left) = Self::bind(request, fields, left).await? else {
+                    let Some(left) = Self::bind(constants, fields, left).await? else {
                         return Ok(None);
                     };
-                    let Some(right) = Self::bind(request, fields, right).await? else {
+                    let Some(right) = Self::bind(constants, fields, right).await? else {
                         return Ok(None);
                     };
                     let pair = (Box::new(left), Box::new(right));
@@ -544,12 +571,7 @@ impl Predicate {
                         let Some((op, constant)) = operands(field.id, *op, left, right) else {
                             continue;
                         };
-                        let Some(value) = request
-                            .constants
-                            .constant(constant)
-                            .await?
-                            .as_ref()
-                            .and_then(Atom::of)
+                        let Some(value) = constants.atom(constant).await?
                         else {
                             break;
                         };
@@ -604,6 +626,7 @@ async fn use_index(
     range: Range,
     top: Option<Top>,
     projection: &[usize],
+    constants: &Constants<'_>,
 ) -> Result<Option<OrderedScan>> {
     let residuals = request
         .scan
@@ -614,7 +637,7 @@ async fn use_index(
     let mut predicates = Vec::new();
     if top.is_some() {
         for predicate in request.scan.predicates.iter().chain(residuals) {
-            if let Some(predicate) = Predicate::bind(request, fields, predicate).await? {
+            if let Some(predicate) = Predicate::bind(constants, fields, predicate).await? {
                 predicates.push(predicate);
             } else {
                 covered = false;
@@ -1340,30 +1363,10 @@ impl Covered {
                 && let Some((array, start, reservation)) = first.plain_column(*slot, rows.len())
             {
                 let range = start..start + rows.len();
-                let sliced = match scalar {
-                    ScalarType::Utf8 => array.as_any().downcast_ref::<StringArray>().map(|array| {
-                        slice_bytes(
-                            &mut builder,
-                            array,
-                            range,
-                            tree.retain_result_buffers(reservation),
-                        )
-                    }),
-                    ScalarType::Binary => {
-                        array.as_any().downcast_ref::<BinaryArray>().map(|array| {
-                            slice_bytes(
-                                &mut builder,
-                                array,
-                                range,
-                                tree.retain_result_buffers(reservation),
-                            )
-                        })
-                    }
-                    _ => None,
-                };
-                if let Some(array) = sliced {
-                    arrays.push(array?);
-                    shared = true;
+                if let Some((array, shares)) = covered_slice(&mut builder, scalar, array.as_ref(), range,
+                    tree.retain_result_buffers(reservation))? {
+                    arrays.push(array);
+                    shared |= shares;
                     continue;
                 }
             }
@@ -1386,6 +1389,88 @@ impl Covered {
     }
 }
 
+fn can_share_bits(bits: &BooleanBuffer, rows: &RowRange<usize>) -> bool {
+    (bits.offset() + rows.start).is_multiple_of(8) && rows.len().is_multiple_of(8)
+}
+
+fn slice_bits(bits: &BooleanBuffer, rows: RowRange<usize>, owner: Arc<dyn Send + Sync>) -> BooleanBuffer {
+    if !can_share_bits(bits, &rows) {
+        // At a partial byte the exported bitmap must contain only the requested rows.
+        let mut copy = BooleanBufferBuilder::new(rows.len());
+        copy.append_buffer(&bits.slice(rows.start, rows.len()));
+        return copy.finish();
+    }
+    let bits = bits.slice(rows.start, rows.len());
+    let buffer = bits.inner().slice_with_length(bits.offset() / 8, rows.len() / 8);
+    BooleanBuffer::new(retain_buffer_with_owner(&buffer, owner), 0, rows.len())
+}
+
+fn slice_nulls(array: &dyn Array, rows: RowRange<usize>, owner: Arc<dyn Send + Sync>) -> Option<NullBuffer> {
+    array.nulls().map(|nulls| NullBuffer::new(slice_bits(nulls.inner(), rows, owner)))
+}
+
+fn covered_slice(
+    builder: &mut BatchBuilder, scalar: &ScalarType, array: &dyn Array, rows: RowRange<usize>,
+    owner: Arc<dyn Send + Sync>,
+) -> Result<Option<(ArrayRef, bool)>> {
+    use arrow_array::{cast::AsArray, types::*};
+    let bound = rows.len() * 64 + 1024;
+    let nulls = || slice_nulls(array, rows.clone(), Arc::clone(&owner));
+    let shares_nulls = array.nulls().is_some_and(|nulls| can_share_bits(nulls.inner(), &rows));
+    macro_rules! integer {
+        ($ty:ty, $signed:ty, $output:ty) => {
+            if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
+                return builder.column(bound, || {
+                    let result = values.slice(rows.start, rows.len()).try_unary::<_, $ty, _>(|value| {
+                        <$signed>::try_from(value).map(|value| value as $output).map_err(super::format_error)
+                    })?;
+                    Ok(Arc::new(arrow_array::PrimitiveArray::<$ty>::new(result.values().clone(), nulls())))
+                }).map(|array| Some((array, shares_nulls)));
+            }
+        };
+    }
+    let result = match scalar {
+        ScalarType::Utf8 => array.as_any().downcast_ref::<StringArray>()
+            .map(|values| slice_bytes(builder, values, rows.clone(), Arc::clone(&owner))).transpose()?,
+        ScalarType::Binary => array.as_any().downcast_ref::<BinaryArray>()
+            .map(|values| slice_bytes(builder, values, rows.clone(), Arc::clone(&owner))).transpose()?,
+        ScalarType::Bool => array.as_any().downcast_ref::<BooleanArray>().map(|values| builder.column(bound, || {
+            Ok(Arc::new(BooleanArray::new(slice_bits(values.values(), rows.clone(), Arc::clone(&owner)), nulls())))
+        })).transpose()?,
+        ScalarType::Uuid => array.as_any().downcast_ref::<FixedSizeBinaryArray>().filter(|values| values.value_length() == 16)
+            .map(|values| builder.column(bound, || {
+                let values = values.values().slice_with_length(rows.start * 16, rows.len() * 16);
+                let values = retain_buffer_with_owner(&values, Arc::clone(&owner));
+                Ok(Arc::new(FixedSizeBinaryArray::try_new(16, values, nulls()).map_err(super::format_error)?))
+            })).transpose()?,
+        ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(timezone) } =>
+            array.as_any().downcast_ref::<Int64Array>().map(|values| builder.column(bound, || {
+                let values = values.values().slice(rows.start, rows.len());
+                let values = retain_buffer_with_owner(values.inner(), Arc::clone(&owner));
+                Ok(Arc::new(TimestampMicrosecondArray::new(values.into(), nulls()).with_timezone(timezone.clone())))
+            })).transpose()?,
+        ScalarType::DateDay if array.data_type() == &arrow_schema::DataType::Int64 => {
+            let values = array.as_primitive::<Int64Type>().slice(rows.start, rows.len());
+            return builder.column(bound, || {
+                let days = values.try_unary::<_, Date32Type, _>(|value| i32::try_from(value).map_err(super::format_error))?;
+                Ok(Arc::new(Date32Array::new(days.values().clone(), nulls())))
+            }).map(|array| Some((array, shares_nulls)));
+        }
+        ScalarType::I8 => { integer!(Int8Type, i8, i8); None }
+        ScalarType::I16 => { integer!(Int16Type, i16, i16); None }
+        ScalarType::I32 => { integer!(Int32Type, i32, i32); None }
+        ScalarType::I64 => { integer!(Int64Type, i64, i64); None }
+        ScalarType::U8 => { integer!(UInt8Type, i8, u8); None }
+        ScalarType::U16 => { integer!(UInt16Type, i16, u16); None }
+        ScalarType::U32 => { integer!(UInt32Type, i32, u32); None }
+        ScalarType::U64 => { integer!(UInt64Type, i64, u64); None }
+        _ => None,
+    };
+    let shares_values = !matches!(scalar, ScalarType::Bool)
+        || array.as_any().downcast_ref::<BooleanArray>().is_some_and(|values| can_share_bits(values.values(), &rows));
+    Ok(result.map(|array| (array, shares_values || shares_nulls)))
+}
+
 fn slice_bytes<T: ByteArrayType<Offset = i32>>(
     builder: &mut BatchBuilder,
     array: &GenericByteArray<T>,
@@ -1402,7 +1487,7 @@ fn slice_bytes<T: ByteArrayType<Offset = i32>>(
     builder.column(bound, || {
         let values = retain_buffer_with_owner(
             &array.values().slice_with_length(base as usize, length),
-            owner,
+            Arc::clone(&owner),
         );
         let offsets = OffsetBuffer::new(
             offsets
@@ -1411,9 +1496,7 @@ fn slice_bytes<T: ByteArrayType<Offset = i32>>(
                 .collect::<Vec<_>>()
                 .into(),
         );
-        let nulls = array
-            .nulls()
-            .map(|_| NullBuffer::from(rows.map(|row| !array.is_null(row)).collect::<Vec<_>>()));
+        let nulls = slice_nulls(array, rows, owner);
         let array =
             GenericByteArray::<T>::try_new(offsets, values, nulls).map_err(super::format_error)?;
         Ok(Arc::new(array))
@@ -1522,13 +1605,13 @@ impl Head {
     }
 
     fn require_identity(&self, slot: usize, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<()> {
-        use rtdb_types::EntityId;
+        use rtdb_columnar::EntityIdRef;
         let key = self.address().key;
         let _decode = memory.reserve(key.len().saturating_add(256))?;
-        let matches = match (EntityId::from_handle_bytes(key)?, self.tuple().cell(slot)) {
-            (EntityId::String(id), AtomRef::Text(value)) => id == value,
-            (EntityId::Integer(id), AtomRef::Integer(value)) => i128::from(id) == value,
-            (EntityId::Uuid(id), AtomRef::Uuid(value)) => id == value,
+        let matches = match (EntityIdRef::from_handle_bytes(key)?, self.tuple().cell(slot)) {
+            (EntityIdRef::String(id), AtomRef::Text(value)) => id == value,
+            (EntityIdRef::Integer(id), AtomRef::Integer(value)) => i128::from(id) == value,
+            (EntityIdRef::Uuid(id), AtomRef::Uuid(value)) => id == value,
             _ => false,
         };
         if !matches { return Err(super::uncovered_owned_range()); }
@@ -1572,6 +1655,55 @@ mod tests {
     use super::*;
     use rtdb_columnar::MemoryBudget;
     use rtdb_types::Value;
+
+    #[tokio::test]
+    async fn a_seek_reuses_bound_atoms_and_caches_ineligible_literals() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct Evaluator(AtomicUsize);
+        #[async_trait]
+        impl ConstantEvaluator for Evaluator {
+            async fn constant(&self, expression: &Expr) -> Result<Option<rtdb_types::Value>> {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                let Expr::Literal(value) = expression else { unreachable!() };
+                Ok(Some(value.clone()))
+            }
+        }
+        let evaluator = Evaluator(AtomicUsize::new(0));
+        let constants = Constants { evaluator: &evaluator, atoms: Default::default() };
+        let negative = Expr::Literal(rtdb_types::Value::F64(-0.0));
+        let positive = Expr::Literal(rtdb_types::Value::F64(1.0));
+        let first = constants.atom(&negative).await.unwrap();
+        assert_eq!(first, None);
+        assert_eq!(first, constants.atom(&negative).await.unwrap());
+        assert_ne!(first, constants.atom(&positive).await.unwrap());
+        assert_eq!(evaluator.0.load(AtomicOrdering::Relaxed), 2);
+    }
+
+    #[test]
+    fn covered_instant_reuses_only_selected_values_and_validity() {
+        let memory = MemoryBudget::new(1 << 20);
+        let reservation = memory.reserve(32 << 10).unwrap();
+        let source = Int64Array::from((0..24).map(|row| (row != 9).then_some(-10 * row)).collect::<Vec<_>>());
+        let mut builder = BatchBuilder::new(4096, &memory).unwrap();
+        let (slice, shared) = covered_slice(&mut builder,
+            &ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) },
+            &source, 8..16, reservation.clone()).unwrap().unwrap();
+        let values = slice.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        assert!(shared);
+        assert_eq!(values.values().as_ptr(), source.values().as_ptr().wrapping_add(8));
+        assert_eq!(values.values().len(), 8);
+        assert_eq!(values.value(0), -80);
+        assert!(values.is_null(1));
+        assert_eq!(values.nulls().unwrap().inner().inner().as_ptr(), source.nulls().unwrap().inner().inner().as_ptr().wrapping_add(1));
+        let bits = BooleanBuffer::new_set(8);
+        let partial = slice_bits(&bits, 2..5, Arc::new(()));
+        assert_eq!(partial.values(), &[0b0000_0111]);
+        drop((source, reservation, builder));
+        assert_eq!(memory.used_bytes(), 32 << 10);
+        drop(slice);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn unsigned_postings_match_sql_order_and_preserve_covered_bits() {

@@ -200,7 +200,7 @@ impl<'a> AtomRef<'a> {
     }
 }
 
-fn decimal_coefficient_fits(precision: u8, coefficient: i128) -> bool {
+pub(super) fn decimal_coefficient_fits(precision: u8, coefficient: i128) -> bool {
     (1..=38).contains(&precision) && coefficient.unsigned_abs() < 10_u128.pow(u32::from(precision))
 }
 
@@ -208,7 +208,7 @@ pub(super) const FLOAT_NAN_ORDER: u64 = u64::MAX;
 
 // SQL sorting distinguishes signed zeros and places every NaN in one last
 // equivalence class. Float payloads still come from the original row.
-fn float_order(value: f64) -> u64 {
+pub(super) fn float_order(value: f64) -> u64 {
     const SIGN: u64 = 1 << 63;
     if value.is_nan() {
         return FLOAT_NAN_ORDER;

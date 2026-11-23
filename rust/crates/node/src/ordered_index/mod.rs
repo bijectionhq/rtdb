@@ -15,7 +15,7 @@ mod usage;
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_value};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
@@ -59,7 +59,48 @@ impl Definition {
     }
 }
 
+#[derive(Default)]
+struct DefinitionCache {
+    tables: parking_lot::Mutex<BTreeMap<(String, Instant, usize), Arc<tokio::sync::OnceCell<CachedDefinitions>>>>,
+}
+
+type CachedDefinitions = (Arc<[Definition]>, Option<Arc<MemoryReservation>>);
+
 async fn definitions(
+    database: &str, snapshot: &Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>,
+    now: Instant, cancellation: &CancellationToken,
+) -> Result<Arc<[Definition]>> {
+    let load = || load_definitions(database, snapshot, storage, memory, now, cancellation);
+    let Some(budget) = memory.snapshot_budget() else { return load().await.map(Into::into); };
+    if !snapshot.contains_table(&TableRef::new(CATALOG.0, CATALOG.1)) {
+        return Ok(Arc::from([]));
+    }
+    if cancellation.is_cancelled() { return Err(maintenance::cancelled()); }
+    let cache = snapshot.memo::<DefinitionCache>();
+    let entry = {
+        let mut tables = cache.tables.lock();
+        let key = (database.to_owned(), now, Arc::as_ptr(budget) as usize);
+        if !tables.contains_key(&key) && tables.len() >= 4 {
+            tables.pop_first();
+        }
+        Arc::clone(tables.entry(key).or_default())
+    };
+    let loaded = entry.get_or_try_init(|| async {
+        let definitions = load().await?;
+        let bytes = definitions.iter().fold(256usize, |bytes, definition| {
+            bytes.saturating_add(256 + definition.name.len() + definition.table.schema.len() + definition.table.table.len())
+                .saturating_add(definition.columns.iter().map(|column| 32 + column.len()).sum::<usize>())
+        });
+        Ok::<_, Anomaly>((definitions.into(), budget.reserve(bytes).ok()))
+    });
+    let (definitions, charge) = cancellation.run_until_cancelled(loaded).await.ok_or_else(maintenance::cancelled)??;
+    if charge.is_none() {
+        cache.tables.lock().retain(|_, candidate| !Arc::ptr_eq(candidate, &entry));
+    }
+    Ok(Arc::clone(definitions))
+}
+
+async fn load_definitions(
     database: &str,
     snapshot: &Snapshot,
     storage: &Arc<BufferPool>,
@@ -158,12 +199,24 @@ async fn read_definitions(mut cursor: rtdb_query::QueryCursor) -> Result<Vec<Def
         let batch = batch.batch();
         let schema = batch.schema();
         for row in 0..batch.num_rows() {
-            let cell =
-                |column| read_value(schema.field(column), batch.column(column).as_ref(), row);
+            let arrow = |column| ArrowCell { field: schema.field(column), array: batch.column(column).as_ref(), row };
+            let cell = |column| read_value(schema.field(column), batch.column(column).as_ref(), row);
             let text = |value| match value {
                 Value::Utf8(value) => Ok(value),
                 _ => Err(format_error("Expected an index name or column")),
             };
+            if let (Some(columns), Some(version), Some(name), Some(schema_name), Some(table_name)) =
+                (arrow(3).list(), arrow(4).int64(), arrow(0).utf8(), arrow(1).utf8(), arrow(2).utf8())
+                && let Some(columns) = columns.map(|column| column.utf8().map(str::to_owned)).collect::<Option<Vec<_>>>()
+            {
+                definitions.push(Definition {
+                    name: name.to_owned(),
+                    table: TableRef::new(schema_name, table_name),
+                    columns,
+                    version,
+                });
+                continue;
+            }
             let Value::List(columns) = cell(3)? else {
                 return Err(format_error("Expected index columns"));
             };

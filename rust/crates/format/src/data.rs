@@ -272,6 +272,8 @@ impl EncodedEvent for EventRef<'_> {
 impl PageEvent {
     pub fn page_ordinal(&self) -> usize { self.row }
 
+    pub fn put_offset(&self) -> Option<usize> { self.put_ref().map(|put| put.offset) }
+
     /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
     pub fn document_bytes(&self) -> Result<usize> {
         if let Some(bytes) = self.bytes.get() { return Ok(*bytes); }
@@ -442,6 +444,38 @@ impl EventBatch {
     /// The dense union of each row's operation, whose put leg holds its document.
     pub fn operations(&self) -> Result<&UnionArray> {
         self.batch.column(self.op).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Event operation array type changed"))
+    }
+
+    pub fn put_document(&self) -> Result<Option<&StructArray>> {
+        let union = self.operations()?;
+        let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
+        legs.iter().find(|(_, leg)| leg.name() == "put").map(|(id, _)| {
+            union.child(id).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))
+        }).transpose()
+    }
+
+    /// Validates the page headers and visits erasure rows with one operation and IID view.
+    pub fn visit_erasures(&self, mut check: impl FnMut() -> Result<()>, mut visit: impl FnMut(usize, Option<(Iid, Timestamp)>) -> Result<()>) -> Result<()> {
+        let union = self.operations()?;
+        let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
+        let mut erase = None;
+        let mut valid_operations = [false; 128];
+        for (id, leg) in legs.iter() {
+            if let Ok(id) = usize::try_from(id) { valid_operations[id] = true; }
+            if leg.name() == "erase" { erase = Some(id); }
+        }
+        let iids = IidView::new(self.batch.column(self.iid).as_ref())?;
+        for (row, &id) in union.type_ids().iter().enumerate() {
+            check()?;
+            if id < 0 || !valid_operations[id as usize] {
+                return Err(invalid("Event operation type ID has no leg"));
+            }
+            let iid = iids.get(row)?;
+            Interval::new(self.timestamp(self.valid_from, row)?, self.timestamp(self.valid_to, row)?)?;
+            let erased = if Some(id) == erase { Some((iid, self.timestamp(self.system_from, row)?)) } else { None };
+            visit(row, erased)?;
+        }
+        Ok(())
     }
     pub fn len(&self) -> usize { self.batch.num_rows() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }

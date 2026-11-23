@@ -38,6 +38,7 @@ pub struct NodeOptions {
     /// Whether scans consult the node's accelerators; results are the same either way.
     pub scan_acceleration: bool,
     pub ordered_index_arrow_references: bool,
+    pub ordered_index_arrow_references_on_private_storage: bool,
 }
 
 impl NodeOptions {
@@ -52,7 +53,8 @@ impl Default for NodeOptions {
             command_capacity: 64, file_size_target: 100 * 1024 * 1024, trie: TrieConfig::default(), query: QueryOptions::default(),
             replication: ReplicationConfig::default(), compaction: MergeConfig::default(), compaction_threads: 2,
             garbage: GarbageConfig::default(), automatic_compaction: true, automatic_gc: true,
-            artefact_threads: 1, automatic_artefacts: true, scan_acceleration: true, ordered_index_arrow_references: false }
+            artefact_threads: 1, automatic_artefacts: true, scan_acceleration: true, ordered_index_arrow_references: false,
+            ordered_index_arrow_references_on_private_storage: true }
     }
 }
 

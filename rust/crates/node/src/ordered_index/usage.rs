@@ -78,6 +78,7 @@ impl OrderedIndexInventory for Inventory {
                 &context.cancellation,
             )
             .await?
+            .iter()
             {
                 let bytes = [
                     &definition.name,
@@ -91,7 +92,7 @@ impl OrderedIndexInventory for Inventory {
                 });
                 allocations.push(context.memory.reserve(bytes)?);
                 let through = source_frontier(snapshot, &definition.table);
-                let current = indexes.entry(definition).or_insert(through);
+                let current = indexes.entry(definition.clone()).or_insert(through);
                 *current = (*current).max(through);
             }
         }

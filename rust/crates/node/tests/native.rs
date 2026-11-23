@@ -4961,9 +4961,14 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
     let paths = database.object_store().list(Some(&root)).await.unwrap();
     let manifests: Vec<_> = paths.iter().filter(|entry| entry.key.as_str().contains("/manifests/")).collect();
     assert_eq!(manifests.len(), 1);
-    let manifest: serde_json::Value = serde_json::from_slice(&database.object_store().get(&manifests[0].key).await.unwrap()).unwrap();
-    assert_eq!(manifest["layout"]["source_rows"], 6);
-    assert!(manifest["layout"]["revisions"].is_object());
+    let bytes = database.object_store().get(&manifests[0].key).await.unwrap();
+    assert!(bytes.starts_with(&[0xff; 4]));
+    let mut stream = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let manifest = stream.next().unwrap().unwrap();
+    let integer = |name| manifest.column_by_name(name).unwrap().as_any()
+        .downcast_ref::<arrow_array::Int64Array>().unwrap().value(0);
+    assert_eq!(integer("source_rows"), 6);
+    assert_eq!(manifest.column_by_name("revisions").unwrap().null_count(), 0);
 
     let measured = rows(session.query_sql(
         "SELECT index_name, definition_version, through_block, file_bytes \
@@ -4975,7 +4980,7 @@ async fn ordered_index_publishes_its_own_roots_and_seeks_both_directions_at_a_ba
     else { panic!("Expected one published index's metadata: {entry:?}"); };
     assert_eq!(name, "orders_by_customer");
     assert!(*version >= 0);
-    assert_eq!(Some(*through), manifest["layout"]["through"].as_i64());
+    assert_eq!(*through, integer("through"));
     let published_bytes: u64 = paths.iter().filter(|entry| {
         entry.key.as_str().contains("/pages/") || entry.key.as_str().contains("/manifests/")
     }).map(|entry| entry.size).sum();
@@ -5206,6 +5211,25 @@ async fn ordered_index_gathers_projected_table_columns_at_the_original_basis() {
         vec![Value::Null, Value::I64(4)],
     ]);
     assert!(observer.take().is_empty(), "the ordered seek supplied the nested payload rows");
+    let input = (10..310).map(|id| StructFields::from([
+        ("_id".into(), Value::I64(id)), ("customer".into(), Value::Utf8("batch".into())),
+        ("priority".into(), Value::I64(id)),
+        ("payload".into(), Value::Utf8(if id % 3 == 0 { "skip" } else { "keep" }.into())),
+    ])).collect();
+    let commit = session.state_mut().execute_tx(
+        vec![put_rows(&node, "orders", input, None, None)],
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(commit.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    observer.take();
+    let query = "SELECT payload, _id FROM orders WHERE customer = 'batch' AND payload <> 'skip'
+                 ORDER BY priority, _id LIMIT 140 OFFSET 20";
+    let expected = (10..310).filter(|id| id % 3 != 0).skip(20).take(140)
+        .map(|id| vec![Value::Utf8("keep".into()), Value::I64(id)]).collect::<Vec<_>>();
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, expected);
+    assert!(observer.take().is_empty(), "the ordered payload cursor supplied multiple candidate batches");
     stop(&node, driver).await;
 }
 
@@ -5363,6 +5387,7 @@ async fn a_covered_ordered_scan_yields_a_batch_before_opening_later_leaves() {
 async fn ordered_index_retires_erased_keys_and_drop_recreate_gets_a_fresh_generation() {
     let mut config = options();
     config.automatic_artefacts = false;
+    config.ordered_index_arrow_references_on_private_storage = false;
     let (node, driver) = running(config, services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let database = node.catalog().database("xtdb").unwrap();

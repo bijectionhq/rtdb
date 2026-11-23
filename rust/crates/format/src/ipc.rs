@@ -20,6 +20,7 @@ mod undefined;
 
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
+    buffer: Option<Buffer>,
     pages: PageDecoder,
     next_page: usize,
     encoded_page_sizes: Vec<usize>,
@@ -92,6 +93,12 @@ impl Seek for SparseFile {
 trait RetainedReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> RetainedReader for T {}
 
+struct RetainedFileBuffer(Buffer);
+
+impl AsRef<[u8]> for RetainedFileBuffer {
+    fn as_ref(&self) -> &[u8] { self.0.as_slice() }
+}
+
 impl ArrowFile {
     pub fn open(bytes: Arc<[u8]>, projection: Option<Vec<usize>>) -> Result<Self> {
         Self::from_reader(Cursor::new(bytes), projection)
@@ -106,6 +113,15 @@ impl ArrowFile {
     /// The layout must describe this immutable reader, as returned by `inspect_file`.
     /// The caller retains a decoding reservation through this reader and every returned buffer or schema.
     pub fn from_inspected_reader(reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
+        Self::from_inspected(reader, None, projection, layout)
+    }
+
+    /// Decodes page and dictionary bodies from the caller's retained file buffer.
+    pub fn from_inspected_buffer(buffer: Buffer, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
+        Self::from_inspected(Cursor::new(RetainedFileBuffer(buffer.clone())), Some(buffer), projection, layout)
+    }
+
+    fn from_inspected(reader: impl Read + Seek + Send + 'static, buffer: Option<Buffer>, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
         let mut reader: Box<dyn RetainedReader> = Box::new(reader);
         reader.seek(SeekFrom::End(-10)).map_err(invalid)?;
         let mut tail = [0; 10]; reader.read_exact(&mut tail).map_err(invalid)?;
@@ -116,10 +132,10 @@ impl ArrowFile {
         let mut pages = PageDecoder::from_footer(&bytes, data_end, projection)?;
         for index in 0..pages.dictionary_count() {
             let block = pages.dictionaries[index];
-            let buffer = read_block(reader.as_mut(), &block)?;
-            pages.load_dictionary(index, buffer)?;
+            let bytes = read_block_from(buffer.as_ref(), reader.as_mut(), &block)?;
+            pages.load_dictionary(index, bytes)?;
         }
-        Ok(Self { reader, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
+        Ok(Self { reader, buffer, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
     }
 
     pub fn schema(&self) -> SchemaRef { self.pages.schema() }
@@ -142,7 +158,7 @@ impl ArrowFile {
     }
 
     pub fn read_page(&mut self, page: usize) -> Result<RecordBatch> {
-        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?)?;
+        let buffer = read_block_from(self.buffer.as_ref(), self.reader.as_mut(), self.pages.block(page)?)?;
         let batch = self.pages.decode_page(page, buffer)?;
         self.next_page = page + 1;
         Ok(batch)
@@ -291,6 +307,16 @@ impl Iterator for ArrowFile {
         Some(self.read_page(page))
     }
 }
+fn read_block_from(buffer: Option<&Buffer>, reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
+    let Some(buffer) = buffer else { return read_block(reader, block); };
+    let range = block_range(block)?;
+    let start = usize::try_from(range.start).map_err(invalid)?;
+    let end = usize::try_from(range.end).map_err(invalid)?;
+    if end > buffer.len() { return Err(invalid("failed to fill whole buffer")); }
+    let block = buffer.slice_with_length(start, end - start);
+    Ok(rtdb_columnar::retain_buffer_with_owner(&block, Arc::new(())))
+}
+
 fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
     let range = block_range(block)?;
     reader.seek(SeekFrom::Start(range.start)).map_err(invalid)?;
@@ -1122,4 +1148,25 @@ fn jvm_end_marker(bytes: &mut Vec<u8>, end: usize) -> Result<()> {
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-arrow", error.to_string())
+}
+
+
+#[test]
+fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {
+    use arrow_array::Int64Array;
+    use arrow_ipc::writer::FileWriter;
+    let batch = RecordBatch::try_from_iter([("key", Arc::new(Int64Array::from(vec![3, -5, 7])) as ArrayRef)]).unwrap();
+    let mut writer = FileWriter::try_new(Vec::new(), batch.schema_ref()).unwrap();
+    for _ in 0..8 { writer.write(&batch).unwrap(); }
+    let bytes = Buffer::from(writer.into_inner().unwrap());
+    let mut cursor = Cursor::new(bytes.as_slice());
+    let layout = inspect_file(&mut cursor).unwrap();
+    let mut reader = ArrowFile::from_inspected_buffer(bytes.clone(), None, layout).unwrap();
+    let decoded = reader.read_page(0).unwrap();
+    let source = bytes.as_ptr() as usize;
+    let output = decoded.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr() as usize;
+    assert!((source..source + bytes.len()).contains(&output));
+    assert!(rtdb_columnar::shared_allocation_size(&decoded).unwrap() < bytes.len());
+    drop((reader, bytes));
+    assert_eq!(decoded, batch);
 }

@@ -240,6 +240,13 @@ impl CandidateIids {
         Self::build(iids.len(), iids, memory)
     }
 
+    pub fn from_sorted(iids: &[Iid], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if !iids.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(crate::invalid("candidate-iid", "Candidate IIDs must be strictly increasing"));
+        }
+        Self::build(iids.len(), iids.iter().copied(), memory)
+    }
+
     fn build(capacity: usize, iids: impl IntoIterator<Item = Iid>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = memory.reserve(256usize.saturating_add(capacity.saturating_mul(16)))?;
         let mut values = FixedSizeBinaryBuilder::with_capacity(capacity, 16);
@@ -348,4 +355,24 @@ impl ConstantEvaluator for ExecutionConstants<'_> {
         let scope = self.0.scope()?;
         Ok(Some(self.0.evaluate(&scope, expression, &Schema::default(), &[]).await?))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_index_candidate_scope_stays_in_sorted_arrow_storage() {
+        let memory = MemoryBudget::new(4096);
+        let first = Iid([1; 16]);
+        let last = Iid([9; 16]);
+        let scope = CandidateIids::from_sorted(&[first, last], &memory).unwrap();
+        assert_eq!(scope.values.value(0), first.as_bytes());
+        assert_eq!(scope.values.value(1), last.as_bytes());
+        assert!(scope.intersects(Iid([0; 16]), first));
+        assert!(!scope.intersects(Iid([2; 16]), Iid([8; 16])));
+        assert_eq!(scope.iter().collect::<Vec<_>>(), [first, last]);
+        assert_eq!(memory.used_bytes(), 256 + 2 * 16);
+    }
+
 }

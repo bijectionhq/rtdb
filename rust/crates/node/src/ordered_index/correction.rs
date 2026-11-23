@@ -50,7 +50,7 @@ pub(super) fn encode(entries: &[Entry]) -> Result<Vec<u8>> {
             tuples.push(span.tuple.view());
         }
     }
-    KeyBatch::build(
+    KeyBatch::gather(
         &tuples,
         BatchKind::Correction,
         vec![
@@ -97,7 +97,7 @@ pub(super) fn decode(
         let key_len = u32::from_le_bytes(group[20..24].try_into().map_err(format_error)?) as usize;
         if key_len > groups.len() { return Err(invalid()); }
         let key = groups.split_to(key_len);
-        if !key.is_empty() { rtdb_types::EntityId::from_handle_bytes(&key).map_err(format_error)?; }
+        if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(&key).map_err(format_error)?; }
         let end = offset
             .checked_add(length)
             .filter(|&end| end <= from.len())

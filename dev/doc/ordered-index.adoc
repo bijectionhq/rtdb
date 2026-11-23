@@ -49,26 +49,36 @@ It emits both retractions and insertions when a key or interval moves.
 Payload-only changes with the same projected valid-time spans share the previous root.
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
-The projector reads typed Arrow cells directly from table events.
+The projector selects plain scalar keys from the source Arrow columns.
+A governed put compares the document identity with the complete borrowed event identity.
+A world shadow uses the logical null state of its field marker to identify a local tombstone.
 A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
-Seeks compare cells in the leaf's Arrow buffers, and a page rewrite copies surviving cells directly into the new buffers.
+Seeks compare cells in the leaf's Arrow buffers.
+A rewrite interleaves surviving and edited rows with matching key layouts directly into the new buffers.
 Readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
+Private in-memory stores publish Arrow references by default.
 Set `orderedIndexArrowReferences: true` on writers after upgrading every node that reads ordered-index objects in the installation.
-The default publishes JSON references for compatibility during the reader rollout.
+Durable and shared stores default to JSON during the reader rollout.
+Set `orderedIndexArrowReferences: false` to select JSON on any store.
+A legacy manifest's checksum binds the canonical JSON bytes of its layout.
 A new Arrow page can refer to an existing JSON page.
 Arrow references preserve complete key fences, entry counts, and measured subtree coefficients.
 Correction spans refer to rows of index-owned Arrow key batches.
 A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.
 Branch fences and the revision directory carry the remaining tree metadata.
-Each read or maintenance cycle owns its page buffers and its live replay state.
-A forward contiguous run from one leaf can share selected plain text or binary value bytes.
-Other columns gather their projected cells into independent buffers.
+Each read or maintenance cycle owns its page buffers.
+The captured snapshot can retain typed definitions and projected replay changes within its memory budget.
+A forward contiguous run from one leaf can share selected plain text, binary, UUID, Boolean, or microsecond instant value bytes and byte-aligned validity bits.
+Partial bitmap bytes are repacked to expose only the selected bits.
+Date and integer output converts the selected column values to the requested width.
 Shared buffers have rebased offsets and carry the backing allocation's memory reservation.
 On a hosted read, Arrow wire encoders can borrow those buffers with the page's permit until the encoded bytes are ready.
 The encoder releases the batch before waiting for the transport.
 Hosted readers that return Arrow arrays to callers use independent result buffers.
 The scan traces how many covered rows share at least one buffer and how many gather every column.
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
+An uncompressed source page borrows its aligned IPC body from the retained file bytes.
+Replay discovers erase cuts from the operation column and can reuse the decoded pages while their reservations fit.
 Cold page reads carry the published size into a bounded provider fetch and validate the digest before opening Arrow buffers.
 The page admission and memory reservation stay with the provider operation through cancellation.
 A missing checkpoint, missing source coverage or memory admission failure while opening the seek uses the normal SQL executor.

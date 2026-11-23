@@ -24,8 +24,14 @@ fn startup_defaults_match_the_pinned_factories() {
 
 #[test]
 fn ordered_index_reference_publication_uses_the_configured_format() -> rtdb_types::Result<()> {
-    assert!(!decode("{}")?.node_options(1 << 20)?.ordered_index_arrow_references);
-    assert!(decode("orderedIndexArrowReferences: true")?.node_options(1 << 20)?.ordered_index_arrow_references);
+    let automatic = decode("{}")?.node_options(1 << 20)?;
+    assert!(!automatic.ordered_index_arrow_references);
+    assert!(automatic.ordered_index_arrow_references_on_private_storage);
+    let enabled = decode("orderedIndexArrowReferences: true")?.node_options(1 << 20)?;
+    assert!(enabled.ordered_index_arrow_references);
+    let disabled = decode("orderedIndexArrowReferences: false")?.node_options(1 << 20)?;
+    assert!(!disabled.ordered_index_arrow_references);
+    assert!(!disabled.ordered_index_arrow_references_on_private_storage);
     Ok(())
 }
 

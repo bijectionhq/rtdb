@@ -1,6 +1,7 @@
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::any::{Any, TypeId};
 
 use rtdb_types::{Anomaly, BlockIndex, CatalogCheckpoint, CatalogCut, LogicalType, OwnedRelation, ReplicaPosition, Result, TableRef, Timestamp, TransactionKey};
 
@@ -15,6 +16,15 @@ impl std::fmt::Debug for CatalogRead {
     }
 }
 
+#[derive(Default)]
+struct SnapshotMemos(parking_lot::Mutex<BTreeMap<TypeId, Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for SnapshotMemos {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SnapshotMemos").finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     trie_catalog: Arc<TrieCatalog>,
@@ -25,6 +35,7 @@ pub struct Snapshot {
     system_time_cap: Option<Timestamp>,
     catalog_cut: Option<CatalogCut>,
     catalog_read: Option<CatalogRead>,
+    memos: Arc<SnapshotMemos>,
     certified_read: Option<Arc<rtdb_types::residence_trace::CertifiedRead>>,
 }
 
@@ -52,7 +63,7 @@ impl OwnedRoutingInventory {
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, certified_read: None }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, certified_read: None, memos: Default::default() }
     }
     pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
         self.catalog_cut = catalog_cut;
@@ -126,6 +137,12 @@ impl Snapshot {
         self.certified_read.as_ref()
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
+    /// Owns derived state for this immutable snapshot and its clones.
+    pub fn memo<T: Any + Default + Send + Sync>(&self) -> Arc<T> {
+        let mut memos = self.memos.0.lock();
+        Arc::clone(memos.entry(TypeId::of::<T>()).or_insert_with(|| Arc::new(T::default())))
+            .downcast().expect("memo type matches its key")
+    }
     pub fn serving_search<T: std::any::Any>(&self) -> Option<&T> { self.durable.search.as_ref()?.get() }
     /// Whether a transaction's own uncommitted writes are layered over this snapshot.
     pub fn has_overlays(&self) -> bool { !self.layered.is_empty() }
@@ -145,7 +162,10 @@ impl Snapshot {
         if cap.is_some_and(|cap| self.basis.is_none_or(|basis| cap > basis.system_time)) {
             return Err(Anomaly::incorrect("rtdb.index/future-read-basis", "Query basis exceeds the captured partition head"));
         }
-        self.system_time_cap = cap;
+        if self.system_time_cap != cap {
+            self.memos = Default::default();
+            self.system_time_cap = cap;
+        }
         Ok(self)
     }
     pub fn block_index(&self) -> BlockIndex { self.durable.block_index() }
@@ -254,6 +274,7 @@ impl Snapshot {
     /// Layers a transaction's own segments over this snapshot, as staging its whole write would.
     pub fn with_transaction_segments(&self, tx_key: rtdb_types::TransactionKey, segments: &std::collections::BTreeMap<TableRef, Arc<LiveTable>>) -> Result<Self> {
         let mut next = self.clone();
+        next.memos = Default::default();
         for (table, segment) in segments { next.layered.entry(table.clone()).or_default().push(Arc::clone(segment)); }
         next.table_catalog = Arc::new(next.table_catalog.with_entries_for(segments.keys().cloned())?);
         next.basis = Some(tx_key);
@@ -262,6 +283,7 @@ impl Snapshot {
     }
     pub fn with_staged(&self, staged: &[Arc<StagedWrite>]) -> Result<Self> {
         let mut next = self.clone();
+        if !staged.is_empty() { next.memos = Default::default(); }
         for write in staged {
             if write.predecessor() != next.basis || write.block_index() != self.block_index() {
                 return Err(Anomaly::incorrect("rtdb.index/overlay-order", "Staged overlay does not follow the snapshot basis and block"));
@@ -298,4 +320,18 @@ mod owned_routing_tests {
         assert!(!(OwnedRoutingInventory { has_journal_tries: true, ..empty }).journal_exhausted());
         assert!(!(OwnedRoutingInventory { journal_events: 1, ..empty }).journal_exhausted());
     }
+}
+
+#[test]
+fn ordered_index_snapshot_memos_follow_the_captured_basis() {
+    #[derive(Default)]
+    struct Memo;
+    let transaction = TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(10) };
+    let live = LiveIndex::new(BlockIndex(0), Some(transaction), TrieConfig::default());
+    let snapshot = Snapshot::new(Arc::new(TrieCatalog::default()), Arc::new(TableCatalog::default()), Arc::new(live));
+    let memo = snapshot.memo::<Memo>();
+    assert!(Arc::ptr_eq(&memo, &snapshot.clone().memo::<Memo>()));
+    assert!(Arc::ptr_eq(&memo, &snapshot.clone().with_system_time_cap(Some(Timestamp(10))).unwrap().memo::<Memo>()));
+    assert!(!Arc::ptr_eq(&memo, &snapshot.clone().with_system_time_cap(Some(Timestamp(9))).unwrap().memo::<Memo>()));
+    assert!(!Arc::ptr_eq(&memo, &snapshot.with_transaction_segments(transaction, &BTreeMap::new()).unwrap().memo::<Memo>()));
 }

@@ -199,6 +199,7 @@ pub(super) struct Entry {
 struct EntryView<'a> {
     key: KeyRef<'a>,
     item: &'a Item,
+    posting: Option<(&'a Postings, usize)>,
 }
 
 impl EntryView<'_> {
@@ -238,6 +239,7 @@ impl Entry {
         EntryView {
             key: self.key.view(),
             item: &self.item,
+            posting: None,
         }
     }
 
@@ -457,16 +459,40 @@ impl Leaf {
         let postings = if keys.is_empty() {
             None
         } else {
-            let keys = keys
-                .iter()
-                .map(|entry| match entry.key {
-                    KeyRef::Posting(bucket, tuple, iid) if matches!(entry.item, Item::Posting) => {
-                        Ok((bucket, tuple, iid))
+            let mut edits = Vec::new();
+            let mut edit_rows = Vec::new();
+            for (position, entry) in keys.iter().enumerate() {
+                if entry.posting.is_some() { continue; }
+                let KeyRef::Posting(bucket, tuple, address) = entry.key else {
+                    return Err(format_error("Invalid ordered index posting"));
+                };
+                if !matches!(entry.item, Item::Posting) {
+                    return Err(format_error("Invalid ordered index posting"));
+                }
+                edit_rows.push(position);
+                edits.push((bucket, tuple, address));
+            }
+            if edits.len() == keys.len() {
+                Some(Postings::build(&edits)?)
+            } else {
+                let edits = (!edits.is_empty()).then(|| Postings::build(&edits)).transpose()?;
+                let mut positions = edit_rows.into_iter().enumerate().peekable();
+                let selected = keys.iter().enumerate().map(|(index, entry)| {
+                    if let Some(&(row, position)) = positions.peek() && position == index {
+                        positions.next();
+                        (edits.as_ref().expect("edits have a posting batch"), row)
+                    } else {
+                        entry.posting.expect("survivors have a posting batch")
                     }
-                    _ => Err(format_error("Invalid ordered index posting")),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Some(Postings::build(&keys)?)
+                }).collect::<Vec<_>>();
+                match Postings::interleave(&selected)? {
+                    Some(postings) => Some(postings),
+                    None => Some(Postings::build(&keys.iter().map(|entry| {
+                        let KeyRef::Posting(bucket, tuple, address) = entry.key else { unreachable!() };
+                        (bucket, tuple, address)
+                    }).collect::<Vec<_>>())?),
+                }
+            }
         };
         Self::new(
             postings,
@@ -526,6 +552,7 @@ impl Leaf {
             EntryView {
                 key: self.key(row),
                 item: &POSTING_ITEM,
+                posting: self.postings.as_ref().map(|postings| (postings, row)),
             }
         } else {
             self.metadata[row - self.posting_count()].view()
@@ -881,6 +908,7 @@ impl Tree {
                         item.as_ref().map(|item| EntryView {
                             key: key.view(),
                             item,
+                            posting: None,
                         })
                     })
                     .collect(),
@@ -937,6 +965,7 @@ impl Tree {
                             changed.push(EntryView {
                                 key: key.view(),
                                 item,
+                                posting: None,
                             });
                         }
                     }

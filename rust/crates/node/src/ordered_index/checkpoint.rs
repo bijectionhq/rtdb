@@ -39,9 +39,43 @@ pub(super) struct Checkpoint {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Manifest {
+struct Manifest<'a> {
     checksum: String,
-    layout: Checkpoint,
+    #[serde(borrow)]
+    layout: &'a serde_json::value::RawValue,
+}
+
+fn decode_legacy_manifest(bytes: &[u8]) -> Result<Checkpoint> {
+    let Manifest { checksum, layout } = serde_json::from_slice(bytes).map_err(format_error)?;
+    let checkpoint = match serde_json::from_str(layout.get()) {
+        Ok(checkpoint) => checkpoint,
+        Err(_) => {
+            #[derive(Deserialize)]
+            struct ParsedManifest {
+                #[serde(rename = "checksum")]
+                _checksum: String,
+                layout: Checkpoint,
+            }
+            serde_json::from_slice::<ParsedManifest>(bytes).map_err(format_error)?.layout
+        }
+    };
+    if checksum != format!("{:x}", Sha256::digest(layout.get().as_bytes())) {
+        // Legacy verification also accepted whitespace or field-order changes to the envelope's layout.
+        struct HashWriter(Sha256);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut digest = HashWriter(Sha256::new());
+        serde_json::to_writer(&mut digest, &checkpoint).map_err(format_error)?;
+        if checksum != format!("{:x}", digest.0.finalize()) {
+            return Err(format_error("Invalid ordered index checkpoint checksum"));
+        }
+    }
+    Ok(checkpoint)
 }
 
 impl Checkpoint {
@@ -250,12 +284,7 @@ pub(super) async fn latest(
     let mut checkpoint = if bytes.starts_with(&ipc::CONTINUATION) {
         decode_manifest(ipc::decode(bytes, 1)?, &allocation)?
     } else {
-        let Manifest { checksum, layout } = serde_json::from_slice(&bytes).map_err(format_error)?;
-        let encoded = serde_json::to_vec(&layout).map_err(format_error)?;
-        if checksum != format!("{:x}", Sha256::digest(&encoded)) {
-            return Err(format_error("Invalid ordered index checkpoint checksum"));
-        }
-        layout
+        decode_legacy_manifest(&bytes)?
     };
     if frontier(&object.key) != Some(checkpoint.through)
         || checkpoint.through < 0
@@ -342,9 +371,9 @@ pub(super) async fn publish(
     let encoded = if tree.arrow_references {
         ipc::encode(&encode_manifest(&checkpoint)?)?
     } else {
-        let encoded = serde_json::to_vec(&checkpoint).map_err(format_error)?;
-        let checksum = format!("{:x}", Sha256::digest(&encoded));
-        serde_json::to_vec(&Manifest { checksum, layout: checkpoint }).map_err(format_error)?
+        let layout = serde_json::value::to_raw_value(&checkpoint).map_err(format_error)?;
+        let checksum = format!("{:x}", Sha256::digest(layout.get().as_bytes()));
+        serde_json::to_vec(&Manifest { checksum, layout: &layout }).map_err(format_error)?
     };
     if cancellation.is_cancelled() {
         return Err(cancelled());
@@ -472,6 +501,23 @@ mod tests {
     use rtdb_storage::{MemoryStore, cache::BufferPool};
 
     use super::*;
+
+    #[test]
+    fn legacy_manifest_accepts_published_bytes_and_preserves_the_checksum() {
+        let layout = r#"{"through":7,"scope":0,"source_rows":9,"revisions":null}"#;
+        let checksum = format!("{:x}", Sha256::digest(layout));
+        let manifest = format!(r#"{{"checksum":"{checksum}","layout":{layout}}}"#);
+        let decoded = decode_legacy_manifest(manifest.as_bytes()).unwrap();
+        assert_eq!(decoded.through, 7);
+        assert_eq!(decoded.source_rows, 9);
+        let raw = serde_json::value::to_raw_value(&decoded).unwrap();
+        assert_eq!(serde_json::to_vec(&Manifest { checksum, layout: &raw }).unwrap(), manifest.as_bytes());
+        let spaced = manifest.replace(r#""scope":0"#, r#""scope": 0"#);
+        assert_eq!(decode_legacy_manifest(spaced.as_bytes()).unwrap().scope, 0);
+        let corrupt = manifest.replace(r#""scope":0"#, r#""scope":1"#);
+        assert_eq!(decode_legacy_manifest(corrupt.as_bytes()).err().unwrap().message.as_deref(),
+            Some("Invalid ordered index checkpoint checksum"));
+    }
 
     #[tokio::test]
     async fn arrow_checkpoint_reopens_the_json_subtrees_it_keeps() -> Result<()> {

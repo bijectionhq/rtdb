@@ -854,36 +854,17 @@ impl ScanCursor {
                     && scan.top_k.is_none() && scan.ordered_top_k.is_none() && scan.matches.is_empty()
                     && bounds.valid_time.is_point() && bounds.system_time.is_point()
                     && let Some(iids) = scan.iids.as_ref().filter(|iids| (1..=128).contains(&iids.len())) {
-                    let iids = iids.iter().copied().collect();
-                    let request = crate::ScanRequest { database: name, scan, snapshot, storage, bounds, memory: &execution.context.memory,
-                        current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
-                        constants: &crate::accelerate::ExecutionConstants(execution), verifier, partitions: database_partitions };
-                    let mut resolved = crate::table_point_rows(&request, &iids).await?;
-                    if resolved.is_none() {
-                        for accelerator in execution.context.accelerators.iter() {
-                            resolved = accelerator.point_rows(&request, &iids).await?;
-                            if resolved.is_some() { break; }
-                        }
-                    }
-                    if let Some(rows) = resolved {
-                        if rows.is_empty() { return Ok((parts, *verifier.counts.lock())); }
-                        let batch = match verifier.gather_search_rows(scan, &rows).await {
-                            Ok(batch) => Some(batch),
-                            Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => None,
-                            Err(error) => return Err(error),
-                        };
-                        if let Some(mut batch) = batch {
-                            if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
-                                let schema = Schema::new(scan.columns.clone())?;
-                                let mask = crate::columnar::predicate_mask(&batch, &predicate, &schema, execution).await?;
-                                batch = batch.select(&mask, &execution.context.memory)?;
-                            }
-                            if batch.len != 0 { parts.push_back(Part::Resolved(Some(batch))); }
-                            return Ok((parts, *verifier.counts.lock()));
-                        }
+                    if let Some(batch) = verifier.point_batch(scan, bounds, database_partitions, iids).await? {
+                        if let Some(batch) = batch { parts.push_back(Part::Resolved(Some(batch))); }
+                        return Ok((parts, *verifier.counts.lock()));
                     }
                 }
+                let mut legacy_scope_current = true;
                 for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids && !ranked_here) {
+                    if !legacy_scope_current {
+                        narrowed.iids = candidate_iids.as_ref().map(|iids: &crate::CandidateIids| iids.iter().collect());
+                        legacy_scope_current = true;
+                    }
                     let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
                         verifier, partitions: database_partitions };
@@ -908,7 +889,7 @@ impl ScanCursor {
                         {
                             ranking.verified = scores;
                         }
-                        narrowed.iids = Some(candidates.iter().collect());
+                        legacy_scope_current = false;
                         candidate_iids = Some(candidates);
                     }
                 }
@@ -932,6 +913,9 @@ impl ScanCursor {
                         }
                         Err(error) => return Err(error),
                     }
+                }
+                if !legacy_scope_current && queries.iter().any(Option::is_some) {
+                    narrowed.iids = candidate_iids.as_ref().map(|iids| iids.iter().collect());
                 }
                 let mut matches = Vec::with_capacity(scan.matches.len());
                 for (evaluated, query) in scan.matches.iter().zip(queries) {
@@ -958,7 +942,7 @@ impl ScanCursor {
                 };
                 // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
                 let split = match (fragmenter, snapshot.tx_basis()) {
-                    (Some(fragmenter), Some(basis)) if order.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && ranking.is_none() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
+                    (Some(fragmenter), Some(basis)) if order.is_none() && candidate_iids.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && ranking.is_none() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
                         fragmenter.depth(name, &scan.table.name.table, persisted_bytes(snapshot)).map(|depth| (depth, basis)),
                     _ => None,
                 };
@@ -1174,6 +1158,7 @@ pub(crate) async fn ordered_input(scan: &Scan, execution: &Execution, limit: usi
             Box::new(OrderedPayload {
                 scan: payload, schema, execution: execution.clone(), candidates: Some(candidates), predicate, verify,
                 projection, iid_at, skip: offset, remaining: limit.saturating_sub(offset), _memory: memory,
+                source: None, found: Default::default(), join_memory: None,
             })
         }
     }))
@@ -1212,6 +1197,9 @@ fn include_iid(scan: &mut Scan) -> Result<usize> {
 
 struct OrderedPayload {
     scan: Scan,
+    source: Option<Box<PartitionScan>>,
+    found: std::collections::HashMap<Iid, Option<(usize, usize)>>,
+    join_memory: Option<Arc<MemoryReservation>>,
     execution: Execution,
     schema: Schema,
     candidates: Option<Box<dyn crate::OrderedCandidates>>,
@@ -1236,15 +1224,62 @@ impl crate::columnar::BatchCursor for OrderedPayload {
             let ids = candidates.next_iids(self.remaining.saturating_add(self.skip)).await?;
             if ids.is_empty() {
                 self.candidates = None;
+                self.source = None;
+                self.found = Default::default();
+                self.join_memory = None;
                 return Ok(None);
             }
-            let _scratch = memory.reserve(ids.len().saturating_mul(256))?;
-            let mut scan = self.scan.clone();
-            scan.iids = Some(ids.iter().copied().collect());
-            let mut source = ScanCursor::new(scan, self.execution.clone(), None).await?;
-            let mut found = BTreeMap::new();
+            let bytes = ids.len().saturating_mul(256);
+            match self.join_memory.as_mut() {
+                Some(charge) if charge.bytes() < bytes =>
+                    Arc::get_mut(charge).expect("the payload cursor owns its join reservation").grow_to(bytes)?,
+                None => self.join_memory = Some(memory.reserve(bytes)?),
+                _ => {}
+            }
+            let database = self.execution.context.catalog.database(&self.scan.table.name.database)?;
+            let [snapshot] = database.partitions.as_slice() else {
+                unreachable!("ordered acceleration requires one partition");
+            };
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let mut point = None;
+            if sorted.len() <= 128 && self.execution.context.catalog.owned_position_mask.is_none() {
+                let keys: BTreeSet<_> = sorted.iter().copied().collect();
+                let mut scan = self.scan.clone();
+                scan.iids = Some(keys);
+                let verifier = ScanVerifier { scan: &scan, execution: &self.execution, pushdowns: None,
+                    partition: snapshot, storage: &database.storage, canonical_entity_iids: false,
+                    shared_rank: None, counts: Default::default() };
+                let bounds = match &self.source {
+                    Some(source) => source.bounds,
+                    None => bounds(&scan, snapshot, &self.execution).await?,
+                };
+                if bounds.valid_time.is_point() && bounds.system_time.is_point() {
+                    point = verifier.point_batch(&scan, bounds, &database.partitions, scan.iids.as_ref().unwrap()).await?;
+                }
+            }
             let mut batches = Vec::new();
-            while let Some(batch) = source.next_batch().await? {
+            self.found.clear();
+            let source = if point.is_none() {
+                if self.source.is_none() {
+                    let read_bounds = bounds(&self.scan, snapshot, &self.execution).await?;
+                    self.source = Some(Box::new(PartitionScan::new(snapshot.clone(), Arc::clone(&database.storage),
+                        self.scan.clone(), self.execution.clone(), read_bounds, None, false, None)));
+                }
+                let source = self.source.as_mut().unwrap();
+                source.reset_candidates(crate::CandidateIids::from_sorted(&sorted, memory)?);
+                Some(source)
+            } else {
+                None
+            };
+            let mut source = source;
+            loop {
+                let batch = match source.as_mut() {
+                    Some(source) => source.next_batch().await?,
+                    None => point.take().flatten(),
+                };
+                let Some(batch) = batch else { break; };
                 let Column::Arrow { array, .. } = &batch.columns[self.iid_at] else {
                     return Err(invalid("ordered-row-iid", "Ordered scan returned no IID array"));
                 };
@@ -1257,15 +1292,16 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                     let iid = iids.get(row)?;
                     let selected = mask.as_ref().is_none_or(|mask| mask[row]);
                     let position = selected.then_some((batches.len(), row));
-                    if found.insert(iid, position).is_some() {
+                    if self.found.insert(iid, position).is_some() {
                         return Err(invalid("ordered-row-duplicate", "Ordered point scan returned more than one row for an IID"));
                     }
                 }
                 batches.push(batch);
             }
+            if let Some(source) = source { source.candidate_iids = None; }
             let mut order = Vec::with_capacity(ids.len().min(self.remaining));
             for iid in ids {
-                match found.remove(&iid) {
+                match self.found.remove(&iid) {
                     None if !self.verify => return Err(invalid("ordered-row-missing", "A row in the ordered index is absent at the read basis")),
                     None | Some(None) => continue,
                     Some(Some(_)) if self.skip != 0 => self.skip -= 1,
@@ -1277,7 +1313,12 @@ impl crate::columnar::BatchCursor for OrderedPayload {
             }
             if !order.is_empty() {
                 self.remaining -= order.len();
-                if self.remaining == 0 { self.candidates = None; }
+                if self.remaining == 0 {
+                    self.candidates = None;
+                    self.source = None;
+                    self.found = Default::default();
+                    self.join_memory = None;
+                }
                 return ColumnBatch::take_rows(&batches, &order, &self.projection, memory).map(Some);
             }
         }
@@ -1292,6 +1333,37 @@ impl crate::columnar::BatchCursor for OrderedPayload {
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
 struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
+
+impl ScanVerifier<'_> {
+    async fn point_batch(&self, scan: &Scan, bounds: TemporalBounds, partitions: &[Snapshot],
+        iids: &BTreeSet<Iid>) -> Result<Option<Option<crate::columnar::ColumnBatch>>> {
+        let execution = self.execution;
+        let request = crate::ScanRequest { database: &scan.table.name.database, scan, snapshot: self.partition, storage: self.storage,
+            bounds, memory: &execution.context.memory, current_time: execution.context.current_time,
+            cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
+            verifier: self, partitions };
+        let mut resolved = crate::table_point_rows(&request, iids).await?;
+        if resolved.is_none() {
+            for accelerator in execution.context.accelerators.iter() {
+                resolved = accelerator.point_rows(&request, iids).await?;
+                if resolved.is_some() { break; }
+            }
+        }
+        let Some(rows) = resolved else { return Ok(None); };
+        if rows.is_empty() { return Ok(Some(None)); }
+        let mut batch = match self.gather_search_rows(scan, &rows).await {
+            Ok(batch) => batch,
+            Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
+            let schema = Schema::new(scan.columns.clone())?;
+            let mask = crate::columnar::predicate_mask(&batch, &predicate, &schema, execution).await?;
+            batch = batch.select(&mask, &execution.context.memory)?;
+        }
+        Ok(Some((batch.len != 0).then_some(batch)))
+    }
+}
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
@@ -1580,6 +1652,16 @@ fn projects_archive_history(scan: &Scan) -> bool {
 }
 
 impl PartitionScan {
+    fn reset_candidates(&mut self, candidates: crate::CandidateIids) {
+        debug_assert!(self.loaded.is_empty() && self.output.is_empty());
+        self.candidate_iids = Some(candidates);
+        self.initialized = false;
+        self.files = FileDescriptors::default();
+        self.pages = PageDescriptors::default();
+        self.tasks = None;
+        self.page_test = None;
+    }
+
     fn pruning(&self) -> PruningOptions {
         let iid = match &self.candidate_iids {
             Some(iids) if iids.len() == 1 => iids.iter().next(),
