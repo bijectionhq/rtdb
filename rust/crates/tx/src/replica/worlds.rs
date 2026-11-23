@@ -89,15 +89,10 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         {
             continue;
         }
-        match operation {
-            Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
-            | Operation::OwnedWriteIids { relation, documents, .. } if !documents.rows().is_empty() => {
-                selected.entry(relation.world().unwrap_or(ROOT)).or_default().insert(relation.name());
-            }
-            Operation::Public(TxOp::OwnedDelete { relation, .. }) => {
-                selected.entry(ROOT).or_default().insert(relation.name());
-            }
-            _ => (),
+        if let Some((relation, rows)) = operation.owned_documents() && rows > 0 {
+            selected.entry(relation.world().unwrap_or(ROOT)).or_default().insert(relation.name());
+        } else if let Operation::Public(TxOp::OwnedDelete { relation, .. }) = operation {
+            selected.entry(ROOT).or_default().insert(relation.name());
         }
     }
     let retained_release = crate::hosted_control::retained_release_world(operations);

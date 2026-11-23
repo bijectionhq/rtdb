@@ -54,6 +54,12 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::SPATIAL_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::Open).await?)]),
+                crate::owned_actions::SPATIAL_NEXT_OWNED => Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::SPATIAL_CLOSE_OWNED => {
+                    self.close_spatial_owned_action(&call, &action.body)?;
+                    Ok(Vec::new())
+                }
                 crate::owned_actions::SPATIAL_HELD_OWNED_V1 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V1).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V2).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V3 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V3).await?)]),

@@ -8,7 +8,7 @@ use arrow_array::{
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_types::{Anomaly, EntityId, Keyword, LogicalType, Result, ScalarType};
+use rtdb_types::{Anomaly, EntityId, Iid, Keyword, LogicalType, Result, ScalarType};
 
 use crate::{from_field, to_field};
 
@@ -30,6 +30,22 @@ impl<'a> EntityIdRef<'a> {
             2 => Ok(Self::Integer((u64::from_be_bytes(payload.try_into().map_err(|_| invalid())?) ^ (1 << 63)) as i64)),
             3 => Ok(Self::Uuid(payload.try_into().map_err(|_| invalid())?)),
             _ => Err(invalid()),
+        }
+    }
+
+    pub fn iid(self) -> Iid {
+        match self {
+            Self::String(value) => EntityId::string_iid(value),
+            Self::Keyword(value) => EntityId::keyword_iid(value),
+            Self::Integer(value) => EntityId::Integer(value).iid(),
+            Self::Uuid(value) => Iid(value),
+        }
+    }
+
+    pub fn owned_payload_bytes(self) -> usize {
+        match self {
+            Self::String(value) | Self::Keyword(value) => value.len(),
+            Self::Integer(_) | Self::Uuid(_) => 0,
         }
     }
 
@@ -160,5 +176,17 @@ mod tests {
         let field = to_field("_id", &entity_id_type()).unwrap();
         let actual = (0..ids.len()).map(|row| read_entity_id(&field, array.as_ref(), row).unwrap()).collect::<Vec<_>>();
         assert_eq!(actual, ids);
+    }
+
+    #[test]
+    fn borrowed_identity_hash_matches_the_owned_identity() {
+        for id in [
+            EntityIdRef::String("spot"),
+            EntityIdRef::Keyword("places/spot"),
+            EntityIdRef::Integer(i64::MIN),
+            EntityIdRef::Uuid([4; 16]),
+        ] {
+            assert_eq!(id.iid(), id.into_owned().iid());
+        }
     }
 }

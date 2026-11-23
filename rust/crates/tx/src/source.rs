@@ -21,6 +21,7 @@ const HOSTED_INSTANT_MICROS: std::ops::Range<i64> = -62_135_596_800_000_000..253
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
+    OwnedArrowIids { create_only: bool, relation: rtdb_types::OwnedRelation, documents: ArrowDocuments, iids: Vec<Iid>, presence: Vec<std::collections::BTreeSet<String>>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedWriteIids { create_only: bool, relation: rtdb_types::OwnedRelation, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     InsertIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     InsertArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
@@ -38,14 +39,23 @@ impl Operation {
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckWorldPurge { relation, .. }
                 | TxOp::OwnedErase { relation, .. } | TxOp::OwnedSweepExpired { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
-                | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. })
-                | Self::OwnedWriteIids { relation, .. } => Some(relation),
+                | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. }) | Self::OwnedWriteIids { relation, .. } | Self::OwnedArrowIids { relation, .. } => Some(relation),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn owned_documents(&self) -> Option<(&rtdb_types::OwnedRelation, usize)> {
+        match self {
+            Self::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
+            | Self::OwnedWriteIids { relation, documents, .. } => Some((relation, documents.rows().len())),
+            Self::Public(TxOp::OwnedArrowDocs { relation, documents, .. })
+            | Self::OwnedArrowIids { relation, documents, .. } => Some((relation, documents.array().len())),
             _ => None,
         }
     }
 
     pub(crate) fn is_owned(&self) -> bool {
-        match self { Self::Public(operation) => operation.is_owned(), Self::OwnedWriteIids { .. } => true, _ => false }
+        match self { Self::Public(operation) => operation.is_owned(), Self::OwnedWriteIids { .. } | Self::OwnedArrowIids { .. } => true, _ => false }
     }
 }
 
@@ -91,6 +101,7 @@ impl SourceTransaction {
             *operation = Operation::Public(match effect {
                 OwnedPeriodEffect::Create(documents) => TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to },
                 OwnedPeriodEffect::Replace(documents) => TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to },
+                OwnedPeriodEffect::Arrow { documents, create_only } => TxOp::OwnedArrowDocs { relation, documents, create_only, valid_from, valid_to },
                 OwnedPeriodEffect::Delete(id) => TxOp::OwnedDelete { relation, id, valid_from, valid_to },
             });
         }
@@ -133,14 +144,18 @@ impl SourceTransaction {
                     (range_evidence_bytes(relation, fixed), None, 0),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedSweepExpired { relation, id, .. }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
-                Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }) => (relation.name().len(), None, 0),
+                Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedRelativePeriod { relation, effect, .. }) => {
                     let identity = match effect {
                         OwnedPeriodEffect::Delete(id) => id.as_value().retained_bytes()?,
-                        OwnedPeriodEffect::Create(_) | OwnedPeriodEffect::Replace(_) => 0,
+                        OwnedPeriodEffect::Create(_) | OwnedPeriodEffect::Replace(_) | OwnedPeriodEffect::Arrow { .. } => 0,
                     };
                     (relation.name().len().checked_add(identity).ok_or_else(overflow)?, None, 0)
                 },
+                Operation::OwnedArrowIids { relation, iids, presence, .. } => {
+                    let inventory = presence.iter().flatten().try_fold(0usize, |bytes, name| bytes.checked_add(name.capacity() + 128).ok_or_else(overflow))?;
+                    (relation.name().len(), None, iids.capacity().checked_mul(16).and_then(|bytes| bytes.checked_add(inventory)).ok_or_else(overflow)?)
+                }
                 Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
                 Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
@@ -374,6 +389,14 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. } | TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }
                     | TxOp::OwnedRelativePeriod { effect: OwnedPeriodEffect::Create(documents) | OwnedPeriodEffect::Replace(documents), .. })
                     | Operation::OwnedWriteIids { documents, .. } | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
+                Operation::Public(TxOp::OwnedArrowDocs { documents, .. }
+                    | TxOp::OwnedRelativePeriod { effect: OwnedPeriodEffect::Arrow { documents, .. }, .. })
+                | Operation::OwnedArrowIids { documents, .. } => {
+                    let names = documents.columns().iter().try_fold(256usize, |bytes, name| {
+                        bytes.checked_add(name.len().saturating_mul(2) + 128).ok_or_else(overflow)
+                    })?;
+                    names.checked_mul(documents.array().len()).ok_or_else(overflow)?
+                }
                 Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::InsertArrowIids { documents, .. } | Operation::PutReplayArrow { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
@@ -484,6 +507,23 @@ fn owned_field_presence(documents: &Documents) -> Value {
         row.iter().filter(|(_, value)| !matches!(value, Value::Undefined))
             .map(|(name, _)| Value::Utf8(name.clone())).collect(),
     )).collect())
+}
+
+fn encode_owned_arrow_fields(documents: &ArrowDocuments, body: &mut StructFields<Value>) -> Result<Vec<Iid>> {
+    let array = documents.array();
+    let iids = (0..array.len()).map(|row| documents.owned_id_ref(row).map(rtdb_columnar::EntityIdRef::iid)).collect::<Result<_>>()?;
+    let presence = (0..array.len()).map(|row| {
+        let mut names = Vec::new();
+        for (field, column) in array.fields().iter().zip(array.columns()) {
+            let cell = rtdb_columnar::ArrowCell { field, array: column.as_ref(), row };
+            if !cell.is_undefined()? { names.push(Value::Utf8(field.name().clone())); }
+        }
+        Ok(Value::List(names.into()))
+    }).collect::<Result<Vec<_>>>()?;
+    body.insert("iids".into(), Value::Null);
+    body.insert("field_presence".into(), Value::List(presence.into()));
+    body.insert("arrow_payload".into(), Value::Bool(true));
+    Ok(iids)
 }
 
 fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections::BTreeSet<String>>>> {
@@ -706,6 +746,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("from_offset_micros".into(), from_offset.map_or(Value::Null, Value::I64));
             body.insert("to_offset_micros".into(), to_offset.map_or(Value::Null, Value::I64));
             match effect {
+                OwnedPeriodEffect::Arrow { documents, create_only } => {
+                    if documents.row_count() != 1 { return Err(invalid("Relative Arrow writes require one fact")); }
+                    identities = Cow::Owned(encode_owned_arrow_fields(documents, &mut body)?);
+                    docs = Some((relation.name().to_owned(), SourceDocuments::Arrow(documents)));
+                    if *create_only { "rtdb-owned-relative-insert-v2" } else { "rtdb-owned-relative-replace-v2" }
+                },
                 OwnedPeriodEffect::Delete(id) => {
                     body.insert("relation".into(), Value::Utf8(relation.name().into()));
                     body.insert("id".into(), id.as_value());
@@ -725,6 +771,22 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
                     }
                 },
             }
+        }
+        Operation::Public(TxOp::OwnedArrowDocs { relation, documents, create_only, valid_from, valid_to }) => {
+            identities = Cow::Owned(encode_owned_arrow_fields(documents, &mut body)?);
+            time_fields(&mut body, *valid_from, *valid_to);
+            docs = Some((relation.name().to_owned(), SourceDocuments::Arrow(documents)));
+            if *create_only { "rtdb-owned-insert-v1" } else { "rtdb-owned-replace-v1" }
+        }
+        Operation::OwnedArrowIids { create_only, relation, documents, iids, presence, valid_from, valid_to } => {
+            identities = Cow::Borrowed(iids);
+            body.insert("iids".into(), Value::Null);
+            body.insert("arrow_payload".into(), Value::Bool(true));
+            body.insert("field_presence".into(), Value::list(presence.iter()
+                .map(|fields| Value::list(fields.iter().cloned().map(Value::Utf8).collect())).collect()));
+            time_fields(&mut body, *valid_from, *valid_to);
+            docs = Some((relation.name().to_owned(), SourceDocuments::Arrow(documents)));
+            if *create_only { "rtdb-owned-insert-v1" } else { "rtdb-owned-replace-v1" }
         }
         Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to } | TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
@@ -1806,8 +1868,27 @@ impl SourceOperationReader<'_> {
                 if let Some(relation) = owned {
                     let presence = body.column_by_name("field_presence")
                         .map(|_| value("field_presence").and_then(read_owned_field_presence)).transpose()?.flatten();
-                    let documents = Documents::read_arrow_with_presence(structs, layout, true, presence.as_deref(), memory)?;
                     let iids = iids.ok_or_else(|| invalid("Owned insert operation has no IIDs"))?;
+                    if relation.is_root_data() && matches!(value("arrow_payload"), Ok(Value::Bool(true))) {
+                        let presence = presence.ok_or_else(|| invalid("Owned Arrow payload requires exact field presence"))?;
+                        let documents = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)?
+                            .ok_or_else(|| invalid("Owned Arrow payload is not a struct"))?;
+                        if relative {
+                            let period = read_relative_period(body, offset)?;
+                            let ([fields], [iid]) = (presence.as_slice(), iids.as_slice()) else {
+                                return Err(invalid("Relative Arrow writes require one fact"));
+                            };
+                            let documents = documents.select_owned_fields(fields, memory)?;
+                            if documents.owned_id_ref(0)?.iid() != *iid {
+                                return Err(invalid("Owned document IID does not match its identity"));
+                            }
+                            let effect = OwnedPeriodEffect::Arrow { documents, create_only: name == "rtdb-owned-relative-insert-v2" };
+                            return Ok(Operation::Public(TxOp::OwnedRelativePeriod { relation, effect, period }));
+                        }
+                        return Ok(Operation::OwnedArrowIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids,
+                            presence, valid_from, valid_to });
+                    }
+                    let documents = Documents::read_arrow_with_presence(structs, layout, true, presence.as_deref(), memory)?;
                     if relative {
                         let period = read_relative_period(body, offset)?;
                         for (row, iid) in documents.rows().iter().zip(iids) {
@@ -2061,6 +2142,35 @@ mod tests {
     }
 
     #[test]
+    fn relative_root_arrow_replay_keeps_geometry_and_exact_presence() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("locations").unwrap();
+        let arrow = |id: &str, column, bytes: &[u8]| {
+            let batch = RecordBatch::try_from_iter([
+                ("_id", Arc::new(arrow_array::StringArray::from(vec![id])) as arrow_array::ArrayRef),
+                (column, Arc::new(arrow_array::BinaryArray::from_iter_values([bytes]))),
+            ]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+            TxOp::OwnedRelativePeriod {
+                relation: relation.clone(), effect: OwnedPeriodEffect::Arrow { documents, create_only: false },
+                period: OwnedRelativePeriod::from_fields(None, Some(Timestamp(126)), Some(Timestamp(-7)), None).unwrap(),
+            }
+        };
+        let transaction = SourceTransaction::new(vec![
+            arrow("a", "location", b"wkb"), arrow("b", "partition", b"zone"),
+        ], SubmitOptions::default(), &memory).unwrap();
+        let mut replayed = roundtrip(&transaction);
+        replayed.place_owned_periods(Timestamp(123), true).unwrap();
+        let Operation::Public(TxOp::OwnedArrowDocs {
+            documents, create_only: false, valid_from: Some(Timestamp(116)), valid_to: Some(Timestamp(126)), ..
+        }) = &replayed.operations[0] else { panic!("expected placed Arrow write"); };
+        assert_eq!(documents.columns(), ["_id", "location"]);
+        let payload = documents.array().column(1).as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+        assert_eq!(payload.value(0), b"wkb");
+    }
+
+    #[test]
     fn ordered_world_clock_advance_keeps_its_parent_pin_without_point_checks() {
         let world = Iid([4; 16]);
         let pin = Iid([5; 16]);
@@ -2284,6 +2394,29 @@ mod tests {
         let [Operation::PutReplayArrow { documents, iids: Some(iids), .. }] = replayed.operations.as_slice() else { panic!("expected columnar replay"); };
         assert_eq!(documents.array().len(), 2);
         assert_eq!(iids, &[EntityId::Integer(1).iid(), EntityId::Integer(2).iid()]);
+    }
+
+    #[test]
+    fn owned_arrow_source_keeps_nulls_and_complete_identity_on_replay() {
+        let memory = budget();
+        let batch = RecordBatch::try_from_iter([
+            ("_id", Arc::new(arrow_array::StringArray::from(vec!["a", "b"])) as arrow_array::ArrayRef),
+            ("payload", Arc::new(arrow_array::BinaryArray::from(vec![Some(b"data".as_slice()), None]))),
+        ]).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+        let source = SourceTransaction::new(vec![TxOp::OwnedArrowDocs {
+            relation: rtdb_types::OwnedRelation::new("facts").unwrap(),
+            documents, create_only: true, valid_from: None, valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let replayed = roundtrip(&source);
+        let [Operation::OwnedArrowIids { documents, iids, presence, create_only: true, .. }] = replayed.operations.as_slice() else {
+            panic!("expected owned Arrow replay");
+        };
+        assert_eq!(iids, &[EntityId::String("a".into()).iid(), EntityId::String("b".into()).iid()]);
+        assert_eq!(documents.array().len(), 2);
+        assert!(documents.array().column(1).is_null(1));
+        assert!(presence[1].contains("payload"));
     }
 
     #[test]

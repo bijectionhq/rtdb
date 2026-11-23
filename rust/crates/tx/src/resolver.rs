@@ -6,13 +6,13 @@ use async_trait::async_trait;
 use prost::Message;
 use arrow_array::{Array, RecordBatch, cast::AsArray};
 use arrow_schema::{DataType, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{AcceptanceStage, ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
 use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::bounded_retry::is_bounded_receipts_table;
@@ -1011,6 +1011,10 @@ impl<'a> OpenTransaction<'a> {
                 self.sweep_owned_expiry(relation, id, *created, *expiry).await,
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from, valid_to }) =>
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
+            Operation::Public(TxOp::OwnedArrowDocs { relation, documents, create_only, valid_from, valid_to }) =>
+                self.write_owned_arrow(relation, documents, None, *valid_from, *valid_to, *create_only).await,
+            Operation::OwnedArrowIids { relation, documents, iids, presence, create_only, valid_from, valid_to } =>
+                self.write_owned_arrow(relation, documents, Some((iids, presence)), *valid_from, *valid_to, *create_only).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
                 self.write_owned(relation, documents, None, *valid_from, *valid_to, true).await,
             Operation::Public(TxOp::OwnedRelativePeriod { .. }) => Err(Anomaly::incorrect(
@@ -1147,11 +1151,11 @@ impl<'a> OpenTransaction<'a> {
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             for row in 0..batch.num_rows() {
-                let cell = |index| rtdb_columnar::read_value(batch.schema_ref().field(index), batch.column(index).as_ref(), row);
+                let text = |name| ArrowCell::named(batch, name, row).and_then(ArrowCell::utf8);
                 if present
-                    || !matches!(cell(0)?, Value::Utf8(name) if name == path.name())
-                    || !matches!(cell(1)?, Value::Utf8(name) if name == target.schema)
-                    || !matches!(cell(2)?, Value::Utf8(name) if name == target.table)
+                    || text("_id") != Some(path.name())
+                    || text("schema_name") != Some(target.schema.as_str())
+                    || text("table_name") != Some(target.table.as_str())
                 {
                     return Err(Anomaly::incorrect("rtdb.owned/spatial-path", "Spatial path belongs to another relation"));
                 }
@@ -1224,21 +1228,13 @@ impl<'a> OpenTransaction<'a> {
                     let batch = batch.batch();
                     for row in 0..batch.num_rows() {
                         if found { return Err(different()); }
-                        let cell = |name| {
-                            let (index, field) = batch.schema_ref().column_with_name(name).ok_or_else(different)?;
-                            let array = batch.column(index).as_ref();
-                            let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
-                            let _charge = self.context.memory.reserve(bytes.checked_mul(2).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)?)?;
-                            rtdb_columnar::read_value(field, array, row)
-                        };
-                        let matches_text = |key, expected: &str| -> Result<bool> {
-                            Ok(matches!(cell(key)?, Value::Utf8(text) if text == expected))
-                        };
-                        let Value::List(stored_columns) = cell("columns")? else { return Err(different()); };
-                        if !matches_text("_id", name.name())? || !matches_text("schema_name", &target.schema)?
-                            || !matches_text("table_name", &target.table)?
+                        let cell = |name| ArrowCell::named(batch, name, row);
+                        let text = |name| cell(name).and_then(ArrowCell::utf8);
+                        let Some(stored_columns) = cell("columns").and_then(ArrowCell::list) else { return Err(different()); };
+                        if text("_id") != Some(name.name()) || text("schema_name") != Some(target.schema.as_str())
+                            || text("table_name") != Some(target.table.as_str())
                             || stored_columns.len() != columns.len()
-                            || !stored_columns.iter().zip(columns).all(|(value, expected)| matches!(value.as_ref(), Value::Utf8(column) if column == expected))
+                            || !stored_columns.zip(columns).all(|(value, expected)| value.utf8() == Some(expected.as_str()))
                         {
                             return Err(different());
                         }
@@ -1312,6 +1308,8 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedDeclareRelation { .. } | TxOp::OwnedDeclarePath { .. }
                         | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. }
                         | TxOp::OwnedSweepExpired { .. })
+                    | Operation::Public(TxOp::OwnedArrowDocs { create_only: true, .. })
+                    | Operation::OwnedArrowIids { create_only: true, .. }
                     | Operation::OwnedWriteIids { create_only: true, .. } if root.is_none() => (),
                     _ => return Err(lifetime_uncovered()),
                 }
@@ -1465,6 +1463,13 @@ impl<'a> OpenTransaction<'a> {
             let mut checked_tip = None;
             for operation in operations {
                 effects = effects.saturating_add(1);
+                if let Some((relation, rows)) = operation.owned_documents()
+                    && publish_root && !bounded_write && relation.is_root_data() && rows > 0
+                {
+                    root_rows = root_rows.saturating_add(rows);
+                    effects = effects.saturating_add(rows - 1);
+                    continue;
+                }
                 match operation {
                     Operation::Public(TxOp::OwnedDeadline { .. }) => {}
                     Operation::Public(TxOp::HostedControl(control)) if control.is_check() => { checks += 1; }
@@ -1490,11 +1495,13 @@ impl<'a> OpenTransaction<'a> {
                         replacement = Some((relation, id));
                         root_rows += 1;
                     }
-                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
-                    | Operation::OwnedWriteIids { relation, documents, .. }
-                        if publish_root && !bounded_write && relation.is_root_data() && !documents.rows().is_empty() => {
-                        root_rows = root_rows.saturating_add(documents.rows().len());
-                        effects = effects.saturating_add(documents.rows().len() - 1);
+                    Operation::Public(TxOp::OwnedArrowDocs { relation, documents, valid_from: None, valid_to: None, create_only })
+                    | Operation::OwnedArrowIids { relation, documents, valid_from: None, valid_to: None, create_only, .. }
+                        if relation.is_root_data() && documents.array().len() == 1 && replacement.is_none()
+                            && if *create_only { sibling_fork || (proposal_hold && !proposal_shorten) }
+                                else { replaces_pin && !proposal_hold } => {
+                        replacement = Some((relation, documents.owned_id(0)?));
+                        root_rows += 1;
                     }
                     Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })
                         if proposal_shorten && relation.is_root_data() && replacement.is_none() => {
@@ -1635,6 +1642,15 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
             for operation in operations {
+                if let Operation::Public(TxOp::OwnedArrowDocs { relation, documents, create_only: true, .. })
+                    | Operation::OwnedArrowIids { relation, documents, create_only: true, .. } = operation
+                {
+                    for row in 0..documents.row_count() {
+                        let id = documents.owned_id(row)?;
+                        self.require_proposal_create_absence(owner, relation, relation, &id).await?;
+                    }
+                    continue;
+                }
                 let (relation, documents) = match operation {
                     Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. })
                     | Operation::OwnedWriteIids { relation, documents, create_only: true, .. } =>
@@ -1671,10 +1687,8 @@ impl<'a> OpenTransaction<'a> {
                 .map(|(world, ..)| (*world, (0, 0))).collect();
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
-                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
-                    | Operation::OwnedWriteIids { relation, documents, .. }
-                        if root_publication.is_some() && relation.is_root_data() && !documents.rows().is_empty() => {
-                        let count = documents.rows().len();
+                    _ if root_publication.is_some() && operation.owned_documents().is_some_and(|(relation, rows)| relation.is_root_data() && rows != 0) => {
+                        let (_, count) = operation.owned_documents().expect("matched document write");
                         root_rows += count;
                         count
                     }
@@ -2007,7 +2021,7 @@ impl<'a> OpenTransaction<'a> {
         &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         kind: rtdb_types::OwnedChangeKind,
     ) -> Result<()> {
-        use rtdb_types::{EntityId, OwnedRelation};
+        use rtdb_types::OwnedRelation;
         if relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION {
             return Err(Anomaly::incorrect("rtdb.owned/immutable-attempt", "Attempt reservations are immutable"));
         }
@@ -2363,6 +2377,170 @@ impl<'a> OpenTransaction<'a> {
         self.put_documents(&table, documents, iids, from, to, DocumentWrite::Owned { relation, owner, create_only }).await
     }
 
+    async fn write_owned_arrow(
+        &mut self, relation: &rtdb_types::OwnedRelation, documents: &ArrowDocuments,
+        replay: Option<(&[Iid], &[std::collections::BTreeSet<String>])>,
+        from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool,
+    ) -> Result<()> {
+        if !relation.is_root_data() {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let table = relation.table(owner);
+        let declaration = self.read_owned_schema(owner, relation).await?;
+        let base_time = self.tx_key().system_time;
+        let restoring = self.hosted_replay.as_ref().map(|replay| replay.source_time());
+        let mut lifetime_context = None;
+        let mut lifetime_period = None;
+        let mut lifetime_floor = None;
+        if let Some((schema, _)) = &declaration {
+            if let Some(source) = restoring {
+                let valid = replay_period(from, to)?;
+                schema.require_replayed_period(valid, source, EventOp::Put)?;
+            } else {
+                schema.require_root_write_period(from, to)?;
+            }
+            if let Some(duration) = schema.lifetime_micros() {
+                if !create_only {
+                    return Err(if restoring.is_some() { replay_period_unavailable() } else { lifetime_uncovered() });
+                }
+                let context = self.context.query_context(self.snapshot()?, base_time,
+                    &self.options.default_tz, self.trace_parent)?.with_accelerators(Arc::from([]));
+                if restoring.is_none() {
+                    let end = Timestamp(base_time.0.checked_add(duration).ok_or_else(overflow)?);
+                    lifetime_period = Some(interval(base_time, end)?);
+                    let floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
+                    floor.check(duration, base_time)?;
+                    let mut next = rtdb_types::OwnedLifetimeFloor::at(duration, base_time)?;
+                    next.swept_present_through = floor.swept_present_through;
+                    if next.expired_created_through > floor.expired_created_through { lifetime_floor = Some(next); }
+                }
+                lifetime_context = Some(context);
+            }
+        } else if restoring.is_some() {
+            return Err(replay_period_unavailable());
+        }
+        let mut lifetime_ids = BTreeSet::new();
+        let array = documents.array();
+        if replay.is_some_and(|(iids, presence)| iids.len() != array.len() || presence.len() != array.len()) {
+            return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
+        }
+        let memory = Arc::clone(&self.context.memory);
+        let _scratch = memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(256)))?;
+        let row_cells = |row: usize| array.fields().iter().zip(array.columns()).map(move |(field, values)| ArrowCell { field, array: values.as_ref(), row });
+        let endpoint = |cell: ArrowCell<'_>| -> Result<Option<Timestamp>> {
+            if cell.is_null()? { return Ok(None); }
+            cell.zoned_micros().map(Some).ok_or_else(|| Anomaly::fault("xtdb/invalid-timestamp-col-type", "Invalid timestamp col type"))
+        };
+        for row in 0..array.len() {
+            let selected = replay.map(|(_, presence)| &presence[row]);
+            let cell_is_present = |cell: ArrowCell<'_>| -> Result<bool> {
+                Ok(selected.is_none_or(|selection| selection.contains(cell.field.name())) && !cell.is_undefined()?)
+            };
+            let id_cell = row_cells(row).find(|cell| cell.field.name() == "_id")
+                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/missing-id", "Owned row has no _id"))?;
+            let _id = memory.reserve(rtdb_columnar::estimate_copy_cell_bytes(id_cell.field, id_cell.array, row)?.saturating_mul(4))?;
+            let id = documents.owned_id(row)?;
+            let iid = id.iid();
+            if !cell_is_present(id_cell)? || replay.is_some_and(|(iids, _)| iids[row] != iid) {
+                return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
+            }
+            let mut types = StructFields::new();
+            let mut fields = Vec::new();
+            let mut columns = Vec::new();
+            let mut fields_present = 0;
+            let mut explicit_validity = false;
+            let mut valid_from = from.unwrap_or(base_time);
+            let mut valid_to = to.unwrap_or(Timestamp::MAX);
+            for (cell, source) in row_cells(row).zip(array.columns()) {
+                if !cell_is_present(cell)? { continue; }
+                fields_present += 1;
+                match cell.field.name().as_str() {
+                    "_valid_from" | "_valid_to" => {
+                        explicit_validity = true;
+                        if let Some(time) = endpoint(cell)? {
+                            if cell.field.name() == "_valid_from" { valid_from = time; } else { valid_to = time; }
+                        }
+                    }
+                    name => {
+                        let ty = cell.logical_type()?;
+                        rtdb_columnar::validate_readable_cell(cell.field, cell.array, &rtdb_columnar::from_field(cell.field)?, row, &memory)?;
+                        types.insert(name.to_owned(), ty);
+                        fields.push(cell.field.clone());
+                        columns.push(source.slice(row, 1));
+                    }
+                }
+            }
+            if selected.is_some_and(|expected| expected.len() != fields_present) {
+                return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence names an unknown column"));
+            }
+            if restoring.is_some() && explicit_validity { return Err(replay_period_unavailable()); }
+            if let Some((schema, _)) = &declaration {
+                if schema.requires_bounded_period() {
+                    if explicit_validity {
+                        return Err(Anomaly::incorrect(
+                            "rtdb.owned/validity-policy", "A bounded period belongs to the ordered operation",
+                        ));
+                    }
+                    self.reserve_bounded_period_write(relation, id.clone())?;
+                } else if restoring.is_none() {
+                    schema.require_write_validity(explicit_validity)?;
+                }
+                schema.validate_types(&types)?;
+                for (field, column) in fields.iter().zip(&columns) {
+                    if matches!(types.get(field.name()), Some(LogicalType::Scalar(ScalarType::Decimal { .. }))) {
+                        rtdb_columnar::validate_projected_decimals(field, column.as_ref())?;
+                    }
+                }
+            }
+            if let Some(context) = &lifetime_context {
+                if (restoring.is_some() && !lifetime_ids.insert(id.clone()))
+                    || rtdb_query::owned_purge_floor(Arc::clone(context), owner, relation, &id).await?.is_some()
+                    || self.read_owned_revision(owner, relation, &id, Interval::ALL).await?.is_some()
+                { return Err(insert_exists()); }
+            }
+            let valid_time = match lifetime_period {
+                Some(valid) => valid,
+                None => interval(valid_from, valid_to)?,
+            };
+            let key = self.admit_owned_put(&table, relation, owner, id, iid, valid_time, create_only, rtdb_types::OwnedChangeKind::Put).await?
+                .ok_or_else(|| Anomaly::fault("rtdb.owned/missing-entity-key", "Governed put has no complete key"))?;
+            let content = rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None)?;
+            let header = EventHeader { commit_position: 0, iid, system_from: base_time, valid_time, op: EventOp::Put };
+            self.buffer.append_owned_put(&table, content, header, &key, documents.source_bytes())?;
+        }
+        if let Some(floor) = lifetime_floor {
+            self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
+        }
+        Ok(())
+    }
+
+    async fn admit_owned_put(
+        &mut self, table: &TableRef, relation: &rtdb_types::OwnedRelation, owner: &str,
+        id: EntityId, iid: Iid, valid: Interval, create_only: bool, kind: rtdb_types::OwnedChangeKind,
+    ) -> Result<Option<Arc<[u8]>>> {
+        let key = if relation.is_world_catalog() {
+            None
+        } else {
+            if iid != id.iid() {
+                return Err(Anomaly::incorrect("rtdb.owned/invalid-locality", "Owned row locality differs from the canonical key"));
+            }
+            self.track_unique_mutation(owner, relation, &id, valid).await?;
+            self.track_capacity_mutation(owner, relation, &id, valid).await?;
+            Some(id.handle_bytes().into())
+        };
+        if self.snapshot()?.contains_table(table) {
+            let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
+            if create_only && self.read_owned_revision(owner, relation, &id, valid).await?.is_some() {
+                return Err(insert_exists());
+            }
+        }
+        if !relation.is_world_catalog() {
+            self.record_owned_change(relation, id, kind, valid)?;
+        }
+        Ok(key)
+    }
+
     async fn require_absent(&self, table: &TableRef, iid: Iid, valid: Interval) -> Result<()> {
         use rtdb_plan::{Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 
@@ -2404,34 +2582,13 @@ impl<'a> OpenTransaction<'a> {
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
             let valid_time = interval(row_from, row_to)?;
-            let mut entity_key = None;
             let id = crate::source::document_id(document, &self.context.memory)?;
-            if !relation.is_world_catalog() {
-                entity_key = Some(id.handle_bytes().into());
-                if iid != id.iid() {
-                    return Err(Anomaly::incorrect("rtdb.owned/invalid-locality", "Owned row locality differs from the canonical key"));
-                }
-                self.track_unique_mutation(owner, relation, &id, valid_time).await?;
-                self.track_capacity_mutation(owner, relation, &id, valid_time).await?;
-            }
-            if self.snapshot()?.contains_table(table) {
-                let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
-                if create_only && self.read_owned_revision(owner, relation, &id, valid_time).await?.is_some() {
-                    return Err(insert_exists());
-                }
-            }
-            if !relation.is_world_catalog() {
-                use rtdb_types::OwnedChangeKind;
-                // The world write path already validates the shadow carrier.
-                let kind = if relation.world().is_some()
-                    && rtdb_types::WorldShadow::is_tombstone(document)
-                {
-                    OwnedChangeKind::Delete
-                } else {
-                    OwnedChangeKind::Put
-                };
-                self.record_owned_change(relation, id, kind, valid_time)?;
-            }
+            let kind = if relation.world().is_some() && rtdb_types::WorldShadow::is_tombstone(document) {
+                rtdb_types::OwnedChangeKind::Delete
+            } else {
+                rtdb_types::OwnedChangeKind::Put
+            };
+            let entity_key = self.admit_owned_put(table, relation, owner, id, iid, valid_time, create_only, kind).await?;
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
             self.buffer.append_to(table, StoredEvent { commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
         }
@@ -2728,6 +2885,10 @@ fn no_owned_principal() -> Anomaly {
 
 fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Result<()> {
     let put_columns = &["_id", "_fn", "_valid_from", "_valid_to"][..];
+    if let Operation::Public(TxOp::OwnedArrowDocs { relation, documents, .. }) | Operation::OwnedArrowIids { relation, documents, .. } = operation {
+        let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        return validate_document_columns(&relation.table(owner), documents.columns(), "insert", put_columns);
+    }
     if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. }) | Operation::OwnedWriteIids { relation, documents, .. } = operation {
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let permitted = if relation.world().is_some() {

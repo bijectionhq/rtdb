@@ -153,11 +153,11 @@ struct DmlBuffer { operations: Vec<BufferedOperation> }
 impl DmlBuffer {
     fn append(&mut self, operation: TxOp, memory: &Arc<MemoryBudget>) -> Result<()> {
         let bytes = match &operation {
-            TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } => relation.name().len(),
+            TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. } => relation.name().len(),
             TxOp::OwnedRelativePeriod { relation, effect, .. } => {
                 let identity = match effect {
                     rtdb_tx::OwnedPeriodEffect::Delete(id) => id.as_value().retained_bytes()?,
-                    rtdb_tx::OwnedPeriodEffect::Create(_) | rtdb_tx::OwnedPeriodEffect::Replace(_) => 0,
+                    rtdb_tx::OwnedPeriodEffect::Create(_) | rtdb_tx::OwnedPeriodEffect::Replace(_) | rtdb_tx::OwnedPeriodEffect::Arrow { .. } => 0,
                 };
                 relation.name().len().checked_add(identity).ok_or_else(allocation_overflow)?
             },

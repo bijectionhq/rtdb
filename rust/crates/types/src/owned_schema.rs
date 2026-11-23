@@ -351,6 +351,25 @@ impl OwnedSchema {
         self.0.fields.iter().find(|field| field.name == name && !matches!(field.kind, Kind::OpaqueBinary {}))
     }
 
+    pub fn validate_types(&self, types: &StructFields<LogicalType>) -> Result<()> {
+        for field in &self.0.fields {
+            let accepts = match types.get(field.name.as_str()) {
+                None | Some(LogicalType::Nothing) => field.optional,
+                Some(LogicalType::Null) => field.nullable,
+                Some(LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_) }))
+                    if matches!(field.kind, Kind::Instant {}) => true,
+                Some(ty) => *ty == LogicalType::Scalar(field.kind.scalar()),
+            };
+            if !accepts { return Err(nonconforming(&field.name)); }
+        }
+        for (name, ty) in types {
+            if !matches!(name.as_str(), "_id" | "_valid_from" | "_valid_to")
+                && ty != &LogicalType::Nothing && !self.0.fields.iter().any(|field| &field.name == name)
+            { return Err(nonconforming(name)); }
+        }
+        Ok(())
+    }
+
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
         for field in &self.0.fields {
             let accepts = match row.get(field.name.as_str()) {

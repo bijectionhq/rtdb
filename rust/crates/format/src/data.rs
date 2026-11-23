@@ -555,9 +555,19 @@ fn event_builder(rows: usize, put_fields: Option<&StructFields<LogicalType>>, me
 
 /// `source_bytes` is the shared source allocation held by the document buffers.
 pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    put_batch(documents, headers, None, source_bytes, memory)
+}
+
+/// Stages governed puts with their complete entity keys alongside the Arrow documents.
+pub fn keyed_put_batch(documents: ArrayRef, headers: &[EventHeader], keys: BinaryArray, source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    if keys.len() != headers.len() || keys.null_count() != 0 { return Err(invalid("Governed puts require one complete key per header")); }
+    put_batch(documents, headers, Some(keys), source_bytes, memory)
+}
+
+fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryArray>, source_bytes: Option<usize>, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     if documents.len() != headers.len() || documents.null_count() != 0
         || !matches!(documents.data_type(), DataType::Struct(_))
-        || headers.iter().any(|header| header.op != EventOp::Put || header.commit_position != 0) {
+        || headers.iter().any(|header| header.op != EventOp::Put || (keys.is_none() && header.commit_position != 0)) {
         return Err(invalid("Put headers and their Arrow documents disagree"));
     }
     let retained = documents.get_array_memory_size().max(source_bytes.unwrap_or_default());
@@ -586,6 +596,7 @@ pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_byte
         (documents, None)
     };
     let bound = headers.len().checked_mul(128).and_then(|bytes| bytes.checked_add(documents.get_array_memory_size()))
+        .and_then(|bytes| bytes.checked_add(keys.as_ref().map_or(0, Array::get_array_memory_size)))
         .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?;
     let mut reservation = if let Some(mut reservation) = copy {
         let lease = Arc::get_mut(&mut reservation).expect("put copy owns its reservation");
@@ -600,7 +611,16 @@ pub fn owned_put_batch(documents: ArrayRef, headers: &[EventHeader], source_byte
     let offsets = (0..headers.len()).map(|offset| i32::try_from(offset).map_err(invalid)).collect::<Result<Vec<_>>>()?;
     let operations = UnionArray::try_new(fields, ScalarBuffer::from(vec![2; headers.len()]), Some(ScalarBuffer::from(offsets)),
         vec![Arc::new(NullArray::new(0)), Arc::new(NullArray::new(0)), documents]).map_err(invalid)?;
-    let batch = event_columns(headers, Arc::new(operations), None, None)?;
+    let mut batch = event_columns(headers, Arc::new(operations), None, None)?;
+    if let Some(keys) = keys {
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(entity_key_field()));
+        fields.push(Arc::new(commit_position_field()));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(keys));
+        columns.push(Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))));
+        batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)?;
+    }
     Arc::get_mut(&mut reservation).expect("put construction owns its reservation").shrink_to(batch.get_array_memory_size())?;
     OwnedBatch::with_reservation(batch, reservation)
 }

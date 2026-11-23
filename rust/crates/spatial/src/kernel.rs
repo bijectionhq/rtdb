@@ -17,6 +17,8 @@ pub(crate) struct Location {
 }
 
 impl Location {
+    pub(crate) fn retained_bytes(&self) -> usize { self.geometry.retained_bytes() }
+
     pub(crate) fn decode(bytes: &[u8], work: &mut GeometryWork) -> Result<Self> {
         let Some((&tag, payload)) = bytes.split_first() else {
             return Err(invalid("Missing location encoding"));
@@ -218,7 +220,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Anomaly {
     Anomaly::incorrect("rtdb.spatial/invalid", message)
 }
 
-fn geometry_error(error: geometry::GeometryRefusal) -> Anomaly {
+pub(crate) fn geometry_error(error: geometry::GeometryRefusal) -> Anomaly {
     if error.bound.as_ref().is_some_and(|bound| {
         matches!(
             bound.kind,

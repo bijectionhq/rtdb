@@ -555,8 +555,8 @@ pub(crate) fn hosted_root_world_reads(operations: &[crate::source::Operation]) -
             },
             Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
                 | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
-                | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedDelete { relation, .. })
-            | Operation::OwnedWriteIids { relation, .. }
+                | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedDelete { relation, .. })
+            | Operation::OwnedWriteIids { relation, .. } | Operation::OwnedArrowIids { relation, .. }
                 if relation.world().is_none() && !relation.is_world_catalog() => None,
             _ => return false,
         };
@@ -1427,6 +1427,11 @@ fn finite_landing_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Opti
 
 pub fn proposal_landing_write_rows(op: &crate::TxOp) -> Option<usize> {
     use crate::TxOp;
+    if let TxOp::OwnedArrowDocs { relation, documents, create_only, valid_from, valid_to } = op {
+        let valid = (valid_from.is_none() && valid_to.is_none())
+            || (!create_only && finite_landing_period(*valid_from, *valid_to).is_some());
+        return (relation.is_root_data() && valid && documents.row_count() != 0).then_some(documents.row_count());
+    }
     let (relation, documents) = match op {
         TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None } =>
             (relation, documents),
@@ -1528,6 +1533,32 @@ pub(crate) fn hosted_proposal_land(
                         relation, id, starts: vec![None], create_only: true,
                     }).is_some()
                         || assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
+                }
+            }
+            Operation::Public(TxOp::OwnedArrowDocs { relation, documents, valid_from, valid_to, create_only })
+            | Operation::OwnedArrowIids { relation, documents, valid_from, valid_to, create_only, .. }
+                if relation.is_root_data() && !close && documents.row_count() != 0 =>
+            {
+                let start = match (valid_from, valid_to) {
+                    (None, None) => None,
+                    _ if !create_only => Some(finite_landing_period(*valid_from, *valid_to)?),
+                    _ => return None,
+                };
+                for row in 0..documents.row_count() {
+                    let id = documents.owned_id(row).ok()?;
+                    assertion_count += 1;
+                    if assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
+                    match writes.entry((relation.name(), id.handle_bytes())) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(ProposalLandingKey { relation, id, starts: vec![start], create_only: *create_only });
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) if !create_only => {
+                            let starts = &mut entry.get_mut().starts;
+                            if start.is_some() != starts[0].is_some() { return None; }
+                            if !starts.contains(&start) { starts.push(start); }
+                        }
+                        _ => return None,
+                    }
                 }
             }
             Operation::Public(TxOp::OwnedDelete { relation, id, valid_from: None, valid_to: None })

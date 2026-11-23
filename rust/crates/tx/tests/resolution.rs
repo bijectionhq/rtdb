@@ -943,6 +943,59 @@ async fn declared_owned_schema_distinguishes_omission_and_null_after_source_deco
 }
 
 #[tokio::test]
+async fn owned_arrow_replay_preserves_lifetime_and_explicit_bounds() {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use rtdb_columnar::OwnedBatch;
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{OwnedRelation, OwnedSchema};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let lifetime = OwnedRelation::new("lifetime-facts").unwrap();
+    let period = OwnedRelation::new("period-facts").unwrap();
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap();
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let declared = resolver.resolve_source(
+        state.snapshot(), SourcePosition(0), Timestamp(10), source(vec![
+            TxOp::OwnedDeclareRelation {
+                relation: lifetime.clone(),
+                schema: OwnedSchema::from_json(br#"{"fields":[],"validity":"acceptance","lifetime_micros":10}"#).unwrap(),
+            },
+            TxOp::OwnedDeclareRelation {
+                relation: period.clone(),
+                schema: OwnedSchema::from_json(br#"{"fields":[],"validity":"bounded_period"}"#).unwrap(),
+            },
+        ]), &context,
+    ).await.unwrap();
+    assert!(declared.result().committed(), "{:?}", declared.result().error());
+    let batch = RecordBatch::try_from_iter([("_id", Arc::new(Int64Array::from(vec![7])) as ArrayRef)]).unwrap();
+    let batch = OwnedBatch::new(batch, &context.memory).unwrap();
+    let docs = ArrowDocuments::from_owned_payload(&batch, &context.memory).unwrap().unwrap();
+    let write = |relation: &OwnedRelation, from, to| TxOp::OwnedArrowDocs {
+        relation: relation.clone(), documents: docs.clone(), create_only: true, valid_from: from, valid_to: to,
+    };
+    let committed = resolver.resolve_source(
+        state.snapshot(), SourcePosition(1), Timestamp(20), source(vec![
+            write(&lifetime, None, None),
+            write(&period, Some(Timestamp(3)), Some(Timestamp(5))),
+        ]), &context,
+    ).await.unwrap();
+    assert!(committed.result().committed(), "{:?}", committed.result().error());
+    for (relation, from, to) in [(lifetime, 20, 30), (period, 3, 5)] {
+        let write = &committed.writes().tables()[&relation.table("owner")];
+        let event = write.batch().unwrap().view().read_event(0).unwrap();
+        assert_eq!(event.header().valid_time, Interval::new(Timestamp(from), Timestamp(to)).unwrap());
+    }
+}
+
+#[tokio::test]
 async fn world_mutations_refuse_source_operations_without_held_admission() {
     use rtdb_types::{EntityId, Iid, OwnedRelation, OwnedWorld, TransactionKey, TxId, WorldSchemas, WorldShadow};
 

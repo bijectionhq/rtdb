@@ -18,7 +18,7 @@ use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, Own
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
-use rtdb_tx::{Documents, OwnedRelativePeriod, TxOp};
+use rtdb_tx::{ArrowDocuments, Documents, OwnedRelativePeriod, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
@@ -38,10 +38,15 @@ pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
 pub(crate) const SPATIAL_HELD_OWNED_V1: &str = "rtdb.owned.SpatialHeld.v1";
 pub(crate) const SPATIAL_HELD_OWNED_V2: &str = "rtdb.owned.SpatialHeld.v2";
+pub(crate) const SPATIAL_OPEN_OWNED: &str = "rtdb.owned.SpatialOpen.v1";
+pub(crate) const SPATIAL_NEXT_OWNED: &str = "rtdb.owned.SpatialNext.v1";
+pub(crate) const SPATIAL_CLOSE_OWNED: &str = "rtdb.owned.SpatialClose.v1";
+const SPATIAL_FILTER_TOKEN: &str = "rtdb.owned.spatial_filter";
+const MAX_SPATIAL_FILTERS: usize = 32;
 pub(crate) const SPATIAL_HELD_OWNED_V3: &str = "rtdb.owned.SpatialHeld.v3";
 
 #[derive(Clone, Copy)]
-pub(crate) enum SpatialHeldWire { V1, V2, V3 }
+pub(crate) enum SpatialHeldWire { V1, V2, V3, Open }
 pub(crate) const DROP_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DropSpatialPath.v1";
 pub(crate) const DECLARE_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DeclareSpatialPath.v1";
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
@@ -294,7 +299,17 @@ pub(crate) struct OwnedReadResource {
     session: String,
     database: String,
     witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
+    spatial_filters: Mutex<BTreeMap<Uuid, Arc<RetainedSpatialFilter>>>,
     _permit: Option<OwnedSemaphorePermit>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+struct RetainedSpatialFilter {
+    relation: OwnedRelation,
+    path: OwnedRelation,
+    batch: OwnedBatch,
+    region: rtdb_spatial::PreparedRegion,
+    valid_at: Timestamp,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -399,7 +414,10 @@ fn measure_batch(measured: &rtdb_node::OwnedRangeCount) -> Result<RecordBatch, S
 }
 
 impl Leased for OwnedReadResource {
-    fn close(&self) { self.snapshot.close(); }
+    fn close(&self) {
+        self.snapshot.close();
+        if let Ok(mut filters) = self.spatial_filters.lock() { filters.clear(); }
+    }
 }
 
 pub(crate) struct OwnedWorldReadResource {
@@ -566,7 +584,7 @@ fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
     single_owned_batch(stream)
 }
 
-fn decode_spatial_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
+fn decode_retained_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
     let stream = OwnedStream::read_buffer(arrow_buffer::Buffer::from(arrow), call.memory()).map_err(status)?;
     single_owned_batch(stream)
 }
@@ -585,6 +603,46 @@ fn single_owned_batch(stream: OwnedStream) -> Result<OwnedBatch, Status> {
     Ok(stream.pop().expect("validated one batch"))
 }
 
+fn spatial_filters_unavailable() -> Status { Status::internal("Owned spatial filter storage is unavailable") }
+
+fn spatial_document_columns(batch: &RecordBatch) -> Result<Vec<&str>, Status> {
+    let layout = batch.schema_ref().field_with_name("document_columns").map(Field::data_type);
+    if !matches!(layout, Ok(DataType::List(item)) if item.data_type() == &DataType::Utf8
+        && !item.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)) {
+        return Err(invalid("Spatial document_columns must be a List<Utf8>"));
+    }
+    let columns = ArrowCell::named(batch, "document_columns", 0).and_then(ArrowCell::list)
+        .ok_or_else(|| invalid("Spatial document_columns must be a List<Utf8>"))?;
+    if columns.len() > 128 {
+        return Err(invalid("Spatial document_columns exceeds its column limit"));
+    }
+    let mut names = BTreeSet::new();
+    for column in columns {
+        let name = column.utf8().ok_or_else(|| invalid("Spatial document columns must be Utf8 values"))?;
+        if name.is_empty() || name.len() > 128 || name.starts_with('_')
+            || name.chars().any(char::is_control) || !names.insert(name) {
+            return Err(invalid("Spatial document columns must be distinct owned field names"));
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn spatial_partition(batch: &RecordBatch) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, Status> {
+    let (parts, parts_row) = owned_scalar::<ListArray>(batch, "partition")?
+        .ok_or_else(|| invalid("Owned held spatial request has no partition"))?;
+    let offsets = parts.value_offsets();
+        let indices = offsets[parts_row] as usize..offsets[parts_row + 1] as usize;
+        if indices.len() > 15 {
+            return Err(invalid("Owned held spatial request exceeds its byte or partition limit"));
+        }
+        let DataType::List(element) = parts.data_type() else { unreachable!() };
+        indices.map(|row| {
+            binary_cell(element, parts.values().as_ref(), row).map_err(status)?
+                .filter(|value| value.len() <= 4096).map(std::borrow::Cow::Borrowed)
+                .ok_or_else(|| invalid("Spatial partition values must be bounded Binary values"))
+        }).collect()
+}
+
 fn owned_scalar<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<Option<(&'a T, usize)>, Status> {
     let Some((index, field)) = batch.schema_ref().column_with_name(name) else { return Ok(None); };
     let Some((field, array, row)) = selected_cell(field, batch.column(index).as_ref(), 0).map_err(status)? else {
@@ -599,7 +657,10 @@ fn owned_scalar<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> R
 }
 
 fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
-    let batch = decode_batch(call, arrow)?;
+    require_identity(decode_batch(call, arrow)?)
+}
+
+fn require_identity(batch: OwnedBatch) -> Result<OwnedBatch, Status> {
     if batch.batch().schema_ref().index_of("_id").is_err() {
         return Err(invalid("Owned action requires an _id column"));
     }
@@ -639,23 +700,25 @@ impl Service {
         self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }]).await
     }
 
-    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &[u8], spatial: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_path_action(&self, call: &Call, body: &Bytes, spatial: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
-        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
+        let batch = decode_retained_batch(call, body.slice_ref(arrow))?;
+        let batch = batch.batch();
+        if batch.num_rows() != 1 || batch.num_columns() != 2 {
             return Err(invalid("Owned path declaration requires one row with _id and columns"));
         }
-        let (mut rows, _decoded) = upload::documents(batch.batch(), self)?;
-        let row = rows.pop().expect("validated one row");
-        let (Some(Value::Utf8(name)), Some(Value::List(columns))) = (row.get("_id"), row.get("columns")) else {
-            return Err(invalid("Owned path declaration requires a text name and text column list"));
-        };
-        let columns = columns.iter().map(|column| match column.as_ref() {
-            Value::Utf8(column) => Ok(column.clone()),
-            _ => Err(invalid("Owned path key column is not text")),
-        }).collect::<Result<Vec<_>, _>>()?;
-        let name = OwnedRelation::new(name.as_str()).map_err(status)?;
+        let name = ArrowCell::named(batch, "_id", 0).and_then(ArrowCell::utf8)
+            .ok_or_else(|| invalid("Owned path declaration requires a text name"))?;
+        let name = OwnedRelation::new(name).map_err(status)?;
+        let columns = ArrowCell::named(batch, "columns", 0).and_then(ArrowCell::list)
+            .filter(|columns| columns.len() <= 16)
+            .ok_or_else(|| invalid("Owned path declaration requires a bounded text column list"))?;
+        let columns = columns.map(|column| column.utf8()
+            .ok_or_else(|| invalid("Owned path key column is not text"))).collect::<Result<Vec<_>, _>>()?;
+        let bytes = columns.iter().try_fold(1024, |bytes, column| wire::add(bytes, wire::add(column.len(), 128)?))?;
+        let _charge = call.reserve(bytes)?;
+        let columns = columns.into_iter().map(str::to_owned).collect();
         let declaration = if spatial {
             TxOp::OwnedDeclareSpatialPath { relation, name, columns }
         } else {
@@ -713,10 +776,40 @@ impl Service {
         self.owned_write_reply(call, vec![operation]).await
     }
 
-    pub(crate) async fn create_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn create_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
+        let batch = require_identity(decode_retained_batch(call, body.slice_ref(arrow))?)?;
+        if relation.is_root_data() && batch.batch().column_by_name("_ordered_micros").is_none() {
+            if batch.batch().column_by_name("_absent").is_none() {
+                if let Some(documents) = ArrowDocuments::from_owned_payload(&batch, self.memory()).map_err(status)? {
+                    return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs {
+                        relation, documents, create_only: true, valid_from: None, valid_to: None,
+                    }]).await;
+                }
+            } else {
+                let rows = batch.batch().num_rows();
+                let _operations = call.reserve(wire::mul(rows, std::mem::size_of::<TxOp>() + 512)?)?;
+                let mut operations = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    let positions = owned_payload_columns(batch.batch(), row, &[])?;
+                    operations.push(match self.owned_payload(&batch, row, &positions)? {
+                        Some(documents) => TxOp::OwnedArrowDocs {
+                            relation: relation.clone(), documents, create_only: true, valid_from: None, valid_to: None,
+                        },
+                        None => {
+                            let (mut rows, _decoded) = upload::owned_documents(&batch.batch().slice(row, 1), call.memory())?;
+                            strip_owned_absence(&mut rows[0])?;
+                            TxOp::OwnedInsertDocs {
+                                relation: relation.clone(), documents: Documents::new(rows, self.memory()).map_err(status)?,
+                                valid_from: None, valid_to: None,
+                            }
+                        }
+                    });
+                }
+                return self.owned_write_reply(call, operations).await;
+            }
+        }
         let (mut rows, _decoded) = upload::owned_documents(batch.batch(), call.memory())?;
         for row in &mut rows { strip_owned_absence(row)?; }
         let operation = TxOp::OwnedInsertDocs {
@@ -726,22 +819,24 @@ impl Service {
         self.owned_write_reply(call, vec![operation]).await
     }
 
-    pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
-        self.commit_owned(call, body, format, Vec::new(), false, Vec::new()).await
+    pub(crate) async fn commit_owned_action(&self, call: &Call, body: &Bytes, format: CommitFormat) -> Result<ActionResult, Status> {
+        self.commit_owned(call, body, body, format, Vec::new(), false, Vec::new()).await
     }
 
-    pub(crate) async fn commit_owned_counted_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_counted_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
+        let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (conditions, body, _counts) = owned_count_conditions(call, body)?;
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
-        self.commit_owned(call, body, CommitFormat::Ordered, witnesses, false, conditions).await
+        self.commit_owned(call, envelope, body, CommitFormat::Ordered, witnesses, false, conditions).await
     }
 
-    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], format: CommitFormat, erase_allowed: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, envelope: &Bytes, format: CommitFormat, erase_allowed: bool) -> Result<ActionResult, Status> {
+        let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let allow_empty = erase_allowed || matches!(format, CommitFormat::Ordered);
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, allow_empty)?;
-        self.commit_owned(call, body, format, witnesses, erase_allowed, Vec::new()).await
+        self.commit_owned(call, envelope, body, format, witnesses, erase_allowed, Vec::new()).await
     }
 
     fn owned_witness_prefix<'a>(
@@ -772,11 +867,12 @@ impl Service {
         Ok((witnesses, body, framing))
     }
 
-    pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8], counted: bool) -> Result<ActionResult, Status> {
-        self.commit_hosted_with_reads(call, body, counted, Vec::new(), None, false).await
+    pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &Bytes, counted: bool) -> Result<ActionResult, Status> {
+        self.commit_hosted_with_reads(call, body, body, counted, Vec::new(), None, false).await
     }
 
-    pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
+        let body = envelope.as_ref();
         if self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
         let ([kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing hosted root commit kind"))?;
@@ -786,7 +882,7 @@ impl Service {
             _ => return Err(invalid("Invalid hosted root commit kind")),
         };
         let (worlds, body) = self.hosted_world_read_prefix(call, body)?;
-        self.commit_hosted_with_reads(call, body, counted, worlds, None, false).await
+        self.commit_hosted_with_reads(call, envelope, body, counted, worlds, None, false).await
     }
 
     fn hosted_world_read_prefix<'a>(
@@ -824,8 +920,9 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_flagged_action(
-        &self, call: &Call, body: &[u8], recheck_at_staging: bool,
+        &self, call: &Call, envelope: &Bytes, recheck_at_staging: bool,
     ) -> Result<ActionResult, Status> {
+        let body = envelope.as_ref();
         self.hosted_control_policy(call)?;
         let ([flags], body) = body.split_first_chunk::<1>()
             .ok_or_else(|| invalid("Missing hosted commit flags"))?;
@@ -848,11 +945,11 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, primary, counted, worlds, refusal, recheck_at_staging).await
+        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging).await
     }
 
     async fn commit_hosted_with_reads(
-        &self, call: &Call, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
+        &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
@@ -911,7 +1008,7 @@ impl Service {
         } else {
             CommitEffects::Facts
         };
-        let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, effects)?;
+        let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         let _refusal = if let Some(refusal) = refusal {
             if replay {
@@ -932,7 +1029,7 @@ impl Service {
                 call, controls, scope, &mut rows_left, false,
             )?;
             let facts = self.decode_owned_commit_groups(
-                call, facts, &mut alternative, &mut rows_left, CommitEffects::Facts,
+                call, envelope, facts, &mut alternative, &mut rows_left, CommitEffects::Facts,
             )?;
             alternative.extend(controls.into_iter().map(TxOp::HostedControl));
             writes.push(TxOp::HostedConstraintRefusal);
@@ -991,7 +1088,7 @@ impl Service {
         Ok((controls, held))
     }
 
-    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, conditions: Vec<TxOp>) -> Result<ActionResult, Status> {
+    async fn commit_owned(&self, call: &Call, envelope: &Bytes, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, conditions: Vec<TxOp>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -1008,29 +1105,145 @@ impl Service {
         let mut writes = vec![TxOp::owned_deadline(deadline)];
         writes.extend(conditions);
         let effects = if erase_allowed { CommitEffects::Replay } else { CommitEffects::Facts };
-        let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, effects)?;
+        let _rows = self.decode_owned_commit_groups(call, envelope, groups, &mut writes, &mut rows_left, effects)?;
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }
 
     fn decode_owned_commit_groups(
-        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, writes: &mut Vec<TxOp>,
+        &self, call: &Call, envelope: &Bytes, groups: Vec<(OwnedRelation, &[u8])>, writes: &mut Vec<TxOp>,
         rows_left: &mut usize, effects: CommitEffects,
     ) -> Result<Vec<(Arc<MemoryReservation>, Arc<MemoryReservation>)>, Status> {
         let mut retained = Vec::with_capacity(groups.len());
         for (relation, arrow) in groups {
-            let batch = request_batch(call, arrow)?;
+            let batch = require_identity(decode_retained_batch(call, envelope.slice_ref(arrow))?)?;
             let rows = batch.batch().num_rows();
             *rows_left = rows_left.checked_sub(rows)
                 .ok_or_else(|| invalid("Owned commit exceeds its total row limit"))?;
             let operations = wire::mul(rows, 2)?;
-            let operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
+            let mut operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
+            if relation.is_root_data() {
+                let charge = Arc::get_mut(&mut operations_charge).expect("commit group owns its operation reservation");
+                for row in 0..rows {
+                    let start = writes.len();
+                    let bytes = charge.bytes();
+                    if !self.append_owned_arrow_row(writes, &relation, &batch, row, effects, charge)? {
+                        writes.truncate(start);
+                        charge.shrink_to(bytes).map_err(status)?;
+                        let (row, _decoded) = upload::owned_documents(&batch.batch().slice(row, 1), call.memory())?;
+                        self.append_owned_commit_group(writes, &relation, row, effects)?;
+                    }
+                }
+                retained.push((operations_charge, Arc::clone(batch.reservation())));
+                continue;
+            }
             let (rows, documents_charge) = upload::owned_documents(batch.batch(), call.memory())?;
             self.append_owned_commit_group(writes, &relation, rows, effects)?;
             retained.push((operations_charge, documents_charge));
         }
         Ok(retained)
+    }
+
+    fn owned_payload(&self, batch: &OwnedBatch, row: usize, positions: &[usize]) -> Result<Option<ArrowDocuments>, Status> {
+        let selected = batch.batch().slice(row, 1).project(positions).map_err(arrow)?;
+        let selected = OwnedBatch::with_reservation(selected, batch.reservation().clone()).map_err(status)?;
+        ArrowDocuments::from_owned_payload(&selected, self.memory()).map_err(status)
+    }
+
+    fn append_owned_arrow_row(
+        &self, writes: &mut Vec<TxOp>, relation: &OwnedRelation, batch: &OwnedBatch, row: usize, effects: CommitEffects, charge: &mut MemoryReservation,
+    ) -> Result<bool, Status> {
+        let source = batch.batch();
+        let controls = [
+            "_op", "_read_valid_micros", "_read_system_micros", "_valid_from", "_valid_to",
+            "_valid_from_offset_micros", "_valid_to_offset_micros",
+        ];
+        if source.column_by_name("_ordered_micros").is_some() { return Ok(false); }
+        let positions = owned_payload_columns(source, row, &controls)?;
+        let cell = |name| ArrowCell::named(source, name, row);
+        let id = {
+            let cell = cell("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?;
+            read_entity_id(cell.field, cell.array, cell.row).map_err(status)?
+        };
+        let mut own_id = || -> Result<EntityId, Status> {
+            charge.grow_to(wire::add(charge.bytes(), id.owned_payload_bytes())?).map_err(status)?;
+            Ok(id.into_owned())
+        };
+        let operation = cell("_op").and_then(ArrowCell::utf8).ok_or_else(|| invalid("Owned commit _op must be Utf8"))?;
+        let optional = |name| cell(name).map(optional_bound).transpose().map(Option::flatten);
+        let signed = |name| -> Result<Option<Timestamp>, Status> {
+            optional(name)?.map(|cell| cell.int64().map(Timestamp)
+                .ok_or_else(|| invalid("Owned observation requires signed microsecond integers"))).transpose()
+        };
+        let valid_at = signed("_read_valid_micros")?;
+        let expected = signed("_read_system_micros")?;
+        match valid_at {
+            Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: own_id()?, valid_at, expected }),
+            None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
+            None => (),
+        }
+        let endpoint = |name| -> Result<Option<Timestamp>, Status> {
+            optional(name)?.map(|cell| cell.zoned_micros()
+                .ok_or_else(|| invalid("Owned mutation validity bounds must be zoned microsecond timestamps"))).transpose()
+        };
+        let valid_from = endpoint("_valid_from")?;
+        let valid_to = endpoint("_valid_to")?;
+        let has_payload = || -> Result<bool, Status> {
+            for &position in &positions {
+                let field = source.schema_ref().field(position);
+                let value = ArrowCell { field, array: source.column(position).as_ref(), row };
+                if field.name() != "_id" && !value.is_null().map_err(status)? { return Ok(true); }
+            }
+            Ok(false)
+        };
+        let from_offset = signed("_valid_from_offset_micros")?;
+        let to_offset = signed("_valid_to_offset_micros")?;
+        if from_offset.is_some() || to_offset.is_some() {
+            if matches!(effects, CommitEffects::Replay) {
+                return Err(invalid("Invalid relative Root period"));
+            }
+            let period = OwnedRelativePeriod::from_fields(valid_from, valid_to, from_offset, to_offset)
+                .ok_or_else(|| invalid("A relative Root period needs one coordinate for each finite bound"))?;
+            let effect = match operation {
+                "create" | "replace" => {
+                    let Some(documents) = self.owned_payload(batch, row, &positions)? else { return Ok(false); };
+                    rtdb_tx::OwnedPeriodEffect::Arrow { documents, create_only: operation == "create" }
+                }
+                "delete" if !has_payload()? => rtdb_tx::OwnedPeriodEffect::Delete(own_id()?),
+                _ => return Err(invalid("A relative Root period requires a fact write")),
+            };
+            writes.push(TxOp::OwnedRelativePeriod {
+                relation: relation.clone(), effect, period,
+            });
+            return Ok(true);
+        }
+        let operation = match operation {
+            "check" => {
+                if valid_at.is_none() || valid_from.is_some() || valid_to.is_some() || has_payload()? {
+                    return Err(invalid("Owned check requires one observation and no mutation fields"));
+                }
+                return Ok(true);
+            }
+            "create" | "replace" => {
+                let Some(documents) = self.owned_payload(batch, row, &positions)? else { return Ok(false); };
+                TxOp::OwnedArrowDocs { relation: relation.clone(), documents, create_only: operation == "create", valid_from, valid_to }
+            }
+            "delete" => {
+                if has_payload()? { return Err(invalid("Owned delete carries document values")); }
+                TxOp::OwnedDelete { relation: relation.clone(), id: own_id()?, valid_from, valid_to }
+            }
+            "erase" if matches!(effects, CommitEffects::Replay) => {
+                if valid_from.is_some() || valid_to.is_some() || has_payload()? {
+                    return Err(invalid("Owned erase requires only a typed identity and optional observation"));
+                }
+                TxOp::OwnedErase { relation: relation.clone(), id: own_id()? }
+            }
+            "declare-capacity" if matches!(effects, CommitEffects::HostedRoot) => return Ok(false),
+            _ => return Err(invalid("Unknown owned commit operation")),
+        };
+        writes.push(operation);
+        Ok(true)
     }
 
     fn append_owned_commit_group(
@@ -1282,7 +1495,7 @@ impl Service {
         }
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
-            witnesses: Mutex::default(), _permit: permit, _reservation: reservation,
+            witnesses: Mutex::default(), spatial_filters: Mutex::default(), _permit: permit, _reservation: reservation,
         });
         let handle = Bytes::copy_from_slice(handle.as_bytes());
         if call.session.audience_source().is_some() {
@@ -2050,78 +2263,121 @@ impl Service {
         let held = self.owned_read(call, &handle)?;
         let (relation, request) = split_relation(request)?;
         let (path, request) = split_relation(request)?;
-        let batch = decode_spatial_batch(call, body.slice_ref(request))?;
-        let selected_documents = matches!(wire, SpatialHeldWire::V3);
+        let batch = decode_retained_batch(call, body.slice_ref(request))?;
+        let selected_documents = matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open);
         let expected_columns = if selected_documents { 10 } else { 9 };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_columns {
             return Err(invalid("Owned held spatial read requires one request row"));
         }
-        let batch = batch.batch();
+        let input = batch.batch();
         let document_columns;
         let projection = match wire {
             SpatialHeldWire::V1 => rtdb_spatial::Projection::Identities,
             SpatialHeldWire::V2 => rtdb_spatial::Projection::Documents,
-            SpatialHeldWire::V3 => {
-                let layout = batch.schema_ref().field_with_name("document_columns").map(Field::data_type);
-                if !matches!(layout, Ok(DataType::List(item)) if item.data_type() == &DataType::Utf8
-                    && !item.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)) {
-                    return Err(invalid("Spatial document_columns must be a List<Utf8>"));
-                }
-                let columns = ArrowCell::named(batch, "document_columns", 0).and_then(ArrowCell::list)
-                    .ok_or_else(|| invalid("Spatial document_columns must be a List<Utf8>"))?;
-                if columns.len() > 128 {
-                    return Err(invalid("Spatial document_columns exceeds its column limit"));
-                }
-                let mut names = BTreeSet::new();
-                for column in columns {
-                    let name = column.utf8().ok_or_else(|| invalid("Spatial document columns must be Utf8 values"))?;
-                    if name.is_empty() || name.len() > 128 || name.starts_with('_')
-                        || name.chars().any(char::is_control) || !names.insert(name) {
-                        return Err(invalid("Spatial document columns must be distinct owned field names"));
-                    }
-                }
-                document_columns = names.into_iter().collect::<Vec<_>>();
+            SpatialHeldWire::V3 | SpatialHeldWire::Open => {
+                document_columns = spatial_document_columns(input)?;
                 rtdb_spatial::Projection::SelectedDocuments(&document_columns)
             }
         };
-        let (Some((parts, parts_row)), Some((region, region_row)), Some((predicate, predicate_row)),
+        let (Some((region, region_row)), Some((predicate, predicate_row)),
              Some((valid_at, valid_row)), Some((limit, limit_row)), Some((observe, observe_row)),
              Some((reported_center, center_row))) = (
-            owned_scalar::<ListArray>(batch, "partition")?, owned_scalar::<BinaryArray>(batch, "region")?,
-            owned_scalar::<StringArray>(batch, "predicate")?, owned_scalar::<Int64Array>(batch, "valid_micros")?,
-            owned_scalar::<Int64Array>(batch, "limit")?, owned_scalar::<BooleanArray>(batch, "observe")?,
-            owned_scalar::<BooleanArray>(batch, "reported_center")?,
+            owned_scalar::<BinaryArray>(input, "region")?, owned_scalar::<StringArray>(input, "predicate")?,
+            owned_scalar::<Int64Array>(input, "valid_micros")?, owned_scalar::<Int64Array>(input, "limit")?,
+            owned_scalar::<BooleanArray>(input, "observe")?, owned_scalar::<BooleanArray>(input, "reported_center")?,
         ) else { return Err(invalid("Owned held spatial request has invalid fields")); };
         let region = region.value(region_row);
-        let offsets = parts.value_offsets();
-        let indices = offsets[parts_row] as usize..offsets[parts_row + 1] as usize;
-        if indices.len() > 15 || region.len() > 1 << 20 {
-            return Err(invalid("Owned held spatial request exceeds its byte or partition limit"));
-        }
-        let DataType::List(element) = parts.data_type() else { unreachable!() };
-        let partition = indices.map(|row| {
-            binary_cell(element, parts.values().as_ref(), row).map_err(status)?
-                .filter(|value| value.len() <= 4096).map(std::borrow::Cow::Borrowed)
-                .ok_or_else(|| invalid("Spatial partition values must be bounded Binary values"))
-        }).collect::<Result<Vec<_>, _>>()?;
-        let radius = owned_scalar::<Float64Array>(batch, "radius_m")?.map(|(array, row)| array.value(row));
+        if region.len() > 1 << 20 { return Err(invalid("Owned held spatial region exceeds its byte limit")); }
+        let partition = spatial_partition(input)?;
+        let radius = owned_scalar::<Float64Array>(input, "radius_m")?.map(|(array, row)| array.value(row));
         let predicate = rtdb_spatial::Predicate::parse(predicate.value(predicate_row), radius, reported_center.value(center_row)).map_err(status)?;
-        let after = match batch.schema_ref().column_with_name("after") {
-            Some((index, field)) => selected_cell(field, batch.column(index).as_ref(), 0).map_err(status)?
+        let after = match input.schema_ref().column_with_name("after") {
+            Some((index, field)) => selected_cell(field, input.column(index).as_ref(), 0).map_err(status)?
                 .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose()?,
             None => None,
         };
         let valid_at = Timestamp(valid_at.value(valid_row));
         let limit = usize::try_from(limit.value(limit_row)).map_err(|_| invalid("Invalid spatial limit"))?;
         let observe = observe.value(observe_row);
-        let present = held.snapshot.system_time();
-        let (page, witness) = held.snapshot.spatial_projected(&relation, &path, rtdb_spatial::Request {
+        let prepared = if matches!(wire, SpatialHeldWire::Open) {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+            Some(rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?)
+        } else {
+            None
+        };
+        let (page, witness) = held.snapshot.spatial_page(&relation, &path, rtdb_spatial::Request {
             partition, region: region.into(), predicate, valid_at, after, limit,
-        }, observe, projection).await.map_err(status)?;
+        }, observe, projection, prepared.as_ref()).await.map_err(status)?;
+        let mut retained = None;
+        let mut token = None;
+        if prepared.is_some() && page.more {
+            let guard = held.spatial_filters.lock().map_err(|_| spatial_filters_unavailable())?;
+            if guard.len() >= MAX_SPATIAL_FILTERS { return Err(Status::resource_exhausted("The held read has too many spatial filters")); }
+            let nonce = Uuid::new_v4();
+            if guard.contains_key(&nonce) { return Err(spatial_filters_unavailable()); }
+            retained = Some((guard, call.reserve(1024)?));
+            token = Some(nonce);
+        }
+        let reply = self.spatial_reply(call, &held, &relation, valid_at, page, witness, selected_documents, token)?;
+        if let (Some((mut filters, reservation)), Some(token), Some(region)) = (retained, token, prepared) {
+            filters.insert(token, Arc::new(RetainedSpatialFilter {
+                relation, path, batch, region, valid_at, _reservation: reservation,
+            }));
+        }
+        Ok(reply)
+    }
+
+    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (held, token, body) = self.spatial_capability(call, body)?;
+        let (header, after) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Spatial continuation has no page controls"))?;
+        let limit = usize::from(header[0]);
+        let observe = match header[1] { 0 => false, 1 => true, _ => return Err(invalid("Invalid spatial continuation observation flag")) };
+        let after = EntityIdRef::from_handle_bytes(after).map_err(status)?;
+        let filter = held.spatial_filters.lock().map_err(|_| spatial_filters_unavailable())?
+            .get(&token).cloned().ok_or_else(|| Status::not_found("Unknown held spatial filter"))?;
+        let columns = spatial_document_columns(filter.batch.batch())?;
+        let request = rtdb_spatial::Request {
+            partition: spatial_partition(filter.batch.batch())?,
+            region: Default::default(), predicate: rtdb_spatial::Predicate::All,
+            valid_at: filter.valid_at, after: Some(after), limit,
+        };
+        let (page, witness) = held.snapshot.spatial_page(
+            &filter.relation, &filter.path, request, observe,
+            rtdb_spatial::Projection::SelectedDocuments(&columns), Some(&filter.region),
+        ).await.map_err(status)?;
+        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, page, witness, true, Some(token))
+    }
+
+    pub(crate) fn close_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (held, token, tail) = self.spatial_capability(call, body)?;
+        if !tail.is_empty() { return Err(invalid("Spatial filter close has trailing bytes")); }
+        held.spatial_filters.lock().map_err(|_| spatial_filters_unavailable())?.remove(&token);
+        Ok(())
+    }
+
+    fn spatial_capability<'a>(&self, call: &Call, body: &'a [u8]) -> Result<(Arc<OwnedReadResource>, Uuid, &'a [u8]), Status> {
+        let (header, tail) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Spatial continuation has no held filter capability"))?;
+        let (handle, token) = header.split_at(16);
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        held.snapshot.check().map_err(status)?;
+        let token = Uuid::from_slice(token).map_err(|_| invalid("Invalid held spatial filter capability"))?;
+        Ok((held, token, tail))
+    }
+
+    fn spatial_reply(
+        &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
+        page: rtdb_spatial::Page, witness: Option<OwnedRangeWitness>, selected_documents: bool, token: Option<Uuid>,
+    ) -> Result<ActionResult, Status> {
+        let present = held.snapshot.system_time();
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("rtdb.owned.spatial_more".into(), if page.more { "1" } else { "0" }.into());
+        if let Some(token) = token.filter(|_| page.more) {
+            metadata.insert(SPATIAL_FILTER_TOKEN.into(), token.simple().to_string());
+        }
         if let Some(witness) = witness {
-            let nonce = held.remember(call, &relation, witness)?;
+            let nonce = held.remember(call, relation, witness)?;
             metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
         }
         let documents = page.documents();
@@ -2139,28 +2395,26 @@ impl Service {
         }
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         let mut charge = None;
-        let output = if page.hits.is_empty() {
-            None
-        } else {
-            let ids = if let Some(documents) = documents {
-                let batch = documents.batch();
-                let (source, target) = (batch.schema_ref().field(0), schema.field(0));
-                let array = batch.column(0);
-                charge = Some(call.reserve(rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, target).map_err(status)?)?);
-                rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target).ok()
-                    .map(|(_, array)| array).filter(|array| array.data_type() == target.data_type())
-            } else { None };
-            let ids = if let Some(ids) = ids { ids } else {
-                let ids = || page.hits.iter().map(|hit| EntityIdRef::from(&hit.id));
-                let bound = ids().try_fold(4096, |bytes, id| {
-                    let text_bytes = match id {
-                        EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(),
-                        _ => 0,
-                    };
-                    wire::add(bytes, wire::add(128, wire::mul(text_bytes, 4)?)?)
-                })?;
-                charge = Some(call.reserve(bound)?);
-                entity_id_array(ids()).map_err(status)?
+        let output = if let Some(rows) = page.rows() {
+            let batch = rows.batch();
+            let (source, target) = (batch.schema_ref().field(0), schema.field(0));
+            let array = batch.column(0);
+            let bound = rtdb_columnar::arrow_relayout_bound(array.as_ref(), source, target).map_err(status)?;
+            charge = Some(call.reserve(wire::add(bound, 4096)?)?);
+            let ids = match rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target) {
+                Ok((_, ids)) if ids.data_type() == target.data_type() => ids,
+                _ => {
+                    let ids = (0..array.len()).map(|row| read_entity_id(source, array.as_ref(), row)).collect::<rtdb_types::Result<Vec<_>>>().map_err(status)?;
+                    let bound = ids.iter().try_fold(4096, |bytes, id| {
+                        let text = match id {
+                            EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(),
+                            _ => 0,
+                        };
+                        wire::add(bytes, wire::add(128, wire::mul(text, 4)?)?)
+                    })?;
+                    charge = Some(call.reserve(bound)?);
+                    entity_id_array(ids).map_err(status)?
+                }
             };
             let distances = Arc::new(Float64Array::from_iter(page.hits.iter().map(|hit| hit.distance_m)));
             let mut columns = vec![ids, distances];
@@ -2168,10 +2422,10 @@ impl Service {
                 columns.push(Arc::new(document));
             }
             Some(RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?)
-        };
+        } else { None };
         let reply = self.owned_point_reply(&schema, output.as_ref(), present, valid_at, None)?;
         drop(charge);
-        held.snapshot.check_relations([&relation]).map_err(status)?;
+        held.snapshot.check_relations([relation]).map_err(status)?;
         Ok(reply)
     }
 
@@ -3108,7 +3362,8 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, charge) })
     }
 
-    pub(crate) async fn publish_world_cut_action(&self, call: &Call, body: &[u8], publish_root: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn publish_world_cut_action(&self, call: &Call, envelope: &Bytes, publish_root: bool) -> Result<ActionResult, Status> {
+        let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World fork has no held root handle"))?;
@@ -3212,7 +3467,7 @@ impl Service {
             let mut operations = Vec::new();
             let mut fact_rows_left = rows_left;
             root_batches = Some(self.decode_owned_commit_groups(
-                call, owned_groups(facts, false, true)?, &mut operations, &mut fact_rows_left, CommitEffects::Facts,
+                call, envelope, owned_groups(facts, false, true)?, &mut operations, &mut fact_rows_left, CommitEffects::Facts,
             )?);
             rows_left = rows_left.checked_sub(operations.len() + witnesses.len())
                 .ok_or_else(|| invalid("Fork exceeds its effect limit"))?;
@@ -3228,17 +3483,15 @@ impl Service {
                     TxOp::OwnedCheck { relation, .. } if relation.is_root_data() =>
                         root.checks.push(operation),
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                    | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } if relation.is_root_data() =>
+                    | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } if relation.is_root_data() =>
                         writes.push(operation),
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
             }
-            if (authored_replacement && !sibling && !proposal_hold && !matches!(writes.as_slice(), [
-                TxOp::OwnedReplaceDocs { documents, valid_from: None, valid_to: None, .. }
-            ] if documents.rows().len() == 1))
-                || ((sibling || (proposal_hold && !proposal_shorten)) && !matches!(writes.as_slice(), [
-                    TxOp::OwnedInsertDocs { documents, valid_from: None, valid_to: None, .. }
-                ] if documents.rows().len() == 1))
+            if (authored_replacement && !sibling && !proposal_hold
+                && !matches!(writes.as_slice(), [write] if write.is_single_unbounded_root_document(false)))
+                || ((sibling || (proposal_hold && !proposal_shorten))
+                    && !matches!(writes.as_slice(), [write] if write.is_single_unbounded_root_document(true)))
                 || (proposal_shorten && !matches!(writes.as_slice(), [
                     TxOp::OwnedDelete { valid_from: None, valid_to: None, .. }
                 ]))
@@ -3309,7 +3562,8 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn commit_world_batch_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_world_batch_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
+        let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
@@ -3460,7 +3714,7 @@ impl Service {
         let _root_framing = call.reserve(ordered_group_count(root)? * 512)?;
         let mut root_ops = Vec::new();
         let _root_groups = self.decode_owned_commit_groups(
-            call, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, CommitEffects::Facts,
+            call, envelope, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, CommitEffects::Facts,
         )?;
         let mut root = rtdb_node::OwnedRootSection::default();
         let mut root_writes = Vec::new();
@@ -3471,7 +3725,7 @@ impl Service {
                 _ if proposal_land && rtdb_tx::is_proposal_landing_frontier(&operation) =>
                     root_writes.push(operation),
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. }
+                | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. }
                     if root_attempt.is_some() && relation.is_root_data() =>
                     root_writes.push(operation),
                 _ => return Err(invalid("Operation is outside the held Root section")),
@@ -3835,6 +4089,37 @@ fn history_row_time(batch: &RecordBatch, name: &str, row: usize) -> Result<Optio
 
 fn history_invalid() -> Status {
     Status::internal("Owned history returned invalid or overlapping slices")
+}
+
+fn optional_bound(cell: ArrowCell<'_>) -> Result<Option<ArrowCell<'_>>, Status> {
+    Ok((!cell.is_null().map_err(status)?).then_some(cell))
+}
+
+fn owned_payload_columns(batch: &RecordBatch, row: usize, controls: &[&str]) -> Result<Vec<usize>, Status> {
+    let absent = ArrowCell::named(batch, "_absent", row).map(optional_bound).transpose()?.flatten();
+    let mut omitted = BTreeSet::new();
+    if let Some(absent) = absent {
+        let fields = absent.list().filter(|fields| fields.len() <= 128)
+            .ok_or_else(|| invalid("Owned _absent must be a list of at most 128 field names"))?;
+        for field in fields {
+            let name = field.utf8().ok_or_else(|| invalid("Owned _absent field must be text"))?;
+            let value = ArrowCell::named(batch, name, row)
+                .ok_or_else(|| invalid("Owned _absent may name only distinct null payload cells"))?;
+            if name.starts_with('_') || !value.is_null().map_err(status)? || !omitted.insert(name) {
+                return Err(invalid("Owned _absent may name only distinct null payload cells"));
+            }
+        }
+    }
+    let mut positions = Vec::new();
+    for (position, field) in batch.schema_ref().fields().iter().enumerate() {
+        let value = ArrowCell { field, array: batch.column(position).as_ref(), row };
+        if field.name() != "_absent" && !controls.contains(&field.name().as_str())
+            && !omitted.contains(field.name().as_str()) && !value.is_undefined().map_err(status)?
+        {
+            positions.push(position);
+        }
+    }
+    Ok(positions)
 }
 
 fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), Status> {

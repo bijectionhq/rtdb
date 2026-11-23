@@ -420,6 +420,44 @@ impl ArrowDocuments {
         OwnedBatch::with_reservation(parameter, reservation)
     }
 
+    pub fn from_owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        let batch = batch.batch();
+        if batch.num_rows() == 0 || !batch.schema_ref().fields().iter().all(|field| Self::compatible(field, false)) {
+            return Ok(None);
+        }
+        if batch.schema_ref().fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>().len() != batch.num_columns() {
+            return Ok(None);
+        }
+        let layout = DecodedDocumentLayout::new(batch.schema_ref().fields(), memory)?;
+        Ok(Some(Self { array: StructArray::from(batch.clone()), layout, source_bytes: None }))
+    }
+
+    pub(crate) fn owned_id(&self, row: usize) -> Result<EntityId> {
+        self.owned_id_ref(row).map(rtdb_columnar::EntityIdRef::into_owned)
+    }
+
+    pub(crate) fn owned_id_ref(&self, row: usize) -> Result<rtdb_columnar::EntityIdRef<'_>> {
+        let (field, column) = self.array.fields().iter().zip(self.array.columns())
+            .find(|(field, _)| field.name() == "_id")
+            .ok_or_else(|| Anomaly::incorrect("rtdb.owned/missing-id", "Owned row has no _id"))?;
+        rtdb_columnar::read_entity_id(field, column.as_ref(), row)
+    }
+
+    pub(crate) fn select_owned_fields(&self, names: &BTreeSet<String>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let (fields, columns): (Vec<_>, Vec<_>) = self.array.fields().iter().zip(self.array.columns())
+            .filter(|(field, _)| names.contains(field.name()))
+            .map(|(field, column)| (Arc::clone(field), Arc::clone(column))).unzip();
+        if fields.len() != names.len() {
+            return Err(Anomaly::incorrect("rtdb.tx/document-presence", "Document presence names an unknown column"));
+        }
+        let fields = Fields::from(fields);
+        let layout = DecodedDocumentLayout::new(&fields, memory)?;
+        let array = StructArray::try_new_with_length(fields, columns, None, self.array.len())
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        Ok(Self { array, layout, source_bytes: self.source_bytes })
+    }
+
+    pub fn row_count(&self) -> usize { self.array.len() }
     pub(crate) fn array(&self) -> &StructArray { &self.array }
     pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
     pub(crate) fn column_type(&self, name: &str) -> Option<&LogicalType> { self.layout.types.get(name) }
@@ -1232,6 +1270,7 @@ impl OwnedRelativePeriod {
 pub enum OwnedPeriodEffect {
     Create(Documents),
     Replace(Documents),
+    Arrow { documents: ArrowDocuments, create_only: bool },
     Delete(EntityId),
 }
 
@@ -1274,6 +1313,7 @@ pub enum TxOp {
         expiry: Timestamp, scope: rtdb_types::PlacedAttemptScope,
     },
     OwnedDelete { relation: rtdb_types::OwnedRelation, id: EntityId, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    OwnedArrowDocs { relation: rtdb_types::OwnedRelation, documents: ArrowDocuments, create_only: bool, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedReplaceDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedInsertDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     /// Resolve the finite bounds at this Root transaction's ordered reading.
@@ -1294,8 +1334,20 @@ impl TxOp {
         Self::OwnedDeadline { until, recheck_at_staging: false, journal_before: None }
     }
 
+    pub fn is_single_unbounded_root_document(&self, create_only: bool) -> bool {
+        match self {
+            Self::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None } =>
+                create_only && relation.is_root_data() && documents.rows().len() == 1,
+            Self::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None } =>
+                !create_only && relation.is_root_data() && documents.rows().len() == 1,
+            Self::OwnedArrowDocs { relation, documents, valid_from: None, valid_to: None, create_only: create } =>
+                *create == create_only && relation.is_root_data() && documents.row_count() == 1,
+            _ => false,
+        }
+    }
+
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
+        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
     }
 }
 

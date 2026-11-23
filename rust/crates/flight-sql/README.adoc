@@ -464,6 +464,14 @@ The list may be empty and may contain up to 128 distinct owned field names.
 The struct contains `_system_from` and the requested fields available in the held relation schema.
 The top-level `_id` identifies both the hit and its document.
 
+`rtdb.owned.SpatialOpen.v1` accepts the v3 request and returns the same Arrow projection.
+A page with more matches includes a hex-encoded 16-byte filter capability in the `rtdb.owned.spatial_filter` schema metadata.
+`rtdb.owned.SpatialNext.v1` takes the 16-byte held read handle, the 16-byte filter capability, a one-byte page limit from 1 through 128, a one-byte observation flag, and the exclusive complete typed identity.
+The identity starts with tag 0 for UTF-8 text, 1 for UTF-8 keyword, 2 for a big-endian signed 64-bit integer with its sign bit flipped, or 3 for a 16-byte UUID.
+A continuation uses the original filter, valid instant, and held cut and can be retried with the same body.
+`rtdb.owned.SpatialClose.v1` takes the held read handle and filter capability, returning no result.
+A held read retains up to 32 filters and releases them when it closes.
+
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name and `column: Utf8` for the canonical Binary key column.
 Declare up to 16 immutable named unique paths per owned relation before writing relation data. An exact retry of the declaration keeps its original definition. An existing empty typed relation must declare the key as Binary.

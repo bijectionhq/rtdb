@@ -2146,11 +2146,25 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
     ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.spatial_page(relation, path, request, observe, projection, None).await
+    }
+
+    pub async fn spatial_page(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
+        prepared: Option<&rtdb_spatial::PreparedRegion>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
         let lease = context.catalog.read_lease();
-        let work = rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection);
-        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let work = async {
+            if let Some(prepared) = prepared {
+                rtdb_spatial::read_prepared(Arc::clone(&context), &self.owner, relation, path, prepared, request, projection).await
+            } else {
+                rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection).await
+            }
+        };
+        let page = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))
@@ -2854,7 +2868,7 @@ impl NativeSession {
             || fork.root.as_ref().and_then(|section| section.publication.as_ref()).is_some_and(|root| {
                 root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                    | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                    | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                     _ => true,
                 })
             })
@@ -2958,7 +2972,7 @@ impl NativeSession {
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                 _ => true,
             }) {
                 return Err(unavailable());

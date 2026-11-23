@@ -41,39 +41,39 @@ pub struct Hit {
 
 struct SelectedHit {
     hit: Hit,
-    document: Option<(Arc<OwnedBatch>, usize)>,
+    source: Arc<OwnedBatch>,
+    row: usize,
 }
 
 pub struct Page {
     pub hits: Vec<Hit>,
     pub more: bool,
-    documents: Option<OwnedBatch>,
+    rows: Option<OwnedBatch>,
+    includes_documents: bool,
     _reservation: Arc<MemoryReservation>,
 }
 
 impl Page {
     pub fn documents(&self) -> Option<&OwnedBatch> {
-        self.documents.as_ref()
+        self.rows.as_ref().filter(|_| self.includes_documents)
+    }
+
+    pub fn rows(&self) -> Option<&OwnedBatch> {
+        self.rows.as_ref()
     }
 }
 
-fn gather_documents(
+fn gather_selected(
     hits: &[SelectedHit],
     projection: Projection<'_>,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<OwnedBatch>> {
-    let Some((first, _)) = hits.first().and_then(|hit| hit.document.as_ref()) else {
-        return Ok(None);
-    };
-    let schema = first.batch().schema_ref();
+    let Some(first) = hits.first() else { return Ok(None); };
+    let schema = first.source.batch().schema_ref();
     let mut sources: Vec<&OwnedBatch> = Vec::new();
     let mut positions = Vec::with_capacity(hits.len());
     for hit in hits {
-        let (source, row) = hit
-            .document
-            .as_ref()
-            .expect("one spatial projection per read");
-        let source = source.as_ref();
+        let source = hit.source.as_ref();
         if source.batch().schema_ref() != schema {
             return Err(Anomaly::fault(
                 "rtdb.spatial/projection",
@@ -88,13 +88,13 @@ fn gather_documents(
                 sources.push(source);
                 index
             });
-        positions.push((index, *row));
+        positions.push((index, hit.row));
     }
     let indices: Vec<_> = schema
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(index, field)| projection.includes(field.name()).then_some(index))
+        .filter_map(|(index, field)| (index == 0 || projection.includes(field.name())).then_some(index))
         .collect();
     let mut output = BatchBuilder::new(4096 + hits.len() * 64 + indices.len() * 128, memory)?;
     let columns = indices
@@ -136,8 +136,68 @@ pub async fn read_held(
     request: Request<'_>,
     projection: Projection<'_>,
 ) -> Result<Page> {
+    let region = PreparedRegion::new(&request.region, request.predicate, &context.memory)?;
+    read_prepared(context, owner, relation, path, &region, request, projection).await
+}
+
+pub struct PreparedRegion {
+    predicate: Predicate,
+    location: Option<Location>,
+    ranges: Vec<KeyRange>,
+    steps: usize,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PreparedRegion {
+    pub fn new(region_bytes: &[u8], predicate: Predicate, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut reservation = memory.reserve(kernel::WORK_BYTES)?;
+        let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
+        let region = if matches!(predicate, Predicate::All) {
+            if !region_bytes.is_empty() {
+                return Err(kernel::invalid(
+                    "An unrestricted spatial read takes no region",
+                ));
+            }
+            None
+        } else {
+            let region = Location::decode(region_bytes, &mut work)?;
+            predicate.validate_region(&region)?;
+            Some(region)
+        };
+        let ranges = match &region {
+            Some(region) => work.scoped(|work| predicate.cover(region, work))?,
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            vec![KeyRange {
+                start: i64::MIN,
+                end: i64::MAX,
+            }]
+        });
+        let bytes = region.as_ref().map_or(0, Location::retained_bytes)
+            .checked_add(ranges.capacity() * std::mem::size_of::<KeyRange>())
+            .and_then(|bytes| bytes.checked_add(512)).ok_or_else(postings::work_limit)?;
+        let lease = Arc::get_mut(&mut reservation).expect("geometry construction owns the reservation");
+        if bytes > lease.bytes() {
+            lease.grow_to(bytes)?;
+        } else {
+            lease.shrink_to(bytes)?;
+        }
+        Ok(Self { predicate, location: region, ranges, steps: work.usage().steps, _reservation: reservation })
+    }
+}
+
+pub async fn read_prepared(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    path: &OwnedRelation,
+    region: &PreparedRegion,
+    request: Request<'_>,
+    projection: Projection<'_>,
+) -> Result<Page> {
     if !(1..=128).contains(&request.limit)
-        || (matches!(request.predicate, Predicate::Nearest { .. }) && request.after.is_some())
+        || (matches!(region.predicate, Predicate::Nearest { .. }) && request.after.is_some())
     {
         return Err(kernel::invalid(
             "Invalid spatial page size or nearest continuation",
@@ -155,28 +215,7 @@ pub async fn read_held(
     }
     let _geometry_memory = context.memory.reserve(kernel::WORK_BYTES)?;
     let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
-    let region = if matches!(request.predicate, Predicate::All) {
-        if !request.region.is_empty() {
-            return Err(kernel::invalid(
-                "An unrestricted spatial read takes no region",
-            ));
-        }
-        None
-    } else {
-        let region = Location::decode(&request.region, &mut work)?;
-        request.predicate.validate_region(&region)?;
-        Some(region)
-    };
-    let ranges = match &region {
-        Some(region) => work.scoped(|work| request.predicate.cover(region, work))?,
-        None => None,
-    }
-    .unwrap_or_else(|| {
-        vec![KeyRange {
-            start: i64::MIN,
-            end: i64::MAX,
-        }]
-    });
+    work.charge(region.steps).map_err(kernel::geometry_error)?;
     let partition = (request.partition.len() == definition.partition.len())
         .then(|| Partition::of(request.partition.iter().map(|part| part.as_ref())));
     let mut candidates = Candidates {
@@ -220,7 +259,7 @@ pub async fn read_held(
                         bytes,
                         digest,
                         partition,
-                        &ranges,
+                        &region.ranges,
                         &context.memory,
                         || context.check_cancelled(),
                         |iid| candidates.insert(iid),
@@ -258,7 +297,7 @@ pub async fn read_held(
             candidates.extend_live(batch.view(), &context)?;
         }
     }
-    let geometry = (region.is_some() || matches!(projection, Projection::Documents))
+    let geometry = (region.location.is_some() || matches!(projection, Projection::Documents))
         .then_some(definition.geometry.as_str());
     let cursor = rtdb_query::open_owned_spatial_scan(
         Arc::clone(&context),
@@ -275,7 +314,8 @@ pub async fn read_held(
         return Ok(Page {
             hits: Vec::new(),
             more: false,
-            documents: None,
+            rows: None,
+            includes_documents: projection.has_documents(),
             _reservation: reservation,
         });
     };
@@ -302,7 +342,7 @@ pub async fn read_held(
             if request.after.is_some_and(|after| id <= after) {
                 continue;
             }
-            let exact = if let Some(region) = &region {
+            let exact = if let Some(location_filter) = &region.location {
                 let Some(bytes) =
                     binary_cell(batch.schema_ref().field(1), batch.column(1).as_ref(), row)?
                 else {
@@ -310,7 +350,7 @@ pub async fn read_held(
                 };
                 work.scoped(|work| {
                     let location = Location::decode(bytes, work)?;
-                    request.predicate.evaluate(&location, region, work)
+                    region.predicate.evaluate(&location, location_filter, work)
                 })?
             } else {
                 Some(None)
@@ -323,36 +363,30 @@ pub async fn read_held(
                         selected.pop();
                         more = true;
                     }
-                    let text_bytes = match id {
-                        EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(),
-                        _ => 0,
-                    };
-                    let reservation = context.memory.reserve(text_bytes.saturating_add(128))?;
-                    let document = projection
-                        .has_documents()
-                        .then(|| (Arc::clone(&source), row));
+                    let reservation = context.memory.reserve(id.owned_payload_bytes().saturating_add(128))?;
                     let hit = Hit {
                         id: id.into_owned(),
                         distance_m,
                         _reservation: reservation,
                     };
-                    selected.insert(index, SelectedHit { hit, document });
+                    selected.insert(index, SelectedHit { hit, source: Arc::clone(&source), row });
                 } else {
                     more = true;
                 }
             }
         }
     }
-    if matches!(request.predicate, Predicate::Nearest { .. }) {
+    if matches!(region.predicate, Predicate::Nearest { .. }) {
         more = false;
     }
     context.check_cancelled()?;
-    let documents = gather_documents(&selected, projection, &context.memory)?;
+    let rows = gather_selected(&selected, projection, &context.memory)?;
     let hits = selected.into_iter().map(|selected| selected.hit).collect();
     Ok(Page {
         hits,
         more,
-        documents,
+        rows,
+        includes_documents: projection.has_documents(),
         _reservation: reservation,
     })
 }

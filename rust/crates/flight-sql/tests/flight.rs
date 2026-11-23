@@ -949,6 +949,17 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
     let reply = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
     let hold = &reply[0].body[..16];
     let valid = i64::from_be_bytes(reply[0].body[16..24].try_into().unwrap());
+    let mut replace = relation.clone();
+    replace.extend_from_slice(&i64::MAX.to_be_bytes());
+    ipc(&mut replace, [
+        ("_id", Arc::new(StringArray::from(vec!["b"])) as ArrayRef),
+        ("_op", Arc::new(StringArray::from(vec!["replace"]))),
+        ("location", Arc::new(BinaryArray::from_iter_values([point(9.0)]))),
+        ("borough", Arc::new(BinaryArray::from_iter_values([b"montrouge"]))),
+        ("never_written", Arc::new(BinaryArray::from(vec![None::<&[u8]>]))),
+        ("_absent", select(&["never_written"])),
+    ]);
+    client.action("rtdb.owned.Commit.v1", replace.into()).await.unwrap();
     frame(&mut relation, path);
     client.action("rtdb.owned.DropSpatialPath.v1", relation.into()).await.unwrap();
 
@@ -1009,6 +1020,48 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
         assert_eq!(document.column_by_name(geometry).is_some(), expected);
     }
 
+    let mut region = vec![0, 1];
+    region.extend_from_slice(&3u32.to_le_bytes());
+    region.extend_from_slice(&1u32.to_le_bytes());
+    region.extend_from_slice(&5u32.to_le_bytes());
+    for (longitude, latitude) in [(0.0f64, -1.0f64), (3.0, -1.0), (3.0, 1.0), (0.0, 1.0), (0.0, -1.0)] {
+        region.extend_from_slice(&longitude.to_le_bytes());
+        region.extend_from_slice(&latitude.to_le_bytes());
+    }
+    let request = query(hold, path, valid, None, &region, "intersects", Some(select(&["borough"])));
+    let first = client.action("rtdb.owned.SpatialOpen.v1", request).await.unwrap();
+    let mut first = StreamReader::try_new(first[0].body.as_ref(), None).unwrap();
+    let first_schema = first.schema();
+    let token = uuid::Uuid::parse_str(&first_schema.metadata()["rtdb.owned.spatial_filter"]).unwrap();
+    assert_eq!(first_schema.metadata()["rtdb.owned.spatial_more"], "1");
+    let first = first.next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(first.schema_ref().field(0), first.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("a"));
+
+    let other = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let mut capability = hold.to_vec();
+    capability.extend_from_slice(token.as_bytes());
+    let mut next = capability.clone();
+    next.extend_from_slice(&[1, 0, 0, b'a']);
+    let mut foreign = next.clone();
+    foreign[..16].copy_from_slice(&other[0].body[..16]);
+    assert_eq!(client.action("rtdb.owned.SpatialNext.v1", foreign.into()).await.unwrap_err().code(), tonic::Code::NotFound);
+    client.action("rtdb.owned.CloseRead.v1", other[0].body.slice(..16)).await.unwrap();
+
+    for _ in 0..2 {
+        let resumed = client.action("rtdb.owned.SpatialNext.v1", Bytes::copy_from_slice(&next)).await.unwrap();
+        let mut resumed = StreamReader::try_new(resumed[0].body.as_ref(), None).unwrap();
+        let schema = resumed.schema();
+        assert_eq!(schema.metadata()["rtdb.owned.present_micros"], valid.to_string());
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
+        assert!(!schema.metadata().contains_key("rtdb.owned.spatial_filter"));
+        let resumed = resumed.next().unwrap().unwrap();
+        assert_eq!(rtdb_columnar::read_entity_id(resumed.schema_ref().field(0), resumed.column(0).as_ref(), 0).unwrap(),
+            rtdb_columnar::EntityIdRef::String("b"));
+    }
+    client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
+    assert_eq!(client.action("rtdb.owned.SpatialNext.v1", next.into()).await.unwrap_err().code(), tonic::Code::NotFound);
+
     let mut wrong_type = ListBuilder::new(Int64Builder::new());
     wrong_type.append(true);
     for columns in [select(&["borough", "borough"]), Arc::new(wrong_type.finish())] {
@@ -1016,6 +1069,46 @@ async fn owned_spatial_flight_pages_share_the_original_cut() {
         assert_eq!(client.action(projected, request).await.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
     client.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(hold)).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn owned_arrow_writes_refuse_a_decimal_coefficient_outside_declared_precision() {
+    use arrow_array::{ArrayRef, BinaryArray, Decimal128Array};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let relation = b"\0\x06places";
+    let mut schema = relation.to_vec();
+    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"score","type":{"kind":"decimal","precision":2,"scale":0,"bitWidth":128},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
+
+    let request = |coefficient, commit| {
+        let mut columns = vec![
+            ("_id", Arc::new(StringArray::from(vec!["place"])) as ArrayRef),
+            ("location", Arc::new(BinaryArray::from_iter_values([b"wkb"]))),
+            ("score", Arc::new(Decimal128Array::from(vec![coefficient]).with_precision_and_scale(2, 0).unwrap())),
+        ];
+        let mut body = relation.to_vec();
+        if commit {
+            body.extend_from_slice(&i64::MAX.to_be_bytes());
+            columns.push(("_op", Arc::new(StringArray::from(vec!["replace"]))));
+        }
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+        Bytes::from(body)
+    };
+    let refused = client.action("rtdb.owned.Create.v1", request(100, false)).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "Decimal coefficient exceeds its declared precision");
+
+    client.action("rtdb.owned.Create.v1", request(99, false)).await.unwrap();
+
+    let refused = client.action("rtdb.owned.Commit.v1", request(-100, true)).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "Decimal coefficient exceeds its declared precision");
     running.stop().await;
 }
 

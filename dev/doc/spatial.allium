@@ -29,6 +29,10 @@ entity SpatialPostings {
 -- A partition's digest is a candidate key, and the exact read also compares the partition bytes on the resolved row.
 -- The exact comparison uses the partition values borrowed from the held read request.
 -- A held read uses the path definition, source inventory, and live segments selected by the same snapshot.
+-- A prepared filter belongs to its authenticated held read and retains its Arrow partition and parsed region.
+-- A continuation sends the filter capability, complete typed identity, bound, and observation flag.
+-- Repeating a continuation evaluates the same filter and held cut.
+-- Closing a filter or its held read releases the retained filter.
 -- A missing or invalid posting file is covered by reading candidate IIDs through the native Arrow page reader within the read budget.
 -- The live tail contributes candidate IIDs from its held event batches.
 -- One read budget covers all candidate sources and all refined rows.
@@ -39,7 +43,7 @@ entity SpatialPostings {
 -- A range page advances in complete typed identity order at the original hold.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
 -- A document projection includes the resolved document and its system revision in hit order at the original hold.
--- Selection retains the winning row positions until it gathers the final document projection.
+-- Selection retains the winning row positions until it gathers the final identities and requested document projection.
 -- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
 -- An observed read with an admitted placed witness scope, including an empty page, binds the relation frontier for ordered validation.
 -- Erasure orders against the held admission, and its newly compacted source carries no erased posting.

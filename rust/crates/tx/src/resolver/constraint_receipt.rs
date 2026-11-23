@@ -164,8 +164,10 @@ fn write_relation(op: &Operation) -> Option<&rtdb_types::OwnedRelation> {
         Operation::Public(
             TxOp::OwnedInsertDocs { relation, .. }
             | TxOp::OwnedReplaceDocs { relation, .. }
+            | TxOp::OwnedArrowDocs { relation, .. }
             | TxOp::OwnedDelete { relation, .. },
         )
+        | Operation::OwnedArrowIids { relation, .. }
         | Operation::OwnedWriteIids { relation, .. } => Some(relation),
         _ => None,
     }
@@ -255,8 +257,10 @@ fn primary_op(op: &Operation) -> bool {
             | TxOp::OwnedCheckCapacity { relation, .. }
             | TxOp::OwnedInsertDocs { relation, .. }
             | TxOp::OwnedReplaceDocs { relation, .. }
+            | TxOp::OwnedArrowDocs { relation, .. }
             | TxOp::OwnedDelete { relation, .. },
         )
+        | Operation::OwnedArrowIids { relation, .. }
         | Operation::OwnedWriteIids { relation, .. } => {
             relation.is_root_data() || matches!(relation.name(), ATTEMPTS | PUBLICATIONS)
         }

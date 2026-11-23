@@ -42,9 +42,10 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedDeclareCapacity { .. }
                         | TxOp::OwnedInsertDocs { .. }
                         | TxOp::OwnedReplaceDocs { .. }
+                        | TxOp::OwnedArrowDocs { .. }
                         | TxOp::OwnedDelete { .. }
                         | TxOp::HostedControl(_)
-                ) | Operation::OwnedWriteIids { .. }
+                ) | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
             ) || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedErase { .. })))
         };
         if !operations
@@ -96,8 +97,8 @@ impl OpenTransaction<'_> {
                             | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::HostedControl(_)
                     )) && !(publishing_world && matches!(operation,
                         Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }
-                            | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedDelete { .. })
-                            | Operation::OwnedWriteIids { .. }
+                            | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedArrowDocs { .. } | TxOp::OwnedDelete { .. })
+                            | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
                     )) {
                         return Err(unavailable());
                     }
@@ -107,15 +108,8 @@ impl OpenTransaction<'_> {
                     return Err(unavailable());
                 }
             }
-            has_native_effect |= match operation {
-                Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedDeclareCapacity { .. }) => true,
-                Operation::Public(
-                    TxOp::OwnedInsertDocs { documents, .. }
-                    | TxOp::OwnedReplaceDocs { documents, .. },
-                )
-                | Operation::OwnedWriteIids { documents, .. } => !documents.rows().is_empty(),
-                _ => false,
-            };
+            has_native_effect |= matches!(operation, Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedDeclareCapacity { .. }))
+                || operation.owned_documents().is_some_and(|(_, rows)| rows > 0);
         }
         let fork_with_controls = operations.iter().any(|operation| matches!(
             operation, Operation::Public(TxOp::OwnedForkWorld { root: crate::OwnedForkRoot::Controls | crate::OwnedForkRoot::ProposalControls, .. })

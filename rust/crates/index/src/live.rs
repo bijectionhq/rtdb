@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
-use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch};
+use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch, keyed_put_batch};
 use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, Value};
 
@@ -802,7 +802,25 @@ impl TransactionBuffer {
         if event.commit_position != 0 {
             return Err(invalid("The transaction buffer assigns owned commit positions"));
         }
-        let position = if table.is_owned_event_data() {
+        let position = self.next_owned_position(table)?;
+        if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().try_for_each(Value::admit_object_dates)?; }
+        let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
+        let bytes = document_bytes.checked_add(event.entity_key.as_ref().map_or(0, |key| key.len()))
+            .and_then(|bytes| bytes.checked_add(4096)).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
+            .ok_or_else(|| invalid("Transaction event size overflow"))?;
+        let reservation = self.budget.reserve(bytes)?;
+        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
+        if let Some(position) = position {
+            event.commit_position = position;
+            self.consume_owned_position(position);
+        }
+        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
+        pending.events.push(event);
+        pending.reservations.push(reservation);
+        Ok(())
+    }
+    fn next_owned_position(&self, table: &TableRef) -> Result<Option<u32>> {
+        Ok(if table.is_owned_event_data() {
             match &self.owned_positions {
                 Some(OwnedCommitPositions::Landing(previous)) => {
                     Some(previous.checked_add(1).ok_or_else(|| invalid("Owned commit position overflow"))?)
@@ -814,31 +832,42 @@ impl TransactionBuffer {
             }
         } else {
             None
-        };
-        if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().try_for_each(Value::admit_object_dates)?; }
-        let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
-        let bytes = document_bytes.checked_add(event.entity_key.as_ref().map_or(0, |key| key.len()))
-            .and_then(|bytes| bytes.checked_add(4096)).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))
-            .ok_or_else(|| invalid("Transaction event size overflow"))?;
-        let reservation = self.budget.reserve(bytes)?;
-        if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
-        let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
-        if let Some(position) = position {
-            event.commit_position = position;
-            match &mut self.owned_positions {
-                Some(OwnedCommitPositions::Landing(previous)) => *previous = position,
-                Some(OwnedCommitPositions::Archive(remaining)) => { let _ = remaining.next(); },
-                None => return Err(invalid("The owned transaction lost its assertion order")),
-            }
+        })
+    }
+
+    fn consume_owned_position(&mut self, position: u32) {
+        match &mut self.owned_positions {
+            Some(OwnedCommitPositions::Landing(previous)) => *previous = position,
+            Some(OwnedCommitPositions::Archive(remaining)) => { let _ = remaining.next(); },
+            None => unreachable!("only an ordered transaction has an owned position"),
         }
-        pending.events.push(event);
-        pending.reservations.push(reservation);
+    }
+
+    pub fn append_owned_put(
+        &mut self, table: &TableRef, content: arrow_array::ArrayRef, mut header: EventHeader,
+        key: &[u8], source_bytes: Option<usize>,
+    ) -> Result<()> {
+        if !table.is_owned_event_data() || header.commit_position != 0 {
+            return Err(invalid("An owned Arrow put requires a governed table and an unassigned position"));
+        }
+        let position = self.next_owned_position(table)?;
+        if let Some(position) = position { header.commit_position = position; }
+        let _key = self.budget.reserve(key.len().checked_add(4096).ok_or_else(|| invalid("Owned key is too large"))?)?;
+        let keys = arrow_array::BinaryArray::from_iter_values([key]);
+        let batch = keyed_put_batch(content, &[header], keys, source_bytes, &self.budget)?;
+        self.append_batch_inner(table, batch)?;
+        if let Some(position) = position { self.consume_owned_position(position); }
         Ok(())
     }
+
     pub fn append_batch(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
         if self.retains_owned_positions() && table.is_owned_event_data() {
             return Err(invalid("An ordered landing stages governed events in assertion order"));
         }
+        self.append_batch_inner(table, batch)
+    }
+
+    fn append_batch_inner(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
         let batch = IndexBatch::from_owned(batch)?;
         if batch.is_empty() { return Ok(()); }
         if !batch.has_system_time(self.tx_key.system_time) {
@@ -1130,6 +1159,34 @@ mod row_column_type_tests {
 mod chunk_tests {
     use super::*;
     use rtdb_types::EntityId;
+
+    #[test]
+    fn governed_arrow_puts_consume_positions_in_order_with_row_events() {
+        let memory = MemoryBudget::new(1 << 24);
+        let state = crate::PartitionState::empty(Default::default()).unwrap();
+        let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(1) };
+        let mut transaction = TransactionBuffer::new(state.snapshot(), key, memory).unwrap();
+        transaction.retain_archived_owned_positions(vec![3, 7]).unwrap();
+        let table = rtdb_types::OwnedRelation::new("locations").unwrap().table("owner");
+        let id = EntityId::String("place".into());
+        let row = RecordBatch::try_from_iter([
+            ("_id", Arc::new(arrow_array::StringArray::from(vec!["place"])) as arrow_array::ArrayRef),
+            ("location", Arc::new(arrow_array::BinaryArray::from_iter_values([b"location"]))),
+        ]).unwrap();
+        let header = EventHeader { commit_position: 0, iid: id.iid(), system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put };
+        transaction.append_owned_put(&table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None).unwrap();
+        transaction.append_to(&table, StoredEvent {
+            commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
+            system_from: key.system_time, valid_time: Interval::ALL,
+            operation: StoredOperation::Delete, recency: None,
+        }).unwrap();
+        let staged = transaction.stage().unwrap();
+        let batch = staged.tables()[&table].batch().unwrap();
+        let first = batch.view().read_event(0).unwrap();
+        let second = batch.view().read_event(1).unwrap();
+        assert_eq!((first.header().commit_position, first.header().op), (3, EventOp::Put));
+        assert_eq!((second.header().commit_position, second.header().op), (7, EventOp::Delete));
+    }
 
     #[test]
     fn a_table_written_a_row_per_transaction_is_held_in_merged_chunks_with_its_rows_in_place() {

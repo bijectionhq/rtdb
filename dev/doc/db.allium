@@ -398,6 +398,9 @@ variant TxMessage : SourceMessage {
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
+    -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
+    -- Acceptance-relative Root writes retain those columns when their validity offsets are placed at the ordered system time.
+    -- Root publication and fork admission count the Arrow document rows against the same effect limits as row writes.
     -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.

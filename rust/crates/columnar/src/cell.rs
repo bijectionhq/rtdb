@@ -3,7 +3,7 @@ use arrow_array::{
     cast::AsArray,
     types::{
         Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, Int16Type, Int32Type,
-        Int64Type,
+        Int64Type, TimestampMicrosecondType,
     },
 };
 use arrow_schema::{DataType, Field, UnionMode};
@@ -282,6 +282,20 @@ impl<'a> ArrowCell<'a> {
             _ => return Err(layout()),
         }
         Ok(Some((parameters, coefficient)))
+    }
+
+    pub fn zoned_micros(self) -> Option<rtdb_types::Timestamp> {
+        let Self { field, array, row } = self.physical().ok()?;
+        if !matches!(
+            field.data_type(),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_))
+        ) || array.is_null(row)
+        {
+            return None;
+        }
+        Some(rtdb_types::Timestamp(
+            array.as_primitive::<TimestampMicrosecondType>().value(row),
+        ))
     }
 
     pub fn is_undefined(self) -> Result<bool> {
