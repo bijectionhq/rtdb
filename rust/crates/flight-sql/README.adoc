@@ -417,6 +417,11 @@ Each row includes `_system_from`, the winning revision. Gaps and tombstones have
 Schema metadata reports `rtdb.owned.present_micros`, `rtdb.owned.valid_from_micros`, and `rtdb.owned.valid_to_micros`.
 The returned present metadata identifies the system cut used for the read. A fresh hold can use its own cut or an earlier certified cut. A derived hold uses its selected cut and declared relations. Reads refuse more than 4096 slices or an oversized Flight result.
 
+`rtdb.owned.ReadHeldPositionValidDuring.v1` adds a signed big-endian 64-bit commit timestamp and an unsigned big-endian 32-bit first masked assertion position immediately after the held handle.
+It returns the same valid slices with that commit's assertions at and after the supplied position removed from resolution.
+Reads require a retained clear Root data relation and respect ordered erasure.
+They issue no commit witness.
+
 On placed writer sessions with retained leases, a fully completed valid window at the held head carries the same optional `rtdb.owned.range_witness` nonce as covered ranges, including a proven empty window.
 A fully covered held count also carries that nonce, including zero counts.
 The nonce depends on the entire relation's frontier at the held cut and retains the original session, placement and expiry.

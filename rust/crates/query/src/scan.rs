@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_owned_position_mask_hides_only_the_selected_commit_suffix() {
+    async fn owned_position_points_and_windows_hide_only_the_selected_commit_suffix() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
         let table = relation.table("alice");
@@ -1620,6 +1620,28 @@ mod tests {
             let (column, field) = batch.schema_ref().column_with_name("v").unwrap();
             assert_eq!(rtdb_columnar::read_value(field, batch.column(column).as_ref(), 0).unwrap(), Value::I64(expected));
             assert!(result.next_batch().await.unwrap().is_none());
+        }
+        for (system, expected) in [
+            (100, vec![(5, 10, 1), (10, 28, 2)]),
+            (110, vec![(5, 10, 1), (10, 20, 2), (20, 28, 4)]),
+        ] {
+            let mut result = crate::open_owned_valid_during_with_position_mask(
+                Arc::clone(&context), "alice", &relation, &id,
+                Interval::from_micros(5, 28).unwrap(), Timestamp(system), (Timestamp(100), 2),
+            ).await.unwrap().unwrap();
+            let mut slices = Vec::new();
+            while let Some(page) = result.next_batch().await.unwrap() {
+                let page = page.batch();
+                let timestamp = |name: &str| page.column_by_name(name).unwrap().as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+                let (column, field) = page.schema_ref().column_with_name("v").unwrap();
+                for row in 0..page.num_rows() {
+                    let Value::I64(value) = rtdb_columnar::read_value(field, page.column(column).as_ref(), row).unwrap()
+                    else { panic!("Expected the winning fact value"); };
+                    slices.push((timestamp("_valid_from").value(row), timestamp("_valid_to").value(row), value));
+                }
+            }
+            assert_eq!(slices, expected);
         }
     }
 
