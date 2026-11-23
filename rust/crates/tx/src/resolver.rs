@@ -509,6 +509,35 @@ pub trait TransactionWriter: Send {
 }
 pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Aborted { error: Anomaly, user_metadata: Option<UserMetadata> } }
 
+fn independent_world_observations(operations: &[Operation], publishing: &BTreeSet<Iid>) -> BTreeSet<Iid> {
+    operations.iter().filter_map(|operation| match operation {
+        Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.world(),
+        Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock.world),
+        _ => None,
+    }).filter(|world| !publishing.contains(world)).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn batch_observers_exclude_the_publishing_world_and_include_clock_only_worlds() -> Result<()> {
+    let writer = Iid([1; 16]);
+    let clock_only = Iid([2; 16]);
+    let scope = rtdb_types::PlacedAttemptScope::new("held-batch-observations", 1)?;
+    let guarded = rtdb_types::OwnedRelation::new("facts")?.in_world(writer)?;
+    let operations = [
+        Operation::Public(TxOp::OwnedCheckWorldPurge {
+            relation: guarded, pin: writer, frontier: 0, local_frontier: None,
+        }),
+        Operation::Public(TxOp::OwnedCheckWorldScope {
+            scope,
+            clock: Some(rtdb_types::WorldClockLimit { world: clock_only, pin: clock_only, before: Timestamp(7) }),
+        }),
+    ];
+    assert_eq!(independent_world_observations(&operations, &BTreeSet::from([writer])),
+        BTreeSet::from([clock_only]));
+    Ok(())
+}
+
 #[derive(Default)]
 struct PendingOwnedChanges {
     bytes: usize,
@@ -1186,14 +1215,17 @@ impl<'a> OpenTransaction<'a> {
         if root_publication.is_some() && (root_publications.next().is_some() || publications.is_empty()) {
             return Err(unavailable());
         }
-        let world_batch = publications.len() > 1 || root_publication.is_some();
+        let publishing_worlds = publications.iter().map(|(world, ..)| *world).collect::<BTreeSet<_>>();
+        let observing_worlds = independent_world_observations(operations, &publishing_worlds);
+        let world_batch = publications.len() > 1 || root_publication.is_some()
+            || (!publications.is_empty() && !observing_worlds.is_empty());
         let hosted_world_reads = crate::hosted_control::hosted_root_world_reads(operations);
         let root_conditions = !publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }) =>
                 relation.world().is_none() && !relation.is_world_catalog(),
             _ => false,
         });
-        if publications.len() > 8 { return Err(unavailable()); }
+        if publications.len() + observing_worlds.len() > 8 { return Err(unavailable()); }
         if publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedReplaceDocs { relation, .. })
             | Operation::OwnedWriteIids { relation, .. } => relation.world().is_some(),
@@ -1231,13 +1263,20 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock),
             _ => None,
         }) {
-            if !publications.is_empty() || !hosted_world_reads || !clock_worlds.insert(clock.world) {
+            if !(hosted_world_reads || world_batch) || publishing_worlds.contains(&clock.world)
+                || !clock_worlds.insert(clock.world)
+            {
                 return Err(unavailable());
             }
             admitted.insert(clock.world);
             if admitted.len() > 8 {
                 return Err(unavailable());
             }
+        }
+        if !publications.is_empty() && !observing_worlds.is_empty()
+            && (proposal_land.is_some() || proposal_overlay.is_some() || retained_release.is_some())
+        {
+            return Err(unavailable());
         }
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
@@ -1541,8 +1580,8 @@ impl<'a> OpenTransaction<'a> {
                         hosted = true;
                         1
                     }
-                    Operation::Public(TxOp::OwnedCheckWorldScope { .. }) => {
-                        scoped_checks += 1;
+                    Operation::Public(TxOp::OwnedCheckWorldScope { clock, .. }) => {
+                        scoped_checks += usize::from(clock.is_none());
                         1
                     }
                     Operation::Public(TxOp::OwnedDeadline { .. }
@@ -1553,7 +1592,7 @@ impl<'a> OpenTransaction<'a> {
                 if effects > 4096 { return Err(unavailable()); }
             }
             if deadline.is_none() || scoped_checks != 1 || !hosted
-                || counts.len() != publications.len() || self.owned_worlds.len() != publications.len()
+                || self.owned_worlds.len() != publications.len() + observing_worlds.len()
             {
                 return Err(unavailable());
             }
@@ -1573,6 +1612,11 @@ impl<'a> OpenTransaction<'a> {
                 {
                     return Err(unavailable());
                 }
+            }
+            if counts.iter().any(|(world, (rows, witnesses))| {
+                !observing_worlds.contains(world) || *rows != 0 || !(1..=128).contains(witnesses)
+            }) {
+                return Err(unavailable());
             }
         }
         self.check_hosted_controls(operations, source_scope, replay).await?;

@@ -1018,7 +1018,8 @@ async fn retire_world_pins(
 pub(crate) async fn commit_checkpoint_world_batch(
     directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession, deployment: Uuid,
     sections: Vec<rtdb_node::OwnedWorldSection>, root: rtdb_node::OwnedRootSection,
-    fingerprint: [u8; 32], controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    observed: rtdb_node::OwnedWorldObservations, fingerprint: [u8; 32],
+    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
 ) -> Result<TransactionKey> {
     if !(1..=8).contains(&sections.len()) { return Err(OwnedWorld::unavailable()); }
     let installation = directory.deployment(&deployment.to_string()).await?.ok_or_else(OwnedWorld::unavailable)?;
@@ -1039,7 +1040,7 @@ pub(crate) async fn commit_checkpoint_world_batch(
         }
         admitted.push((retained.until, section));
     }
-    let outcome = session.commit_owned_world_batch(admitted, root, fingerprint, controls, deadline).await?;
+    let outcome = session.commit_owned_world_batch(admitted, root, observed, fingerprint, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
     }

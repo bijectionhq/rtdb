@@ -146,13 +146,13 @@ impl OwnedWorldHost for PlacedWorldHost {
 
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
-        root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
+        root: rtdb_node::OwnedRootSection, observed: rtdb_node::OwnedWorldObservations, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
             commit_checkpoint_world_batch(self.directory.as_ref(), &self.archive, call.session, deployment,
-                sections, root, fingerprint, controls, deadline).await
+                sections, root, observed, fingerprint, controls, deadline).await
         })
     }
 
