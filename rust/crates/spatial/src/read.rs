@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
 
 use arrow_array::{Float64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use geometry::{GeometryWork, KeyRange};
+use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
     BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell,
     copy_selected_cells, estimate_copy_cell_bytes, read_entity_id,
@@ -11,7 +11,7 @@ use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_storage::ObjectKey;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
 
 use crate::{
     Predicate, Projection, definition,
@@ -209,14 +209,19 @@ async fn definition_ready(context: Arc<QueryContext>, definition: &definition::D
         .fold(0usize, |count, batch| count.saturating_add(batch.view().len()));
     if unindexed_rows > MAX_UNINDEXED_ROWS { return Ok(false); }
     for trie in uncovered {
-        let result = rtdb_query::visit_trie_iids(
-            &context, Arc::clone(&database.storage), &table.slug, &trie.key, |_| {
-                unindexed_rows += 1;
-                if unindexed_rows > MAX_UNINDEXED_ROWS { Err(postings::work_limit()) } else { Ok(()) }
-            },
-        ).await;
-        if unindexed_rows > MAX_UNINDEXED_ROWS { return Ok(false); }
-        result?;
+        context.check_cancelled()?;
+        if let Some(rows) = trie.metadata.as_ref().and_then(|metadata| metadata.row_count)
+            .and_then(|rows| usize::try_from(rows).ok())
+        {
+            unindexed_rows = unindexed_rows.saturating_add(rows);
+            if unindexed_rows > MAX_UNINDEXED_ROWS { return Ok(false); }
+            continue;
+        }
+        let Some(rows) = rtdb_query::trie_row_count_up_to(
+            &context, Arc::clone(&database.storage), &table.slug, &trie.key,
+            MAX_UNINDEXED_ROWS - unindexed_rows,
+        ).await? else { return Ok(false); };
+        unindexed_rows += rows;
     }
     Ok(true)
 }
@@ -235,10 +240,31 @@ pub async fn read_held(
 
 pub struct PreparedRegion {
     predicate: Predicate,
-    location: Option<Location>,
+    location: Option<RegionGeometry>,
     ranges: Vec<KeyRange>,
     steps: usize,
     _reservation: Arc<MemoryReservation>,
+}
+
+enum RegionGeometry {
+    Prepared(PreparedGeometry),
+    Plain(Geometry),
+}
+
+impl RegionGeometry {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Prepared(geometry) => geometry.retained_bytes(),
+            Self::Plain(geometry) => geometry.retained_bytes(),
+        }
+    }
+
+    fn evaluate(&self, predicate: Predicate, candidate: &Location, work: &mut GeometryWork) -> Result<Option<Option<f64>>> {
+        match self {
+            Self::Prepared(geometry) => predicate.evaluate(candidate, geometry, Some(geometry), work),
+            Self::Plain(geometry) => predicate.evaluate(candidate, geometry, None, work),
+        }
+    }
 }
 
 impl PreparedRegion {
@@ -257,17 +283,33 @@ impl PreparedRegion {
             predicate.validate_region(&region)?;
             Some(region)
         };
-        let ranges = match &region {
-            Some(region) => work.scoped(|work| predicate.cover(region, work))?,
-            None => None,
-        }
-        .unwrap_or_else(|| {
-            vec![KeyRange {
-                start: i64::MIN,
-                end: i64::MAX,
-            }]
-        });
-        let bytes = region.as_ref().map_or(0, Location::retained_bytes)
+        let (region, ranges) = match region {
+            Some(region) if !region.geometry.is_empty() && predicate.cover_predicate().is_some() => {
+                work.scoped(|work| {
+                    let geometry = predicate.prepare_geometry(&region.geometry, work)?;
+                    let ranges = predicate.cover(&geometry, work)?;
+                    Ok::<_, Anomaly>((Some(RegionGeometry::Prepared(geometry)), ranges))
+                })?
+            }
+            Some(region) => {
+                // An uncovered predicate only spends topology work when it reaches a candidate.
+                let geometry = if region.geometry.is_empty()
+                    || matches!(predicate, Predicate::Classification(crate::Classification::Unknown))
+                {
+                    RegionGeometry::Plain(region.geometry)
+                } else {
+                    let mut preparation = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
+                    match predicate.prepare_geometry(&region.geometry, &mut preparation) {
+                        Ok(geometry) => RegionGeometry::Prepared(geometry),
+                        Err(_) => RegionGeometry::Plain(region.geometry),
+                    }
+                };
+                (Some(geometry), None)
+            }
+            None => (None, None),
+        };
+        let ranges = ranges.unwrap_or_else(|| vec![KeyRange { start: i64::MIN, end: i64::MAX }]);
+        let bytes = region.as_ref().map_or(0, RegionGeometry::retained_bytes)
             .checked_add(ranges.capacity() * std::mem::size_of::<KeyRange>())
             .and_then(|bytes| bytes.checked_add(512)).ok_or_else(postings::work_limit)?;
         let lease = Arc::get_mut(&mut reservation).expect("geometry construction owns the reservation");
@@ -303,7 +345,7 @@ pub async fn read_prepared(
         .reserve(capacity * std::mem::size_of::<SelectedHit>())?;
     let mut selected = Vec::<SelectedHit>::with_capacity(capacity);
     let mut more = false;
-    let projection_layout =
+    let (projection_layout, _) =
         visit_matches(Arc::clone(&context), owner, relation, path, region, &request, projection, false, |source, row, id, _, distance_m| {
                 let index = selection_position(&selected, id, distance_m)?;
                 if index < capacity {
@@ -350,6 +392,79 @@ fn inconsistent_projection() -> Anomaly {
     Anomaly::fault("rtdb.spatial/projection", "Spatial matches have no projection")
 }
 
+pub struct PreparedRange {
+    matches: Vec<(EntityId, Iid)>,
+    relation: OwnedRelation,
+    valid_at: Timestamp,
+    columns: DocumentColumns,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PreparedRange {
+    pub fn relation(&self) -> &OwnedRelation { &self.relation }
+
+    pub async fn prepare(
+        context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
+        region: &PreparedRegion, request: &Request<'_>,
+    ) -> Result<Self> {
+        if !(1..=128).contains(&request.limit) || !matches!(request.page, PageOrder::Identity { .. })
+            || matches!(region.predicate, Predicate::Nearest { .. })
+        {
+            return Err(kernel::invalid("Invalid spatial page size or continuation"));
+        }
+        let mut matches = Vec::new();
+        let mut reservation = context.memory.reserve(0)?;
+        let mut payload_bytes = 0usize;
+        let (_, columns) = visit_matches(Arc::clone(&context), owner, relation, path, region, request, Projection::Identities, true,
+            |_, _, id, iid, _| {
+                let capacity = if matches.len() == matches.capacity() {
+                    (matches.capacity() * 2).max(8)
+                } else {
+                    matches.capacity()
+                };
+                payload_bytes = payload_bytes.checked_add(id.owned_payload_bytes()).ok_or_else(postings::work_limit)?;
+                let required = payload_bytes.checked_add(capacity * std::mem::size_of::<(EntityId, Iid)>())
+                    .ok_or_else(postings::work_limit)?;
+                Arc::get_mut(&mut reservation).expect("matches own their reservation").grow_to(required)?;
+                if capacity > matches.capacity() {
+                    matches.reserve_exact(capacity - matches.len());
+                }
+                matches.push((id.into_owned(), iid.ok_or_else(inconsistent_projection)?));
+                Ok(())
+            },
+        ).await?;
+        context.check_cancelled()?;
+        matches.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        context.check_cancelled()?;
+        Ok(Self { matches, relation: relation.clone(), valid_at: request.valid_at, columns,
+            _reservation: reservation })
+    }
+
+    pub async fn page(
+        &self, context: Arc<QueryContext>, owner: &str, after: Option<EntityIdRef<'_>>,
+        limit: usize, projection: Projection<'_>,
+    ) -> Result<Page> {
+        if !(1..=128).contains(&limit) {
+            return Err(kernel::invalid("Invalid spatial page size or continuation"));
+        }
+        let start = after.map_or(0, |after| self.matches.partition_point(|entry| {
+            EntityIdRef::from(&entry.0) <= after
+        }));
+        let end = (start + limit).min(self.matches.len());
+        let _selection = context.memory.reserve(std::mem::size_of::<(EntityIdRef<'_>, Iid)>() * (end - start))?;
+        let selection = self.matches[start..end].iter().map(|(id, iid)| {
+            (EntityIdRef::from(id), *iid)
+        }).collect::<Vec<_>>();
+        super::nearest::gather_range(context, owner, &self.relation, self.valid_at, projection,
+            &self.columns, &selection, end < self.matches.len()).await
+    }
+}
+
+pub(super) struct DocumentColumns {
+    pub(super) geometry: String,
+    pub(super) partition: Vec<String>,
+}
+
 pub(super) async fn visit_matches(
     context: Arc<QueryContext>,
     owner: &str,
@@ -360,7 +475,7 @@ pub(super) async fn visit_matches(
     projection: Projection<'_>,
     include_iid: bool,
     mut visit: impl FnMut(&Arc<OwnedBatch>, usize, EntityIdRef<'_>, Option<Iid>, Option<f64>) -> Result<()>,
-) -> Result<Option<(rtdb_plan::Schema, Vec<usize>)>> {
+) -> Result<(Option<(rtdb_plan::Schema, Vec<usize>)>, DocumentColumns)> {
     let definition =
         definition::held_definition(Arc::clone(&context), owner, relation, path).await?;
     if request.partition.len() > definition.partition.len() {
@@ -406,21 +521,23 @@ pub(super) async fn visit_matches(
             let length = usize::try_from(size).map_err(|_| postings::work_limit())?;
             match database
                 .storage
-                .get_exact_or(&key, length, &context.memory)
+                .get_exact_cached_or(&key, length, &context.memory)
                 .await
             {
                 Ok(bytes) => {
-                    match postings::candidates(
+                    let check = || context.check_cancelled();
+                    check()?;
+                    let computed = bytes.sha256(|bytes| postings::sha256(bytes, &check))?;
+                    match postings::verify_digest(computed, digest).and_then(|()| postings::candidates(
                         bytes,
-                        digest,
                         partition,
                         &region.ranges,
                         &context.memory,
-                        || context.check_cancelled(),
+                        check,
                         |iid| candidates.insert(iid),
-                    ) {
+                    )) {
                         Ok(()) => continue,
-                        Err(error) if error.code == "rtdb.spatial/postings" => (),
+                        Err(error) if error.code == "rtdb.spatial/postings" => { database.storage.evict(&key); }
                         Err(error) => return Err(error),
                     }
                 }
@@ -454,23 +571,25 @@ pub(super) async fn visit_matches(
     }
     let geometry = (region.location.is_some() || matches!(projection, Projection::Documents))
         .then_some(definition.geometry.as_str());
+    let partition = definition.partition[..request.partition.len()].to_vec();
     let cursor = rtdb_query::open_owned_spatial_scan(
         Arc::clone(&context),
         owner,
         relation,
         geometry,
-        &definition.partition[..request.partition.len()],
+        &partition,
         request.valid_at,
         candidates.ids,
         projection,
         include_iid,
     )
     .await?;
+    let partition_start = 1 + usize::from(geometry.is_some());
+    let columns = DocumentColumns { geometry: definition.geometry, partition };
     let Some(rtdb_query::OwnedSpatialScan { mut cursor, document_columns }) = cursor else {
-        return Ok(None);
+        return Ok((None, columns));
     };
     let mut refined = 0;
-    let partition_start = 1 + usize::from(geometry.is_some());
     while let Some(source) = cursor.next_batch().await? {
         let source = Arc::new(source);
         let batch = source.batch();
@@ -505,7 +624,7 @@ pub(super) async fn visit_matches(
                     let Some(location) = Location::decode_stored(bytes, definition.encoding, work)? else {
                         return Ok(None);
                     };
-                    region.predicate.evaluate(&location, location_filter, work)
+                    location_filter.evaluate(region.predicate, &location, work)
                 })?
             } else {
                 Some(None)
@@ -515,7 +634,7 @@ pub(super) async fn visit_matches(
             }
         }
     }
-    Ok(Some((cursor.runtime_schema().clone(), document_columns)))
+    Ok((Some((cursor.runtime_schema().clone(), document_columns)), columns))
 }
 
 fn partition_matches(
@@ -586,9 +705,10 @@ impl Candidates {
     }
 
     fn extend_live(&mut self, events: &EventBatch, context: &QueryContext) -> Result<()> {
-        for row in 0..events.len() {
+        let iids = events.iids()?;
+        for row in 0..iids.len() {
             context.check_cancelled_at(row)?;
-            self.insert_unindexed(events.iid(row)?)?;
+            self.insert_unindexed(iids.get(row)?)?;
         }
         Ok(())
     }

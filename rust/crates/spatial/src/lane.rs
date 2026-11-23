@@ -113,12 +113,14 @@ impl ArtefactBuilder for Builder {
             let _geometry = memory.reserve(kernel::WORK_BYTES)?;
             let (mut reader, _metadata) = input::open_input(source, &memory)?;
             let mut postings = postings::Postings::new(&memory)?;
+            let mut put_columns = definition.partition.clone();
+            put_columns.push(definition.geometry.clone());
             for page in 0..reader.page_count() {
                 if cancel.is_cancelled() {
                     return Err(postings::cancelled());
                 }
-                let page = input::read_page(&mut reader, page, &memory)?;
-                let events = EventBatch::new(page.batch().clone())?;
+                let _page = memory.reserve(reader.page_allocation_bound(page)?)?;
+                let events = EventBatch::new(reader.read_event_page(page, &put_columns)?)?;
                 for row in 0..events.len() {
                     let mut work =
                         GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
@@ -130,7 +132,6 @@ impl ArtefactBuilder for Builder {
                 }
             }
             let writer = std::fs::File::options()
-                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(bundle)

@@ -175,6 +175,16 @@ impl CacheLease {
     pub fn as_slice(&self) -> &[u8] { &self.allocation.as_slice()[self.range.clone()] }
     pub fn is_partial_allocation(&self) -> bool { self.range.len() != self.allocation.len() }
 
+    /// Memoizes the successfully computed SHA-256 of the complete immutable allocation.
+    pub fn sha256<E>(&self, compute: impl FnOnce(&[u8]) -> std::result::Result<[u8; 32], E>) -> std::result::Result<[u8; 32], E> {
+        if self.is_partial_allocation() { return compute(self.as_slice()); }
+        let mut digest = self.allocation.sha256.lock();
+        if let Some(digest) = *digest { return Ok(digest); }
+        let value = compute(self.as_slice())?;
+        *digest = Some(value);
+        Ok(value)
+    }
+
     /// The slice retains the entire allocation and its byte reservation.
     pub fn slice(&self, range: Range<usize>) -> Result<Self> {
         if range.start > range.end || range.end > self.range.len() {
@@ -505,6 +515,33 @@ impl BufferPool {
         Ok(CacheLease { allocation, range: 0..length })
     }
 
+    /// Tries to cache an exact immutable object using only the shared pool's budget.
+    pub async fn get_exact_cached_or(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        if length > self.budget.limit_bytes() { return self.get_exact_or(key, length, fallback).await; }
+        let mut cleanup = EmptyEntryCleanup { pool: self, key, armed: true };
+        if let Ok(entry) = self.entry(key) {
+            let mut slot = entry.allocation.lock().await;
+            match slot.as_ref() {
+                Some(allocation) if allocation.len() == length => {
+                    cleanup.armed = false;
+                    return Ok(CacheLease { allocation: allocation.clone(), range: 0..length });
+                }
+                None => {
+                    let allocation = self.store.exact_object_allocation(key, length)?;
+                    if let Ok(reservation) = reserve_read(length, allocation, |bytes| self.reserve(bytes)) {
+                        let bytes = reservation.retaining_io(self.store.get_fresh_exact(key, length)).await?;
+                        let allocation = Arc::new(reservation.finish(bytes)?);
+                        *slot = Some(allocation.clone());
+                        cleanup.armed = false;
+                        return Ok(CacheLease { allocation, range: 0..length });
+                    }
+                }
+                Some(_) => (),
+            }
+        }
+        self.get_exact_or(key, length, fallback).await
+    }
+
     async fn fetch_whole(&self, key: &ObjectKey, length: usize, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<RetainedBytes>> {
         let allocation = self.store.whole_object_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, reserve)?;
@@ -772,4 +809,21 @@ mod view_tests {
         drop(lease);
         assert_eq!(second.pool_retained_bytes(), 0);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn spatial_arrow_posting_digest_follows_the_object_allocation() {
+    let store = Arc::new(crate::MemoryStore::default());
+    let key = ObjectKey::new("postings").unwrap();
+    store.put(&key, bytes::Bytes::from_static(&[1, 2])).await.unwrap();
+    let pool = BufferPool::with_budget(store, CacheBudget::new(1 << 20));
+    let fallback = MemoryBudget::new(1 << 20);
+    let initial = pool.get_exact_cached_or(&key, 2, &fallback).await.unwrap();
+    assert_eq!(initial.sha256(|_| Err::<[u8; 32], _>("cancelled")), Err("cancelled"));
+    assert_eq!(initial.sha256(|_| Ok::<_, ()>([23; 32])), Ok([23; 32]));
+    let same = pool.get_exact_cached_or(&key, 2, &fallback).await.unwrap();
+    assert_eq!(same.sha256(|_| -> std::result::Result<_, ()> { panic!("cached object rehashed") }), Ok([23; 32]));
+    let partial = same.slice(0..1).unwrap();
+    assert_eq!(partial.sha256(|bytes| { assert_eq!(bytes, &[1]); Ok::<_, ()>([42; 32]) }), Ok([42; 32]));
 }

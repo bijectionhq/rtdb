@@ -394,7 +394,10 @@ struct RetainedSpatialFilter {
 }
 
 enum RetainedSpatialQuery {
-    Range { path: OwnedRelation, region: rtdb_spatial::PreparedRegion },
+    Range {
+        matches: rtdb_node::HeldSpatialRange,
+        earlier: Option<(OwnedRelation, rtdb_spatial::PreparedRegion)>,
+    },
     Nearest(HeldSpatialNearest),
 }
 
@@ -776,6 +779,14 @@ fn spatial_document_columns(batch: &RecordBatch) -> Result<Vec<&str>, Status> {
         }
     }
     Ok(names.into_iter().collect())
+}
+
+fn spatial_after(input: &RecordBatch) -> Result<Option<EntityIdRef<'_>>, Status> {
+    match input.schema_ref().column_with_name("after") {
+        Some((index, field)) => selected_cell(field, input.column(index).as_ref(), 0).map_err(status)?
+            .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose(),
+        None => Ok(None),
+    }
 }
 
 fn spatial_partition(batch: &RecordBatch) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, Status> {
@@ -3143,11 +3154,7 @@ impl Service {
             None
         };
         let predicate = rtdb_spatial::Predicate::parse(predicate.value(predicate_row), radius, reported_center.value(center_row)).map_err(status)?;
-        let after = match input.schema_ref().column_with_name("after") {
-            Some((index, field)) => selected_cell(field, input.column(index).as_ref(), 0).map_err(status)?
-                .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose()?,
-            None => None,
-        };
+        let after = spatial_after(input)?;
         use rtdb_spatial::{PageOrder, Predicate};
         let page = if matches!(predicate, Predicate::Nearest { .. }) {
             if after.is_some() { return Err(invalid("Nearest continuation requires a held ranking")); }
@@ -3163,16 +3170,23 @@ impl Service {
             let (ranking, page, witness) = held.snapshot.open_spatial_nearest(&relation, &path, request, after_radius, observe, projection)
                 .await.map_err(status)?;
             (page, witness, Some(RetainedSpatialQuery::Nearest(ranking)))
-        } else {
-            let prepared = if matches!(wire, SpatialHeldWire::Open) {
-                held.snapshot.check_relation(&relation).map_err(status)?;
-                Some(rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?)
+        } else if matches!(wire, SpatialHeldWire::Open) {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+            let region = rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?;
+            if matches!(page, PageOrder::Identity { .. }) {
+                let (matches, page, witness) = held.snapshot.open_spatial_range(&relation, &path, request, observe, projection, &region)
+                    .await.map_err(status)?;
+                let earlier = after.map(|_| (path, region));
+                (page, witness, Some(RetainedSpatialQuery::Range { matches, earlier }))
             } else {
-                None
-            };
-            let (page, witness) = held.snapshot.spatial_page(&relation, &path, request, observe, projection, prepared.as_ref())
+                let (page, witness) = held.snapshot.spatial_page(&relation, &path, request, observe, projection, Some(&region))
+                    .await.map_err(status)?;
+                (page, witness, None)
+            }
+        } else {
+            let (page, witness) = held.snapshot.spatial_page(&relation, &path, request, observe, projection, None)
                 .await.map_err(status)?;
-            (page, witness, prepared.map(|region| RetainedSpatialQuery::Range { path, region }))
+            (page, witness, None)
         };
         let mut retained = None;
         let mut token = None;
@@ -3212,13 +3226,19 @@ impl Service {
         let columns = spatial_document_columns(filter.batch.batch())?;
         let projection = rtdb_spatial::Projection::SelectedDocuments(&columns);
         let (page, witness) = match (&filter.query, distance) {
-            (RetainedSpatialQuery::Range { path, region }, None) => {
-                let request = rtdb_spatial::Request {
-                    partition: spatial_partition(filter.batch.batch())?,
-                    region: Default::default(), predicate: rtdb_spatial::Predicate::All,
-                    valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
-                };
-                held.snapshot.spatial_page(&filter.relation, path, request, observe, projection, Some(region)).await
+            (RetainedSpatialQuery::Range { matches, earlier }, None) => {
+                if let Some((path, region)) = earlier
+                    && spatial_after(filter.batch.batch())?.is_some_and(|initial| after < initial)
+                {
+                    let request = rtdb_spatial::Request {
+                        partition: spatial_partition(filter.batch.batch())?,
+                        region: Default::default(), predicate: rtdb_spatial::Predicate::All,
+                        valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
+                    };
+                    held.snapshot.spatial_page(&filter.relation, path, request, observe, projection, Some(region)).await
+                } else {
+                    held.snapshot.next_spatial_range(matches, after, limit, observe, projection).await
+                }
             }
             (RetainedSpatialQuery::Nearest(ranking), Some(distance_m)) => {
                 held.snapshot.next_spatial_nearest(ranking, rtdb_spatial::NearestPosition { distance_m, id: after },

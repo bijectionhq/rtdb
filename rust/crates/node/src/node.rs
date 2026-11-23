@@ -1458,6 +1458,11 @@ pub struct OwnedReadSession {
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
+pub struct HeldSpatialRange {
+    held_context: std::sync::Weak<QueryContext>,
+    matches: rtdb_spatial::PreparedRange,
+}
+
 pub struct HeldSpatialNearest {
     held_context: std::sync::Weak<QueryContext>,
     ranking: rtdb_spatial::PreparedNearest,
@@ -2589,6 +2594,49 @@ impl OwnedReadSession {
             }
         });
         let page = context.reading(work).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((page, witness))
+    }
+
+    pub async fn open_spatial_range(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
+        region: &rtdb_spatial::PreparedRegion,
+    ) -> Result<(HeldSpatialRange, rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let work = async {
+            let matches = rtdb_spatial::PreparedRange::prepare(
+                Arc::clone(&context), &self.owner, relation, path, region, &request,
+            ).await?;
+            let after = match request.page {
+                rtdb_spatial::PageOrder::Identity { after } => after,
+                rtdb_spatial::PageOrder::NearestOnce => unreachable!("validated range order"),
+            };
+            let page = matches.page(Arc::clone(&context), &self.owner, after, request.limit, projection).await?;
+            Ok::<_, Anomaly>((matches, page))
+        };
+        let (matches, page) = rtdb_storage::IoRegion::retaining(context.clone(), rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((HeldSpatialRange { held_context: Arc::downgrade(&self.context), matches }, page, witness))
+    }
+
+    pub async fn next_spatial_range(
+        &self, held: &HeldSpatialRange, after: rtdb_columnar::EntityIdRef<'_>,
+        limit: usize, observe: bool, projection: rtdb_spatial::Projection<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        if !held.held_context.upgrade().is_some_and(|original| Arc::ptr_eq(&original, &self.context)) {
+            return Err(Anomaly::incorrect("rtdb.owned/spatial-hold", "Spatial range belongs to another read"));
+        }
+        self.admit_read().await?;
+        let relation = held.matches.relation();
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let work = held.matches.page(Arc::clone(&context), &self.owner, Some(after), limit, projection);
+        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
         Ok((page, witness))

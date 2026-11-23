@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Cursor, Read, Seek};
+use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -146,7 +146,7 @@ impl Postings {
         order.dedup_by_key(|row| key(*row));
         let order = UInt32Array::from(order);
         let mut writer =
-            ArrowFileWriter::new_bounded_reserved(file, &schema, MAX_FILE_BYTES, memory)?;
+            ArrowFileWriter::new_hashed_bounded_reserved(file, &schema, MAX_FILE_BYTES, memory)?;
         for start in (0..order.len()).step_by(BATCH_ROWS) {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
@@ -160,28 +160,32 @@ impl Postings {
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(corrupt)?;
             writer.write(&batch)?;
         }
-        let mut file = writer.finish()?;
-        let length = file.metadata().map_err(corrupt)?.len();
-        file.rewind().map_err(corrupt)?;
-        let mut hash = Sha256::new();
-        let mut scratch = [0; 64 << 10];
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
-            }
-            let count = file.read(&mut scratch).map_err(corrupt)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&scratch[..count]);
+        let (length, digest) = writer.finish_hashed()?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
         }
-        Ok((length, hash.finalize().to_vec()))
+        Ok((length, digest.to_vec()))
     }
+}
+
+pub(crate) fn sha256(bytes: &[u8], check: &impl Fn() -> Result<()>) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    for chunk in bytes.chunks(64 << 10) {
+        check()?;
+        hash.update(chunk);
+    }
+    Ok(hash.finalize().into())
+}
+
+pub(crate) fn verify_digest(actual: [u8; 32], expected: &[u8]) -> Result<()> {
+    if actual.as_slice() != expected {
+        return Err(corrupt("Spatial posting file identity does not match the catalog"));
+    }
+    Ok(())
 }
 
 pub(crate) fn candidates(
     bytes: impl AsRef<[u8]> + Send + 'static,
-    digest: &[u8],
     partition: Option<Partition>,
     ranges: &[KeyRange],
     memory: &Arc<MemoryBudget>,
@@ -190,16 +194,6 @@ pub(crate) fn candidates(
 ) -> Result<()> {
     if bytes.as_ref().len() as u64 > MAX_FILE_BYTES {
         return Err(corrupt("Spatial posting file exceeds its size limit"));
-    }
-    let mut hash = Sha256::new();
-    for chunk in bytes.as_ref().chunks(64 << 10) {
-        check()?;
-        hash.update(chunk);
-    }
-    if digest != hash.finalize().as_slice() {
-        return Err(corrupt(
-            "Spatial posting file identity does not match the catalog",
-        ));
     }
     let file_error = |error: Anomaly| {
         if error.code == "rtdb/memory-budget-exceeded" {

@@ -359,10 +359,15 @@ pub fn distance(
     if intersects(a, b, work)? {
         return Ok(0.0);
     }
-    let right = segments(b);
+    reference_segment_distance(a, &segments(b), work)
+}
+
+fn reference_segment_distance(
+    a: &Geometry, right: &[(Pos, Pos)], work: &mut GeometryWork,
+) -> Result<f64, GeometryRefusal> {
     let mut best = f64::INFINITY;
     for left in segments(a) {
-        for &right in &right {
+        for &right in right {
             work.charge(1)?;
             best = space_segment_distance(&a.space, left, right, best, work)?;
         }
@@ -376,6 +381,14 @@ pub fn classify(
     accuracy_m: Option<f64>,
     area: &Geometry,
     work: &mut GeometryWork,
+) -> Result<&'static str, GeometryRefusal> {
+    classify_with(point, accuracy_m, area, None, None, work)
+}
+
+fn classify_with(
+    point: Pos, accuracy_m: Option<f64>, area: &Geometry,
+    topology: Option<&crate::topology::relation::PreparedTopology>,
+    edges: Option<&[(Pos, Pos)]>, work: &mut GeometryWork,
 ) -> Result<&'static str, GeometryRefusal> {
     area.space.validate_kernel()?;
     if !area.space.is_ground() {
@@ -397,7 +410,10 @@ pub fn classify(
     {
         return collection::classify(point, accuracy, area, members, work);
     }
-    let relation = point_relation(point, area, work)?;
+    let relation = match topology {
+        Some(topology) => topology.replay_relation(area, point, work)?,
+        None => point_relation(point, area, work)?,
+    };
     if accuracy == 0.0 {
         return Ok(if relation == Rel::Outside {
             "outside"
@@ -405,8 +421,13 @@ pub fn classify(
             "inside"
         });
     }
+    let fresh;
+    let edges = match edges {
+        Some(edges) => edges,
+        None => { fresh = segments(area); &fresh }
+    };
     let mut boundary = f64::INFINITY;
-    for edge in segments(area) {
+    for &edge in edges {
         boundary = space_segment_distance(&area.space, (point, point), edge, boundary, work)?;
     }
     if within_slack(boundary, accuracy) {

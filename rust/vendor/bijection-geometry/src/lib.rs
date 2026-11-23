@@ -349,6 +349,68 @@ impl From<&serde_json::Value> for Gv {
     }
 }
 
+/// A borrowed, validated input to geometry admission.
+#[doc(hidden)]
+pub trait ValueView<'a>: Copy {
+    fn scalar(self) -> Scalar;
+    fn text(self) -> Option<std::borrow::Cow<'a, str>>;
+    fn array(self) -> Option<impl ExactSizeIterator<Item = Self>>;
+    fn object(self) -> Option<impl Iterator<Item = (std::borrow::Cow<'a, str>, Self)>>;
+
+    fn field(self, name: &str) -> Option<Self> {
+        self.object()?.find(|(key, _)| key == name).map(|(_, value)| value)
+    }
+
+    fn number(self) -> Option<f64> {
+        match self.scalar() {
+            Scalar::Float(value) if value.is_finite() => Some(value),
+            Scalar::Integer(value) => Some(value as f64),
+            _ => None,
+        }
+    }
+
+    fn is_empty_array(self) -> bool {
+        self.array().is_some_and(|items| items.len() == 0)
+    }
+}
+
+#[doc(hidden)]
+pub enum Scalar {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    Other,
+}
+
+impl<'a> ValueView<'a> for &'a Gv {
+    fn scalar(self) -> Scalar {
+        match *self {
+            Gv::Null => Scalar::Null,
+            Gv::Bool(value) => Scalar::Bool(value),
+            Gv::Int64(value) => Scalar::Integer(value),
+            Gv::Float(value) => Scalar::Float(value),
+            _ => Scalar::Other,
+        }
+    }
+
+    fn text(self) -> Option<std::borrow::Cow<'a, str>> {
+        if let Gv::String(text) = self { Some(text.as_str().into()) } else { None }
+    }
+
+    fn array(self) -> Option<impl ExactSizeIterator<Item = Self>> {
+        if let Gv::Array(items) = self { Some(items.iter()) } else { None }
+    }
+
+    fn object(self) -> Option<impl Iterator<Item = (std::borrow::Cow<'a, str>, Self)>> {
+        if let Gv::Object(fields) = self {
+            Some(fields.iter().map(|(name, value)| (name.as_str().into(), value)))
+        } else {
+            None
+        }
+    }
+}
+
 /// Admits a decoded value as a geometry of one of `types` under
 /// `declaration`, the engine validator's check of a property declared
 /// `geometry: { space, size }`. Bindings admit the same values; they
@@ -402,6 +464,15 @@ pub fn admit_value(
 
 pub fn admit_value_with_work(
     value: &Gv,
+    declaration: &GeometryDeclaration,
+    work: &mut GeometryWork,
+) -> Result<Geometry, GeometryRefusal> {
+    admit_view_with_work(value, declaration, work)
+}
+
+#[doc(hidden)]
+pub fn admit_view_with_work<'a>(
+    value: impl ValueView<'a>,
     declaration: &GeometryDeclaration,
     work: &mut GeometryWork,
 ) -> Result<Geometry, GeometryRefusal> {
@@ -859,8 +930,8 @@ pub fn js_json(value: &Gv, out: &mut String) -> Result<(), GeometryRefusal> {
 
 /// Count canonical JSON bytes without constructing a second geometry-sized
 /// string. One bounded scalar scratch reservation covers number formatting.
-fn json_length(
-    value: &Gv,
+fn json_length<'a>(
+    value: impl ValueView<'a>,
     work: &mut GeometryWork,
     depth: usize,
 ) -> Result<usize, GeometryRefusal> {
@@ -879,36 +950,65 @@ fn json_length(
             })
             .sum::<usize>())
     }
-    Ok(match value {
-        Gv::Null => 4,
-        Gv::Bool(value) => {
-            if *value {
-                4
+    Ok(match value.scalar() {
+        Scalar::Null => 4,
+        Scalar::Bool(value) => if value { 4 } else { 5 },
+        Scalar::Integer(value) if value.unsigned_abs() >= 1 << 53 => json::number_len(value as f64),
+        Scalar::Integer(value) => decimal_digits(value.unsigned_abs()) + usize::from(value < 0),
+        Scalar::Float(value) if value.is_finite() => json::number_len(value),
+        Scalar::Float(_) => 4,
+        Scalar::Other => {
+            if let Some(text) = value.text() {
+                quoted(&text, work)?
+            } else if let Some(values) = value.array() {
+                let mut length = 2 + values.len().saturating_sub(1);
+                for value in values {
+                    length += json_length(value, work, depth + 1)?;
+                }
+                length
+            } else if let Some(values) = value.object() {
+                let mut length = 2;
+                for (index, (key, value)) in values.enumerate() {
+                    length += usize::from(index != 0) + quoted(&key, work)? + 1
+                        + json_length(value, work, depth + 1)?;
+                }
+                length
             } else {
-                5
+                return Err(invalid("expected geometry object"));
             }
         },
-        Gv::Int64(value) if value.unsigned_abs() >= 1 << 53 => json::number(*value as f64).len(),
-        Gv::Int64(value) => value.to_string().len(),
-        Gv::Float(value) if value.is_finite() => json::number(*value).len(),
-        Gv::Float(_) => 4,
-        Gv::String(value) => quoted(value, work)?,
-        Gv::Array(values) => {
-            let mut length = 2 + values.len().saturating_sub(1);
-            for value in values {
-                length += json_length(value, work, depth + 1)?;
-            }
-            length
-        },
-        Gv::Object(values) => {
-            let mut length = 2 + values.len().saturating_sub(1);
-            for (key, value) in values {
-                length += quoted(key, work)? + 1 + json_length(value, work, depth + 1)?;
-            }
-            length
-        },
-        Gv::Other => return Err(invalid("expected geometry object")),
     })
+}
+
+fn decimal_digits(value: u64) -> usize {
+    value.checked_ilog10().unwrap_or(0) as usize + 1
+}
+
+#[cfg(test)]
+#[test]
+fn spatial_arrow_decimal_length_matches_rendered_json_across_binary64() {
+    let check = |value| assert_eq!(json::number_len(value), json::number(value).len(), "{value:e}");
+    for value in [-0.0, 0.0, 1e-7, 1e-6, -1e-6, 1e20, 1e21, -1e21, f64::MAX, f64::from_bits(1)] {
+        check(value);
+        let previous = f64::from_bits(value.to_bits().saturating_sub(1));
+        if previous.is_finite() {
+            check(previous);
+        }
+        let next = f64::from_bits(value.to_bits() + 1);
+        if next.is_finite() {
+            check(next);
+        }
+    }
+    let mut bits = 0x5f43_9edc_4411_2a31u64;
+    for _ in 0..8192 {
+        bits ^= bits << 13;
+        bits ^= bits >> 7;
+        bits ^= bits << 17;
+        let value = f64::from_bits(bits);
+        if value.is_finite() {
+            check(value);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ admission
@@ -924,10 +1024,11 @@ pub fn number(x: &Gv) -> Option<f64> {
     }
 }
 
-fn array<'a>(v: Option<&'a Gv>, limits: &Limits) -> Result<&'a [Gv], GeometryRefusal> {
-    let Some(Gv::Array(items)) = v else {
-        return Err(invalid("array bound"));
-    };
+fn array<'a, V: ValueView<'a>>(
+    v: Option<V>,
+    limits: &Limits,
+) -> Result<impl ExactSizeIterator<Item = V>, GeometryRefusal> {
+    let items = v.and_then(ValueView::array).ok_or_else(|| invalid("array bound"))?;
     if items.len() > limits.ring_coordinates {
         return Err(limits.over(
             format!(
@@ -1119,7 +1220,7 @@ struct Admission<'l, 'w> {
 impl Admission<'_, '_> {
     /// One position, -0 normalized to 0, and whether both coordinates are
     /// Python integers.
-    fn point(&mut self, v: Option<&Gv>) -> Result<Pos, GeometryRefusal> {
+    fn point<'a, V: ValueView<'a>>(&mut self, v: Option<V>) -> Result<Pos, GeometryRefusal> {
         self.work.charge(1)?;
         self.count += 1;
         if self.count > self.limits.coordinates {
@@ -1146,22 +1247,18 @@ impl Admission<'_, '_> {
                 },
             })
         };
-        let Some(Gv::Array(items)) = v else {
-            return Err(refused());
-        };
+        let mut items = v.and_then(ValueView::array).ok_or_else(refused)?;
         if items.len() != if self.heights.is_some() { 3 } else { 2 } {
             return Err(refused());
         }
-        let (x, y) = match (number(&items[0]), number(&items[1])) {
-            (Some(x), Some(y)) => (x, y),
-            _ => return Err(refused()),
-        };
+        let mut next = || items.next().and_then(ValueView::number).ok_or_else(refused);
+        let (x, y) = (next()?, next()?);
         if self.space.frame == CoordinateFrame::Wgs84 && (x.abs() > 180.0 || y.abs() > 90.0) {
             return Err(refused());
         }
         if let Some(heights) = &mut self.heights {
             self.work.allocate(16)?;
-            let height = number(&items[2]).ok_or_else(refused)?;
+            let height = next()?;
             if (self.space.frame == CoordinateFrame::Wgs84
                 && height.abs()
                     * match &self.space.dimensions {
@@ -1185,8 +1282,8 @@ impl Admission<'_, '_> {
         ])
     }
 
-    fn line(&mut self, v: &Gv, ring: bool) -> Result<Vec<Pos>, GeometryRefusal> {
-        let items = array(Some(v), self.limits)?;
+    fn line<'a, V: ValueView<'a>>(&mut self, v: Option<V>, ring: bool) -> Result<Vec<Pos>, GeometryRefusal> {
+        let items = array(v, self.limits)?;
         self.work.allocate(items.len().saturating_mul(32))?;
         let height_start = self.heights.as_ref().map_or(0, Vec::len);
         let mut ps = Vec::with_capacity(items.len());
@@ -1239,8 +1336,8 @@ impl Admission<'_, '_> {
     }
 
     /// A closed ring of great elliptic arcs (or segments), simple.
-    fn ring(&mut self, v: &Gv) -> Result<(Vec<Pos>, arcs::Ring), GeometryRefusal> {
-        let ps = self.line(v, true)?;
+    fn ring<'a>(&mut self, v: impl ValueView<'a>) -> Result<(Vec<Pos>, arcs::Ring), GeometryRefusal> {
+        let ps = self.line(Some(v), true)?;
         let ring = self.work.scoped(|work| {
             work.charge(ps.len())?;
             arcs::Ring::admit(&self.space.frame, &ps, work)
@@ -1251,8 +1348,8 @@ impl Admission<'_, '_> {
         Ok((ps, ring))
     }
 
-    fn polygon(&mut self, v: &Gv) -> Result<(Vec<Vec<Pos>>, Vec<arcs::Ring>), GeometryRefusal> {
-        let items = array(Some(v), self.limits)?;
+    fn polygon<'a, V: ValueView<'a>>(&mut self, v: Option<V>) -> Result<(Vec<Vec<Pos>>, Vec<arcs::Ring>), GeometryRefusal> {
+        let items = array(v, self.limits)?;
         let mut positions = Vec::with_capacity(items.len());
         let mut rings = Vec::with_capacity(items.len());
         for item in items {
@@ -1278,8 +1375,8 @@ pub fn admit_geometry(
     admit_coordinates(value, space, limits, &mut GeometryWork::default())
 }
 
-fn admit_coordinates(
-    value: &Gv,
+fn admit_coordinates<'a>(
+    value: impl ValueView<'a>,
     space: &GeometrySpace,
     limits: &Limits,
     work: &mut GeometryWork,
@@ -1287,8 +1384,8 @@ fn admit_coordinates(
     admit_coordinates_nested(value, space, limits, work, 0)
 }
 
-fn admit_coordinates_nested(
-    value: &Gv,
+fn admit_coordinates_nested<'a>(
+    value: impl ValueView<'a>,
     space: &GeometrySpace,
     limits: &Limits,
     work: &mut GeometryWork,
@@ -1303,18 +1400,11 @@ fn admit_coordinates_nested(
     space.validate_kernel()?;
     work.charge(1)?;
     work.allocate(space.retained_bytes())?;
-    let Gv::Object(members) = value else {
-        return Err(invalid("expected geometry object"));
-    };
-    let kind = match value.get("type") {
-        Some(Gv::String(s)) => Kind::parse(s),
-        _ => None,
-    }
-    .ok_or_else(|| invalid("unsupported geometry type"))?;
-    if members
-        .iter()
-        .any(|(key, _)| key != "type" && key != kind.contents_key())
-    {
+    let mut members = value.object().ok_or_else(|| invalid("expected geometry object"))?;
+    let kind = value.field("type").and_then(ValueView::text)
+        .and_then(|name| Kind::parse(&name))
+        .ok_or_else(|| invalid("unsupported geometry type"))?;
+    if members.any(|(key, _)| key != "type" && key != kind.contents_key())    {
         return Err(invalid("unsupported member"));
     }
     let size = work.scoped(|work| {
@@ -1331,7 +1421,7 @@ fn admit_coordinates_nested(
         ));
     }
     if kind == Kind::GeometryCollection {
-        let members = array(value.get("geometries"), limits)?;
+        let members = array(value.field("geometries"), limits)?;
         work.allocate(
             members
                 .len()
@@ -1374,10 +1464,10 @@ fn admit_coordinates_nested(
         rings: 0,
         heights: (!space.is_ground()).then(Vec::new),
     };
-    let coordinates = value.get("coordinates");
+    let coordinates = value.field("coordinates");
     let coords = match kind {
         Kind::GeometryCollection => unreachable!("collection admitted above"),
-        Kind::Point if matches!(coordinates, Some(Gv::Array(items)) if items.is_empty()) => {
+        Kind::Point if coordinates.is_some_and(ValueView::is_empty_array) => {
             Coords::Empty
         },
         Kind::Point => Coords::Point(admission.point(coordinates)?),
@@ -1389,34 +1479,28 @@ fn admit_coordinates_nested(
                     .saturating_mul(std::mem::size_of::<Option<Pos>>()),
             )?;
             let ps = items
-                .iter()
                 .map(|x| {
                     admission.work.charge(1)?;
-                    match x {
-                        Gv::Array(items) if items.is_empty() => Ok(None),
-                        _ => admission.point(Some(x)).map(Some),
-                    }
+                    if x.is_empty_array() { Ok(None) } else { admission.point(Some(x)).map(Some) }
                 })
                 .collect::<Result<Vec<_>, GeometryRefusal>>()?;
             Coords::MultiPoint(ps)
         },
         Kind::LineString => {
-            Coords::Points(admission.line(coordinates.unwrap_or(&Gv::Null), false)?)
+            Coords::Points(admission.line(coordinates, false)?)
         },
         Kind::MultiLineString => {
             let items = array(coordinates, limits)?;
             let ls = items
-                .iter()
-                .map(|x| admission.line(x, false))
+                .map(|x| admission.line(Some(x), false))
                 .collect::<Result<Vec<_>, GeometryRefusal>>()?;
             Coords::Lines(ls)
         },
-        Kind::Polygon => Coords::Lines(admission.polygon(coordinates.unwrap_or(&Gv::Null))?.0),
+        Kind::Polygon => Coords::Lines(admission.polygon(coordinates)?.0),
         Kind::MultiPolygon => {
             let items = array(coordinates, limits)?;
             let (ps, rings): (Vec<_>, Vec<_>) = items
-                .iter()
-                .map(|x| admission.polygon(x))
+                .map(|x| admission.polygon(Some(x)))
                 .collect::<Result<Vec<_>, GeometryRefusal>>()?
                 .into_iter()
                 .unzip();
@@ -1517,16 +1601,38 @@ pub mod json {
 
     /// Shortest round-trip decimal digits of a positive finite number and
     /// the position of its decimal point.
-    fn shortest(x: f64) -> (String, i32) {
-        let text = format!("{x:e}");
+    fn shortest(x: f64, digits: &mut [u8; 17]) -> (&str, i32) {
+        let mut text = std::io::Cursor::new([0; 32]);
+        std::io::Write::write_fmt(&mut text, format_args!("{x:e}")).expect("fits binary64");
+        let length = text.position() as usize;
+        let text = std::str::from_utf8(&text.get_ref()[..length]).expect("ASCII decimal");
         let (mantissa, exponent) = text.split_once('e').expect("exponent form");
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = digits.trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
-        (
-            digits.to_string(),
-            exponent.parse::<i32>().expect("exponent") + 1,
-        )
+        let mut count = 0;
+        for digit in mantissa.bytes().filter(|&byte| byte != b'.') {
+            digits[count] = digit;
+            count += 1;
+        }
+        while count > 1 && digits[count - 1] == b'0' {
+            count -= 1;
+        }
+        let digits = std::str::from_utf8(&digits[..count]).expect("ASCII decimal digits");
+        (digits, exponent.parse::<i32>().expect("exponent") + 1)
+    }
+
+    pub(crate) fn number_len(x: f64) -> usize {
+        if x == 0.0 {
+            return 1;
+        }
+        let mut scratch = [0; 17];
+        let (digits, point) = shortest(x.abs(), &mut scratch);
+        let count = digits.len();
+        let body = match point {
+            1..=21 => (point as usize).max(count + usize::from(count > point as usize)),
+            -5..=0 => 2 + (-point) as usize + count,
+            _ => count + usize::from(count > 1) + 2
+                + super::decimal_digits((point - 1).unsigned_abs() as u64),
+        };
+        usize::from(x < 0.0) + body
     }
 
     /// ECMAScript `Number::toString` of a finite double; zero of either sign
@@ -1535,7 +1641,8 @@ pub mod json {
         if x == 0.0 {
             return "0".into();
         }
-        let (digits, point) = shortest(x.abs());
+        let mut scratch = [0; 17];
+        let (digits, point) = shortest(x.abs(), &mut scratch);
         let k = digits.len() as i32;
         let sign = if x < 0.0 { "-" } else { "" };
         if k <= point && point <= 21 {
@@ -1643,18 +1750,25 @@ pub fn admit_position_with_work(
     declaration: &GeometryDeclaration,
     work: &mut GeometryWork,
 ) -> Result<Position, GeometryRefusal> {
+    admit_position_view_with_work(value, declaration, work)
+}
+
+#[doc(hidden)]
+pub fn admit_position_view_with_work<'a>(
+    value: impl ValueView<'a>,
+    declaration: &GeometryDeclaration,
+    work: &mut GeometryWork,
+) -> Result<Position, GeometryRefusal> {
     if !declaration.space.is_ground() {
         return Err(invalid("Positions require XY coordinates"));
     }
-    let Gv::Object(object) = value else {
-        return Err(invalid("A position is an object"));
-    };
-    if object.len() != 2 {
+    let object = value.object().ok_or_else(|| invalid("A position is an object"))?;
+    if object.take(3).count() != 2 {
         return Err(invalid("A position has point and accuracy_m"));
     }
-    let accuracy_m = match value.get("accuracy_m") {
-        Some(Gv::Null) => None,
-        Some(radius) if number(radius).is_some_and(|radius| radius >= 0.0) => number(radius),
+    let accuracy_m = match value.field("accuracy_m") {
+        Some(radius) if matches!(radius.scalar(), Scalar::Null) => None,
+        Some(radius) if radius.number().is_some_and(|radius| radius >= 0.0) => radius.number(),
         _ => {
             return Err(invalid(
                 "Accuracy must be finite non-negative metres or explicit null",
@@ -1662,9 +1776,9 @@ pub fn admit_position_with_work(
         },
     };
     let point = value
-        .get("point")
+        .field("point")
         .ok_or_else(|| invalid("A position requires a point"))?;
-    let geometry = admit_declared_with_work(point, &[Kind::Point], declaration, work)?;
+    let geometry = require_kind(admit_view_with_work(point, declaration, work)?, &[Kind::Point])?;
     let Coords::Point(point) = geometry.coords else {
         return Err(invalid("A position requires a Point"));
     };

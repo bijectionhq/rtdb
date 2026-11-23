@@ -10,7 +10,7 @@ use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
+use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
@@ -36,6 +36,12 @@ struct OpenedLayout {
     whole: Option<CacheLease>,
 }
 
+enum DataProjection<'a> {
+    Full,
+    Iid,
+    PutColumns(&'a [String]),
+}
+
 impl DataFile {
     async fn open(&mut self, memory: &Arc<MemoryBudget>) -> Result<&OpenedLayout> {
         if self.opened.is_none() {
@@ -51,6 +57,10 @@ impl DataFile {
     }
 
     async fn decode_page(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.decode_page_as(page, memory, DataProjection::Full).await
+    }
+
+    async fn decode_page_as(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
@@ -62,7 +72,16 @@ impl DataFile {
         }
         audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
-        let batch = reader.decode_page(page, page_buffer(bytes))?;
+        let bytes = if matches!(projection, DataProjection::Iid) {
+            Buffer::from(Bytes::from_owner(bytes))
+        } else {
+            page_buffer(bytes)
+        };
+        let batch = match projection {
+            DataProjection::Full => reader.decode_page(page, bytes)?,
+            DataProjection::Iid => reader.decode_iid_page(page, bytes)?,
+            DataProjection::PutColumns(columns) => reader.decode_event_page(page, bytes, columns)?,
+        };
         Ok((batch, charged))
     }
 
@@ -130,16 +149,12 @@ pub async fn visit_trie_iids(
     let pages = file.open(&context.memory).await?.layout.decoder.page_count();
     for page in 0..pages {
         context.check_cancelled()?;
-        let (events, _charged) = match file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
-            Some(held) => (held.batch.view().clone(), context.memory.reserve(held.bound)?),
-            None => {
-                let (batch, charge) = file.decode_page(page, &context.memory).await?;
-                (EventBatch::new(batch)?, charge)
-            }
-        };
-        for row in 0..events.len() {
-            context.check_cancelled_at(row)?;
-            visit(events.iid(row)?)?;
+        if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+            let _charged = context.memory.reserve(held.bound)?;
+            visit_iids(context, held.batch.view().iids()?, &mut visit)?;
+        } else {
+            let (batch, _charged) = file.decode_page_as(page, &context.memory, DataProjection::Iid).await?;
+            visit_iids(context, IidView::new(batch.column(0).as_ref())?, &mut visit)?;
         }
     }
     Ok(())
@@ -159,6 +174,38 @@ pub async fn visit_trie_events(
         if cancellation.is_cancelled() { return Err(point_cancelled()); }
         let (batch, _charge) = file.decode_page(page, memory).await?;
         visit(&EventBatch::new(batch)?)?;
+    }
+    Ok(())
+}
+
+/// Counts rows from persisted IPC message metadata, stopping above the requested limit.
+#[doc(hidden)]
+pub async fn trie_row_count_up_to(
+    context: &crate::QueryContext, storage: Arc<BufferPool>, slug: &TableSlug, trie: &TrieKey, limit: usize,
+) -> Result<Option<usize>> {
+    context.check_cancelled()?;
+    let mut file = DataFile {
+        storage, key: ObjectKey::new(slug.data_key(trie))?,
+        metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
+    };
+    file.open(&context.memory).await?;
+    let opened = file.opened.as_ref().expect("the data file is open");
+    let decoder = &opened.layout.decoder;
+    let mut rows = 0usize;
+    for page in 0..decoder.page_count() {
+        context.check_cancelled()?;
+        let metadata = file.read_range(opened.whole.as_ref(), decoder.page_metadata_range(page)?, &context.memory).await?;
+        let page_rows = decoder.page_rows(page, metadata.as_slice())?;
+        if page_rows > limit - rows { return Ok(None); }
+        rows += page_rows;
+    }
+    Ok(Some(rows))
+}
+
+fn visit_iids(context: &crate::QueryContext, iids: IidView<'_>, visit: &mut impl FnMut(Iid) -> Result<()>) -> Result<()> {
+    for row in 0..iids.len() {
+        context.check_cancelled_at(row)?;
+        visit(iids.get(row)?)?;
     }
     Ok(())
 }
@@ -1781,11 +1828,24 @@ impl PartitionScan {
             }
             (PageSource::File { file, page: page_index, .. }, None) => {
                 let data = &mut self.files.entries[*file];
-                let (page, charged) = data.decode_page(*page_index, &self.execution.context.memory).await?;
+                let context = &self.execution.context;
+                let selected;
+                let projection = if context.spatial_refinement {
+                    selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+                    DataProjection::PutColumns(&selected)
+                } else {
+                    DataProjection::Full
+                };
+                let (page, charged) = data.decode_page_as(*page_index, &context.memory, projection).await?;
                 let bound = charged.bytes();
                 audience_work::scan_items(page.num_rows())?;
                 let headers = IndexBatch::header_bytes(page.num_rows())?;
-                let batch = match data.storage.admit(bound).zip(data.storage.admit(headers)) {
+                let cached_page = if context.spatial_refinement {
+                    None
+                } else {
+                    data.storage.admit(bound).zip(data.storage.admit(headers))
+                };
+                let batch = match cached_page {
                     Some((reservation, headers)) => {
                         let batch = IndexBatch::from_owned_with_headers(OwnedBatch::with_reservation(page, reservation)?, headers)?;
                         admitted = Some((Arc::clone(&batch), bound));
@@ -2935,6 +2995,25 @@ mod tests {
 
     async fn persisted_page_fixture() -> (PartitionState, TableRef, Vec<StoredEvent>, Arc<MemoryStore>, usize) {
         persisted_pages(false).await
+    }
+
+    #[tokio::test]
+    async fn spatial_arrow_trie_fallback_visits_iids_and_counts_persisted_events() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let snapshot = state.value().snapshot();
+        let slug = snapshot.table_entry(&table).unwrap().slug.clone();
+        let trie = snapshot.trie_entries(&table).into_iter().find(|trie| trie.key.level() == 0).unwrap().key.clone();
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (_, execution, _) = descriptor_scan(snapshot, table, Arc::clone(&storage));
+        let context = execution.context.as_ref();
+        let mut iids = Vec::new();
+        visit_trie_iids(context, Arc::clone(&storage), &slug, &trie, |iid| {
+            iids.push(iid);
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(iids, events.iter().map(|event| event.iid).collect::<Vec<_>>());
+        assert_eq!(trie_row_count_up_to(context, Arc::clone(&storage), &slug, &trie, 3).await.unwrap(), Some(3));
+        assert_eq!(trie_row_count_up_to(context, storage, &slug, &trie, 2).await.unwrap(), None);
     }
 
     /// Persists one page per event; `misplaced` writes the second event's page in the first one's place too.

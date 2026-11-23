@@ -1683,6 +1683,18 @@ async fn check_spatial_pages_at_the_original_cut() {
         assert_eq!(rtdb_columnar::read_entity_id(resumed.schema_ref().field(0), resumed.column(0).as_ref(), 0).unwrap(),
             rtdb_columnar::EntityIdRef::String("b"));
     }
+    let request = query(hold, path, valid, Some("a"), &region, "intersects", Some(select(&["borough"])));
+    let anchored = client.action("rtdb.owned.SpatialOpen.v1", request).await.unwrap();
+    let anchored = StreamReader::try_new(anchored[0].body.as_ref(), None).unwrap();
+    let bounded_token = uuid::Uuid::parse_str(&anchored.schema().metadata()["rtdb.owned.spatial_filter"]).unwrap();
+    let mut earlier = hold.to_vec();
+    earlier.extend_from_slice(bounded_token.as_bytes());
+    earlier.extend_from_slice(&[1, 0, 0, b'0']);
+    let reply = client.action("rtdb.owned.SpatialNext.v1", earlier.into()).await.unwrap();
+    let earlier = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(earlier.schema_ref().field(0), earlier.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("a"));
+
     let mut last = capability.clone();
     last.extend_from_slice(&[1, 0, 0, b'b']);
     let last = client.action("rtdb.owned.SpatialNext.v1", last.into()).await.unwrap();

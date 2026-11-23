@@ -29,7 +29,7 @@ mod sort;
 mod window;
 mod scan;
 #[doc(hidden)]
-pub use scan::visit_trie_iids;
+pub use scan::{trie_row_count_up_to, visit_trie_iids};
 #[doc(hidden)]
 pub use scan::visit_trie_events;
 mod fragment;

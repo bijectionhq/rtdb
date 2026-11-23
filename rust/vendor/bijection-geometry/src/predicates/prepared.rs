@@ -35,6 +35,7 @@ pub struct PreparedGeometry {
     index: Option<PackedEdges>,
     topology: Option<crate::topology::relation::PreparedTopology>,
     retained_bytes: usize,
+    reference_segments: Option<Vec<(Pos, Pos)>>,
 }
 
 impl Deref for PreparedGeometry {
@@ -83,6 +84,7 @@ impl PreparedGeometry {
             index,
             topology,
             retained_bytes,
+            reference_segments: None,
         })
     }
 
@@ -217,6 +219,51 @@ impl PreparedGeometry {
             predicate,
             work,
         )
+    }
+
+    pub fn prepare_reference_points(&mut self) {
+        if let Some(topology) = &mut self.topology {
+            self.retained_bytes += topology.retain_points(&self.geometry);
+        }
+    }
+
+    /// Retains the reference traversal order for exact distance and classification.
+    pub fn prepare_reference_segments(&mut self) {
+        if self.reference_segments.is_none() {
+            let segments = super::segments(&self.geometry);
+            self.retained_bytes += segments.capacity() * std::mem::size_of::<(Pos, Pos)>();
+            self.reference_segments = Some(segments);
+        }
+    }
+
+    pub fn topology_from(
+        &self, left: &Geometry, predicate: super::TopologyPredicate, work: &mut GeometryWork,
+    ) -> Result<bool, GeometryRefusal> {
+        match &self.topology {
+            Some(right) => right.evaluate_from(left, &self.geometry, predicate, work),
+            None => super::topology(left, &self.geometry, predicate, work),
+        }
+    }
+
+    pub fn exact_distance_from(&self, left: &Geometry, work: &mut GeometryWork) -> Result<f64, GeometryRefusal> {
+        let Some(right) = self.reference_segments.as_deref() else {
+            return super::distance(left, &self.geometry, work);
+        };
+        if matches!((&left.coords, &self.coords), (crate::Coords::Point(_), crate::Coords::Point(_))) {
+            work.charge(1)?;
+            return super::geometry_point_distance(left, &self.geometry);
+        }
+        if self.topology_from(left, super::TopologyPredicate::Intersects, work)? {
+            return Ok(0.0);
+        }
+        super::reference_segment_distance(left, right, work)
+    }
+
+    pub fn classify_exact(
+        &self, point: Pos, accuracy_m: Option<f64>, work: &mut GeometryWork,
+    ) -> Result<&'static str, GeometryRefusal> {
+        super::classify_with(point, accuracy_m, &self.geometry, self.topology.as_ref(),
+            self.reference_segments.as_deref(), work)
     }
 
     pub fn intersects(
@@ -395,6 +442,30 @@ mod tests {
         Kind,
         Size,
     };
+
+    #[test]
+    fn spatial_arrow_one_sided_preparation_preserves_distance_bits_and_work() {
+        use super::Preparation;
+        let space = GeometrySpace::wgs84_xy();
+        let line = |latitude| Geometry::new(
+            Kind::LineString, Coords::Points(vec![[0.0, latitude], [2.0, latitude]]), space.clone(),
+        );
+        let right = line(2.0);
+        let mut prepared = PreparedGeometry::new(right.clone(), Preparation::Topology, &mut GeometryWork::default()).unwrap();
+        prepared.prepare_reference_segments();
+        for left in [line(0.0), line(2.0), Geometry::new(Kind::Point, Coords::Point([1.0, 1.0]), space)] {
+            for steps in [100, 100_000] {
+                let mut reference = GeometryWork::with_limits(steps, 8 << 20);
+                let mut cached = GeometryWork::with_limits(steps, 8 << 20);
+                assert_eq!(
+                    crate::predicates::distance(&left, &right, &mut reference).map(f64::to_bits),
+                    prepared.exact_distance_from(&left, &mut cached).map(f64::to_bits),
+                );
+                assert_eq!(cached.usage().steps, reference.usage().steps);
+                assert_eq!(cached.usage().peak_allocated_bytes, reference.usage().peak_allocated_bytes);
+            }
+        }
+    }
 
     #[test]
     fn metric_preparation_preserves_pruning_and_exact_contact() -> anyhow::Result<()> {

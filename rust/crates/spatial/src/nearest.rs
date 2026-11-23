@@ -14,7 +14,7 @@ use rtdb_types::{Anomaly, Iid, OwnedRelation, Result, Timestamp};
 use crate::{
     NearestPosition, Page, PageOrder, Predicate, PreparedRegion, Projection, Request, kernel,
     postings::work_limit,
-    read::{SelectedHit, empty_projected_documents, gather_selected, visit_matches},
+    read::{DocumentColumns, SelectedHit, empty_projected_documents, gather_selected, visit_matches},
 };
 
 pub struct PreparedNearest {
@@ -183,6 +183,78 @@ impl PreparedNearest {
             _distance_reservation: Arc::clone(self.ranking.reservation()),
         })
     }
+}
+
+pub(super) async fn gather_range(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    valid_at: Timestamp,
+    projection: Projection<'_>,
+    document_columns: &DocumentColumns,
+    selection: &[(EntityIdRef<'_>, Iid)],
+    more: bool,
+) -> Result<Page> {
+    let reservation = context.memory.reserve(4096 + selection.len() * 256)?;
+    let positions = selection.iter().enumerate().map(|(rank, (id, _))| (*id, rank))
+        .collect::<BTreeMap<_, _>>();
+    if positions.len() != selection.len() { return Err(inconsistent_ranking()); }
+    let iids = selection.iter().map(|(_, iid)| *iid).collect();
+    let (geometry, partition) = if matches!(projection, Projection::Documents) {
+        (Some(document_columns.geometry.as_str()), document_columns.partition.as_slice())
+    } else {
+        (None, &[][..])
+    };
+    let cursor = open_owned_spatial_scan(
+        Arc::clone(&context), owner, relation, geometry, partition, valid_at, iids, projection, false,
+    ).await?;
+    let mut selected = (0..selection.len()).map(|_| None).collect::<Vec<_>>();
+    let mut layout = None;
+    if let Some(OwnedSpatialScan { mut cursor, document_columns }) = cursor {
+        while let Some(source) = cursor.next_batch().await? {
+            let source = Arc::new(source);
+            let batch = source.batch();
+            for row in 0..batch.num_rows() {
+                context.check_cancelled_at(row)?;
+                let id = read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)?;
+                let Some(&rank) = positions.get(&id) else { continue; };
+                let destination = &mut selected[rank];
+                if destination.is_some() { return Err(inconsistent_ranking()); }
+                *destination = Some(SelectedHit {
+                    distance_m: None,
+                    source: Arc::clone(&source),
+                    row,
+                });
+            }
+        }
+        layout = Some((cursor.runtime_schema().clone(), document_columns));
+    }
+    let selected = selected.into_iter().collect::<Option<Vec<_>>>().ok_or_else(inconsistent_ranking)?;
+    let rows = if selected.is_empty() {
+        empty_projected_documents(
+            projection, layout.as_ref().map(|(schema, columns)| (schema, columns.as_slice())),
+            &context.memory,
+        )?
+    } else {
+        let ids = [0];
+        let columns = if projection.has_documents() {
+            layout.as_ref().ok_or_else(inconsistent_ranking)?.1.as_slice()
+        } else {
+            &ids
+        };
+        gather_selected(&selected, columns, &context.memory)?
+    };
+    let distance_reservation = context.memory.reserve(4096 + selection.len() * 16)?;
+    let distances = Float64Array::new_null(selection.len());
+    drop(reservation);
+    Ok(Page {
+        more,
+        next_distance_m: None,
+        rows,
+        includes_documents: projection.has_documents(),
+        distances,
+        _distance_reservation: distance_reservation,
+    })
 }
 
 fn seek(

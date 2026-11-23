@@ -316,3 +316,99 @@ fn empty_dense_union_stream_keeps_offset_buffers_aligned() {
     assert_eq!(batch.schema(), schema);
     assert!(reader.next().is_none());
 }
+
+#[test]
+fn spatial_arrow_projects_iids_and_put_children_from_the_same_file() {
+    use arrow_buffer::Buffer;
+    use rtdb_format::{data::{EncodedEvent, EventBatch, PutColumn, StoredEvent, StoredOperation, build_event_batch}, ipc::{ArrowFile, PageDecoder}};
+    use rtdb_types::{Iid, Interval, LogicalType, RunEndWidth, ScalarType, Timestamp, Value};
+
+    let events = [
+        StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([42; 16]),
+            system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([
+                ("geometry".into(), Value::Binary(vec![1, 2, 3])),
+                ("payload".into(), Value::Utf8("irrelevant document payload".repeat(8192))),
+            ])),
+        },
+        StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([42; 16]),
+            system_from: Timestamp(9), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Delete,
+        },
+    ];
+    let put = StructFields::from([
+        ("geometry".into(), LogicalType::Scalar(ScalarType::Binary)),
+        ("payload".into(), LogicalType::Scalar(ScalarType::Utf8)),
+    ]);
+    let batch = build_event_batch(&events, Some(put), Some(RunEndWidth::I32)).unwrap();
+    let bytes = write_file(&batch.schema(), &[batch]).unwrap();
+    let tail = bytes.len() - 10;
+    let footer = tail - arrow_ipc::reader::read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+    let decoder = PageDecoder::from_footer(&bytes[footer..tail], footer as u64, None).unwrap();
+    let offset = decoder.page_range(0).unwrap();
+    let projected = decoder.decode_iid_page(0, Buffer::from(bytes[offset.start as usize..offset.end as usize].to_vec())).unwrap();
+    assert_eq!(projected.num_columns(), 1);
+    let iids = rtdb_columnar::IidView::new(projected.column(0).as_ref()).unwrap();
+    assert!(matches!(iids, rtdb_columnar::IidView::Run32(_)));
+    assert_eq!(iids.get(1).unwrap(), events[1].iid);
+
+    let mut reader = ArrowFile::open(bytes.into(), None).unwrap();
+    let projected = EventBatch::new(reader.read_event_page(0, &["geometry".into()]).unwrap()).unwrap();
+    let event = projected.borrow_event(0).unwrap();
+    assert!(matches!(event.put_column("payload"), Some(PutColumn::Absent)));
+    let Some(PutColumn::Stored(field, array, row)) = event.put_column("geometry") else {
+        panic!("projected geometry column");
+    };
+    assert_eq!(rtdb_columnar::binary_cell(field, array, row).unwrap(), Some(&[1, 2, 3][..]));
+    assert_eq!(projected.header(1).unwrap().op, rtdb_types::EventOp::Delete);
+}
+
+#[test]
+fn spatial_arrow_hashing_writer_keeps_the_complete_ipc_bytes() {
+    use sha2::{Digest, Sha256};
+
+    let batch = page();
+    let expected = write_file(&batch.schema(), std::slice::from_ref(&batch)).unwrap();
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(output.path()).unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+    let mut writer = ArrowFileWriter::new_hashed_bounded_reserved(file, &batch.schema(), expected.len() as u64, &memory).unwrap();
+    writer.write(&batch).unwrap();
+    let (length, digest) = writer.finish_hashed().unwrap();
+    assert_eq!(length, expected.len() as u64);
+    assert_eq!(digest.as_slice(), Sha256::digest(&expected).as_slice());
+    assert_eq!(std::fs::read(output.path()).unwrap(), expected);
+}
+
+#[test]
+fn spatial_arrow_iid_projection_skips_an_unselected_dictionary() {
+    use arrow_array::{builder::{FixedSizeBinaryBuilder, StringDictionaryBuilder}, types::Int8Type};
+    use arrow_buffer::Buffer;
+    use arrow_ipc::writer::FileWriter;
+    use rtdb_format::ipc::PageDecoder;
+
+    let mut iid = FixedSizeBinaryBuilder::new(16);
+    iid.append_value([9; 16]).unwrap();
+    let mut payload = StringDictionaryBuilder::<Int8Type>::new();
+    payload.append("unselected").unwrap();
+    let batch = RecordBatch::try_from_iter([
+        ("_iid", Arc::new(iid.finish()) as arrow_array::ArrayRef),
+        ("payload", Arc::new(payload.finish())),
+    ]).unwrap();
+    let mut sink = Vec::new();
+    let mut writer = FileWriter::try_new(&mut sink, &batch.schema()).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+    drop(writer);
+    let tail = sink.len() - 10;
+    let footer = tail - arrow_ipc::reader::read_footer_length(sink[tail..].try_into().unwrap()).unwrap();
+    let decoder = PageDecoder::from_footer(&sink[footer..tail], footer as u64, None).unwrap();
+    assert_eq!(decoder.dictionary_count(), 1);
+    let block = decoder.page_range(0).unwrap();
+    let bytes = Buffer::from(sink[block.start as usize..block.end as usize].to_vec());
+    assert!(decoder.decode_page(0, bytes.clone()).is_err());
+    let projected = decoder.decode_iid_page(0, bytes).unwrap();
+    assert_eq!(projected.column(0), batch.column(0));
+}

@@ -15,6 +15,7 @@ use rtdb_types::{Anomaly, Result};
 mod decoded_schema;
 mod java_layout;
 mod nulls;
+mod projection;
 mod undefined;
 
 pub struct ArrowFile {
@@ -146,12 +147,22 @@ impl ArrowFile {
         self.next_page = page + 1;
         Ok(batch)
     }
+
+    /// Reads an event page with only the requested children of its put leg.
+    pub fn read_event_page(&mut self, page: usize, put_columns: &[String]) -> Result<RecordBatch> {
+        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?)?;
+        let batch = self.pages.decode_event_page(page, buffer, put_columns)?;
+        self.next_page = page + 1;
+        Ok(batch)
+    }
+
 }
 
 pub struct PageDecoder {
     decoder: FileDecoder,
     schema: SchemaRef,
     source_schema: SchemaRef,
+    decoded_schema: SchemaRef,
     blocks: Vec<arrow_ipc::Block>,
     dictionaries: Vec<arrow_ipc::Block>,
 }
@@ -166,7 +177,7 @@ impl PageDecoder {
         let schema = if let Some(projection) = &projection { Arc::new(decoded.project(projection).map_err(invalid)?) } else { Arc::clone(&decoded) };
         // SAFETY: persisted blocks come from the database's Arrow writer. The reference writer's undefined union
         // cells use type ID -1. Decode checks each block's framing and repairs those cells before validating the page.
-        let mut decoder = unsafe { FileDecoder::new(decoded, footer.version()).with_skip_validation(true) };
+        let mut decoder = unsafe { FileDecoder::new(Arc::clone(&decoded), footer.version()).with_skip_validation(true) };
         if let Some(projection) = projection { decoder = decoder.with_projection(projection); }
         let blocks: Vec<_> = footer.recordBatches().ok_or_else(|| invalid("Arrow footer has no record-batch inventory"))?.iter().copied().collect();
         let dictionaries: Vec<_> = footer.dictionaries().into_iter().flat_map(|blocks| blocks.iter().copied()).collect();
@@ -176,7 +187,7 @@ impl PageDecoder {
                 return Err(invalid("Arrow block exceeds data region"));
             }
         }
-        Ok(Self { decoder, schema, source_schema, blocks, dictionaries })
+        Ok(Self { decoder, schema, source_schema, decoded_schema: decoded, blocks, dictionaries })
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
@@ -189,6 +200,24 @@ impl PageDecoder {
 
     pub fn page_range(&self, page: usize) -> Result<std::ops::Range<u64>> {
         block_range(self.block(page)?)
+    }
+
+    pub fn page_metadata_range(&self, page: usize) -> Result<std::ops::Range<u64>> {
+        let block = self.block(page)?;
+        let start = u64::try_from(block.offset()).map_err(invalid)?;
+        let length = u64::try_from(block.metaDataLength()).map_err(invalid)?;
+        Ok(start..start.checked_add(length).ok_or_else(|| invalid("Arrow block end overflow"))?)
+    }
+
+    pub fn page_rows(&self, page: usize, metadata: &[u8]) -> Result<usize> {
+        let block = self.block(page)?;
+        if metadata.len() != usize::try_from(block.metaDataLength()).map_err(invalid)? {
+            return Err(invalid("Arrow block differs from its footer length"));
+        }
+        let message = arrow_ipc::root_as_message(&metadata[block_header(metadata)?]).map_err(invalid)?;
+        check_block_message(&message, usize::try_from(block.bodyLength()).map_err(invalid)?, false)?;
+        let batch = message.header_as_record_batch().ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
+        usize::try_from(batch.length()).map_err(invalid)
     }
 
     pub fn dictionary_count(&self) -> usize { self.dictionaries.len() }
@@ -213,6 +242,31 @@ impl PageDecoder {
         let block = *self.dictionary(index)?;
         let bytes = prepare_block(&block, bytes, &self.source_schema, true)?;
         self.decoder.read_dictionary(&block, &bytes).map_err(invalid)
+    }
+
+    pub fn decode_iid_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
+        let iid = self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
+        match self.decode_projected(page, &bytes, projection::Selection::Iid) {
+            Ok(batch) => Ok(batch),
+            Err(_) => self.decode_page(page, bytes)?.project(&[iid]).map_err(invalid),
+        }
+    }
+
+    pub fn decode_event_page(&self, page: usize, bytes: Buffer, put_columns: &[String]) -> Result<RecordBatch> {
+        match self.decode_projected(page, &bytes, projection::Selection::PutColumns(put_columns)) {
+            Ok(batch) => Ok(batch),
+            // Some reference layouts use undefined union legs or unknown null counts.
+            Err(_) => self.decode_page(page, bytes),
+        }
+    }
+
+    fn decode_projected(&self, page: usize, bytes: &Buffer, selection: projection::Selection<'_>) -> Result<RecordBatch> {
+        let block = self.block(page)?;
+        let (header, metadata_end) = block_message(block, bytes)?;
+        let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
+        check_block_message(&message, bytes.len() - metadata_end, false)?;
+        let batch = message.header_as_record_batch().ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
+        projection::decode(&bytes.slice(metadata_end), batch, &self.decoded_schema, message.version(), selection)
     }
 
     pub fn decode_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
@@ -251,12 +305,16 @@ fn block_message(block: &arrow_ipc::Block, bytes: &[u8]) -> Result<(std::ops::Ra
     if bytes.len() != allocation_add(metadata_end, body_length)? {
         return Err(invalid("Arrow block differs from its footer length"));
     }
+    Ok((block_header(&bytes[..metadata_end])?, metadata_end))
+}
+
+fn block_header(metadata: &[u8]) -> Result<std::ops::Range<usize>> {
     let mut prefix = 0;
-    let mut length = inspection_i32(&bytes[..metadata_end], &mut prefix)?;
-    if length == -1 { length = inspection_i32(&bytes[..metadata_end], &mut prefix)?; }
+    let mut length = inspection_i32(metadata, &mut prefix)?;
+    if length == -1 { length = inspection_i32(metadata, &mut prefix)?; }
     let header_end = allocation_add(prefix, usize::try_from(length).map_err(invalid)?)?;
-    if header_end > metadata_end { return Err(invalid("Arrow block header exceeds its metadata")); }
-    Ok((prefix..header_end, metadata_end))
+    if header_end > metadata.len() { return Err(invalid("Arrow block header exceeds its metadata")); }
+    Ok(prefix..header_end)
 }
 
 fn block_bound(block: &arrow_ipc::Block, bytes: &[u8], dictionary: bool) -> Result<usize> {
@@ -597,6 +655,10 @@ fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_le
 
 fn validate_lz4_lengths(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result<()> {
     let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) else { return Ok(()); };
+    validate_lz4_batch(batch, body)
+}
+
+fn validate_lz4_batch(batch: arrow_ipc::RecordBatch<'_>, body: &[u8]) -> Result<()> {
     if !batch.compression().is_some_and(|compression| compression.codec() == arrow_ipc::CompressionType::LZ4_FRAME) { return Ok(()); }
     if let Some(buffers) = batch.buffers() {
         for buffer in buffers {
@@ -784,7 +846,7 @@ enum WriterAllocation {
     Owned { memory: Arc<MemoryBudget>, _schema: Arc<MemoryReservation>, blocks: Vec<Arc<MemoryReservation>>, block_bound: usize },
 }
 
-struct LimitedFile { file: File, position: u64, limit: u64 }
+struct LimitedFile { file: File, position: u64, limit: u64, sha256: Option<sha2::Sha256> }
 
 impl Write for LimitedFile {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -793,6 +855,9 @@ impl Write for LimitedFile {
         }
         let count = self.file.write(bytes)?;
         self.position += count as u64;
+        if let Some(hash) = &mut self.sha256 {
+            sha2::Digest::update(hash, &bytes[..count]);
+        }
         Ok(count)
     }
     fn flush(&mut self) -> std::io::Result<()> { self.file.flush() }
@@ -807,9 +872,13 @@ impl ArrowFileWriter {
 
     /// Rejects a write before the file would exceed `byte_limit`, including its footer.
     /// The caller reserves schema translation, Arrow encoding and footer scratch through `finish`.
-    pub fn new_bounded(mut file: File, schema: &Schema, byte_limit: u64) -> Result<Self> {
+    pub fn new_bounded(file: File, schema: &Schema, byte_limit: u64) -> Result<Self> {
+        Self::new_file(file, schema, byte_limit, None)
+    }
+
+    fn new_file(mut file: File, schema: &Schema, limit: u64, sha256: Option<sha2::Sha256>) -> Result<Self> {
         if file.metadata().map_err(invalid)?.len() != 0 || file.stream_position().map_err(invalid)? != 0 { return Err(invalid("Arrow output file must be empty and positioned at zero")); }
-        let writer = JavaFile::new(LimitedFile { file, position: 0, limit: byte_limit }, schema)?;
+        let writer = JavaFile::new(LimitedFile { file, position: 0, limit, sha256 }, schema)?;
         Ok(Self { writer, allocation: WriterAllocation::CallerReserved })
     }
 
@@ -822,9 +891,18 @@ impl ArrowFileWriter {
     /// Applies both the output-byte limit and the shared schema/footer memory budget.
     /// The file must be empty at offset zero; callers separately reserve each page's encoding scratch.
     pub fn new_bounded_reserved(file: File, schema: &Schema, byte_limit: u64, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::new_funded_file(file, schema, byte_limit, memory, None)
+    }
+
+    /// Writes the same IPC format while hashing exactly the bytes accepted by the file.
+    pub fn new_hashed_bounded_reserved(file: File, schema: &Schema, byte_limit: u64, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::new_funded_file(file, schema, byte_limit, memory, Some(sha2::Digest::new()))
+    }
+
+    fn new_funded_file(file: File, schema: &Schema, byte_limit: u64, memory: &Arc<MemoryBudget>, sha256: Option<sha2::Sha256>) -> Result<Self> {
         let reservation = memory.reserve(schema_translation_bound(schema)?)?;
         let block_bound = allocation_mul(allocation_add(dictionary_count(schema)?, 1)?, 512)?;
-        let mut writer = Self::new_bounded(file, schema, byte_limit)?;
+        let mut writer = Self::new_file(file, schema, byte_limit, sha256)?;
         writer.allocation = WriterAllocation::Owned { memory: Arc::clone(memory), _schema: reservation, blocks: Vec::new(), block_bound };
         Ok(writer)
     }
@@ -869,11 +947,21 @@ impl ArrowFileWriter {
 
     /// Finishes the JVM-compatible end marker and returns the caller-owned file at its end.
     pub fn finish(self) -> Result<File> {
+        Ok(self.finish_file()?.file)
+    }
+
+    pub fn finish_hashed(self) -> Result<(u64, [u8; 32])> {
+        let file = self.finish_file()?;
+        let hash = file.sha256.ok_or_else(|| invalid("Arrow writer was opened without hashing"))?;
+        Ok((file.position, sha2::Digest::finalize(hash).into()))
+    }
+
+    fn finish_file(self) -> Result<LimitedFile> {
         let _footer = match &self.allocation {
             WriterAllocation::CallerReserved => None,
             WriterAllocation::Owned { memory, _schema, blocks, block_bound } => Some(memory.reserve(allocation_add(_schema.bytes(), allocation_mul(blocks.len(), *block_bound)?)?)?),
         };
-        Ok(self.writer.finish()?.file)
+        self.writer.finish()
     }
 }
 

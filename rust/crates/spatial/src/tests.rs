@@ -17,8 +17,21 @@ fn point(longitude: f64, latitude: f64) -> Vec<u8> {
     [vec![0], geometry.wkb()].concat()
 }
 
+fn checked_candidates(
+    bytes: Vec<u8>,
+    digest: &[u8],
+    partition: Option<Partition>,
+    ranges: &[geometry::KeyRange],
+    memory: &std::sync::Arc<MemoryBudget>,
+    check: impl Fn() -> rtdb_types::Result<()>,
+    insert: impl FnMut(Iid) -> rtdb_types::Result<()>,
+) -> rtdb_types::Result<()> {
+    postings::verify_digest(postings::sha256(&bytes, &check)?, digest)?;
+    postings::candidates(bytes, partition, ranges, memory, check, insert)
+}
+
 #[test]
-fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitions() {
+fn spatial_arrow_posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitions() {
     let cases = [(179.999, 0.0, -179.999, 0.0), (34.0, 90.0, -31.0, 90.0)];
     for (row_lon, row_lat, query_lon, query_lat) in cases {
         let mut work = GeometryWork::default();
@@ -26,10 +39,11 @@ fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitio
         let origin = Location::decode(&point(query_lon, query_lat), &mut work).unwrap();
         let radius = Predicate::WithinDistance(500.0);
         assert_eq!(
-            radius.evaluate(&row, &origin, &mut work).unwrap(),
+            radius.evaluate(&row, &origin.geometry, None, &mut work).unwrap(),
             Some(None)
         );
-        let cover = radius.cover(&origin, &mut work).unwrap().unwrap();
+        let prepared = radius.prepare_geometry(&origin.geometry, &mut work).unwrap();
+        let cover = radius.cover(&prepared, &mut work).unwrap().unwrap();
         let selected = Partition::of([b"east".as_slice()]);
         let elsewhere = Partition::of([b"west".as_slice()]);
         let wanted = Iid([1; 16]);
@@ -50,7 +64,7 @@ fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitio
         assert_eq!(length, bytes.len() as u64);
         assert!(bytes.starts_with(b"ARROW1"));
         let mut hits = Vec::new();
-        postings::candidates(
+        checked_candidates(
             bytes.clone(),
             &digest,
             Some(selected),
@@ -65,7 +79,7 @@ fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitio
         .unwrap();
         assert_eq!(hits, [wanted]);
         hits.clear();
-        postings::candidates(
+        checked_candidates(
             bytes.clone(),
             &digest,
             None,
@@ -80,7 +94,7 @@ fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitio
         .unwrap();
         hits.sort_unstable();
         assert_eq!(hits, [wanted, Iid([2; 16])]);
-        let error = postings::candidates(
+        let error = checked_candidates(
             bytes.clone(),
             &digest,
             None,
@@ -93,7 +107,7 @@ fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitio
         assert_eq!(error.code, "rtdb.spatial/cancelled");
         bytes[0] ^= 1;
         assert!(
-            postings::candidates(
+            checked_candidates(
                 bytes,
                 &digest,
                 Some(selected),
@@ -108,7 +122,7 @@ fn posting_covers_keep_points_across_the_antimeridian_and_exclude_other_partitio
 }
 
 #[test]
-fn spatial_postings_seek_across_arrow_page_boundaries() {
+fn spatial_arrow_postings_seek_across_page_boundaries() {
     let memory = MemoryBudget::new(32 << 20);
     let partition = Partition::of([b"area".as_slice()]);
     let iid = Iid([9; 16]);
@@ -128,7 +142,7 @@ fn spatial_postings_seek_across_arrow_page_boundaries() {
         )
         .unwrap();
     let mut selected = Vec::new();
-    postings::candidates(
+    checked_candidates(
         std::fs::read(file.path()).unwrap(),
         &digest,
         Some(partition),
@@ -145,4 +159,35 @@ fn spatial_postings_seek_across_arrow_page_boundaries() {
     )
     .unwrap();
     assert_eq!(selected, [iid, iid]);
+}
+
+
+#[test]
+fn spatial_arrow_bijection_images_borrow_fields_and_preserve_coordinate_bits() {
+    use geometry::{Scalar, ValueView};
+    use rtdb_types::SpatialGeometryEncoding;
+
+    fn float(out: &mut Vec<u8>, value: f64) {
+        out.push(5);
+        let bits = value.to_bits();
+        out.extend_from_slice(&(if bits >> 63 == 0 { bits ^ (1 << 63) } else { !bits }).to_be_bytes());
+    }
+
+    let longitude = 1.000_000_000_000_000_2;
+    let mut image = b"\rcoordinates\0\x01\x0c".to_vec();
+    float(&mut image, longitude);
+    float(&mut image, -0.0);
+    image.extend_from_slice(b"\0\0type\0\x01\x09Point\0\x01\0\0");
+    let mut work = GeometryWork::default();
+    let decoded = super::bijection_geometry::decode(&image, &mut work).unwrap();
+    assert!(matches!(decoded.field("type").unwrap().text(), Some(std::borrow::Cow::Borrowed("Point"))));
+    assert!(matches!(decoded.field("coordinates").unwrap().array().unwrap().next().unwrap().scalar(),
+        Scalar::Float(value) if value.to_bits() == longitude.to_bits()));
+    let loc = Location::decode_stored(&image, SpatialGeometryEncoding::BijectionGeometry, &mut work)
+        .unwrap().unwrap();
+    assert_eq!(loc.geometry.wkb(), point(longitude, 0.0)[1..]);
+
+    image.push(0);
+    let error = Location::decode_stored(&image, SpatialGeometryEncoding::BijectionGeometry, &mut work).err().unwrap();
+    assert_eq!(error.message.as_deref(), Some("Bijection geometry has trailing bytes"));
 }

@@ -923,7 +923,8 @@ pub async fn open_owned_spatial_scan(
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(), table: relation.table(owner),
     };
-    let context = context.for_owned_relation(name.clone(), None);
+    let mut context = context.for_owned_relation(name.clone(), None);
+    Arc::make_mut(&mut context).spatial_refinement = include_iid && !projection.has_documents();
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
     let mut fields = vec!["_id"];
     fields.extend(geometry);

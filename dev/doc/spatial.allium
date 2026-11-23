@@ -22,6 +22,8 @@ entity SpatialPostings {
 -- A declaration after a drop has a fresh generation.
 -- A path can index original Bijection geometry or position images in an existing Binary document column.
 -- The encoding is part of the path declaration and stays fixed for its generation.
+-- Native WKB and Bijection images admit their binary ordinates directly into typed geometry.
+-- Admission counts the exact canonical JSON byte length with bounded scalar scratch.
 -- Readiness at a held cut requires current-generation postings on the durable sources scheduled for spatial indexing.
 -- The live tail and unscheduled durable sources must fit the fallback scan limits at that cut.
 -- An ordered Root catalog publication can require the exact staged path definition and check its coverage at the ordered cut.
@@ -34,26 +36,34 @@ entity SpatialPostings {
 -- A failed readiness condition prevents publication of the revised catalog.
 -- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.
 -- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.
+-- The builder decodes the geometry and partition children of a put where the IPC layout allows projection.
 -- The builder appends covering keys to typed Arrow columns and sorts their row positions.
+-- The posting digest covers the exact bytes written to the file.
 -- A held read decodes posting pages against the admitted immutable IPC allocation.
 -- A posting read admits the recorded object length and provider scratch before reading its body.
+-- Each cached immutable posting allocation retains the digest of its bytes for comparison with the held catalog.
 -- Admitted posting and trie provider reads retain the captured catalog until their I/O completes.
 -- Each shape contributes the keys of a bounded covering, and each point contributes a leaf with its reported accuracy class.
 -- A partition's digest is a candidate key, and the exact read also compares the partition bytes on the resolved row.
 -- The exact comparison uses the partition values borrowed from the held read request.
 -- A held read uses the path definition, source inventory, and live segments selected by the same snapshot.
--- A prepared filter belongs to its authenticated held read and retains its Arrow partition and parsed region.
+-- Exact refinement reuses the prepared region topology and its ordered metric segments across candidates.
+-- A prepared filter belongs to its authenticated held read and retains its request projection and range or ranked matches.
 -- A continuation sends the filter capability, complete typed identity, bound, and observation flag.
 -- Repeating a continuation evaluates the same filter and held cut.
 -- Closing a filter or its held read releases the retained filter.
--- A missing or invalid posting file is covered by reading candidate IIDs through the native Arrow page reader within the read budget.
+-- A missing or invalid posting file is covered by reading the IID projection through the native Arrow page reader within the read budget.
+-- Readiness counts uncovered rows from trie catalog counts or Arrow page metadata.
 -- The live tail contributes candidate IIDs from its held event batches.
 -- One read budget covers all candidate sources and all refined rows.
 -- Any candidate set contains every IID whose visible row matches the requested partition and predicate.
 -- A complete typed identity contributes at most one result at the chosen valid instant.
 -- Complete row history, including delete and erase events, determines visibility before exact geometry refinement.
 -- Only visible rows supply geometry to the read's exact predicate.
+-- Range refinement reads the complete typed identity, IID, geometry and equality partition of each candidate.
 -- A range page advances in complete typed identity order at the original hold.
+-- A held range continuation reuses refined matches after its original anchor.
+-- Each range page gathers documents for the IIDs selected by that page.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
 -- A ranked distance window excludes its exact lower radius and includes its upper radius when supplied.
 -- Consecutive distance windows opened on one held read use its original snapshot and valid instant.

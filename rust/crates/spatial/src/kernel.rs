@@ -4,7 +4,7 @@ use geometry::predicates::{
 };
 use geometry::spatial_index::{candidate_ranges, point_key, shape_keys};
 use geometry::{
-    Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, Gv, KeyRange, Kind, Size,
+    Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, KeyRange, Kind, Scalar, Size, ValueView,
 };
 use rtdb_types::{Anomaly, Result, SpatialGeometryEncoding};
 
@@ -12,13 +12,11 @@ pub(crate) const WORK_STEPS: usize = 10_000_000;
 pub(crate) const WORK_BYTES: usize = 8 << 20;
 
 pub(crate) struct Location {
-    geometry: Geometry,
+    pub(crate) geometry: Geometry,
     position_accuracy: Option<Option<f64>>,
 }
 
 impl Location {
-    pub(crate) fn retained_bytes(&self) -> usize { self.geometry.retained_bytes() }
-
     pub(crate) fn decode(bytes: &[u8], work: &mut GeometryWork) -> Result<Self> {
         let Some((&tag, payload)) = bytes.split_first() else {
             return Err(invalid("Missing location encoding"));
@@ -61,7 +59,7 @@ impl Location {
             return Self::decode(bytes, work).map(Some);
         }
         let value = crate::bijection_geometry::decode(bytes, work)?;
-        if matches!(value, Gv::Null) {
+        if matches!(value.scalar(), Scalar::Null) {
             return Ok(None);
         }
         let declaration = GeometryDeclaration {
@@ -69,14 +67,14 @@ impl Location {
             size: Size::Large,
         };
         if encoding == SpatialGeometryEncoding::BijectionPosition {
-            let position = geometry::admit_position_with_work(&value, &declaration, work)
+            let position = geometry::admit_position_view_with_work(value, &declaration, work)
                 .map_err(geometry_error)?;
             return Ok(Some(Self {
                 geometry: Geometry::new(Kind::Point, Coords::Point(position.point), declaration.space),
                 position_accuracy: Some(position.accuracy_m),
             }));
         }
-        let geometry = geometry::admit_value_with_work(&value, &declaration, work)
+        let geometry = geometry::admit_view_with_work(value, &declaration, work)
             .map_err(geometry_error)?;
         Ok(Some(Self { geometry, position_accuracy: None }))
     }
@@ -153,55 +151,65 @@ impl Predicate {
         }))
     }
 
-    pub(crate) fn cover(
-        self,
-        region: &Location,
-        work: &mut GeometryWork,
-    ) -> Result<Option<Vec<KeyRange>>> {
-        let predicate = match self {
-            Self::All => return Ok(None),
-            Self::Topology(TopologyPredicate::Disjoint)
+    pub(crate) fn cover_predicate(self) -> Option<CoverPredicate> {
+        Some(match self {
+            Self::All
+            | Self::Topology(TopologyPredicate::Disjoint)
             | Self::Classification(Classification::Outside | Classification::Unknown)
-            | Self::Nearest { radius_m: None, .. } => return Ok(None),
+            | Self::Nearest { radius_m: None, .. } => return None,
             Self::Topology(_) => CoverPredicate::Touches,
             Self::WithinDistance(distance_m)
-            | Self::Nearest {
-                radius_m: Some(distance_m),
-                ..
-            } => CoverPredicate::Within { distance_m },
+            | Self::Nearest { radius_m: Some(distance_m), .. } => CoverPredicate::Within { distance_m },
             Self::Classification(Classification::Inside) => CoverPredicate::ClassifyInside,
             Self::Classification(Classification::Uncertain) => CoverPredicate::Classify,
-        };
-        if region.geometry.is_empty() {
-            return Ok(None);
-        }
-        let prepared = PreparedGeometry::new(region.geometry.clone(), Preparation::Topology, work)
+        })
+    }
+
+    pub(crate) fn prepare_geometry(self, region: &Geometry, work: &mut GeometryWork) -> Result<PreparedGeometry> {
+        let mut prepared = PreparedGeometry::new(region.clone(), Preparation::Topology, work)
             .map_err(geometry_error)?;
-        candidate_ranges(&prepared, predicate, work)
-            .map(Some)
-            .map_err(geometry_error)
+        if matches!(self, Self::Topology(_) | Self::WithinDistance(_) | Self::Nearest { .. }) {
+            prepared.prepare_reference_points();
+        }
+        if matches!(self, Self::WithinDistance(_) | Self::Nearest { .. } | Self::Classification(_)) {
+            prepared.prepare_reference_segments();
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn cover(self, region: &PreparedGeometry, work: &mut GeometryWork) -> Result<Option<Vec<KeyRange>>> {
+        self.cover_predicate().map(|predicate| candidate_ranges(region, predicate, work).map_err(geometry_error)).transpose()
     }
 
     // Outer option denotes eligibility; the inner value is the exact nearest distance.
     pub(crate) fn evaluate(
         self,
         value: &Location,
-        region: &Location,
+        region: &Geometry,
+        prepared: Option<&PreparedGeometry>,
         work: &mut GeometryWork,
     ) -> Result<Option<Option<f64>>> {
+        let distance = |work: &mut GeometryWork| match prepared {
+            Some(prepared) => prepared.exact_distance_from(&value.geometry, work),
+            None => predicates::distance(&value.geometry, region, work),
+        };
         let exact = match self {
             Self::All => return Ok(Some(None)),
-            Self::Topology(predicate) => {
-                predicates::topology(&value.geometry, &region.geometry, predicate, work)
-            }
+            Self::Topology(predicate) => match prepared {
+                Some(prepared) => prepared.topology_from(&value.geometry, predicate, work),
+                None => predicates::topology(&value.geometry, region, predicate, work),
+            },
             Self::WithinDistance(radius_m) => {
-                predicates::distance(&value.geometry, &region.geometry, work)
+                distance(work)
                     .map(|distance| distance.is_finite() && distance <= radius_m)
             }
             Self::Classification(expected) => {
                 match (&value.geometry.coords, value.position_accuracy) {
                     (Coords::Point(point), Some(accuracy)) => {
-                        predicates::classify(*point, accuracy, &region.geometry, work).map(
+                        match prepared {
+                            Some(prepared) => prepared.classify_exact(*point, accuracy, work),
+                            None => predicates::classify(*point, accuracy, region, work),
+                        }.map(
                             |actual| {
                                 actual
                                     == match expected {
@@ -223,7 +231,7 @@ impl Predicate {
                 if value.position_accuracy.is_some() && !reported_center {
                     return Ok(None);
                 }
-                let distance = predicates::distance(&value.geometry, &region.geometry, work)
+                let distance = distance(work)
                     .map_err(geometry_error)?;
                 return Ok((distance.is_finite()
                     && radius_m.is_none_or(|radius| distance <= radius))

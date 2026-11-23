@@ -69,6 +69,28 @@ pub(crate) struct PreparedTopology {
     shape: Shape,
     dimension: i8,
     bounds: [f64; 4],
+    preparation: TopologyCost,
+    points: Option<std::collections::BTreeSet<[u64; 3]>>,
+}
+
+struct TopologyCost {
+    steps: usize,
+    bytes: usize,
+    peak: usize,
+}
+
+impl TopologyCost {
+    fn replay(&self, work: &mut GeometryWork) -> Result<bool, GeometryRefusal> {
+        if work.observer.is_some() || self.steps > work.remaining_steps()
+            || self.peak > work.allocation_limit.saturating_sub(work.allocated_bytes)
+        {
+            return Ok(false);
+        }
+        work.charge(self.steps)?;
+        work.allocate(self.peak)?;
+        work.release(self.peak - self.bytes);
+        Ok(true)
+    }
 }
 
 fn dim(geometry: &Geometry) -> i8 {
@@ -156,58 +178,78 @@ impl PreparedTopology {
         geometry: &Geometry,
         work: &mut GeometryWork,
     ) -> Result<Self, GeometryRefusal> {
-        geometry.space.validate_kernel()?;
-        if !geometry.space.is_ground() || geometry.heights.is_some() {
-            return Err(crate::unsupported_space(
-                "Topology requires explicit ground projection",
-            ));
-        }
-        work.charge(geometry.position_count())?;
-        let frame = geometry.space.frame.clone();
-        let shape = Shape::new(
-            &frame,
-            &[geometry],
-            Parts {
-                areas: true,
-                lines: true,
-                points: true,
-            },
-            work,
-        )?;
-        let mut bounds = [
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        ];
-        for edge in &shape.edges {
-            if edge.role != Role::Collapsed {
-                bounds = span(bounds, arcs::arc_box(shape.geographic, edge.start, edge.end));
+        let initial_bytes = work.allocated_bytes;
+        let initial_steps = work.steps;
+        let previous_peak = std::mem::replace(&mut work.peak_allocated_bytes, initial_bytes);
+        let result = (|| {
+            geometry.space.validate_kernel()?;
+            if !geometry.space.is_ground() || geometry.heights.is_some() {
+                return Err(crate::unsupported_space(
+                    "Topology requires explicit ground projection",
+                ));
             }
-        }
-        if shape.geographic {
-            for ring in shape.rings.iter().filter(|ring| !ring.hole) {
-                let full = [-180.0 - TOLERANCE, 180.0 + TOLERANCE];
-                if ring.region(0, false) {
-                    bounds = span(bounds, [full[0], bounds[1], full[1], 90.0 + TOLERANCE]);
-                }
-                if ring.region(1, false) {
-                    bounds = span(bounds, [full[0], -90.0 - TOLERANCE, full[1], bounds[3]]);
+            work.charge(geometry.position_count())?;
+            let frame = geometry.space.frame.clone();
+            let shape = Shape::new(
+                &frame,
+                &[geometry],
+                Parts {
+                    areas: true,
+                    lines: true,
+                    points: true,
+                },
+                work,
+            )?;
+            let mut bounds = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for edge in &shape.edges {
+                if edge.role != Role::Collapsed {
+                    bounds = span(bounds, arcs::arc_box(shape.geographic, edge.start, edge.end));
                 }
             }
-        }
-        let index = PackedEdges::new(
-            shape.edges.iter().map(|edge| edge.raw).collect(),
-            &frame,
-            work,
-        )?;
-        Ok(Self {
-            frame,
-            index,
-            dimension: dim(geometry),
-            bounds,
-            shape,
-        })
+            if shape.geographic {
+                for ring in shape.rings.iter().filter(|ring| !ring.hole) {
+                    let full = [-180.0 - TOLERANCE, 180.0 + TOLERANCE];
+                    if ring.region(0, false) {
+                        bounds = span(bounds, [full[0], bounds[1], full[1], 90.0 + TOLERANCE]);
+                    }
+                    if ring.region(1, false) {
+                        bounds = span(bounds, [full[0], -90.0 - TOLERANCE, full[1], bounds[3]]);
+                    }
+                }
+            }
+            let index = PackedEdges::new(
+                shape.edges.iter().map(|edge| edge.raw).collect(),
+                &frame,
+                work,
+            )?;
+            Ok(Self {
+                frame,
+                index,
+                dimension: dim(geometry),
+                bounds,
+                shape,
+                points: None,
+                preparation: TopologyCost {
+                    steps: work.steps - initial_steps,
+                    bytes: work.allocated_bytes - initial_bytes,
+                    peak: work.peak_allocated_bytes - initial_bytes,
+                },
+            })
+        })();
+        work.peak_allocated_bytes = work.peak_allocated_bytes.max(previous_peak);
+        result
+    }
+
+    pub(crate) fn retain_points(&mut self, geometry: &Geometry) -> usize {
+        if self.dimension != 0 || self.points.is_some() { return 0; }
+        let count = geometry.position_count();
+        self.points = Some(build_point_set(geometry));
+        count.saturating_mul(80)
     }
 
     fn geographic(&self) -> bool {
@@ -264,6 +306,34 @@ impl PreparedTopology {
         work: &mut GeometryWork,
     ) -> Result<bool, GeometryRefusal> {
         work.scoped(|work| evaluate_topologies(a, b, predicate, self, other, work))
+    }
+
+    pub(crate) fn evaluate_from(
+        &self, left: &Geometry, right: &Geometry, predicate: Predicate, work: &mut GeometryWork,
+    ) -> Result<bool, GeometryRefusal> {
+        validate_pair(left, right)?;
+        if left.is_empty() || right.is_empty() {
+            return Ok(empty_pair(left, right, predicate));
+        }
+        work.scoped(|work| {
+            let left_topology = Self::new(left, work)?;
+            if self.preparation.replay(work)? {
+                evaluate_topologies(left, right, predicate, &left_topology, self, work)
+            } else {
+                let right_topology = Self::new(right, work)?;
+                evaluate_topologies(left, right, predicate, &left_topology, &right_topology, work)
+            }
+        })
+    }
+
+    pub(crate) fn replay_relation(
+        &self, geometry: &Geometry, point: Pos, work: &mut GeometryWork,
+    ) -> Result<Rel, GeometryRefusal> {
+        if self.preparation.replay(work)? {
+            self.relation(point, work)
+        } else {
+            Self::new(geometry, work)?.relation(point, work)
+        }
     }
 
     /// Interior 0, boundary 1 or exterior 2. Candidate edges and samples
@@ -585,6 +655,11 @@ fn validate_pair(a: &Geometry, b: &Geometry) -> Result<(), GeometryRefusal> {
     Ok(())
 }
 
+fn empty_pair(a: &Geometry, b: &Geometry, predicate: Predicate) -> bool {
+    matches!(predicate, Predicate::Disjoint)
+        || matches!(predicate, Predicate::Equals) && a.is_empty() && b.is_empty()
+}
+
 pub(crate) fn evaluate(
     a: &Geometry,
     b: &Geometry,
@@ -593,8 +668,7 @@ pub(crate) fn evaluate(
 ) -> Result<bool, GeometryRefusal> {
     validate_pair(a, b)?;
     if a.is_empty() || b.is_empty() {
-        return Ok(matches!(predicate, Predicate::Disjoint)
-            || matches!(predicate, Predicate::Equals) && a.is_empty() && b.is_empty());
+        return Ok(empty_pair(a, b, predicate));
     }
     work.scoped(|work| {
         let left = PreparedTopology::new(a, work)?;
@@ -613,8 +687,7 @@ fn evaluate_topologies(
 ) -> Result<bool, GeometryRefusal> {
     validate_pair(a, b)?;
     if a.is_empty() || b.is_empty() {
-        return Ok(matches!(predicate, Predicate::Disjoint)
-            || matches!(predicate, Predicate::Equals) && a.is_empty() && b.is_empty());
+        return Ok(empty_pair(a, b, predicate));
     }
     let geographic = left.geographic();
     if !reaches(&left.bounds, &right.bounds, geographic) {
@@ -623,8 +696,8 @@ fn evaluate_topologies(
     if left.dimension == 0 || right.dimension == 0 {
         let mut cells = [[-1_i8; 3]; 3];
         if left.dimension == 0 && right.dimension == 0 {
-            let a = point_set(a, work)?;
-            let b = point_set(b, work)?;
+            let a = point_set(a, left.points.as_ref(), work)?;
+            let b = point_set(b, right.points.as_ref(), work)?;
             if a.iter().any(|p| b.contains(p)) {
                 cells[0][0] = 0;
             }
@@ -636,15 +709,15 @@ fn evaluate_topologies(
             }
             return Ok(evaluate_matrix(cells, 0, 0, predicate));
         }
-        let (points, topology, predicate) = if left.dimension == 0 {
-            (a, right, predicate)
+        let (points, cached, topology, predicate) = if left.dimension == 0 {
+            (a, left.points.as_ref(), right, predicate)
         } else {
-            (b, left, predicate.transposed())
+            (b, right.points.as_ref(), left, predicate.transposed())
         };
         // A finite point set cannot cover a positive-dimensional interior.
         // Locate each distinct point once; no pair arrangement is needed.
         cells[2][0] = topology.dimension;
-        for p in point_set(points, work)? {
+        for p in point_set(points, cached, work)?.iter() {
             let location = topology.locate(&Point::vertex(p.map(f64::from_bits)), work)?;
             cells[0][location] = 0;
         }
@@ -760,18 +833,26 @@ fn refine(
 
 /// Distinct points by their frame vertex: ±180 and a pole's longitudes
 /// name one point in WGS84.
-fn point_set(
+fn point_set<'a>(
     geometry: &Geometry,
+    cached: Option<&'a std::collections::BTreeSet<[u64; 3]>>,
     work: &mut GeometryWork,
-) -> Result<std::collections::BTreeSet<[u64; 3]>, GeometryRefusal> {
+) -> Result<std::borrow::Cow<'a, std::collections::BTreeSet<[u64; 3]>>, GeometryRefusal> {
     let count = geometry.position_count();
     work.charge(count.saturating_mul(count.max(1).ilog2() as usize + 1))?;
     work.allocate(count.saturating_mul(80))?;
+    Ok(match cached {
+        Some(points) => std::borrow::Cow::Borrowed(points),
+        None => std::borrow::Cow::Owned(build_point_set(geometry)),
+    })
+}
+
+fn build_point_set(geometry: &Geometry) -> std::collections::BTreeSet<[u64; 3]> {
     let mut points = std::collections::BTreeSet::new();
     geometry.for_each(|p| {
         points.insert(arcs::embed(&geometry.space.frame, *p).map(f64::to_bits));
     });
-    Ok(points)
+    points
 }
 
 fn evaluate_matrix(

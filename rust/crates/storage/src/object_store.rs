@@ -124,12 +124,13 @@ impl ReadReservation {
     /// Transfers the charge to the completed allocation; mismatched byte counts are rejected.
     pub fn finish(self, bytes: Bytes) -> Result<RetainedBytes> {
         if bytes.len() != self.length { return Err(Error::Task("reserved read returned a different byte count".into())); }
-        Ok(RetainedBytes { bytes, _retention: self.retention })
+        Ok(RetainedBytes { bytes, _retention: self.retention, sha256: Default::default() })
     }
 }
 
 pub struct RetainedBytes {
     bytes: Bytes,
+    pub(crate) sha256: parking_lot::Mutex<Option<[u8; 32]>>,
     _retention: Arc<dyn Send + Sync>,
 }
 

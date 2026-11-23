@@ -323,6 +323,10 @@ pub struct EventBatch {
     put_type: std::sync::Arc<std::sync::OnceLock<LogicalType>>,
 }
 
+pub(crate) fn event_arrow_error(error: arrow_schema::ArrowError) -> Anomaly {
+    invalid(error)
+}
+
 impl EventBatch {
     pub fn new(batch: RecordBatch) -> Result<Self> {
         let schema = batch.schema();
@@ -476,8 +480,12 @@ impl EventBatch {
         Ok(self.keys().map(|keys| keys.value(row)))
     }
 
+    pub fn iids(&self) -> Result<IidView<'_>> {
+        IidView::new(self.batch.column(self.iid).as_ref())
+    }
+
     pub fn iid(&self, row: usize) -> Result<Iid> {
-        IidView::new(self.batch.column(self.iid).as_ref())?.get(row)
+        self.iids()?.get(row)
     }
 
     pub fn header(&self, row: usize) -> Result<EventHeader> {

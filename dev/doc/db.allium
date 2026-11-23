@@ -2065,6 +2065,8 @@ surface QueryAccess {
         -- Evaluated vectors of one list kind pack into a single Arrow column across row and component nulls.
         -- Mixed Float32 and Float64 components retain their respective widths in a dense Arrow union.
         -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
+        -- A spatial fallback read projects IIDs from persisted pages.
+        -- A spatial refinement scan can project the requested put children from persisted pages.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
