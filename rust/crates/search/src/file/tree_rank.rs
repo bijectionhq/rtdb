@@ -93,10 +93,13 @@ pub(crate) struct TreeRanked {
     members: Vec<MemberStart>,
     documents: u32,
     bounds: TemporalBounds,
-    id_order: bool,
+    order: TreeRankOrder,
     checked_frequencies: BTreeSet<(usize, usize)>,
     checked_positions: BTreeSet<(usize, usize)>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TreeRankOrder { Score, Integer, Uuid }
 
 pub(crate) struct TreeCandidate {
     pub iid: Iid,
@@ -107,7 +110,7 @@ pub(crate) struct TreeCandidate {
 
 impl TreeRanked {
     pub async fn open(file: Arc<TreeFile>, column: usize, matching: &Query, scoring: &RankScorer,
-        bounds: TemporalBounds, id_order: bool) -> Result<Self> {
+        bounds: TemporalBounds, order: TreeRankOrder) -> Result<Self> {
         let term_ids: BTreeMap<_, _> = matching.terms().iter().chain(scoring.scorer().query().terms())
             .collect::<BTreeSet<_>>().into_iter().enumerate().map(|(index, term)| (term.as_str(), index)).collect();
         let names = term_ids.keys().map(|term| term.to_string()).collect::<Vec<_>>();
@@ -134,10 +137,12 @@ impl TreeRanked {
             matching.iter().copied().min_by_key(|&index| terms[index].as_ref().expect("matching term is present").frequency)
         } else { None };
         let mut rank = Self { file, terms, leading, matching, scoring: score_terms, phrases, scorer: scoring.clone(),
-            ready: BinaryHeap::new(), members, documents, bounds, id_order,
+            ready: BinaryHeap::new(), members, documents, bounds, order,
             checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new() };
         if let Some(leading) = leading {
-            rank.push_node(leading, rank.terms[leading].as_ref().expect("leading term is present").node)?;
+            let node = rank.terms[leading].as_ref().expect("leading term is present").node;
+            let floors = rank.uuid_floors(std::iter::once(node.first)).await?;
+            rank.push_node(leading, node, floors.get(&node.first).copied())?;
         }
         Ok(rank)
     }
@@ -149,7 +154,7 @@ impl TreeRanked {
         else { self.scorer.term_bound(index, frequency, length) }
     }
 
-    fn push_node(&mut self, leading: usize, node: RankNode) -> Result<()> {
+    fn push_node(&mut self, leading: usize, node: RankNode, floor: Option<Iid>) -> Result<()> {
         if document_range(node.last).0 >= self.documents {
             return Err(corrupt("Search window exceeds its document directory"));
         }
@@ -160,17 +165,19 @@ impl TreeRanked {
                 score += self.term_score(index, summary.unit_score, summary.frequency, summary.length);
             }
         }
-        let id = if !self.id_order { None }
-            else if self.scoring.as_slice() == [leading] && self.scorer.scorer().uses_unit_term_scores() { node.peak.or(node.minimum) }
-            else { node.minimum };
-        self.ready.push(Work { key: RankKey { score, id }, first: node.first, job: Job::Node(node) });
+        let integer = if self.scoring.as_slice() == [leading] && self.scorer.scorer().uses_unit_term_scores() {
+            node.peak.or(node.minimum)
+        } else { node.minimum };
+        self.ready.push(Work { key: self.key(score, integer, floor), first: node.first, job: Job::Node(node) });
         Ok(())
     }
 
     async fn open_node(&mut self, node: RankNode) -> Result<()> {
         let leading = self.leading.expect("only matching sources enter the rank frontier");
         if node.height != 0 {
-            for child in rank_tree::children(self.file.reader(), node).await? { self.push_node(leading, child)?; }
+            let children = rank_tree::children(self.file.reader(), node).await?;
+            let floors = self.uuid_floors(children.iter().map(|child| child.first)).await?;
+            for child in children { self.push_node(leading, child, floors.get(&child.first).copied())?; }
             return Ok(());
         }
         let leaf = self.terms[leading].as_ref().expect("leading term is present").leaf(&self.file, node).await?;
@@ -185,25 +192,52 @@ impl TreeRanked {
             } else { BTreeMap::new() };
             windows.push(bound);
         }
-        for (&window, (_, _, ids)) in &windows[leading] {
-            if self.matching.iter().any(|&term| !windows[term].contains_key(&window)) { continue; }
+        let matching = &self.matching;
+        let matching_windows = || windows[leading].iter()
+            .filter(|&(&window, _)| matching.iter().all(|&term| windows[term].contains_key(&window)));
+        let floors = self.uuid_floors(matching_windows().map(|(&window, _)| window)).await?;
+        for (&window, (_, _, ids)) in matching_windows() {
             let mut score = 0.0;
             for (index, &term) in self.scoring.iter().enumerate() {
                 if let Some((_, impact, _)) = windows[term].get(&window) {
                     score += self.term_score(index, impact.max_unit_score, impact.frequency, impact.length);
                 }
             }
-            let id = if !self.id_order { None } else {
-                match self.scoring.as_slice() {
-                    [term] if self.scorer.scorer().uses_unit_term_scores() && score > 0.0 =>
-                        windows[*term].get(&window).and_then(|(_, _, ids)| ids.peak).or(ids.minimum),
-                    _ => ids.minimum,
-                }
+            let integer = match self.scoring.as_slice() {
+                [term] if self.scorer.scorer().uses_unit_term_scores() && score > 0.0 =>
+                    windows[*term].get(&window).and_then(|(_, _, ids)| ids.peak).or(ids.minimum),
+                _ => ids.minimum,
             };
             let blocks = windows.iter().map(|term| term.get(&window).map(|(block, _, _)| Arc::clone(block))).collect();
-            self.ready.push(Work { key: RankKey { score, id }, first: window, job: Job::Windows(blocks) });
+            self.ready.push(Work { key: self.key(score, integer, floors.get(&window).copied()), first: window, job: Job::Windows(blocks) });
         }
         Ok(())
+    }
+
+    fn key(&self, score: f64, integer: Option<i64>, iid: Option<Iid>) -> RankKey {
+        match self.order {
+            TreeRankOrder::Score => RankKey::integer(score, None),
+            TreeRankOrder::Integer => RankKey::integer(score, integer),
+            TreeRankOrder::Uuid => iid.map_or_else(|| RankKey::integer(score, None), |iid| RankKey::uuid(score, iid.0)),
+        }
+    }
+
+    async fn uuid_floors(&self, windows: impl Iterator<Item = u32>) -> Result<BTreeMap<u32, Iid>> {
+        if self.order != TreeRankOrder::Uuid { return Ok(BTreeMap::new()); }
+        let documents = windows.map(|window| (window, document_range(window).0)).collect::<Vec<_>>();
+        let pages = self.pages(DOCUMENT, documents.iter().map(|&(_, doc)| document_page(doc)).collect()).await?;
+        // A published tree writes all documents in nondecreasing IID order, including across members.
+        // The first document of the first window bounds every posting that can enter the work item.
+        documents.into_iter().map(|(window, doc)| {
+            let expected = document_page(doc);
+            let batch = &pages[&expected];
+            let starts = table(batch, Table::Pages);
+            let start = starts.column(0).as_primitive::<UInt32Type>();
+            if doc >= self.documents || starts.len() != 1 || start.is_null(0) || start.value(0) as usize != expected {
+                return Err(corrupt("Search UUID floor has an invalid document page"));
+            }
+            Ok((window, Document::iid_at(&table(batch, Table::Runs), (doc - start.value(0)) as usize)?))
+        }).collect()
     }
 
     async fn pages(&self, kind: u8, pages: BTreeSet<usize>) -> Result<BTreeMap<usize, RecordBatch>> {
@@ -218,7 +252,8 @@ impl TreeRanked {
             return Ok(Vec::new());
         }
         let mut windows = BTreeMap::new();
-        while windows.len() < 4 && self.ready.peek().is_some_and(|work| matches!(work.job, Job::Windows(_))) {
+        let batch = if self.order == TreeRankOrder::Uuid { 1 } else { 4 };
+        while windows.len() < batch && self.ready.peek().is_some_and(|work| matches!(work.job, Job::Windows(_))) {
             let Some(Work { first, job: Job::Windows(blocks), .. }) = self.ready.pop() else { unreachable!() };
             windows.insert(first, blocks);
         }
@@ -273,8 +308,7 @@ impl TreeRanked {
                 }))
             });
         }
-        let doc_page = |doc: u32| doc as usize / DOCUMENT_ROWS * DOCUMENT_ROWS;
-        let records = self.pages(DOCUMENT, nominated.iter().map(|&(_, doc)| doc_page(doc)).collect()).await?;
+        let records = self.pages(DOCUMENT, nominated.iter().map(|&(_, doc)| document_page(doc)).collect()).await?;
         let mut docs = BTreeMap::new();
         for (&requested, page) in &records {
             let starts = table(page, Table::Pages);
@@ -287,7 +321,7 @@ impl TreeRanked {
         let mut candidates = Vec::new();
         let mut frequencies = Vec::with_capacity(self.scoring.len());
         for (window, doc) in nominated {
-            let start = doc_page(doc);
+            let start = document_page(doc);
             let (first, runs) = &docs[&start];
             let record = Document::at(runs, (doc - first) as usize)?;
             if scope.is_some_and(|scope| !scope.contains(&record.iid))
@@ -296,11 +330,13 @@ impl TreeRanked {
             frequencies.extend(self.scoring.iter().map(|&term| in_window(term, window).map_or(0, |posting| posting.frequency(doc))));
             let score = self.scorer.scorer().score(&frequencies, stored_length(record.length as usize));
             candidates.push(TreeCandidate { iid: record.iid, member: document_member(&self.members, doc) as u32,
-                key: RankKey { score, id: record.id }, rectangles: record.visibility });
+                key: self.key(score, record.id, Some(record.iid)), rectangles: record.visibility });
         }
         Ok(candidates)
     }
 }
+
+fn document_page(doc: u32) -> usize { doc as usize / DOCUMENT_ROWS * DOCUMENT_ROWS }
 
 fn was_checked(checked: &mut BTreeSet<(usize, usize)>, address: (usize, usize)) -> bool {
     const MAX_VALIDATED_SLICES: usize = 1024;
@@ -311,10 +347,14 @@ fn was_checked(checked: &mut BTreeSet<(usize, usize)>, address: (usize, usize)) 
 struct Document { iid: Iid, id: Option<i64>, length: u32, visibility: Vec<[i64; 4]> }
 
 impl Document {
-    fn at(runs: &StructArray, row: usize) -> Result<Self> {
-        if row >= runs.len() { return Err(corrupt("Search document exceeds its page")); }
+    fn iid_at(runs: &StructArray, row: usize) -> Result<Iid> {
         let iids = runs.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search IID layout");
-        let iid = Iid(iids.value(row).try_into().expect("fixed-width search IID"));
+        if row >= runs.len() || iids.is_null(row) { return Err(corrupt("Search document exceeds its page or has no IID")); }
+        Ok(Iid(iids.value(row).try_into().expect("fixed-width search IID")))
+    }
+
+    fn at(runs: &StructArray, row: usize) -> Result<Self> {
+        let iid = Self::iid_at(runs, row)?;
         let identities = runs.column(2).as_binary::<i32>();
         let id = identities.is_valid(row).then(|| EntityIdRef::from_handle_bytes(identities.value(row)).ok()).flatten()
             .and_then(|id| match id { EntityIdRef::Integer(id) => Some(id), _ => None });

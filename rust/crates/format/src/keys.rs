@@ -192,6 +192,11 @@ impl TrieKey {
     pub fn part(&self) -> &[u8] { &self.part }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
 
+    /// The precedence of this persisted source when event IID and system time are equal.
+    pub fn scan_precedence(&self) -> (i64, BlockIndex, CivilDate, &[u8]) {
+        (self.level, self.block_index, self.recency.unwrap_or(CivilDate::MAX), &self.part)
+    }
+
     /// The partition group of a tiered trie: a current trie at level 2 and up, or a historical one at level 3 and up (trie-cat.allium: InsertTrie_General).
     /// Level 0, level 1 and the levelled level-2 historical tries belong to none.
     pub fn part_group(&self) -> Option<PartGroup> {

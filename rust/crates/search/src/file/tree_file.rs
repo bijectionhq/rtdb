@@ -155,6 +155,7 @@ pub(crate) struct TreeLocator {
     pub length: u64,
     page: PageRef,
     synopsis: Option<Arc<[u8; SYNOPSIS_BYTES]>>,
+    canonical_uuid_iids: bool,
 }
 
 impl TreeLocator {
@@ -184,7 +185,7 @@ impl TreeLocator {
         let bits = synopsis.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search synopsis layout");
         if bits.len() != 1 || bits.is_null(0) { return Err(corrupt("Search root has no complete term synopsis")); }
         let synopsis = Arc::new(bits.value(0).try_into().map_err(fault)?);
-        Ok(Self { length: locator.length as u64, page, synopsis: Some(synopsis) })
+        Ok(Self { length: locator.length as u64, page, synopsis: Some(synopsis), canonical_uuid_iids: false })
     }
 
     pub fn encode(&self) -> String {
@@ -192,7 +193,12 @@ impl TreeLocator {
         let header = format!("{}:{}:{}:{}:{digest}", self.length, self.page.offset, self.page.metadata, self.page.body);
         let Some(bits) = self.synopsis.as_deref() else { return header; };
         let check = synopsis_digest(&self.page.digest, bits);
-        format!("{header}:{}:{}", encode_hex(bits), encode_hex(&check))
+        let mut encoded = format!("{header}:{}:{}", encode_hex(bits), encode_hex(&check));
+        if self.canonical_uuid_iids {
+            encoded.push(':');
+            encoded.push_str(&encode_hex(&uuid_evidence_digest(&self.page.digest)));
+        }
+        encoded
     }
 
     pub fn decode(value: &str) -> Option<Self> {
@@ -204,10 +210,20 @@ impl TreeLocator {
         let digest = decode_hex(fields.next()?)?;
         let page = PageRef { offset, metadata, body, digest };
         let range = page.range().ok()?;
-        let synopsis = fields.next().and_then(decode_hex::<SYNOPSIS_BYTES>).zip(fields.next().and_then(decode_hex::<32>))
+        let synopsis = fields.next().zip(fields.next())
+            .and_then(|(bits, check)| decode_hex::<SYNOPSIS_BYTES>(bits).zip(decode_hex::<32>(check)))
             .filter(|(bits, check)| synopsis_digest(&digest, bits) == *check).map(|(bits, _)| Arc::new(bits));
-        (range.end <= length && range.end - range.start <= MAX_ROOT_BYTES).then_some(Self { length, page, synopsis })
+        let canonical_uuid_iids = synopsis.is_some() && fields.next().and_then(decode_hex::<32>)
+            .is_some_and(|check| check == uuid_evidence_digest(&digest));
+        (range.end <= length && range.end - range.start <= MAX_ROOT_BYTES)
+            .then_some(Self { length, page, synopsis, canonical_uuid_iids })
     }
+
+    pub fn with_uuid_iid_evidence(self, canonical_uuid_iids: bool) -> Self {
+        Self { canonical_uuid_iids, ..self }
+    }
+
+    pub fn has_canonical_uuid_iids(&self) -> bool { self.canonical_uuid_iids }
 
     pub fn digest(&self) -> [u8; 32] { self.page.digest }
 
@@ -226,6 +242,13 @@ fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
         *byte = u8::from_str_radix(&hex[2 * position..2 * position + 2], 16).ok()?;
     }
     Some(bytes)
+}
+
+fn uuid_evidence_digest(root: &[u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb.search/canonical-uuid-iids");
+    digest.update(root);
+    digest.finalize().into()
 }
 
 fn synopsis_digest(root: &[u8; 32], bits: &[u8; SYNOPSIS_BYTES]) -> [u8; 32] {
@@ -418,6 +441,11 @@ mod tests {
         super::super::write_versioned_group(&columns, [[Ok(rows.clone())]], "tree", 42, None, &mut file, None, TREE_FORMAT_VERSION).unwrap();
         let locator = TreeLocator::read(&mut file).unwrap();
         assert_eq!(TreeLocator::decode(&locator.encode()), Some(locator.clone()));
+        assert!(!locator.has_canonical_uuid_iids());
+        let certified = locator.clone().with_uuid_iid_evidence(true);
+        assert_eq!(TreeLocator::decode(&certified.encode()), Some(certified.clone()));
+        let wrong_proof = format!("{}:{}", locator.encode(), encode_hex(&uuid_evidence_digest(&[0; 32])));
+        assert_eq!(TreeLocator::decode(&wrong_proof), Some(locator.clone()));
         assert!(locator.might_contain(0, "report"));
         assert!(!locator.might_contain(0, "unpublished-term"));
         file.rewind().unwrap();
@@ -433,8 +461,8 @@ mod tests {
         let scoring = Query::parse("audit");
         let bounds = TemporalBounds { valid_time: Interval::at(Timestamp(2)).unwrap(), system_time: Interval::at(Timestamp(2)).unwrap() };
         let scorer = Arc::new(Scorer::new(scoring.clone(), None)).for_ranking().unwrap();
-        let mut rank = super::super::TreeRanked::open(Arc::clone(&tree), 0, &matching, &scorer, bounds, true).await.unwrap();
-        assert_eq!(rank.bound().unwrap().id, Some(0));
+        let mut rank = super::super::TreeRanked::open(Arc::clone(&tree), 0, &matching, &scorer, bounds, super::super::TreeRankOrder::Integer).await.unwrap();
+        assert_eq!(rank.bound().unwrap().integer_id(), Some(0));
         let mut actual = BTreeMap::new();
         while rank.bound().is_some() {
             for hit in rank.expand(None, &mut 0).await.unwrap() { actual.insert(hit.iid.0, hit.key.score.to_bits()); }

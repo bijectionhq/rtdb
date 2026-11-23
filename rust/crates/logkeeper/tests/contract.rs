@@ -10,6 +10,61 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_physical_trim_receipt_requires_every_journal_and_survives_a_retry() {
+    let mut ensemble = Ensemble::start(3).await;
+    let stream = ensemble.config("all-trim");
+    let writer = open_writer(stream.clone(), 1, CancellationToken::new()).await.unwrap();
+    assert_eq!(append(writer.as_ref(), "offloaded", 1).await.offset, LogOffset(0));
+    ensemble.stop(2).await;
+    rtdb_logkeeper::trim(&stream, LogOffset(0)).await.unwrap();
+    assert!(rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.is_err());
+    ensemble.restart(2).await;
+    let stream = ensemble.config("all-trim");
+    rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.unwrap();
+    rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_trim_rejects_a_journal_that_accepts_ordinary_trim_without_fsync() {
+    let data = tempfile::tempdir().unwrap();
+    let server = common::Server::start_with_durability(data.path(), "127.0.0.1:0".parse().unwrap(), 0, false).await;
+    let stream = rtdb_logkeeper::StreamConfig {
+        servers: vec![server.address.to_string().into()], stream: "nondurable-trim".into(),
+        write_quorum: 1, maximum_message_bytes: 1024,
+    };
+    let writer = open_writer(stream.clone(), 1, CancellationToken::new()).await.unwrap();
+    append(writer.as_ref(), "trimmed", 1).await;
+    rtdb_logkeeper::trim(&stream, LogOffset(0)).await.unwrap();
+    assert!(rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.is_err());
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_trim_appends_a_fresh_event_for_the_current_floor_even_on_repeat() {
+    let mut ensemble = Ensemble::start(1).await;
+    let stream = ensemble.config_of(&[0], "durable-trim-retry");
+    let writer = open_writer(stream.clone(), 1, CancellationToken::new()).await.unwrap();
+    append(writer.as_ref(), "released", 1).await;
+    append(writer.as_ref(), "retained", 2).await;
+    let directory = ensemble.directories[0].path().to_owned();
+    let journal_bytes = || std::fs::read_dir(directory.join("segments")).unwrap()
+        .map(|file| file.unwrap().metadata().unwrap().len()).sum::<u64>();
+    rtdb_logkeeper::trim(&stream, LogOffset(0)).await.unwrap();
+    let ordinary = journal_bytes();
+    rtdb_logkeeper::trim(&stream, LogOffset(-1)).await.unwrap();
+    assert_eq!(journal_bytes(), ordinary);
+    rtdb_logkeeper::trim_all(&stream, LogOffset(-1)).await.unwrap();
+    let first = journal_bytes();
+    assert!(first > ordinary);
+    rtdb_logkeeper::trim_all(&stream, LogOffset(0)).await.unwrap();
+    assert!(journal_bytes() > first);
+    drop(writer);
+    ensemble.stop(0).await;
+    let retained = rtdb_logkeeper::inspect_retained(&directory, &stream.stream, None).unwrap().unwrap();
+    assert_eq!(retained.interval, [1, 1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_audit_distinguishes_equal_committed_positions_with_different_payloads() {
     let ensemble = Ensemble::start(2).await;
     for (server, payload) in [(0, "first"), (1, "different")] {

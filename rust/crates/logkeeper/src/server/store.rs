@@ -126,6 +126,10 @@ impl Store {
             RequestBody::Commit(commit) => (commit.stream, Box::new(move |state| state.commit(commit.epoch, commit.commit_lsn))),
             RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
+            RequestBody::TrimDurable(trim) => {
+                if !self.journal.is_durable() { return Outcome::Now(failed("durable trim requires a journal with fsync")); }
+                (trim.stream, Box::new(move |state| state.trim_durable(trim.through_lsn)))
+            }
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
             RequestBody::CheckSynced(check) => return self.check_after_durability(&check.stream, admission, |state| state.check_synced(check.epoch)),
             RequestBody::ActivateLoglet(check) => {

@@ -53,3 +53,69 @@ Metadata naming an erased unit is erased with it before the window ends.
 ## Open questions
 
 - Which `xt.txs` columns survive the window.
+
+## Bounded application retry identities
+
+Native clients can set `rtdb_retry_v1: {nonce: '0123456789abcdef0123456789abcdef', not_after_micros: 123456789}` in transaction metadata.
+The deadline is exclusive UTC microseconds and at most one hour ahead of the admission clock.
+PgWire clients require `SHOW rtdb_bounded_retry` to return `1` on each connection before submitting this format.
+The identity includes version, nonce and deadline under the authenticated principal and database history.
+Timeouts and disconnects are retried under the same identity with the same body.
+A new operation needs a new identity.
+Classic databases scope the receipt table to the database storage.
+Placed history fingerprints retain identity across writer epochs and exclude receipts inherited from a parent history.
+
+A source transaction's versioned retry field must agree with its metadata.
+The encoded transaction starts with a refusal assertion for readers that do not understand the field.
+An upgraded resolver removes that assertion once it has verified the field.
+It chooses the maximum of the previous durable retry clock and the exact source timestamp, independently of the projected SQL system time.
+An accepted transition publishes the new clock and original outcome with its effects or after discarding an aborted batch.
+The same body receives the original durable transaction result until the deadline, including an abort.
+A different body receives `rtdb/idempotency-conflict`, and an elapsed identity always receives `rtdb/idempotency-expired`, including after later clock regressions.
+Clock progress follows bounded retry log observations.
+The physical retention obligations in M1 still apply to the new receipt rows and their original outcomes.
+
+Lean checks the separation between append observation and commit order, irreversible observed expiry, preservation of the first terminal result, and same-body redemption for both commits and aborts.
+It rejects reporting a smoothed observation, using a regressed clock, and replacing a terminal receipt.
+Verus checks that expiry uses the exclusive boundary and that a regressed append observation cannot reopen an identity.
+The native node test flushes the first terminal results, reopens the database, redeems the abort and commit, then verifies that expiry survives a second restart and clock rollback.
+The resolver tests cover the compatibility assertion and reuse of a placed identity after writer turnover, with an independent fork history as a control.
+
+## Ordered retirement and storage custody
+
+The durable transaction row stores both the raw source append timestamp and the receipt clock carried forward from its exact predecessor.
+The receipt clock is local to the installed history and survives replay, a writer change, and a clock regression.
+If a pre-retention writer installs a newer result without a clock, resumed readers and writers carry forward the last observed clock from the same history.
+A bounded application retry remains expired at its exclusive cutoff even when the next append clock sample is earlier.
+Its identity remains scoped by principal and, in a placed deployment, the history fingerprint across writer epochs.
+Legacy application keys remain reusable after their window ends.
+Placed attempt redemption checks the installed receipt clock.
+An applied prefix remains a causal token independently of the attempt receipt.
+
+New source-log submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
+The immutable result row keeps the transaction coordinate, commit flag and structured result error.
+A newly resolved legacy-guard duplicate carries its original coordinate in the structured outcome, so historical redemption does not require keeping the expiring application key.
+A structured result error may carry application-provided context, including an assertion message.
+Redacting arbitrary historical error text is a separate policy from retiring user metadata.
+Current reads of `xt.txs.user_metadata` select the payload at the installed receipt clock, including when the requested system time is earlier.
+Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
+The collector retains a legacy key's predecessors while a newer interval of that key is still active.
+Formerly embedded metadata and metadata from external writers lack the new source admission record and need migration.
+Old readers omit newly separated metadata until they support the retained projection.
+Arbitrary user metadata has no typed association with another storage unit, so early privacy erasure of such an association still needs an explicit data contract.
+For a placed deployment enrolled in the versioned outcome format, each frame carries its exact current outcome and at most 128 distinct older erasures per collection step.
+An operator confirms format support in every eligible serving and recovery image and parks the deployment before pinning a compatible engine.
+Check `rtdb-multi --build-info` for `placed_receipt_retirement: true`.
+On the parked deployment, run `rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME`.
+The directory persists the opt-in across restarts.
+Writers emit the marked encoding on the next activation.
+Legacy readers fail before applying a marked record.
+Keep a compatible engine pinned for attachments that replay that history, including restore images.
+The logical erasures enter successor compaction.
+Earlier immutable copies retain their own custody obligations.
+
+The durable receipt clock and erase events identify logical retirement and its ordered point.
+They grant no authority to delete an immutable source-log segment, a replica segment, a checkpoint, an archive, a skipped payload, or a held trie.
+A physically retired scope requires an exact successor checkpoint, release of every recovery reference and entitlement, and settlement by each copy's custodian.
+An archive's recorded key withdrawal or empty-inventory receipt only attests its own authority and provider scope.
+A report on R8 must retain the physical-closure gap until all copy classes, versions and recovery holds are accounted for.

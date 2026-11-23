@@ -297,22 +297,21 @@ class LogProcessor(
     }
 
     private suspend fun handleRecord(polled: Log.Record<ReplicaMessage>) {
-        val record = bufferPool.resolveOversized(polled)
-        val msgTerm = record.message.termId
-        val msgSeq = record.message.termSeq
+        val msgTerm = polled.message.termId
+        val msgSeq = polled.message.termSeq
 
         // Read before the fold, because a claim confers only where it is above every term that precedes it.
         val seenBefore = highestTermSeen
 
         when (admit(msgTerm, msgSeq)) {
             Verdict.FENCED ->
-                LOG.debug { "[$dbName] discarding fenced record ${record.msgId} (term $msgTerm < $seenBefore)" }
+                LOG.debug { "[$dbName] discarding fenced record ${polled.msgId} (term $msgTerm < $seenBefore)" }
 
             Verdict.DISCARDED ->
-                LOG.debug { "[$dbName] discarding record ${record.msgId} behind term $msgTerm's position (at $msgSeq)" }
+                LOG.debug { "[$dbName] discarding record ${polled.msgId} behind term $msgTerm's position (at $msgSeq)" }
 
             Verdict.VOIDED -> {
-                LOG.warn("[$dbName] replica record ${record.msgId} (term $msgTerm, position $msgSeq) follows a record that never reached the log — voiding the rest of term $msgTerm")
+                LOG.warn("[$dbName] replica record ${polled.msgId} (term $msgTerm, position $msgSeq) follows a record that never reached the log — voiding the rest of term $msgTerm")
 
                 // Fencing leaves a leader nothing further to read back at or below this term.
                 val role = state
@@ -327,7 +326,8 @@ class LogProcessor(
             }
 
             // A role ending cancels the handle mid-record, so the record is re-offered to whatever replaces that role.
-            Verdict.APPLY ->
+            Verdict.APPLY -> {
+                val record = bufferPool.resolveOversized(polled)
                 while (true) {
                     currentCoroutineContext().ensureActive()
 
@@ -355,13 +355,14 @@ class LogProcessor(
                         throw e
                     }
                 }
+            }
         }
 
         // Below the apply: a role ending mid-record leaves the position short, which is what re-offers the record.
         // A record the tail fenced or the role held advances it all the same.
-        latestReplicaMsgId = record.msgId
+        latestReplicaMsgId = polled.msgId
 
-        adjudicateClaim(record, conferring = msgTerm > seenBefore)
+        adjudicateClaim(polled, conferring = msgTerm > seenBefore)
     }
 
     private suspend fun adjudicateClaim(record: Log.Record<ReplicaMessage>, conferring: Boolean) {

@@ -278,9 +278,12 @@ value ExternalSourceToken {
 }
 
 value TransactionKey {
-    -- tx_id is monotonically increasing, assigned by the source log or off the RESOLVED head for an external-source database.
-    -- system_time is strictly increasing across a partition's committed transactions.
-    -- A client MAY specify one, and a specified system_time that does not advance on the latest completed transaction aborts the transaction.
+    -- tx_id is the increasing commit-order position, assigned by the source log or off the RESOLVED head for an external-source database.
+    -- system_time is the strictly increasing projection used by temporal SQL.
+    -- An ordinary explicit system_time that does not advance the resolved history or leads the append clock aborts the transaction.
+    -- An owned explicit time instead witnesses the append observation and uses the ordinary automatic projection.
+    -- That projection advances by a chronon when an observed clock ties or regresses.
+    -- Native source outcomes retain the unmodified append observation in xt.txs.source_log_time.
     -- Strictness is what lets a read basis name a transaction by its system_time — see snapshot_token.
     tx_id: Integer
     system_time: Timestamp
@@ -593,6 +596,7 @@ variant OversizedMessage : ReplicaMessage {
     -- term_id and term_seq on the envelope are the DECLINED message's, so read-side fencing decides without fetching the payload.
     -- Readers resolve it as the record is read, ahead of both the pending-block hold and the staleness check: an offloaded upload closes a block, and one left unresolved would be held behind the block it closes.
     -- block_index is the block the standing-in record lands in — the open one, not the last completed — because block-gc.allium collects on it.
+    -- New references authenticate the exact encoded body with SHA-256; older references still verify the decoded term and sequence.
     storage_version: Integer
     storage_epoch: Integer
     block_index: Integer
@@ -694,6 +698,7 @@ config {
 -- Opening a directory receipt verifies fresh root bytes before loading table metadata.
 -- An ordinary startup admits the root metadata and first required replica offset in one directory update.
 -- The startup grant lasts through cursor admission and the drain of the provider reads it owns.
+-- A delivered record in the admitted replay interval retains the grant while a referenced payload is fetched, including after cancellation of its caller.
 -- Those files remain required until follower adoption.
 -- A failed historical check or older candidate preparation discards the remaining older confirmations.
 -- The writer continues recovery of the selected checkpoint.
@@ -967,6 +972,12 @@ rule LeaderProcessesTx {
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
         -- A transaction with rtdb_ordered_system_time enabled in user metadata aborts before evaluating mutations if its requested system time precedes the source message timestamp.
         -- The refused transaction uses the normally assigned system time, so it still advances the resolved head.
+        -- A version-one bounded application retry carries an exclusive cutoff and a nonce in a dedicated source field.
+        -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
+        -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.
+        -- The first admitted terminal outcome installs its receipt in the same replica frame as its transaction result, including an abort.
+        -- A same-body retry links to that exact outcome; a different body fails with a conflict.
+        -- A reader using the first receipt returns the original committed or aborted result.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
     -- An UPDATE produces a new version for a row when an assigned value changes under type-sensitive equality.
         -- SQL mutations stage compatible nested Arrow payloads with the valid-time bounds evaluated for each row.
@@ -1193,6 +1204,7 @@ rule LeaderAppliesRecord {
     -- The fence discards anything below this term, ends this term on anything above it, and discards a rival's losing claim at this same term, its position being behind this term's.
     -- So a record reaching here carries this term, unless it was held behind the block this term inherited and drained at the adopt, having met the fence at its own position under a lower term.
     -- The native driver matches a read-back of its own resolved transaction to the pending append at its sequence before apply or buffering.
+    -- Both engines admit the outer term and sequence before fetching an oversized payload.
     -- A record at the sequence of a pending transaction must carry that transaction, including when an oversized envelope supplies its payload separately.
     -- A mismatch faults the processor, delivers the fault to a pending caller identified by the admitted term and sequence, and leaves the transaction's rows, catalog and applied progress untouched.
     when: HandleReplicaMessage(record)
@@ -2033,6 +2045,14 @@ open question "Which node-local caller failures during committed database-operat
 
 open question "How should operator-selected skipped transactions be represented in this processing model?"
     -- The pinned resolver persists the source payload under skipped-txs before staging an aborted xt.txs row carrying xtdb/skipped-tx.
+    -- Each ordered source transaction carries the raw append observation and the greatest such observation through its predecessor.
+    -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
+    -- Source-log metadata is stored in finite-lived rows outside durable transaction-result history.
+    -- Ordered erasures remove eligible payloads from later reads and compaction products without changing the transaction coordinate.
+    -- A placed outcome record contains exactly one put naming the current attempt.
+    -- A deployment admitted to the versioned outcome format may also carry bounded erasures of distinct expired outcomes.
+    -- Read-back rejects erasure of the current attempt, an extra outcome, and any multi-row outcome in the original format.
+    -- Physical retirement also requires successor coverage and release or revocation of each earlier immutable copy.
     -- Its transaction ID is the source position and its system time is smoothed against the resolved head.
     -- The skip takes effect before decoding transaction operations and uses the ordinary append, read-back and apply pipeline.
 

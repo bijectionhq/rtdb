@@ -40,7 +40,7 @@ pub const FORMAT_VERSION: i32 = 13;
 pub(crate) const TREE_FORMAT_VERSION: i32 = 14;
 pub(crate) use page_tree::PageCache;
 pub(crate) use tree_file::{TreeFile, TreeLocator};
-pub(crate) use tree_rank::TreeRanked;
+pub(crate) use tree_rank::{TreeRankOrder, TreeRanked};
 pub(crate) fn encode_tantivy_stats(sections: &[Section]) -> Vec<u8> { legacy11::encode_catalog(sections) }
 pub(crate) const LEGACY_FORMAT_VERSION: i32 = 12;
 pub(crate) const TANTIVY_FORMAT_VERSION: i32 = 11;
@@ -797,7 +797,7 @@ impl Ranked {
         let windows = self.0.as_ref()?;
         let &(score, window) = windows.windows.get(windows.next)?;
         let id = windows.ascending_id.then(|| windows.file.manifest.window_id(window)).flatten();
-        Some(crate::rank_cutoff::RankKey { score, id })
+        Some(crate::rank_cutoff::RankKey::integer(score, id))
     }
 
     pub fn expand(&mut self) -> Result<Vec<(DocMatch, f64)>> {
@@ -1289,7 +1289,7 @@ mod tests {
         let matching = Query::parse("invoice");
         let scorer = Arc::new(Scorer::new(matching.clone(), None)).for_ranking().unwrap();
         let mut ranked = file.ranked_for_query("body", &matching, &scorer, at(2, 2), true).unwrap();
-        assert_eq!(ranked.bound().unwrap().id, Some(0));
+        assert_eq!(ranked.bound().unwrap().integer_id(), Some(0));
         let hits = ranked.expand(None, &mut 0).await.unwrap();
         assert!(hits.iter().any(|(doc, _)| file.integer_id(doc) == Some(0)));
 
@@ -1337,14 +1337,14 @@ mod tests {
         let tree = Arc::new(TreeFile::remote(pool.clone(), key.clone(), cache.clone(), &locator, &columns, "remote-v14", 42).await.unwrap());
         let term = Query::parse("invoice");
         let scoring = Arc::new(Scorer::new(term.clone(), None)).for_ranking().unwrap();
-        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), true).await.unwrap();
-        assert_eq!(rank.bound().unwrap().id, Some(0));
+        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.unwrap();
+        assert_eq!(rank.bound().unwrap().integer_id(), Some(0));
         assert!(rank.expand(None, &mut 0).await.unwrap().is_empty());
         let mut hits = Vec::new();
         while hits.is_empty() {
             hits = rank.expand(None, &mut 0).await.unwrap();
         }
-        assert!(hits.iter().any(|hit| hit.key.id == Some(0)));
+        assert!(hits.iter().any(|hit| hit.key.integer_id() == Some(0)));
         assert_eq!(tree.events(rows[12_000].iid).await.unwrap().len(), 1);
         let reads = store.ranges.lock().clone();
         let sent: u64 = reads.iter().map(|range| range.end - range.start).sum();
@@ -1379,7 +1379,7 @@ mod tests {
         let bad_key = ObjectKey::new("search/bad-tree").unwrap();
         store.put(&bad_key, damaged.into()).await.unwrap();
         let bad = Arc::new(TreeFile::remote(pool.clone(), bad_key, cache, &locator, &columns, "remote-v14", 42).await.unwrap());
-        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), true).await.is_err());
+        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.is_err());
     }
 
     #[test]

@@ -1203,13 +1203,13 @@ impl ReplicationDriver {
                 if self.config.external_source { return Err(invalid("External-source database received attach operation")); }
                 let operation = DbOp::AttachDatabase(message);
                 let verdict = check_db_op(self.effects.as_ref(), leader.resolver()?, &operation);
-                Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve)?)
+                Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve).await?)
             }
             Some(SourceMessage::Protobuf(SourceBody::DetachDatabase(message))) => {
                 if self.config.external_source { return Err(invalid("External-source database received detach operation")); }
                 let operation = DbOp::DetachDatabase(message);
                 let verdict = check_db_op(self.effects.as_ref(), leader.resolver()?, &operation);
-                Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve)?)
+                Some(leader.resolver_mut()?.resolve_db_op(durable, position, metadata.timestamp, operation, verdict, &self.resolve).await?)
             }
             Some(SourceMessage::Protobuf(SourceBody::TriesAdded(mut message))) => {
                 message.source_msg_id = Some(position.0);
@@ -1271,7 +1271,7 @@ impl ReplicationDriver {
                     let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                     context.storage.object_store().put(&key, payload).await?;
                     let attempt = SourceTransaction::skipped_attempt(&message, position)?;
-                    resolver.resolve_skipped(durable, position, log_time, attempt, &context)
+                    resolver.resolve_skipped(durable, position, log_time, attempt, &context).await
                 }.await,
             };
             (resolver, result)

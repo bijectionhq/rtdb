@@ -1,9 +1,11 @@
+mod retained_metadata;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{builder::{BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder}, cast::AsArray};
+use arrow_array::{Array, StructArray, builder::{BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder}, cast::AsArray};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
@@ -294,6 +296,7 @@ pub(crate) struct PartitionScan {
     candidate_iids: Option<crate::CandidateIids>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
     slots: Vec<Option<usize>>,
+    metadata_time: Option<Option<Value>>,
 }
 
 use crate::analysis::ScanCounts;
@@ -346,7 +349,7 @@ pub(crate) enum IidOrder { Ascending, Descending }
 
 /// Whether every `_id` the snapshots hold for the table is a UUID, each then being its own IID. A plan records the type
 /// it was prepared against, and a row of another ID type may have been written since.
-fn stores_uuid_ids(table: &rtdb_types::TableRef, snapshots: &[Snapshot]) -> bool {
+pub(crate) fn stores_uuid_ids(table: &rtdb_types::TableRef, snapshots: &[Snapshot]) -> bool {
     let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
     snapshots.iter().all(|snapshot| snapshot.column_types_for(table, ["_id".to_owned()]).get("_id").is_some_and(|ty| *ty == uuid || *ty == rtdb_types::LogicalType::Nothing))
 }
@@ -508,6 +511,15 @@ impl ScanCursor {
         if !execution.context.catalog.permits_table(&scan.table.name) {
             return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
         }
+        let virtual_metadata = retained_metadata::is_projected(&scan)
+            && database_partitions.iter().any(retained_metadata::has_sidecar);
+        let pushdowns = if virtual_metadata { None } else { pushdowns };
+        let accelerate = accelerate && !virtual_metadata;
+        if virtual_metadata {
+            // The filter above this scan evaluates the projected values.
+            let metadata = scan.columns.iter().find(|field| field.name == "user_metadata").map(|field| field.id);
+            scan.predicates.retain(|predicate| metadata.is_none_or(|id| !predicate.referenced_columns().contains(&id)));
+        }
         let fixed_iids = scan.iids.is_some();
         let accelerate = accelerate && execution.context.catalog.owned_position_mask.is_none();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.evaluator()); }
@@ -544,7 +556,7 @@ impl ScanCursor {
             };
             Some(RankProjection { output, source: source.name.clone(), scorer, verified: None })
         } else { None };
-        let fragmenter = execution.context.catalog.fragmenter.clone();
+        let fragmenter = if virtual_metadata { None } else { execution.context.catalog.fragmenter.clone() };
         let mut parts = VecDeque::new();
         let mut verified_counts = ScanCounts::default();
         for snapshot in database_partitions {
@@ -609,7 +621,7 @@ impl ScanCursor {
             let mut local_scan = narrowed.clone();
             if candidate_iids.is_some() { local_scan.iids = None; }
             let partition = |confined, matches| PartitionScan {
-                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, ranking: ranking.clone(), candidate_iids: candidate_iids.clone(),
+                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, ranking: ranking.clone(), candidate_iids: candidate_iids.clone(), metadata_time: None,
                 slots: slots.clone(), scan: local_scan.clone(), execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                 tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
@@ -648,7 +660,7 @@ impl PartitionScan {
             scan.iids = Some(Default::default());
             fragment
         });
-        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
+        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, metadata_time: None, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
             output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
@@ -704,7 +716,7 @@ fn retained_ranked_batch(scan: &Scan, score: rtdb_plan::ColumnId, iids: &crate::
 }
 
 async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usize>, projection: &[usize]) -> Result<Option<crate::OrderedScan>> {
-    if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() {
+    if scan.ordered_top_k.is_none() || scan.iids.is_some() || !scan.matches.is_empty() || retained_metadata::is_projected(scan) {
         return Ok(None);
     }
     let context = &execution.context;
@@ -1471,17 +1483,23 @@ impl PartitionScan {
         // A page is kept for the tasks still to come that read it: those above this one, or below it in a descending scan.
         if self.order == Some(IidOrder::Descending) { self.loaded.retain(|index,_| self.pages.entries[*index].lower < task.range.lower); }
         else { self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper); }
-        self.output = groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(group, rows)| {
+        for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            let metadata = self.retained_transaction_metadata(rows, &batches).await?;
             let page = &self.pages.entries[selected[group]].source;
-            crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
+            let (mut projected, _projected_charge) = metadata.map_or((None, None), |(column, charge)| (Some(column), Some(charge)));
+            let output = crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
                 if let Some(ranking) = &self.ranking
                     && self.scan.columns[position].id == ranking.output
                 {
                     return self.rank_column(ranking, rows, &batches).map(Some);
                 }
+                if self.scan.columns[position].name == "user_metadata" && projected.is_some() {
+                    return Ok(projected.take());
+                }
                 self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose()
-            })
-        }).collect::<Result<_>>()?;
+            })?;
+            self.output.push_back(output);
+        }
         drop(group_reservations);
         self.output_reservation = Some(reservation);
         Ok(())
@@ -1561,6 +1579,30 @@ fn resolved_text<'a>(name: &str, row: &ResolvedRow<(u32, u32)>, batches: &'a [Ar
         "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => PutText::Other,
         _ => batches[row.source.0 as usize].view().borrow_event(row.source.1 as usize)?.put_text(name)?,
     })
+}
+
+fn match_input_cell(batch: &IndexBatch, row: usize, name: &str) -> Result<Option<(StructArray, usize, usize)>> {
+    let op = batch.view().operations()?;
+    let put = op.child(op.type_id(row)).as_any().downcast_ref::<StructArray>()
+        .ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
+    Ok(put.fields().iter().position(|field| field.name() == name)
+        .map(|index| (put.clone(), index, op.value_offset(row))))
+}
+
+fn read_match_input_bound(batch: &IndexBatch, row: usize, name: &str) -> Result<usize> {
+    match match_input_cell(batch, row, name)? {
+        Some((put, index, offset)) => rtdb_columnar::estimate_read_cell_bytes(&put.fields()[index], put.column(index).as_ref(), offset),
+        None => Ok(0),
+    }
+}
+
+fn read_match_input(batch: &IndexBatch, row: usize, name: &str) -> Result<Value> {
+    let Some((put, index, offset)) = match_input_cell(batch, row, name)? else { return Ok(Value::Null); };
+    let (field, array) = (&put.fields()[index], put.column(index).as_ref());
+    match batch.put_field_type(index) {
+        Some(logical) => rtdb_columnar::read_execution_value_as(logical, field, array, offset),
+        None => rtdb_columnar::read_execution_value(field, array, offset),
+    }
 }
 
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {
