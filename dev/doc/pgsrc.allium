@@ -1,13 +1,13 @@
 -- allium: 3
 -- pgsrc.allium
 --
--- Scope: what the Postgres external source may confirm to its upstream.
+-- Scope: what the Postgres external source may confirm to its upstream and the native batches it submits.
 --   Confirming is an instruction to discard, not a progress report, so the only
 --   question is which positions are safe to give.
 -- Includes: the positions tracked and their ordering; the confirmation rule;
 --   the re-delivery skip; the effect of a failed import; the reopening of a
 --   lost stream.
--- Excludes: XTDB's processing model (see db.allium); row and type mapping;
+-- Excludes: XTDB's processing model (see db.allium); other row and type mappings;
 --   TOAST and replica-identity constraints; slot and publication creation.
 --
 -- db.allium describes when XTDB can recover an external-source token.
@@ -348,6 +348,13 @@ surface TargetIngestion {
 
     @guarantee NativeMirrorPayloads
         -- The native mirror builds Arrow batches for snapshot and WAL fields in their received order.
+        -- Bytea, UUID, date, timestamp, interval, and decimal text feeds typed Arrow columns.
+        -- Observed decimal scales, time zones, and interval representations determine the field or dense union legs.
+        -- One-dimensional float4 and float8 arrays with default bounds use their corresponding Arrow float children and retain component nulls.
+        -- Multidimensional arrays and explicitly bounded arrays retain their PostgreSQL text.
+        -- The pgvector vector and halfvec types use Float32 children, with fixed-size lists for declared dimensions and variable-size lists for unconstrained dimensions.
+        -- Snapshot type metadata and WAL relation and type messages identify pgvector fields.
+        -- Ordinary homogeneous floating-point arrays in JSON and JSONB build packed Float64 children.
         -- It stages Arrow document vectors with separately resolved event headers.
 
     @guarantee SubmissionIsOrdered

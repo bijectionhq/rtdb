@@ -14,7 +14,7 @@ struct Reading { header: [u8; 5], header_read: usize, bytes: Vec<u8>, bytes_read
 impl Reading { fn new() -> Self { Self { header: [0; 5], header_read: 0, bytes: Vec::new(), bytes_read: 0, charge: None } } }
 pub(crate) struct Connection { socket: Box<dyn Socket>, reading: Reading, memory: Arc<MemoryBudget>, max_message: usize }
 #[derive(Clone, Debug)]
-pub(crate) struct Column { pub name: String, pub oid: u32 }
+pub(crate) struct Column { pub name: String, pub oid: u32, pub typmod: i32 }
 pub(crate) struct Row { frame: Frame, cells: Vec<Option<std::ops::Range<usize>>> }
 impl Row {
     pub fn cell(&self, index: usize) -> Result<Option<&str>> {
@@ -156,7 +156,7 @@ impl Connection {
 
 fn row_description(bytes: &[u8]) -> Result<Vec<Column>> {
     let mut input = Input::new(bytes); let count = usize::from(input.u16()?); let mut fields = Vec::with_capacity(count);
-    for _ in 0..count { let name = input.string()?.to_owned(); input.take(6)?; let oid = input.u32()?; input.take(6)?; if input.u16()? != 0 { return Err(protocol("Source query requires text result format")); } fields.push(Column { name, oid }); }
+    for _ in 0..count { let name = input.string()?.to_owned(); input.take(6)?; let oid = input.u32()?; input.take(2)?; let typmod = input.i32()?; if input.u16()? != 0 { return Err(protocol("Source query requires text result format")); } fields.push(Column { name, oid, typmod }); }
     input.end()?; Ok(fields)
 }
 

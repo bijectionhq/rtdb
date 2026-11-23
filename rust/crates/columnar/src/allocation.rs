@@ -1,4 +1,6 @@
-use rtdb_types::{Anomaly, ListKind, LogicalType, Result, ScalarType, Value};
+use arrow_array::{Array, UnionArray};
+use arrow_schema::DataType;
+use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, ScalarType, Value};
 
 /// Bounds allocations made by `build_array` and `copy_array`, including temporary value clones and Arrow container capacities.
 /// Sum this bound for each column before building a batch; existing input values require their own reservation.
@@ -22,6 +24,36 @@ pub fn estimate_builder_bytes_refs<'a>(logical: &LogicalType, values: impl IntoI
     }
     multiply(bytes, 4)
 }
+
+/// Reserves the scalar writer bound from decoded types and variable payload lengths.
+pub fn estimate_scalar_builder_bytes<'a>(
+    logical: &LogicalType, cells: impl IntoIterator<Item = Option<(&'a ScalarType, usize)>>,
+) -> Result<usize> {
+    logical.validate()?;
+    let (mut bytes, _) = schema_cost(logical)?;
+    let value_size = std::mem::size_of::<Value>();
+    for cell in cells {
+        let (cost, heap) = match cell {
+            None => (absent_cost(logical)?, 0),
+            Some((scalar, heap)) => {
+                let width = match scalar {
+                    ScalarType::FixedSizeBinary(width) => *width as usize,
+                    ScalarType::Utf8 | ScalarType::Uri | ScalarType::Keyword | ScalarType::Binary | ScalarType::Transit => heap,
+                    _ => 32,
+                };
+                let mut cost = add(present_cell_cost()?, width)?;
+                if matches!(logical, LogicalType::Maybe(_) | LogicalType::Union(_)) {
+                    cost = add(cost, present_cell_cost()?)?;
+                }
+                (cost, heap)
+            }
+        };
+        bytes = add(bytes, add(cost, add(value_size, heap)?)?)?;
+    }
+    multiply(bytes, 4)
+}
+
+fn present_cell_cost() -> Result<usize> { add(multiply(std::mem::size_of::<Value>(), 2)?, 128) }
 
 fn schema_cost(logical: &LogicalType) -> Result<(usize, usize)> {
     let mut bytes = 1024;
@@ -48,7 +80,7 @@ fn schema_cost(logical: &LogicalType) -> Result<(usize, usize)> {
 
 fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
     if matches!(value, Value::Undefined | Value::Null) { return absent_cost(logical); }
-    let mut bytes = add(multiply(std::mem::size_of::<Value>(), 2)?, 128)?;
+    let mut bytes = present_cell_cost()?;
     match logical {
         LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => bytes = add(bytes, cell_cost(inner, value)?)?,
         LogicalType::Nothing | LogicalType::Null => {}
@@ -86,6 +118,8 @@ fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
                     let plain = match element.as_ref() { LogicalType::Maybe(inner) => inner.as_ref(), element => element };
                     if matches!(plain, LogicalType::Scalar(ScalarType::F32 | ScalarType::F64)) {
                         bytes = add(bytes, multiply(values.len(), 8)?)?;
+                    } else if let Some(cost) = packed_number_cost(element, values)? {
+                        bytes = add(bytes, cost)?;
                     } else {
                         for value in values.iter() { bytes = add(bytes, cell_cost(element, value.as_ref())?)?; }
                     }
@@ -109,6 +143,37 @@ fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
         },
     }
     Ok(bytes)
+}
+
+fn packed_number_cost(element: &LogicalType, list: &ListValue) -> Result<Option<usize>> {
+    let Some(array) = list.array() else { return Ok(None); };
+    fn numeric_type(data_type: &DataType) -> bool {
+        matches!(data_type, DataType::Null | DataType::Int8 | DataType::Int16 | DataType::Int32
+            | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+            | DataType::Float16 | DataType::Float32 | DataType::Float64)
+    }
+    let nulls = match array.data_type() {
+        DataType::Union(fields, _) if fields.iter().all(|(_, field)| field.metadata().is_empty() && numeric_type(field.data_type())) => {
+            let union = array.as_any().downcast_ref::<UnionArray>().expect("numeric Arrow union");
+            (0..union.len()).filter(|&row| {
+                let child = union.child(union.type_id(row));
+                *child.data_type() == DataType::Null || child.is_null(union.value_offset(row))
+            }).count()
+        }
+        DataType::Null => array.len(),
+        data_type if numeric_type(data_type) => array.null_count(),
+        _ => return Ok(None),
+    };
+    let mut present = add(present_cell_cost()?, 32)?;
+    match element {
+        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. }
+            if matches!(inner.as_ref(), LogicalType::Scalar(_)) => present = add(present, present_cell_cost()?)?,
+        LogicalType::Union(legs) if legs.iter().all(|leg| matches!(leg, LogicalType::Scalar(_) | LogicalType::Null)) =>
+            present = add(present, present_cell_cost()?)?,
+        LogicalType::Scalar(_) | LogicalType::Nothing | LogicalType::Null => (),
+        _ => return Ok(None),
+    }
+    Ok(Some(add(multiply(array.len() - nulls, present)?, multiply(nulls, absent_cost(element)?)?)?))
 }
 
 /// An absent or null cell occupies one null slot in every descendant array and clones no value.
@@ -175,3 +240,20 @@ fn map_node_cost() -> Result<usize> { add(multiply(add(std::mem::size_of::<Value
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(overflow) }
 fn multiply(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(overflow) }
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/allocation-bound", "Array builder allocation bound cannot be represented") }
+
+#[cfg(test)]
+mod tests {
+    use super::{add, cell_cost, packed_number_cost};
+    use rtdb_types::{ListValue, Value};
+
+    #[test]
+    fn packed_child_estimates_match_the_exact_scalar_allocation_bound() {
+        for values in [vec![Value::I8(0), Value::Null, Value::I8(-5)],
+            vec![Value::Null, Value::F64(-0.0), Value::I16(42), Value::F32(1.0)], vec![Value::Null]] {
+            let list = ListValue::from(values.clone());
+            let ty = list.element_type();
+            let legacy = values.iter().try_fold(0, |cost, value| add(cost, cell_cost(&ty, value)?)).unwrap();
+            assert_eq!(packed_number_cost(&ty, &list).unwrap(), Some(legacy));
+        }
+    }
+}

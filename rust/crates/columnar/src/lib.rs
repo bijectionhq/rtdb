@@ -14,7 +14,7 @@ mod schema;
 mod text;
 mod values;
 
-pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs};
+pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs, estimate_scalar_builder_bytes};
 pub use cell::ArrowCell;
 pub use conform::{DeclaredBatch, arrow_relayout_bound, conform_batch, event_relayout_bound, relayout_arrow_column, relayout_event_column};
 pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DECIMAL_SCALE_KEY, decimal_field_parameters, decimal_parameters, decimal_scale, decimal_storage_precision, decimal_storage_scale, map_schema_fields, validate_projected_decimals, with_decimal_parameters, with_decimal_scale};

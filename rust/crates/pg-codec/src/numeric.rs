@@ -54,12 +54,16 @@ impl Numeric {
     }
 
     pub(crate) fn into_value(self) -> Result<Value> {
+        Ok(Value::Decimal(self.into_decimal()?))
+    }
+
+    pub(crate) fn into_decimal(self) -> Result<DecimalValue> {
         let (precision, width) = self.layout();
         let bytes = match self.coefficient {
             Coefficient::Narrow(value) => value.to_be_bytes().to_vec(),
             Coefficient::Wide(value) => value.to_be_bytes().to_vec(),
         };
-        Ok(Value::Decimal(DecimalValue::new(bytes, precision, self.scale, width)?))
+        DecimalValue::new(bytes, precision, self.scale, width)
     }
 
     pub(crate) fn into_arrow(self, name: &str) -> Result<(Field, ArrayRef)> {

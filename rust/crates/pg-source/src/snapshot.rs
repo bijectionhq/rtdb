@@ -1,7 +1,7 @@
 use std::{collections::{BTreeSet, VecDeque}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef};
-use crate::{ArrowPgTransaction, Lsn, Remote, SourceConfig, config::{identifier, literal}, decoder::snapshot_rows, wire::{Connection, QueryResult, protocol}};
+use crate::{ArrowPgTransaction, Lsn, Remote, SourceConfig, config::{identifier, literal}, decoder::snapshot_rows, vector_types::VectorTypes, wire::{Connection, QueryResult, protocol}};
 
 pub(crate) async fn publication_exists(remote: &Remote, config: &SourceConfig, memory: Arc<MemoryBudget>) -> Result<bool> {
     let mut connection = Connection::open(remote, false, memory).await?;
@@ -9,7 +9,7 @@ pub(crate) async fn publication_exists(remote: &Remote, config: &SourceConfig, m
     Ok(!result.rows.is_empty())
 }
 pub(crate) struct SnapshotReader {
-    _slot: Connection, query: Connection, pub lsn: Lsn, ignored: BTreeSet<TableRef>, tables: VecDeque<TableRef>, table_page: Option<QueryResult>, table: Option<TableRef>, tables_finished: bool, memory: Arc<MemoryBudget>,
+    _slot: Connection, query: Connection, vectors: VectorTypes, pub lsn: Lsn, ignored: BTreeSet<TableRef>, tables: VecDeque<TableRef>, table_page: Option<QueryResult>, table: Option<TableRef>, tables_finished: bool, memory: Arc<MemoryBudget>,
 }
 impl SnapshotReader {
     pub async fn open(remote: &Remote, config: &SourceConfig, memory: Arc<MemoryBudget>) -> Result<Self> {
@@ -26,14 +26,15 @@ impl SnapshotReader {
         query.query(&format!("SET TRANSACTION SNAPSHOT {}", literal(&snapshot)?)).await?;
         query.query("SET LOCAL IntervalStyle = 'iso_8601'").await?;
         query.query(&format!("DECLARE rtdb_tables NO SCROLL CURSOR FOR SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = {} ORDER BY schemaname, tablename", literal(&config.publication_name)?)).await?;
-        Ok(Self { _slot: slot, query, lsn, ignored: config.ignore_tables.clone(), tables: VecDeque::new(), table_page: None, table: None, tables_finished: false, memory })
+        let vectors = VectorTypes::load(&mut query, &memory).await?;
+        Ok(Self { _slot: slot, query, vectors, lsn, ignored: config.ignore_tables.clone(), tables: VecDeque::new(), table_page: None, table: None, tables_finished: false, memory })
     }
     pub async fn next_batch(&mut self) -> Result<Option<ArrowPgTransaction>> {
         loop {
             if let Some(table) = &self.table {
                 let result = self.query.query("FETCH FORWARD 1000 FROM rtdb_rows").await?;
                 if result.rows.is_empty() { self.query.query("CLOSE rtdb_rows").await?; self.table = None; continue; }
-                let changes = snapshot_rows(table, &result.columns, &result.rows, &self.memory)?;
+                let changes = snapshot_rows(table, &result.columns, &result.rows, &self.memory, &self.vectors)?;
                 return Ok(Some(ArrowPgTransaction { lsn: self.lsn, commit_time: None, batches: vec![changes] }));
             }
             if self.tables.is_empty() && !self.tables_finished {

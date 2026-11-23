@@ -207,6 +207,12 @@ pub fn parse_sql_zoned_datetime(text: &str) -> Result<(Instant, ZoneId)> {
 /// Offset and region suffixes follow the pinned SQL_TIMESTAMP_FORMATTER, with microsecond value precision.
 /// SMART resolution clamps day 29–31 to the month's end and carries exact 24:00 into the next date.
 pub fn parse_sql_timestamp_literal(text: &str) -> Result<Value> {
+    let (value, timezone) = parse_sql_timestamp_micros(text)?;
+    Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone })
+}
+
+/// Parses a SQL timestamp literal into epoch microseconds and its optional zone.
+pub fn parse_sql_timestamp_micros(text: &str) -> Result<(i64, Option<String>)> {
     let parsed = parse(text)?;
     let zoned = parsed.zone.is_some() || parsed.offset.is_some();
     let value = if zoned { parsed.instant("UTC")?.as_micros()?.0 } else { Instant::new(parsed.local.epoch_second(), parsed.local.nano())?.as_micros()?.0 };
@@ -214,7 +220,7 @@ pub fn parse_sql_timestamp_literal(text: &str) -> Result<Value> {
         let offset = parsed.offset.unwrap();
         offset.to_string()
     })) } else { None };
-    Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone })
+    Ok((value, timezone))
 }
 
 /// Parses the SQL timestamp grammar without reducing its fractional precision.

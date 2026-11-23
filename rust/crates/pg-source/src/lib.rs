@@ -6,6 +6,7 @@ mod metrics;
 mod snapshot;
 mod stream;
 mod token;
+mod vector_types;
 mod wire;
 
 pub use config::{CONFIG_TYPE, DIRECT_MIRROR_TYPE, Remote, SourceConfig, SslMode};

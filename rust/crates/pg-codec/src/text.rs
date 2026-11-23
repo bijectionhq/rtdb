@@ -1,10 +1,10 @@
 use rtdb_types::StructFields;
-use std::collections::BTreeMap;
-use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
+use std::{borrow::Cow, collections::BTreeMap};
+use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, PgType, Result, ScalarType, TimeUnit, Value};
 use crate::interval::parse as interval;
 
 mod column;
-pub use column::read_text_column;
+pub use column::{read_source_text_column, read_text_column, read_vector_column};
 mod transit_input;
 pub use transit_input::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction};
 
@@ -17,13 +17,20 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         21 => Value::I16(text.parse().map_err(invalid)?), 23 => Value::I32(text.parse().map_err(invalid)?), 20 => Value::I64(text.parse().map_err(invalid)?),
         700 => Value::F32(float32(text)?), 701 => Value::F64(float(text)?),
         1700 => decimal(text)?,
-        17 => Value::Binary(if let Some(hex) = text.strip_prefix("\\x") { if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); } hex.as_bytes().chunks_exact(2).map(|pair| { let text = std::str::from_utf8(pair).map_err(invalid)?; u8::from_str_radix(text, 16).map_err(invalid) }).collect::<Result<_>>()? } else { text.as_bytes().to_vec() }),
+        17 => Value::Binary(bytea(text)?.into_owned()),
         2950 => Value::Uuid(parse_uuid(text)?),
         1082 => Value::calendar_date(rtdb_types::CivilDate::parse_iso(text)?, rtdb_types::DateUnit::Day),
         1083 => Value::Time { value: rtdb_types::parse_iso_local_time(text)? as i64, unit: TimeUnit::Nanosecond, bit_width: 64 },
-        1114 => { let value = rtdb_types::parse_sql_timestamp_literal(text)?; if !matches!(&value, Value::Timestamp { timezone: None, .. }) { return Err(invalid("Invalid PostgreSQL local timestamp")); } value },
+        1114 => Value::Timestamp { value: local_timestamp_micros(text)?, unit: TimeUnit::Microsecond, timezone: None },
         1184 => timestamp(text)?,
-        1186 => { let (months, days, nanoseconds) = interval(text)?; if nanoseconds % 1000 != 0 { Value::IntervalMonthDayNano { months, days, nanoseconds } } else if nanoseconds != 0 || days != 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } } else { Value::IntervalYearMonth(months) } },
+        1186 => {
+            let (months, days, nanoseconds) = interval(text)?;
+            match interval_type(days, nanoseconds) {
+                ScalarType::Interval(IntervalUnit::YearMonth) => Value::IntervalYearMonth(months),
+                ScalarType::IntervalMonthDayMicro => Value::IntervalMonthDayMicro { months, days, nanoseconds },
+                _ => Value::IntervalMonthDayNano { months, days, nanoseconds },
+            }
+        },
         11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
         1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; let mut list = rtdb_types::ListBuilder::with_capacity(0); visit_array(text, |value| { list.push(value.map_or(Ok(Value::Null), |text| read_text(element, &text))?); Ok(()) })?; Value::List(list.finish()) },
         114 | 3802 => read_json(text)?,
@@ -42,10 +49,44 @@ fn parse_boolean(text: &str) -> Result<bool> { Ok(match text.trim().to_ascii_low
 pub(crate) fn float32(text: &str) -> Result<f32> { Ok(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }) }
 pub(crate) fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
 fn decimal(text: &str) -> Result<Value> { crate::numeric::parse(text)?.into_value() }
-fn timestamp(text: &str) -> Result<Value> {
-    let Value::Timestamp { value, unit, timezone: Some(zone) } = rtdb_types::parse_sql_timestamp_literal(text)? else { return Err(invalid("Zoned timestamp requires an offset or region")); };
-    Ok(Value::Timestamp { value, unit, timezone: Some(rtdb_expr::normalize_timezone(&zone)?) })
+
+fn parse_decimal(text: &str) -> Result<DecimalValue> {
+    crate::numeric::parse(text)?.into_decimal()
 }
+
+fn bytea(text: &str) -> Result<Cow<'_, [u8]>> {
+    let Some(hex) = text.strip_prefix("\\x") else { return Ok(Cow::Borrowed(text.as_bytes())); };
+    if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); }
+    let bytes = hex.as_bytes().chunks_exact(2).map(|pair| {
+        let text = std::str::from_utf8(pair).map_err(invalid)?;
+        u8::from_str_radix(text, 16).map_err(invalid)
+    }).collect::<Result<_>>()?;
+    Ok(Cow::Owned(bytes))
+}
+
+fn local_timestamp_micros(text: &str) -> Result<i64> {
+    let (value, timezone) = rtdb_types::parse_sql_timestamp_micros(text)?;
+    if timezone.is_some() { return Err(invalid("Invalid PostgreSQL local timestamp")); }
+    Ok(value)
+}
+
+fn zoned_timestamp_micros(text: &str) -> Result<(i64, String)> {
+    let (value, zone) = rtdb_types::parse_sql_timestamp_micros(text)?;
+    let zone = zone.ok_or_else(|| invalid("Zoned timestamp requires an offset or region"))?;
+    Ok((value, rtdb_expr::normalize_timezone(&zone)?))
+}
+
+fn timestamp(text: &str) -> Result<Value> {
+    let (value, zone) = zoned_timestamp_micros(text)?;
+    Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some(zone) })
+}
+
+fn interval_type(days: i32, nanoseconds: i64) -> ScalarType {
+    if nanoseconds % 1000 != 0 { ScalarType::Interval(IntervalUnit::MonthDayNano) }
+    else if nanoseconds != 0 || days != 0 { ScalarType::IntervalMonthDayMicro }
+    else { ScalarType::Interval(IntervalUnit::YearMonth) }
+}
+
 fn visit_array<'a>(text: &'a str, visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {
     visit_array_elements(text, false, visit)
 }
@@ -148,7 +189,11 @@ fn read_json(text: &str) -> Result<Value> {
         Some(b't') if text == "true" => Value::Bool(true),
         Some(b'f') if text == "false" => Value::Bool(false),
         Some(b'"') => Value::Utf8(serde_json::from_str(text).map_err(invalid)?),
-        Some(b'[') => { let values: Vec<Box<RawValue>> = serde_json::from_str(text).map_err(invalid)?; Value::list(values.into_iter().map(|value| read_json(value.get())).collect::<Result<_>>()?) },
+        Some(b'[') => {
+            let values: Vec<&RawValue> = serde_json::from_str(text).map_err(invalid)?;
+            if let Some(list) = json_float_list(&values)? { Value::List(list) }
+            else { Value::list(values.into_iter().map(|value| read_json(value.get())).collect::<Result<_>>()?) }
+        },
         Some(b'{') => {
             let mut fields: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).map_err(invalid)?;
             let kind = fields.get("@type").and_then(|kind| serde_json::from_str::<String>(kind.get()).ok());
@@ -178,6 +223,24 @@ fn read_json(text: &str) -> Result<Value> {
         }
     })
 }
+fn json_float_list(values: &[&serde_json::value::RawValue]) -> Result<Option<rtdb_types::ListValue>> {
+    let is_float = |text: &str| {
+        matches!(text.as_bytes().first(), Some(b'-' | b'0'..=b'9'))
+            && (text.contains(['.', 'e', 'E']) || text.trim_start_matches('-').len() > 64)
+    };
+    if !values.iter().all(|value| value.get() == "null" || is_float(value.get()))
+        || !values.iter().any(|value| value.get() != "null")
+    {
+        return Ok(None);
+    }
+    let mut builder = arrow_array::builder::Float64Builder::with_capacity(values.len());
+    for value in values {
+        let text = value.get();
+        builder.append_option((text != "null").then(|| float(text)).transpose()?);
+    }
+    Ok(Some(rtdb_types::ListValue::from_f64(builder.finish())))
+}
+
 fn zoned_timestamp(text: &str) -> Result<Value> {
     timestamp(text)
 }

@@ -150,3 +150,18 @@ Additional properties are required from the tables replicated using this indexer
   - Like in XTDB, it is incorrect to specify a `_valid_to` without a `_valid_from`
 
 No configuration properties are provided.
+
+
+#### Numeric arrays and pgvector
+
+| PostgreSQL column type | Native XTDB layout |
+| --- | --- |
+| One-dimensional `real[]` (`float4[]`) | List of 32-bit floats |
+| One-dimensional `double precision[]` (`float8[]`) | List of 64-bit floats |
+| pgvector `vector(n)` and `halfvec(n)` | Fixed-size list of `n` 32-bit floats |
+| pgvector `vector` and `halfvec` with no declared dimension | Variable-size list of 32-bit floats |
+
+The mirror preserves SQL nulls and null elements in PostgreSQL arrays.
+Multidimensional arrays and arrays with non-default lower bounds retain their PostgreSQL text representation.
+It recognizes the pgvector extension's types in its installed schema.
+The pgvector type catalog is read when snapshotting starts and when opening the replication stream.
