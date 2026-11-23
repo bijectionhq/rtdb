@@ -1878,14 +1878,30 @@ async fn exact_historical_parent_context(
     Ok(context)
 }
 
-async fn historical_parent_context(
-    context: Arc<rtdb_query::QueryContext>, owner: &str, requested: Timestamp,
-    schemas: &[(OwnedRelation, rtdb_types::OwnedSchema)],
-) -> Result<Option<(Arc<rtdb_query::QueryContext>, Timestamp)>> {
-    let unavailable = OwnedWorld::unavailable;
+// Journal reads may select the exact pinned physical cut. Publication-based
+// selection still requires a Root publication at the requested coordinate.
+async fn parent_journal_context(
+    context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
+    system: Timestamp, expected: &rtdb_types::OwnedSchema,
+) -> Result<()> {
     let parent = context.current_time.as_micros()?;
-    if requested > parent { return Err(unavailable()); }
-    check_archive_coverage(&context, owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
+    if system != parent {
+        exact_historical_parent_context(context, owner, system, &[(relation.clone(), expected.clone())]).await?;
+        return Ok(());
+    }
+    require_historical_parent_archive(&context, parent)?;
+    check_archive_coverage(&context, owner, [(relation, 0)])?;
+    let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&context), owner, relation).await?;
+    if !actual.is_some_and(|(actual, _)| &actual == expected) {
+        return Err(OwnedWorld::unavailable());
+    }
+    context.check_cancelled()
+}
+
+fn require_historical_parent_archive(
+    context: &rtdb_query::QueryContext, parent: Timestamp,
+) -> Result<()> {
+    let unavailable = OwnedWorld::unavailable;
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
     if snapshot.tx_basis().is_none_or(|basis| basis.system_time != parent)
@@ -1894,6 +1910,20 @@ async fn historical_parent_context(
     {
         return Err(unavailable());
     }
+    Ok(())
+}
+
+async fn historical_parent_context(
+    context: Arc<rtdb_query::QueryContext>, owner: &str, requested: Timestamp,
+    schemas: &[(OwnedRelation, rtdb_types::OwnedSchema)],
+) -> Result<Option<(Arc<rtdb_query::QueryContext>, Timestamp)>> {
+    let unavailable = OwnedWorld::unavailable;
+    let parent = context.current_time.as_micros()?;
+    if requested > parent { return Err(unavailable()); }
+    check_archive_coverage(&context, owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
+    require_historical_parent_archive(&context, parent)?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
     let publication = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
     if snapshot.relation_event_frontier(&publication.purge_table(owner))? != 0 {
         return Err(unavailable());
@@ -2177,12 +2207,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let read = async {
                                         guard()?;
                                         let context = Arc::clone(&context).with_owned_read_guard(guard);
-                                        check_archive_coverage(&context, &owner, [(&relation, 0)])?;
-                                        let selected_context = exact_historical_parent_context(Arc::clone(&context), &owner, selected, &[]).await?;
-                                        let selected_schema = rtdb_query::read_owned_relation_schema(selected_context, &owner, &relation).await?;
-                                        if !selected_schema.is_some_and(|(actual, _)| actual == schema) {
-                                            return Err(OwnedWorld::unavailable());
-                                        }
+                                        parent_journal_context(Arc::clone(&context), &owner, &relation, selected, &schema).await?;
                                         let columns = rtdb_node::archived_path_touch_at_cut(
                                             Arc::clone(&context), &owner, &relation, &path, &id, selected, before, group, valid,
                                         ).await?;
@@ -2255,12 +2280,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let read = async {
                                         guard()?;
                                         let context = Arc::clone(&context).with_owned_read_guard(guard);
-                                        check_archive_coverage(&context, &owner, [(&relation, 0)])?;
-                                        let capped = exact_historical_parent_context(Arc::clone(&context), &owner, selected, &[]).await?;
-                                        let actual = rtdb_query::read_owned_relation_schema(capped, &owner, &relation).await?;
-                                        if !actual.is_some_and(|(actual, _)| actual == schema) {
-                                            return Err(OwnedWorld::unavailable());
-                                        }
+                                        parent_journal_context(Arc::clone(&context), &owner, &relation, selected, &schema).await?;
                                         rtdb_node::archived_changes_at_cut(context, &owner, &relation, after, through, limit, reverse).await
                                     };
                                     let response = tokio::select! {
@@ -2274,8 +2294,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let read = async {
                                         guard()?;
                                         let context = Arc::clone(&context).with_owned_read_guard(guard);
-                                        let schemas = [(relation.clone(), schema)];
-                                        exact_historical_parent_context(Arc::clone(&context), &owner, selected, &schemas).await?;
+                                        parent_journal_context(Arc::clone(&context), &owner, &relation, selected, &schema).await?;
                                         require_parent_journal(&context, &owner, &relation, request.system.lower()).await?;
                                         let page = rtdb_node::archived_versions_at_cut(
                                             Arc::clone(&context), &owner, &relation, &id, selected, request,
@@ -2285,7 +2304,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         for mut version in page.versions {
                                             let version_context = context.with_owned_system_cut(version.system_time, &context.cancellation)?;
                                             let version_schema = rtdb_query::read_owned_relation_schema(version_context, &owner, &relation).await?;
-                                            if !version_schema.is_some_and(|(schema, _)| schema == schemas[0].1) {
+                                            if !version_schema.is_some_and(|(actual, _)| actual == schema) {
                                                 return Err(OwnedWorld::unavailable());
                                             }
                                             let mut timeline = Vec::new();
