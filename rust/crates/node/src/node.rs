@@ -2854,7 +2854,7 @@ impl NativeSession {
             || fork.root.as_ref().and_then(|section| section.publication.as_ref()).is_some_and(|root| {
                 root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                    | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                    | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                     _ => true,
                 })
             })
@@ -2958,7 +2958,7 @@ impl NativeSession {
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                 _ => true,
             }) {
                 return Err(unavailable());

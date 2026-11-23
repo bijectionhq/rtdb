@@ -1049,6 +1049,28 @@ impl Service {
             }
             let valid_from = valid_endpoint(row.remove("_valid_from"))?;
             let valid_to = valid_endpoint(row.remove("_valid_to"))?;
+            let from_offset = optional_micros(row.remove("_valid_from_offset_micros"))?;
+            let to_offset = optional_micros(row.remove("_valid_to_offset_micros"))?;
+            if from_offset.is_some() || to_offset.is_some() {
+                let (Some(from), Some(to)) = (from_offset, to_offset) else {
+                    return Err(invalid("A relative Root period requires both offsets"));
+                };
+                if !relation.is_root_data() || matches!(effects, CommitEffects::Replay)
+                    || valid_from.is_some() || valid_to.is_some() || from >= to
+                {
+                    return Err(invalid("Invalid relative Root period"));
+                }
+                let effect = match operation.as_str() {
+                    "create" => rtdb_tx::OwnedPeriodEffect::Create(Documents::new(vec![row], self.memory()).map_err(status)?),
+                    "replace" => rtdb_tx::OwnedPeriodEffect::Replace(Documents::new(vec![row], self.memory()).map_err(status)?),
+                    "delete" if !has_payload(&row) => rtdb_tx::OwnedPeriodEffect::Delete(id),
+                    _ => return Err(invalid("A relative Root period requires a fact write")),
+                };
+                writes.push(TxOp::OwnedRelativePeriod {
+                    relation: relation.clone(), effect, from_micros: from.0, to_micros: to.0,
+                });
+                continue;
+            }
             if operation == "check" {
                 if valid_at.is_none() || valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
                     return Err(invalid("Owned check requires one observation and no mutation fields"));
@@ -3203,7 +3225,7 @@ impl Service {
                     TxOp::OwnedCheck { relation, .. } if relation.is_root_data() =>
                         root.checks.push(operation),
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                    | TxOp::OwnedDelete { relation, .. } if relation.is_root_data() =>
+                    | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } if relation.is_root_data() =>
                         writes.push(operation),
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
@@ -3446,7 +3468,8 @@ impl Service {
                 _ if proposal_land && rtdb_tx::is_proposal_landing_frontier(&operation) =>
                     root_writes.push(operation),
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                | TxOp::OwnedDelete { relation, .. } if root_attempt.is_some() && relation.is_root_data() =>
+                | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. }
+                    if root_attempt.is_some() && relation.is_root_data() =>
                     root_writes.push(operation),
                 _ => return Err(invalid("Operation is outside the held Root section")),
             }
