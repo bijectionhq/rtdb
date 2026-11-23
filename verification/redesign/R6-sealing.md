@@ -58,6 +58,7 @@ The S3 vault registers each slot in a conditionally updated shard before issuing
 Scope withdrawal closes the namespace and freezes each shard before tombstoning the registered slots, including registrations whose create result was lost.
 A late conditional create for a registered slot races with the terminal tombstone on that same slot.
 The serving and checkpoint retirement owners invoke the same vault settlement after their existing admission and drain checks.
+The DynamoDB vault orders each conditional unit creation against a scope fence in a transaction and confirms the fenced slot census before reporting withdrawal.
 
 Local and S3 checkpoint captures use separate slots for their objects and replica archive records.
 Capture cryptography combines the slot with an indispensable capture authority secret, so withdrawing the capture also disables any retained slot.
