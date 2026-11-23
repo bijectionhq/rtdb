@@ -202,6 +202,7 @@
 -- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
 -- Its ordered condition checks the original parent pin and Root purge frontier.
 -- Finite Proposal replacements can land after the Root publication advances when the transaction checks each exact start and both held timeline frontiers for each affected relation.
+-- A registered decision must tie each partition frontier marker to a write to that Root relation, with one marker per relation and one offered control write per address.
 -- A landing with point writes requires the original parent publication and may also contain finite replacements at distinct addresses.
 -- A Proposal overlay may append multiple fresh carriers in any generation.
 -- Each create checks its own original absence in the parent and overlay.

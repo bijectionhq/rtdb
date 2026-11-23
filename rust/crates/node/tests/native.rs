@@ -724,13 +724,23 @@ async fn ordered_owned_unique_groups_swaps_and_refuses_conflicts() {
         hit.revision,
     );
     assert!(held.unique(&relation, &path, &[3], valid).await.unwrap().is_none());
-    assert!(held.unique(&relation, &path, &[1], valid.next().unwrap()).await.is_err());
+    let future = held.unique(&relation, &path, &[1], valid.next().unwrap()).await.unwrap().unwrap();
+    assert_eq!(
+        rtdb_query::owned_row_revision(future.row.batch(), 0, &EntityId::Integer(2), node.memory()).unwrap(),
+        hit.revision,
+    );
     drop(held);
 
-    let invalid = session.state_mut().execute_tx(
-        vec![replace(1, 4, Some(Timestamp(i64::MAX - 1)))], AutonomousTxOptions::default(),
+    let end = Timestamp(i64::MAX - 1);
+    let bounded = session.state_mut().execute_tx(
+        vec![replace(1, 4, Some(end))], AutonomousTxOptions::default(),
     ).await.unwrap();
-    assert_eq!(invalid.error().unwrap().code, "rtdb.owned/unique-valid-time");
+    assert!(bounded.committed(), "{:?}", bounded.error());
+    let held = session.open_owned_read().await.unwrap();
+    assert!(held.unique(&relation, &path, &[4], bounded.tx_key().system_time).await.unwrap().is_some());
+    assert!(held.unique(&relation, &path, &[4], end).await.unwrap().is_none());
+    assert!(held.unique(&relation, &path, &[2], end).await.unwrap().is_some());
+    drop(held);
     let release = TxOp::OwnedDelete {
         relation: relation.clone(), id: EntityId::Integer(2), valid_from: None, valid_to: None,
     };

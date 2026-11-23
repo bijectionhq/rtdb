@@ -48,7 +48,10 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
 }
 
 fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], placed: bool) -> Result<()> {
-    use crate::hosted_control::{ProposalLandingEffect, hosted_proposal_land, hosted_proposal_overlay, retained_release_world};
+    use crate::hosted_control::{
+        ProposalLandingEffect, hosted_proposal_land, hosted_proposal_overlay, retained_release_world,
+        root_partition_frontiers_match,
+    };
 
     let world = hosted_proposal_overlay(primary).is_some()
         || retained_release_world(primary).is_some()
@@ -58,13 +61,18 @@ fn validate_registered_choice(primary: &[Operation], refusal: &[Operation], plac
         Operation::Public(TxOp::OwnedPublishWorld { attempt, fingerprint, .. }) if world => Some((attempt, fingerprint)),
         _ => None,
     });
-    if !placed || !(world || primary.iter().all(primary_op)
-        || crate::hosted_control::hosted_root_world_reads(primary))
+    if !placed || !root_partition_frontiers_match(primary)
+        || !(world || primary.iter().all(primary_op)
+            || crate::hosted_control::hosted_root_world_reads(primary))
     {
         return Err(invalid());
     }
     let offered_controls = primary.iter().filter_map(hosted)
         .filter(|control| !control.is_check()).collect::<Vec<_>>();
+    let mut control_addresses = std::collections::BTreeSet::new();
+    if offered_controls.iter().any(|control| !control_addresses.insert((control.name(), control.id()))) {
+        return Err(invalid());
+    }
     let attempts = primary.iter().filter(|op| write_relation(op)
         .is_some_and(|relation| relation.name() == ATTEMPTS)).collect::<Vec<_>>();
     if (attempts.is_empty() && embedded.is_none()) || (!attempts.is_empty() && embedded.is_some()) {

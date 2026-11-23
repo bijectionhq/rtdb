@@ -719,7 +719,12 @@ mod tests {
         child.ancestor.as_mut().expect("fixture contains an ancestor").logical = Timestamp(201);
         assert!(OwnedWorld::from_record(&child.record()).is_err());
         child.fork_lineage[0].logical = Timestamp(201);
-        assert_eq!(OwnedWorld::from_record(&child.record())?.inherited_clock(), Timestamp(201));
+        let retained = OwnedWorld::from_record(&child.record())?;
+        assert_eq!(retained.initial_clock(), Timestamp(201));
+        assert_eq!(retained.inherited_system(), Timestamp(200));
+        child.ancestor.as_mut().unwrap().logical = Timestamp::MAX;
+        child.fork_lineage[0].logical = Timestamp::MAX;
+        assert!(OwnedWorld::from_record(&child.record()).is_err());
         Ok(())
     }
 }
