@@ -228,13 +228,13 @@ impl OpenTransaction<'_> {
                     ]),
                     Interval::ALL,
                 )?;
-                active.insert(id, (world, charge));
+                active.insert(id, (world, charge, clock));
             }
         }
 
         let mut identities = BTreeSet::new();
         for shadow in effects.shadows {
-            let (world, _) = active
+            let (world, _, clock) = active
                 .get(&shadow.world)
                 .ok_or_else(OwnedWorld::unavailable)?;
             let root = shadow.relation;
@@ -255,13 +255,12 @@ impl OpenTransaction<'_> {
             {
                 return Err(OwnedWorld::unavailable());
             }
-            if world.mode == WorldClockMode::Proposal {
-                schema.require_replayed_period(shadow.valid, logical, rtdb_types::EventOp::Put)?;
-            } else {
-                if schema.requires_bounded_period() {
-                    return Err(OwnedWorld::unavailable());
-                }
-                schema.require_write_validity(true)?;
+            schema.require_replayed_period(shadow.valid, *clock, rtdb_types::EventOp::Put)?;
+            if matches!(world.mode, WorldClockMode::Held { .. })
+                && schema.has_acceptance_validity()
+                && shadow.valid.lower() != *clock
+            {
+                return Err(OwnedWorld::unavailable());
             }
             let (image, change) = if let Some(mut fields) = shadow.fields {
                 fields.insert("_id".into(), shadow.id.as_value());
