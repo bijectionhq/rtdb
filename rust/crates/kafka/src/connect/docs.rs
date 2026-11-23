@@ -191,7 +191,27 @@ fn document_growth(value: &Value) -> Result<usize> {
     match value {
         Value::Struct(fields) => fields.values().try_fold(4096usize, add),
         Value::Map { entries, .. } => entries.iter().map(|(_, value)| value).try_fold(4096usize, add),
+        Value::List(values) if values.array().is_some() => values.len().checked_mul(8192)
+            .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Document allocation overflow")),
         Value::List(values) => values.iter().try_fold(4096usize, |bytes, value| add(bytes, value.as_ref())),
         _ => Ok(4096),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn document_admission_keeps_packed_float_buffers_and_the_existing_growth_bound() {
+    use arrow_array::Float32Array;
+    use rtdb_types::ListValue;
+
+    let array: Float32Array = [Some(-0.0_f32), None, Some(f32::from_bits(0x7fc1_2345))].into_iter().collect();
+    let source = array.values().as_ptr();
+    let value = Value::List(ListValue::from_f32(array));
+    let mut element = super::ConnectSchema::new(SchemaKind::F32);
+    element.optional = true;
+    let schema = super::ConnectSchema::new(SchemaKind::Array(Arc::new(element)));
+    assert_eq!(document_growth(&value).unwrap(), 4096 + 3 * 8192);
+    let Value::List(list) = convert_with_schema(value, Some(&schema)).unwrap() else { panic!("expected Arrow list"); };
+    let array = list.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(source, array.values().as_ptr());
 }

@@ -64,8 +64,11 @@ fn selected_collection_blocks_discard_the_declared_byte_length() {
     let schema = plan(r#"{"type":"array","items":"int"}"#); let mut context = context();
     let resolution = AvroResolution::compile(&schema, &schema, &mut context).unwrap();
     for bytes in [[1, 0, 2, 0], [1, 8, 2, 0], [1, 1, 2, 0]] {
-        assert_eq!(schema.decode_datum(&bytes, &mut context).unwrap().value, Avro::Array(vec![Avro::Int(1)]));
-        assert_eq!(resolution.decode_datum(&bytes, &mut context).unwrap().value, Avro::Array(vec![Avro::Int(1)]));
+        for datum in [schema.decode_datum(&bytes, &mut context).unwrap(), resolution.decode_datum(&bytes, &mut context).unwrap()] {
+            let Avro::PackedArray(packed) = datum.value else { panic!("expected packed array"); };
+            assert_eq!(packed.values.array().unwrap().data_type(), &arrow_schema::DataType::Int32);
+            assert_eq!(packed.into_physical_values(), vec![Avro::Int(1)]);
+        }
     }
     assert!(resolution.decode_datum(&[1, 0], &mut context).is_err());
 }
@@ -143,4 +146,49 @@ fn guided_decode_admits_selected_allocations_and_retains_cached_charges() {
     assert_eq!(resolution.decode_datum(&bytes, &mut next).unwrap().value, Avro::Record(vec![("keep".into(), Avro::Int(7))]));
     assert!(writer.decode_datum(&bytes, &mut next).is_err());
     drop(resolution); assert!(budget.used_bytes() > 0); drop(next); assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn optional_float_blocks_keep_nan_payloads_and_negative_zero_in_both_binary_readers() {
+    use arrow_array::{Array, Float32Array};
+    let schema = plan(r#"{"type":"array","items":["float","null"]}"#);
+    let mut context = context();
+    let resolution = AvroResolution::compile(&schema, &schema, &mut context).unwrap();
+    let float_bits = 0x7fc1_2345_u32;
+    let mut bytes = vec![3, 10, 0];
+    bytes.extend_from_slice(&float_bits.to_le_bytes());
+    bytes.push(2);
+    bytes.extend([2, 0]);
+    bytes.extend_from_slice(&(-0.0_f32).to_le_bytes());
+    bytes.push(0);
+    for datum in [schema.decode_datum(&bytes, &mut context).unwrap(), resolution.decode_datum(&bytes, &mut context).unwrap()] {
+        let Avro::PackedArray(packed) = datum.value else { panic!("expected packed array"); };
+        let array = packed.values.array().unwrap().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(array.value(0).to_bits(), float_bits);
+        assert!(array.is_null(1));
+        assert_eq!(array.value(2).to_bits(), (-0.0_f32).to_bits());
+    }
+}
+
+#[test]
+fn reader_resolution_promotes_numeric_array_items_without_losing_double_bits() {
+    use arrow_array::{Float32Array, Float64Array};
+    let writer = plan(r#"{"type":"array","items":"float"}"#);
+    let reader = plan(r#"{"type":"array","items":"double"}"#);
+    let mut context = context();
+    let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
+    let value = f32::from_bits(0x7fc1_2345);
+    let mut bytes = vec![4];
+    bytes.extend_from_slice(&value.to_le_bytes());
+    bytes.extend_from_slice(&(-0.0_f32).to_le_bytes());
+    bytes.push(0);
+    let raw = writer.decode_datum(&bytes, &mut context).unwrap();
+    let Avro::PackedArray(packed) = &raw.value else { panic!("expected packed array"); };
+    assert!(packed.values.array().unwrap().as_any().is::<Float32Array>());
+    for datum in [resolution.decode_datum(&bytes, &mut context).unwrap(), resolution.resolve(raw, &mut context).unwrap()] {
+        let Avro::PackedArray(packed) = datum.value else { panic!("expected promoted packed array"); };
+        let array = packed.values.array().unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(array.value(0).to_bits(), f64::from(value).to_bits());
+        assert_eq!(array.value(1).to_bits(), (-0.0_f64).to_bits());
+    }
 }

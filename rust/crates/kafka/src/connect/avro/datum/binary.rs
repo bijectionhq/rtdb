@@ -1,4 +1,4 @@
-use super::*;
+use super::{Avro, AvroDatumPlan, AvroMap, BinaryWindow, MapKey, PackedArray, Preflight, Result, Schema, error, resolve, resolution};
 
 pub(super) fn decode(plan: &AvroDatumPlan, bytes: &[u8]) -> Result<Avro> {
     let mut reader = Preflight { bytes, offset: 0, window: BinaryWindow::new(bytes.len()), allocated: 0, limit: usize::MAX, names: &plan.names, view_bytes: 0 };
@@ -21,8 +21,8 @@ pub(in crate::connect::avro) fn value(schema: &Schema, reader: &mut Preflight<'_
         Schema::Boolean => Avro::Boolean(reader.take(1)?[0] == 1),
         Schema::Int | Schema::Date | Schema::TimeMillis => Avro::Int(reader.int()?),
         Schema::Long | Schema::TimeMicros | Schema::TimestampMillis | Schema::TimestampMicros | Schema::TimestampNanos | Schema::LocalTimestampMillis | Schema::LocalTimestampMicros | Schema::LocalTimestampNanos => Avro::Long(reader.long()?),
-        Schema::Float => Avro::Float(f32::from_le_bytes(reader.number_bytes(4)?.try_into().expect("four bytes"))),
-        Schema::Double => Avro::Double(f64::from_le_bytes(reader.number_bytes(8)?.try_into().expect("eight bytes"))),
+        Schema::Float => Avro::Float(super::numeric::float(reader)?),
+        Schema::Double => Avro::Double(super::numeric::double(reader)?),
         Schema::String | Schema::Uuid => match String::from_utf8(bytes(reader)?) { Ok(text) => Avro::String(text), Err(cause) => Avro::Utf8(cause.into_bytes()) },
         Schema::Bytes | Schema::BigDecimal => Avro::Bytes(bytes(reader)?),
         Schema::Fixed(fixed) => Avro::Fixed(fixed.size, reader.take(fixed.size)?.to_vec()),
@@ -40,6 +40,9 @@ pub(in crate::connect::avro) fn value(schema: &Schema, reader: &mut Preflight<'_
         }
         Schema::Record(record) => Avro::Record(record.fields.iter().map(|field| Ok((field.name.clone(), value(&field.schema, reader, depth + 1)?))).collect::<Result<_>>()?),
         Schema::Array(array) => {
+            if let Some((kind, branches)) = PackedArray::layout(&array.items) {
+                return Ok(Avro::PackedArray(PackedArray::read(kind, kind, branches, reader, depth + 1)?));
+            }
             let mut values = Vec::new();
             loop { let count = block(reader)?; if count == 0 { break; } for _ in 0..count { values.push(value(&array.items, reader, depth + 1)?); } }
             Avro::Array(values)

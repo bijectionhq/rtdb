@@ -1,6 +1,8 @@
 use super::*;
 mod map_order;
 mod binary;
+mod numeric;
+pub(super) use numeric::{NumericKind, PackedArray};
 pub(super) use binary::{bytes as read_bytes, block as read_block, value as read_value};
 #[cfg(test)] mod utf8_tests;
 
@@ -8,7 +10,7 @@ pub(super) use binary::{bytes as read_bytes, block as read_block, value as read_
 pub(super) enum PhysicalValue {
     Null, Boolean(bool), Int(i32), Long(i64), Float(f32), Double(f64),
     String(String), Utf8(Vec<u8>), Bytes(Vec<u8>), Fixed(usize, Vec<u8>), Enum(u32, String),
-    Array(Vec<Self>), Map(AvroMap), Record(Vec<(String, Self)>), Union(u32, Box<Self>),
+    Array(Vec<Self>), PackedArray(PackedArray), Map(AvroMap), Record(Vec<(String, Self)>), Union(u32, Box<Self>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
 rtdb-storage.workspace = true
 rtdb-types.workspace = true
 rtdb-java-date.workspace = true

@@ -122,6 +122,17 @@ pub(crate) fn validate_value(schema: &ConnectSchema, value: &Value, depth: usize
     if let Some(valid) = logical { return if valid { Ok(()) } else { Err(invalid()) }; }
     match (&schema.kind, value) {
         (SchemaKind::Bool, Value::Bool(_)) | (SchemaKind::I8, Value::I8(_)) | (SchemaKind::I16, Value::I16(_)) | (SchemaKind::I32, Value::I32(_)) | (SchemaKind::I64, Value::I64(_)) | (SchemaKind::F32, Value::F32(_)) | (SchemaKind::F64, Value::F64(_)) | (SchemaKind::String, Value::Utf8(_)) | (SchemaKind::Bytes, Value::Binary(_)) => Ok(()),
+        (SchemaKind::Array(element), Value::List(values)) if depth < 128 => {
+            let layout = element.resolved();
+            if !matches!(layout.name.as_deref(), Some("org.apache.kafka.connect.data.Decimal" | "org.apache.kafka.connect.data.Date"
+                | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp"))
+                && super::numeric::plain_matches(values, &layout.kind, layout.optional)
+            {
+                Ok(())
+            } else {
+                values.iter().try_for_each(|value| validate_value(element, value.as_ref(), depth + 1))
+            }
+        }
         (SchemaKind::Array(element), Value::List(values)) => values.iter().try_for_each(|value| validate_value(element, value.as_ref(), depth + 1)),
         (SchemaKind::Map(key, element), Value::Map { entries, .. }) => entries.iter().try_for_each(|(k, v)| { validate_value(key, k, depth + 1)?; validate_value(element, v, depth + 1) }),
         (SchemaKind::Struct(fields), Value::Struct(values)) => fields.iter().try_for_each(|field| {

@@ -1,9 +1,12 @@
 use std::{collections::BTreeMap, sync::Arc};
+use arrow_array::{Array, ArrayRef, NullArray, UnionArray, builder::{Float64Builder, Int64Builder},
+    types::{ArrowPrimitiveType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type}};
+use arrow_schema::{DataType, Field, UnionFields};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rtdb_types::{DecimalValue, Result, StructFields, TimeUnit, Value};
+use rtdb_types::{DecimalValue, ListValue, Result, StructFields, TimeUnit, Value};
 use super::json_value::JsonValue as Json;
-use super::{ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, PluginSpec, SchemaKind, error};
+use super::{ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, PluginSpec, SchemaKind, error, numeric};
 mod charset;
 
 pub(super) fn open(spec: &PluginSpec, is_key: bool, parsers: &super::registry::ParserFactories) -> Result<Box<dyn Converter>> {
@@ -145,8 +148,10 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
             if !json.is_object() { return Err(error("conversion-error", "Struct payload must be an object")); }
             Value::Struct(fields.iter().map(|field| Ok((field.name.clone(), convert_budget(&Some(Arc::clone(&field.schema)), json.get(&field.name).unwrap_or(&Json::Null), replace, depth + 1, budget)?))).collect::<Result<_>>()?)
         }
-        Some(SchemaKind::Array(element)) => Value::List(rtdb_types::ListValue::try_from_cells(json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?.iter().map(|value| convert_budget(&Some(Arc::clone(element)), value, replace, depth + 1, budget)))?),
-        Some(SchemaKind::ArrayOfNull) => Value::List(rtdb_types::ListValue::try_from_cells(json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)))?),
+        Some(SchemaKind::Array(element)) => Value::List(json_array(
+            json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?, Some(element), replace, false, depth + 1, budget)?),
+        Some(SchemaKind::ArrayOfNull) => Value::List(json_array(
+            json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?, None, replace, false, depth + 1, budget)?),
         Some(SchemaKind::MapOfNull | SchemaKind::MapWithNullValues(_)) => {
             let entries = json.as_array().ok_or_else(|| error("conversion-error", "Map must be a tuple array"))?.iter().map(|entry| {
                 let pair = entry.as_array().filter(|pair| pair.len() == 2).ok_or_else(|| error("conversion-error", "Map entry must be a pair"))?;
@@ -170,11 +175,139 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
         None => match json {
             Json::Null => Value::Null, Json::Boolean(value) => Value::Bool(*value), Json::String(value) => Value::Utf8(value.clone()),
             Json::Number(_) | Json::Decimal(_) => if json.is_integral() { Value::I64(integral()) } else { Value::F64(json.double_value().ok_or_else(|| error("conversion-error", "Invalid number"))?) },
-            Json::Array(values) => Value::List(rtdb_types::ListValue::try_from_cells(values.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)))?),
+            Json::Array(values) => Value::List(json_array(values, None, replace, false, depth + 1, budget)?),
             Json::Object(values) => Value::Map { entries: values.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), convert_budget(&None, value, replace, depth + 1, budget)?))).collect::<Result<_>>()?, sorted: false },
         },
     })
 }
+fn json_array(
+    values: &[Json], element: Option<&Arc<ConnectSchema>>, replace: bool, registry: bool,
+    depth: usize, budget: &mut DecodeBudget,
+) -> Result<ListValue> {
+    if let Some(schema) = element.filter(|schema| !matches!(schema.name.as_deref(), Some(
+        "org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time"
+        | "org.apache.kafka.connect.data.Timestamp" | "org.apache.kafka.connect.data.Decimal")))
+    {
+        macro_rules! primitive {
+            ($ty:ty, $variant:ident, $read:expr) => {{
+                let default = match schema.default_value().filter(|_| replace) {
+                    Some(Value::$variant(value)) => Some(*value),
+                    None => None,
+                    Some(_) => return slow_json_array(values, element, replace, registry, depth, budget),
+                };
+                return primitive_json_array::<$ty>(values, schema, default, registry, depth, budget, $read);
+            }};
+        }
+        match schema.kind {
+            SchemaKind::I8 => primitive!(Int8Type, I8, |json: &Json| json.int_value().unwrap_or(0) as i8),
+            SchemaKind::I16 => primitive!(Int16Type, I16, |json: &Json| json.int_value().unwrap_or(0) as i16),
+            SchemaKind::I32 => primitive!(Int32Type, I32, |json: &Json| json.int_value().unwrap_or(0)),
+            SchemaKind::I64 => primitive!(Int64Type, I64, |json: &Json| json.long_value().unwrap_or(0)),
+            SchemaKind::F32 => primitive!(Float32Type, F32, |json: &Json| json.float_value().unwrap_or(0.0)),
+            SchemaKind::F64 => primitive!(Float64Type, F64, |json: &Json| json.double_value().unwrap_or(0.0)),
+            _ => (),
+        }
+    }
+    if element.is_none() && values.iter().all(|value| value.is_null() || value.is_number()) {
+        return schemaless_numbers(values, depth, budget);
+    }
+    slow_json_array(values, element, replace, registry, depth, budget)
+}
+
+fn slow_json_array(values: &[Json], element: Option<&Arc<ConnectSchema>>, replace: bool, registry: bool,
+    depth: usize, budget: &mut DecodeBudget,
+) -> Result<ListValue> {
+    let schema = element.cloned();
+    ListValue::try_from_cells(values.iter().map(|value| {
+        if registry { registry_value(element.expect("registry array element"), Some(value), depth, budget) }
+        else { convert_budget(&schema, value, replace, depth, budget) }
+    }))
+}
+
+fn primitive_json_array<T: ArrowPrimitiveType>(
+    values: &[Json], schema: &ConnectSchema, default: Option<T::Native>, registry: bool,
+    depth: usize, budget: &mut DecodeBudget, read: impl Fn(&Json) -> T::Native,
+) -> Result<ListValue> {
+    numeric::collect::<T>(values.len(), values.iter().map(|json| {
+        if registry {
+            if depth > 128 { return Err(error("conversion-error", "Registry value nesting limit exceeded")); }
+            budget.claim(512)?;
+        }
+        budget.claim(512)?;
+        if depth > 128 { return Err(error("conversion-error", "Connect value nesting limit exceeded")); }
+        if json.is_null() {
+            if let Some(default) = default {
+                budget.claim(schema.default_value().expect("matched default").retained_bytes()?)?;
+                return Ok(Some(default));
+            }
+            if !schema.optional { return Err(error("conversion-error", "Null for required Connect field")); }
+            return Ok(None);
+        }
+        if let Some(text) = json.as_str() { budget.claim(text.len().saturating_mul(2))?; }
+        Ok(Some(read(json)))
+    }))
+}
+
+fn schemaless_numbers(values: &[Json], depth: usize, budget: &mut DecodeBudget) -> Result<ListValue> {
+    let int = |json: &Json| json.long_value().unwrap_or(0);
+    let double = |json: &Json| json.double_value().ok_or_else(|| error("conversion-error", "Invalid number"));
+    let mut charge = || {
+        budget.claim(512)?;
+        if depth > 128 { return Err(error("conversion-error", "Connect value nesting limit exceeded")); }
+        Ok(())
+    };
+    if values.iter().all(|value| value.is_null() || value.is_integral()) {
+        return numeric::collect::<Int64Type>(values.len(), values.iter().map(|json| {
+            charge()?;
+            Ok((!json.is_null()).then(|| int(json)))
+        }));
+    }
+    if !values.iter().any(Json::is_integral) {
+        return numeric::collect::<Float64Type>(values.len(), values.iter().map(|json| {
+            charge()?;
+            (!json.is_null()).then(|| double(json)).transpose()
+        }));
+    }
+    let mut ints = Int64Builder::new();
+    let mut doubles = Float64Builder::new();
+    let mut nulls = 0;
+    let mut fields = Vec::with_capacity(3);
+    let mut ids = Vec::with_capacity(values.len());
+    let mut offsets = Vec::with_capacity(values.len());
+    for json in values {
+        charge()?;
+        let (ty, name, offset) = if json.is_null() {
+            let offset = nulls;
+            nulls += 1;
+            (DataType::Null, "null", offset)
+        } else if json.is_integral() {
+            let offset = ints.values_slice().len();
+            ints.append_value(int(json));
+            (DataType::Int64, "i64", offset)
+        } else {
+            let offset = doubles.values_slice().len();
+            doubles.append_value(double(json)?);
+            (DataType::Float64, "f64", offset)
+        };
+        let id = fields.iter().position(|field: &Field| field.data_type() == &ty).unwrap_or(fields.len());
+        if id == fields.len() { fields.push(Field::new(name, ty.clone(), ty == DataType::Null)); }
+        ids.push(id as i8);
+        offsets.push(i32::try_from(offset).map_err(|cause| error("allocation-overflow", cause))?);
+    }
+    let ints = Arc::new(ints.finish());
+    let doubles = Arc::new(doubles.finish());
+    let children = fields.iter().map(|field| -> ArrayRef {
+        match field.data_type() {
+            DataType::Int64 => ints.clone(),
+            DataType::Float64 => doubles.clone(),
+            _ => Arc::new(NullArray::new(nulls)),
+        }
+    }).collect();
+    let fields = UnionFields::try_new(0..fields.len() as i8, fields).map_err(|cause| error("conversion-error", cause))?;
+    let array = UnionArray::try_new(fields, ids.into(), Some(offsets.into()), children).map_err(|cause| error("conversion-error", cause))?;
+    Ok(numeric::pack(Field::new("$data$", array.data_type().clone(), false), Arc::new(array)))
+}
+
 fn decimal(json: &Json, schema: &ConnectSchema) -> Result<Value> {
     use std::str::FromStr;
     let (coefficient, scale) = if json.is_number() {
@@ -240,7 +373,8 @@ fn registry_value(schema: &Arc<ConnectSchema>, json: Option<&Json>, depth: usize
             budget.claim(fields.len().saturating_mul(4096))?;
             Ok(Value::Struct(fields.iter().map(|field| Ok((field.name.clone(), registry_value(&field.schema, json.get(&field.name), depth + 1, budget)?))).collect::<Result<_>>()?))
         }
-        SchemaKind::Array(element) => Ok(Value::List(rtdb_types::ListValue::try_from_cells(json.as_array().ok_or_else(|| error("conversion-error", "Connect array payload must be an array"))?.iter().map(|value| registry_value(element, Some(value), depth + 1, budget)))?)),
+        SchemaKind::Array(element) => Ok(Value::List(json_array(
+            json.as_array().ok_or_else(|| error("conversion-error", "Connect array payload must be an array"))?, Some(element), true, true, depth + 1, budget)?)),
         SchemaKind::Map(key, value) => {
             let entries = if matches!(key.resolved().kind, SchemaKind::String) {
                 json.as_object().ok_or_else(|| error("conversion-error", "Connect map payload must be an object"))?.iter().map(|(name, json)| { budget.claim(name.len().saturating_add(512))?; Ok((Value::Utf8(name.clone()), registry_value(value, Some(json), depth + 1, budget)?)) }).collect::<Result<_>>()?
@@ -266,4 +400,61 @@ fn matching_struct_fields(schema: &ConnectSchema, json: &Json, depth: usize, bud
         }
         None => Ok(matched),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeBudget, Json, convert_budget, convert_registry, error, json_array};
+    use crate::connect::{ConnectSchema, SchemaKind};
+    use arrow_array::{Array, Float32Array, Int64Array, UnionArray};
+    use rtdb_types::{ListValue, Value};
+    use std::sync::Arc;
+
+    #[test]
+    fn json_numeric_arrays_match_scalar_layout_and_consume_the_same_budget() {
+        for (kind, payload) in [(SchemaKind::F32, r#"[-0.0,1152921573326323713,null,"other"]"#),
+            (SchemaKind::I16, "[32768,-32769,null,1.5]"), (SchemaKind::F64, "[]")] {
+            let mut element = ConnectSchema::new(kind);
+            element.optional = true;
+            let element = Arc::new(element);
+            let values = Json::from_str(payload).unwrap();
+            let values = values.as_array().unwrap();
+            for registry in [false, true] {
+                let mut old = DecodeBudget::new(128).unwrap();
+                let mut new = DecodeBudget::new(128).unwrap();
+                let expected = ListValue::try_from_cells(values.iter().map(|value| {
+                    if registry { super::registry_value(&element, Some(value), 1, &mut old) }
+                    else { convert_budget(&Some(element.clone()), value, true, 1, &mut old) }
+                })).unwrap();
+                let actual = json_array(values, Some(&element), true, registry, 1, &mut new).unwrap();
+                let (field, array) = actual.packed_column().unwrap();
+                let (expected_field, expected_array) = expected.packed_column().unwrap();
+                assert_eq!(field, expected_field);
+                assert_eq!(array.to_data(), expected_array.to_data());
+                assert_eq!(new.remaining, old.remaining);
+                if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
+                    assert_eq!(array.value(0).to_bits(), (-0.0_f32).to_bits());
+                }
+            }
+        }
+        let element = Arc::new(ConnectSchema::new(SchemaKind::I64));
+        let root = Arc::new(ConnectSchema::new(SchemaKind::Array(element)));
+        let json = Json::from_str("[null]").unwrap();
+        let actual = convert_registry(&root, &json, 8192).unwrap_err();
+        let expected = error("conversion-error", "Null for required Connect field");
+        assert_eq!((actual.code, actual.message), (expected.code, expected.message));
+    }
+
+    #[test]
+    fn schemaless_numbers_keep_the_original_dense_union_order_and_float_bits() {
+        let json = Json::from_str("[null,-0.0,9223372036854775807,1.25]").unwrap();
+        let Value::List(values) = convert_budget(&None, &json, true, 0, &mut DecodeBudget::new(128).unwrap()).unwrap() else { panic!("expected list"); };
+        let union = values.array().unwrap().as_any().downcast_ref::<UnionArray>().unwrap();
+        assert_eq!(union.type_ids().as_ref(), &[0, 1, 2, 1]);
+        let float = union.child(1).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
+        assert_eq!(float.value(0).to_bits(), (-0.0_f64).to_bits());
+        let integer = union.child(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(integer.value(0), i64::MAX);
+        assert!(union.child(0).data_type() == &arrow_schema::DataType::Null);
+    }
 }

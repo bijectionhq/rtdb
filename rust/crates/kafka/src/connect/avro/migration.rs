@@ -41,7 +41,7 @@ fn inferred_schema(schema: &Schema, value: &Avro, names: &BTreeMap<String, Schem
         (_, Avro::Int(_)) => Schema::Int, (_, Avro::Long(_)) => Schema::Long,
         (_, Avro::Float(_)) => Schema::Float, (_, Avro::Double(_)) => Schema::Double,
         (_, Avro::String(_) | Avro::Utf8(_)) => Schema::String, (_, Avro::Bytes(_)) => Schema::Bytes,
-        (_, Avro::Record(_) | Avro::Array(_) | Avro::Enum(_, _) | Avro::Fixed(_, _)) => schema.clone(),
+        (_, Avro::Record(_) | Avro::Array(_) | Avro::PackedArray(_) | Avro::Enum(_, _) | Avro::Fixed(_, _)) => schema.clone(),
         _ => return Err(invalid()),
     })
 }
@@ -70,6 +70,7 @@ fn encode_as(target: &Schema, actual: &Schema, value: Avro, names: &BTreeMap<Str
             let Schema::Map(actual) = physical(actual) else { return Err(invalid()); };
             Ok(Json::Object(values.ordered()?.into_iter().map(|(key, value)| Ok((key.into_text(), encode_as(&target.types, &actual.types, value, names, depth + 1)?))).collect::<Result<_>>()?))
         }
+        (Schema::Array(_), Avro::PackedArray(values)) => encode_as(target, actual, Avro::Array(values.into_physical_values()), names, depth),
         (Schema::Array(target), Avro::Array(values)) => {
             let Schema::Array(actual) = physical(actual) else { return Err(invalid()); };
             Ok(Json::Array(values.into_iter().map(|value| encode_as(&target.items, &actual.items, value, names, depth + 1)).collect::<Result<_>>()?))
@@ -116,6 +117,7 @@ fn encode(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, depth:
             }
             Json::Object(output)
         }
+        (Schema::Array(_), Avro::PackedArray(values)) => return encode(schema, Avro::Array(values.into_physical_values()), names, depth),
         (Schema::Array(array), Avro::Array(values)) => Json::Array(values.into_iter().map(|value| encode(&array.items, value, names, depth + 1)).collect::<Result<_>>()?),
         (Schema::Map(map), Avro::Map(values)) => Json::Object(values.ordered()?.into_iter().map(|(name, value)| Ok((name.into_text(), encode(&map.types, value, names, depth + 1)?))).collect::<Result<_>>()?),
         (Schema::Null, Avro::Null) => Json::Null,

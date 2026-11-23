@@ -25,6 +25,17 @@ enum Action {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind { Null, Boolean, Int, Long, Float, Double, String, Bytes, Fixed, Enum, Record, Array, Map, Union }
 
+impl Kind {
+    fn numeric(self) -> Option<super::datum::NumericKind> {
+        use super::datum::NumericKind;
+        Some(match self {
+            Self::Int => NumericKind::Int, Self::Long => NumericKind::Long,
+            Self::Float => NumericKind::Float, Self::Double => NumericKind::Double,
+            _ => return None,
+        })
+    }
+}
+
 impl AvroResolution {
     pub fn compile(writer: &Arc<AvroDatumPlan>, reader: &Arc<AvroDatumPlan>, context: &mut ConversionContext) -> Result<Self> {
         writer.retain_source(context)?;

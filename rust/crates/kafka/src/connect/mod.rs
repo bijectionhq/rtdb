@@ -1,5 +1,6 @@
 mod config;
 mod converter;
+mod numeric;
 mod data;
 mod docs;
 mod driver;

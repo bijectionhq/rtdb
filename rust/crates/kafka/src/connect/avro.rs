@@ -425,6 +425,24 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
         Avro::Float(value) => Value::F32(value), Avro::Double(value) => Value::F64(value), Avro::String(value) | Avro::Enum(_, value) => Value::Utf8(value),
         Avro::Utf8(value) => Value::Utf8(datum::java_utf8(&value)),
         Avro::Bytes(value) | Avro::Fixed(_, value) => Value::Binary(value),
+        Avro::PackedArray(packed) => {
+            let Schema::Array(array) = schema else { return Err(error("avro-decode", "Array value lacks its schema")); };
+            if let SchemaKind::Array(element) = &connect.kind {
+                let element = element.resolved();
+                if datum::PackedArray::layout(&array.items) == Some((packed.kind, packed.branches))
+                    && packed.kind.matches_connect(&element.kind)
+                    && !matches!(element.name.as_deref(), Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time"
+                        | "org.apache.kafka.connect.data.Timestamp" | "org.apache.kafka.connect.data.Decimal"))
+                    && (packed.values.is_empty() || depth + 1 + usize::from(packed.branches.is_some()) <= 128)
+                {
+                    Value::List(packed.values)
+                } else {
+                    return convert(schema, Avro::Array(packed.into_physical_values()), names, unions, &connect, depth);
+                }
+            } else {
+                return convert(schema, Avro::Array(packed.into_physical_values()), names, unions, &connect, depth);
+            }
+        }
         Avro::Array(values) => {
             let Schema::Array(array) = schema else { return Err(error("avro-decode", "Array value lacks its schema")); };
             let element = match &connect.kind { SchemaKind::Array(element) => element.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(error("avro-decode", "Array Connect schema is absent")) };

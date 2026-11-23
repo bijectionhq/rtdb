@@ -11,6 +11,13 @@ impl AvroResolution {
                 if !scalar_matches(*writer, *fixed, value) { return Err(invalid()); }
                 value_bound(value, depth)
             }
+            (Action::Array(child), Avro::PackedArray(values)) => {
+                if packed_reader(&self.actions[*child], values).is_some() {
+                    packed_bound(values, depth)
+                } else {
+                    self.bound(id, &Avro::Array(values.clone().into_physical_values()), depth)
+                }
+            }
             (Action::Array(child), Avro::Array(values)) => values.iter().try_fold(4096usize, |size, value| add(size, self.bound(*child, value, depth + 1)?)),
             (Action::Map { child, .. }, Avro::Map(values)) => values.iter().try_fold(4096usize, |size, (key, value)| add(add(size, key.len().checked_mul(8).ok_or_else(overflow)?)?, self.bound(*child, value, depth + 1)?)),
             (Action::Enum(symbols), Avro::Enum(index, _)) => match symbols.get(*index as usize).and_then(Option::as_ref) { Some((_, symbol)) => add(4096, symbol.len()), None => Err(error("avro-resolution", "Reader enum has no symbol or default")) },
@@ -32,6 +39,13 @@ impl AvroResolution {
         match (self.actions.get(id).ok_or_else(invalid)?, datum) {
             (Action::Error(message), _) => Err(error("avro-resolution", message)),
             (Action::Scalar { reader, .. }, value) => promote(value, *reader),
+            (Action::Array(child), Avro::PackedArray(values)) => {
+                if let Some(reader) = packed_reader(&self.actions[*child], &values) {
+                    Ok(Avro::PackedArray(values.promote(reader)))
+                } else {
+                    self.apply(id, Avro::Array(values.into_physical_values()), depth)
+                }
+            }
             (Action::Array(child), Avro::Array(values)) => Ok(Avro::Array(values.into_iter().map(|value| self.apply(*child, value, depth + 1)).collect::<Result<_>>()?)),
             (Action::Map { child, strings }, Avro::Map(values)) => Ok(Avro::Map(values.map_values(|value| self.apply(*child, value, depth + 1))?.with_strings(*strings))),
             (Action::Enum(symbols), Avro::Enum(index, _)) => match symbols.get(index as usize).and_then(Option::as_ref) { Some((index, symbol)) => Ok(Avro::Enum(*index, symbol.clone())), None => Err(invalid()) },
@@ -58,6 +72,7 @@ pub(in crate::connect::avro) fn value_bound(value: &Avro, depth: usize) -> Resul
         Avro::String(value) => sum(4096, value.len().checked_mul(4).ok_or_else(overflow)?),
         Avro::Utf8(value) | Avro::Bytes(value) | Avro::Fixed(_, value) => sum(4096, value.len().checked_mul(4).ok_or_else(overflow)?),
         Avro::Enum(_, value) => sum(4096, value.len()),
+        Avro::PackedArray(values) => packed_bound(values, depth),
         Avro::Array(values) => values.iter().try_fold(4096usize, |bytes, value| sum(bytes, value_bound(value, depth + 1)?)),
         Avro::Map(values) => values.iter().try_fold(4096usize, |bytes, (key, value)| sum(sum(bytes, key.len().checked_mul(8).ok_or_else(overflow)?)?, value_bound(value, depth + 1)?)),
         Avro::Record(values) => values.iter().try_fold(4096usize, |bytes, (key, value)| sum(sum(bytes, key.len())?, value_bound(value, depth + 1)?)),
@@ -65,6 +80,20 @@ pub(in crate::connect::avro) fn value_bound(value: &Avro, depth: usize) -> Resul
         Avro::Null | Avro::Boolean(_) | Avro::Int(_) | Avro::Long(_) | Avro::Float(_) | Avro::Double(_) => Ok(4096),
     }
 }
+fn packed_reader(action: &Action, values: &super::super::datum::PackedArray) -> Option<super::super::datum::NumericKind> {
+    match (values.branches, action) {
+        (None, Action::Scalar { writer, reader, .. }) if writer.numeric() == Some(values.kind) => reader.numeric(),
+        (Some(_), Action::WriterUnion { equivalent: true, .. }) => Some(values.kind),
+        _ => None,
+    }
+}
+
+fn packed_bound(values: &super::super::datum::PackedArray, depth: usize) -> Result<usize> {
+    let child_levels = 1 + usize::from(values.branches.is_some());
+    if !values.values.is_empty() { nesting(depth + child_levels)?; }
+    values.values.len().checked_mul(4096 * child_levels).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)
+}
+
 fn scalar_matches(kind: Kind, fixed: Option<usize>, value: &Avro) -> bool {
     match (kind, value) {
         (Kind::Null, Avro::Null) | (Kind::Boolean, Avro::Boolean(_)) | (Kind::Int, Avro::Int(_)) | (Kind::Long, Avro::Long(_)) | (Kind::Float, Avro::Float(_)) | (Kind::Double, Avro::Double(_)) | (Kind::String, Avro::String(_) | Avro::Utf8(_)) | (Kind::Bytes, Avro::Bytes(_)) => true,

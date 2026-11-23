@@ -55,8 +55,20 @@ pub(super) fn bridge(target: &Schema, actual: &Schema, value: Avro, connect: &Co
             Ok(Avro::Record(output))
         }
         Schema::Array(target) => {
-            let (Schema::Array(actual), Avro::Array(values)) = (actual, value) else { return Err(invalid()); };
+            let Schema::Array(actual) = actual else { return Err(invalid()); };
             let child = match &connect.kind { SchemaKind::Array(child) => child.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(invalid()) };
+            let values = match value {
+                Avro::PackedArray(packed) => {
+                    if target.items == actual.items && (packed.values.is_empty() || depth + 1 + usize::from(packed.branches.is_some()) <= 128)
+                        && (child.resolved().optional || packed.values.array().is_some_and(|array| array.logical_null_count() == 0))
+                    {
+                        return Ok(Avro::PackedArray(packed));
+                    }
+                    packed.into_physical_values()
+                }
+                Avro::Array(values) => values,
+                _ => return Err(invalid()),
+            };
             Ok(Avro::Array(values.into_iter().map(|value| bridge(&target.items, &actual.items, value, child, target_plan, actual_plan, next_union, context, depth + 1)).collect::<Result<_>>()?))
         }
         Schema::Map(target) => {

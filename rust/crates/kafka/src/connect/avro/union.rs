@@ -43,7 +43,7 @@ pub(super) fn matches_member(candidate: &ConnectSchema, selected_connect: &Conne
         SchemaKind::I64 => matches!(value, Avro::Long(_)),
         SchemaKind::F32 => matches!(value, Avro::Float(_)), SchemaKind::F64 => matches!(value, Avro::Double(_)),
         SchemaKind::Bool => matches!(value, Avro::Boolean(_)), SchemaKind::String => matches!(value, Avro::String(_) | Avro::Utf8(_)),
-        SchemaKind::Array(_) => matches!(value, Avro::Array(_)), SchemaKind::Map(_, _) => matches!(value, Avro::Map(_)),
+        SchemaKind::Array(_) => matches!(value, Avro::Array(_) | Avro::PackedArray(_)), SchemaKind::Map(_, _) => matches!(value, Avro::Map(_)),
         SchemaKind::Struct(_) => matches!(value, Avro::Record(_)) && same_schema(candidate, selected_connect, &mut Default::default(), 0)?,
         SchemaKind::Bytes => {
             if !matches!(value, Avro::Bytes(_) | Avro::Fixed(_, _)) { false }
