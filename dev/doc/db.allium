@@ -412,6 +412,7 @@ variant TxMessage : SourceMessage {
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
     -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
+    -- A canonical float vector argument with no absent vector or component is gathered into source IPC from its Arrow buffers.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
@@ -2020,6 +2021,7 @@ surface QueryAccess {
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- It emits a null where every operand is null.
         -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
+        -- Evaluated vectors of one float width and list kind pack into a single Arrow column whatever their row and component nulls.
         -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.

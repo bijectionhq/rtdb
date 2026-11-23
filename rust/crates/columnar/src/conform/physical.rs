@@ -73,6 +73,51 @@ pub(super) fn additional_bytes(data: &ArrayData, source: &Field, target: &Field,
     }
 }
 
+/// A result union of one data leg and nullable Null legs reads as that leg's type with nulls,
+/// so a declared plain field receives the leg's cells by position.
+/// Returns `None` for any other source, or a target that is itself a union.
+pub(super) fn collapse_union(array: &ArrayRef, source: &Field, target: &Field) -> Result<Option<(ArrayRef, Field)>> {
+    let Some((leg, field)) = collapsible_union(source, target) else { return Ok(None) };
+    let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(incompatible)?;
+    let picks = (0..union.len()).map(|row| (union.type_id(row) == leg).then(|| union.value_offset(row) as u32))
+        .collect::<arrow_array::UInt32Array>();
+    if !target.is_nullable() && picks.null_count() > 0 { return Ok(None); }
+    let child = arrow_select::take::take(union.child(leg).as_ref(), &picks, None).map_err(crate::arrow_error)?;
+    Ok(Some((child, field.as_ref().clone().with_nullable(true))))
+}
+
+/// Bounds the gather `collapse_union` performs, including the per-component indices a fixed-size list takes.
+pub(super) fn collapse_bytes(array: &dyn Array, source: &Field, target: &Field) -> Result<Option<usize>> {
+    let Some((leg, field)) = collapsible_union(source, target) else { return Ok(None) };
+    let DataType::Union(fields, _) = source.data_type() else { return Ok(None) };
+    let Some(index) = fields.iter().position(|(id, _)| id == leg) else { return Ok(None) };
+    let rows = array.len();
+    let picks = super::multiply(rows, 16)?;
+    let output = match field.data_type() {
+        DataType::FixedSizeList(item, width) => {
+            let Some(width) = usize::try_from(*width).ok().zip(item.data_type().primitive_width()) else { return Ok(None) };
+            super::multiply(super::multiply(rows, width.0)?, super::add(width.1, 8)?)?
+        }
+        _ => super::multiply(make_array(array.to_data().child_data()[index].clone()).get_array_memory_size(), 3)?,
+    };
+    Ok(Some(super::add(picks, output)?))
+}
+
+fn collapsible_union(source: &Field, target: &Field) -> Option<(i8, Arc<Field>)> {
+    let DataType::Union(fields, UnionMode::Dense) = source.data_type() else { return None };
+    if matches!(target.data_type(), DataType::Union(..)) { return None; }
+    let mut data = None;
+    for (id, field) in fields.iter() {
+        match field.data_type() {
+            DataType::Null if field.is_nullable() => {}
+            DataType::Null | DataType::Union(..) => return None,
+            _ if data.is_some() => return None,
+            _ => data = Some((id, Arc::clone(field))),
+        }
+    }
+    data
+}
+
 fn undefined_union(source: &Field, target: &Field, event: bool) -> bool {
     event && source.data_type() == &DataType::Null && !source.is_nullable()
         && matches!(target.data_type(), DataType::Union(_, UnionMode::Dense))

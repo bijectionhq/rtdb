@@ -183,6 +183,25 @@ fn number_cell(field: &Field, array: &dyn Array, index: usize) -> Value {
     }
 }
 
+/// The data type of the leg an undecorated component joins; every such leg is named and typed by `field` alone.
+fn field_type(value: &Value) -> Option<DataType> {
+    Some(match value {
+        Value::Null => DataType::Null,
+        Value::I8(_) => DataType::Int8,
+        Value::U8(_) => DataType::UInt8,
+        Value::I16(_) => DataType::Int16,
+        Value::U16(_) => DataType::UInt16,
+        Value::I32(_) => DataType::Int32,
+        Value::U32(_) => DataType::UInt32,
+        Value::I64(_) => DataType::Int64,
+        Value::U64(_) => DataType::UInt64,
+        Value::F16(_) => DataType::Float16,
+        Value::F32(_) => DataType::Float32,
+        Value::F64(_) => DataType::Float64,
+        _ => return None,
+    })
+}
+
 fn field(value: &Value) -> Option<Field> {
     let (name, data_type) = match value {
         Value::Null => ("null", DataType::Null),
@@ -262,14 +281,20 @@ impl NumericListBuilder {
     }
 
     pub(crate) fn push(&mut self, value: &Value) -> Option<()> {
-        let field = field(value)?;
-        let leg = if let Some(i) = self.fields.iter().position(|candidate| candidate == &field) { i } else {
+        let existing = field_type(value).and_then(|data_type| self.fields.iter().position(|candidate| *candidate.data_type() == data_type));
+        let leg = if let Some(i) = existing { i } else {
+            let field = field(value)?;
+            if let Some(i) = self.fields.iter().position(|candidate| candidate == &field) { return self.append_leg(i, value); }
             let i = self.fields.len();
             if i >= i8::MAX as usize { return None; }
             self.builders.push(make_builder(field.data_type(), 0));
             self.fields.push(field);
             i
         };
+        self.append_leg(leg, value)
+    }
+
+    fn append_leg(&mut self, leg: usize, value: &Value) -> Option<()> {
         let builder = self.builders.get_mut(leg)?;
         let id = i8::try_from(leg).ok()?;
         let offset = i32::try_from(builder.len()).ok()?;

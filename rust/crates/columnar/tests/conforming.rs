@@ -261,3 +261,30 @@ fn nulls_already_in_a_nullable_leg_read_as_null_and_rewrite_into_the_null_leg() 
     let union = copied.as_any().downcast_ref::<UnionArray>().unwrap();
     assert_eq!(leg_names(&to_field("v", &logical).unwrap(), union), ["f64", "null", "utf8", "null"]);
 }
+
+#[test]
+fn a_nullable_vector_union_conforms_to_its_declared_plain_layout_with_typed_components() {
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
+    let memory = MemoryBudget::new(1 << 22);
+    let vector = LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(2), element: Box::new(LogicalType::Scalar(ScalarType::F32).maybe()) };
+    let vector_field = to_field(&rtdb_columnar::leg_name(&vector).unwrap(), &vector).unwrap();
+    let null_field = to_field(&rtdb_columnar::leg_name(&LogicalType::Null).unwrap(), &LogicalType::Null).unwrap();
+    let DataType::FixedSizeList(item, _) = vector_field.data_type() else { panic!("vector layout") };
+    let vectors = FixedSizeListArray::new(Arc::clone(item), 2, Arc::new(Float32Array::from(vec![Some(-0.0), None, Some(f32::NAN), Some(2.5)])), None);
+    let fields = UnionFields::try_new(vec![0, 1], vec![vector_field.clone(), null_field]).unwrap();
+    let union = UnionArray::try_new(fields.clone(), ScalarBuffer::from(vec![0i8, 1, 0]), Some(ScalarBuffer::from(vec![1i32, 0, 0])),
+        vec![Arc::new(vectors) as ArrayRef, Arc::new(NullArray::new(1))]).unwrap();
+    let source = Schema::new(vec![Field::new("embedding", DataType::Union(fields, UnionMode::Dense), false)]);
+    let target = Schema::new(vec![to_field("embedding", &vector.clone().maybe()).unwrap()]);
+    let union: ArrayRef = Arc::new(union);
+    assert!(rtdb_columnar::relayout_arrow_column(Arc::clone(&union), source.field(0), target.field(0)).is_err(), "the union stays a union outside result conformance");
+    let page = conform_batch(OwnedBatch::new(RecordBatch::try_new(Arc::new(source), vec![union]).unwrap(), &memory).unwrap(), &target, &memory).unwrap();
+    let column = page.batch().column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    assert_eq!(column.nulls().map(|nulls| nulls.iter().collect::<Vec<_>>()), Some(vec![true, false, true]));
+    let components = column.values().as_any().downcast_ref::<Float32Array>().unwrap();
+    let rows = |row: usize| (0..2).map(|index| components.is_valid(row * 2 + index).then(|| components.value(row * 2 + index).to_bits())).collect::<Vec<_>>();
+    assert_eq!(rows(0), [Some(f32::NAN.to_bits()), Some(2.5f32.to_bits())]);
+    assert_eq!(rows(2), [Some((-0.0f32).to_bits()), None]);
+    drop(page);
+    assert_eq!(memory.used_bytes(), 0);
+}

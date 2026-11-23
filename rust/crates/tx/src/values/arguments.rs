@@ -52,7 +52,7 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
             let field = batch.schema_ref().field(position);
             let array = batch.column(position);
             let source = &types[position];
-            if (*source_layout == SourceArgumentLayout::Uploaded || plain_scalar_field(field))
+            if (*source_layout == SourceArgumentLayout::Uploaded || plain_scalar_field(field) || dense_float_vectors(field, array.as_ref()))
                 && can_copy_argument(source) && source.join(ty) == *ty && has_valid_union_nulls(field, array.as_ref()) {
                 if field.data_type() == target.data_type() { return Ok((Arc::clone(array), None)); }
                 if let Ok(bound) = arrow_relayout_bound(array.as_ref(), field, target)
@@ -77,6 +77,18 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
             Ok((output, Some(scratch)))
         }
     }
+}
+
+/// A float vector column with no absent vector or component, which the canonical cell rebuild would reproduce exactly.
+fn dense_float_vectors(field: &Field, array: &dyn Array) -> bool {
+    let (element, values) = match field.data_type() {
+        DataType::List(element) => (element, array.as_list::<i32>().values()),
+        DataType::FixedSizeList(element, _) => (element, array.as_fixed_size_list().values()),
+        _ => return false,
+    };
+    field.metadata().is_empty() && element.metadata().is_empty()
+        && matches!(element.data_type(), DataType::Float32 | DataType::Float64)
+        && array.null_count() == 0 && values.null_count() == 0
 }
 
 fn has_valid_union_nulls(field: &Field, array: &dyn Array) -> bool {
@@ -160,4 +172,31 @@ fn decoding_one_argument_chunk_preserves_compatible_arrow_inputs() {
     let replay = SqlArguments::from_arrow(aligned, &memory).unwrap();
     let values = replay.rows().map(|row| row.unwrap()[0].clone()).collect::<Vec<_>>();
     assert_eq!(values, [first, second]);
+}
+
+#[test]
+fn canonical_dense_float_vectors_keep_their_buffers_and_encode_as_their_rows_would() {
+    use rtdb_types::{ListValue, Value};
+    let memory = MemoryBudget::new(1 << 20);
+    let vector = |values: Vec<f32>| Value::FixedSizeList(ListValue::from_f32(arrow_array::Float32Array::from(values)));
+    let rows = vec![vec![vector(vec![1.0, -0.0, f32::MAX])], vec![vector(vec![0.5, f32::MIN_POSITIVE, 3.0])]];
+    let ty = rows[0][0].logical_type();
+    let array = rtdb_columnar::build_array(&ty, &rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>()).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("?_0", &ty).unwrap()])), vec![array]).unwrap();
+    let canonical = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let ArgumentChunk::Arrow { batch, .. } = canonical.chunks[0].1.as_ref() else { panic!("Expected Arrow argument"); };
+    let original = batch.batch().column(0).as_fixed_size_list().values().to_data();
+    let field = to_field("?_0", &canonical.types()[0]).unwrap();
+
+    let (kept, scratch) = argument_vector(&canonical.chunks[0].1, 0, &field, &canonical.types()[0], &memory).unwrap();
+    assert!(scratch.is_none());
+    assert_eq!(kept.as_fixed_size_list().values().to_data().buffers()[0].as_ptr(), original.buffers()[0].as_ptr());
+
+    let bits = |batch: &OwnedBatch| {
+        let column = batch.batch().column(0);
+        let values = column.as_fixed_size_list().values().as_primitive::<arrow_array::types::Float32Type>();
+        (batch.batch().schema(), column.null_count(), values.values().iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+    };
+    let from_rows = SqlArguments::from_rows(rows, &memory).unwrap().source_columnar_batch(&memory).unwrap();
+    assert_eq!(bits(&canonical.source_columnar_batch(&memory).unwrap()), bits(&from_rows));
 }

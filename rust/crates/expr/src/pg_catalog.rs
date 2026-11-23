@@ -80,6 +80,12 @@ pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>
         CastTarget::Fixed(LogicalType::Scalar(ScalarType::RegClass)) => if let Value::Utf8(name) = value { return Ok(Value::RegClass(relation_oid(name, context)?)); },
         CastTarget::Fixed(LogicalType::Scalar(ScalarType::RegProc)) => if let Value::Utf8(name) = value { return Ok(Value::RegProc(proc_oid(name)?)); },
         CastTarget::List(element) if element.union_target().is_none() => {
+            if let Value::List(list) | Value::FixedSizeList(list) = value
+                && let Some((field, values)) = crate::float_list_cast::packed(list)
+                && let Some(list) = crate::float_list_cast::cast(&field, values.as_ref(), element, |bytes| context.reserve(bytes))?
+            {
+                return Ok(Value::List(list));
+            }
             let parsed;
             let values = match value {
                 Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(),

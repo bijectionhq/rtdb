@@ -25,6 +25,8 @@
 -- Logical relation cursors expose the root operator's pages as separate batches.
 -- Logical relation queries use Arrow vectors for semantic pages, including pages that downstream operators observe before transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
+-- An Arrow client result union of one data leg and nullable null legs conforms to that leg's declared plain field by Arrow position.
+-- A fixed-size vector result column already in its declared layout keeps its component buffer.
 -- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
 -- A pgwire portal can encode numeric coefficients, standard PostgreSQL arrays, and structured JSON, JSON-LD, and Transit results from their Arrow cells.
@@ -62,6 +64,9 @@
 -- Column tables preserve one semantic page across the input list's batches.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
 -- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.
+-- A list cast to REAL or DOUBLE PRECISION elements converts the packed components of a numeric list in one pass, through binary64 as each scalar cast does.
+-- A list of unannotated numbers derives its element type from the legs and validity its elements select.
+-- A list parameter enters evaluation as its Arrow cell.
 -- Score calculation and nullable result construction use Arrow input arrays and output buffers.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
 -- Computed UNNEST gathers both original payload and evaluated child columns by Arrow position.

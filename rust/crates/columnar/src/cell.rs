@@ -94,6 +94,11 @@ impl<'a> ArrowCell<'a> {
         }
 
         let cell = self.physical()?;
+        if let Some((field, array, range)) = cell.sequence_range()
+            && let Some(legs) = LeafLegs::observe(field, array, range)
+        {
+            return legs?.observed_type_bytes(cell.field.size());
+        }
         let bytes = cell
             .field
             .size()
@@ -170,6 +175,15 @@ impl<'a> ArrowCell<'a> {
                 }
             }
             LogicalType::List { kind, .. } => {
+                if let Some(legs) = cell
+                    .sequence_range()
+                    .and_then(|(field, array, range)| LeafLegs::observe(field, array, range))
+                {
+                    return Ok(LogicalType::List {
+                        kind,
+                        element: Box::new(legs?.element_type()?),
+                    });
+                }
                 let types = cell
                     .sequence()
                     .ok_or_else(layout)?
@@ -461,6 +475,121 @@ impl<'a> ArrowCell<'a> {
         let Self { field, array, row } = self.physical()?;
         Ok(field.data_type() == &DataType::Null || array.is_null(row))
     }
+}
+
+/// The legs a sequence of unannotated numeric or null elements selects, in the order its elements first select them.
+/// Every element of one leg has the same observed type, so the element type is decided once per leg rather than once per element.
+struct LeafLegs<'a> {
+    seen: Vec<LeafLeg<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct LeafLeg<'a> {
+    field: &'a Field,
+    null: bool,
+    count: usize,
+}
+
+impl<'a> LeafLegs<'a> {
+    fn observe(field: &'a Field, values: &'a dyn Array, range: std::ops::Range<usize>) -> Option<Result<Self>> {
+        if field.data_type() != values.data_type() {
+            return None;
+        }
+        let mut legs = Self { seen: Vec::new() };
+        match field.data_type() {
+            DataType::Union(fields, UnionMode::Dense) => {
+                if !fields.iter().all(|(_, field)| leaf(field)) {
+                    return None;
+                }
+                let union = values.as_union();
+                for row in range {
+                    let id = union.type_id(row);
+                    let Some((_, field)) = fields.iter().find(|(tag, _)| *tag == id) else {
+                        return Some(Err(layout()));
+                    };
+                    let child = union.child(id);
+                    let offset = union.value_offset(row);
+                    if child.data_type() != field.data_type() || offset >= child.len() {
+                        return Some(Err(layout()));
+                    }
+                    legs.add(field, field.data_type() == &DataType::Null || child.is_null(offset));
+                }
+            }
+            _ if leaf(field) => {
+                if field.data_type() == &DataType::Null {
+                    if !range.is_empty() {
+                        legs.seen.push(LeafLeg { field, null: true, count: range.len() });
+                    }
+                } else {
+                    for row in range {
+                        legs.add(field, values.is_null(row));
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(Ok(legs))
+    }
+
+    fn add(&mut self, field: &'a Field, null: bool) {
+        match self.seen.iter_mut().find(|leg| std::ptr::eq(leg.field, field) && leg.null == null) {
+            Some(leg) => leg.count += 1,
+            None => self.seen.push(LeafLeg { field, null, count: 1 }),
+        }
+    }
+
+    fn element_type(&self) -> Result<LogicalType> {
+        let types = self.seen.iter().map(|leg| leg.observed_type()).collect::<Result<Vec<_>>>()?;
+        Ok(LogicalType::join_all(&types))
+    }
+
+    fn observed_type_bytes(&self, parent: usize) -> Result<usize> {
+        let bytes = parent.checked_mul(16).and_then(|bytes| bytes.checked_add(256)).ok_or_else(layout)?;
+        self.seen.iter().try_fold(bytes, |bytes, leg| {
+            if leg.undefined() {
+                return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read"));
+            }
+            leg.field.size().checked_mul(16)
+                .and_then(|child| child.checked_add(256))
+                .and_then(|child| child.checked_mul(leg.count))
+                .and_then(|child| bytes.checked_add(child))
+                .ok_or_else(layout)
+        })
+    }
+}
+
+impl LeafLeg<'_> {
+    fn undefined(self) -> bool { self.field.data_type() == &DataType::Null && !self.field.is_nullable() }
+
+    fn observed_type(self) -> Result<LogicalType> {
+        if self.undefined() {
+            Ok(LogicalType::Nothing)
+        } else if self.null {
+            Ok(LogicalType::Null)
+        } else {
+            crate::from_field(&self.field.clone().with_nullable(false))
+        }
+    }
+}
+
+/// An element whose observed type depends only on its field and its validity.
+fn leaf(field: &Field) -> bool {
+    field.metadata().is_empty()
+        && matches!(
+            field.data_type(),
+            DataType::Null
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+        )
 }
 
 fn layout() -> Anomaly {

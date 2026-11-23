@@ -7,6 +7,7 @@ use super::{EvalContext, ExpressionRow, boolean, integer, nullish, overflow};
 
 mod compare;
 mod calls;
+mod packed;
 mod scalar;
 
 type Pending<'a,T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -40,6 +41,8 @@ impl<'a> EvaluationFrame<'a> {
             Expr::Column { id, .. } => self.row.arrow_cell(self.schema.position(*id)?),
             Expr::Field { expr, name, .. } => self.arrow_input(expr)?.structure()?
                 .find(|child| child.field.name() == name),
+            Expr::Parameter { index, .. } => self.context.parameters.arrow_cell(*index)
+                .filter(|cell| matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_)))),
             _ => None,
         }
     }
@@ -400,7 +403,9 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
                 from_value(super::retained_clone(value.as_ref(), frame.context)?, frame)?
             },
             ListReader::Arrow(cell) => {
-                let item = cell.sequence().and_then(|mut values| values.nth(index)).ok_or_else(|| invalid("nth"))?;
+                let (field, array, range) = cell.sequence_range().ok_or_else(|| invalid("nth"))?;
+                if index >= range.len() { return Err(invalid("nth")); }
+                let item = ArrowCell { field, array, row: range.start + index };
                 from_arrow(item, frame)?
             }
             ListReader::Cast { input,element } => {
@@ -498,6 +503,12 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 {
                     frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
                     return rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row);
+                }
+                if let EvalValue::List(Kind::List, reader) = &value
+                    && let ListReader::Cast { input, element } = reader.as_ref()
+                    && let Some(values) = packed::float_cast(input, *element, frame.context)?
+                {
+                    return Ok(Value::List(values));
                 }
                 let size = len(&value)?;
                 if let EvalValue::List(Kind::List, reader) = &value

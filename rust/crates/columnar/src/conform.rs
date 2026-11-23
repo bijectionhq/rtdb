@@ -93,6 +93,18 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
             }
         };
         let (source_field, array) = arrow_input;
+        if let Some(collapse) = physical::collapse_bytes(array.as_ref(), source_field, field).ok().flatten()
+            && let Ok(_gather) = memory.reserve(collapse)
+            && let Some((leg, leg_field)) = physical::collapse_union(array, source_field, field).ok().flatten()
+            && let Ok(bound) = arrow_relayout_bound(leg.as_ref(), &leg_field, field)
+            && let Ok(_scratch) = memory.reserve(bound)
+            && let Ok((physical, retained)) = physical::relayout(leg, &leg_field, field, false)
+        {
+            output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
+            fields.push(physical);
+            arrays.push(retained);
+            continue;
+        }
         let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;
         if let Ok(_scratch) = memory.reserve(bound)
             && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field, false)
