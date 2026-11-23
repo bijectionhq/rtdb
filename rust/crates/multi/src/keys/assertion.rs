@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc};
+use std::{fs, num::NonZeroU64, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use rtdb_storage::IoRegion;
@@ -14,23 +14,23 @@ use super::{DESTROYED, KEY_BYTES, LocalKeyService, archive, io, is_destroyed, ne
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AssertionStage {
     deployment: Uuid,
-    incarnation: Uuid,
+    incarnation: NonZeroU64,
     stage: Uuid,
 }
 
 impl AssertionStage {
     pub(super) const KEY_PREFIX: &str = "assertion-stage-";
 
-    pub fn new(deployment: Uuid, incarnation: Uuid, stage: Uuid) -> Result<Self> {
-        if deployment.is_nil() || incarnation.is_nil() || stage.is_nil() {
+    pub fn new(deployment: Uuid, incarnation: NonZeroU64, stage: Uuid) -> Result<Self> {
+        if deployment.is_nil() || stage.is_nil() {
             return Err(Anomaly::incorrect(
-                "rtdb.multi/assertion-stage", "An assertion stage requires three non-nil identities",
+                "rtdb.multi/assertion-stage", "An assertion stage requires a deployment and a staging identity",
             ));
         }
         Ok(Self { deployment, incarnation, stage })
     }
 
-    fn key_id(self) -> String {
+    pub(super) fn key_id(self) -> String {
         format!("{}{}-{}-{}", Self::KEY_PREFIX, self.deployment, self.incarnation, self.stage)
     }
 
@@ -68,7 +68,7 @@ impl From<AssertionEnvelope> for Bytes {
 }
 
 impl AssertionEnvelope {
-    fn seal(stage: AssertionStage, wrapping_key: &[u8; KEY_BYTES], plaintext: &[u8]) -> Result<Self> {
+    pub(super) fn seal(stage: AssertionStage, wrapping_key: &[u8; KEY_BYTES], plaintext: &[u8]) -> Result<Self> {
         let data_key = new_key()?;
         let wrapped = Cipher::new(wrapping_key)?.seal(&stage.associated("key"), &data_key)?;
         let body = Cipher::new(&data_key)?.seal(&stage.associated("body"), plaintext)?;
@@ -79,17 +79,37 @@ impl AssertionEnvelope {
         Ok(Self(frame.freeze()))
     }
 
-    fn open(&self, stage: AssertionStage, wrapping_key: &[u8; KEY_BYTES]) -> Result<Bytes> {
+    pub(super) fn open(&self, stage: AssertionStage, wrapping_key: &[u8; KEY_BYTES]) -> Result<Bytes> {
         let data_key = Cipher::new(wrapping_key)?
             .open(&stage.associated("key"), &self.0[HEADER.len()..BODY_OFFSET])?;
         Ok(Cipher::new(&data_key)?.open(&stage.associated("body"), &self.0[BODY_OFFSET..])?)
     }
 }
 
-impl LocalKeyService {
-    /// Issues a one-use staging identity. A caller retains the original returned
-    /// frame for retry and reconciles unused stages after ambiguous publication.
-    pub async fn seal_assertion_stage(
+#[async_trait::async_trait]
+pub trait AssertionKeyService: Send + Sync {
+    /// The caller retains the original frame for retry and reconciles unused
+    /// stages after ambiguous publication.
+    async fn seal_assertion_stage(
+        &self, stage: AssertionStage, region: &Arc<IoRegion>, plaintext: Bytes,
+    ) -> Result<AssertionEnvelope>;
+
+    /// The caller owns current disclosure admission and the lifetime of
+    /// returned plaintext.
+    async fn open_assertion_stage(
+        &self, stage: AssertionStage, region: &Arc<IoRegion>, envelope: AssertionEnvelope,
+    ) -> Result<Bytes>;
+
+    /// Records vault withdrawal, including for a stage that never acquired a
+    /// key. The ordered completion barrier owns the remaining custody.
+    async fn retire_assertion_stage(
+        &self, stage: AssertionStage, region: &Arc<IoRegion>,
+    ) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl AssertionKeyService for LocalKeyService {
+    async fn seal_assertion_stage(
         &self, stage: AssertionStage, region: &Arc<IoRegion>, plaintext: Bytes,
     ) -> Result<AssertionEnvelope> {
         if !self.provision_archive_keys {
@@ -118,9 +138,7 @@ impl LocalKeyService {
         }).await?
     }
 
-    /// Opens in the broker under the stage lock. The caller owns current
-    /// disclosure admission and the lifetime of returned plaintext.
-    pub async fn open_assertion_stage(
+    async fn open_assertion_stage(
         &self, stage: AssertionStage, region: &Arc<IoRegion>, envelope: AssertionEnvelope,
     ) -> Result<Bytes> {
         let authority = self.clone();
@@ -141,9 +159,7 @@ impl LocalKeyService {
         }).await?)
     }
 
-    /// Tombstones a stage at the local broker, including one that never acquired
-    /// a key. The ordered completion barrier owns the remaining custody.
-    pub async fn retire_assertion_stage(
+    async fn retire_assertion_stage(
         &self, stage: AssertionStage, region: &Arc<IoRegion>,
     ) -> Result<()> {
         let authority = self.clone();
@@ -187,7 +203,7 @@ mod tests {
         let vault = LocalKeyService::with_archive_broker(directory.path())?;
         let region = IoRegion::new();
         let deployment = Uuid::new_v4();
-        let incarnation = Uuid::new_v4();
+        let incarnation = NonZeroU64::MIN;
         let a = AssertionStage::new(deployment, incarnation, Uuid::new_v4())?;
         let b = AssertionStage::new(deployment, incarnation, Uuid::new_v4())?;
         let missing = AssertionStage::new(deployment, incarnation, Uuid::new_v4())?;

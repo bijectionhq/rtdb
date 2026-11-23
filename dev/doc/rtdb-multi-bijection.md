@@ -253,6 +253,8 @@ Each payload needs its own wrapped data key and destructible wrapping capability
 The local operation broker can stage an assertion envelope under a single-use identity scoped to the original deployment and incarnation.
 It authenticates the wrapped key and sealed body for separate purposes and keeps the wrapping capability out of the general key and archive APIs.
 A broker tombstone refuses both further opens and reuse of that stage.
+The hosted S3 key service has a distinct object prefix for assertion capabilities.
+It refuses versioned custody and uses conditional writes for staging and withdrawal.
 Native ingress, exact ordered placement, current disclosure and the multi-custodian destruction barrier still need to use this envelope before assertion erasure can be offered.
 
 ### Wake

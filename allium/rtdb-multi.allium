@@ -100,6 +100,7 @@ external entity KeyService {
     -- A local assertion stage has its own wrapping capability, bound to the deployment, incarnation and single-use stage identity.
     -- The broker opens a stage envelope only while that capability is live.
     -- A retired stage stays tombstoned, including when it never held a wrapping capability.
+    -- The S3 provider gives assertion capabilities a separate prefix and conditionally publishes each permanent stage tombstone.
     -- The hosted S3 vault uses the same custody entry for a first residence whether its key identity omits the initial incarnation or spells it out.
 }
 

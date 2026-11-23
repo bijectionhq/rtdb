@@ -18,7 +18,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 mod archive;
 mod assertion;
 mod journal;
-pub use assertion::{AssertionEnvelope, AssertionStage};
+pub use assertion::{AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;
 pub use archive::ArchiveKey;
 pub use crate::cipher::object::FramedObject;
@@ -70,6 +70,8 @@ pub trait KeyService: Send + Sync {
     fn custody_namespace(&self) -> Result<String>;
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
+
+    fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> { None }
 
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
         self.key(&key.id()).await.map(|_| ())
@@ -346,6 +348,10 @@ impl KeyService for LocalKeyService {
             Err(error) => return Err(io(error)),
         }
         self.publish(&path, DESTROYED)
+    }
+
+    fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {
+        self.provision_archive_keys.then_some(self as &dyn AssertionKeyService)
     }
 
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {

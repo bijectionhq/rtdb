@@ -1,12 +1,16 @@
 //! Current deployment keys in a dedicated, never-versioned S3 bucket.
 
+use std::sync::Arc;
+
 use aws_sdk_s3::{Client, primitives::ByteStream, types::ServerSideEncryption};
+use bytes::Bytes;
+use rtdb_storage::{Error, IoRegion};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use uuid::Uuid;
 
 use super::{
-    DELETION_SIGNING_KEY_ID, KEY_BYTES, KeyService, NAMESPACE_KEY_ID, malformed, new_key,
-    require_matching_key,
+    AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
+    KeyService, NAMESPACE_KEY_ID, malformed, new_key, require_matching_key,
 };
 
 pub struct S3KeyService {
@@ -105,8 +109,7 @@ impl S3KeyService {
         Ok(Current::Live { key, etag })
     }
 
-    // Every caller reads the authoritative object after a conditional conflict.
-    async fn put(&self, path: &str, body: &[u8], condition: Precondition<'_>) -> Result<()> {
+    async fn put(&self, path: &str, body: &[u8], condition: Precondition<'_>) -> Result<bool> {
         let put = self
             .client
             .put_object()
@@ -120,15 +123,31 @@ impl S3KeyService {
         };
         match put.send().await {
             Ok(reply) if reply.version_id().is_some() => Err(versioned()),
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(error)
                 if error
                     .raw_response()
                     .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
             {
-                Ok(())
+                Ok(false)
             }
             Err(_) => Err(unavailable("write current key")),
+        }
+    }
+
+    async fn withdraw_current(&self, path: &str) -> Result<()> {
+        for _ in 0..4 {
+            let current = self.current(path).await?;
+            let condition = match &current {
+                Current::Absent => Precondition::Absent,
+                Current::Live { etag, .. } => Precondition::Matches(etag),
+                Current::Withdrawn => return self.require_never_versioned().await,
+            };
+            self.put(path, &[], condition).await?;
+        }
+        match self.current(path).await? {
+            Current::Withdrawn => self.require_never_versioned().await,
+            _ => Err(unavailable("confirm key withdrawal")),
         }
     }
 }
@@ -163,20 +182,11 @@ impl KeyService for S3KeyService {
     }
 
     async fn destroy(&self, id: &str) -> Result<()> {
-        let path = object_path(id)?;
-        for _ in 0..4 {
-            let current = self.current(&path).await?;
-            let condition = match &current {
-                Current::Absent => Precondition::Absent,
-                Current::Live { etag, .. } => Precondition::Matches(etag),
-                Current::Withdrawn => return self.require_never_versioned().await,
-            };
-            self.put(&path, &[], condition).await?;
-        }
-        match self.current(&path).await? {
-            Current::Withdrawn => self.require_never_versioned().await,
-            _ => Err(unavailable("confirm key withdrawal")),
-        }
+        self.withdraw_current(&object_path(id)?).await
+    }
+
+    fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {
+        Some(self)
     }
 
     async fn install(&self, id: &str, key: [u8; KEY_BYTES]) -> Result<()> {
@@ -187,6 +197,51 @@ impl KeyService for S3KeyService {
             None => Err(unavailable("confirm key installation")),
         }
     }
+}
+
+#[async_trait::async_trait]
+impl AssertionKeyService for S3KeyService {
+    async fn seal_assertion_stage(
+        &self, stage: AssertionStage, _region: &Arc<IoRegion>, plaintext: Bytes,
+    ) -> Result<AssertionEnvelope> {
+        self.require_never_versioned().await?;
+        let key = new_key()?;
+        let envelope = AssertionEnvelope::seal(stage, &key, &plaintext)?;
+        drop(plaintext);
+        let path = assertion_path(stage);
+        if self.put(&path, &key, Precondition::Absent).await? {
+            return Ok(envelope);
+        }
+        match self.current(&path).await? {
+            Current::Live { .. } | Current::Withdrawn => Err(Anomaly::new(
+                AnomalyCategory::Conflict, "rtdb.multi/assertion-stage-used",
+                "This assertion stage already has a custody entry",
+            )),
+            Current::Absent => Err(unavailable("confirm assertion staging")),
+        }
+    }
+
+    async fn open_assertion_stage(
+        &self, stage: AssertionStage, _region: &Arc<IoRegion>, envelope: AssertionEnvelope,
+    ) -> Result<Bytes> {
+        self.require_never_versioned().await?;
+        match self.current(&assertion_path(stage)).await? {
+            Current::Live { key, .. } => envelope.open(stage, &key),
+            Current::Withdrawn => Err(Error::ErasedUnderView.into()),
+            Current::Absent => Err(unavailable("read assertion wrapping capability")),
+        }
+    }
+
+    async fn retire_assertion_stage(
+        &self, stage: AssertionStage, _region: &Arc<IoRegion>,
+    ) -> Result<()> {
+        self.require_never_versioned().await?;
+        self.withdraw_current(&assertion_path(stage)).await
+    }
+}
+
+fn assertion_path(stage: AssertionStage) -> String {
+    format!("assertion-capabilities/{}", stage.key_id())
 }
 
 fn locator(specification: &str) -> Result<(&str, &str)> {
@@ -363,11 +418,12 @@ mod transport_tests {
     const ABSENT: &[u8] = b"<Error><Code>NoSuchKey</Code></Error>";
     const LIVE: &[u8; KEY_BYTES] = b"01234567890123456789012345678901";
     const ENCRYPTED: &str = "x-amz-server-side-encryption: AES256\r\nETag: \"tag\"\r\n";
+    const ASSERTION_PATH: &str = "/assertion-capabilities/assertion-stage-00000000-0000-0000-0000-00000000abcd-17-00000000-0000-0000-0000-000000001234";
 
     struct Exchange {
         method: &'static str,
         request_header: &'static str,
-        metadata_key: Option<&'static str>,
+        path: Option<&'static str>,
         status: &'static str,
         response_headers: &'static str,
         body: &'static [u8],
@@ -400,8 +456,8 @@ mod transport_tests {
                 }
                 let path = if exchange.method == "VERSION" {
                     "/?versioning".to_owned()
-                } else if let Some(key) = exchange.metadata_key {
-                    format!("/metadata/{key}")
+                } else if let Some(path) = exchange.path {
+                    path.to_owned()
                 } else {
                     format!("/keys/{ID}")
                 };
@@ -452,7 +508,7 @@ mod transport_tests {
         Exchange {
             method,
             request_header: "",
-            metadata_key: None,
+            path: None,
             status,
             response_headers: "",
             body,
@@ -470,11 +526,11 @@ mod transport_tests {
     async fn the_vault_exposes_its_namespace_and_deletion_signing_identity() {
         let (vault, service) = mock_s3(vec![
             Exchange {
-                metadata_key: Some(NAMESPACE_KEY_ID),
+                path: Some("/metadata/.rtdb-key-namespace"),
                 ..get(LIVE)
             },
             Exchange {
-                metadata_key: Some(DELETION_SIGNING_KEY_ID),
+                path: Some("/metadata/.rtdb-deletion-signing-seed"),
                 ..get(LIVE)
             },
         ])
@@ -522,6 +578,56 @@ mod transport_tests {
         assert_eq!(
             vault.install(ID, [3; KEY_BYTES]).await.unwrap_err().code,
             "rtdb.multi/key-destroyed"
+        );
+        service.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn assertion_capabilities_have_a_separate_conditional_withdrawal_route() {
+        let version = || exchange("VERSION", "200 OK", NEVER_VERSIONED);
+        let assertion = |exchange| Exchange { path: Some(ASSERTION_PATH), ..exchange };
+        let (vault, service) = mock_s3(vec![
+            version(),
+            assertion(get(LIVE)),
+            version(),
+            assertion(get(LIVE)),
+            assertion(Exchange {
+                request_header: "if-match: \"tag\"",
+                ..exchange("PUT", "200 OK", b"")
+            }),
+            assertion(get(b"")),
+            version(),
+            version(),
+            assertion(get(b"")),
+            version(),
+            assertion(Exchange {
+                request_header: "if-none-match: *",
+                ..exchange(
+                    "PUT", "412 Precondition Failed",
+                    b"<Error><Code>PreconditionFailed</Code></Error>",
+                )
+            }),
+            assertion(get(b"")),
+        ]).await;
+        let stage = AssertionStage::new(
+            "00000000-0000-0000-0000-00000000abcd".parse().unwrap(),
+            std::num::NonZeroU64::new(17).unwrap(),
+            "00000000-0000-0000-0000-000000001234".parse().unwrap(),
+        ).unwrap();
+        assert!(vault.existing_key(&stage.key_id()).await.is_err());
+        let authority = vault.assertion_keys().unwrap();
+        let region = IoRegion::new();
+        let plaintext = Bytes::from_static(b"retained assertion");
+        let envelope = AssertionEnvelope::seal(stage, LIVE, &plaintext).unwrap();
+        assert_eq!(authority.open_assertion_stage(stage, &region, envelope.clone()).await.unwrap(), plaintext);
+        authority.retire_assertion_stage(stage, &region).await.unwrap();
+        assert_eq!(
+            authority.open_assertion_stage(stage, &region, envelope).await.unwrap_err().code,
+            "rtdb/erased-under-view",
+        );
+        assert_eq!(
+            authority.seal_assertion_stage(stage, &region, plaintext).await.unwrap_err().code,
+            "rtdb.multi/assertion-stage-used",
         );
         service.await.unwrap();
     }
