@@ -1030,7 +1030,7 @@ impl OwnedReadSession {
         Ok(Self {
             context, node: self.node.clone(), identity: Arc::clone(&self.identity),
             database: self.database.clone(), owner: self.owner.clone(), present: self.present,
-            witness_scope: None, witness_until: self.witness_until, fork_until: self.fork_until,
+            witness_scope: self.witness_scope, witness_until: self.witness_until, fork_until: self.fork_until,
             cancellation, session_cancellation: self.session_cancellation.clone(),
             historical: None, scoped_root: Some(relations), attachment: self.attachment.clone(),
             _reservation: reservation,
@@ -1040,6 +1040,24 @@ impl OwnedReadSession {
     pub fn require_unscoped_root(&self) -> Result<()> {
         if self.scoped_root.is_some() { return Err(scoped_root_denied()); }
         Ok(())
+    }
+
+    pub fn check_witness_relation(&self, relation: &rtdb_types::OwnedRelation, evidence: &OwnedRangeWitness) -> Result<()> {
+        self.check()?;
+        if &evidence.relation != relation || evidence.basis != self.present
+            || !evidence.matches_scope(self.witness_scope)
+        {
+            return Err(scoped_root_denied());
+        }
+        self.relation_release_guard_for([relation], true)?()
+    }
+
+    /// A completed scoped point can conservatively depend on its relation's frontier.
+    pub fn scoped_point_witness(
+        &self, relation: &rtdb_types::OwnedRelation, expiry: Option<Timestamp>,
+    ) -> Result<Option<OwnedRangeWitness>> {
+        if self.scoped_root.is_none() { return Ok(None); }
+        self.relation_witness_for(relation, true, expiry)
     }
 
     pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {
@@ -1415,6 +1433,7 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         scope: rtdb_types::PlacedAttemptScope,
     ) -> Result<(String, Timestamp, Timestamp)> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.witness_scope != Some(scope) || !relation.is_root_data() || self.node.now() >= self.witness_until {
             return Err(lifetime_read_unavailable());
@@ -1458,6 +1477,7 @@ impl OwnedReadSession {
         &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, nomination: &str,
         scope: rtdb_types::PlacedAttemptScope, deadline: Timestamp,
     ) -> Result<(Timestamp, Timestamp)> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         let now = self.node.now();
         if self.historical.is_some() || self.witness_scope != Some(scope) || !relation.is_root_data()

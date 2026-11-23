@@ -235,7 +235,7 @@ type Witnesses = Vec<(Arc<OwnedReadResource>, OwnedRangeWitness)>;
 
 impl OwnedReadResource {
     fn remember(&self, call: &Call, relation: &OwnedRelation, evidence: OwnedRangeWitness) -> Result<Uuid, Status> {
-        self.snapshot.check().map_err(status)?;
+        self.snapshot.check_witness_relation(relation, &evidence).map_err(status)?;
         let mut witnesses = self.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?;
         if let Some((nonce, _)) = witnesses.iter().find(|(_, witness)| &witness.relation == relation && witness.evidence.same_range(&evidence)) {
             return Ok(*nonce);
@@ -637,7 +637,10 @@ impl Service {
             let nonce = Uuid::from_bytes(*nonce);
             let witness = held.witnesses.lock().map_err(|_| Status::internal("Owned range witness storage is unavailable"))?
                 .get(&nonce)
-                .map(|witness| witness.evidence.clone()).ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
+                .map(|witness| {
+                    held.snapshot.check_witness_relation(&witness.relation, &witness.evidence).map_err(status)?;
+                    Ok::<_, Status>(witness.evidence.clone())
+                }).transpose()?.ok_or_else(|| Status::not_found("Unknown owned range witness"))?;
             witnesses.push((held, witness));
         }
         Ok((witnesses, body, framing))
@@ -716,6 +719,11 @@ impl Service {
         writes.extend(condition);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
+        if replay {
+            for (held, _) in &witnesses {
+                held.snapshot.require_unscoped_root().map_err(status)?;
+            }
+        }
         if replay && (counted || !worlds.is_empty()) {
             return Err(invalid("Native replay admits an original effect batch"));
         }
@@ -1027,7 +1035,7 @@ impl Service {
             return Err(status(error));
         }
         let (relation, id, valid, _identity) = point_request(call, request, if with_valid { PointTime::Optional } else { PointTime::Default })?;
-        self.execute_owned_point(&held.snapshot, &relation, &id, valid).await
+        self.execute_owned_point(&held.snapshot, &relation, &id, valid, Some((call, &held))).await
     }
 
     pub(crate) async fn held_owned_historical_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1066,7 +1074,7 @@ impl Service {
         let mut replies = Vec::with_capacity(2);
         for system in [before, group] {
             let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(system, valid, &id, cursor, None, Some(&columns)).await?;
+            let reply = self.finish_owned_point_inner(system, valid, &id, cursor, None, Some(&columns), |_| Ok(None)).await?;
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -2700,30 +2708,37 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
-        self.execute_owned_point(&snapshot, &relation, &id, None).await
+        self.execute_owned_point(&snapshot, &relation, &id, None, None).await
     }
 
     async fn execute_owned_point(
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
+        origin: Option<(&Call, &OwnedReadResource)>,
     ) -> Result<ActionResult, Status> {
         let present = snapshot.system_time();
         let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
-        let reply = self.finish_owned_point(present, valid.unwrap_or(present), id, cursor, lifetime).await?;
+        let witness = |expiry| origin.map(|(call, held)| {
+            let evidence = snapshot.scoped_point_witness(relation, expiry).map_err(status)?;
+            evidence.map(|evidence| held.remember(call, relation, evidence)).transpose()
+        }).transpose().map(Option::flatten);
+        let reply = self.finish_owned_point_inner(present, valid.unwrap_or(present), id, cursor, lifetime, None, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
     async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
-        self.finish_owned_point_inner(present, valid, id, result, lifetime, None).await
+        self.finish_owned_point_inner(present, valid, id, result, lifetime, None, |_| Ok(None)).await
     }
 
     async fn finish_owned_point_inner(
         &self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
         lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
+        witness: impl FnOnce(Option<Timestamp>) -> Result<Option<Uuid>, Status>,
     ) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
-            return self.owned_point_reply(&Schema::empty(), None, present, valid, None);
+            let schema = with_point_witness(&Schema::empty(), witness(None)?);
+            return self.owned_point_reply(&schema, None, present, valid, None);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -2756,7 +2771,8 @@ impl Service {
                 Some(batch.batch().project(&fields).map_err(arrow)?)
             } else { None };
             let rows = projected.as_ref().unwrap_or_else(|| batch.batch());
-            let reply = self.owned_point_reply_until(rows.schema_ref(), Some(rows), present, valid, Some(revision), until)?;
+            let schema = with_point_witness(rows.schema_ref(), witness(until)?);
+            let reply = self.owned_point_reply_until(&schema, Some(rows), present, valid, Some(revision), until)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
             }
@@ -2764,6 +2780,7 @@ impl Service {
         } else {
             let schema = if path_columns.is_some() { Schema::empty() }
                 else { wire::plan_schema(cursor.runtime_schema(), self.memory())? };
+            let schema = with_point_witness(&schema, witness(None)?);
             self.owned_point_reply(&schema, None, present, valid, None)
         }
     }
@@ -2804,6 +2821,13 @@ impl Service {
         let retained = self.memory().reserve(reply.body.len()).map_err(status)?;
         Ok(ActionResult { body: wire::retain(reply.body, retained) })
     }
+}
+
+fn with_point_witness(schema: &Schema, nonce: Option<Uuid>) -> Schema {
+    let Some(nonce) = nonce else { return schema.clone(); };
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
+    schema.clone().with_metadata(metadata)
 }
 
 #[derive(Clone, Copy)]
