@@ -233,8 +233,12 @@ pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHist
         events.sort_unstable_by_key(|event| (std::cmp::Reverse(event.header.precedence()), event.header.valid_time.lower()));
         if events.windows(2).any(|pair| {
             let (left, right) = (&pair[0], &pair[1]);
-            left.header.version() == right.header.version() && (left.origin.is_none() || left.origin != right.origin
-                || left.header.op != right.header.op || left.header.valid_time.intersects(right.header.valid_time))
+            if left.header.version() != right.header.version() { return false; }
+            match (left.origin, right.origin) {
+                (Some(a), Some(b)) if a == b => left.header.op != right.header.op || left.header.valid_time.intersects(right.header.valid_time),
+                (Some(a), Some(b)) => a.0[..16] != b.0[..16] || a.source_block() != b.source_block() || a.ordinal() == b.ordinal(),
+                _ => true,
+            }
         }) { return Ok(None); }
         let first = visible.len();
         for event in events {

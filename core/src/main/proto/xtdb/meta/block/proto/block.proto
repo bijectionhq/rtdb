@@ -36,6 +36,8 @@ message TableBlock {
     repeated xtdb.log.proto.RetiredSearchRun retired_search_runs = 8;
     // When the table's relation was retired: every trie it holds or later receives is garbage.
     int64 retired_as_of_micros = 9;
+  xtdb.log.proto.EntityDirectoryRoot entity_directory = 13;
+  repeated xtdb.log.proto.EntityDirectoryRoot retired_entity_directories = 14;
 }
 
 message TxKey {

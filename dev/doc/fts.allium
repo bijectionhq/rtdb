@@ -178,8 +178,11 @@ rule SearchJobRuns {
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
     -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
-    -- A format 16 writer seals a posting run over the table's accepted block extent and writes forward witnesses for the indexed fields.
-    -- The table owns one entity history for each primary trie, shared by ordinary point reads and searches.
+    -- A format 16 writer seals forward witnesses for the indexed fields with the primary block.
+    -- After block adoption the independent lane can build a posting run over that accepted extent.
+    -- Queries account for that extent from primary history until the run is adopted.
+    -- The table directory covers a sealed prefix of accepted events and carries each erased entity's latest erase frontier.
+    -- The table also owns event header pages for individual primary tries.
     -- A point read takes a primary trie without entity history from the data pages its metadata routes the requested keys to, so older data narrows the read rather than sending it to a scan.
     -- Gap nomination charges each decoded page and counts every inspected row against its budget before opening the next page.
     -- The per-trie point path checks recorded entity keys in history files, primary pages, and live segments.
@@ -441,6 +444,10 @@ contract SearchCorrectness {
     @invariant VisibilityIsResolved
         -- Whether a row is visible is decided by the scan's resolution over the candidate's full history.
         -- A document's rectangles only ever rule a candidate out: an event in another trie or the live index can cut a run's rectangles and never widen them.
+        -- A point read follows the pinned directory and adds accepted events from its durable and live suffix.
+        -- Recorded typed entity keys delimit separate histories behind the same routing IID.
+        -- A post-erase snapshot applies its erase frontier at earlier system times as well.
+        -- An accepted event's origin identifies a relocated payload in primary Arrow.
         -- A packed point query can batch complete IID histories from the held packs and live segments into that same resolver.
         -- If a relevant source lacks complete version evidence, the primary history resolves those candidates.
 

@@ -210,6 +210,7 @@ impl TrieDetails {
 pub fn replay_artefact_file(
     slug: &TableSlug, trie: &TrieKey, record: &crate::log::proto::ArtefactRecord,
 ) -> Result<Option<String>> {
+    if record.kind() == crate::entity_directory::RECORD_KIND { return Ok(None); }
     if record.kind() == crate::search_manifest::RECORD_KIND {
         let change = crate::log::proto::SearchRunChange::from_artefact(record)?;
         if change.retire_only() { return Ok(None); }
@@ -312,6 +313,26 @@ impl TableBlock {
         self
     }
 
+    pub fn with_entity_directory(mut self, active: Option<crate::log::proto::EntityDirectoryRoot>,
+        retired: Vec<crate::log::proto::EntityDirectoryRoot>) -> Self {
+        let wire = Arc::make_mut(&mut self.wire);
+        wire.entity_directory = active;
+        wire.retired_entity_directories = retired;
+        self
+    }
+
+    pub async fn checkpoint_trie_files_with_pages(&self, entry: &TableEntry, contents: CheckpointContents,
+        pages: &dyn crate::cow_tree::PageStore) -> Result<BTreeSet<String>> {
+        let mut files = self.checkpoint_trie_files(entry, contents)?;
+        if contents == CheckpointContents::Replay && let Some(directory) = &self.wire.entity_directory {
+            let prefix = crate::entity_directory::prefix(&entry.slug);
+            for page in crate::cow_tree::reachable(pages, &directory.reference()?).await? {
+                files.insert(crate::cow_tree::page_key(&prefix, page));
+            }
+        }
+        Ok(files)
+    }
+
     pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
         self.wire.partitions.iter().flat_map(|partition| &partition.tries)
             .chain(self.wire.tries.iter().filter(|_| self.wire.partitions.is_empty()))
@@ -328,6 +349,8 @@ impl TableBlock {
         for partition in &mut wire.partitions { retain_primary(&mut partition.tries); }
         wire.search_runs.clear();
         wire.retired_search_runs.clear();
+        wire.entity_directory = None;
+        wire.retired_entity_directories.clear();
         Self { wire: Arc::new(wire), charge: self.charge.clone() }
     }
 

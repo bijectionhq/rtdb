@@ -13,6 +13,9 @@ The same pinned catalog determines which version is visible and where its payloa
 | `HistoryWriter`, `HistoryRoot`, `HistoryRange`, `HistoryPage`, and `ForwardPage` and `HistoryObject` | Passive objects | A single writer's authenticated directory and immutable header or revision pages. |
 | `EntityHistoryArtefacts`, `EntityHistoryBuilder`, and `SearchBuilder` | Passive builders | The build inputs and publication ports for table history and search. |
 | `SearchRun`, `SearchManifest`, and `LogicalCoverage` | Passive values | Source extents, authenticated routing, and active and retired run receipts. |
+| `PageDigest`, `RootRef`, directory pages, and `DirectoryManifest` | Passive values | Authenticated routing data and the active and retired roots of one table's catalog. |
+| `EntityDirectoryBuilder` and the copy-on-write writer | Passive builders | One sealed source prefix and the pages changed by its edits. |
+| `ObjectPageStore`, `FreshPages`, and `DirectoryRead` | Passive adapters | Immutable page I/O and the catalog and memory scope of one read. |
 | `RetainedArtefactJournal` and `PrepareSearch` | Passive adapters | Access to verified retained replay and to the file builders invoked by sealing. |
 | `ReplicationDriver` and the artefact driver | Active objects | Ordered adoption and replay, and selection and scheduling of independent build work. |
 | `TrieCollector` | Passive cycle worker | The eligibility observations and receipts used by a collection cycle. |
@@ -40,8 +43,13 @@ A separate forward page stores each field's revision, keyed by the accepted even
 Equivalent analyzed text shares a posting revision for the same field and entity.
 A forward witness must match the resolved event's identity before a posting can certify its score.
 Older revisions and absent witnesses can be checked by scoring the resolved primary row.
-A point read uses table history where a trie has it and reads only the routed primary pages of a trie that does not.
-Data written before table history therefore keeps entity-level reads instead of falling back to a table scan.
+A point read follows the pinned table directory to the selected entity histories and adds accepted events from the suffix.
+The directory keeps headers, stable origins, and an Arrow location hint through its sealed block.
+Where events carry typed keys, the full key delimits the history behind the routing IID.
+Compaction preserves event origins, so a reader can find a relocated payload when the hint's trie has retired.
+Each erase advances the entity's frontier and removes earlier events, including for reads at older system times.
+A directory can bootstrap from retained L0 sources with stable event origins.
+Legacy points can route through per-trie histories or the selected primary pages.
 Upgrade readers and compaction workers together with ingest writers when enabling this mode or upgrading an existing format 16 deployment.
 Older writers can discard the optional event identity and cannot reproduce the resulting compaction output at the same key.
 
@@ -82,6 +90,12 @@ Replay supplies the erase frontier, so recovery can discard pre-erase text and p
 Events in the same commit retain source order for erasure.
 Maintenance reconstructs older runs containing erase witnesses before adopting them into ordered replacements.
 A retry after a table checkpoint is staged reuses its receipts while publishing the root.
+The same table checkpoint records the directory receipt, its writer fence, and the digest of its ordered erase frontier.
+The receipt's row count includes each retained event and one frontier row per erased entity.
+Each update names the expected predecessor root in the ordered catalog.
+An immutable directory page is addressed by its content digest, and a later seal reuses the untouched subtrees.
+Checkpoint replay archives include every page reachable from the active root and keep the live primary payloads.
+Collection protects the pages reached by installed checkpoints and captured readers while hosted releases also respect fork and archive holds.
 
 ## Query execution
 

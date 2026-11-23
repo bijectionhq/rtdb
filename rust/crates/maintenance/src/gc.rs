@@ -70,6 +70,8 @@ pub struct TrieCollector {
     clock: CollectorClock,
     /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
     first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
+    first_directory_observed: Mutex<BTreeMap<(TableRef, rtdb_format::cow_tree::PageDigest), i64>>,
+    directory: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     first_search_observed: Mutex<BTreeMap<(TableRef, [u8; 32]), i64>>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     retirements: Option<Arc<dyn TableRetirements>>,
@@ -85,7 +87,7 @@ impl TrieCollector {
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
         Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), search: None,
-            retirements: None, store, partition, publisher, observer, config })
+            first_directory_observed: Mutex::default(), directory: None, retirements: None, store, partition, publisher, observer, config })
     }
 
     pub fn with_search(mut self, publisher: Arc<dyn ArtefactPublisher>, version: rtdb_types::StorageVersion, epoch: rtdb_types::StorageEpoch) -> Self {
@@ -106,6 +108,12 @@ impl TrieCollector {
             retirements.retire(chunk.to_vec(), as_of).await?;
         }
         Ok(())
+    }
+
+    pub fn with_entity_directories(mut self, publisher: Arc<dyn ArtefactPublisher>, version: rtdb_types::StorageVersion,
+        epoch: rtdb_types::StorageEpoch) -> Self {
+        self.directory = Some((publisher, version, epoch));
+        self
     }
 
     /// Keeps the eligible tries whose reader lease has elapsed since this collector first observed them.
@@ -189,13 +197,88 @@ impl TrieCollector {
                     self.collect_table(&entry, &keys, &groups, cut, collection.current().trie_catalog(), &release).await?;
                     self.collect_search_seals(&entry, &seals, cut, collection.current().trie_catalog(), cancellation).await?;
                     self.collect_pending_search(&entry, collection.current().trie_catalog(), collection.current().table_catalog().block_index(), cancellation).await?;
-                    self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await
+                    self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await?;
+                    self.collect_entity_directory_pages(&entry, &collection, cut, cancellation).await
                 }).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
         });
         tasks.buffer_unordered(self.config.table_parallelism).for_each(|_| async {}).await;
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
+    }
+
+    async fn collect_entity_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection,
+        cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
+        use rtdb_format::{cow_tree, entity_directory, log::proto::EntityDirectoryChange};
+        let Some((publisher, version, epoch)) = &self.directory else { return Ok(()); };
+        let table = &entry.table;
+        let catalog = collection.current().trie_catalog();
+        let retired = catalog.retired_entity_directories(table).map(|receipt| Ok((receipt, receipt.reference()?)))
+            .collect::<Result<Vec<_>>>()?;
+        if retired.is_empty() { return Ok(()); }
+        let mut held = collection.held_entity_directories(table).map(|root| root.reference()).collect::<Result<Vec<_>>>()?;
+        if let Some(latest) = collection.current().table_catalog().block_index() {
+            let directory = ObjectKey::new(format!("{}/blocks", entry.slug.table_prefix()))?;
+            for checkpoint in self.store.list(Some(&directory)).await? {
+                if cancellation.is_cancelled() { return Err(crate::closed()); }
+                let Ok(block) = block_index_from_key(checkpoint.key.as_str()) else { continue; };
+                if block >= latest { continue; }
+                let size = usize::try_from(checkpoint.size).map_err(crate::invalid)?;
+                let bytes = match self.store.get_fresh_exact(&checkpoint.key, size).await {
+                    Ok(bytes) => bytes,
+                    Err(rtdb_storage::Error::MissingObject(_)) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let checkpoint = rtdb_format::catalog::TableBlock::decode(&bytes)?;
+                if let Some(root) = &checkpoint.as_proto().entity_directory {
+                    held.push(root.reference()?);
+                }
+            }
+        }
+        let roots: BTreeSet<_> = held.iter().map(|root| root.digest).collect();
+        let now = (self.clock)();
+        let lease = self.config.reader_lease_micros()?;
+        let eligible = {
+            let candidates: BTreeSet<_> = retired.iter().filter(|(_, root)| !roots.contains(&root.digest)).map(|(_, root)| root.digest).collect();
+            let mut first = self.first_directory_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            first.retain(|(recorded, digest), _| recorded != table || candidates.contains(digest));
+            candidates.into_iter().filter(|&digest| {
+                let observed = *first.entry((table.clone(), digest)).or_insert(now);
+                rtdb_storage::read_lease::collection_waited(observed, lease, now)
+            }).collect::<BTreeSet<_>>()
+        };
+        if eligible.is_empty() { return Ok(()); }
+        let prefix = entity_directory::prefix(&entry.slug);
+        let pages = rtdb_storage::cow_pages::FreshPages { store: self.store.as_ref(), prefix: &prefix };
+        let mut reachable = BTreeSet::new();
+        for root in &held {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            if !reachable.contains(&root.digest) {
+                reachable.extend(cow_tree::reachable(&pages, root).await?);
+            }
+        }
+        let mut entries = Vec::new();
+        for (receipt, root) in retired.into_iter().filter(|(_, root)| eligible.contains(&root.digest)) {
+            let mut released = true;
+            for digest in cow_tree::retirement_order(&pages, &root, &reachable).await? {
+                if cancellation.is_cancelled() { return Err(crate::closed()); }
+                let key = ObjectKey::new(cow_tree::page_key(&prefix, digest))?;
+                if !self.store.release_entity_directory_page(&key, cut).await? {
+                    released = false;
+                    break;
+                }
+            }
+            if !released { continue; }
+            let key = TrieKey::l0(BlockIndex(receipt.through_block()))?;
+            let record = EntityDirectoryChange { root: Some(receipt.clone()), replaces_root: None }.to_artefact()?;
+            entries.push(ArtefactEntry { trie_key: Some(key.to_string()), record: Some(record) });
+            if entries.len() >= self.config.chunk_size { break; }
+        }
+        if !entries.is_empty() {
+            publisher.remove(ArtefactsRemoved { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
+                table_name: Some(table.schema_and_table()), entries, source_msg_id: None }).await?;
+        }
+        Ok(())
     }
 
     async fn collect_search_seals(&self, entry: &TableEntry, seals: &[TrieKey], cut: Option<CatalogCut>, catalog: &TrieCatalog,

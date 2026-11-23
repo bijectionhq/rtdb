@@ -4849,6 +4849,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -5098,6 +5099,7 @@ dependencies = [
  "rtdb-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "stacker",
  "tempfile",
  "tokio",

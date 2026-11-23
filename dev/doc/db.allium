@@ -1176,6 +1176,8 @@ rule LeaderProcessesTriesAdded {
 }
 
 rule LeaderProcessesArtefactsAdded {
+    -- An entity directory update names the exact directory it expects to replace.
+    -- Ordered application adopts it only while that expected root is current and the source extent advances.
     -- Artefacts from an artefact lane, forwarded to the replica log, where every node records them on its trie catalog, this one included.
     -- An entry is accepted when its trie is live in the leader's durable catalog and its storage version and epoch are the leader's.
     -- The leader deletes the file of an entry whose trie is not live: a reader treats a missing artefact as absent, so deleting one is never wrong, and a file nothing records would otherwise wait for its trie's collection.
@@ -1340,6 +1342,8 @@ rule LeaderAppliesInheritedTx {
 }
 
 rule LeaderUploadsBlockOnBoundary {
+    -- The seal may advance a table's entity directory after authenticating immutable pages for its accepted source prefix.
+    -- The checkpoint includes the directory receipt and any directories still awaiting collection.
     -- The leader reads its OWN boundary back and PRODUCES the block (see The block cycle).
     -- By log order the durable live index now holds exactly this block's transactions and no more — which is precisely what the block-cut pause buys: nothing was resolved and applied between the boundary and here, so a durable L0 block never contains rows from a later block.
     --

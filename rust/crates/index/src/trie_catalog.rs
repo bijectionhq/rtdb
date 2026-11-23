@@ -102,6 +102,7 @@ struct TableTries {
     search: std::sync::Arc<crate::search_manifest::SearchManifest>,
     /// When the table's relation was retired: every trie it holds or later receives is garbage from then on.
     retired: Option<Timestamp>,
+    directory: std::sync::Arc<crate::entity_directory::DirectoryManifest>,
 }
 
 impl TableTries {
@@ -287,6 +288,24 @@ impl TrieCatalog {
         block.with_search_runs(self.search_runs(table).cloned().collect(), self.retired_search_runs(table).cloned().collect())
     }
 
+    pub fn entity_directory(&self, table: &TableRef) -> Option<&log_pb::EntityDirectoryRoot> {
+        self.tables.get(table)?.directory.active()
+    }
+
+    pub fn retired_entity_directories(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::EntityDirectoryRoot> {
+        self.tables.get(table).into_iter().flat_map(|state| state.directory.retired())
+    }
+
+    pub fn with_entity_directory(&self, table: &TableRef, block: TableBlock) -> TableBlock {
+        block.with_entity_directory(self.entity_directory(table).cloned(), self.retired_entity_directories(table).cloned().collect())
+    }
+
+    pub fn accepts_entity_directory(&self, table: &TableRef, key: &TrieKey, record: &log_pb::ArtefactRecord) -> bool {
+        self.trie(table, key).is_some() && self.tables.get(table).is_some_and(|state| {
+            log_pb::EntityDirectoryChange::from_artefact(record).is_ok_and(|change| state.directory.accepts(key, &change))
+        })
+    }
+
     pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
         let Ok(change) = log_pb::SearchRunChange::from_artefact(record) else { return false; };
         let Some(run) = &change.run else { return false; };
@@ -299,6 +318,12 @@ impl TrieCatalog {
         let state = next.tables.entry(table).or_default();
         for mut trie in tries {
             trie.artefacts.retain(|record| {
+                if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
+                    if let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(record) {
+                        std::sync::Arc::make_mut(&mut state.directory).install(&trie.key, change);
+                    }
+                    return false;
+                }
                 if record.kind() != rtdb_format::search_manifest::RECORD_KIND { return true; }
                 if trie.key.level() == 0 && let Ok(change) = log_pb::SearchRunChange::from_artefact(record)
                     && !change.retire_only() && change.replaces.is_empty()
@@ -335,6 +360,14 @@ impl TrieCatalog {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
+                if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
+                    let anchored = state.shards.get(&Shard::of(&key)).and_then(|shard| shard.tries.get(&key.block_index()))
+                        .is_some_and(|trie| trie.key == key);
+                    if anchored && let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(&record) {
+                        std::sync::Arc::make_mut(&mut state.directory).install(&key, change);
+                    }
+                    continue;
+                }
                 if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
                     if key.level() == 0 && self.accepts_search_run(table, &record)
                         && let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) {
@@ -372,6 +405,13 @@ impl TrieCatalog {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
+                if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
+                    if key.level() == 0 && let Ok(change) = log_pb::EntityDirectoryChange::from_artefact(&record)
+                        && let Some(root) = change.root.filter(|root| root.through_block() == key.block_index().0) {
+                        std::sync::Arc::make_mut(&mut state.directory).forget(&root);
+                    }
+                    continue;
+                }
                 if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
                     if let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) && change.retire_only()
                         && let Some(run) = change.run {
@@ -406,6 +446,7 @@ impl TrieCatalog {
         for (table, old) in &self.tables {
             primary.tables.entry(table.clone()).or_default().search = std::sync::Arc::clone(&old.search);
             if let Some(retired) = old.retired { primary.tables.entry(table.clone()).or_default().retire(retired); }
+            primary.tables.entry(table.clone()).or_default().directory = std::sync::Arc::clone(&old.directory);
             for (shard, old) in old.shards.iter().filter(|(shard, _)| shard.level == 0) {
                 let new = primary.tables.entry(table.clone()).or_default().shards.entry(shard.clone()).or_default();
                 new.max_block_index = new.max_block_index.max(old.max_block_index);
@@ -451,6 +492,8 @@ impl TrieCatalog {
             let reconstruct_watermarks = partitions.first().is_some_and(|partition| partition.max_block_index.is_none());
             let mut state = TableTries::default();
             let wire = blocks[&table].as_proto();
+            state.directory = std::sync::Arc::new(crate::entity_directory::DirectoryManifest::load(
+                wire.entity_directory.clone(), wire.retired_entity_directories.clone())?);
             state.search = std::sync::Arc::new(crate::search_manifest::SearchManifest::load(&wire.search_runs, &wire.retired_search_runs)?);
             state.retired = wire.retired_as_of_micros.map(Timestamp);
             for partition in partitions {

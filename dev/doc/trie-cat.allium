@@ -180,6 +180,17 @@ given {
 
 -- Behaviourally-relevant fields only; see TrieCatalog.kt for full interface.
 
+value EntityDirectory {
+    -- A sealed table's authenticated logical history and erase frontier.
+    root: Bytes
+    through_block: Integer
+    source_rows: Integer
+    has_erases: Boolean
+    erase_frontier_digest: Bytes
+    allocation: Bytes
+    writer_fence: Integer
+}
+
 entity TrieCatalog {
     -- See: trie/TrieCatalog.kt, trie_catalog.clj
     --
@@ -189,6 +200,10 @@ entity TrieCatalog {
     -- Each table also owns an independent logical search manifest of authenticated posting receipts.
     -- Primary trie replacement and search-run replacement advance their respective inventories in the catalog cut.
     -- A checkpoint carries active run receipts and pending retirements with the primary trie inventory.
+    -- Each table has at most one active entity directory.
+    -- An entity-directory record is anchored to the L0 block the receipt covers.
+    -- Installing the receipt makes it active and retains the former root for collection.
+    -- Primary relocation preserves the table's entity directory and event origins.
     --
     -- addTries(tries, as_of): register new tries, transitioning superseded inputs to garbage.
     -- withPartitions(table, tries, as_of): the partition layout table would have with tries
@@ -212,6 +227,8 @@ entity TrieCatalog {
     -- group_artefact_prefix(table, group): tables/<slug>/artefacts/<group>, under which every artefact of the group lives.
     -- recorded_artefact_key(table, trie_key, record): artefact_key under the trie's prefix for a trie-scoped record, and under its group's prefix for a group-scoped one.
     tries: Map<TableRef, Map<Shard, ShardState>>
+    entity_directories: Map<TableRef, EntityDirectory>
+    retired_entity_directories: Map<TableRef, List<EntityDirectory>>
 }
 
 value Shard {

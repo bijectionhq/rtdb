@@ -877,3 +877,74 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     assert!(observer.0.lock().unwrap().is_empty());
     assert!(state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().released());
 }
+
+#[tokio::test]
+async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_next_root() {
+    use rtdb_format::{
+        cow_tree::{self, Edit, NoSummary, RootRef, Row},
+        entity_directory,
+        log::proto::{ArtefactsAdded, ArtefactsRemoved, EntityDirectoryChange, EntityDirectoryRoot},
+    };
+    use rtdb_maintenance::ArtefactPublisher;
+    use rtdb_storage::{cache::BufferPool, cow_pages::ObjectPageStore};
+    use rtdb_types::{MemoryBudget, SourcePosition};
+
+    struct DirectoryPublisher(Arc<PartitionState>);
+
+    #[async_trait]
+    impl ArtefactPublisher for DirectoryPublisher {
+        async fn publish(&self, _: ArtefactsAdded) -> Result<SourcePosition> { unreachable!() }
+        async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> {
+            let entries = message.entries.into_iter().map(|entry| {
+                (entry.trie_key.unwrap().parse().unwrap(), entry.record.unwrap())
+            }).collect();
+            self.0.remove_artefacts(&TableRef::new("public", "docs"), entries);
+            Ok(SourcePosition(1))
+        }
+    }
+
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let store = Arc::new(MemoryStore::default());
+    let input = ObjectPageStore { store: store.clone(), storage: Arc::new(BufferPool::new(store.clone(), 16 << 20)),
+        prefix: entity_directory::prefix(&entry.slug) };
+    let memory = MemoryBudget::new(16 << 20);
+    let count = cow_tree::MAX_LEAF_ROWS + 1;
+    let key = |index| u32::try_from(index).unwrap().to_be_bytes().to_vec();
+    let edits = (0..count).map(|index| Edit::Put(Row { key: key(index), value: vec![0] })).collect();
+    let (old, _) = cow_tree::apply(&input, None, edits, &NoSummary, &memory).await.unwrap();
+    let old = old.unwrap();
+    let (next, _) = cow_tree::apply(&input, Some(&old), vec![Edit::Put(Row { key: key(0), value: vec![1] })],
+        &NoSummary, &memory).await.unwrap();
+    let next = next.unwrap();
+    let old_pages = cow_tree::reachable(&input, &old).await.unwrap();
+    let new_pages = cow_tree::reachable(&input, &next).await.unwrap();
+
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let adopt = |through, root: &RootRef, previous: Option<&RootRef>| {
+        let mut l0 = CatalogTrie::notification(TrieKey::l0(BlockIndex(through)).unwrap(), 1, None).unwrap();
+        let receipt = EntityDirectoryRoot { root: Some(root.encode()), through_block: Some(through),
+            source_rows: Some(count as i64), allocation: Some(vec![through as u8; 16]), writer_fence: Some(1),
+            erase_frontier_digest: Some(vec![0; 32]), ..Default::default() };
+        l0.artefacts.push(EntityDirectoryChange { root: Some(receipt), replaces_root: previous.map(RootRef::encode) }.to_artefact().unwrap());
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![l0])]), Timestamp(through)).unwrap();
+    };
+    adopt(0, &old, None);
+    let reader = state.snapshot();
+    adopt(1, &next, Some(&old));
+    let primary = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
+    let observer = Arc::new(Observer::default());
+    let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), unleased(), fixed_clock()).unwrap()
+        .with_entity_directories(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(6), StorageEpoch(0));
+    let cancellation = CancellationToken::new();
+    collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
+    assert!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, old.digest)).unwrap()).await.is_ok());
+    drop(reader);
+    collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
+    assert!(observer.0.lock().unwrap().is_empty());
+    for page in old_pages {
+        assert_eq!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, page)).unwrap()).await.is_ok(), new_pages.contains(&page));
+    }
+    assert!(state.value().trie_catalog().retired_entity_directories(&table).next().is_none());
+}

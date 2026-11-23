@@ -15,8 +15,19 @@ pub struct ObjectPageStore {
 #[async_trait::async_trait]
 impl PageStore for ObjectPageStore {
     async fn get(&self, digest: PageDigest, length: u64) -> Result<Bytes> {
+        crate::audience_work::decode_bytes(
+            usize::try_from(length).map_err(|error| {
+                Anomaly::fault("rtdb.storage/cow-page-length", error.to_string())
+            })?,
+        )?;
         let key = ObjectKey::new(page_key(&self.prefix, digest))?;
         let lease = if self.store.supports_scan_ranges(&key) {
+            if self.storage.scan_length(&key).await? != length {
+                return Err(Anomaly::fault(
+                    "rtdb.storage/cow-page-length",
+                    "Directory page length differs from its reference",
+                ));
+            }
             self.storage.get_scan_range(&key, 0..length).await?
         } else {
             self.storage.get(&key).await?

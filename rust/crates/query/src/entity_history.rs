@@ -2,9 +2,9 @@ use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
 
 use futures::{FutureExt, TryStreamExt};
 use rtdb_format::entity_history::{self, HistoryRoot};
-use rtdb_index::TrieState;
+use rtdb_index::{CatalogTrie, TrieState};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease}};
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, MemoryBudget, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result};
 
 use crate::{LocatedHistoryEvent, ResolvedSearchRow, ScanRequest, SearchRowLocation, resolve_located_point};
 
@@ -46,6 +46,11 @@ pub async fn table_point_rows(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -
     if table.is_owned_event_data() || rtdb_types::TableRef::owned_schema(&table.schema)
         || !request.bounds.system_time.is_point() || !request.bounds.valid_time.is_point() {
         return Ok(None);
+    }
+    match crate::entity_directory::resolve_points(request, keys).await {
+        Ok(Some(rows)) if !rows.windows(2).any(|pair| pair[0].version.iid == pair[1].version.iid) => return Ok(Some(rows)),
+        Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+        _ => {}
     }
     match read_history(request, keys).await {
         Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
@@ -143,18 +148,18 @@ fn same_identity(identities: &mut BTreeMap<Iid, Option<Vec<u8>>>, iid: Iid, key:
     }
 }
 
-fn charge_history(charge: &mut Arc<rtdb_types::MemoryReservation>, count: usize, key_bytes: usize) -> Result<()> {
+pub(crate) fn charge_history(charge: &mut Arc<rtdb_types::MemoryReservation>, count: usize, key_bytes: usize) -> Result<()> {
     let lease = Arc::get_mut(charge).expect("unpublished histories own their reservation");
     let needed = 4096usize.saturating_add(count.saturating_mul(384)).saturating_add(key_bytes);
     if needed > lease.bytes() { lease.grow_to(needed.max(lease.bytes().saturating_mul(2)))?; }
     Ok(())
 }
 
-fn contains(part: &[u8], iid: Iid) -> bool {
+pub(crate) fn contains(part: &[u8], iid: Iid) -> bool {
     part.iter().enumerate().all(|(depth, digit)| (iid.0[depth / 4] >> (6 - 2 * (depth % 4))) & 3 == *digit)
 }
 
-fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Entity history read cancelled") }
+pub(crate) fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Entity history read cancelled") }
 
 pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types::BlockIndex>,
     scope: Option<&BTreeSet<Iid>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
@@ -164,59 +169,74 @@ pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSe
     }
 }
 
-async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types::BlockIndex>,
+pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_format::keys::TableSlug,
+    trie: &CatalogTrie, scope: Option<&BTreeSet<Iid>>, max_rows: usize,
+    mut visit: impl FnMut(LocatedHistoryEvent<()>, Option<&[u8]>) -> Result<bool>) -> Result<Option<usize>> {
+    let Some(record) = trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION) else {
+        return crate::scan::primary_point_events(request, slug, &trie.key, scope, max_rows, visit).await;
+    };
+    let key = ObjectKey::new(slug.recorded_artefact_key(&trie.key, record)?)?;
+    let root = HistoryRoot::decode(record.stats(), record.file_size())?;
+    let file = HistoryObject::open(request, key, record.file_size()).await?;
+    let directory = file.read(root.range()).await?;
+    let _directory = request.memory.reserve(directory.as_slice().len().saturating_mul(2).saturating_add(4096))?;
+    let ranges = entity_history::ranges(directory.as_slice(), root, entity_history::owner(slug, &trie.key), scope)?;
+    let mut inspected = 0usize;
+    for range in ranges {
+        if request.cancellation.is_cancelled() { return Err(cancelled()); }
+        inspected = inspected.saturating_add(range.rows as usize);
+        if inspected > max_rows { return Ok(None); }
+        audience_work::scan_items(range.rows as usize)?;
+        let bytes = file.read(range.range()).await?;
+        let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
+        let page = range.read(bytes.as_slice())?;
+        for row in 0..range.rows as usize {
+            let (header, origin) = page.event(row)?;
+            if scope.is_some_and(|keys| !keys.contains(&header.iid)) { continue; }
+            let event = LocatedHistoryEvent { header, origin, witness: None, location: SearchRowLocation::Persisted {
+                trie: trie.key.clone(), page: range.page, row: range.first_row + row as u32,
+            }};
+            if !visit(event, page.entity_key(row))? { return Ok(None); }
+        }
+    }
+    Ok(Some(inspected))
+}
+
+async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex>,
     scope: Option<&BTreeSet<Iid>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
     let table = &request.scan.table.name.table;
     let mut iids = BTreeSet::new();
     let mut charge = request.memory.reserve(4096)?;
-    let mut inspected = 0usize;
+    let budget = limit.saturating_mul(32);
     let Some(entry) = request.snapshot.table_entry(table) else { return Ok(Some(iids)); };
-    for trie in request.snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == TrieState::Live) {
-        if trie.key.level() == 0 && covered.contains(&trie.key.block_index()) { continue; }
-        if scope.is_some_and(|keys| !keys.iter().any(|&key| contains(trie.key.part(), key))) { continue; }
-        let budget = limit.saturating_mul(32);
-        let mut nominate = |header: rtdb_types::EventHeader, origin: Option<rtdb_types::EventOrigin>| -> Result<bool> {
-            if header.op != rtdb_types::EventOp::Put || header.system_from >= request.bounds.system_time.upper()
-                || header.valid_time.lower() >= request.bounds.valid_time.upper()
-                || header.valid_time.upper() <= request.bounds.valid_time.lower()
-                || scope.is_some_and(|keys| !keys.contains(&header.iid))
-                || (trie.key.level() != 0 && origin.is_some_and(|origin| covered.contains(&origin.source_block()))) {
-                return Ok(true);
-            }
-            if !iids.contains(&header.iid) {
-                if iids.len() == limit { return Ok(false); }
-                charge_history(&mut charge, iids.len() + 1, 0)?;
-                iids.insert(header.iid);
-            }
-            Ok(true)
-        };
-        match trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION) {
-            Some(record) => {
-                let key = ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?;
-                let root = HistoryRoot::decode(record.stats(), record.file_size())?;
-                let file = HistoryObject::open(request, key, record.file_size()).await?;
-                let directory = file.read(root.range()).await?;
-                let _directory = request.memory.reserve(directory.as_slice().len().saturating_mul(2).saturating_add(4096))?;
-                let ranges = entity_history::ranges(directory.as_slice(), root, entity_history::owner(&entry.slug, &trie.key), scope)?;
-                for range in ranges {
-                    if request.cancellation.is_cancelled() { return Err(cancelled()); }
-                    inspected = inspected.saturating_add(range.rows as usize);
-                    if inspected > budget { return Ok(None); }
-                    let bytes = file.read(range.range()).await?;
-                    let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
-                    let page = range.read(bytes.as_slice())?;
-                    for row in 0..range.rows as usize {
-                        let (header, origin) = page.event(row)?;
-                        if !nominate(header, origin)? { return Ok(None); }
-                    }
-                }
-            }
-            None => {
-                let Some(rows) = crate::scan::primary_point_events(request, &entry.slug, &trie.key, scope, budget.saturating_sub(inspected),
-                    |event, _| nominate(event.header, event.origin)).await? else { return Ok(None); };
-                inspected = inspected.saturating_add(rows);
-            }
+    let mut nominate = |header: EventHeader| -> Result<bool> {
+        if header.op != EventOp::Put || header.system_from >= request.bounds.system_time.upper()
+            || header.valid_time.lower() >= request.bounds.valid_time.upper()
+            || header.valid_time.upper() <= request.bounds.valid_time.lower()
+            || scope.is_some_and(|keys| !keys.contains(&header.iid)) {
+            return Ok(true);
         }
+        if !iids.contains(&header.iid) {
+            if iids.len() == limit { return Ok(false); }
+            charge_history(&mut charge, iids.len() + 1, 0)?;
+            iids.insert(header.iid);
+        }
+        Ok(true)
+    };
+    let (through, mut inspected) = crate::entity_directory::nominate(request, covered, scope, budget,
+        &mut |header, _| nominate(header)).await?.map_or((None, 0), |(through, count)| (Some(through), count));
+    for trie in request.snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == TrieState::Live) {
+        let is_l0 = trie.key.level() == 0;
+        let block = trie.key.block_index();
+        if through.is_some_and(|through| block <= through) || (is_l0 && covered.contains(&block)) { continue; }
+        if scope.is_some_and(|keys| !keys.iter().any(|&key| contains(trie.key.part(), key))) { continue; }
+        let Some(rows) = visit_trie_events(request, &entry.slug, trie, scope, budget.saturating_sub(inspected), |event, _| {
+            if event.origin.is_some_and(|origin| {
+                through.is_some_and(|through| origin.source_block() <= through) || covered.contains(&origin.source_block())
+            }) { return Ok(true); }
+            nominate(event.header)
+        }).await? else { return Ok(None); };
+        inspected = inspected.saturating_add(rows);
     }
     Ok(Some(iids))
 }

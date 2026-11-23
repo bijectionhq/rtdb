@@ -724,7 +724,9 @@ impl MaintenanceSupervisor {
         let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
             let clock = Arc::clone(&self.clock);
             Arc::new(move || clock.monotonic_micros())
-        })?.with_search(artefacts, self.logs.storage_version, self.logs.storage_epoch).with_retirements(Arc::new(crate::table_retirement::RetiredRelations {
+        })?
+            .with_entity_directories(artefacts.clone(), self.logs.storage_version, self.logs.storage_epoch)
+            .with_search(artefacts, self.logs.storage_version, self.logs.storage_epoch).with_retirements(Arc::new(crate::table_retirement::RetiredRelations {
             database: self.database.clone(), partition: Arc::clone(&self.partition), storage: Arc::clone(&self.storage),
             memory: Arc::clone(&self.memory), term: handle.clone(),
         })));

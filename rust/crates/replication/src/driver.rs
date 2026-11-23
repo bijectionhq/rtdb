@@ -1308,7 +1308,10 @@ impl ReplicationDriver {
                             let slug = self.partition.value().table_catalog().entry(&table).map(|entry| entry.slug.clone());
                             self.partition.remove_artefacts(&table, entries.clone());
                             // The lane deletes the objects from the store next; this node's cached copies are its own to drop.
-                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| slug.recorded_artefact_key(trie, record).ok()));
+                            let keys = slug.iter().flat_map(|slug| entries.iter().filter_map(move |(trie, record)| {
+                                if record.kind() == rtdb_format::entity_directory::RECORD_KIND { return None; }
+                                slug.recorded_artefact_key(trie, record).ok()
+                            }));
                             for key in keys.filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect::<BTreeSet<_>>() { let _ = self.resolve.storage.invalidate(&key).await; }
                         }
                     }
@@ -1911,6 +1914,10 @@ fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::S
     let mut rejected = BTreeSet::new();
     for entry in entries {
         let (Ok(key), Some(record)) = (entry.trie_key.as_deref().unwrap_or_default().parse::<TrieKey>(), &entry.record) else { continue };
+        if record.kind() == rtdb_format::entity_directory::RECORD_KIND {
+            if catalog.accepts_entity_directory(&table, &key, record) { message.entries.push(entry); }
+            continue;
+        }
         if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
             if key.level() == 0 && catalog.accepts_search_run(&table, record) { message.entries.push(entry); }
             continue;

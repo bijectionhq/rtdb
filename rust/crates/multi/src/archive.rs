@@ -1320,8 +1320,12 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
         if closure.insert(path, CheckpointMember::metadata(observed)).is_some() {
             return Err(inconsistent("Two checkpoint tables use the same storage path"));
         }
-        for object in metadata.checkpoint_trie_files(&table, contents)? {
-            closure.entry(key(&object)?).or_default();
+        let prefix = rtdb_format::entity_directory::prefix(&table.slug);
+        let pages = rtdb_storage::cow_pages::FreshPages { store: plaintext, prefix: &prefix };
+        for object in metadata.checkpoint_trie_files_with_pages(&table, contents, &pages).await? {
+            let member = rtdb_format::entity_directory::page_digest(&object)
+                .map_or_else(CheckpointMember::default, |page| CheckpointMember::metadata(page.0));
+            closure.entry(key(&object)?).or_insert(member);
         }
         for trie in metadata.trie_details() {
             let Some(extent) = trie.data_file_size else { continue; };

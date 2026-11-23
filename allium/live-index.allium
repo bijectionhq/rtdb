@@ -301,7 +301,8 @@ entity LiveTableTx {
 -- Opened from within an active transaction, a TableSnapshot takes the newest view of that table instead — the transaction's own where it has written to it, else its newest staged predecessor's — so a query inside the transaction sees durable rows, its predecessors' rows and its own.
 --
 -- A Snapshot also pins the two catalogs a reader needs alongside those segments: the trie catalog, which locates the historical tries on disk, and the table catalog's per-table metadata.
--- Pinning them is what stops a reader combining pinned data with catalog state read live at the moment it happens to ask.
+-- The pinned trie catalog supplies the table's entity directory and the authoritative payload inventory for the same read.
+-- The directory covers accepted events through its sealed block, and the snapshot supplies the committed and permitted staged suffix.
 --
 -- A snapshot takes both catalogs from one read of the partition's value, the value current when it opens.
 -- A transaction snapshot takes its segments from that same read.

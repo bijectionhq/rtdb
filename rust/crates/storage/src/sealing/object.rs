@@ -21,6 +21,7 @@ pub fn framed(key: &ObjectKey) -> bool {
     (key.starts_with("tables/") && key.contains("/data/") && key.ends_with(".arrow"))
         || rtdb_format::entity_history::is_ranged_artefact(key)
         || rtdb_format::search_manifest::is_ranged_run(key)
+        || rtdb_format::entity_directory::page_digest(key).is_some()
 }
 
 fn invalid(key: &ObjectKey) -> Error {

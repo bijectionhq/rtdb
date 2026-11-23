@@ -60,6 +60,7 @@ impl PartitionValue {
 struct CheckpointTries {
     tries: BTreeMap<TableRef, BTreeSet<TrieKey>>,
     search: BTreeMap<TableRef, BTreeSet<[u8; 32]>>,
+    entity_directories: BTreeMap<TableRef, rtdb_format::log::proto::EntityDirectoryRoot>,
 }
 
 impl CheckpointTries {
@@ -73,7 +74,8 @@ impl CheckpointTries {
         let search = catalog.tables().map(|table| {
             (table.clone(), catalog.search_runs(table).filter_map(|run| run.identity().ok()).collect())
         }).collect();
-        Self { tries, search }
+        let entity_directories = catalog.tables().filter_map(|table| Some((table.clone(), catalog.entity_directory(table)?.clone()))).collect();
+        Self { tries, search, entity_directories }
     }
 
     fn requires(&self, table: &TableRef, key: &TrieKey) -> bool {
@@ -98,6 +100,7 @@ impl BlockPreparation {
         let catalog = self.table_catalog()?;
         catalog.tables().iter().map(|(table, meta)| {
             let block = meta.to_block(trie_catalog.partitions(table)?)?;
+            let block = trie_catalog.with_entity_directory(table, block);
             Ok((table.clone(), trie_catalog.with_retirement(table, trie_catalog.with_search_manifest(table, block))))
         }).collect()
     }
@@ -149,6 +152,12 @@ impl TrieCollection {
             });
             (!protected).then_some(run)
         })
+    }
+
+    pub fn held_entity_directories<'a>(&'a self, table: &'a TableRef) -> impl Iterator<Item = &'a rtdb_format::log::proto::EntityDirectoryRoot> + 'a {
+        self.current.trie_catalog().entity_directory(table).into_iter()
+            .chain(self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.entity_directories.get(table)))
+            .chain(self.readers.iter().filter_map(move |reader| reader.entity_directory(table)))
     }
 
     fn protected(&self, table: &TableRef, key: &TrieKey) -> bool {

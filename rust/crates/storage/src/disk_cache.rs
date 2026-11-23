@@ -352,6 +352,10 @@ impl ObjectStore for DiskCachedStore {
         self.cache.invalidate(&self.key(key)?)?;
         Ok(())
     }
+    async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        self.upstream.release_entity_directory_page(key, cut).await
+    }
+
     async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
         self.remote.search_staging_owner().await
     }

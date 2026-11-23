@@ -1,5 +1,6 @@
 mod artefact;
 mod driver;
+mod entity_directory;
 mod entity_history;
 mod failure;
 mod gc;

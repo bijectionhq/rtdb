@@ -53,6 +53,7 @@ pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, Constant
 pub use accelerate::{LocatedHistoryEvent, resolve_located_point};
 mod cow_pages;
 pub use cow_pages::ObjectPageStore;
+pub mod entity_directory;
 mod entity_history;
 pub use entity_history::{HistoryObject, table_point_rows, uncovered_history_iids};
 pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions, retain_catalog_snapshot};

@@ -9,6 +9,7 @@ pub mod diagnostics;
 pub mod envelope;
 mod stage_journal;
 pub mod search_manifest;
+pub mod entity_directory;
 pub mod entity_history;
 pub mod hll;
 pub mod ipc;

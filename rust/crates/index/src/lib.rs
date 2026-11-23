@@ -17,3 +17,4 @@ pub use trie_catalog::{CatalogTrie, Shard, TrieCatalog, TrieState};
 pub use rtdb_format::catalog::TableEntry;
 pub use rtdb_format::data::{StoredEvent, StoredOperation};
 mod search_manifest;
+mod entity_directory;

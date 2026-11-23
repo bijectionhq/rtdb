@@ -1532,6 +1532,7 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 
 fn is_collected_trie_file(key: &str) -> bool {
     rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) || rtdb_format::keys::is_compacted_primary_file(key)
+        || rtdb_format::entity_directory::page_digest(key).is_some()
 }
 
 fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord, exact: bool) -> bool {
@@ -1559,6 +1560,11 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 #[async_trait]
 impl ObjectStore for GarbageStore {
     fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
+    async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
+        let publication = self.retirement_publication(key).await?.map(rtdb_format::log::proto::PublishedObjectVersion::from);
+        self.release_search_run(key, publication.as_ref(), cut).await
+    }
+
     fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         self.inner.whole_object_allocation(key, length)
     }
@@ -1629,7 +1635,8 @@ impl ObjectStore for GarbageStore {
         if version.is_none() && terminal.is_none() {
             return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
         }
-        let path = rtdb_format::search_manifest::is_run_key(key.as_str()).then_some(key.as_str());
+        let path = (rtdb_format::search_manifest::is_run_key(key.as_str())
+            || rtdb_format::entity_directory::page_digest(key.as_str()).is_some()).then_some(key.as_str());
         let (floor, allowed) = readers.close_admission(cut, &[path]).await?;
         if !allowed[0] { return Ok(false); }
         self.write_release_record(key, Some(floor), version.as_ref(), None, terminal.as_ref()).await?;

@@ -248,6 +248,11 @@ pub trait ObjectStore: Send + Sync {
         self.delete(key).await?;
         Ok(true)
     }
+    async fn release_entity_directory_page(&self, key: &ObjectKey, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        if self.defers_trie_releases() { return Ok(false); }
+        self.delete(key).await?;
+        Ok(true)
+    }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.

@@ -118,6 +118,11 @@ impl RecoveredBlockConfirmation {
             let names = table.schema.len().checked_add(table.table.len())?.checked_add(1024)?;
             let bytes = block.as_proto().search_runs.iter().filter(|run| run.blocks == [catalog.block_index().0])
                 .try_fold(bytes, |bytes, run| bytes.checked_add(run.encoded_size())?.checked_add(1024))?;
+            let wire = block.as_proto();
+            let bytes = if let Some(root) = wire.entity_directory.as_ref().filter(|root| root.through_block() == catalog.block_index().0) {
+                let previous = wire.retired_entity_directories.iter().max_by_key(|root| root.through_block());
+                bytes.checked_add(root.encoded_size())?.checked_add(previous.map_or(0, |root| root.root().len()))?.checked_add(256)?
+            } else { bytes };
             l0_details(block, &key).try_fold(bytes, |bytes, detail| {
                 bytes.checked_add(names)?.checked_add(detail.encoded_size())
             })
@@ -744,6 +749,11 @@ pub(crate) fn l0_tries(index: BlockIndex, tables: &BTreeMap<rtdb_types::TableRef
             });
             let mut trie = CatalogTrie::notification(key.clone(), detail.data_file_size.unwrap_or_default(), summary)?;
             trie.artefacts = detail.artefacts.clone();
+            if let Some(root) = block.as_proto().entity_directory.as_ref().filter(|root| root.through_block() == index.0) {
+                let previous = block.as_proto().retired_entity_directories.iter().max_by_key(|root| root.through_block());
+                trie.artefacts.push(proto::EntityDirectoryChange { root: Some(root.clone()),
+                    replaces_root: previous.and_then(|root| root.root.clone()) }.to_artefact()?);
+            }
             for run in block.as_proto().search_runs.iter().filter(|run| run.blocks == [index.0]) {
                 trie.artefacts.push(proto::SearchRunChange { run: Some(run.clone()), ..Default::default() }.to_artefact()?);
             }

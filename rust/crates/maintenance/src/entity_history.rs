@@ -17,13 +17,15 @@ pub struct EntityHistoryArtefacts;
 impl ArtefactKind for EntityHistoryArtefacts {
     fn name(&self) -> &str { entity_history::KIND }
     fn builder(&self, database: ArtefactDatabase) -> Result<Arc<dyn ArtefactBuilder>> {
-        Ok(Arc::new(EntityHistoryBuilder { store: database.store, memory: database.memory }))
+        let directory = crate::entity_directory::EntityDirectoryBuilder::new(&database);
+        Ok(Arc::new(EntityHistoryBuilder { store: database.store, memory: database.memory, directory }))
     }
 }
 
 struct EntityHistoryBuilder {
     store: Arc<dyn ObjectStore>,
     memory: Arc<MemoryBudget>,
+    directory: crate::entity_directory::EntityDirectoryBuilder,
 }
 
 fn definition(table: TableRef) -> ArtefactDefinition {
@@ -42,11 +44,13 @@ impl ArtefactBuilder for EntityHistoryBuilder {
     async fn seal_serving_search(&self, value: &Arc<PartitionValue>, table: &TableRef, trie: &TrieKey, path: &Path,
         size: u64, cancellation: &CancellationToken) -> Result<Vec<ArtefactRecord>> {
         let job = ArtefactJob { definition: definition(table.clone()), owner: ArtefactOwner::Trie(trie.clone()) };
+        let mut records = self.directory.seal_serving_search(value, table, trie, path, size, cancellation).await?;
         match self.build(&job, ArtefactSource::Local { data: path, size }, value, cancellation).await {
-            Ok(record) => Ok(vec![record]),
-            Err(error) if cancellation.is_cancelled() => Err(error),
-            Err(_) => Ok(Vec::new()),
+            Ok(record) => records.push(record),
+            Err(error) if cancellation.is_cancelled() => return Err(error),
+            Err(_) => {}
         }
+        Ok(records)
     }
 
     async fn build(&self, job: &ArtefactJob, source: ArtefactSource<'_>, value: &Arc<PartitionValue>,

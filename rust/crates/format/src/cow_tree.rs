@@ -15,13 +15,14 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use sha2::{Digest, Sha256};
 
 pub const MAX_LEAF_ROWS: usize = 2048;
 pub const MAX_FANOUT: usize = 64;
 const MAX_HEIGHT: u8 = 64;
 const MAX_PAGE_BYTES: u64 = 128 << 20;
+const PAGE_GENERATION: &str = "rtdb.cow-tree.generation";
 const ROOT_MAGIC: &[u8; 8] = b"RTDBCOW1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -159,7 +160,7 @@ fn binary<'a>(values: impl Iterator<Item = &'a [u8]>) -> BinaryArray {
     builder.finish()
 }
 
-fn encode(page: &Page, height: u8) -> Result<Bytes> {
+fn encode(page: &Page, height: u8, generation: Option<i64>) -> Result<Bytes> {
     let columns: Vec<Arc<dyn Array>> = match page {
         Page::Leaf(rows) => vec![
             Arc::new(binary(rows.iter().map(|row| row.key.as_slice()))),
@@ -183,7 +184,12 @@ fn encode(page: &Page, height: u8) -> Result<Bytes> {
             ]
         }
     };
-    let schema = Arc::clone(schema(height));
+    let schema = match generation {
+        Some(generation) => Arc::new(schema(height).as_ref().clone().with_metadata(
+            std::collections::HashMap::from([(PAGE_GENERATION.to_owned(), generation.to_string())]),
+        )),
+        None => Arc::clone(schema(height)),
+    };
     let batch = RecordBatch::try_new(schema.clone(), columns).map_err(invalid)?;
     let mut bytes = Vec::new();
     {
@@ -196,7 +202,16 @@ fn encode(page: &Page, height: u8) -> Result<Bytes> {
 
 fn decode(bytes: &Bytes, height: u8) -> Result<Page> {
     let mut reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None).map_err(invalid)?;
-    if reader.schema() != *schema(height) || reader.num_batches() != 1 {
+    let actual = reader.schema();
+    if actual.fields() != schema(height).fields()
+        || reader.num_batches() != 1
+        || (!actual.metadata().is_empty()
+            && (actual.metadata().len() != 1
+                || !actual
+                    .metadata()
+                    .get(PAGE_GENERATION)
+                    .is_some_and(|generation| generation.parse::<i64>().is_ok())))
+    {
         return Err(invalid("Unexpected Arrow page layout"));
     }
     let batch = reader
@@ -319,6 +334,7 @@ struct Writer<'a> {
     summary: &'a dyn Summary,
     memory: &'a Arc<MemoryBudget>,
     written: BTreeSet<PageDigest>,
+    generation: Option<i64>,
 }
 
 impl Writer<'_> {
@@ -349,7 +365,7 @@ impl Writer<'_> {
         let _charge = self
             .memory
             .reserve(estimated.saturating_mul(3).saturating_add(4096))?;
-        let bytes = encode(&page, height)?;
+        let bytes = encode(&page, height, self.generation)?;
         let root = RootRef {
             digest: digest(&bytes),
             length: bytes.len() as u64,
@@ -499,6 +515,18 @@ pub async fn apply(
     summary: &dyn Summary,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(Option<RootRef>, Vec<PageDigest>)> {
+    apply_with_generation(store, base, edits, summary, memory, None).await
+}
+
+/// The seal's generation prevents a later edit from recreating a digest after its retirement.
+pub async fn apply_with_generation(
+    store: &dyn PageStore,
+    base: Option<&RootRef>,
+    edits: Vec<Edit>,
+    summary: &dyn Summary,
+    memory: &Arc<MemoryBudget>,
+    generation: Option<i64>,
+) -> Result<(Option<RootRef>, Vec<PageDigest>)> {
     if edits.is_empty() {
         return Ok((base.cloned(), Vec::new()));
     }
@@ -520,6 +548,7 @@ pub async fn apply(
         summary,
         memory,
         written: BTreeSet::new(),
+        generation,
     };
     let mut edges = if let Some(base) = base {
         writer.rewrite(base, None, &edits, true).await?
@@ -576,38 +605,52 @@ pub async fn visit(
     range: Range<Vec<u8>>,
     admit: &(dyn Fn(&[u8]) -> bool + Send + Sync),
     memory: &Arc<MemoryBudget>,
-    mut row: impl FnMut(Row) -> Result<bool>,
+    mut row: impl FnMut(Row) -> Result<bool> + Send,
 ) -> Result<()> {
     if range.start >= range.end || !admit(&root.summary) {
         return Ok(());
     }
-    let mut pending = vec![(root.clone(), None)];
-    while let Some((reference, edge)) = pending.pop() {
-        let (page, _charge) = load(store, &reference, edge.as_ref(), Some(memory)).await?;
+    visit_page(store, root, None, &range, admit, memory, &mut row).await?;
+    Ok(())
+}
+
+fn visit_page<'a, F: FnMut(Row) -> Result<bool> + Send + 'a>(
+    store: &'a dyn PageStore,
+    root: &'a RootRef,
+    edge: Option<&'a Edge>,
+    range: &'a Range<Vec<u8>>,
+    admit: &'a (dyn Fn(&[u8]) -> bool + Send + Sync),
+    memory: &'a Arc<MemoryBudget>,
+    row: &'a mut F,
+) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+    Box::pin(async move {
+        let (page, _charge) = load(store, root, edge, Some(memory)).await?;
         match page {
             Page::Leaf(rows) => {
-                for value in rows.into_iter().filter(|row| range.contains(&row.key)) {
+                let start = rows.partition_point(|row| row.key < range.start);
+                let end = rows.partition_point(|row| row.key < range.end);
+                for value in rows.into_iter().skip(start).take(end - start) {
                     if !row(value)? {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
             Page::Branch(children) => {
-                pending.extend(
-                    children
-                        .into_iter()
-                        .rev()
-                        .filter(|child| {
-                            child.last >= range.start
-                                && child.first < range.end
-                                && admit(&child.root.summary)
-                        })
-                        .map(|edge| (edge.root.clone(), Some(edge))),
-                );
+                for child in children.iter().filter(|child| {
+                    child.last >= range.start
+                        && child.first < range.end
+                        && admit(&child.root.summary)
+                }) {
+                    if !visit_page(store, &child.root, Some(child), range, admit, memory, row)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                }
             }
         }
-    }
-    Ok(())
+        Ok(true)
+    })
 }
 
 pub async fn reachable(store: &dyn PageStore, root: &RootRef) -> Result<Vec<PageDigest>> {
@@ -628,6 +671,40 @@ pub async fn reachable(store: &dyn PageStore, root: &RootRef) -> Result<Vec<Page
     Ok(seen.into_iter().collect())
 }
 
+pub async fn retirement_order(
+    store: &dyn PageStore,
+    root: &RootRef,
+    protected: &BTreeSet<PageDigest>,
+) -> Result<Vec<PageDigest>> {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![(root.clone(), None, false)];
+    let mut pages = Vec::new();
+    while let Some((reference, edge, expanded)) = pending.pop() {
+        if expanded {
+            pages.push(reference.digest);
+            continue;
+        }
+        if protected.contains(&reference.digest) || !seen.insert(reference.digest) {
+            continue;
+        }
+        match load(store, &reference, edge.as_ref(), None).await {
+            Ok((Page::Branch(children), _)) => {
+                pending.push((reference, None, true));
+                pending.extend(
+                    children
+                        .into_iter()
+                        .map(|edge| (edge.root.clone(), Some(edge), false)),
+                );
+            }
+            Ok((Page::Leaf(_), _)) => pages.push(reference.digest),
+            // A prior pass releases descendants before their parent.
+            Err(error) if error.category == AnomalyCategory::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(pages)
+}
+
 fn invalid(message: impl std::fmt::Display) -> Anomaly {
     Anomaly::fault("rtdb.format/cow-tree", message.to_string())
 }
@@ -643,12 +720,9 @@ mod tests {
     #[async_trait::async_trait]
     impl PageStore for Pages {
         async fn get(&self, digest: PageDigest, _: u64) -> Result<Bytes> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(&digest)
-                .cloned()
-                .ok_or_else(|| invalid("Page missing"))
+            self.0.lock().unwrap().get(&digest).cloned().ok_or_else(|| {
+                Anomaly::new(AnomalyCategory::NotFound, "test/missing", "Page missing")
+            })
         }
         async fn put(&self, digest: PageDigest, bytes: Bytes) -> Result<()> {
             self.0.lock().unwrap().insert(digest, bytes);
@@ -806,5 +880,51 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn retirement_skips_shared_pages_and_can_resume_after_a_leaf_is_released() {
+        let store = Pages::default();
+        let memory = MemoryBudget::new(16 << 20);
+        let (root, _) = apply_with_generation(
+            &store,
+            None,
+            (0..MAX_LEAF_ROWS + 1).map(put).collect(),
+            &NoSummary,
+            &memory,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let root = root.unwrap();
+        let (next, _) = apply_with_generation(
+            &store,
+            Some(&root),
+            vec![Edit::Put(Row {
+                key: key(0),
+                value: key(42),
+            })],
+            &NoSummary,
+            &memory,
+            Some(2),
+        )
+        .await
+        .unwrap();
+        let next = next.unwrap();
+        let held = reachable(&store, &next)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let order = retirement_order(&store, &root, &held).await.unwrap();
+        assert_eq!(order.len(), 2);
+        assert_eq!(*order.last().unwrap(), root.digest);
+        store.0.lock().unwrap().remove(&order[0]);
+        assert!(reachable(&store, &root).await.is_err());
+        assert_eq!(
+            retirement_order(&store, &root, &held).await.unwrap(),
+            [root.digest]
+        );
+        assert_eq!(reachable(&store, &next).await.unwrap().len(), 3);
     }
 }

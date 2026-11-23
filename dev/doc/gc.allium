@@ -346,6 +346,10 @@ rule GarbageCollectTries {
     -- Run one cycle: collect garbage from every table in the table catalog.
     -- The same cycle releases superseded logical search runs once the current checkpoint and all admitted readers have moved past their receipts and the collection lease has elapsed.
     -- Hosted release binds the provider publication to a catalog floor before acknowledgement.
+    -- Directory collection marks all pages reachable from the current root, retained checkpoints, and captured readers.
+    -- After its reader lease, a retired root can release its unmarked pages.
+    -- Hosted fork and archive holds continue to protect the pages in their checkpoint closures.
+    -- A replay checkpoint holds every page reached by each active entity directory.
     -- Tables are processed concurrently up to `tableParallelism`, with DELETE
     -- operations bounded across the cycle by `deleteParallelism`. Both bounds
     -- are out-of-spec implementation parameters (see TrieGarbageCollector.kt).

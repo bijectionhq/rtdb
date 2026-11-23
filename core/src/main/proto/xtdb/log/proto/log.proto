@@ -163,6 +163,21 @@ message ArtefactEntry {
     ArtefactRecord record = 2;
 }
 
+message EntityDirectoryRoot {
+    bytes root = 1;
+    int64 through_block = 2;
+    int64 source_rows = 3;
+    bool has_erases = 4;
+    bytes allocation = 5;
+    uint64 writer_fence = 6;
+    bytes erase_frontier_digest = 7;
+}
+
+message EntityDirectoryChange {
+    EntityDirectoryRoot root = 1;
+    bytes replaces_root = 2;
+}
+
 message SearchRun {
     string definition_id = 1;
     int64 definition_version = 2;
