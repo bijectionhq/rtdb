@@ -455,6 +455,69 @@ The workload also passed five temporal canaries.
 These runs establish correctness across the measured routes.
 The workload ran alongside the test suites, so its latencies are unsuitable for a controlled performance comparison.
 
+### Closure pass on RTDB main `d488486491`
+
+This pass re-traced the 28 ledger entries from the Rust entry points at `d488486491` and closed the routes below.
+It does not close the whole remaining-path table above, and the gaps it leaves are listed after the changes.
+
+| # | Change |
+| --- | --- |
+| 1, 6 | A list of unannotated numbers or nulls, including a dense union of them, derives its element type from the union legs and validity its elements select. It no longer reads a logical type per element. Element reads on an Arrow list index the child directly instead of walking the sequence. |
+| 1, 2 | The numeric list builder finds an existing leg by data type before it allocates a named field, so appending a component no longer allocates. |
+| 3, 7 | A cast of a packed numeric list, or of an Arrow list cell, to `REAL` or `DOUBLE PRECISION` elements converts the child array in one pass. Each component goes through binary64 and then to the target width, as the scalar cast does, and a component already at the target width is copied bit for bit. Casts to a nullable element type keep the union-remapping path. A list with no present component, and decimal, unsigned and non-float-union inputs, keep the element-wise cast. The cosine fallback over such a cast therefore scores a typed array. |
+| 15, 16 | A list-valued query parameter enters expression evaluation as its Arrow cell, as a column does. |
+| 13 | A canonical ADBC argument column of float vectors with no absent vector or component is gathered into source IPC from its Arrow buffers. It no longer goes through a per-cell rebuild, and it gathers the same values, schema and validity as that rebuild. |
+| 19 | A fixed-size vector result column already in its declared layout keeps its component buffer. An Arrow client result union of one data leg and nullable null legs conforms to the declared plain field by gathering that leg's cells. Event and transaction relayout keep their union. |
+| 25 | Evaluated vectors of one float width and list kind pack into a single Arrow column, whatever their row and component nulls. Previously they split into a run per nullability. |
+| 23 | Text rendering and its allocation bound read packed `Float32` and `Float64` lists from their buffers. |
+
+Re-tracing corrected one row of the remaining-path table.
+`open_bound` in `query/src/cursor.rs` opens every query through `build_ordered_columns`, `build_columns` or `build_column_pages`, and fails rather than falling back to rows.
+The row operator tree in `build_pages_at` (`JoinCursor`, row `Apply` and `Mark`, `WindowCursor`, `SortCursor`, the collected aggregate, and the per-row spill codec) is reached only through the leaf for system catalog and inspection scans, which carry no embeddings.
+That code is still present.
+
+#### Remaining gaps after the closure pass
+
+| # | Path | Site | What still happens |
+| --- | --- | --- | --- |
+| 1, 6 | Noncanonical list children: field metadata, non-float unions, decorated decimals | `expr/src/evaluate/reader.rs` `materialize`, `columnar/src/values.rs` `read_list` | One value per element. |
+| 2, 3 | `ARRAY[...]` with computed elements; casts to decimal, integer, text or temporal elements | `reader.rs` `ListReader::Expressions` and `ListReader::Cast` | Each element is evaluated and appended to the typed builder in turn. |
+| 5 | Equality and ordering of non-float lists | `expr/src/evaluate/reader/compare.rs`, `expr/src/compare.rs` | Per-element values. |
+| 9, 16–18 | Row operator tree | `query/src/operators.rs` `build_pages_at` | Unreachable for user tables, but not removed. |
+| 17 | `DISTINCT` and set operations where one key column lacks a direct hash | `query/src/set_keys.rs` `ArrowKey::read` | Decodes the whole row, including packed vectors. |
+| 6, 10 | Admission of ambiguous union layouts | `columnar/src/read_check.rs` | Reads every cell. |
+| 14 | Event assembly for run-end-encoded targets, absent cells under non-null targets, and invalid cells | `format/src/data.rs` `put_columns`, `maintenance/src/merge.rs` | Rebuilds the field from cells. |
+| 19 | Cursor output when relayout declines | `query/src/cursor.rs` `column_batch` | Copies cells. |
+| 11–13 | Static `PATCH` and timed `PUT` fallbacks, owned writes to non-root relations, Flight owned-write fallbacks, mutation per-row slices | `tx/src/submission.rs`, `tx/src/resolver.rs`, `flight-sql/src/owned_actions.rs`, `flight-sql/src/upload.rs` | Decode documents into packed values. |
+| 12 | Receipt legs and unmergeable layouts in source coalescing | `tx/src/source.rs` `canonical_document_struct` | Reads every cell twice. |
+| 13 | Argument chunks with nullable vectors, URI or keyword fields, or invalid union nulls | `tx/src/values/arguments.rs` | Rebuild from cells. |
+| 15, 20 | pgwire Bind | `pgwire/src/protocol.rs`, `types/src/pg.rs` | Builds a row of values. `float4[]` and `float8[]` parameter OIDs are unsupported. |
+| 21 | Transit COPY IN and JVM Transit binds and transactions | `format/src/transit.rs`, `ffi/src/lib.rs`, `ffi/src/transit.rs`, `pgwire/src/copy.rs` | Each float passes through a packed tree, a `TransitValue` and a `Value`. |
+| 15 | `EXECUTE`, `SHOW` and `SET` arguments, and the FFI argument row | `node/src/control.rs`, `ffi/src/statement.rs` | Value rows. |
+| 22 | PostgreSQL source numeric, temporal, UUID and JSON columns | `pg-source/src/decoder.rs` | Decode to values first. Float arrays and pgvector columns arrive as text. |
+| 22 | Kafka JSON and Avro arrays | `kafka/src/connect/converter.rs`, `kafka/src/connect/avro` | Convert per element. |
+| 23 | CLI file inspector, `EXPLAIN` literals, `ListValue` serialization | `server/src/inspect.rs`, `query/src/explain.rs`, `types/src/list_value.rs` | Per-component values. |
+| 25 | Fragment predicate constants other than numeric lists, and the legacy base64 reply | `query/src/fragment.rs`, `multi/src/control.rs`, `multi/src/agent.rs` | Travel in JSON. |
+
+Some of these gaps need a decision before the engineering work.
+Supporting `float4[]` and `float8[]` Bind parameters, and decoding PostgreSQL float arrays and pgvector into lists, changes externally visible types.
+Retiring JSON predicate constants and the base64 fragment reply changes a protocol that mixed-version deployments share.
+The Transit adapters are compatibility formats whose cache and tag semantics a direct Arrow builder would have to reproduce.
+
+#### Qualification of the closure pass
+
+The implementation commit `6c3e1f2905` sits on RTDB main `d488486491`.
+The types, columnar, expression, query and transaction crates passed 1,405 tests, including every regression the pass adds.
+The Rust workspace, excluding `rtdb-simulation`, passed 5,971 tests with 11 ignored and one failure.
+That failure, `ordered_owned_unique_groups_swaps_and_refuses_conflicts` in `crates/node/tests/native.rs`, expects a held unique lookup at a later valid instant to fail.
+Main commit `6121b7546c` removed that refusal from `OwnedReadSession::unique` without changing the test.
+`rtdb-simulation` does not compile on main `d488486491`, because commit `a3659e2a1a` added `timed_origin` to `ArchivedReplicaEntry` without updating its two initializers.
+Neither failure involves a file this pass changes.
+
+The release workload on the 100,000-vector GloVe fixture passed result-order and distance-bit checks for all 60 stationary and 20 churn query/filter cases, and five temporal canaries.
+Its p50 latencies stayed within a few percent of the candidate before this pass for every filter, as its measured routes do not use the casts and adapters this pass changes.
+The Gradle suites did not run, because this host has JDK 21 and 26 but not the JDK 25 toolchain the build requires.
+
 ### Pre-integration non-Arrow inventory at `fa969b755`
 
 This source audit covers RTDB vector search at `fa969b755`, from client input and primary storage through exact SQL, the experimental ANN workload, and result export.
