@@ -1516,7 +1516,8 @@ pub fn proposal_close_controls<'a>(controls: impl IntoIterator<Item = &'a Hosted
     checks > 0 && (3..=5).contains(&replacements) && (1..=2).contains(&inserts)
 }
 
-pub const MAX_PROPOSAL_LAND_ROWS: usize = 16;
+/// Physical ceiling for positioned assertions in a single hosted Root order.
+pub const MAX_PROPOSAL_LAND_ROWS: usize = 32;
 
 pub(crate) fn public_fact_frontier(id: &str) -> bool {
     let Some(encoded) = id.strip_prefix("public_fact_head:") else { return false; };
