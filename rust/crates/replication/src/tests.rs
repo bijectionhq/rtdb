@@ -752,6 +752,27 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
 }
 
 #[tokio::test]
+async fn retained_replay_requires_the_offload_even_when_readback_cached_it() {
+    let fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
+    let envelope = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(0)),
+        message: ReplicaBody::TriesDeleted(proto::TriesDeleted {
+            table_name: Some("public/docs".into()),
+            trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect(),
+        }),
+    };
+    fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
+    let record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
+    let record = fixture.logs.decode_replica(record).unwrap().unwrap();
+    let stored = record.envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap();
+    let cached = fixture.logs.resolve_oversized(record.clone()).await.unwrap();
+    assert!(matches!(cached.envelope.message, ReplicaBody::TriesDeleted(_)));
+    fixture.store.delete(&rtdb_storage::ObjectKey::new(stored).unwrap()).await.unwrap();
+    assert!(fixture.logs.resolve_oversized(record.clone()).await.is_ok());
+    assert_eq!(fixture.logs.resolve_oversized_fresh(record).await.unwrap_err().code, "rtdb.storage/missing-object");
+}
+
+#[tokio::test]
 async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefixes() {
     let config = ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() };
     let mut leader = fixture(config.clone(), 1 << 27).await;

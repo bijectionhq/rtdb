@@ -28,6 +28,10 @@ impl AdmittedReplica {
     pub(crate) async fn resolve_payload(self, logs: &PartitionLogs) -> Result<Self> {
         Ok(Self(logs.resolve_oversized(self.0).await?))
     }
+
+    pub(crate) async fn resolve_payload_fresh(self, logs: &PartitionLogs) -> Result<Self> {
+        Ok(Self(logs.resolve_oversized_fresh(self.0).await?))
+    }
 }
 
 impl std::ops::Deref for AdmittedReplica {

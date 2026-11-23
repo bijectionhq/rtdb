@@ -176,9 +176,22 @@ impl PartitionLogs {
     pub async fn resolve_oversized(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let lease = self.cache.get(&ObjectKey::new(key)?).await?;
-        let reservation = self.memory.reserve(replica_decode_bound(lease.as_slice().len())?)?;
-        let envelope = record.envelope.unwrap_payload(lease.as_slice())?;
-        let fingerprint = record.fingerprint.map(|_| fingerprint(lease.as_slice()));
+        self.decode_oversized(record, lease.as_slice())
+    }
+
+    pub(crate) async fn resolve_oversized_fresh(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+        let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
+        let key = ObjectKey::new(key)?;
+        let length = usize::try_from(self.store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
+        let _payload = self.memory.reserve(length)?;
+        let payload = self.store.get_fresh_exact(&key, length).await?;
+        self.decode_oversized(record, &payload)
+    }
+
+    fn decode_oversized(&self, record: ReplicaRecord, payload: &[u8]) -> Result<ReplicaRecord> {
+        let reservation = self.memory.reserve(replica_decode_bound(payload.len())?)?;
+        let envelope = record.envelope.unwrap_payload(payload)?;
+        let fingerprint = record.fingerprint.map(|_| fingerprint(payload));
         Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint })
     }
 }

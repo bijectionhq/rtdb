@@ -5345,6 +5345,80 @@ async fn rebuilding_a_missing_ordered_root_preserves_the_incremental_manifest() 
 }
 
 #[tokio::test]
+async fn ordered_index_rebuilds_missing_l0_from_a_reopened_journal_without_resurrecting_erased_keys() {
+    use rtdb_format::keys::TrieKey;
+    use rtdb_storage::ObjectKey;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = options();
+    config.automatic_artefacts = false;
+    config.membership = Membership::Durable { primary: local_database(directory.path()), skipped: BTreeSet::new() };
+    let mut template = services();
+    let observer = Arc::new(OrderedIndexReads::default());
+    template.scan_accelerators.push(observer.clone());
+    let (node, driver) = running(config.clone(), fresh_local_services(&template)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    index_sql(&mut session, "CREATE INDEX orders_key ON orders (customer, _id)").await;
+    let original = index_sql(&mut session, "INSERT INTO orders RECORDS {_id: 1, customer: 'removed-secret'}, {_id: 2, customer: 'retained'}").await;
+    index_flush(&node, &database).await;
+    let table = TableRef::new("public", "orders");
+    let old_l0 = {
+        let snapshot = database.snapshot();
+        let trie = TrieKey::l0(snapshot.trie_catalog().l0_max_block_index(&table)).unwrap();
+        ObjectKey::new(snapshot.table_entry(&table).unwrap().slug.data_key(&trie)).unwrap()
+    };
+    let erase = ["INSERT INTO orders RECORDS {_id: 1, customer: 'removed-in-revision'}",
+        "ERASE FROM orders WHERE _id = 1",
+        "INSERT INTO orders RECORDS {_id: 1, customer: 'z-reinserted'}"];
+    let result = session.state_mut().execute_tx(
+        erase.into_iter().map(|sql| TxOp::Sql { sql: sql.into(), args: None }).collect(),
+        AutonomousTxOptions::default(),
+    ).await.unwrap();
+    assert!(result.committed());
+    index_flush(&node, &database).await;
+    database.build_artefacts().await.unwrap();
+    let prefix = ObjectKey::new("ordered-index/v2").unwrap();
+    let baseline = {
+        let store = database.object_store();
+        let mut baseline = BTreeMap::new();
+        for object in store.list(Some(&prefix)).await.unwrap() {
+            baseline.insert(object.key.clone(), store.get(&object.key).await.unwrap());
+            store.delete(&object.key).await.unwrap();
+        }
+        assert!(baseline.keys().any(|key| key.as_str().contains("/manifests/")));
+        baseline
+    };
+    drop(session);
+    drop(database);
+    stop(&node, driver).await;
+    drop(node);
+
+    let (node, driver) = running(config, fresh_local_services(&template)).await;
+    node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let store = database.object_store();
+    store.delete(&old_l0).await.unwrap();
+    database.build_artefacts().await.unwrap();
+    let mut rebuilt = BTreeMap::new();
+    for object in store.list(Some(&prefix)).await.unwrap() {
+        rebuilt.insert(object.key.clone(), store.get(&object.key).await.unwrap());
+    }
+    assert_eq!(rebuilt, baseline);
+    assert!(matches!(store.head(&old_l0).await, Err(rtdb_storage::Error::MissingObject(_))));
+
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    observer.take();
+    let current = "SELECT _id FROM orders WHERE customer >= 'a' ORDER BY customer, _id LIMIT 2";
+    assert_eq!(rows(session.query_sql(current, vec![]).await.unwrap()).await, [vec![Value::I64(2)], vec![Value::I64(1)]]);
+    let historical = "SELECT _id FROM orders FOR SYSTEM_TIME AS OF ? WHERE customer >= 'a' ORDER BY customer, _id LIMIT 2";
+    let at = Value::Timestamp { value: original.0, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    assert_eq!(rows(session.query_sql(historical, vec![at]).await.unwrap()).await, [vec![Value::I64(2)]]);
+    assert!(observer.take().is_empty());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn ordered_coverage_uses_only_adopted_l0_files() {
     let mut config = options();
     config.automatic_artefacts = false;

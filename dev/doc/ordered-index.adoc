@@ -73,10 +73,14 @@ A read failure after it opens terminates the stream at its captured basis.
 
 The index worker packs its own immutable pages and publishes a checkpoint after its pages and revision directory are durable.
 It checks coverage against the table catalog's durable event count before publication.
-Each flushed input comes from the captured catalog's adopted L0 inventory and must match its recorded byte length.
+Each flushed file input comes from the captured catalog's adopted L0 inventory and must match its recorded byte length.
 Queries can use a complete checkpoint plus replay from the captured table events, and a reopened node can use the same files.
 Table compaction changes neither the logical roots nor the index's publication schedule.
 A damaged checkpoint can be rebuilt from retained level-zero events.
+If a source data object is missing, native local maintenance can rebuild from its synchronized epoch-zero journal from genesis through the captured checkpoint.
+The rebuild requires the exact checkpoint boundary, an unbroken block sequence, and the adopted event count for every nonempty table block.
+It reuses the flush page layout and reads the captured prefix twice, once for erase cuts and once to project the surviving events.
+The fallback requires any offloaded replica payloads in the interval and supports journals that can replay without an external source or placed lifetime authority.
 A rebuild determines the latest captured erase for each IID before it writes pages.
 It projects events from the erase onward, preserving the operation order at the erase revision.
 A maintenance cycle that incorporates an erase removes the affected IID from older roots and collects unreachable pages and manifests.
