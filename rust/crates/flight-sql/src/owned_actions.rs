@@ -201,6 +201,7 @@ pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdent
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
+pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
@@ -1475,6 +1476,18 @@ impl Service {
         let reply = self.owned_point_reply(&schema, None, at, at, None)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_row_carrier_exists_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        self.hosted_control_policy(call)?;
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Protected row existence needs its held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let present = held.snapshot.protected_row_carrier_exists(&relation, &id, scope).await.map_err(status)?;
+        Ok(ActionResult { body: wire::retain(vec![u8::from(present)], call.reserve(64)?) })
     }
 
     pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

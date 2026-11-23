@@ -19,6 +19,31 @@ pub struct OwnedIdentityPage {
 }
 
 impl OwnedReadSession {
+    /// Observe existence over the complete valid extent without opening ciphertext.
+    pub async fn protected_row_carrier_exists(
+        &self, relation: &OwnedRelation, id: &EntityId, scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<bool> {
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        if self.witness_scope != Some(scope) || !is_protected_row_carrier(relation, id) {
+            return Err(protected_page_unavailable());
+        }
+        let context = self.relation_context(relation)?;
+        let mut present = false;
+        if let Some(mut rows) = rtdb_query::open_owned_point(
+            context, &self.owner, relation, id, Some(rtdb_types::Interval::ALL), Some(&["_id"]),
+        ).await? {
+            while let Some(batch) = rows.next_batch().await? {
+                if batch.batch().num_rows() != 0 {
+                    present = true;
+                    break;
+                }
+            }
+        }
+        self.check_live_point_relation(relation)?;
+        Ok(present)
+    }
+
     /// Give the installed hosted projector a bounded page of ciphertext
     /// carrier identities and a witness only on completion of its prefix.
     pub async fn protected_carrier_page(
@@ -214,6 +239,23 @@ fn invalid_page() -> Anomaly {
 fn lower_hex(text: &str) -> bool {
     text.bytes()
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_protected_row_carrier(relation: &OwnedRelation, id: &EntityId) -> bool {
+    relation.name() == "fact_unit_column_payloads"
+        && matches!(id, EntityId::String(id) if id.starts_with("row/") && id.len() > 4)
+}
+
+#[cfg(test)]
+#[test]
+fn held_carrier_existence_has_only_the_row_payload_target() -> Result<()> {
+    let payloads = OwnedRelation::new("fact_unit_column_payloads")?;
+    let row = EntityId::String("row/opaque".to_owned());
+    assert!(is_protected_row_carrier(&payloads, &row));
+    assert!(!is_protected_row_carrier(&payloads, &EntityId::String("row/".to_owned())));
+    assert!(!is_protected_row_carrier(&payloads, &EntityId::String("column/opaque".to_owned())));
+    assert!(!is_protected_row_carrier(&OwnedRelation::new("fact_unit_fences")?, &row));
+    Ok(())
 }
 
 fn valid_carrier_prefix(prefix: &str) -> bool {
