@@ -105,6 +105,10 @@ impl WorldReadmission {
             (Some(old), Some(relocated))
                 if relocated.original == old.basis
                     && old.basis.system_time <= self.source_cut
+                    && (old.system == old.basis.system_time)
+                        == (relocated.retained.system == relocated.retained.basis.system_time)
+                    && relocated.retained.system > self.basis.system_time
+                    && relocated.retained.system <= relocated.retained.basis.system_time
                     && relocated.retained.world == old.world
                     && relocated.retained.pin == old.pin
                     && relocated.retained.logical == old.logical
@@ -248,6 +252,7 @@ mod tests {
             suffix: [5; 16],
             manifest: "a".repeat(43),
             basis: position(2, 20),
+            system: Timestamp(20),
             source_root: position(1, 10),
             logical: Timestamp(17),
         };
@@ -267,6 +272,7 @@ mod tests {
         };
         let mut retained = original.clone();
         retained.basis = position(102, 120);
+        retained.system = Timestamp(120);
         let mut admission = WorldReadmission {
             binding: [9; 32],
             world: world.id.0,

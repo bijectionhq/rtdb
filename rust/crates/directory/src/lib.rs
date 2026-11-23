@@ -583,6 +583,7 @@ pub struct CheckpointWorldAncestor {
     pub suffix: uuid::Uuid,
     pub manifest_sha256: String,
     pub basis: rtdb_types::TransactionKey,
+    pub system: rtdb_types::Timestamp,
     pub source_root: rtdb_types::TransactionKey,
     pub logical: rtdb_types::Timestamp,
 }

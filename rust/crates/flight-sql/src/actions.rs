@@ -101,7 +101,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
-                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V2 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
+                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V3 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
@@ -132,7 +132,7 @@ impl Service {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V1 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
+                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V2 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
                 crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::PUBLISH_WORLD_CUT_V2 => {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])

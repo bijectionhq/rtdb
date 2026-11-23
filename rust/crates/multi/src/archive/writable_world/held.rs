@@ -233,7 +233,7 @@ enum AncestorRead {
 enum AncestorResult {
     Point(Option<WorldFact>, bool),
     Changes(rtdb_node::OwnedMergedChanges),
-    Clock(Timestamp),
+    Clock(rtdb_query::ArchivedHeldClock),
     SelectedClock(Option<(Timestamp, Timestamp)>),
     PathTouch([(Option<WorldFact>, bool); 2]),
     Version(Timestamp, Vec<(Interval, WorldFact, bool)>),
@@ -271,21 +271,23 @@ impl HeldCheckpointWorld {
         &self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> Result<rtdb_node::OwnedForkCut> {
         self.check()?;
-        let cut = self.open.snapshot.fork_overlay_cut(scope, &self.open.record, system).await?;
-        if let Some(ancestor) = &self.open.record.ancestor {
+        let archived = if self.open.record.ancestor.is_some() {
             let relations = self.open.record.schemas.relations().map(|(name, _)| OwnedRelation::new(name))
                 .collect::<Result<Vec<_>>>()?;
-            if self.preflight_accepted_scope(&relations, system).await? != ancestor.logical {
-                return Err(OwnedWorld::unavailable());
-            }
-        }
+            Some(self.archived_accepted_clock(&relations, system).await?)
+        } else {
+            None
+        };
+        let cut = self.open.snapshot.fork_overlay_cut(
+            scope, &self.open.record, system, archived.as_ref(),
+        ).await?;
         self.check()?;
         Ok(cut)
     }
 
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
-    pub fn ancestor(&self) -> Option<(Iid, TransactionKey)> {
-        self.open.record.ancestor.as_ref().map(|ancestor| (Iid(ancestor.world), ancestor.basis))
+    pub fn ancestor(&self) -> Option<(Iid, Timestamp)> {
+        self.open.record.ancestor.as_ref().map(|ancestor| (Iid(ancestor.world), ancestor.system))
     }
     pub fn parent_pin(&self) -> Iid { self.open.record.pin }
     pub fn until(&self) -> Timestamp { self.open.retained.until }
@@ -422,20 +424,29 @@ impl HeldCheckpointWorld {
 
     pub async fn preflight_accepted_scope(&self, relations: &[OwnedRelation], system: Timestamp) -> Result<Timestamp> {
         self.check()?;
-        if self.ancestor().is_some() {
-            let mut clock = None;
-            for relation in relations {
-                let (result, _) = self.read_ancestor(relation, AncestorRead::Clock(system)).await?;
-                let AncestorResult::Clock(reading) = result else { return Err(OwnedWorld::unavailable()); };
-                if clock.replace(reading).is_some_and(|previous| previous != reading) {
-                    return Err(OwnedWorld::unavailable());
-                }
-            }
-            return clock.ok_or_else(OwnedWorld::unavailable);
+        if let Some(ancestor) = &self.open.record.ancestor {
+            return self.archived_accepted_clock(relations, system).await?.reading(ancestor, system);
         }
         let clock = self.open.snapshot.certify_world_accepted_scope(&self.open.record, relations, system).await?;
         self.require_accepted_archive_scope(relations).await?;
         Ok(clock)
+    }
+
+    async fn archived_accepted_clock(
+        &self, relations: &[OwnedRelation], system: Timestamp,
+    ) -> Result<rtdb_query::ArchivedHeldClock> {
+        let unavailable = OwnedWorld::unavailable;
+        let ancestor = self.open.record.ancestor.as_ref().ok_or_else(unavailable)?;
+        let mut certified = None;
+        for relation in relations {
+            let (result, _) = self.read_ancestor(relation, AncestorRead::Clock(system)).await?;
+            let AncestorResult::Clock(clock) = result else { return Err(unavailable()); };
+            let reading = clock.reading(ancestor, system)?;
+            if certified.replace((clock, reading)).is_some_and(|(_, previous)| previous != reading) {
+                return Err(unavailable());
+            }
+        }
+        certified.map(|(clock, _)| clock).ok_or_else(unavailable)
     }
 
     pub async fn select_accepted_scope(&self, relations: &[OwnedRelation], requested: Timestamp)
@@ -600,7 +611,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, selected: Timestamp, after: Timestamp,
         through: Timestamp, limit: usize, reverse: bool,
     ) -> Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)> {
-        if self.ancestor().is_none_or(|(_, cap)| cap.system_time != selected) {
+        if self.ancestor().is_none_or(|(_, cap)| cap != selected) {
             return Err(OwnedWorld::unavailable());
         }
         let (result, witness) = self.read_ancestor(
@@ -1529,12 +1540,17 @@ impl<'a> InheritedRelation<'a> {
         let world = Iid(*ancestor.world.as_bytes());
         let (record, _charge) = rtdb_query::read_owned_world(Arc::clone(&overlay), owner, world)
             .await?.ok_or_else(unavailable)?;
+        let overlay = if ancestor.system == ancestor.basis.system_time {
+            overlay
+        } else {
+            overlay.with_owned_system_cut(ancestor.system, &overlay.cancellation)?
+        };
         let clock = rtdb_query::read_owned_world_clock_revision(Arc::clone(&overlay), owner, world).await?;
         let root_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&root), owner, relation).await?;
         if record.dropped || record.ancestor.is_some() || record.pin.0 != *ancestor.pin.as_bytes()
             || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
             || record.basis != ancestor.source_root || ancestor.source_root.system_time > root.current_time.as_micros()?
-            || clock != Some((ancestor.logical, ancestor.basis.system_time))
+            || clock != Some((ancestor.logical, ancestor.system))
             || !root_schema.is_some_and(|(actual, _)| &actual == schema)
         {
             return Err(unavailable());
@@ -1542,7 +1558,7 @@ impl<'a> InheritedRelation<'a> {
         let shadow = relation.in_world(world)?;
         Ok(Self {
             root, overlay, owner, relation, shadow, world, initial_clock: record.initial_clock(),
-            overlay_basis: ancestor.basis.system_time, schema, memory,
+            overlay_basis: ancestor.system, schema, memory,
         })
     }
 
@@ -2049,7 +2065,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                 let overlay = overlay.with_owned_read_guard(Arc::clone(&guard));
                                                 let (owner, relation, schema) = (&owner, &relation, &schema);
                                                 async move {
-                                                    let inherited = InheritedRelation::open(root, overlay, owner, relation, ancestor, schema, memory)
+                                                    let inherited = InheritedRelation::open(root, Arc::clone(&overlay), owner, relation, ancestor, schema, memory)
                                                         .await?.at(selected).await?;
                                                     match read {
                                                         AncestorRead::Point { id, valid } => {
@@ -2064,7 +2080,10 @@ pub(crate) async fn open_held_checkpoint_world(
                                                         },
                                                         AncestorRead::Clock(group) => {
                                                             inherited.changes(group, group, 1, false).await?;
-                                                            Ok(AncestorResult::Clock(inherited.accepted_group(group).await?.1))
+                                                            let clock = rtdb_query::read_archived_held_clock(
+                                                                &overlay, owner, inherited.world, group,
+                                                            ).await?;
+                                                            Ok(AncestorResult::Clock(clock))
                                                         },
                                                         AncestorRead::SelectClock(requested) =>
                                                             Ok(AncestorResult::SelectedClock(inherited.select_clock(requested).await?)),
