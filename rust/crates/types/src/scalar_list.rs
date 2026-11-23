@@ -121,7 +121,7 @@ impl ScalarList {
         let tag = union.type_id(index);
         let offset = union.value_offset(index);
         let (_, field) = fields.iter().find(|(id, _)| *id == tag).expect("validated union tag");
-        (field, union.child(tag).as_ref(), offset)
+        (field.as_ref(), union.child(tag).as_ref(), offset)
     }
 
     pub(crate) fn utf8(&self, index: usize) -> Option<&str> {

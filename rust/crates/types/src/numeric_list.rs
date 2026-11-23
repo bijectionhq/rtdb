@@ -326,7 +326,7 @@ fn numeric_position<'a>(mut field: &'a Field, mut array: &'a dyn Array, mut inde
                 let union = array.as_union();
                 let id = union.type_id(index);
                 let (_, field) = fields.iter().find(|(tag, _)| *tag == id).expect("validated numeric union tag");
-                (field, union.child(id).as_ref(), union.value_offset(index))
+                (field.as_ref(), union.child(id).as_ref(), union.value_offset(index))
             }
             DataType::RunEndEncoded(ends, child) => {
                 macro_rules! run {
