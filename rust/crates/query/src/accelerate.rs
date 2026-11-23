@@ -20,6 +20,7 @@ pub trait ConstantEvaluator: Send + Sync {
 }
 
 /// What an accelerator sees of one partition's scan before it opens.
+#[derive(Clone, Copy)]
 pub struct ScanRequest<'a> {
     pub database: &'a str,
     pub scan: &'a Scan,
@@ -50,157 +51,51 @@ impl ScanRequest<'_> {
     pub fn ranked_id_is_uuid(&self, id: ColumnId) -> bool {
         let uuid = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uuid);
         self.scan.columns.iter().any(|field| field.id == id && field.name == "_id" && field.data_type == uuid)
+            && crate::scan::stores_uuid_ids(&self.scan.table.name.table, self.partitions)
     }
 
     pub fn permits_ranked_uuid_id(&self, id: ColumnId) -> bool {
         let table = &self.scan.table.name.table;
         !table.is_owned_event_data()
             && self.ranked_id_is_uuid(id)
-            && crate::scan::stores_uuid_ids(table, self.partitions)
             && self.snapshot.live_has_canonical_entity_iids(table)
+    }
+
+    pub fn ranked_id_is_integer(&self, id: ColumnId) -> bool {
+        use rtdb_types::{LogicalType, ScalarType};
+        let integer = |data_type: &LogicalType| {
+            data_type.legs().iter().all(|leg| matches!(leg, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)))
+        };
+        self.scan.columns.iter().any(|field| field.id == id && field.name == "_id" && integer(&field.data_type))
+            && self.partitions.iter().all(|snapshot| snapshot.column_types_for(&self.scan.table.name.table, ["_id".into()]).get("_id")
+                .is_none_or(|data_type| *data_type == LogicalType::Nothing || integer(data_type)))
+    }
+
+    #[doc(hidden)]
+    pub async fn ranked_selection(&self, rows: Vec<crate::VerifiedRankRow>) -> Result<Option<ScanSelection>> {
+        let scores = rows.iter().map(|winner| (winner.row.version.iid, winner.key.score)).collect();
+        let Some(scores) = CandidateScores::from_verified(scores, self.memory)? else { return Ok(None); };
+        let iids = CandidateIids::build(scores.iids.len(), scores.iter().map(|(iid, _)| iid), self.memory)?;
+        let rows = match self.verifier.gather_ranked(rows.into_iter().map(|winner| winner.row).collect()).await {
+            Ok(rows) => rows,
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => BTreeMap::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(ScanSelection { iids, scores: Some(scores.with_rows(rows)) }))
     }
 }
 
 #[async_trait]
 pub trait CandidateVerifier: Send + Sync {
-    fn permits_search_witness(&self) -> bool { false }
-
-    fn partition_ranking(&self) -> Option<&PartitionRanking> { None }
-
     /// Resolves the scan, applies its predicates, and scores each surviving UTF-8 cell.
     async fn score_visible(&self, iids: BTreeSet<Iid>, column: ColumnId, ascending_id: Option<ColumnId>, scorer: &rtdb_text::Scorer) -> Result<CandidateScores>;
 
-    async fn score_resolved(&self, _rows: Vec<ResolvedSearchRow>, _column: ColumnId, _ascending_id: Option<ColumnId>,
-        _scorer: &rtdb_text::Scorer) -> Result<Option<CandidateScores>> { Ok(None) }
-}
+    /// Uses the pinned row locations when available and resolves the IIDs in primary history otherwise.
+    async fn verify_ranked(&self, _iids: &BTreeSet<Iid>, _rows: Option<Vec<ResolvedSearchRow>>, _column: ColumnId, _ascending_id: Option<ColumnId>,
+        _scorer: &rtdb_text::Scorer) -> Result<Option<Vec<crate::VerifiedRankRow>>> { Ok(None) }
 
-pub struct PartitionRanking {
-    winners: parking_lot::Mutex<PartitionWinners>,
-    work: parking_lot::Mutex<RankWorkState>,
-    ready: tokio::sync::Notify,
-    memory: Arc<MemoryBudget>,
-}
-
-#[derive(Default)]
-struct RankWorkState {
-    waiting: BTreeMap<usize, f64>,
-    in_flight: BTreeSet<usize>,
-}
-
-pub struct PartitionRankWork<'a> {
-    ranking: &'a PartitionRanking,
-    partition: usize,
-    _charge: Arc<MemoryReservation>,
-}
-
-pub struct RankWorkPermit<'a> {
-    ranking: &'a PartitionRanking,
-    partition: usize,
-}
-
-impl PartitionRankWork<'_> {
-    pub async fn acquire(&self, bound: f64, cancellation: &CancellationToken) -> Result<RankWorkPermit<'_>> {
-        const MAX_IN_FLIGHT: usize = 4;
-        self.ranking.work.lock().waiting.insert(self.partition, bound);
-        loop {
-            if cancellation.is_cancelled() {
-                self.ranking.work.lock().waiting.remove(&self.partition);
-                self.ranking.ready.notify_waiters();
-                return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Interrupted,
-                    "rtdb.query/cancelled", "Ranked work cancelled during admission"));
-            }
-            let notified = self.ranking.ready.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
-                let mut work = self.ranking.work.lock();
-                let best = work.waiting.iter().max_by(|(a_id, a), (b_id, b)| a.total_cmp(b).then_with(|| b_id.cmp(a_id)));
-                if work.in_flight.len() < MAX_IN_FLIGHT && best.is_some_and(|(&partition, _)| partition == self.partition) {
-                    work.waiting.remove(&self.partition);
-                    work.in_flight.insert(self.partition);
-                    self.ranking.ready.notify_waiters();
-                    return Ok(RankWorkPermit { ranking: self.ranking, partition: self.partition });
-                }
-            }
-            cancellation.run_until_cancelled(notified).await;
-        }
-    }
-}
-
-impl Drop for RankWorkPermit<'_> {
-    fn drop(&mut self) {
-        self.ranking.work.lock().in_flight.remove(&self.partition);
-        self.ranking.ready.notify_waiters();
-    }
-}
-
-impl Drop for PartitionRankWork<'_> {
-    fn drop(&mut self) {
-        let mut work = self.ranking.work.lock();
-        work.waiting.remove(&self.partition);
-        self.ranking.ready.notify_waiters();
-    }
-}
-
-#[derive(Default)]
-struct PartitionWinners {
-    keys: BTreeSet<ScoredIid>,
-    scores: BTreeMap<Iid, f64>,
-    charge: Option<Arc<MemoryReservation>>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-struct ScoredIid { iid: Iid, score: f64 }
-
-impl Eq for ScoredIid {}
-impl PartialOrd for ScoredIid {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
-}
-impl Ord for ScoredIid {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score.total_cmp(&other.score).then_with(|| self.iid.cmp(&other.iid))
-    }
-}
-
-impl PartitionRanking {
-    pub(crate) fn new(memory: Arc<MemoryBudget>) -> Self { Self { winners: Default::default(), work: Default::default(), ready: Default::default(), memory } }
-
-    pub fn register(&self, partition: &Snapshot) -> Option<PartitionRankWork<'_>> {
-        let charge = self.memory.reserve(256).ok()?;
-        let partition = std::ptr::from_ref(partition) as usize;
-        Some(PartitionRankWork { ranking: self, partition, _charge: charge })
-    }
-
-    /// Only the verifier's scores of resolved, predicate-checked rows enter the cutoff that every partition prunes on.
-    pub fn add_verified(&self, limit: usize, scores: &CandidateScores) { self.admit(limit, scores.iter()); }
-
-    fn admit(&self, limit: usize, rows: impl IntoIterator<Item = (Iid, f64)>) {
-        if !(1..=4096).contains(&limit) { return; }
-        let mut winners = self.winners.lock();
-        if winners.charge.is_none() {
-            let Ok(charge) = self.memory.reserve(256 + limit * 160) else { return; };
-            winners.charge = Some(charge);
-        }
-        for (iid, score) in rows {
-            if !score.is_finite() { continue; }
-            let score = if score == 0.0 { 0.0 } else { score };
-            if let Some(&previous) = winners.scores.get(&iid) {
-                if previous >= score { continue; }
-                winners.keys.remove(&ScoredIid { iid, score: previous });
-            }
-            winners.scores.insert(iid, score);
-            winners.keys.insert(ScoredIid { iid, score });
-            if winners.keys.len() > limit {
-                let removed = winners.keys.pop_first().expect("ranking exceeded its limit");
-                winners.scores.remove(&removed.iid);
-            }
-        }
-    }
-
-    pub fn cutoff(&self, limit: usize) -> Option<f64> {
-        let winners = self.winners.lock();
-        (winners.keys.len() == limit).then(|| winners.keys.first().map(|key| key.score)).flatten()
-    }
+    /// Gathers the scan's output columns from verified versions after ranking.
+    async fn gather_ranked(&self, _rows: Vec<ResolvedSearchRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
 }
 
 #[derive(Clone)]
@@ -404,6 +299,9 @@ pub trait OrderedBatches: Send {
 #[async_trait]
 pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
+    /// Supplies exact ranking work for a point scan at the given cut.
+    async fn rank_source<'a>(&'a self, _request: ScanRequest<'a>) -> Result<Option<Box<dyn crate::RankSource + 'a>>> { Ok(None) }
+
     /// Resolves complete, pinned histories for an explicit set of entities.
     async fn point_rows(&self, _request: &ScanRequest<'_>, _iids: &BTreeSet<Iid>) -> Result<Option<Vec<ResolvedSearchRow>>> { Ok(None) }
     /// Optionally supplies the scores of a ranked point scan alongside its candidate scope.
@@ -450,53 +348,4 @@ impl ConstantEvaluator for ExecutionConstants<'_> {
         let scope = self.0.scope()?;
         Ok(Some(self.0.evaluate(&scope, expression, &Schema::default(), &[]).await?))
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_shared_cutoff_counts_distinct_finite_winners_from_each_partition() {
-        let ranking = PartitionRanking::new(MemoryBudget::new(4096));
-        let (first, second, third) = (Iid([1; 16]), Iid([2; 16]), Iid([3; 16]));
-        ranking.admit(2, [(first, 3.0), (first, 4.0), (second, f64::NAN)]);
-        assert_eq!(ranking.cutoff(2), None);
-        ranking.admit(2, [(second, -0.0)]);
-        assert_eq!(ranking.cutoff(2).unwrap().to_bits(), 0.0f64.to_bits());
-        ranking.admit(2, [(third, 5.0), (first, 2.0)]);
-        assert_eq!(ranking.cutoff(2), Some(4.0));
-    }
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn a_free_rank_slot_admits_the_highest_waiting_bound_and_cancelled_work_releases_priority() {
-    use std::task::Poll;
-
-    let memory = MemoryBudget::new(1 << 20);
-    let ranking = PartitionRanking::new(Arc::clone(&memory));
-    let workers: Vec<_> = (0..7).map(|partition| PartitionRankWork {
-        ranking: &ranking, partition, _charge: memory.reserve(256).unwrap(),
-    }).collect();
-    let stop = CancellationToken::new();
-    let mut permits = Vec::new();
-    for worker in &workers[..4] { permits.push(worker.acquire(1.0, &stop).await.unwrap()); }
-
-    let cancelled = CancellationToken::new();
-    let mut low = std::pin::pin!(workers[4].acquire(2.0, &stop));
-    let mut high = std::pin::pin!(workers[5].acquire(4.0, &stop));
-    let mut interrupted = std::pin::pin!(workers[6].acquire(f64::INFINITY, &cancelled));
-    assert!(futures::poll!(&mut low).is_pending());
-    assert!(futures::poll!(&mut high).is_pending());
-    assert!(futures::poll!(&mut interrupted).is_pending());
-    drop(permits.pop());
-    assert!(futures::poll!(&mut high).is_pending());
-    cancelled.cancel();
-    assert!(matches!(futures::poll!(&mut interrupted), Poll::Ready(Err(_))));
-    assert!(futures::poll!(&mut low).is_pending());
-    let permit = high.await.unwrap();
-    assert!(futures::poll!(&mut low).is_pending());
-    drop(permit);
-    assert!(low.await.is_ok());
 }

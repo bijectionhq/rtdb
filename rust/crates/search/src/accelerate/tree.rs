@@ -1,11 +1,9 @@
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::sync::OnceLock;
 
 use rtdb_format::keys::TrieKey;
 use rtdb_format::{log::proto::{SearchRun, TermDirectoryRoot}, term_directory};
 use rtdb_plan::ColumnId;
 use rtdb_query::ObjectPageStore;
+use rtdb_query::{RankOutcome, RankSource, RankWork};
 use rtdb_text::{RankScorer, Scorer};
 use tokio::sync::OnceCell;
 
@@ -53,7 +51,6 @@ impl RecordedTree {
     }
 }
 
-struct Nomination { iid: Iid, source: Option<usize>, witness: Option<SearchWitness>, visibility: Vec<[i64; 4]> }
 enum Task {
     Open(usize),
     Expand(usize),
@@ -62,8 +59,18 @@ enum Task {
     ExpandLogical(usize),
     Legacy(usize),
     Live(usize, Arc<crate::runtime::LivePostingPage>),
-    Verify(Nomination),
-    VerifyBatch(BinaryHeap<Entry>),
+    LiveSuffix(usize, u32),
+    Verify(Vec<Nomination>),
+}
+
+struct Nomination {
+    key: RankKey,
+    iid: Iid,
+    witness: Option<SearchWitness>,
+}
+
+impl Nomination {
+    fn unknown(iid: Iid) -> Self { Self { key: RankKey::unknown(), iid, witness: None } }
 }
 
 pub(super) struct LogicalCoverage<'a> {
@@ -135,68 +142,21 @@ impl LogicalCoverage<'_> {
     }
 }
 
-fn gap_task(frontier: &mut Frontier) {
-    if !frontier.ready.iter().any(|entry| matches!(entry.task, Task::Gap)) {
-        frontier.push(RankKey::integer(f64::INFINITY, None), Task::Gap);
-    }
-}
-
-fn run_can_match(run: &SearchRun, field: usize, query: &Query) -> bool {
+fn run_can_match(run: &rtdb_format::log::proto::SearchRun, field: usize, query: &Query) -> bool {
     let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode_route)
         .filter(|locator| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64);
     locator.is_none_or(|locator| query.terms().iter().all(|term| locator.might_contain(field as u32, term)))
 }
-
-fn seed_logical<'a>(runs: impl Iterator<Item = (usize, &'a SearchRun)>, directory: Option<&TermRoutes>) -> Vec<(RankKey, usize)> {
+fn seed_logical<'a>(runs: impl Iterator<Item = (usize, &'a rtdb_format::log::proto::SearchRun)>,
+    directory: Option<&TermRoutes>) -> Vec<(RankKey, usize)> {
     match directory {
         Some(directory) => directory.iter().map(|(index, bound)| (RankKey::integer(bound, None), index)).collect(),
-        None => runs.map(|(index, _)| (RankKey::integer(f64::INFINITY, None), index)).collect(),
+        None => runs.map(|(index, _)| (RankKey::unknown(), index)).collect(),
     }
-}
-struct Entry { key: RankKey, sequence: u64, task: Task }
-
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.compare(other.key).then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-impl PartialOrd for Entry { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-impl PartialEq for Entry { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
-impl Eq for Entry {}
-
-#[derive(Default)]
-struct Frontier { ready: BinaryHeap<Entry>, next: u64 }
-
-impl Frontier {
-    fn push(&mut self, key: RankKey, task: Task) {
-        self.next += 1;
-        self.ready.push(Entry { key, sequence: self.next, task });
-    }
-
-    fn nominate_batch(&mut self, nominations: impl IntoIterator<Item = (RankKey, Nomination)>) {
-        let pending: BinaryHeap<_> = nominations.into_iter().map(|(key, nomination)| {
-            self.next += 1;
-            Entry { key, sequence: self.next, task: Task::Verify(nomination) }
-        }).collect();
-        if let Some(best) = pending.peek() {
-            self.push(best.key, Task::VerifyBatch(pending));
-        }
-    }
-
-    fn next(&mut self) -> Option<Entry> {
-        let entry = self.ready.pop()?;
-        let Task::VerifyBatch(mut pending) = entry.task else { return Some(entry); };
-        let best = pending.pop().expect("only nonempty candidate batches enter the frontier");
-        if let Some(next) = pending.peek() {
-            self.push(next.key, Task::VerifyBatch(pending));
-        }
-        Some(best)
-    }
-
 }
 
 fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() -> arrow_array::StringArray,
-    request: &ScanRequest<'_>, scorer: &Scorer, order: TreeRankOrder, scope: Option<&BTreeSet<Iid>>) -> Result<Option<(RankKey, Nomination)>> {
+    request: &ScanRequest<'_>, scorer: &Scorer, order: TreeRankOrder, scope: Option<&BTreeSet<Iid>>) -> Result<Option<Nomination>> {
     if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
     let header = segment.header(row)?;
     if scope.is_some_and(|scope| !scope.contains(&header.iid)) || !may_be_visible(header.valid_time.lower().0,
@@ -212,29 +172,7 @@ fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() ->
     };
     let source = segment.row(row)?;
     let origin = source.batch.view().origin(source.row)?;
-    Ok(Some((key, Nomination {
-        iid: header.iid, source: None, witness: Some(SearchWitness::Live(header.version(), origin)), visibility: Vec::new(),
-    })))
-}
-
-async fn visible(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition,
-    sources: &[RecordedTree], nomination: &mut Nomination) -> Result<bool> {
-    let Some(own) = nomination.source else { return Ok(true); };
-    let iid = nomination.iid.0;
-    for (index, source) in sources.iter().enumerate() {
-        if index == own || !source.members.values().any(|trie| covers(trie.part(), &iid)) { continue; }
-        let result = async { source.open(runtime, request, definition).await?.events(iid).await }.await;
-        let events = match result {
-            Ok(events) => events,
-            Err(error) => { source.report(runtime, request, definition, &error); return Err(error); }
-        };
-        cut(&mut nomination.visibility, events);
-        if nomination.visibility.is_empty() { return Ok(false); }
-    }
-    for segment in request.snapshot.iter_segments(&definition.table) {
-        cut(&mut nomination.visibility, segment.iid_headers(nomination.iid)?.map(crate::file::KeyedEvent::from));
-    }
-    Ok(nomination.visibility.iter().any(|rectangle| crate::file::meets(*rectangle, request.bounds)))
+    Ok(Some(Nomination { key, iid: header.iid, witness: Some(SearchWitness::Live(header.version(), origin)) }))
 }
 
 impl SearchAccelerator {
@@ -292,345 +230,345 @@ impl SearchAccelerator {
         results.extend(self.live_candidates(request, column, query)?);
         Ok((results.len() <= self.max_candidates).then_some(results))
     }
+}
 
-    pub(super) async fn tree_top_k(&self, request: &ScanRequest<'_>, definition: &SearchDefinition, column: &str,
-        column_id: ColumnId, matching: &Query, scoring_query: Query, ascending_id: Option<ColumnId>,
-        permit_uuid_order: bool, limit: usize, scope: Option<&BTreeSet<Iid>>, include_packs: bool, include_logical: bool,
-        work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
-        if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point() {
-            work.tree_decline = Some("unsupported-snapshot");
+
+pub(super) struct PartitionRankSource<'a> {
+    search: &'a SearchAccelerator,
+    request: ScanRequest<'a>,
+    definition: SearchDefinition,
+    column: String,
+    column_id: ColumnId,
+    column_index: usize,
+    matching: Query,
+    ranking: RankScorer,
+    ascending_id: Option<ColumnId>,
+    order: TreeRankOrder,
+    verification_batch: usize,
+    scope: Option<&'a BTreeSet<Iid>>,
+    sources: Vec<RecordedTree>,
+    ranks: Vec<Option<TreeRanked>>,
+    legacy: Vec<(FileMembers, crate::file::RankedSource)>,
+    logical: Vec<&'a rtdb_format::log::proto::SearchRun>,
+    logical_ranks: Vec<Option<TreeRanked>>,
+    logical_seed: Vec<(RankKey, usize)>,
+    coverage: BTreeSet<rtdb_types::BlockIndex>,
+    gap_queued: bool,
+    segments: Vec<&'a Arc<rtdb_index::LiveTable>>,
+    visibility: Option<super::point::PackedVisibility>,
+    points: Option<&'a BTreeSet<Iid>>,
+    checked: BTreeSet<Iid>,
+    nominated: usize,
+    reservation: Arc<rtdb_columnar::MemoryReservation>,
+    pub(super) work: NarrowingWork,
+}
+
+impl<'a> PartitionRankSource<'a> {
+    pub(super) async fn open(search: &'a SearchAccelerator, request: ScanRequest<'a>, definition: SearchDefinition, column: &str,
+        column_id: ColumnId, matching: Query, scoring: Query, ascending_id: Option<ColumnId>, limit: usize, options: Narrowing<'a>)
+        -> Result<Option<Self>> {
+        if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point()
+            || definition.table.is_owned_event_data() || TableRef::owned_schema(&definition.table.schema) {
             return Ok(None);
         }
         let Some(column_index) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
-        let logical = if include_packs && include_logical { logical_runs(&self.runtime, request, definition) } else { None };
-        let sources = RecordedTree::select(&self.runtime, request, definition, column_index, matching, include_packs, logical.is_some())?;
-        if logical.is_none() && sources.is_empty() && request.snapshot.serving_search::<crate::runtime::ServingPostings>().is_none() {
-            work.tree_decline = Some("no-tree");
-            return Ok(None);
-        }
+        let scope = options.scope.or(request.scan.iids.as_ref());
+        let points = scope.filter(|scope| scope.is_empty() || (!options.omit_logical && scope.len() <= 128
+            && crate::lane::LogicalIndex::supports(&definition)));
+        let include_packs = !options.omit_packs;
+        let logical = if points.is_none() && include_packs && !options.omit_logical { logical_runs(&search.runtime, &request, &definition) } else { None };
+        let mut sources = if points.is_none() {
+            RecordedTree::select(&search.runtime, &request, &definition, column_index, &matching, include_packs, logical.is_some())?
+        } else { Vec::new() };
         if !matching.phrases().is_empty() && !sources.is_empty() && sources.iter().all(|source| source.pack.locator.format() == TREE_FORMAT_VERSION) {
             let paged = definition.artefact_id_for(crate::file::FORMAT_VERSION);
             if sources.iter().flat_map(|source| source.members.values()).all(|key| {
                 request.snapshot.trie_catalog().trie(&definition.table, key)
                     .is_some_and(|trie| trie.artefact(KIND, &paged, definition.version).is_some())
             }) {
-                work.tree_decline = Some("phrase-paged");
-                return Ok(None);
+                sources.clear();
             }
         }
-        let scorer = Arc::new(Scorer::new(scoring_query, None));
+        let scorer = Arc::new(Scorer::new(scoring, None));
         let Some(ranking) = scorer.for_ranking() else { return Ok(None); };
         let routes = match &logical {
-            Some(coverage) => coverage.routes(&self.runtime, request, definition, column_index, matching, &ranking).await?,
+            Some(coverage) => coverage.routes(&search.runtime, &request, &definition, column_index, &matching, &ranking).await?,
             None => None,
         };
         let tree_tries = sources.iter().flat_map(|source| source.members.values().cloned()).collect();
-        let visibility = super::point::PackedVisibility::new(request, &definition.table, &sources, column_index, logical.is_some());
-        let files = if logical.is_some() { Vec::new() } else {
-            let TrieFiles::Complete(Found { files, .. }) = self.trie_files(request, definition, column, &[matching, scorer.query()],
-                LoadSearch::Rank, Some(&tree_tries)).await? else { work.tree_decline = Some("coverage"); return Ok(None); };
+        let visibility = points.is_none().then(|| super::point::PackedVisibility::new(&request, &definition.table, &sources, column_index, logical.is_some()));
+        let files = if points.is_some() || logical.is_some() { Vec::new() } else {
+            let TrieFiles::Complete(Found { files, .. }) = search.trie_files(&request, &definition, column, &[&matching, scorer.query()],
+                LoadSearch::Rank, Some(&tree_tries)).await? else { return Ok(None); };
             files
         };
-        let keep_ids = ascending_id.is_some();
-        let order = if keep_ids {
+        let integer = ascending_id.is_some_and(|id| request.ranked_id_is_integer(id));
+        let uuid = ascending_id.is_some_and(|id| request.ranked_id_is_uuid(id));
+        let order = if integer {
             TreeRankOrder::Integer
-        } else if logical.is_none() && permit_uuid_order && files.is_empty() && sources.iter().all(|source| source.pack.locator.has_canonical_uuid_iids()) {
+        } else if logical.is_none() && ascending_id.is_some_and(|id| request.permits_ranked_uuid_id(id))
+            && files.is_empty() && sources.iter().all(|source| source.pack.locator.has_canonical_uuid_iids()) {
             TreeRankOrder::Uuid
         } else {
             TreeRankOrder::Score
         };
-        let mut legacy = by_file(&files).map(|selected| {
-            let rank = selected.file.ranked_for_query(column, matching, &ranking, request.bounds, keep_ids)?;
+        let legacy = by_file(&files).map(|selected| {
+            let rank = selected.file.ranked_for_query(column, &matching, &ranking, request.bounds, integer)?;
             Ok((selected, rank))
         }).collect::<Result<Vec<_>>>()?;
-        let mut frontier = Frontier::default();
-        for (index, (_, rank)) in legacy.iter().enumerate() {
-            if let Some(bound) = rank.bound() { frontier.push(bound, Task::Legacy(index)); }
-        }
-        let mut ranks = (0..sources.len()).map(|_| OnceLock::new()).collect::<Vec<OnceLock<TreeRanked>>>();
-        for (index, source) in sources.iter().enumerate() {
-            if source.discovery {
-                frontier.push(RankKey::integer(f64::INFINITY, None), Task::Open(index));
-            }
-        }
-        let (logical, mut covered, gaps) = match logical {
+        let ranks = (0..sources.len()).map(|_| None).collect();
+        let (logical, coverage, gap_queued) = match logical {
             Some(coverage) => (coverage.runs, coverage.covered, !coverage.complete),
             None => (Vec::new(), BTreeSet::new(), false),
         };
-        let mut logical_ranks = (0..logical.len()).map(|_| None).collect::<Vec<Option<TreeRanked>>>();
-        let runs = logical.iter().copied().enumerate()
-            .filter(|(_, run)| run_can_match(run, column_index, matching));
-        for (bound, index) in seed_logical(runs, routes.as_ref()) {
-            frontier.push(bound, Task::OpenLogical(index));
+        let logical_ranks = (0..logical.len()).map(|_| None).collect();
+        let runs = logical.iter().copied().enumerate().filter(|(_, run)| run_can_match(run, column_index, &matching));
+        let directory = routes.as_ref();
+        let logical_seed = seed_logical(runs, directory);
+        let segments = request.snapshot.iter_segments(&request.scan.table.name.table).collect();
+        let reservation = request.memory.reserve(4096)?;
+        Ok(Some(Self {
+            search, request, definition, column: column.into(), column_id, column_index, matching, ranking,
+            ascending_id: ascending_id.filter(|_| integer || uuid), order, verification_batch: limit.clamp(16, 128),
+            scope, sources, ranks, legacy, logical, logical_ranks, logical_seed, coverage,
+            gap_queued, segments, visibility, points, checked: BTreeSet::new(), nominated: 0, reservation, work: NarrowingWork::default(),
+        }))
+    }
+
+    fn nominate(&mut self, mut nominations: Vec<Nomination>, more: &mut Vec<RankWork>) -> Result<bool> {
+        self.nominated = self.nominated.saturating_add(nominations.len());
+        if self.nominated > self.search.max_candidates {
+            self.work.tree_decline = Some("candidate-budget");
+            return Ok(false);
         }
-        if gaps { gap_task(&mut frontier); }
-        let mut reservation = request.memory.reserve(4096)?;
-        let mut nominated = 0;
-        let segments: Vec<_> = request.snapshot.iter_segments(&definition.table).collect();
-        for (index, segment) in segments.iter().enumerate() {
-            let (pages, covered) = self.runtime.live_pages_at(Some(request.snapshot), request.database, segment, column);
-            if !self.runtime.can_scan_live_gap(segment, column, covered)? {
-                work.tree_decline = Some("live-coverage-budget");
+        reserve_ranking(&mut self.reservation, self.nominated)?;
+        nominations.retain(|nomination| !self.checked.contains(&nomination.iid));
+        nominations.sort_unstable_by(|left, right| left.key.compare(right.key).then_with(|| right.iid.cmp(&left.iid)));
+        while !nominations.is_empty() {
+            let chunk = nominations.split_off(nominations.len().saturating_sub(self.verification_batch));
+            let bound = chunk.last().expect("nonempty verification batch").key;
+            more.push(RankWork::new(bound, Task::Verify(chunk)));
+        }
+        Ok(true)
+    }
+
+    fn lost_run(&mut self, index: usize, error: &Anomaly, more: &mut Vec<RankWork>) {
+        let run = self.logical[index];
+        self.search.runtime.report_run(self.request.database, &self.definition.table, run, error);
+        for block in run.blocks() { self.coverage.remove(&block); }
+        if !self.gap_queued {
+            self.gap_queued = true;
+            more.push(RankWork::new(RankKey::unknown(), Task::Gap));
+        }
+    }
+
+    async fn verify(&mut self, nominations: Vec<Nomination>) -> Result<Option<RankOutcome>> {
+        let iids: BTreeSet<_> = nominations.iter().map(|nomination| nomination.iid).filter(|iid| !self.checked.contains(iid)).collect();
+        if iids.is_empty() { return Ok(Some(RankOutcome::default())); }
+        self.work.verification_rounds += 1;
+        self.work.verifier_rows += iids.len();
+        let resolved = match &self.visibility {
+            Some(visibility) => visibility.resolve(&self.search.runtime, &self.request, &self.definition, &self.sources, &iids).await,
+            None => rtdb_query::table_point_rows(&self.request, &iids).await.map(|rows| rows.map(|rows| {
+                rows.into_iter().map(|row| super::point::ResolvedVersion { row, witness: None }).collect()
+            })),
+        };
+        let (rows, witnesses) = match resolved {
+            Ok(Some(resolved)) => {
+                self.work.packed_resolved += resolved.len();
+                let (rows, witnesses): (Vec<_>, BTreeMap<_, _>) = resolved.into_iter().map(|resolved| {
+                    let row = resolved.row;
+                    let witness = (row.version, resolved.witness);
+                    (row, witness)
+                }).unzip();
+                (Some(rows), witnesses)
+            }
+            Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+            _ => (None, BTreeMap::new()),
+        };
+        let verified = self.request.verifier.verify_ranked(&iids, rows, self.column_id, self.ascending_id, self.ranking.scorer()).await?;
+        let Some(verified) = verified else { return Ok(None); };
+        for row in &verified {
+            if let Some(Some(witness)) = witnesses.get(&row.version())
+                && nominations.iter().any(|nomination| nomination.iid == row.version().iid
+                    && nomination.witness == Some(*witness) && row.score() > nomination.key.score) {
+                self.work.tree_decline = Some("winner-version");
                 return Ok(None);
             }
-            for page in pages {
-                if let Some(bound) = page.bound(matching, scorer.query(), keep_ids) {
-                    frontier.push(bound, Task::Live(index, page));
-                }
-            }
-            work.uncovered_live_rows += (segment.row_count() - covered) as usize;
-            let complete = crate::SearchRuntime::visit_live_suffix(segment, column, matching, true, covered, request.cancellation, |row, tokens| {
-                if let Some((key, nomination)) = nominate_live(segment, row, tokens, request, &scorer, order, scope)? {
-                    nominated += 1;
-                    if nominated % 128 == 1 { reserve_ranking(&mut reservation, nominated + 128)?; }
-                    frontier.push(key, Task::Verify(nomination));
-                }
-                Ok(nominated <= self.max_candidates)
-            })?;
-            if !complete { work.tree_decline = Some("candidate-budget"); return Ok(None); }
         }
+        self.checked.extend(iids);
+        Ok(Some(RankOutcome { verified, ..Default::default() }))
+    }
+}
 
-        let mut visited = BTreeSet::new();
-        let mut verified = Vec::new();
-        let mut rows = BTreeMap::new();
-        let mut deferred = BTreeMap::<Iid, rtdb_query::ResolvedSearchRow>::new();
-        let mut to_verify = BTreeMap::<Iid, (RankKey, Option<SearchWitness>)>::new();
-        let shared_rank = request.verifier.partition_ranking();
-        let shared_work = shared_rank.and_then(|rank| rank.register(request.snapshot));
-        let trusted = request.scan.top_k.as_ref().is_some_and(|top| top.score.is_some())
-            && request.verifier.permits_search_witness() && match request.scan.predicates.as_slice() {
-                [Expr::Column { id, .. }] => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
-                [Expr::Call { name, .. }] => name.eq_ignore_ascii_case("match"),
-                _ => false,
-            };
-        let batch_size = limit.clamp(1, 128);
-        let mut rounds = 0;
-        loop {
-            if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-            if to_verify.is_empty() && verified.len() >= limit
-                && verified_cutoff(&mut verified, limit).is_some_and(|kth| frontier.ready.peek().is_none_or(|entry| kth.beats(entry.key))) { break; }
-            if to_verify.is_empty() && let Some(cutoff) = shared_rank.and_then(|rank| rank.cutoff(limit))
-                && frontier.ready.peek().is_some_and(|entry| entry.key.score < cutoff) {
-                work.shared_cutoff_prunes += frontier.ready.len();
-                break;
+#[async_trait]
+impl RankSource for PartitionRankSource<'_> {
+    fn seed(&mut self) -> Result<Vec<RankWork>> {
+        let mut seed = Vec::new();
+        if let Some(points) = self.points {
+            if !points.is_empty() {
+                seed.push(RankWork::new(RankKey::unknown(), Task::Verify(points.iter().copied().map(Nomination::unknown).collect())));
             }
-            if !to_verify.is_empty() && (to_verify.len() >= batch_size || frontier.ready.is_empty()) {
-                let _permit = if let Some(shared_work) = &shared_work {
-                    let bound = to_verify.values().map(|(key, _)| key.score).fold(f64::NEG_INFINITY, f64::max);
-                    Some(shared_work.acquire(bound, request.cancellation).await?)
-                } else { None };
-                rounds += 1;
-                if rounds > 16 { work.tree_decline = Some("verification-budget"); return Ok(None); }
-                work.verification_rounds += 1;
-                work.verifier_rows += to_verify.len();
-                let pending = std::mem::take(&mut to_verify);
-                let iids = pending.keys().copied().collect();
-                let resolved = visibility.resolve(&self.runtime, request, definition, &sources, &iids).await;
-                let scores = match resolved {
-                    Ok(Some(resolved)) => {
-                        work.packed_resolved += resolved.len();
-                        let mut gather = Vec::new();
-                        for version in resolved {
-                            let iid = version.row.version.iid;
-                            let (key, witness) = pending[&iid];
-                            if trusted && witness.is_some() && witness == version.witness {
-                                verified.push((key, iid));
-                                deferred.insert(iid, version.row);
-                                work.deferred_payloads += 1;
-                            } else { gather.push(version.row); }
-                        }
-                        match request.verifier.score_resolved(gather, column_id, ascending_id, &scorer).await {
-                            Ok(Some(scores)) => scores,
-                            Ok(None) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
-                            Err(error) if error.code.starts_with("rtdb.storage/") || error.code == "rtdb.query/search-row" => {
-                                request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?
-                            }
-                            Err(error) => return Err(error),
-                        }
+            return Ok(seed);
+        }
+        for (index, (_, rank)) in self.legacy.iter().enumerate() {
+            if let Some(bound) = rank.bound() { seed.push(RankWork::new(bound, Task::Legacy(index))); }
+        }
+        for (index, source) in self.sources.iter().enumerate() {
+            if source.discovery { seed.push(RankWork::new(RankKey::unknown(), Task::Open(index))); }
+        }
+        seed.extend(std::mem::take(&mut self.logical_seed).into_iter().map(|(bound, index)| RankWork::new(bound, Task::OpenLogical(index))));
+        if self.gap_queued { seed.push(RankWork::new(RankKey::unknown(), Task::Gap)); }
+        for (index, segment) in self.segments.iter().enumerate() {
+            let (pages, covered) = self.search.runtime.live_pages_at(Some(self.request.snapshot), self.request.database, segment, &self.column);
+            for page in pages {
+                if let Some(bound) = page.bound(&self.matching, self.ranking.scorer().query(), self.order == TreeRankOrder::Integer) {
+                    seed.push(RankWork::new(bound, Task::Live(index, page)));
+                }
+            }
+            if covered < segment.row_count() {
+                seed.push(RankWork::new(RankKey::unknown(), Task::LiveSuffix(index, covered)));
+            }
+        }
+        Ok(seed)
+    }
+
+    async fn execute(&mut self, work: RankWork) -> Result<Option<RankOutcome>> {
+        let mut more = Vec::new();
+        let request = &self.request;
+        let definition = &self.definition;
+        let runtime = &self.search.runtime;
+        let mut nominations = Vec::new();
+        match work.take::<Task>()? {
+            Task::Verify(nominations) => return self.verify(nominations).await,
+            Task::Gap => {
+                self.gap_queued = false;
+                let available = self.search.max_candidates.saturating_sub(self.nominated);
+                let Some(iids) = rtdb_query::uncovered_history_iids(request, &self.coverage, self.scope, available).await?
+                    else { self.work.tree_decline = Some("logical-gap-budget"); return Ok(None); };
+                nominations.extend(iids.into_iter().map(Nomination::unknown));
+            }
+            Task::OpenLogical(index) => {
+                let table = request.snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
+                let opened = async {
+                    let file = runtime.logical_file(request.storage, &table.slug, self.logical[index], &definition.columns).await?;
+                    TreeRanked::open(file, self.column_index, &self.matching, &self.ranking, request.bounds, self.order).await
+                }.await;
+                match opened {
+                    Ok(rank) => {
+                        self.work.tree_roots += 1;
+                        self.work.logical_roots += 1;
+                        runtime.record_logical_run_read();
+                        if let Some(bound) = rank.bound() { more.push(RankWork::new(bound, Task::ExpandLogical(index))); }
+                        self.logical_ranks[index] = Some(rank);
                     }
-                    Ok(None) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
-                    Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
-                    Err(_) => request.verifier.score_visible(iids, column_id, ascending_id, &scorer).await?,
+                    Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                    Err(error) => self.lost_run(index, &error, &mut more),
+                }
+            }
+            Task::ExpandLogical(index) => {
+                let rank = self.logical_ranks[index].as_mut().expect("logical rank is opened before expansion");
+                let before = self.work.postings_visited;
+                let expanded = rank.expand(self.scope, &mut self.work.postings_visited).await;
+                rtdb_storage::audience_work::scan_items(self.work.postings_visited - before)?;
+                match expanded {
+                    Ok(candidates) => {
+                        self.work.tree_expansions += 1;
+                        self.work.score_evaluations += candidates.len();
+                        nominations.extend(candidates.into_iter().map(|candidate| Nomination {
+                            key: candidate.key, iid: candidate.iid, witness: candidate.revision.map(SearchWitness::Logical),
+                        }));
+                        if let Some(bound) = rank.bound() { more.push(RankWork::new(bound, Task::ExpandLogical(index))); }
+                    }
+                    Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                    Err(error) => self.lost_run(index, &error, &mut more),
+                }
+            }
+            Task::Open(index) => {
+                self.work.tree_roots += 1;
+                let source = &self.sources[index];
+                let opened = async {
+                    let file = source.open(runtime, request, definition).await?;
+                    TreeRanked::open(file, self.column_index, &self.matching, &self.ranking, request.bounds, self.order).await
+                }.await;
+                let rank = match opened {
+                    Ok(rank) => rank,
+                    Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                    Err(error) => {
+                        source.report(runtime, request, definition, &error);
+                        self.work.tree_decline = Some("recorded-root");
+                        return Ok(None);
+                    }
                 };
-                if let Some(rank) = shared_rank { rank.add_verified(limit, &scores); }
-                for (iid, score, id) in scores.ranked() {
-                    let key = if order == TreeRankOrder::Uuid { RankKey::uuid(score, iid.0) } else { RankKey::integer(score, id) };
-                    if deferred.remove(&iid).is_some() {
-                        if let Some(entry) = verified.iter_mut().find(|(_, known)| *known == iid) { entry.0 = key; }
-                    } else { verified.push((key, iid)); }
-                    if let Some(row) = scores.row(iid) { rows.insert(iid, row); }
-                }
-                if let Some(kth) = verified_cutoff(&mut verified, limit) {
-                    if kth.has_id() { verified.truncate(limit); }
-                    else { verified.retain(|(key, _)| !key.score_order(kth).is_lt()); }
-                    let winners: BTreeSet<_> = verified.iter().map(|(_, iid)| *iid).collect();
-                    rows.retain(|iid, _| winners.contains(iid));
-                    deferred.retain(|iid, _| winners.contains(iid));
-                }
-                continue;
+                if let Some(bound) = rank.bound() { more.push(RankWork::new(bound, Task::Expand(index))); }
+                self.ranks[index] = Some(rank);
             }
-            let Some(entry) = frontier.next() else { break; };
-            let _permit = if let Some(shared_work) = &shared_work {
-                Some(shared_work.acquire(entry.key.score, request.cancellation).await?)
-            } else { None };
-            match entry.task {
-                Task::Gap => {
-                    let available = self.max_candidates.saturating_sub(nominated);
-                    let Some(iids) = rtdb_query::uncovered_history_iids(request, &covered, scope, available).await?
-                        else { work.tree_decline = Some("logical-gap-budget"); return Ok(None); };
-                    nominated += iids.len();
-                    reserve_ranking(&mut reservation, nominated)?;
-                    frontier.nominate_batch(iids.into_iter().filter(|iid| !visited.contains(iid)).map(|iid| {
-                        (RankKey::integer(f64::INFINITY, None), Nomination { iid, source: None, witness: None, visibility: Vec::new() })
-                    }));
-                }
-                Task::OpenLogical(index) => {
-                    let table = request.snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
-                    let opened = async {
-                        let file = self.runtime.logical_file(request.storage, &table.slug, logical[index], &definition.columns).await?;
-                        TreeRanked::open(file, column_index, matching, &ranking, request.bounds, order).await
-                    }.await;
-                    let rank = match opened {
-                        Ok(rank) => rank,
-                        Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
-                        Err(error) => {
-                            self.runtime.report_run(request.database, &definition.table, logical[index], &error);
-                            for block in logical[index].blocks() { covered.remove(&block); }
-                            gap_task(&mut frontier);
-                            continue;
-                        }
-                    };
-                    work.tree_roots += 1;
-                    work.logical_roots += 1;
-                    self.runtime.record_logical_run_read();
-                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::ExpandLogical(index)); }
-                    logical_ranks[index] = Some(rank);
-                }
-                Task::ExpandLogical(index) => {
-                    let rank = logical_ranks[index].as_mut().expect("logical rank is opened before expansion");
-                    let candidates = match rank.expand(scope, &mut work.postings_visited).await {
-                        Ok(candidates) => candidates,
-                        Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
-                        Err(error) => {
-                            self.runtime.report_run(request.database, &definition.table, logical[index], &error);
-                            for block in logical[index].blocks() { covered.remove(&block); }
-                            gap_task(&mut frontier);
-                            continue;
-                        }
-                    };
-                    work.tree_expansions += 1;
-                    work.score_evaluations += candidates.len();
-                    nominated += candidates.len();
-                    if nominated > self.max_candidates { work.tree_decline = Some("candidate-budget"); return Ok(None); }
-                    reserve_ranking(&mut reservation, nominated)?;
-                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::ExpandLogical(index)); }
-                    frontier.nominate_batch(candidates.into_iter().map(|candidate| (candidate.key, Nomination {
-                        iid: candidate.iid, source: None, witness: candidate.revision.map(SearchWitness::Logical), visibility: Vec::new(),
-                    })));
-                }
-                Task::Open(index) => {
-                    work.tree_roots += 1;
-                    let source = &sources[index];
-                    let opened = async {
-                        let file = source.open(&self.runtime, request, definition).await?;
-                        TreeRanked::open(file, column_index, matching, &ranking, request.bounds, order).await
-                    }.await;
-                    let rank = match opened { Ok(rank) => rank, Err(error) => {
-                        source.report(&self.runtime, request, definition, &error); work.tree_decline = Some("recorded-root"); return Ok(None);
-                    } };
-                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::Expand(index)); }
-                    let _ = ranks[index].set(rank);
-                }
-                Task::Expand(index) => {
-                    work.tree_expansions += 1;
-                    let rank = ranks[index].get_mut().expect("rank is opened before it expands");
-                    let candidates = match rank.expand(scope, &mut work.postings_visited).await {
-                        Ok(candidates) => candidates,
-                        Err(error) => { sources[index].report(&self.runtime, request, definition, &error); work.tree_decline = Some("rank-page"); return Ok(None); }
-                    };
-                    work.score_evaluations += candidates.len();
-                    nominated += candidates.len();
-                    if nominated > self.max_candidates { work.tree_decline = Some("candidate-budget"); return Ok(None); }
-                    reserve_ranking(&mut reservation, nominated)?;
-                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::Expand(index)); }
-                    frontier.nominate_batch(candidates.into_iter().filter(|candidate| sources[index].members.contains_key(&candidate.member))
-                        .map(|candidate| {
-                            let key = candidate.key;
-                            (key, Nomination { iid: candidate.iid, source: Some(index), witness: Some(SearchWitness::Packed(index, candidate.document)), visibility: candidate.rectangles })
-                        }));
-                }
-                Task::Legacy(index) => {
-                    let (selected, rank) = &mut legacy[index];
-                    let hits = match rank.expand(scope, &mut work.postings_visited).await {
-                        Ok(hits) => hits,
-                        Err(_) => { work.tree_decline = Some("legacy-source"); return Ok(None); }
-                    };
-                    work.score_evaluations += hits.len();
-                    nominated += hits.len();
-                    if nominated > self.max_candidates { work.tree_decline = Some("candidate-budget"); return Ok(None); }
-                    reserve_ranking(&mut reservation, nominated)?;
-                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::Legacy(index)); }
-                    for (run, score) in hits.iter() {
-                        if !selected.members.contains_key(&run.member) { continue; }
-                        let id = keep_ids.then(|| selected.file.integer_id(run)).flatten();
-                        frontier.push(RankKey::integer(score, id), Task::Verify(Nomination {
-                            iid: Iid(run.iid), source: None, witness: None, visibility: Vec::new(),
-                        }));
+            Task::Expand(index) => {
+                self.work.tree_expansions += 1;
+                let rank = self.ranks[index].as_mut().expect("rank is opened before it expands");
+                let before = self.work.postings_visited;
+                let expanded = rank.expand(self.scope, &mut self.work.postings_visited).await;
+                rtdb_storage::audience_work::scan_items(self.work.postings_visited - before)?;
+                let candidates = match expanded {
+                    Ok(candidates) => candidates,
+                    Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                    Err(error) => {
+                        self.sources[index].report(runtime, request, definition, &error);
+                        self.work.tree_decline = Some("rank-page");
+                        return Ok(None);
                     }
-                }
-                Task::Live(index, page) => {
-                    let complete = page.visit(matching, true, |row, tokens| {
-                        if let Some((key, nomination)) = nominate_live(segments[index], row, tokens, request, &scorer, order, scope)? {
-                            nominated += 1;
-                            if nominated % 128 == 1 { reserve_ranking(&mut reservation, nominated + 128)?; }
-                            frontier.push(key, Task::Verify(nomination));
+                };
+                self.work.score_evaluations += candidates.len();
+                nominations.extend(candidates.into_iter().filter(|candidate| self.sources[index].members.contains_key(&candidate.member))
+                    .map(|candidate| Nomination { key: candidate.key, iid: candidate.iid,
+                        witness: Some(SearchWitness::Packed(index, candidate.document)) }));
+                if let Some(bound) = rank.bound() { more.push(RankWork::new(bound, Task::Expand(index))); }
+            }
+            Task::Legacy(index) => {
+                let (selected, rank) = &mut self.legacy[index];
+                let before = self.work.postings_visited;
+                let expanded = rank.expand(self.scope, &mut self.work.postings_visited).await;
+                rtdb_storage::audience_work::scan_items(self.work.postings_visited - before)?;
+                let hits = match expanded {
+                    Ok(hits) => hits,
+                    Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                    Err(_) => { self.work.tree_decline = Some("legacy-source"); return Ok(None); }
+                };
+                self.work.score_evaluations += hits.len();
+                nominations.extend(hits.iter().filter(|(run, _)| selected.members.contains_key(&run.member)).map(|(run, score)| {
+                    let id = (self.order == TreeRankOrder::Integer).then(|| selected.file.integer_id(run)).flatten();
+                    Nomination { key: RankKey::integer(score, id), iid: Iid(run.iid), witness: None }
+                }));
+                if let Some(bound) = rank.bound() { more.push(RankWork::new(bound, Task::Legacy(index))); }
+            }
+            task @ (Task::Live(..) | Task::LiveSuffix(..)) => {
+                let available = self.search.max_candidates.saturating_sub(self.nominated);
+                let mut charge = request.memory.reserve(4096)?;
+                let index = match &task { Task::Live(index, _) | Task::LiveSuffix(index, _) => *index, _ => unreachable!() };
+                let segment = self.segments[index];
+                let visit = |row, tokens: &dyn Fn() -> arrow_array::StringArray| {
+                    if let Some(hit) = nominate_live(segment, row, tokens, request, self.ranking.scorer(), self.order, self.scope)? {
+                        if nominations.len() % 128 == 0 { reserve_ranking(&mut charge, nominations.len() + 128)?; }
+                        nominations.push(hit);
+                    }
+                    Ok(nominations.len() <= available)
+                };
+                let complete = match task {
+                    Task::Live(_, page) => page.visit(&self.matching, true, visit)?,
+                    Task::LiveSuffix(_, covered) => {
+                        if !runtime.can_scan_live_gap(segment, &self.column, covered)? {
+                            self.work.tree_decline = Some("live-coverage-budget");
+                            return Ok(None);
                         }
-                        Ok(nominated <= self.max_candidates)
-                    })?;
-                    if !complete { work.tree_decline = Some("candidate-budget"); return Ok(None); }
-                }
-                Task::VerifyBatch(_) => unreachable!("the frontier returns an individual nomination"),
-                Task::Verify(mut nomination) => {
-                    let iid = nomination.iid;
-                    if visited.contains(&iid) || request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
-                    if visibility.can_resolve(iid) {
-                        visited.insert(iid);
-                        to_verify.insert(iid, (entry.key, nomination.witness));
-                        continue;
+                        self.work.uncovered_live_rows += (segment.row_count() - covered) as usize;
+                        crate::SearchRuntime::visit_live_suffix(segment, &self.column, &self.matching, true, covered, request.cancellation, visit)?
                     }
-                    match visible(&self.runtime, request, definition, &sources, &mut nomination).await {
-                        Ok(false) => continue,
-                        Ok(true) => { visited.insert(iid); to_verify.insert(iid, (entry.key, None)); }
-                        Err(_) => { work.tree_decline = Some("visibility-page"); return Ok(None); }
-                    }
-                }
+                    _ => unreachable!(),
+                };
+                if !complete { self.work.tree_decline = Some("candidate-budget"); return Ok(None); }
             }
         }
-        if !deferred.is_empty() {
-            let remaining = deferred.keys().copied().collect::<BTreeSet<_>>();
-            let scores = request.verifier.score_resolved(deferred.into_values().collect(), column_id, ascending_id, &scorer).await;
-            let scores = match scores {
-                Ok(Some(scores)) => scores,
-                Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
-                _ => { work.tree_decline = Some("winner-payload"); return Ok(None); }
-            };
-            let checked: BTreeMap<_, _> = scores.ranked().map(|(iid, score, id)| (iid, (score, id))).collect();
-            for (key, iid) in verified.iter().filter(|(_, iid)| remaining.contains(iid)) {
-                if checked.get(iid).is_none_or(|(score, id)| *score != key.score || (key.integer_id().is_some() && *id != key.integer_id())) {
-                    work.tree_decline = Some("winner-version");
-                    return Ok(None);
-                }
-                let Some(row) = scores.row(*iid) else { work.tree_decline = Some("winner-payload"); return Ok(None); };
-                rows.insert(*iid, row);
-            }
-            if let Some(rank) = shared_rank { rank.add_verified(limit, &scores); }
-        }
-        let iids = verified.iter().map(|&(_, iid)| iid).collect();
-        if request.scan.top_k.as_ref().is_some_and(|top| top.score.is_some()) {
-            work.retained_rank_rows = rows.len();
-            work.scores = rtdb_query::CandidateScores::from_verified(verified.into_iter().map(|(key, iid)| (iid, key.score)).collect(), request.memory)?
-                .map(|scores| scores.with_rows(rows));
-        }
-        Ok(Some(iids))
+        if !self.nominate(nominations, &mut more)? { return Ok(None); }
+        Ok(Some(RankOutcome { more, ..Default::default() }))
     }
 }

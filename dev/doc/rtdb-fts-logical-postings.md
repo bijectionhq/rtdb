@@ -22,8 +22,11 @@ The same pinned catalog determines which version is visible and where its payloa
 | `RetainedArtefactJournal` and `PrepareSearch` | Passive adapters | Access to verified retained replay and to the file builders invoked by sealing. |
 | `ReplicationDriver` and the artefact driver | Active objects | Ordered adoption and replay, and selection and scheduling of independent build work. |
 | `TrieCollector` | Passive cycle worker | The eligibility observations and receipts used by a collection cycle. |
-| `PartitionRanking` | Monitor | Waiting partitions, ranked task admission, and the verified score cutoff for one compatible shared query basis. |
-| `PartitionRankWork` and `RankWorkPermit` | Passive guards | The lifetime of pending and admitted work in that query. |
+| `QueryRanking` | Monitor | One frontier, work admission, and the verified SQL prefix across the pinned partitions. |
+| Ranked scan workers | Active objects | Claiming work and publishing its outcome under the scan's task lifetime. |
+| `PartitionRankSource` and `ScanVerifier` | Passive objects | Partition coverage, posting readers and visibility and predicate evaluation at the pinned cut. |
+| `RankWork`, `RankOutcome`, `VerifiedRankRow`, and `QueryWinners` | Passive values | Bounded work, child tasks, verified version and score evidence, and the retained rows by partition. |
+| `RankClaim` | Passive guard | An outstanding bound through publication or cancellation. |
 
 ```rust
 struct EventOrigin {
@@ -44,8 +47,8 @@ Receipts from older data can still use the original temporal coordinates when th
 A table history page stores event headers and physical row coordinates.
 A separate forward page stores each field's revision, keyed by the accepted event.
 Equivalent analyzed text shares a posting revision for the same field and entity.
-A forward witness must match the resolved event's identity before a posting can certify its score.
-Older revisions and absent witnesses can be checked by scoring the resolved primary row.
+A forward witness identifies whether a posting refers to the resolved event's text revision.
+The ranked verifier uses the primary row to determine the visible version's score.
 A point read follows the pinned table directory to the selected entity histories and adds accepted events from the suffix.
 The directory keeps headers, stable origins, and an Arrow location hint through its sealed block.
 Where events carry typed keys, the full key delimits the history behind the routing IID.
@@ -125,9 +128,10 @@ flowchart TD
     Postings --> Frontier["Rank by remaining score bounds"]
     Gap --> Frontier
     Frontier --> Resolve
-    Resolve --> Witness["Check an indexed field's forward witness"]
-    Witness --> Arrow["Gather winning or unverified Arrow rows"]
-    Arrow --> SQLResult["Apply SQL predicates, sort, and project"]
+    Resolve --> Verify["Gather predicates and score the visible payload"]
+    Verify --> Frontier
+    Frontier --> Arrow["Gather projected columns for verified winners"]
+    Arrow --> SQLResult["Apply SQL sort and window"]
 ```
 
 Candidate selectors combine covered runs, uncovered history, and the live suffix.
@@ -139,9 +143,13 @@ The query adds each run's term bounds in the scoring query's order and uses the 
 Sparse conjunctions expand the rarest term and batch posting intersections, while dense searches expand score-bounded windows.
 A phrase additionally checks positions in the candidate posting sequence.
 If the directory is missing or unreadable, the lane receives a repair request and the query uses the run synopses.
-A ranked query prioritizes ready work across compatible partitions and shares a score cutoff derived from verified rows.
-Unknown and exact-gap work keeps an unbounded score until it can nominate candidates.
-SQL tie order remains authoritative at equal scores.
+A ranked point query keeps one frontier for the pinned partitions and one verified prefix sized for OFFSET plus LIMIT.
+A worker holds its bound while reading, expanding postings, or verifying rows and publishes its outcome together with the replacement bounds.
+Unknown work, including gaps and unread live suffixes, stays eligible until it has been accounted for.
+Only a verified visible version enters the prefix.
+SQL tie order is available across partitions when the ascending identity is an integer or UUID.
+A score-only ceiling can prune only when its score is strictly below the cutoff.
+The scan gathers final projection columns after the query fixes its winners.
 
 ```yaml
 search:

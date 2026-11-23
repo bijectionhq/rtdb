@@ -83,6 +83,22 @@ impl ScanAccelerator for SearchAccelerator {
         }
     }
 
+    async fn rank_source<'a>(&'a self, request: ScanRequest<'a>) -> Result<Option<Box<dyn rtdb_query::RankSource + 'a>>> {
+        let Some(top) = request.scan.top_k.as_ref() else { return Ok(None); };
+        let Some(column) = request.scan.columns.iter().find(|field| field.id == top.column).map(|field| field.name.as_str()) else { return Ok(None); };
+        let Some((matched_column, matching, definition)) = self.match_definition(&request).await? else { return Ok(None); };
+        if matched_column != column { return Ok(None); }
+        let Some(Value::Utf8(scoring)) = request.constants.constant(&top.query).await? else { return Ok(None); };
+        let Some(limit) = request.ranked_prefix_len(top).await else { return Ok(None); };
+        let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching, Query::parse(&scoring),
+            top.ascending_id, limit, Narrowing::default()).await;
+        match result {
+            Ok(source) => Ok(source.map(|source| Box::new(source) as Box<dyn rtdb_query::RankSource + 'a>)),
+            Err(error) if optional_build_refused(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn point_rows(&self, request: &ScanRequest<'_>, iids: &BTreeSet<Iid>) -> Result<Option<Vec<rtdb_query::ResolvedSearchRow>>> {
         let table = &request.scan.table.name.table;
         if table.is_owned_event_data() || TableRef::owned_schema(&table.schema)
@@ -175,16 +191,22 @@ impl NarrowingWork {
 }
 
 impl SearchAccelerator {
-    async fn narrow(&self, request: &ScanRequest<'_>, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+    async fn match_definition<'a>(&self, request: &ScanRequest<'a>) -> Result<Option<(&'a str, Query, SearchDefinition)>> {
         let scan = request.scan;
         let mut conjuncts = Vec::new();
         for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
-        let mut chosen = None;
         for (column, query) in conjuncts {
-            let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue };
-            if let Some(definition) = self.definition(request, column).await? { chosen = Some((column, Query::parse(&text), definition)); break; }
+            let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue; };
+            if let Some(definition) = self.definition(request, column).await? {
+                return Ok(Some((column, Query::parse(&text), definition)));
+            }
         }
-        let Some((column, query, definition)) = chosen else { return Ok(None) };
+        Ok(None)
+    }
+
+    async fn narrow(&self, request: &ScanRequest<'_>, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        let scan = request.scan;
+        let Some((column, query, definition)) = self.match_definition(request).await? else { return Ok(None); };
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
         if options.is_oracle { return Ok(None); }
         if let Some(top_k) = &scan.top_k {
@@ -479,12 +501,12 @@ struct Recorded {
 enum LoadSearch { Match, Rank }
 
 /// A shared file's selected members and their positions in the scan's trie list.
-struct FileMembers<'a> { file: &'a Arc<SearchFile>, members: BTreeMap<u32, usize> }
+struct FileMembers { file: Arc<SearchFile>, members: BTreeMap<u32, usize> }
 
-fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<'_>> {
+fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers> {
     let mut grouped = BTreeMap::new();
     for (index, trie) in files.iter().enumerate() {
-        let selected = grouped.entry(trie.identity.as_str()).or_insert_with(|| FileMembers { file: &trie.file, members: BTreeMap::new() });
+        let selected = grouped.entry(trie.identity.as_str()).or_insert_with(|| FileMembers { file: Arc::clone(&trie.file), members: BTreeMap::new() });
         selected.members.insert(trie.member, index);
     }
     grouped.into_values()
@@ -864,7 +886,7 @@ fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candida
 }
 
 /// A scored event waiting to be handed out, best score first, and whether its visibility is exact.
-struct Pending { key: RankKey, iid: Iid, exact: bool }
+struct Pending { key: RankKey, iid: Iid }
 impl PartialEq for Pending { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
 impl Eq for Pending {}
 impl PartialOrd for Pending { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
@@ -905,9 +927,9 @@ fn exceeds_retry_limit(
 }
 
 impl Candidates<'_> {
-    fn push(&mut self, iid: Iid, score: f64, id: Option<i64>, exact: bool) {
+    fn push(&mut self, iid: Iid, score: f64, id: Option<i64>) {
         self.scored += 1;
-        self.pending.push(Pending { key: RankKey::integer(score, id), iid, exact });
+        self.pending.push(Pending { key: RankKey::integer(score, id), iid });
     }
 
     fn drop_seen(&mut self) { while self.pending.peek().is_some_and(|top| self.seen.contains(&top.iid)) { self.pending.pop(); } }
@@ -925,7 +947,7 @@ impl Candidates<'_> {
         }
         pending.into_iter().chain(unread).all(|bound| kth.beats(bound))
     }
-    /// The next IID, best first, with its best event's score and whether that event is exactly visible.
+    /// The next IID, best first, with its best event's score.
     async fn next(&mut self, scope: Option<&BTreeSet<Iid>>, ascending_id: bool, work: &mut NarrowingWork)
         -> std::result::Result<Option<Pending>, (Option<usize>, Anomaly)> {
         loop {
@@ -939,9 +961,9 @@ impl Candidates<'_> {
                     if cfg!(feature = "experiments") { work.score_evaluations += scored.len(); }
                     for (doc, score) in scored.iter() {
                         let Some(&own) = self.files[index].0.get(&doc.member) else { continue };
-                        if let Judged::Visible { exact } = self.cutter.judge(own, doc).map_err(|error| (None, error))? {
+                        if let Judged::Visible { .. } = self.cutter.judge(own, doc).map_err(|error| (None, error))? {
                             let id = ascending_id.then(|| self.cutter.files[own].file.integer_id(doc)).flatten();
-                            self.push(Iid(doc.iid), score, id, exact);
+                            self.push(Iid(doc.iid), score, id);
                         }
                     }
                 }
@@ -982,19 +1004,32 @@ impl SearchAccelerator {
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
         let Some(limit) = request.ranked_prefix_len(top_k).await else { work.decline = Some("unsupported-limit"); return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let ascending_id = top_k.ascending_id.filter(|_| request.partitions.len() == 1
-            && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point());
-        let uuid_id = ascending_id.filter(|&id| request.ranked_id_is_uuid(id));
-        let ascending_id = ascending_id.filter(|_| uuid_id.is_none());
-        let uuid_order = uuid_id.is_some_and(|id| request.permits_ranked_uuid_id(id));
         let scoring_query = Query::parse(&text);
         if !options.estimate_first && !options.baseline {
-            let (result, io) = crate::file::observe_tree_io(self.tree_top_k(request, definition, column, top_k.column, matching,
-                scoring_query.clone(), ascending_id, uuid_order, limit, options.scope, !options.omit_packs,
-                !options.omit_logical, work)).await;
+            let (ranked, io) = crate::file::observe_tree_io(async {
+                let ranking = rtdb_query::QueryRanking::new(std::num::NonZeroUsize::new(limit).expect("nonempty prefix"), 1, request.memory)?;
+                let source = tree::PartitionRankSource::open(self, *request, definition.clone(), column, top_k.column, matching.clone(),
+                    scoring_query.clone(), top_k.ascending_id, limit, options);
+                let Some(source) = rtdb_query::run_rank_partition(&ranking, 0, source, request.cancellation).await?
+                    else { return Ok(None); };
+                let tried_ranking = work.tried_ranking;
+                let filter_scope = work.filter_scope;
+                *work = source.work;
+                work.tried_ranking = tried_ranking;
+                work.filter_scope = filter_scope;
+                let Some(mut ranked) = ranking.winners() else { return Ok(None); };
+                request.ranked_selection(ranked.take_partition(0)).await
+            }).await;
             work.tree_io = io;
-            if let Some(result) = result? { return Ok(Some(result)); }
+            if let Some(selection) = ranked? {
+                let iids = selection.iids.iter().collect();
+                work.retained_rank_rows = selection.iids.iter().filter(|iid| selection.scores.as_ref().and_then(|scores| scores.row(*iid)).is_some()).count();
+                work.scores = selection.scores;
+                return Ok(Some(iids));
+            }
         }
+        let ascending_id = top_k.ascending_id.filter(|&id| request.ranked_id_is_integer(id)
+            && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point());
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition, column, &[matching, &scoring_query], LoadSearch::Rank, None).await? else {
             work.decline = Some("coverage");
             return Ok(None);
@@ -1023,11 +1058,6 @@ impl SearchAccelerator {
             files: ranked, cutter: Cutter::new(&files, &skipped, request), pending: std::collections::BinaryHeap::new(),
             seen: BTreeSet::new(), scored: 0, max_candidates: self.max_candidates, scratch: request.memory.reserve(4096)?,
         };
-        let trusted = request.verifier.permits_search_witness() && match request.scan.predicates.as_slice() {
-            [Expr::Column { id, .. }] => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
-            [Expr::Call { name, .. }] => name.eq_ignore_ascii_case("match"),
-            _ => false,
-        };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             let complete = self.runtime.visit_live_matches_at(Some(request.snapshot), request.database, segment, column, matching, true, request.cancellation, |row, tokens| {
                 if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
@@ -1045,7 +1075,7 @@ impl SearchAccelerator {
                 if candidates.scored % 128 == 0 {
                     reserve_ranking(&mut candidates.scratch, candidates.scored.saturating_add(128))?;
                 }
-                candidates.push(header.iid, scoring.bm25_arrow(&tokens()), id, false);
+                candidates.push(header.iid, scoring.bm25_arrow(&tokens()), id);
                 Ok(candidates.scored <= self.max_candidates)
             })?;
             if !complete {
@@ -1087,12 +1117,11 @@ impl SearchAccelerator {
                     Err((_, error)) => return Err(error),
                     Ok(pending) => pending,
                 };
-                let Some(Pending { key, iid, exact }) = pending else { break };
+                let Some(Pending { iid, .. }) = pending else { break };
 
                 handed += 1;
                 if request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
-                // An exactly visible event's row is in the scan's output with its score, so it needs no verifying.
-                if exact && trusted { verified.push((key, iid)); } else { iids.insert(iid); }
+                iids.insert(iid);
             }
             if candidates.scored > self.max_candidates {
                 work.decline = Some("candidate-budget");
@@ -1134,7 +1163,7 @@ mod tests {
     #[test]
     fn retry_budget_requires_distinct_iids_and_available_scratch() {
         let iid = |n| Iid([n; 16]);
-        let pending_event = |score, iid| Pending { key: RankKey::integer(score, None), iid, exact: true };
+        let pending_event = |score, iid| Pending { key: RankKey::integer(score, None), iid };
         let seen = BTreeSet::from([iid(1)]);
         let mut pending = std::collections::BinaryHeap::from([
             pending_event(1.0, iid(1)), pending_event(0.5, iid(2)), pending_event(0.25, iid(2)),

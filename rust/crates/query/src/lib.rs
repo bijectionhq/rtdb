@@ -1,6 +1,9 @@
 mod accelerate;
 #[doc(hidden)]
 pub mod rank_cutoff;
+mod ranking;
+#[doc(hidden)]
+pub use ranking::{QueryRanking, QueryWinners, RankOutcome, RankSource, RankWork, VerifiedRankRow, run_rank_partition};
 mod aggregate;
 mod context;
 mod parameters;
@@ -51,7 +54,7 @@ mod join_storage;
 mod join_spill;
 mod mark;
 
-pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, PartitionRanking, ResolvedSearchRow, ScanAccelerator, ScanRequest, ScanSelection, SearchRowLocation, SnapshotRow};
+pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, ResolvedSearchRow, ScanAccelerator, ScanRequest, ScanSelection, SearchRowLocation, SnapshotRow};
 pub use accelerate::{LocatedHistoryEvent, resolve_located_point};
 mod cow_pages;
 pub use cow_pages::ObjectPageStore;

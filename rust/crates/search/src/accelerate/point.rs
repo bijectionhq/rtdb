@@ -13,7 +13,6 @@ use crate::{SearchDefinition, SearchRuntime, file::PACKED_FORMAT_VERSION};
 
 pub(super) struct PackedVisibility {
     missing: Vec<TrieKey>,
-    primary_missing: Vec<TrieKey>,
     column: usize,
     enabled: bool,
     logical: bool,
@@ -36,23 +35,13 @@ impl PackedVisibility {
             .filter(|entry| entry.state == TrieState::Live && !indexed.contains(&entry.key))
             .filter(|entry| entry.key.recency().is_none_or(|day| day.epoch_day().saturating_mul(86_400_000_000) > earliest))
             .map(|entry| entry.key.clone()).collect();
-        let catalog = request.snapshot.trie_catalog();
-        let through_directory = catalog.entity_directory(table).map(|root| root.through_block());
-        let primary_missing = catalog.iter_tries(table)
-            .filter(|trie| trie.state == TrieState::Live && trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION).is_none())
-            .filter(|trie| through_directory.is_none_or(|through| trie.key.block_index().0 > through))
-            .map(|trie| trie.key.clone()).collect();
         let enabled = !table.is_owned_event_data() && (!indexed.is_empty()
             || request.snapshot.serving_search::<crate::runtime::ServingPostings>().is_some());
-        Self { missing, primary_missing, column, enabled, logical }
+        Self { missing, column, enabled, logical }
     }
 
     pub fn covers(&self, iid: Iid) -> bool {
         self.enabled && !self.missing.iter().any(|trie| covers(trie.part(), &iid.0))
-    }
-
-    pub fn can_resolve(&self, iid: Iid) -> bool {
-        self.covers(iid) || (self.logical && !self.primary_missing.iter().any(|trie| covers(trie.part(), &iid.0)))
     }
 
     pub async fn resolve(&self, runtime: &SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition,

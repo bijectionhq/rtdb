@@ -107,7 +107,6 @@ pub(crate) struct TreeCandidate {
     pub document: u32,
     pub key: RankKey,
     pub revision: Option<super::TextRevision>,
-    pub rectangles: Vec<[i64; 4]>,
 }
 
 impl TreeRanked {
@@ -345,7 +344,7 @@ impl TreeRanked {
                     .value(row).try_into().map_err(|_| corrupt("Ranked document has an invalid text revision"))
             }).transpose()?;
             candidates.push(TreeCandidate { iid: record.iid, member: document_member(&self.members, doc) as u32, document: doc,
-                key: self.key(score, record.id, Some(record.iid)), rectangles: record.visibility, revision });
+                key: self.key(score, record.id, Some(record.iid)), revision });
         }
         Ok(candidates)
     }

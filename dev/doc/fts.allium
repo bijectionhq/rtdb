@@ -295,30 +295,28 @@ rule RepairUnreadableSearchFile {
 -- Dense posting runs expand score-bounded windows in priority order.
 -- A missing or unreadable term directory schedules repair and uses each run's authenticated locator for term membership.
 --
--- A scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, is ranked before it opens, in each partition it reads:
+-- A point scan whose rows feed only projections and then `ORDER BY SEARCH_SCORE(column, query) DESC ... LIMIT n`, with a MATCH on the same column, can rank at one query frontier.
 --
---   1. Every matching event that may be visible bounds its IID above by its score, an IID's best event bounding it.
---      Events in live segments are scored from their rows.
---      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
+--   1. The query accounts for every partition in its pinned view before choosing a cutoff.
+--      Unopened sources and live suffixes without a bound, and exact work for uncovered history, have unbounded rank.
+--      Posting windows use a conservative sum of per-term bounds in scoring order.
+--      Ascending integer and UUID identities can strengthen an equal-score bound when the source proves the corresponding SQL identity order.
 --      Where an earlier selection supplies an IID scope, file and live events outside that scope are discarded before scoring.
---      Resolution reads the full history of each selected IID.
---      A window adds the upper bounds for each term in scoring order.
---      A bound uses the maximum canonical unit score when available, or maximum frequency and minimum stored length with binary64 roundoff covered before addition.
---      For ascending integer identity ties, a window may also carry the smallest possible identity at its score ceiling.
---   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
---      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
---      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
---   3. Verification can stop early only when the n-th verified rank key is strictly ahead of every remaining bound.
---      A remaining bound represents a scored candidate or unread work.
---      A tie is ordered by identity only when both bounds prove its order.
---      The two signed zeroes have the same score rank.
---      An invalid score or bound supplied to this decision also keeps verification going.
---   4. The scan hands on every verified row that may be in the first n.
---      A ranked point scan may emit projected rows retained by its verifier at the same snapshot.
---      If the gather exceeds available memory, the scan releases the retained payload and streams from the narrowed IID selection.
+--   2. Workers expand work and nominate candidates under its bound.
+--      A claimed bound covers the work through publication of its children and verified outcomes.
+--      Verification resolves the candidate's full history and gathers the visible row's text, SQL rank keys and predicate columns.
+--      The verifier checks the SQL predicates and scores that payload.
+--      A stale posting supplies no verified score for its revision.
+--   3. The query stops when all work is exhausted, or when its verified cutoff strictly precedes every queued and claimed bound.
+--      Pending verification has a bound until the verifier reports.
+--      The cutoff counts the first OFFSET plus LIMIT rows across partitions.
+--      A score-only bound requires a strictly lower score than the cutoff.
+--      The signed zeroes have equal score order.
+--      An invalid bound keeps the affected work eligible.
+--   4. The scan gathers projected columns for retained versions after deciding the query's prefix.
+--      If its final gather exceeds available memory, the scan can stream from the narrowed IID selection.
+--      The SQL sort applies the final ordering and window.
 --
--- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
--- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
 -- A candidate-budget miss without an IID scope skips unranked narrowing if the ranked candidate union already contains more distinct IIDs than its limit.
 -- This union is a lower bound for the unranked candidate union and counts each IID once across its pending and handed-out events.
 -- Other declines use unranked narrowing, including an exhausted verification budget or a candidate-budget miss where there is no distinct-IID proof.
@@ -436,22 +434,16 @@ contract SearchCorrectness {
     -- What narrowing may and may not change about a query.
 
     @invariant RankedLimitKeepsTheFirstRows
-        -- Under a ranked LIMIT, the scan hands on every row in the prefix the SQL sort needs.
-        -- The prefix includes the rows skipped by OFFSET and the rows requested by LIMIT.
-        -- A tie at the cutoff remains eligible until the optimizer can prove its position.
-        -- Partitions at a shared basis can admit the highest announced bound first and share a cutoff supplied by verified winners.
-        -- Only the verifier's scores of resolved rows that pass the scan's predicates enter that cutoff; a score certified by a forward witness waits until its payload agrees.
-        -- Pending gap work has an unbounded score until it yields candidates for exact verification.
-        -- A partition prunes on the shared cutoff only when its remaining score bound is strictly lower.
-        -- A bitemporal point scan on one partition may break score ties by ascending UUID _id when the captured table stores UUIDs as their canonical IIDs.
-        -- The live sources attest this identity relationship, and publication records it only after checking every put in the ordered Arrow tree's input.
-        -- The first document in an unread rank range supplies a lower UUID bound for the range because the tree assigns document ordinals in nondecreasing IID order.
-        -- An uncertified tree, an overlapping legacy search file, or missing live identity evidence leaves the UUID cutoff score-only.
-        -- Any unread candidate or window with an unknown tie bound remains eligible at an equal score.
-        -- Independently searched partitions may share a cutoff backed by sufficiently many distinct SQL-verified rows.
-        -- A shared score-only cutoff excludes a branch only when the branch's upper bound is strictly below it.
-        -- With a single supported MATCH residual, an authenticated run can stand in for a payload until its version is among the finalists.
-        -- The scan checks a finalist's resolved version and score on its primary Arrow row before emitting it.
+        -- The scan hands on every row in the prefix the SQL sort needs, including OFFSET and LIMIT.
+        -- One query cutoff accounts for all unopened, queued, claimed and pending-verification work across the pinned partitions.
+        -- Work with unknown rank has an unbounded ceiling until the query has stronger evidence.
+        -- A worker replaces its claimed bound with its child bounds and verified rows in one publication.
+        -- Every cutoff row is a resolved version whose primary payload satisfies the scan's predicates and supplies its score.
+        -- A stale revision cannot suppress a different verified version of the same entity.
+        -- A score tie remains eligible until the available SQL rank keys prove its order.
+        -- Integer and certified canonical UUID bounds can order score ties across partitions.
+        -- A UUID posting range's lower identity bound comes from its first document where publication certifies nondecreasing canonical IID order.
+        -- The final projection gathers the retained rows at the pinned cut.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.

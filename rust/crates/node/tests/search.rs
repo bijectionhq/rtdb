@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicI64, AtomicUsize, Ordering}};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -1333,8 +1333,47 @@ async fn a_uuid_tie_break_prunes_tied_posting_windows_and_preserves_the_sql_page
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
 
+struct FrontierProbe {
+    search: Arc<rtdb_search::SearchAccelerator>,
+    opened: AtomicUsize,
+    fallback: AtomicUsize,
+}
+
+#[async_trait]
+impl rtdb_query::ScanAccelerator for FrontierProbe {
+    async fn candidate_iids(&self, request: &rtdb_query::ScanRequest<'_>) -> Result<Option<std::collections::BTreeSet<rtdb_types::Iid>>> {
+        if request.scan.top_k.is_some() { self.fallback.fetch_add(1, Ordering::Relaxed); }
+        self.search.candidate_iids(request).await
+    }
+
+    async fn rank_source<'a>(&'a self, request: rtdb_query::ScanRequest<'a>) -> Result<Option<Box<dyn rtdb_query::RankSource + 'a>>> {
+        let source = self.search.rank_source(request).await?;
+        if source.is_some() { self.opened.fetch_add(1, Ordering::Relaxed); }
+        Ok(source)
+    }
+}
+
+async fn partition_search(
+    partitions: &[rtdb_index::Snapshot], storage: &Arc<rtdb_storage::cache::BufferPool>,
+    sql: &str, accelerator: Option<Arc<dyn rtdb_query::ScanAccelerator>>,
+) -> Vec<Vec<Value>> {
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 30);
+    let catalog = rtdb_query::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(),
+        rtdb_query::DatabaseSnapshot { partitions: partitions.to_vec(), storage: Arc::clone(storage) },
+    )]), false).unwrap();
+    let context = rtdb_query::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(i64::MAX / 2), "UTC",
+        rtdb_query::QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap();
+    let context = match accelerator {
+        Some(accelerator) => context.with_accelerators(Arc::from([accelerator])),
+        None => context,
+    };
+    let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory).unwrap();
+    let cursor = rtdb_query::PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, Vec::new()).await.unwrap();
+    rows(cursor).await
+}
+
 #[tokio::test]
-async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking_everything() {
+async fn randomized_ranked_windows_over_partitions_match_exhaustive_sql() {
     let mut options = options();
     options.file_size_target = 1;
     options.automatic_artefacts = false;
@@ -1347,10 +1386,12 @@ async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking
     let mut seed = 23u64;
     let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
     let mut partitions = Vec::new();
-    for round in 0..2 {
-        let operations = (0..150).map(|id| {
+    for round in 0..4 {
+        let size = 60 + next() % 120;
+        let operations = (0..size).map(|id| {
             let body: Vec<_> = (0..1 + next() % 8).map(|_| words[next() % words.len()]).collect();
-            sql(&format!("INSERT INTO docs RECORDS {{_id: {}, body: '{}'}}", id + 1000 * round, body.join(" ")))
+            sql(&format!("INSERT INTO docs RECORDS {{_id: {}, body: '{}', bucket: {}, payload: 'doc-{round}-{id}'}}",
+                id + 1000 * round, body.join(" "), next() % 4))
         }).collect();
         assert!(session.state_mut().execute_tx(operations, AutonomousTxOptions::default()).await.unwrap().committed());
         database.flush().await.unwrap();
@@ -1359,29 +1400,20 @@ async fn a_ranked_limit_over_several_partitions_returns_the_same_rows_as_ranking
         database.build_artefacts().await.unwrap();
         partitions.push(database.snapshot());
     }
-    let memory = rtdb_columnar::MemoryBudget::new(1 << 30);
-    let recording = Arc::new(Recording { inner: rtdb_search::SearchRuntime::new(64 << 20).accelerator(), sizes: Default::default(), retained: Default::default() });
-    let run = |query: String| {
-        let catalog = rtdb_query::CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".to_string(), rtdb_query::DatabaseSnapshot { partitions: partitions.clone(), storage: Arc::clone(database.storage()) })]), false).unwrap();
-        let (memory, recording) = (Arc::clone(&memory), Arc::clone(&recording));
-        async move {
-            let context = rtdb_query::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(i64::MAX / 2), "UTC", rtdb_query::QueryOptions::default(), &tokio_util::sync::CancellationToken::new()).unwrap()
-                .with_accelerators(Arc::from([recording as Arc<dyn rtdb_query::ScanAccelerator>]));
-            let prepared = rtdb_sql::prepare_in(&query, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory).unwrap();
-            let cursor = rtdb_query::PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, Vec::new()).await.unwrap();
-            rows(cursor).await.into_iter().map(|row| (row[0].clone(), row[1].clone())).collect::<Vec<_>>()
-        }
-    };
+    let frontier = Arc::new(FrontierProbe {
+        search: rtdb_search::SearchRuntime::new(64 << 20).accelerator(), opened: Default::default(), fallback: Default::default(),
+    });
     for (matching, scoring) in [("invoice", "invoice overdue"), ("overdue late", "late"), ("book", "book red paid")] {
-        let query = format!("SELECT _id, SEARCH_SCORE(body, '{scoring}') AS score FROM docs WHERE MATCH(body, '{matching}') ORDER BY score DESC, _id");
-        let everything = run(query.clone()).await;
-        assert!(everything.len() > 40, "{query} matched only {}", everything.len());
-        for k in [1, 5, 20] {
-            recording.sizes.lock().unwrap().clear();
-            assert_eq!(run(format!("{query} LIMIT {k}")).await, everything.iter().take(k).cloned().collect::<Vec<_>>(), "{query} LIMIT {k}");
-            let sizes = recording.sizes.lock().unwrap().clone();
-            assert_eq!(sizes.len(), 2, "each partition narrowed");
-            assert!(sizes.iter().sum::<usize>() < everything.len(), "{query} LIMIT {k}: each partition was ranked, not merely narrowed: {sizes:?}");
+        let query = format!("SELECT _id, payload, SEARCH_SCORE(body, '{scoring}') AS score FROM docs \
+            WHERE MATCH(body, '{matching}') AND bucket <> 3 ORDER BY score DESC, _id");
+        let everything = partition_search(&partitions, database.storage(), &query, None).await;
+        assert!(everything.len() > 20, "{query} matched only {}", everything.len());
+        for (limit, offset) in [(1, 0), (5, 3), (20, 17)] {
+            let statement = format!("{query} LIMIT {limit} OFFSET {offset}");
+            let ranked = partition_search(&partitions, database.storage(), &statement, Some(frontier.clone())).await;
+            assert_eq!(ranked, everything.iter().skip(offset).take(limit).cloned().collect::<Vec<_>>(), "{statement}");
+            assert_eq!(frontier.opened.swap(0, Ordering::Relaxed), partitions.len(), "{statement}");
+            assert_eq!(frontier.fallback.load(Ordering::Relaxed), 0, "{statement}");
         }
     }
     node.shutdown();
@@ -1922,15 +1954,26 @@ async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking(
     let stop = CancellationToken::new();
     let table = TableRef::new("public", "docs");
     node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
-    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
-    for batch in [
-        "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report'}, {_id: 2, body: 'audit memo'}, {_id: 3, body: 'report'}",
-        "INSERT INTO docs RECORDS {_id: 4, body: 'audit report report report'}, {_id: 5, body: 'audit report'}, {_id: 2, body: 'audit report memo'}",
+    assert!(session.state_mut().execute_tx(vec![
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+        sql("CREATE SEARCH INDEX uuid_docs_body ON uuid_docs (body)"),
+    ], AutonomousTxOptions::default()).await.unwrap().committed());
+    let mut partitions = Vec::new();
+    for (batch, uuid_ids) in [
+        ("INSERT INTO docs RECORDS {_id: 1, body: 'audit report report'}, {_id: 2, body: 'audit memo'}, {_id: 3, body: 'report'}", [1, 4]),
+        ("INSERT INTO docs RECORDS {_id: 5, body: 'audit report'}, {_id: 2, body: 'audit report memo'}", [2, 3]),
+        ("INSERT INTO docs RECORDS {_id: 4, body: 'audit report report report'}", [5, 6]),
     ] {
-        assert!(session.state_mut().execute_tx(vec![sql(batch)], AutonomousTxOptions::default()).await.unwrap().committed());
+        let mut writes = vec![sql(batch)];
+        writes.extend(uuid_ids.map(|id| sql(&format!(
+            "INSERT INTO uuid_docs RECORDS {{_id: UUID '00000000-0000-0000-0000-{id:012x}', body: 'audit report'}}"
+        ))));
+        assert!(session.state_mut().execute_tx(writes, AutonomousTxOptions::default()).await.unwrap().committed());
         database.flush().await.unwrap();
         node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+        partitions.push(database.snapshot());
     }
+    database.build_artefacts().await.unwrap();
     let catalog = database.trie_catalog();
     let runs: Vec<_> = catalog.search_runs(&table).cloned().collect();
     assert_eq!(runs.len(), 2);
@@ -1938,6 +1981,42 @@ async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking(
     let missing = rtdb_storage::ObjectKey::new(runs[0].object_key(&slug).unwrap()).unwrap();
     database.storage().invalidate(&missing).await.unwrap();
     database.object_store().delete(&missing).await.unwrap();
+
+    let uuid_table = TableRef::new("public", "uuid_docs");
+    let uuid_slug = database.snapshot().table_entry(&uuid_table).unwrap().slug.clone();
+    let missing_uuid = catalog.search_runs(&uuid_table).next().unwrap().object_key(&uuid_slug).unwrap();
+    let missing_uuid = rtdb_storage::ObjectKey::new(missing_uuid).unwrap();
+    database.storage().invalidate(&missing_uuid).await.unwrap();
+    database.object_store().delete(&missing_uuid).await.unwrap();
+
+    assert!(session.state_mut().execute_tx(vec![
+        sql("INSERT INTO docs RECORDS {_id: -1, body: 'audit report', payload: 'live'}"),
+        sql("INSERT INTO uuid_docs RECORDS {_id: UUID '00000000-0000-0000-0000-000000000000', body: 'audit report', payload: 'live'}"),
+    ], AutonomousTxOptions::default()).await.unwrap().committed());
+    partitions.push(database.snapshot());
+    let frontier = Arc::new(FrontierProbe { search: runtime.accelerator(), opened: Default::default(), fallback: Default::default() });
+    for table_name in ["docs", "uuid_docs"] {
+        let query = format!("SELECT _id, body, payload, SEARCH_SCORE(body, 'absent') AS score FROM {table_name} \
+            WHERE MATCH(body, 'audit report') ORDER BY score DESC, _id");
+        let everything = partition_search(&partitions, database.storage(), &query, None).await;
+        assert!(everything.len() > 4, "{query}");
+        for (limit, offset) in [(2, 0), (3, 2)] {
+            let statement = format!("{query} LIMIT {limit} OFFSET {offset}");
+            let ranked = partition_search(&partitions, database.storage(), &statement, Some(frontier.clone())).await;
+            assert_eq!(ranked, everything.iter().skip(offset).take(limit).cloned().collect::<Vec<_>>(), "{statement}");
+            assert_eq!(frontier.opened.swap(0, Ordering::Relaxed), partitions.len(), "{statement}");
+            assert_eq!(frontier.fallback.load(Ordering::Relaxed), 0, "{statement}");
+        }
+    }
+
+    let explicit = "SELECT _id, body FROM docs WHERE _id = 1 AND MATCH(body, 'audit report') \
+        ORDER BY SEARCH_SCORE(body, 'report') DESC LIMIT 2";
+    let reads = runtime.logical_run_reads();
+    let expected = partition_search(&partitions, database.storage(), explicit, None).await;
+    assert_eq!(partition_search(&partitions, database.storage(), explicit, Some(frontier.clone())).await, expected);
+    assert_eq!(frontier.opened.load(Ordering::Relaxed), partitions.len());
+    assert_eq!(frontier.fallback.load(Ordering::Relaxed), 0);
+    assert_eq!(runtime.logical_run_reads(), reads);
 
     let queries = [
         ("SELECT _id, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, 'audit report') ORDER BY score DESC, _id ASC LIMIT 2",

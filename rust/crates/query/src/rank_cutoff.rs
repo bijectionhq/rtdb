@@ -128,6 +128,8 @@ pub struct RankKey {
 
 #[cfg(not(verus_keep_ghost))]
 impl RankKey {
+    pub fn unknown() -> Self { Self::integer(f64::INFINITY, None) }
+
     pub fn integer(score: f64, id: Option<i64>) -> Self {
         Self { score, id: id.map(RankIdentity::Integer) }
     }
