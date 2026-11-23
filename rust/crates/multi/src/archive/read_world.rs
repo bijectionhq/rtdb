@@ -260,7 +260,7 @@ where
         None,
         |record| admit(record).map(|_| None),
         |record, _, region| async move {
-            resources.cancellation.run_until_cancelled(async {
+            resources.cancellation.run_until_cancelled(Box::pin(async {
                 let (capture, suffix) = admit(&record)?;
                 let bucket = archive.bucket(Arc::clone(&region)).await?;
                 if read(
@@ -391,7 +391,7 @@ where
                     }
                 }
                 run(context, basis, terminal_source).await
-            }).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
+            })).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
         },
     )
     .await

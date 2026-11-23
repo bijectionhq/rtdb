@@ -169,9 +169,9 @@ pub(super) async fn stage_checkpoint_for(
     {
         return Err(inconsistent("A terminal transfer requires the original current source checkpoint"));
     }
-    super::admit_lifetime_restore(
+    Box::pin(super::admit_lifetime_restore(
         directory.as_ref(), archive, keys, &point, &manifest, hosted_task.as_ref(), transfer_only, false,
-    ).await?;
+    )).await?;
     let intent = CheckpointStage {
         intent: request,
         source_incarnation: point.incarnation,
