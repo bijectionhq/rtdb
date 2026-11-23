@@ -574,7 +574,9 @@ impl Node {
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
-        if !self.factory.options.replication.enabled { return Ok(None); }
+        if !self.factory.options.replication.enabled || database.storage.object_store().defers_trie_releases() {
+            return Ok(None);
+        }
         database.read_lease(&self.factory.clock, &self.factory.options.garbage).await.map(Some)
     }
 

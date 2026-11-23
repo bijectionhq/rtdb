@@ -667,7 +667,7 @@ impl MaintenanceSupervisor {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
             // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
-            if self.options.replication.enabled {
+            if self.options.replication.enabled && !self.store.defers_trie_releases() {
                 if let Ok(lease) = self.options.garbage.reader_lease_micros() {
                     let observed_at = self.clock.monotonic_micros();
                     let installed = current.installed.map(|prefix| prefix.replica);

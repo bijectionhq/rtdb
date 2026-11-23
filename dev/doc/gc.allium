@@ -26,7 +26,9 @@
 -- An admitted provider operation retains that registration through completion, including after caller cancellation.
 -- Compactor reset starts a new naming epoch, so a deletion authorized before it can never reach an output planned after it.
 --
--- Query snapshots on every node also hold a bounded read lease, because another node's collector cannot see them.
+-- Query and fragment snapshots on coordinated storage register with the catalog floor before storage access.
+-- An admitted capture retains that registration through its provider requests.
+-- Replicated snapshots on uncoordinated storage hold a bounded read lease.
 -- A node anchors its lease at a monotonic clock reading taken before it reads the replica log's tip, once its catalog has applied that tip.
 -- A node confirms any pending observation its catalog has already applied before deciding whether to sample the tip again.
 -- A snapshot captured after that confirmation may begin provider requests strictly before the anchor plus `reader_lease` minus `reader_lease_margin`.
