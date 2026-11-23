@@ -1305,6 +1305,38 @@ impl OwnedReadSession {
     }
 
     /// Reads the exact local shadow, retaining its revision even when that shadow is a tombstone.
+    /// Certifies the exact physical revision of a protected writable-world clock publication.
+    pub async fn certify_world_accepted_cut<'a>(
+        &'a self, world: &'a rtdb_types::OwnedWorld, relation: &'a rtdb_types::OwnedRelation,
+        system: Timestamp,
+    ) -> Result<OwnedWorldAcceptedCut<'a>> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        if !relation.is_root_data() || !world.mode.is_writable() || world.dropped
+            || world.schemas.relation(relation).is_none() || system <= world.basis.system_time
+            || system > self.present.system_time
+        {
+            return Err(unavailable());
+        }
+        let (current, _schema) = self.world_registration(world.id).await?.ok_or_else(unavailable)?;
+        if &current != world { return Err(unavailable()); }
+        self.world_merged_changes(world.id, std::slice::from_ref(relation), system, system, 1).await?;
+        let context = self.relation_context(relation)?;
+        let context = context.with_owned_system_cut(system, &context.cancellation)?;
+        let (registration, _schema) = rtdb_query::read_owned_world(Arc::clone(&context), &self.owner, world.id)
+            .await?.ok_or_else(unavailable)?;
+        let (clock, publication) = rtdb_query::read_owned_world_clock_revision(context, &self.owner, world.id)
+            .await?.ok_or_else(unavailable)?;
+        // The clock row is private and appears only after its ordered publication is applied.
+        // Held clocks can lag their physical revision. Proposal clocks may also lag after replay.
+        if &registration != world || publication != system || clock <= world.initial_clock() || clock > system {
+            return Err(unavailable());
+        }
+        self.check_relation(relation)?;
+        Ok(OwnedWorldAcceptedCut { held: self, world: world.id, relation, system })
+    }
+
     pub async fn world_application_clock(&self, world: rtdb_types::Iid) -> Result<Option<Timestamp>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
@@ -2144,6 +2176,22 @@ fn lifetime_read_unavailable() -> Anomaly {
 
 impl Drop for OwnedReadSession {
     fn drop(&mut self) { self.close(); }
+}
+
+/// A certified earlier coordinate tied to the original hold and relation.
+pub struct OwnedWorldAcceptedCut<'a> {
+    held: &'a OwnedReadSession,
+    world: rtdb_types::Iid,
+    relation: &'a rtdb_types::OwnedRelation,
+    system: Timestamp,
+}
+
+impl OwnedWorldAcceptedCut<'_> {
+    pub async fn shadow(
+        &self, id: &rtdb_types::EntityId, valid: Timestamp,
+    ) -> Result<OwnedWorldShadowRead> {
+        self.held.read_world_shadow_at(self.world, self.relation, id, valid, self.system, false).await
+    }
 }
 
 pub struct OwnedWorldShadowRead {

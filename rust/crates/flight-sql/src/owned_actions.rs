@@ -197,6 +197,7 @@ pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParen
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
 pub(crate) const RETAIN_REPLAYED_WORLD_V1: &str = "rtdb.owned.RetainReplayedWorld.v1";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
+pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
@@ -2259,6 +2260,23 @@ impl Service {
             return Err(Status::not_found("unknown owned world read"));
         }
         Ok(entry)
+    }
+
+    pub(crate) async fn held_world_point_at_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
+        let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
+        let system = Timestamp(i64::from_be_bytes(*system));
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
+        let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
+        let point = held.snapshot.accepted_point(&relation, &id, valid, system).await.map_err(status)?;
+        if point.present != system || point.witness.is_some() || point.until.is_some() {
+            return Err(history_invalid());
+        }
+        let response = self.world_point_reply(call, point, valid, None)?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(response)
     }
 
     pub(crate) async fn held_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

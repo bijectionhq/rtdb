@@ -526,6 +526,13 @@ async fn open_private_catalog(
 pub async fn read_owned_world_clock(
     context: Arc<QueryContext>, owner: &str, world: Iid,
 ) -> Result<Option<Timestamp>> {
+    Ok(read_owned_world_clock_revision(context, owner, world).await?.map(|(clock, _)| clock))
+}
+
+/// Returns the logical reading and its actual ordered publication time.
+pub async fn read_owned_world_clock_revision(
+    context: Arc<QueryContext>, owner: &str, world: Iid,
+) -> Result<Option<(Timestamp, Timestamp)>> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
     let id = EntityId::Uuid(world.0);
     let Some(mut cursor) = open_owned_table_point(
@@ -543,7 +550,7 @@ pub async fn read_owned_world_clock(
             return Err(unavailable());
         };
         if reading > revision.0 { return Err(unavailable()); }
-        clock = Some(Timestamp(reading));
+        clock = Some((Timestamp(reading), revision));
     }
     Ok(clock)
 }
