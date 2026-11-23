@@ -213,10 +213,11 @@ impl ObjectStore for RemoteStore {
                 return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
             }
             let version = physical_version(Some(&namespace), &path, response.meta.version.clone());
-            let value = response.bytes().await.map_err(|error| provider_error(&key, error))?;
-            if value.len() as u64 != range.end - range.start {
-                return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
-            }
+            let length = usize::try_from(range.end - range.start)
+                .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
+            let value = collect_exact_body(response, &key, length, || Error::Remote {
+                key: key.to_string(), message: "provider returned a different byte range length".into(),
+            }).await?;
             Ok(ObjectObservation { value, version })
         }).await
     }
@@ -362,6 +363,28 @@ fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
     }
 }
 
+/// Reject an oversized response before copying it into the reserved body buffer.
+async fn collect_exact_body(object: GetResult, key: &ObjectKey, length: usize, wrong_size: impl Fn() -> Error) -> Result<Bytes> {
+    let mut stream = object.into_stream();
+    let first = stream.try_next().await.map_err(|error| provider_error(key, error))?.unwrap_or_default();
+    if first.len() > length { return Err(wrong_size()); }
+    if first.len() == length {
+        while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+            if !chunk.is_empty() { return Err(wrong_size()); }
+        }
+        return Ok(first);
+    }
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(&first);
+    drop(first);
+    while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
+        if chunk.len() > length - bytes.len() { return Err(wrong_size()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != length { return Err(wrong_size()); }
+    Ok(bytes.into())
+}
+
 impl RemoteObjects {
     fn reader(&self) -> Result<&dyn ProviderStore> {
         if IoRegion::requires_audience_transport() {
@@ -408,24 +431,8 @@ impl RemoteObjects {
             return Err(wrong_size());
         }
         let version = physical_version(namespace, &path, object.meta.version.clone());
-        let mut stream = object.into_stream();
-        let first = stream.try_next().await.map_err(|error| provider_error(key, error))?.unwrap_or_default();
-        if first.len() > length { return Err(wrong_size()); }
-        if first.len() == length {
-            while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
-                if !chunk.is_empty() { return Err(wrong_size()); }
-            }
-            return Ok(ObjectObservation { value: first, version });
-        }
-        let mut bytes = Vec::with_capacity(length);
-        bytes.extend_from_slice(&first);
-        drop(first);
-        while let Some(chunk) = stream.try_next().await.map_err(|error| provider_error(key, error))? {
-            if chunk.len() > length - bytes.len() { return Err(wrong_size()); }
-            bytes.extend_from_slice(&chunk);
-        }
-        if bytes.len() != length { return Err(wrong_size()); }
-        Ok(ObjectObservation { value: bytes.into(), version })
+        let value = collect_exact_body(object, key, length, wrong_size).await?;
+        Ok(ObjectObservation { value, version })
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {

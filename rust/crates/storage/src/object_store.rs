@@ -48,15 +48,33 @@ pub struct ObjectObservation<T> {
     pub version: Option<rtdb_types::PhysicalObjectVersion>,
 }
 
+/// The bytes owned by a whole-object read, excluding provider transport metadata.
+pub struct WholeObjectAllocation {
+    pub retained_bytes: usize,
+    pub scratch_bytes: usize,
+}
+
 pub struct ReadReservation {
     length: usize,
     retention: Arc<dyn Send + Sync>,
+    retained_bytes: usize,
+    scratch: Option<Arc<rtdb_types::MemoryReservation>>,
 }
 
 impl ReadReservation {
     /// `retention` must hold the memory charge for `length` bytes until it is dropped.
     pub fn new<T: Send + Sync + 'static>(length: usize, retention: T) -> Self {
-        Self { length, retention: Arc::new(retention) }
+        Self { length, retention: Arc::new(retention), retained_bytes: 0, scratch: None }
+    }
+
+    pub(crate) fn whole(length: usize, retained: Arc<rtdb_types::MemoryReservation>, scratch: Option<Arc<rtdb_types::MemoryReservation>>) -> Self {
+        let retained_bytes = retained.bytes();
+        Self { length, retention: retained, retained_bytes, scratch }
+    }
+
+    pub fn covers(&self, allocation: &WholeObjectAllocation) -> bool {
+        self.retained_bytes >= allocation.retained_bytes
+            && self.scratch.as_ref().map_or(0, |scratch| scratch.bytes()) >= allocation.scratch_bytes
     }
 
     pub fn length(&self) -> usize { self.length }
@@ -68,9 +86,13 @@ impl ReadReservation {
         Ok(())
     }
 
-    /// Keeps the underlying charge alive in provider tasks admitted while polling this read.
+    /// Keeps output and temporary charges alive in provider tasks admitted while polling this read.
     pub async fn retaining_io<T>(&self, work: impl std::future::Future<Output = T>) -> T {
-        crate::IoRegion::retaining(Arc::clone(&self.retention), work).await
+        let owner: Arc<dyn Send + Sync> = match &self.scratch {
+            Some(scratch) => Arc::new((Arc::clone(&self.retention), Arc::clone(scratch))),
+            None => Arc::clone(&self.retention),
+        };
+        crate::IoRegion::retaining(owner, work).await
     }
 
     /// Transfers the charge to the completed allocation; mismatched byte counts are rejected.
@@ -183,6 +205,10 @@ pub trait ObjectStore: Send + Sync {
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         reservation.finish(self.get_range(key, range).await?)
+    }
+    /// How much storage the pool must admit before reading the object body.
+    fn whole_object_allocation(&self, length: usize) -> Result<WholeObjectAllocation> {
+        Ok(WholeObjectAllocation { retained_bytes: length, scratch_bytes: 0 })
     }
     /// Reads a whole immutable object of the reserved length.
     async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> Result<RetainedBytes> {

@@ -18,7 +18,7 @@ use prost_types::Any;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
 use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, WholeObjectAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -950,7 +950,7 @@ impl ObjectStore for FencedStore {
 /// The scheduled reader only follows exact keys in its pinned catalog.
 struct AudienceObjectStore(EncryptingStore);
 
-fn audience_read_only() -> Error { Error::Closed("The audience object view admits only exact reads".into()) }
+fn audience_read_only() -> Error { Error::Closed("The audience object view requires reserved whole-object reads".into()) }
 
 #[async_trait]
 impl ObjectStore for AudienceObjectStore {
@@ -972,23 +972,23 @@ impl ObjectStore for AudienceObjectStore {
     async fn observe_heads(&self, keys: &[ObjectKey]) -> rtdb_storage::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
         IoRegion::audience_object_read(self.0.observe_heads(keys)).await
     }
-    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        IoRegion::audience_object_read(self.0.get(key)).await
-    }
-    async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        IoRegion::audience_object_read(self.0.get_fresh(key)).await
-    }
-    async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
-        IoRegion::audience_object_read(self.0.get_fresh_exact(key, length)).await
-    }
-    async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
-        IoRegion::audience_object_read(self.0.observe_fresh_exact(key, length)).await
-    }
-    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
-        IoRegion::audience_object_read(self.0.get_range(key, range)).await
+    async fn get(&self, _: &ObjectKey) -> rtdb_storage::Result<Bytes> { Err(audience_read_only()) }
+    async fn get_range(&self, _: &ObjectKey, _: Range<u64>) -> rtdb_storage::Result<Bytes> { Err(audience_read_only()) }
+    fn whole_object_allocation(&self, length: usize) -> rtdb_storage::Result<WholeObjectAllocation> {
+        let overflow = || Error::Task("Audience object allocation size overflow".into());
+        let sealed = length.checked_add(OVERHEAD).ok_or_else(overflow)?;
+        // A held archive can hold the original ciphertext, the decrypted body and its
+        // resealed serving copy at once. Budget all three until provider I/O drains.
+        let scratch_bytes = sealed.checked_mul(3).ok_or_else(overflow)?;
+        Ok(WholeObjectAllocation { retained_bytes: sealed, scratch_bytes })
     }
     async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
-        let observed = reservation.retaining_io(self.observe_fresh_exact(key, reservation.length())).await?;
+        let length = reservation.length();
+        if !reservation.covers(&self.whole_object_allocation(length)?) {
+            return Err(audience_read_only());
+        }
+        let read = IoRegion::audience_object_read(self.0.observe_fresh_exact(key, length));
+        let observed = reservation.retaining_io(read).await?;
         reservation.finish(observed.value)
     }
     fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { false }
@@ -2144,8 +2144,14 @@ mod tests {
         let bytes = Bytes::from_static(b"catalog");
         EncryptingStore::new(uncached.clone(), &material).unwrap().put(&object, bytes.clone()).await.unwrap();
         assert!(matches!(stores.ordinary.get(&object).await, Err(Error::MissingObject(_))));
-        assert_eq!(audience.store.get_reserved_object(&object, ReadReservation::new(bytes.len(), ())).await.unwrap().as_slice(), bytes.as_ref());
-        assert!(audience.store.get_reserved_object(&object, ReadReservation::new(bytes.len() - 1, ())).await.is_err());
+        let allocation = audience.store.whole_object_allocation(bytes.len()).unwrap();
+        let peak = allocation.retained_bytes + allocation.scratch_bytes;
+        let too_small = rtdb_storage::cache::BufferPool::new(audience.store.clone(), peak - 1);
+        assert!(matches!(too_small.get(&object).await, Err(Error::MemoryLimit { .. })));
+        let pool = rtdb_storage::cache::BufferPool::new(audience.store.clone(), peak);
+        assert_eq!(pool.get(&object).await.unwrap().as_slice(), bytes.as_ref());
+        assert_eq!(pool.pool_retained_bytes(), allocation.retained_bytes);
+        assert!(matches!(audience.store.get(&object).await, Err(Error::Closed(_))));
 
         let unsupported = factory.wrap_stores(&configuration(Some(2)), cached.clone(), None).await.unwrap();
         assert!(unsupported.audience.is_none());

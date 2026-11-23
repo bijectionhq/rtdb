@@ -356,14 +356,21 @@ impl BufferPool {
         Ok(CacheLease { allocation, range: 0..length })
     }
 
+    async fn fetch_whole(&self, key: &ObjectKey, length: usize, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<RetainedBytes>> {
+        let allocation = self.store.whole_object_allocation(length)?;
+        let retained = reserve(allocation.retained_bytes)?;
+        let scratch = (allocation.scratch_bytes > 0).then(|| reserve(allocation.scratch_bytes)).transpose()?;
+        let reservation = ReadReservation::whole(length, retained, scratch);
+        Ok(Arc::new(self.store.get_reserved_object(key, reservation).await?))
+    }
+
     /// As `get`, except that an object the pool cannot admit is read whole under `fallback`, and not kept.
     pub async fn get_or(&self, key: &ObjectKey, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
         match self.get(key).await {
             Err(Error::MemoryLimit { .. }) => {
                 let size = self.store.head(key).await?.size;
                 let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
-                let reservation = ReadReservation::new(size, reserve_from(fallback, size)?);
-                let allocation = Arc::new(self.store.get_reserved_object(key, reservation).await?);
+                let allocation = self.fetch_whole(key, size, |bytes| reserve_from(fallback, bytes)).await?;
                 Ok(CacheLease { allocation, range: 0..size })
             }
             fetched => fetched,
@@ -391,8 +398,7 @@ impl BufferPool {
                 None => {
                     let size = self.store.head(key).await?.size;
                     let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
-                    let reservation = ReadReservation::new(size, self.reserve(size)?);
-                    let allocation = Arc::new(self.store.get_reserved_object(key, reservation).await?);
+                    let allocation = self.fetch_whole(key, size, |bytes| self.reserve(bytes)).await?;
                     *slot = Some(allocation.clone());
                     allocation
                 }
