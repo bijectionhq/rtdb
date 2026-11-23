@@ -45,6 +45,7 @@ pub struct PlacedOptions {
     pub capabilities: Option<Arc<dyn rtdb_pgwire::CapabilityVerifier>>,
     pub flight_peer: Option<Arc<dyn rtdb_flight_sql::FlightPeerVerifier>>,
     pub flight_owned_worlds: Option<Arc<dyn rtdb_flight_sql::OwnedWorldHost>>,
+    pub world_constraints: Option<Arc<dyn rtdb_node::WorldConstraintArchive>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,12 +159,13 @@ impl ServerDriver {
         let capabilities = placed.as_ref().and_then(|placed| placed.capabilities.clone());
         let flight_peer = placed.as_ref().and_then(|placed| placed.flight_peer.clone());
         let flight_owned_worlds = placed.as_ref().and_then(|placed| placed.flight_owned_worlds.clone());
+        let world_constraints = placed.as_ref().and_then(|placed| placed.world_constraints.clone());
         let gateway_session_state = placed.is_some();
         if let Some(placed) = placed {
             for (protobuf_type, factory) in placed.log_factories { resources = resources.register_log(protobuf_type, factory)?; }
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
-        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, read_fence, scan_fragmenter,
+        let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter,
             ..NodeServices::local(authority, metrics.clone(), auth.clone(), metrics.clone()) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;

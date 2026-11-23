@@ -3,12 +3,15 @@ use std::{collections::BTreeSet, num::NonZeroUsize};
 use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, WorldShadow};
 
 use super::{
-    owned_unique::{MAX_KEY_BYTES, unique_id},
+    owned_unique::{MAX_KEY_BYTES, occupancy_value_at, unique_id},
     replay_constraints::{ConstraintMember, ConstraintMembers},
     *,
 };
 
 use crate::hosted_control::ReplayConstraintKind;
+
+mod world;
+pub use world::{ArchivedCapacityCheck, WorldConstraintArchive};
 
 const RULE: &str = "!rule";
 const MAX_RULES: usize = 16;
@@ -117,6 +120,22 @@ impl CapacityRule {
                     .filter(|&name| name != self.column.as_str()),
             )
             .collect()
+    }
+
+    fn key(
+        &self, qualifiers: &[(&str, &[u8])], mut value: impl FnMut(&str) -> Result<Value>,
+    ) -> Result<Option<Vec<u8>>> {
+        for &(column, expected) in qualifiers {
+            if !matches_predicate(&value(column)?, expected)? {
+                return Ok(None);
+            }
+        }
+        let Value::Binary(mut key) = value(&self.column)? else {
+            return Err(invalid_key());
+        };
+        let length = self.bucket(&key).ok_or_else(invalid_key)?.len();
+        key.truncate(length);
+        Ok(Some(key))
     }
 
     fn decode(value: &Value) -> Result<Self> {
@@ -416,6 +435,9 @@ impl OpenTransaction<'_> {
     }
 
     pub(super) async fn check_final_capacity(&self, operations: &[Operation]) -> Result<()> {
+        if let Some(archive) = self.context.world_constraints.as_deref() {
+            self.check_inherited_capacity(operations, archive).await?;
+        }
         let mut conditions = capacity_conditions(operations).peekable();
         if conditions.peek().is_none() {
             return Ok(());
@@ -956,19 +978,7 @@ impl OpenTransaction<'_> {
         rule: &CapacityRule,
         qualifiers: &[(&str, &[u8])],
     ) -> Result<Option<Vec<u8>>> {
-        for &(column, expected) in qualifiers {
-            if !matches_predicate(&self.read_occupancy_value_at(rows, row, column, uncovered)?, expected)? {
-                return Ok(None);
-            }
-        }
-        let Value::Binary(mut key) =
-            self.read_occupancy_value_at(rows, row, &rule.column, uncovered)?
-        else {
-            return Err(invalid_key());
-        };
-        let length = rule.bucket(&key).ok_or_else(invalid_key)?.len();
-        key.truncate(length);
-        Ok(Some(key))
+        rule.key(qualifiers, |column| self.read_occupancy_value_at(rows, row, column, uncovered))
     }
 
     pub(super) async fn check_capacity_schema(

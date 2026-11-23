@@ -558,6 +558,7 @@ async fn serve_reader(
         )],
         read_fence: Some(Arc::new((*authority).clone())),
         scan_fragmenter: None,
+        world_constraints: None,
         compaction_relay: None,
         claim_wait: Duration::from_secs(1),
         capabilities: None,

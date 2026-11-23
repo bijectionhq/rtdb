@@ -18,6 +18,49 @@ pub(crate) struct WorldArchive {
     pub options: NodeOptions,
 }
 
+#[async_trait::async_trait]
+impl rtdb_node::WorldConstraintArchive for WorldArchive {
+    async fn check_capacity(&self, check: rtdb_node::ArchivedCapacityCheck<'_>) -> Result<()> {
+        let unavailable = OwnedWorld::unavailable;
+        let installed = self.directory.deployment_by_name(check.database).await?.ok_or_else(unavailable)?;
+        if PlacedAttemptScope::new(&installed.stream("replica"), installed.epoch)? != check.placement {
+            return Err(unavailable());
+        }
+        let world = check.world;
+        let pin = Uuid::from_bytes(world.pin.0);
+        let retained = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
+        if retained.world.as_bytes() != &world.id.0
+            || retained.owner != check.owner
+            || retained.capture.as_bytes() != &world.capture.0
+            || retained.suffix.map(|suffix| Iid(*suffix.as_bytes())) != world.suffix
+            || retained.manifest_sha256 != world.manifest
+            || retained.schema_digest != world.schemas.digest()
+            || retained.basis != world.basis
+            || retained.parent_publication != world.parent_publication
+            || retained.mode != world.mode
+            || retained.until != world.until
+            || check.ordered >= retained.until
+        {
+            return Err(unavailable());
+        }
+        let parent = CheckpointReadWorld {
+            deployment: Uuid::parse_str(&installed.id).map_err(|_| unavailable())?,
+            capture: retained.capture,
+            manifest_sha256: retained.manifest_sha256.clone(),
+            suffix: retained.suffix,
+            basis: retained.basis,
+        };
+        admit_capture(&installed, &self.storage, &parent)?;
+        let resources = CheckpointReadResources {
+            node: &self.options, memory: check.memory, cache: Arc::clone(&check.cache), cancellation: check.cancellation,
+        };
+        with_checkpoint_context(
+            self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
+            &parent, resources, |context| check.validate(context),
+        ).await
+    }
+}
+
 pub(crate) struct HeldCheckpointWorld {
     open: OpenWorld,
     memory: Arc<MemoryBudget>,

@@ -408,12 +408,18 @@ impl OpenTransaction<'_> {
     }
 
     pub(super) fn read_occupancy_value_at(&self, rows: &RecordBatch, row: usize, column: &str, uncovered: fn() -> Anomaly) -> Result<Value> {
-        let (slot, field) = rows.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
-        let column = rows.column(slot).as_ref();
-        let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, row)?;
-        let _read = self.context.memory.reserve(bytes.saturating_add(4096))?;
-        rtdb_columnar::read_value(field, column, row)
+        occupancy_value_at(&self.context.memory, rows, row, column, uncovered)
     }
+}
+
+pub(super) fn occupancy_value_at(
+    memory: &Arc<MemoryBudget>, rows: &RecordBatch, row: usize, column: &str, uncovered: fn() -> Anomaly,
+) -> Result<Value> {
+    let (slot, field) = rows.schema_ref().column_with_name(column).ok_or_else(uncovered)?;
+    let column = rows.column(slot).as_ref();
+    let bytes = rtdb_columnar::estimate_read_value_bytes(field, column, row)?;
+    let _read = memory.reserve(bytes.saturating_add(4096))?;
+    rtdb_columnar::read_value(field, column, row)
 }
 
 fn unique_taken() -> Anomaly {

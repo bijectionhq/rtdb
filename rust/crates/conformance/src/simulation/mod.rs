@@ -121,6 +121,7 @@ impl Trial {
             let node_cancellation = cancellation.child_token();
             let context = Arc::new(ResolveContext {
                 owned_witness_scope: None,
+                world_constraints: None,
                 database: "test-db".into(), memory: memory.scope(), storage: cache,
                 query_options: Default::default(), scan_accelerators: Default::default(), cancellation: node_cancellation.clone(), default_tz: "UTC".into(),
                 authorization: Arc::new(DatabasePolicy), execution_observer: None, tracer: None,

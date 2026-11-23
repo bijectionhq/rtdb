@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{Directory, MemberId, MemberRole};
+use rtdb_node::NodeOptions;
 use rtdb_server::{PlacedOptions, ServerDriver, ServerHandle, config::NodeConfiguration};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::net::TcpListener;
@@ -109,19 +110,24 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             else { rtdb_directory::ReplayCustody::Hosted { owner: settings.hosted_task.clone() } },
         tasks: storage_regions.clone(),
     });
+    let owned_archive = crate::archive::WorldArchive {
+        directory: Arc::clone(&directory),
+        storage: settings.agent.world_archive.clone().unwrap_or_else(|| settings.agent.storage.clone()),
+        keys: Arc::clone(&settings.keys),
+        hosted_task: settings.hosted_task.clone(),
+        options: NodeOptions { owned_relations: true, ..options.clone() },
+    };
     let flight_owned_worlds = settings.configuration.flight_sql.as_ref()
         .filter(|flight| flight.port >= 0 && flight.owned_native_actions)
         .map(|_| {
-            let mut options = options.clone();
-            options.owned_relations = true;
             Arc::new(owned_worlds::PlacedWorldHost {
                 directory: Arc::clone(&directory),
                 agent: Arc::clone(&fence),
                 capture_source: settings.agent.world_archive.as_ref().map(|_| settings.agent.storage.clone()),
-                archive: settings.agent.world_archive.clone().unwrap_or_else(|| settings.agent.storage.clone()),
+                archive: owned_archive.storage.clone(),
                 keys: Arc::clone(&settings.keys),
                 hosted_task: settings.hosted_task.clone(),
-                options,
+                options: owned_archive.options.clone(),
             }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
         });
     let storage = Arc::new(crate::store::CellStoreFactory {
@@ -140,6 +146,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
         flight_owned_worlds,
+        world_constraints: Some(Arc::new(owned_archive)),
         read_fence: Some(fence.clone() as Arc<dyn rtdb_node::ReadFence>),
         scan_fragmenter: Some(fragmenter.clone() as Arc<dyn rtdb_query::ScanFragmenter>),
         compaction_relay: match (settings.pool == rtdb_directory::MemberPool::Compaction, &settings.capabilities) {

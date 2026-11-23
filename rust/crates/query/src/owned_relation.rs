@@ -161,6 +161,23 @@ pub async fn open_owned_constraint_projection(
     if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
         return Err(address_unavailable());
     }
+    open_constraint_projection(context, owner, relation, valid, columns).await
+}
+
+pub async fn open_owned_world_constraint_projection(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid: Timestamp, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || relation.root_relation().is_none() || columns.is_empty() {
+        return Err(address_unavailable());
+    }
+    open_constraint_projection(context, owner, relation, valid, columns).await
+}
+
+async fn open_constraint_projection(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid: Timestamp, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
         table: relation.table(owner),
