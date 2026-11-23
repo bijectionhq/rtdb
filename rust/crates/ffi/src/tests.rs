@@ -368,6 +368,40 @@ fn adbc_unsigned_bulk_documents_admit_ids_before_submission() {
 }
 
 #[test]
+fn adbc_bulk_embeddings_keep_their_fixed_size_float_layout_after_flush() {
+    use arrow_array::{FixedSizeListArray, Float32Array, Float64Array};
+    let mut native = Native::open();
+    let handle = native.statement("SELECT 1");
+    let operation = native.operation();
+    let statement = handles::statement(handle).unwrap();
+    let token = handles::cancellation(operation, &statement.session).unwrap();
+    statement.replace_source("vectors", true).unwrap();
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let vectors = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.0, 2.0, 3.0, 0.0])), None).unwrap();
+    let schema = Schema::new(vec![Field::new("_id", DataType::Int64, true), Field::new("embedding", vectors.data_type().clone(), true)]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(vectors)]).unwrap();
+    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_statement_bind(handle, &mut array, &mut schema, &mut error) }, error);
+    assert!(array.release.is_none() && schema.release.is_none());
+    assert_eq!(statement.update(&token).unwrap(), 2);
+
+    ok(unsafe { rtdb_v1_database_flush_all(native.database, 5_000_000_000, &mut error) }, error);
+    statement.replace_source("SELECT _id, COSINE_DISTANCE(embedding, ARRAY[1,0]) AS d, embedding FROM vectors ORDER BY d", false).unwrap();
+    let page = statement.query(&token).unwrap().next().unwrap().unwrap();
+    let batch = page.batch();
+    let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let distances = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+    let vectors = batch.column(2).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+    assert_eq!(ids.values().as_ref(), &[2, 1]);
+    assert_eq!(distances.values().as_ref(), &[0.0, 1.0]);
+    let values = vectors.values().as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(values.values().as_ref(), &[3.0, 0.0, 0.0, 2.0]);
+}
+
+#[test]
 fn arrow_release_is_idempotent_and_retains_charge_through_imported_children() {
     let memory = MemoryBudget::new(1_000_000);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])), vec![Arc::new(Int64Array::from(vec![9]))]).unwrap();

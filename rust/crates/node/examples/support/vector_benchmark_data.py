@@ -3,6 +3,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pyarrow as pa
 
 
 def normalize(vectors):
@@ -26,6 +27,20 @@ def train_centroids(vectors, count, rng):
     return centroids
 
 
+def write_embeddings(path, vectors, clusters=None):
+    children = pa.array(vectors.reshape(-1), type=pa.float32())
+    item = pa.field("item", pa.float32(), nullable=False)
+    vector_type = pa.list_(item, vectors.shape[1])
+    arrays = [pa.FixedSizeListArray.from_arrays(children, type=vector_type)]
+    fields = [pa.field("embedding", vector_type, nullable=False)]
+    if clusters is not None:
+        arrays.append(pa.array(clusters, type=pa.uint32()))
+        fields.append(pa.field("cluster", pa.uint32(), nullable=False))
+    batch = pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields))
+    with pa.OSFile(str(path), "wb") as output, pa.ipc.new_stream(output, batch.schema) as stream:
+        stream.write_batch(batch)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
@@ -47,16 +62,13 @@ def main():
     centroids = train_centroids(train, args.centroids, rng)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    train.tofile(args.output / "vectors.f32")
-    queries.tofile(args.output / "queries.f32")
-    centroids.astype("<f4", copy=False).tofile(args.output / "centroids.f32")
-    with (args.output / "clusters.u32").open("wb") as membership:
-        for offset in range(0, len(train), 4096):
-            batch = normalize(train[offset:offset + 4096])
-            nearest = np.argmax(batch @ centroids.T, axis=1)
-            nearest.astype("<u4").tofile(membership)
-
-    (args.output / "dimensions").write_text(f"{train.shape[1]}\n", encoding="utf-8")
+    membership = np.empty(len(train), dtype=np.uint32)
+    for offset in range(0, len(train), 4096):
+        batch = normalize(train[offset:offset + 4096])
+        membership[offset:offset + len(batch)] = np.argmax(batch @ centroids.T, axis=1)
+    write_embeddings(args.output / "vectors.arrow", train, membership)
+    write_embeddings(args.output / "queries.arrow", queries)
+    write_embeddings(args.output / "centroids.arrow", centroids)
 
 
 if __name__ == "__main__":

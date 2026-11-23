@@ -268,6 +268,29 @@ async fn bulk_ingestion_uses_each_arrow_batch_and_catalog_metadata_uses_dense_un
 }
 
 #[tokio::test]
+async fn bulk_ingest_and_insert_select_preserve_fixed_float_embeddings() {
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array};
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![2.0, 0.0, 0.0, 3.0])), None).unwrap();
+    let schema = Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("embedding", vectors.data_type().clone(), false)]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(vectors)]).unwrap();
+    client.upload(CommandStatementIngest { table: "vectors".into(), ..Default::default() }, vec![batch]).await;
+    client.update("INSERT INTO vectors_copy (_id, embedding) SELECT _id, embedding FROM vectors", None).await;
+    for table in ["vectors", "vectors_copy"] {
+        let sql = format!("SELECT embedding, COSINE_DISTANCE(embedding, ARRAY[1,0]) AS d FROM {table} ORDER BY _id");
+        let results = client.query(&sql).await;
+        let vectors = results[0].column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let values = vectors.values().as_any().downcast_ref::<Float32Array>().unwrap();
+        let distances = results[0].column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), &[2.0, 0.0, 0.0, 3.0]);
+        assert_eq!(distances.values().as_ref(), &[0.0, 1.0]);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn shutdown_joins_a_call_waiting_for_its_first_upload_message() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     let request = client.request(futures::stream::pending::<arrow_flight::FlightData>()); let upload = tokio::spawn(async move { client.client.do_put(request).await });

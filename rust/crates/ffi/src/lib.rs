@@ -250,8 +250,7 @@ pub unsafe extern "C" fn rtdb_v1_statement_prepare(handle: u64, operation: u64, 
 pub unsafe extern "C" fn rtdb_v1_statement_bind(handle: u64, array: *mut FFI_ArrowArray, schema: *mut FFI_ArrowSchema, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let statement = handles::statement(handle)?; let _admitted = statement.session.region.enter()?;
-        let rows = arrow::import_rows(output(array)?, output(schema)?, statement.session.region.memory())?;
-        statement.bind(rows)
+        statement.bind_arrow(output(array)?, output(schema)?)
     }) }
 }
 #[unsafe(no_mangle)]

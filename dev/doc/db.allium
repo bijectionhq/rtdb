@@ -368,6 +368,7 @@ entity SourceMessage {
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Source encoding admits and builds operation body columns one at a time.
+    -- A dense fixed-size float column can be supplied and replayed as Arrow buffers within the document leg.
     -- A document union leg retains columns in their first encounter order across document operations for the same table and mutation kind.
     system_time: Timestamp?
     default_tz: ZoneId               -- always present

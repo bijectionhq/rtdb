@@ -174,10 +174,23 @@ pub(crate) struct ImportedRows {
     pub _reservation: Arc<MemoryReservation>,
 }
 
-/// Takes ownership of a valid Arrow C Data array and schema by replacing both with released structs.
-/// Foreign buffers are copied into retained native values before returning, including on zero-row binds.
-/// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
+pub(crate) enum ImportedBinding {
+    Rows(ImportedRows),
+    Documents(rtdb_tx::ArrowDocuments),
+}
+
+#[cfg(test)]
 pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<ImportedRows> {
+    match unsafe { import_binding(array, schema, memory, false) }? {
+        ImportedBinding::Rows(rows) => Ok(rows),
+        ImportedBinding::Documents(_) => unreachable!(),
+    }
+}
+
+/// Takes ownership of a valid Arrow C Data array and schema by replacing both with released structs.
+/// Foreign buffers are copied into native allocations before returning, including on zero-row binds.
+/// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
+pub(crate) unsafe fn import_binding(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>, bulk: bool) -> Result<ImportedBinding> {
     if array.release.is_none() || schema.release.is_none() { return Err(super::invalid("Arrow bind inputs have already been released")); }
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
@@ -199,6 +212,9 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
     let array = StructArray::from(imported);
     if array.null_count() > 0 { return Err(super::invalid("The bound record batch may not contain null rows")); }
     let batch = RecordBatch::from(array);
+    if bulk && let Some(documents) = rtdb_tx::ArrowDocuments::try_new(&batch, memory)? {
+        return Ok(ImportedBinding::Documents(documents.copy_buffers()?));
+    }
     let mut bound = super::add(4096, super::mul(batch.num_rows(), 64)?)?;
     for row in 0..batch.num_rows() {
         for (field, column) in fields.fields().iter().zip(batch.columns()) {
@@ -213,7 +229,7 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
     }
     let types = fields.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
     let names = fields.fields().iter().map(|field| field.name().clone()).collect();
-    Ok(ImportedRows { arguments: SqlArguments::new(types, rows, memory)?, names, _reservation: schema_charge })
+    Ok(ImportedBinding::Rows(ImportedRows { arguments: SqlArguments::new(types, rows, memory)?, names, _reservation: schema_charge }))
 }
 
 fn decimal_format(format: &str) -> Result<Option<DecimalParameters>> {

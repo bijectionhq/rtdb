@@ -2,10 +2,10 @@ use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Fields, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field};
-use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
+use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 #[derive(Clone, Debug)]
 pub struct RetainedBytes { data: Arc<Vec<u8>>, _reservation: Arc<MemoryReservation> }
@@ -148,6 +148,124 @@ impl Documents {
 }
 
 #[derive(Clone, Debug)]
+pub struct ArrowDocuments {
+    owned: OwnedBatch,
+    layout: Arc<DecodedDocumentLayout>,
+    id: usize,
+}
+
+impl ArrowDocuments {
+    /// Dense floating-point embeddings with simple scalar metadata can travel in their existing Arrow layout.
+    pub fn try_new(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        Self::from_batch(batch, memory, None, false)
+    }
+
+    pub fn try_from_owned(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        Self::from_batch(batch.batch(), memory, Some(batch), false)
+    }
+
+    pub(crate) fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>, owner: Option<&OwnedBatch>, canonical: bool) -> Result<Option<Self>> {
+        let schema = batch.schema();
+        let Ok(id) = schema.index_of("_id") else { return Ok(None); };
+        if !matches!(schema.field(id).data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Utf8) {
+            return Ok(None);
+        }
+        let mut vectors = false;
+        if batch.num_rows() == 0 || !schema.fields().iter().zip(batch.columns()).all(|(field, array)| {
+            if !field.metadata().is_empty() || array.null_count() != 0 ||
+                (field.name().starts_with('_') && field.name() != "_id") {
+                return false;
+            }
+            match field.data_type() {
+                DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+                DataType::Float32 | DataType::Float64 | DataType::Utf8 => true,
+                DataType::FixedSizeList(item, size) if *size > 0 && item.metadata().is_empty() &&
+                    matches!(item.data_type(), DataType::Float32 | DataType::Float64) => {
+                    vectors = true;
+                    array.as_any().downcast_ref::<FixedSizeListArray>()
+                        .is_some_and(|list| list.values().null_count() == 0)
+                }
+                _ => false,
+            }
+        }) || !vectors {
+            return Ok(None);
+        }
+        if schema.fields().iter().map(|field| field.name()).collect::<BTreeSet<_>>().len() != schema.fields().len() {
+            return Ok(None);
+        }
+        let _schema_scratch = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
+        let mut fields = Vec::with_capacity(batch.num_columns());
+        let mut columns = Vec::with_capacity(batch.num_columns());
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            let (logical, list) = match field.data_type() {
+                DataType::FixedSizeList(item, size) => {
+                    let list = column.as_any().downcast_ref::<FixedSizeListArray>()
+                        .ok_or_else(|| Anomaly::incorrect("rtdb.tx/document-schema", "Invalid embedding column"))?;
+                    let element = from_field(&item.as_ref().clone().with_nullable(false))?;
+                    (LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(*size), element: Box::new(element) }, Some(list))
+                }
+                _ => (from_field(&field.as_ref().clone().with_nullable(false))?, None),
+            };
+            let field = to_field(field.name(), &logical)?;
+            let column = if let (Some(list), DataType::FixedSizeList(item, size)) = (list, field.data_type()) {
+                Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *size, Arc::clone(list.values()), None)
+                    .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?) as ArrayRef
+            } else {
+                Arc::clone(column)
+            };
+            fields.push(Arc::new(field));
+            columns.push(column);
+        }
+        let canonical_schema = Arc::new(Schema::new(fields));
+        if canonical && canonical_schema.fields() != schema.fields() { return Ok(None); }
+        let schema = canonical_schema;
+        let layout = DecodedDocumentLayout::new(schema.fields(), memory)?;
+        let canonical = RecordBatch::try_new(schema, columns)
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        let owned = match owner {
+            Some(owner) => OwnedBatch::with_reservation(canonical, Arc::clone(owner.reservation()))?,
+            None => OwnedBatch::new(canonical, memory)?,
+        };
+        Ok(Some(Self { owned, layout, id }))
+    }
+
+    pub fn copy_buffers(mut self) -> Result<Self> {
+        let batch = self.owned.batch();
+        let memory = self.owned.reservation().budget();
+        let rows = u32::try_from(batch.num_rows()).map_err(|_| overflow())?;
+        let overhead = (rows as usize).checked_mul(32).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let _scratch = memory.reserve(overhead)?;
+        let indices = arrow_array::UInt32Array::from_iter_values(0..rows);
+        let mut builder = rtdb_columnar::BatchBuilder::new(4096, memory)?;
+        let columns = batch.columns().iter().map(|array| {
+            let bound = array.get_array_memory_size().checked_mul(4).and_then(|bytes| bytes.checked_add(overhead)).ok_or_else(overflow)?;
+            builder.column(bound, || arrow_select::take::take(array.as_ref(), &indices, None)
+                .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string())))
+        }).collect::<Result<Vec<_>>>()?;
+        let copied = RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
+        self.owned = builder.finish(copied)?;
+        Ok(self)
+    }
+
+    pub fn row_count(&self) -> usize { self.owned.batch().num_rows() }
+    pub(crate) fn batch(&self) -> &OwnedBatch { &self.owned }
+    pub(crate) fn columns(&self) -> &[String] { &self.layout.columns }
+    pub(crate) fn types(&self) -> &StructFields<LogicalType> { &self.layout.types }
+
+    pub(crate) fn iid(&self, row: usize) -> Result<Iid> {
+        let values = self.owned.batch().column(self.id);
+        let field = &self.layout.physical[self.id];
+        rtdb_columnar::read_value(field, values.as_ref(), row)?.entity_id().map(|id| id.iid())
+    }
+
+    pub(crate) fn materialize(&self, memory: &Arc<MemoryBudget>) -> Result<Documents> {
+        let structs = StructArray::from(self.owned.batch().clone());
+        Documents::read_arrow(&structs, Arc::clone(&self.layout), true, memory)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct EntityIds { ids: Arc<Vec<EntityId>>, _reservation: Arc<MemoryReservation> }
 impl EntityIds {
     pub fn new(ids: Vec<EntityId>, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -252,6 +370,7 @@ pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
     SqlBytes { sql: String, arg_bytes: RetainedBytes },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PutArrowDocs { table: TableRef, documents: ArrowDocuments, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     DeleteDocs { table: TableRef, ids: EntityIds, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     EraseDocs { table: TableRef, ids: EntityIds },

@@ -47,7 +47,7 @@ Compare temporal correctness to the exact SQL path, including retained readers a
 
 The prototype runs in the native Node benchmark and exposes approximate retrieval as a separate mode within that workload.
 The SQL distance operator always computes exact distances.
-The centroid index packs the original float32 vectors into one immutable object with a byte range per cluster.
+The centroid index packs float32 vectors, numeric fixture IDs, and 16-byte IIDs into one Arrow IPC stream per cluster in an immutable object.
 The benchmark uses spherical k-means for the centroids and ranks up to 64 candidates from the probed clusters before reranking with SQL.
 The emulator serves that object from RTDB's local object store.
 The cold ANN variant uses a fresh buffer pool for the index object; the warm variant admits the entire index object once before timing.
@@ -67,7 +67,7 @@ curl -fL https://ann-benchmarks.com/glove-100-angular.hdf5 \
 
 for rows in 100000 1000000; do
   OPENBLAS_NUM_THREADS=4 VECLIB_MAXIMUM_THREADS=4 \
-    uv run --no-project --with numpy==2.5.5 --with h5py==3.16.0 \
+    uv run --no-project --with numpy==2.5.5 --with h5py==3.16.0 --with pyarrow==22.0.0 \
     python rust/crates/node/examples/support/vector_benchmark_data.py \
     build/vector-search/glove-100-angular.hdf5 "build/vector-search/glove-$rows" --rows "$rows"
 done
@@ -82,7 +82,7 @@ cargo run --manifest-path rust/Cargo.toml --locked --release -p rtdb-node \
 
 The downloaded GloVe data used for the run has SHA-256 `544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4`.
 The run uses the first twelve held-out queries and independently trains 512 centroids for each size.
-The dataset and generated binary files stay in the ignored build directory.
+The dataset and generated Arrow IPC streams stay in the ignored build directory.
 
 The experiment loads the primary table and centroid index from the same fixed input.
 The benchmark owns the ANN generation for one process.
@@ -233,7 +233,8 @@ Compare the query paths within each run and use the churn tests and recall resul
 
 Keep `COSINE_DISTANCE` and filtered exact SQL as the default query contract.
 The existing ordered index already gives highly selective filters a faster route without changing any returned distance or row.
-The next exact execution optimization should evaluate typed Arrow float buffers in batches and fetch other projected columns only for the winners.
+For exact retrieval, score compatible fixed-size Arrow float arrays in batches and prepare the query once.
+Fetching projected values only for the winners remains a separate optimization.
 The scalar oracle remains the reference for distance and tie behavior.
 
 Use a secondary centroid index for the explicit approximate route.
@@ -249,7 +250,7 @@ Account for newly visible versions at valid-time boundaries and for the writes o
 An erase requires both immediate exclusion from results and eventual removal of the obsolete vector bytes under the index retirement protocol.
 Those are the publication and lifetime obligations to take from the existing ordered index and SlateDB's checkpoint design.
 
-Keep fixed-probe ANN in the benchmark until filtered recall and cold provider I/O have been measured against a batched exact baseline.
+Keep fixed-probe ANN in the benchmark while filtered recall and cold provider I/O remain below the evidence needed for a production planner.
 The present cold measurements count local range requests and bytes.
 The pack time excludes centroid training, and the churn timings leave full generation rebuilds outside the write path.
 The rebuild and generation-retirement costs still need to be measured over sustained writes.
@@ -262,19 +263,30 @@ The full Gradle unit suite passed all 3,190 tests with the native library built 
 
 ## Arrow path inventory
 
-The vector workload uses fixed-size float lists in the primary table.
-Here are the representation boundaries on that path and the work each one currently does.
+The workload uses a dense fixed-size Arrow float list per embedding, scalar predicate columns, and a stable IID per entity.
+Arrow IPC is used where the data crosses a durable or process boundary.
+In-memory code keeps typed buffers alive across those boundaries and creates new buffers when rows are gathered, reordered, or copied from the foreign allocator.
 
-| Stage | Current representation and extra work | Arrow path |
+| Stage | Former conversion | Arrow path and remaining boundaries |
 | --- | --- | --- |
-| Benchmark preparation | The HDF5 reader and centroid trainer use NumPy arrays, then write separate raw floats and cluster IDs. The Rust loader parses the floats one at a time. | Write Arrow IPC record batches with fixed-size float lists and the cluster IDs beside them. |
-| SQL and ADBC ingest | Native document operations carry a map per row and one `Value` per component. The ADBC ingest path turns Arrow rows back into those maps. The source transaction then builds Arrow columns for logging. | Keep typed input columns from ADBC and the benchmark loader. Validate row IDs and temporal bounds alongside the arrays. |
-| Source replay and staging | The source log uses Arrow IPC. Replay materializes each document, transaction staging clones it, and the event builder recreates the arrays before the replica log. | Retain the input Arrow arrays through transaction resolution and event construction. Share the existing event layout and temporal operation order. |
-| Flush, compaction, and scans | Event pages use Arrow. The direct gather for primitive columns excludes fixed-size lists, so embeddings decode into per-component values and are rebuilt when needed. | Gather compatible typed list children directly and preserve validity at both the list and component levels. |
-| SQL distance | Scalar projection rebuilds row values and walks the query vector again for each embedding. The result may be converted back to Arrow before top-k. | Prepare one query vector per invocation and compute an Arrow double distance column directly from the selected embedding buffers. |
-| Centroid index | The prototype writes a custom little-endian record per vector and decodes every component from bytes while scoring. | Store one range-addressable Arrow record batch per cluster and borrow buffers during probing. |
-| ANN handoff | Reranking turns candidate IDs into SQL text with one disjunct per ID, reparses it, and then scores resolved rows. | Pass an internal typed IID scope and reuse the same Arrow distance kernel after resolving those rows. |
-| Output | ADBC and Flight SQL use Arrow; PostgreSQL clients receive PostgreSQL protocol values. | Keep Arrow through execution and convert at the wire boundary selected by the client. |
+| Benchmark preparation | NumPy matrices were written as separate raw float and cluster files, which Rust parsed one scalar at a time. | PyArrow writes fixed-size `float32` lists and `uint32` cluster ordinals in IPC streams. Rust borrows the decoded child buffers. |
+| Native Rust, ADBC, and Flight SQL bulk ingest | The client batch was decoded into argument values, copied into per-row document maps, and converted back to Arrow by the source writer. | Compatible dense batches preserve typed columns. ADBC copies foreign buffers into native Arrow memory so its caller can release the original allocation. Flight retains the decoded batch. |
+| SQL text and prepared arguments | SQL literals and generic parameter bindings use scalar values. General document construction can also materialize a projected embedding. | A compatible Arrow document produced by a dynamic SQL mutation can enter transaction staging directly. SQL literals, generic bindings, PostgreSQL COPY, PATCH document merging, and document shapes with unsupported types or nulls retain their existing paths. |
+| Source log and replay | Source IPC replay unpacked each vector into component values, transaction staging cloned the row, and the event builder rebuilt the array. | Compatible writes use the existing `put-docs` Arrow union leg. Replay retains its document arrays and stages them alongside resolved IIDs and temporal intervals. The source protobuf remains the log envelope. |
+| Replica log, flush, and compaction | Persisted data was Arrow, but copying fixed-size list cells to new pages rebuilt them through scalar values when the direct flat-column path could not run. | The event copier gathers compatible fixed-size float buffers with list and component validity. It keeps the existing layout and falls back for schema coercion. The replica log and same-layout flush already copy Arrow batches. |
+| Structured predicate indexes | The ordered index reads its key columns from Arrow pages during build and uses its own posting-tree codec for scalar keys and IIDs. | The vector stays in the primary data page. Ordered-index candidate IIDs feed the same exact scorer as an ordinary scan. |
+| Exact scan and distance | Scan gather boxed each component, then scalar distance decoded each embedding and prepared the same query repeatedly. | The scan gathers compatible fixed-size float lists directly. A column-to-literal or column-to-parameter cosine expression prepares the query once, reads Float32 or Float64 child buffers, and emits an Arrow Float64 column. Unsupported layouts and general expressions continue through the scalar evaluator. |
+| Centroid ranges and live tail | Cluster records decoded each float manually. Tail reconciliation depended on an IID-to-ID dictionary and read whole documents to identify new rows. | Each range is an Arrow IPC stream. The reader borrows the buffer pool's range and reads typed vector and IID arrays. Tail reconciliation uses event-header IIDs, including for new rows. |
+| ANN reranking | Candidate IDs were formatted into a SQL disjunction and parsed again. | The prepared plan receives the typed IID scope directly. Primary-table visibility and residual predicates still apply before the Arrow scorer and top-k. |
+| Result export | The benchmark converted result columns back to generic values. PostgreSQL clients use PostgreSQL protocol values. | The benchmark reads typed ID and distance buffers. ADBC and Flight SQL export Arrow results, subject to the existing output schema and sort paths. PostgreSQL conversion occurs at the wire boundary. |
 
-The relevant implementation boundaries are `ffi/src/statement.rs`, `tx/src/source.rs`, `tx/src/values.rs`, `tx/src/resolver.rs`, `index/src/live.rs`, `format/src/data.rs`, `query/src/columnar.rs`, and the native vector benchmark.
-A typed route must preserve missing and null values, invalid-component errors, numeric distance and tie behavior, and the table snapshot's visibility.
+The relevant implementation boundaries are `ffi/src/{arrow,statement}.rs`, `flight-sql/src/upload.rs`, `tx/src/{source,values,resolver}.rs`, `index/src/live.rs`, `format/src/data.rs`, `query/src/{columnar,cosine}.rs`, and the native vector benchmark.
+A compatible fast path must preserve missing and null values, invalid-component errors, distance and tie behavior, and the table snapshot's visibility.
+
+When full-text indexes share a table with embeddings, the FTS builder and live text-corpus fallback can still read a complete mixed document before extracting text in `search/src/{lane,accelerate,corpus,runtime}.rs`.
+That cost belongs to the full-text indexing and text-scoring paths.
+The specialized vector benchmark uses ordered predicate indexes and resolves its live tail from headers.
+
+The plain score and the scalar control in the updated benchmark run against the same captured source with scan acceleration disabled.
+The scalar control puts the same distance call under a bound true condition so the specialized projection declines it.
+The benchmark rotates the control, the plain Arrow score, and the exact ordered path, and asserts identical result IDs and distance bits for each query and filter.

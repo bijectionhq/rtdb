@@ -10,7 +10,7 @@ use rtdb_tx::{Documents, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
 use rtdb_types::StructFields;
-use crate::{arrow::ImportedRows, region::EmbeddedRegion};
+use crate::{arrow::{ImportedBinding, ImportedRows}, region::EmbeddedRegion};
 
 pub(crate) struct SessionHandle {
     pub region: Arc<EmbeddedRegion>,
@@ -37,13 +37,22 @@ enum Source {
     Show { statement: AdmittedControl, prepared: bool },
     Bulk { table: TableRef, _name_reservation: Arc<MemoryReservation> },
 }
-struct StatementState { source: Source, bound: Option<ImportedRows> }
+struct StatementState { source: Source, bound: Option<ImportedBinding> }
 pub(crate) struct StatementHandle {
     pub session: Arc<SessionHandle>,
     creation_database: String,
     state: Mutex<Option<StatementState>>,
     _reservation: Arc<MemoryReservation>,
 }
+impl StatementState {
+    fn bound_arguments(bound: &Option<ImportedBinding>) -> Option<&SqlArguments> {
+        match bound {
+            Some(ImportedBinding::Rows(rows)) => Some(&rows.arguments),
+            _ => None,
+        }
+    }
+}
+
 impl StatementHandle {
     pub fn new(session: Arc<SessionHandle>, source: &str, bulk: bool) -> Result<Arc<Self>> {
         session.ensure_open()?;
@@ -92,7 +101,15 @@ impl StatementHandle {
     pub fn close(&self) { self.state.lock().take(); }
     pub fn bind(&self, values: ImportedRows) -> Result<()> {
         self.session.ensure_open()?;
-        self.state.lock().as_mut().ok_or_else(super::closed)?.bound = Some(values); Ok(())
+        self.state.lock().as_mut().ok_or_else(super::closed)?.bound = Some(ImportedBinding::Rows(values)); Ok(())
+    }
+    pub unsafe fn bind_arrow(&self, array: &mut arrow_array::ffi::FFI_ArrowArray, schema: &mut arrow_array::ffi::FFI_ArrowSchema) -> Result<()> {
+        self.session.ensure_open()?;
+        let mut locked = self.state.lock();
+        let state = locked.as_mut().ok_or_else(super::closed)?;
+        let bulk = matches!(&state.source, Source::Bulk { .. });
+        state.bound = Some(unsafe { crate::arrow::import_binding(array, schema, self.session.region.memory(), bulk) }?);
+        Ok(())
     }
     pub fn prepare(&self, token: &CancellationToken) -> Result<()> {
         if token.is_cancelled() { return Err(super::cancelled()); }
@@ -153,7 +170,7 @@ impl StatementHandle {
         let state = locked.as_mut().ok_or_else(super::closed)?;
         let cursor = self.session.region.run(async {
             let mut session = self.session.state.lock();
-            let args = state.bound.as_ref().map(|bound| &bound.arguments);
+            let args = StatementState::bound_arguments(&state.bound);
             match &mut state.source {
                 Source::Sql { text, prepared, .. } => {
                     if text.is_empty() { return Err(Anomaly::incorrect("xtdb.adbc/no-sql", "SQL query not set")); }
@@ -193,12 +210,12 @@ impl StatementHandle {
                         let context = session.prepare_context_for(&self.creation_database, token).await?;
                         *prepared = Some(PreparedSql::prepare(text, &context, Default::default(), ResultSignaturePolicy::Dynamic)?);
                     }
-                    let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(state.bound.as_ref().map(|bound| bound.arguments.clone()))?;
+                    let operation = prepared.as_ref().ok_or_else(not_prepared)?.dml_operation(StatementState::bound_arguments(&state.bound).cloned())?;
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(-1)
                 }
                 Source::Set(control) => {
-                    let values = argument_row(state.bound.as_ref().map(|bound| &bound.arguments), self.session.region.memory())?;
+                    let values = argument_row(StatementState::bound_arguments(&state.bound), self.session.region.memory())?;
                     match session.execute_control_with(control.statement(), &values.0, token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
                         ControlResult::Command { .. } => Ok(-1), _ => Err(Anomaly::incorrect("xtdb.adbc/not-an-update", "Statement is not an update")),
                     }
@@ -206,12 +223,21 @@ impl StatementHandle {
                 Source::Show { .. } => Err(Anomaly::incorrect("xtdb.adbc/not-an-update", "Statement is not an update")),
                 Source::Bulk { table, .. } => {
                     let Some(bound) = state.bound.take() else { return Ok(0); };
-                    let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
-                    let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
-                    let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| bound.names.iter().zip(row).try_fold(bytes, |bytes, (name, value)| super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)))?;
-                    let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
-                    let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned().map(|mut value| { rtdb_columnar::admit_execution_value(&mut value); value })).collect::<StructFields<_>>()).collect();
-                    let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.session.region.memory())?, valid_from: None, valid_to: None };
+                    let (count, operation) = match bound {
+                        ImportedBinding::Documents(documents) => {
+                            let count = i64::try_from(documents.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
+                            (count, TxOp::PutArrowDocs { table: table.clone(), documents, valid_from: None, valid_to: None })
+                        }
+                        ImportedBinding::Rows(bound) => {
+                            let count = i64::try_from(bound.arguments.row_count()).map_err(|_| super::invalid("Bulk row count exceeds i64"))?;
+                            let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
+                            let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| bound.names.iter().zip(row).try_fold(bytes, |bytes, (name, value)| super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)))?;
+                            let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
+                            let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned().map(|mut value| { rtdb_columnar::admit_execution_value(&mut value); value })).collect::<StructFields<_>>()).collect();
+                            let documents = Documents::new(rows, self.session.region.memory())?;
+                            (count, TxOp::PutDocs { table: table.clone(), documents, valid_from: None, valid_to: None })
+                        }
+                    };
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(count)
                 }

@@ -421,7 +421,12 @@ impl<'a> OpenTransaction<'a> {
         let mut cursor = execute(input, context, arguments, syntax).await?;
         let system_time = self.tx_key().system_time;
         while let Some(batch) = cursor.next_batch().await? {
-            mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event))?;
+            if matches!(kind, MutationKind::Put)
+                && let Some((documents, headers)) = arrow_mutation(&batch, system_time, &self.context.memory)? {
+                self.buffer.put_batch(&table.table, documents.batch().clone(), documents.types().clone(), headers)?;
+            } else {
+                mutation_events(batch.batch(), kind, system_time, |event| self.buffer.append_to(&table.table, event))?;
+            }
         }
         Ok(())
     }
@@ -458,6 +463,10 @@ impl<'a> OpenTransaction<'a> {
             }
             Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents, None, *valid_from, *valid_to),
             Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents, Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::PutArrowDocs { table, documents, valid_from, valid_to }) =>
+                self.put_arrow_documents(table, documents, None, *valid_from, *valid_to),
+            Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } =>
+                self.put_arrow_documents(table, documents, Some(iids), *valid_from, *valid_to),
             Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
                 check_table(table)?;
                 let interval = interval(valid_from.unwrap_or(self.tx_key().system_time), valid_to.unwrap_or(Timestamp::MAX))?;
@@ -509,6 +518,22 @@ impl<'a> OpenTransaction<'a> {
         }
         Ok(())
     }
+    fn put_arrow_documents(&mut self, table: &TableRef, documents: &crate::ArrowDocuments, iids: Option<&[Iid]>,
+        from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        let count = documents.row_count();
+        if iids.is_some_and(|iids| iids.len() != count) {
+            return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
+        }
+        let valid = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
+        let _scratch = self.context.memory.reserve(count.checked_mul(128).ok_or_else(overflow)?)?;
+        let headers = (0..count).map(|row| {
+            let iid = match iids { Some(iids) => iids[row], None => documents.iid(row)? };
+            Ok((iid, valid))
+        }).collect::<Result<Vec<_>>>()?;
+        self.buffer.put_batch(table, documents.batch().clone(), documents.types().clone(), headers)?;
+        self.buffer.declare_document_types(table, documents.types())
+    }
+
     fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>) -> Result<()> {
         let key = result.tx_key();
         let error = result.encoded_error()?;
@@ -565,13 +590,15 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
 fn validate_document_operation(operation: &Operation) -> Result<()> {
     let (table, documents, verb, permitted) = match operation {
         Operation::Public(TxOp::PutDocs { table, documents, .. }) | Operation::PutIids { table, documents, .. } =>
-            (table, documents, "put", &["_id", "_fn", "_valid_from", "_valid_to"][..]),
+            (table, documents.columns(), "put", &["_id", "_fn", "_valid_from", "_valid_to"][..]),
+        Operation::Public(TxOp::PutArrowDocs { table, documents, .. }) | Operation::PutArrowIids { table, documents, .. } =>
+            (table, documents.columns(), "put", &["_id"][..]),
         Operation::Public(TxOp::PatchDocs { table, documents, .. }) | Operation::PatchIids { table, documents, .. } =>
-            (table, documents, "patch", &["_id", "_fn"][..]),
+            (table, documents.columns(), "patch", &["_id", "_fn"][..]),
         _ => return Ok(()),
     };
     check_table(table)?;
-    let forbidden: Vec<_> = documents.columns().iter().map(String::as_str)
+    let forbidden: Vec<_> = documents.iter().map(String::as_str)
         .filter(|name| name.starts_with('_') && !permitted.contains(name)).collect();
     if forbidden.is_empty() { return Ok(()); }
     Err(Anomaly::incorrect("xtdb/forbidden-columns", format!("Cannot {verb} documents with columns: [{}]", forbidden.join(", ")))
@@ -583,8 +610,8 @@ fn validate_document_operation(operation: &Operation) -> Result<()> {
 /// Its patch path has no such wrapper.
 fn document_table(operation: &Operation) -> Option<&TableRef> {
     match operation {
-        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
-        | Operation::PutIids { table, .. } => Some(table),
+        Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        | Operation::PutIids { table, .. } | Operation::PutArrowIids { table, .. } => Some(table),
         _ => None,
     }
 }
@@ -606,6 +633,27 @@ fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
 }
 #[derive(Clone, Copy)]
 enum MutationKind { Put, Delete, Erase }
+
+fn arrow_mutation(batch: &rtdb_columnar::OwnedBatch, system_time: Timestamp,
+    memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Option<(crate::ArrowDocuments, Vec<(Iid, Interval)>)>> {
+    let schema = batch.batch().schema();
+    let Some(structs) = batch.batch().column_by_name("doc")
+        .and_then(|array| array.as_any().downcast_ref::<arrow_array::StructArray>())
+        .filter(|array| array.null_count() == 0) else { return Ok(None); };
+    let docs = arrow_array::RecordBatch::from(structs.clone());
+    let Some(documents) = crate::ArrowDocuments::from_batch(&docs, memory, Some(batch), false)? else { return Ok(None); };
+    let column = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))
+        .and_then(|index| OutputColumn::new(schema.field(index), batch.batch().column(index).as_ref()));
+    let iids = column("_iid")?;
+    let from = column("_valid_from")?;
+    let to = column("_valid_to")?;
+    let _scratch = memory.reserve(documents.row_count().checked_mul(128).ok_or_else(overflow)?)?;
+    let headers = (0..documents.row_count()).map(|row| {
+        let valid = interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?;
+        Ok((iids.iid(row)?, valid))
+    }).collect::<Result<_>>()?;
+    Ok(Some((documents, headers)))
+}
 
 /// The events one batch of a mutation's output writes, in its row order.
 fn mutation_events(batch: &arrow_array::RecordBatch, kind: MutationKind, system_time: Timestamp, mut append: impl FnMut(StoredEvent) -> Result<()>) -> Result<()> {

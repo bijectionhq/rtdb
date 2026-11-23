@@ -5275,6 +5275,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "bytes",
  "prost",

@@ -1,8 +1,8 @@
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
-use arrow_buffer::ScalarBuffer;
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
+use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
@@ -81,9 +81,32 @@ pub struct PageEvent {
 }
 
 #[derive(Debug)]
-struct EventPage { put: Option<(arrow_array::StructArray, arrow_schema::Fields, StructFields<LogicalType>)> }
+struct EventPage {
+    put: Option<(arrow_array::StructArray, arrow_schema::Fields, StructFields<LogicalType>)>,
+    _owner: Option<OwnedBatch>,
+}
+
+pub fn put_page_events(
+    documents: OwnedBatch,
+    types: StructFields<LogicalType>,
+    headers: Vec<(Iid, Interval)>,
+    system_from: Timestamp,
+) -> Result<Vec<PageEvent>> {
+    if headers.len() != documents.batch().num_rows() { return Err(invalid("Document and event counts differ")); }
+    let array = arrow_array::StructArray::from(documents.batch().clone());
+    let fields = array.fields().clone();
+    let page = Arc::new(EventPage { put: Some((array, fields, types)), _owner: Some(documents) });
+    Ok(headers.into_iter().enumerate().map(|(offset, (iid, valid_time))| PageEvent {
+        page: Arc::clone(&page), offset, iid, system_from, valid_time, op: EventOp::Put, recency: None,
+        bytes: std::sync::OnceLock::new(),
+    }).collect())
+}
 
 impl PageEvent {
+    pub fn put_types(&self) -> Option<&StructFields<LogicalType>> {
+        self.page.put.as_ref().map(|(_, _, types)| types)
+    }
+
     /// The bytes the event's document decodes to at most, which encoding its cells may hold at once.
     pub fn document_bytes(&self) -> Result<usize> {
         if let Some(bytes) = self.bytes.get() { return Ok(*bytes); }
@@ -184,7 +207,7 @@ impl EventBatch {
             }
             None => None,
         };
-        let page = Arc::new(EventPage { put });
+        let page = Arc::new(EventPage { put, _owner: None });
         let mut ops = [None; 128];
         for (id, leg) in legs.iter() {
             let op = match leg.name().as_str() { "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase, name => return Err(invalid(format!("Unknown event operation: {name}"))) };
@@ -277,7 +300,7 @@ enum PutLeg { First, Last }
 
 /// Builds an owned index batch with scratch for one document column at a time, laid out as a live page.
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
-pub fn owned_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+pub fn owned_event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let metadata = put_fields.as_ref().map_or(Ok(4096), |fields| {
         fields.iter().try_fold(4096usize, |bytes, (name, ty)| {
             ty.retained_bytes()?.checked_add(name.len()).and_then(|bytes| bytes.checked_add(256))
@@ -359,7 +382,7 @@ fn put_columns<E: EncodedEvent>(
     let mut columns = Vec::with_capacity(fields.len());
     for (name, ty) in fields {
         let field = to_field(&name, &ty)?;
-        if copy && builder.is_none() && let Some(column) = gather_column(documents, &field)? {
+        if copy && let Some(column) = gather_column(documents, &field, builder.as_deref_mut())? {
             schema.push(Arc::new(field));
             columns.push(column);
             continue;
@@ -381,7 +404,7 @@ fn put_columns<E: EncodedEvent>(
 
 /// The column `field` describes, copied from the arrays its documents' pages store it in, when every page stores it
 /// under that same flat layout (or lacks it, for a nullable column): the array `copy_array` builds from the cells read.
-fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field) -> Result<Option<ArrayRef>> {
+fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field, builder: Option<&mut BatchBuilder>) -> Result<Option<ArrayRef>> {
     use arrow_schema::TimeUnit as Unit;
     let flat = match field.data_type() {
         DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
@@ -392,7 +415,15 @@ fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field) -> Result<Opt
         DataType::Time64(unit) => matches!(unit, Unit::Microsecond | Unit::Nanosecond),
         _ => false,
     };
-    if !flat || !field.metadata().is_empty() { return Ok(None); }
+    let vector_width = match field.data_type() {
+        DataType::FixedSizeList(item, width) if *width > 0 && item.metadata().is_empty() => match item.data_type() {
+            DataType::Float32 => Some(*width as usize * 4),
+            DataType::Float64 => Some(*width as usize * 8),
+            _ => None,
+        },
+        _ => None,
+    };
+    if (!flat && vector_width.is_none()) || !field.metadata().is_empty() || documents.is_empty() { return Ok(None); }
     let mut sources = Vec::with_capacity(documents.len());
     for document in documents {
         match document.put_column(field.name()) {
@@ -404,7 +435,26 @@ fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field) -> Result<Opt
             _ => return Ok(None),
         }
     }
-    gather(field.data_type(), &sources).map(Some)
+    let build = || gather(field.data_type(), &sources);
+    match builder {
+        Some(builder) => {
+            let bound = if let Some(width) = vector_width {
+                documents.len().checked_mul(width.checked_add(128).ok_or_else(event_size)?)
+                    .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(event_size)?
+            } else {
+                sources.iter().try_fold(4096usize, |bytes, source| {
+                    let cell = match source {
+                        Some((array, row)) => rtdb_columnar::estimate_read_cell_bytes(field, *array, *row)?,
+                        None => 0,
+                    };
+                    bytes.checked_add(cell.checked_mul(2).ok_or_else(event_size)?)
+                        .and_then(|bytes| bytes.checked_add(128)).ok_or_else(event_size)
+                })?
+            };
+            builder.column(bound, build).map(Some)
+        }
+        None => build().map(Some),
+    }
 }
 
 fn gather(data_type: &DataType, sources: &[Option<(&dyn Array, usize)>]) -> Result<ArrayRef> {
@@ -461,8 +511,43 @@ fn gather(data_type: &DataType, sources: &[Option<(&dyn Array, usize)>]) -> Resu
             }
             Arc::new(builder.finish()) as ArrayRef
         }
+        DataType::FixedSizeList(item, width) => {
+            let lists = sources.iter().map(|source| source.map(|(array, row)| {
+                array.as_any().downcast_ref::<FixedSizeListArray>().map(|array| (array, row)).ok_or_else(layout)
+            }).transpose()).collect::<Result<Vec<_>>>()?;
+            let child = match item.data_type() {
+                DataType::Float32 => gather_vector_values::<Float32Type>(&lists, *width as usize)?,
+                DataType::Float64 => gather_vector_values::<Float64Type>(&lists, *width as usize)?,
+                _ => return Err(layout()),
+            };
+            let nulls = lists.iter().any(Option::is_none)
+                .then(|| NullBuffer::new(BooleanBuffer::collect_bool(lists.len(), |row| lists[row].is_some())));
+            Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *width, child, nulls).map_err(invalid)?)
+        }
         _ => return Err(layout()),
     })
+}
+
+fn gather_vector_values<T: arrow_array::ArrowPrimitiveType>(lists: &[Option<(&FixedSizeListArray, usize)>], width: usize) -> Result<ArrayRef> {
+    use arrow_array::{builder::PrimitiveBuilder, cast::AsArray};
+    let mut values = PrimitiveBuilder::<T>::with_capacity(lists.len().checked_mul(width).ok_or_else(event_size)?);
+    for list in lists {
+        match list {
+            Some((list, row)) => {
+                let child = list.values().as_primitive_opt::<T>().ok_or_else(|| invalid("Invalid stored vector child"))?;
+                let start = list.value_offset(*row) as usize;
+                if child.null_count() == 0 {
+                    values.append_slice(&child.values()[start..start + width]);
+                } else {
+                    for component in start..start + width {
+                        if child.is_null(component) { values.append_null(); } else { values.append_value(child.value(component)); }
+                    }
+                }
+            }
+            None => values.append_nulls(width),
+        }
+    }
+    Ok(Arc::new(values.finish()))
 }
 
 /// Keeps the declared recency column even when a page is empty.
@@ -515,7 +600,35 @@ mod tests {
     fn a_column_every_page_stores_under_its_output_layout_is_copied_from_the_pages() {
         let events = [page(Value::I64(1)), page(Value::I64(2))].concat();
         let field = to_field("v", &LogicalType::Scalar(ScalarType::I64)).unwrap();
-        assert!(gather_column(&events.iter().collect::<Vec<_>>(), &field).unwrap().is_some());
+        assert!(gather_column(&events.iter().collect::<Vec<_>>(), &field, None).unwrap().is_some());
+    }
+
+    #[test]
+    fn vector_gather_preserves_parent_and_component_nulls() {
+        let element = LogicalType::Scalar(ScalarType::F32).maybe();
+        let vector = LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(2), element: Box::new(element) }.maybe();
+        let types = StructFields::from([("v".into(), vector.clone())]);
+        let rows = [
+            Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null]),
+            Value::Null,
+            Value::FixedSizeList(vec![Value::F32(4.0), Value::F32(5.0)]),
+        ].into_iter().enumerate().map(|(id, value)| StoredEvent {
+            iid: EntityId::Integer(id as i64).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None,
+        }).collect::<Vec<_>>();
+        let original = EventBatch::new(build_event_batch(&rows, Some(types.clone()), None).unwrap()).unwrap();
+        let events = original.page_events().unwrap();
+        let field = to_field("v", &vector).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let mut builder = BatchBuilder::new(4096, &memory).unwrap();
+        let sources = [&events[2], &events[0], &events[1]];
+        let column = gather_column(&sources, &field, Some(&mut builder)).unwrap().unwrap();
+        let list = column.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let child = list.values().as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+        assert!(list.is_null(2));
+        assert!(child.is_null(3));
+        assert_eq!(child.value(2).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(&child.values()[..2], &[4.0, 5.0]);
     }
 
     #[test]
@@ -523,7 +636,7 @@ mod tests {
         let events = [page(Value::I64(1)), page(Value::Utf8("a".into()))].concat();
         let union = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::Utf8));
         for ty in [LogicalType::Scalar(ScalarType::I64), union] {
-            assert!(gather_column(&events.iter().collect::<Vec<_>>(), &to_field("v", &ty).unwrap()).unwrap().is_none());
+            assert!(gather_column(&events.iter().collect::<Vec<_>>(), &to_field("v", &ty).unwrap(), None).unwrap().is_none());
         }
     }
 }

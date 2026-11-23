@@ -6,14 +6,14 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, builder::FixedSizeBinaryBuilder};
 use arrow_buffer::Buffer;
 use arrow_ipc::{reader::StreamDecoder, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, cache::BufferPool};
-use rtdb_types::{Iid, Value};
+use rtdb_types::{EntityId, Iid};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Filter {
@@ -51,51 +51,59 @@ fn cluster_group(cluster: usize) -> u32 {
 }
 
 pub(super) struct Embeddings {
-    pub(super) vectors: Vec<f32>,
-    pub(super) queries: Vec<f32>,
-    pub(super) centroids: Vec<f32>,
-    pub(super) clusters: Vec<usize>,
+    pub(super) vectors: Float32Array,
+    pub(super) queries: Float32Array,
+    pub(super) centroids: Float32Array,
+    pub(super) clusters: UInt32Array,
     pub(super) dimensions: usize,
+}
+
+fn read_batch(mut stream: Buffer) -> RecordBatch {
+    let mut decoder = StreamDecoder::new().with_require_alignment(true);
+    let batch = decoder.decode(&mut stream).unwrap().expect("embedding record batch");
+    assert!(decoder.decode(&mut stream).unwrap().is_none());
+    decoder.finish().unwrap();
+    batch
 }
 
 impl Embeddings {
     pub(super) fn read(path: &Path) -> Self {
-        let f32_file = |name| {
-            let bytes = std::fs::read(path.join(name)).unwrap();
-            assert_eq!(bytes.len() % 4, 0);
-            bytes.chunks_exact(4).map(|value| f32::from_le_bytes(value.try_into().unwrap())).collect::<Vec<_>>()
+        let open = |name| read_batch(Buffer::from_vec(std::fs::read(path.join(name)).unwrap()));
+        let read = |batch: &RecordBatch| {
+            let vectors = batch.column_by_name("embedding").unwrap().as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let components = vectors.values().as_any().downcast_ref::<Float32Array>().unwrap();
+            assert!(vectors.value_length() > 0 && vectors.len() > 0 && vectors.null_count() == 0 && components.null_count() == 0);
+            assert!(components.values().iter().all(|value| value.is_finite()));
+            (vectors.value_length() as usize, components.clone())
         };
-        let vectors = f32_file("vectors.f32");
-        let queries = f32_file("queries.f32");
-        let centroids = f32_file("centroids.f32");
-        let instances = std::fs::read(path.join("clusters.u32")).unwrap();
-        let dimensions: usize = std::fs::read_to_string(path.join("dimensions")).unwrap().trim().parse().unwrap();
-        assert!(dimensions > 0);
-        assert_eq!(instances.len(), vectors.len() / dimensions * 4);
-        assert!([vectors.len(), queries.len(), centroids.len()].into_iter().all(|len| len > 0 && len % dimensions == 0));
-        let clusters: Vec<_> = instances.chunks_exact(4).map(|value| u32::from_le_bytes(value.try_into().unwrap()) as usize).collect();
-        assert!(clusters.iter().all(|id| *id < centroids.len() / dimensions));
-        assert!(vectors.iter().chain(&queries).chain(&centroids).all(|value| value.is_finite()));
+        let input = open("vectors.arrow");
+        let (dimensions, vectors) = read(&input);
+        let (query_width, queries) = read(&open("queries.arrow"));
+        let (centroid_width, centroids) = read(&open("centroids.arrow"));
+        assert_eq!(query_width, dimensions);
+        assert_eq!(centroid_width, dimensions);
+        let clusters = input.column_by_name("cluster").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+        assert_eq!(clusters.null_count(), 0);
+        assert!(clusters.values().iter().all(|id| (*id as usize) < centroids.len() / dimensions));
         Self { vectors, queries, centroids, clusters, dimensions }
     }
 
     pub(super) fn vector(&self, id: usize) -> &[f32] {
-        &self.vectors[id * self.dimensions..(id + 1) * self.dimensions]
+        &self.vectors.values()[id * self.dimensions..(id + 1) * self.dimensions]
     }
 }
 
 pub(super) struct VectorIndex {
     pub(super) store: Arc<LocalStore>,
-    pub(super) centroids: Vec<f32>,
+    pub(super) centroids: Float32Array,
     pub(super) bytes: u64,
     dimensions: usize,
     ranges: Vec<Range<u64>>,
-    ids: Vec<(Iid, i64)>,
     object: ObjectKey,
 }
 
 pub(super) struct Candidates {
-    pub(super) ids: Vec<i64>,
+    pub(super) rows: Vec<(i64, Iid)>,
     pub(super) requested_ranges: usize,
     pub(super) requested_bytes: u64,
     pub(super) object_reads: usize,
@@ -106,8 +114,8 @@ pub(super) struct Candidates {
 impl VectorIndex {
     pub(super) async fn build(data: &Embeddings, scratch: &Path) -> Self {
         let mut members = vec![Vec::new(); data.centroids.len() / data.dimensions];
-        for (id, &cluster) in data.clusters.iter().enumerate() {
-            members[cluster].push(id);
+        for (id, &cluster) in data.clusters.values().iter().enumerate() {
+            members[cluster as usize].push(id);
         }
         let stage = scratch.join("vectors.bin");
         let mut out = BufWriter::new(File::create(&stage).unwrap());
@@ -115,6 +123,7 @@ impl VectorIndex {
         let width = i32::try_from(data.dimensions).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),
+            Field::new("_iid", DataType::FixedSizeBinary(16), false),
             Field::new("embedding", DataType::FixedSizeList(Arc::clone(&item), width), false),
         ]));
         let mut ranges = Vec::with_capacity(members.len());
@@ -128,9 +137,13 @@ impl VectorIndex {
             out.write_all(&[0; 64][..padding]).unwrap();
             let start = offset + padding as u64;
             let ids = UInt32Array::from_iter_values(members.iter().map(|id| u32::try_from(*id).unwrap()));
+            let mut iids = FixedSizeBinaryBuilder::with_capacity(members.len(), 16);
+            for id in &members {
+                iids.append_value(EntityId::Integer(*id as i64).iid().0).unwrap();
+            }
             let child = Float32Array::from_iter_values(members.iter().flat_map(|id| data.vector(*id).iter().copied()));
             let vectors = FixedSizeListArray::try_new(Arc::clone(&item), width, Arc::new(child), None).unwrap();
-            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(vectors)]).unwrap();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(iids.finish()), Arc::new(vectors)]).unwrap();
             let mut writer = StreamWriter::try_new(&mut out, &schema).unwrap();
             writer.write(&batch).unwrap();
             writer.finish().unwrap();
@@ -144,26 +157,13 @@ impl VectorIndex {
         let object = ObjectKey::new("ann/vectors.bin").unwrap();
         store.put_file(&object, &stage).await.unwrap();
         std::fs::remove_file(stage).unwrap();
-        let mut ids: Vec<_> = (0..data.clusters.len() as i64)
-            .map(|id| (Value::I64(id).entity_id().unwrap().iid(), id))
-            .collect();
-        ids.sort_unstable_by_key(|entry| entry.0);
-        Self { store, centroids: data.centroids.clone(), bytes: offset, dimensions: data.dimensions, ranges, ids, object }
+        Self { store, centroids: data.centroids.clone(), bytes: offset, dimensions: data.dimensions, ranges, object }
     }
 
     pub(super) async fn warm_cache(&self) -> BufferPool {
         let cache = BufferPool::new(self.store.clone(), 512 << 20);
         cache.get(&self.object).await.unwrap();
         cache
-    }
-
-    pub(super) fn indexed_id(&self, iid: Iid) -> Option<i64> {
-        let slot = self.ids.binary_search_by_key(&iid, |entry| entry.0).ok()?;
-        Some(self.ids[slot].1)
-    }
-
-    pub(super) fn lookup_bytes(&self) -> usize {
-        self.ids.capacity() * std::mem::size_of::<(Iid, i64)>()
     }
 
     pub(super) async fn candidates(
@@ -173,9 +173,9 @@ impl VectorIndex {
         filter: Filter,
         probes: usize,
         limit: usize,
-        changed: &BTreeSet<i64>,
+        changed: &BTreeSet<Iid>,
     ) -> Candidates {
-        let mut groups: Vec<_> = self.centroids.chunks_exact(self.dimensions).enumerate()
+        let mut groups: Vec<_> = self.centroids.values().chunks_exact(self.dimensions).enumerate()
             .filter(|(id, _)| !self.ranges[*id].is_empty())
             .filter(|(id, _)| !matches!(filter, Filter::ClusterBelow(end) if cluster_group(*id) >= end))
             .map(|(id, centroid)| (id, -query.iter().zip(centroid).map(|(left, right)| *left * right).sum::<f32>()))
@@ -190,25 +190,23 @@ impl VectorIndex {
             cache.get_range(&self.object, self.ranges[id].clone()).await.map(|bytes| (id, bytes))
         })).buffer_unordered(8);
         while let Some((cluster, bytes)) = reads.try_next().await.unwrap() {
-            let mut stream = Buffer::from(Bytes::from_owner(bytes));
-            let mut decoder = StreamDecoder::new().with_require_alignment(true);
-            let batch = decoder.decode(&mut stream).unwrap().expect("cluster record batch");
-            assert!(decoder.decode(&mut stream).unwrap().is_none());
-            decoder.finish().unwrap();
+            let batch = read_batch(Buffer::from(Bytes::from_owner(bytes)));
             let ids = batch.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
-            let list = batch.column(1).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let iids = batch.column(1).as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let list = batch.column(2).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             let vectors = list.values().as_any().downcast_ref::<Float32Array>().unwrap();
-            for (&id, vector) in ids.values().iter().zip(vectors.values().chunks_exact(self.dimensions)) {
+            for (row, (&id, vector)) in ids.values().iter().zip(vectors.values().chunks_exact(self.dimensions)).enumerate() {
                 let id = id as usize;
-                if !changed.is_empty() && changed.contains(&(id as i64)) { continue; }
                 let (random, group) = self::groups(id, cluster);
                 if !filter.accepts(random, group) { continue; }
+                let iid = Iid::from_slice(iids.value(row)).unwrap();
+                if changed.contains(&iid) { continue; }
                 let (mut dot, mut norm) = (0.0, 0.0);
                 for (&value, query) in vector.iter().zip(query) {
                     dot += value * query;
                     norm += value * value;
                 }
-                let candidate = Neighbor(-dot / norm.sqrt(), id as i64);
+                let candidate = Neighbor(-dot / norm.sqrt(), id as i64, iid);
                 scored += 1;
                 if held.len() < limit {
                     held.push(candidate);
@@ -218,14 +216,14 @@ impl VectorIndex {
                 }
             }
         }
-        Candidates { ids: held.into_iter().map(|candidate| candidate.1).collect(), requested_ranges: selected.len(), requested_bytes,
+        Candidates { rows: held.into_iter().map(|candidate| (candidate.1, candidate.2)).collect(), requested_ranges: selected.len(), requested_bytes,
             object_reads: if cached { 0 } else { selected.len() },
             object_bytes: if cached { 0 } else { requested_bytes },
             scored }
     }
 }
 
-struct Neighbor(f32, i64);
+struct Neighbor(f32, i64, Iid);
 impl PartialEq for Neighbor { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
 impl Eq for Neighbor {}
 impl PartialOrd for Neighbor { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }

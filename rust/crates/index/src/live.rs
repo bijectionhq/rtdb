@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
-use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, owned_event_batch};
+use rtdb_format::data::{EncodedEvent, EventBatch, PageEvent, PutColumn, StoredEvent, StoredOperation, owned_event_batch, put_page_events};
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
@@ -75,23 +75,20 @@ impl IndexBatch {
     pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &StructFields<LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::CopyCaptured, budget)
     }
-    fn build_events(events: &[StoredEvent], declared: &StructFields<LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let mut schema_bytes = 4096usize;
-        for (name, ty) in declared {
-            schema_bytes = schema_bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(ty.retained_bytes().ok()?)).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
-        }
-        for event in events {
-            if let StoredOperation::Put(document) = &event.operation {
-                schema_bytes = schema_bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
-            }
-        }
-        let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(|| invalid("Put schema allocation size overflow"))?)?;
+    fn build_events<E: PendingDocument>(events: &[E], declared: &StructFields<LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let schema_bytes = declared.iter().try_fold(4096usize, |bytes, (name, ty)| {
+            bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(ty.retained_bytes().ok()?)).ok_or_else(schema_size)
+        })?;
+        let schema_bytes = events.iter().try_fold(schema_bytes, |bytes, event| {
+            bytes.checked_add(event.schema_bound()?).ok_or_else(schema_size)
+        })?;
+        let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(schema_size)?)?;
         let mut has_put = matches!(mode, EventBuild::CopyCaptured) || !declared.is_empty();
         let mut documents = Vec::new();
         for event in events {
-            if let StoredOperation::Put(document) = &event.operation {
+            if event.header().op == EventOp::Put {
                 if !matches!(mode, EventBuild::CopyCaptured) {
-                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<StructFields<_>>());
+                    documents.push(event.document_types());
                 }
                 has_put = true;
             }
@@ -433,8 +430,69 @@ impl LiveIndex {
     }
 }
 
+trait PendingDocument: EncodedEvent {
+    fn document_types(&self) -> StructFields<LogicalType>;
+    fn schema_bound(&self) -> Result<usize>;
+}
+
+impl PendingDocument for StoredEvent {
+    fn document_types(&self) -> StructFields<LogicalType> {
+        match &self.operation {
+            StoredOperation::Put(document) => document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect(),
+            _ => StructFields::new(),
+        }
+    }
+
+    fn schema_bound(&self) -> Result<usize> {
+        match &self.operation {
+            StoredOperation::Put(document) => Value::document_retained_bytes(document),
+            _ => Ok(0),
+        }
+    }
+}
+
+enum PendingEvent { Row(StoredEvent), Arrow(PageEvent) }
+
+impl PendingEvent {
+    fn encoded(&self) -> &dyn EncodedEvent {
+        match self {
+            Self::Row(event) => event,
+            Self::Arrow(event) => event,
+        }
+    }
+}
+
+impl EncodedEvent for PendingEvent {
+    fn header(&self) -> EventHeader { self.encoded().header() }
+    fn recency(&self) -> Option<Timestamp> { self.encoded().recency() }
+    fn put_within(&self, fields: &StructFields<LogicalType>) -> bool { self.encoded().put_within(fields) }
+    fn put_cell(&self, name: &str, ty: &LogicalType) -> Result<std::borrow::Cow<'_, Value>> { self.encoded().put_cell(name, ty) }
+    fn put_column(&self, name: &str) -> Option<PutColumn<'_>> { self.encoded().put_column(name) }
+}
+
+impl PendingDocument for PendingEvent {
+    fn document_types(&self) -> StructFields<LogicalType> {
+        match self {
+            Self::Row(event) => event.document_types(),
+            Self::Arrow(event) => event.put_types().cloned().unwrap_or_default(),
+        }
+    }
+
+    fn schema_bound(&self) -> Result<usize> {
+        match self {
+            Self::Row(event) => event.schema_bound(),
+            Self::Arrow(event) => event.put_types().into_iter().flatten().try_fold(256usize, |bytes, (name, ty)| {
+                bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(ty.retained_bytes().ok()?))
+                    .and_then(|bytes| bytes.checked_add(256)).ok_or_else(schema_size)
+            }),
+        }
+    }
+}
+
+fn schema_size() -> Anomaly { invalid("Put schema allocation size overflow") }
+
 #[derive(Default)]
-struct PendingTable { declared: StructFields<LogicalType>, events: Vec<StoredEvent>, reservations: Vec<Arc<MemoryReservation>> }
+struct PendingTable { declared: StructFields<LogicalType>, events: Vec<PendingEvent>, reservations: Vec<Arc<MemoryReservation>> }
 
 pub struct TransactionBuffer {
     base: Snapshot,
@@ -497,10 +555,23 @@ impl TransactionBuffer {
         let reservation = self.budget.reserve(bytes)?;
         if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
         let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
-        pending.events.push(event);
+        pending.events.push(PendingEvent::Row(event));
         pending.reservations.push(reservation);
         Ok(())
     }
+    pub fn put_batch(&mut self, table: &TableRef, documents: OwnedBatch, types: StructFields<LogicalType>,
+        headers: Vec<(Iid, Interval)>) -> Result<()> {
+        if headers.is_empty() { return Ok(()); }
+        let bytes = headers.len().checked_mul(std::mem::size_of::<PendingEvent>() * 3)
+            .and_then(|bytes| bytes.checked_add(4096 + table.schema.len() + table.table.len())).ok_or_else(schema_size)?;
+        let reservation = self.budget.reserve(bytes)?;
+        let events = put_page_events(documents, types, headers, self.tx_key.system_time)?;
+        let pending = self.tables.entry(table.clone()).or_default();
+        pending.events.extend(events.into_iter().map(PendingEvent::Arrow));
+        pending.reservations.push(reservation);
+        Ok(())
+    }
+
     /// The snapshot the transaction started from, without its own writes, for a statement that reads no table.
     pub fn base_snapshot(&self) -> Snapshot { self.base.clone() }
     pub fn snapshot(&self) -> Result<Snapshot> {
@@ -511,7 +582,7 @@ impl TransactionBuffer {
                 None => (Arc::new(LiveTable::new(table.clone(), self.base.block_index(), TrieConfig::default())), 0, None),
             };
             if done == pending.events.len() && declared == Some(&pending.declared) { continue; }
-            let batch = (done < pending.events.len()).then(|| IndexBatch::copy_events(&pending.events[done..], &pending.declared, &self.budget)).transpose()?;
+            let batch = (done < pending.events.len()).then(|| IndexBatch::build_events(&pending.events[done..], &pending.declared, EventBuild::CopyInferred, &self.budget)).transpose()?;
             let segment = Arc::new(segment.append(&TableWrite::new(pending.declared.clone(), batch), self.tx_key.system_time)?);
             segments.insert(table.clone(), (segment, pending.events.len(), pending.declared.clone()));
         }
@@ -525,7 +596,7 @@ impl TransactionBuffer {
     }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
-            let batch = Some(IndexBatch::copy_events(&pending.events, &pending.declared, &self.budget)?);
+            let batch = Some(IndexBatch::build_events(&pending.events, &pending.declared, EventBuild::CopyInferred, &self.budget)?);
             Ok((table.clone(), TableWrite::new(pending.declared.clone(), batch)))
         }).collect::<Result<_>>()?;
         StagedWrite::new(self.tx_key, self.base.tx_basis(), self.base.block_index(), tables)
