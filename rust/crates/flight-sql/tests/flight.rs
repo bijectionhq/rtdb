@@ -1390,8 +1390,8 @@ async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_cou
 }
 
 #[tokio::test]
-#[ignore = "serves an isolated placed database for the paired Bijection Flight test"]
-async fn serve_hosted_spatial_pair() {
+#[ignore = "serves an isolated database for the paired Bijection Flight tests"]
+async fn serve_spatial_pair() {
     use rtdb_types::{OwnedRelation, OwnedSchema};
     use std::path::Path;
 
@@ -1405,15 +1405,27 @@ async fn serve_hosted_spatial_pair() {
 
     let directory = std::path::PathBuf::from(std::env::var_os("RTDB_SPATIAL_PAIR_DIR").unwrap());
     let password = std::env::var("RTDB_SPATIAL_FLIGHT_PASSWORD").unwrap();
-    let options = NodeOptions { file_size_target: 1, automatic_artefacts: false, ..NodeOptions::default() };
-    let running = Running::start_with_options(Some(&password), FlightConfig {
-        owned_native_actions: true,
-        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+    let hosted_controls = match std::env::var("RTDB_SPATIAL_PAIR_MODE").unwrap().as_str() {
+        "standalone" => None,
+        "placed" => Some(rtdb_flight_sql::HostedControlConfig {
             owner: "xtdb".into(),
             relations: ["bj_installation", "bj_fact_root_owner", "bj_fact_root_program"].map(str::to_owned).into(),
         }),
+        mode => panic!("Unknown spatial fixture mode {mode}"),
+    };
+    let standalone = hosted_controls.is_none();
+    let options = NodeOptions { file_size_target: 1, automatic_artefacts: false, ..NodeOptions::default() };
+    let running = Running::start_with_options(Some(&password), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls,
         ..FlightConfig::default()
     }, &["application"], None, options).await;
+    if standalone {
+        std::fs::write(directory.join("listen"), running.server.address().to_string()).unwrap();
+        wait_for(&directory, "standalone-verified").await;
+        running.stop().await;
+        return;
+    }
     let mut client = Client::connect_with_database(&running.server, Some(&format!("xtdb:{password}")), Some("application")).await;
     for statement in [
         "INSERT INTO bj_installation RECORDS {_id: 'authority', _valid_from: TIMESTAMP '1970-01-01Z'}",

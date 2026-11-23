@@ -1,4 +1,4 @@
-"""Run the placed RTDB Flight fixture and Bijection's native client test."""
+"""Verify the standalone and placed RTDB Flight paths with Bijection's native client."""
 
 import argparse
 import asyncio
@@ -76,17 +76,19 @@ async def stop(process):
         await process.wait()
 
 
-async def run(server_binary, client_binary):
+async def run_case(server_binary, client_binary, mode, client_test):
     with tempfile.TemporaryDirectory(prefix="hosted-spatial-pair-") as temporary:
         directory = Path(temporary)
         tls = fixture_tls(directory)
         password = secrets.token_hex(24)
         env = {**os.environ, "RTDB_SPATIAL_PAIR_DIR": temporary,
-               "RTDB_SPATIAL_FLIGHT_PASSWORD": password, "RUST_MIN_STACK": "16777216"}
+               "RTDB_SPATIAL_PAIR_MODE": mode, "RTDB_SPATIAL_FLIGHT_PASSWORD": password,
+               "RTDB_SPATIAL_FLIGHT_DATABASE": "application", "RTDB_SPATIAL_FLIGHT_USER": "xtdb",
+               "RUST_MIN_STACK": "16777216"}
         log = directory / "rtdb.log"
         with log.open("wb") as output:
             server = await asyncio.create_subprocess_exec(
-                server_binary, "--ignored", "--exact", "serve_hosted_spatial_pair", "--nocapture",
+                server_binary, "--ignored", "--exact", "serve_spatial_pair", "--nocapture",
                 env=env, stdout=output, stderr=output,
             )
         client = None
@@ -97,19 +99,31 @@ async def run(server_binary, client_binary):
             ) as bridge:
                 tls_port = bridge.sockets[0].getsockname()[1]
                 client = await asyncio.create_subprocess_exec(
-                    client_binary, "--ignored", "--exact", "--nocapture",
-                    "rtdb::owned_flight::hosted_spatial_pair::hosted_spatial_cutover_orders_the_backfill_and_hook_on_one_commit",
+                    client_binary, "--ignored", "--exact", "--nocapture", client_test,
                     env={**env, "RTDB_SPATIAL_FLIGHT_CA": str(directory / "ca.pem"),
                          "RTDB_SPATIAL_FLIGHT_URL": f"https://127.0.0.1:{tls_port}"},
                 )
                 if await asyncio.wait_for(client.wait(), 140) != 0:
-                    raise RuntimeError("The Bijection client test failed")
+                    raise RuntimeError(f"The {mode} Bijection client test failed")
+                if mode == "standalone":
+                    (directory / "standalone-verified").touch()
                 if await asyncio.wait_for(server.wait(), 15) != 0:
                     raise RuntimeError("The RTDB fixture failed")
         finally:
             await stop(client)
             await stop(server)
             print(log.read_text().replace(password, "[redacted]"), end="")
+
+
+async def run(server_binary, client_binary):
+    await run_case(
+        server_binary, client_binary, "standalone",
+        "rtdb::owned_flight::tests::owned_spatial_client_pages_documents_at_the_original_cut",
+    )
+    await run_case(
+        server_binary, client_binary, "placed",
+        "rtdb::owned_flight::hosted_spatial_pair::hosted_spatial_cutover_orders_the_backfill_and_hook_on_one_commit",
+    )
 
 
 if __name__ == "__main__":

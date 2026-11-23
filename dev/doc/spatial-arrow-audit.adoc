@@ -103,8 +103,9 @@ The geometry kernel consumes the geometry carrier for coverings and exact predic
 Bijection converts application values at its API boundary and preserves their canonical images for document semantics.
 Owned action headers carry authorization, framing, and held-read controls.
 
-== Placed release integration test
+== Bijection and RTDB Flight integration tests
 
-`rust/conformance/run_hosted_spatial_pair.py` starts an isolated placed RTDB fixture and uses a loopback TLS relay for the Bijection client.
+`rust/conformance/run_hosted_spatial_pair.py` starts isolated standalone and placed RTDB databases and uses a loopback TLS relay for the Bijection client.
 Give it the `rtdb-flight-sql` `flight` integration test executable and the Bijection `native_store_runtime` library test executable, in that order.
-The pair checks durable postings over pre-existing data, a concurrent replacement, refusal before readiness, and one commit for the program and hook write.
+The standalone test checks held pagination, empty and projected results, nearest distance ties, and visibility across concurrent replacement and delete.
+The placed test checks durable postings over pre-existing data, a concurrent replacement, refusal before readiness, and one commit for the program and hook write.
