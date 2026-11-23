@@ -88,6 +88,7 @@ enum ArchiveRead {
         lower: Option<StructFields<Value>>,
         upper: Option<StructFields<Value>>,
         valid: Timestamp,
+        earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         read: OrderedRead,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<OrderedResult>>,
@@ -640,7 +641,7 @@ impl HeldCheckpointWorld {
         let read = OrderedRead::Page {
             after: request.after.cloned(), descending: request.descending, limit: request.limit,
         };
-        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read).await?;
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read, None).await?;
         let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((page, witness))
     }
@@ -681,7 +682,7 @@ impl HeldCheckpointWorld {
     pub async fn count(
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>,
     ) -> Result<(u64, OwnedWorldWitness)> {
-        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count).await?;
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count, None).await?;
         let OrderedResult::Count(count) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((count, witness))
     }
@@ -691,26 +692,56 @@ impl HeldCheckpointWorld {
     ) -> Result<(OwnedRangeCount, OwnedWorldWitness)> {
         if self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
         let (result, witness) = self.ordered(
-            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Measure,
+            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Measure, None,
         ).await?;
         let OrderedResult::Measure(measured) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((measured, witness))
     }
 
+    pub async fn parent_range_at(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>,
+        valid: Timestamp, system: Timestamp,
+    ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
+        let read = OrderedRead::Page {
+            after: request.after.cloned(), descending: request.descending, limit: request.limit,
+        };
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read, Some(system)).await?;
+        let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((page, witness))
+    }
+
+    pub async fn parent_count_at(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>, system: Timestamp,
+    ) -> Result<(u64, OwnedWorldWitness)> {
+        let (result, witness) = self.ordered(
+            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count, Some(system),
+        ).await?;
+        let OrderedResult::Count(count) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((count, witness))
+    }
+
     async fn ordered(
         &self, relation: OwnedRelation, path: OwnedRelation, lower: Option<&StructFields<Value>>,
-        upper: Option<&StructFields<Value>>, valid: Timestamp, read: OrderedRead,
+        upper: Option<&StructFields<Value>>, valid: Timestamp, read: OrderedRead, system: Option<Timestamp>,
     ) -> Result<(OrderedResult, OwnedWorldWitness)> {
         self.check_relation(&relation)?;
         Interval::at(valid)?;
         let guard = self.open.snapshot.relation_release_guard([&relation])?;
-        let witness = self.open.snapshot.world_relation_witnesses(
-            self.open.record.id, [&relation],
-        ).await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        let (witness, earlier) = if let Some(system) = system {
+            let schema = self.historical_parent_schema(&relation)?;
+            if system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+            let witness = self.open.snapshot.world_parent_witness(self.open.record.id, &relation).await?;
+            if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+            (witness, Some((system, schema.clone())))
+        } else {
+            let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [&relation])
+                .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+            (witness, None)
+        };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ordered {
             relation, path, frontier: witness.purge_frontier(), lower: lower.cloned(), upper: upper.cloned(),
-            valid, read, guard: Arc::clone(&guard), reply,
+            valid, earlier, read, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let result = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
@@ -1348,11 +1379,17 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, read, guard, mut reply } => {
+                                ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, earlier, read, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner, [(&relation, frontier)])?;
                                         let context = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let context = if let Some((system, schema)) = earlier {
+                                            let schemas = [(relation.clone(), schema)];
+                                            let (context, selected) = historical_parent_context(context, &owner, system, &schemas).await?;
+                                            if selected != system { return Err(OwnedWorld::unavailable()); }
+                                            context
+                                        } else { context };
                                         let (lower, upper) = (lower.as_ref(), upper.as_ref());
                                         let result = match read {
                                             OrderedRead::Page { after, descending, limit } => {

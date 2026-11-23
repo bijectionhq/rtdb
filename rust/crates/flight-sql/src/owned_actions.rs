@@ -219,13 +219,15 @@ pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
+pub(crate) const HELD_WORLD_PARENT_RANGE_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentRangeAt.v1";
+pub(crate) const HELD_WORLD_PARENT_COUNT_AT_V1: &str = "rtdb.owned.CountHeldWorldParentRangeAt.v1";
 pub(crate) const HELD_WORLD_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_COUNT_V1: &str = "rtdb.owned.CountHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_MEASURE_V1: &str = "rtdb.owned.MeasureHeldWorldRange.v1";
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRangeAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
 #[derive(Clone, Copy)]
-pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange, OverlayRangeAt }
+pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange, OverlayRangeAt, ParentRangeAt, ParentCountAt }
 pub(crate) const SEARCH_HELD_WORLD_AT_V1: &str = "rtdb.owned.SearchHeldWorldAt.v1";
 pub(crate) const SEARCH_HELD_WORLD_V1: &str = "rtdb.owned.SearchHeldWorld.v1";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
@@ -1735,13 +1737,13 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
-        let (system, request) = if matches!(order, WorldOrder::OverlayRangeAt) {
+        let (system, request) = if matches!(order, WorldOrder::OverlayRangeAt | WorldOrder::ParentRangeAt | WorldOrder::ParentCountAt) {
             let (system, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world range has no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
         } else { (None, request) };
         let (relation, arrow) = split_relation(request)?;
         let batch = decode_batch(call, arrow)?;
-        let count = matches!(order, WorldOrder::ParentCount | WorldOrder::ParentMeasure);
+        let count = matches!(order, WorldOrder::ParentCount | WorldOrder::ParentCountAt | WorldOrder::ParentMeasure);
         let fields = if count { 4 } else { 7 };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != fields {
             return Err(invalid("Invalid held world range arguments"));
@@ -1757,7 +1759,10 @@ impl Service {
         let upper = compound_bound(Some(upper))?;
         let (schema, page, witness, count_rows) = if count {
             let request = OwnedCountRequest { lower, upper, valid_at };
-            let (rows, witness) = if matches!(order, WorldOrder::ParentMeasure) {
+            let (rows, witness) = if let Some(system) = system {
+                let (count, witness) = held.snapshot.parent_count_at(relation.clone(), path, request, system).await.map_err(status)?;
+                (count_batch(count)?, witness)
+            } else if matches!(order, WorldOrder::ParentMeasure) {
                 let (measured, witness) = held.snapshot.measure(relation.clone(), path, request).await.map_err(status)?;
                 (measure_batch(&measured)?, witness)
             } else {
@@ -1774,7 +1779,12 @@ impl Service {
                 limit: usize::try_from(*limit).map_err(|_| invalid("Invalid held world range limit"))?,
             };
             let (page, witness) = if let Some(system) = system {
-                (held.snapshot.overlay_range_at(relation.clone(), path, request, valid_at, system).await.map_err(status)?, None)
+                if matches!(order, WorldOrder::ParentRangeAt) {
+                    let (page, witness) = held.snapshot.parent_range_at(relation.clone(), path, request, valid_at, system).await.map_err(status)?;
+                    (page, Some(witness))
+                } else {
+                    (held.snapshot.overlay_range_at(relation.clone(), path, request, valid_at, system).await.map_err(status)?, None)
+                }
             } else {
                 let (page, witness) = if matches!(order, WorldOrder::OverlayRange) {
                     held.snapshot.overlay_range(relation.clone(), path, request, valid_at).await
