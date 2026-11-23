@@ -2082,6 +2082,7 @@ mod tests {
                     operation: StoredOperation::Put(StructFields::from([
                         ("_id".into(), Value::I64(1)),
                         ("v".into(), Value::I64(value)),
+                        ("k".into(), Value::Binary(vec![u8::try_from(value).unwrap()])),
                     ])),
                     recency: None,
                 }).unwrap();
@@ -2130,6 +2131,30 @@ mod tests {
                 }
             }
             assert_eq!(slices, expected);
+        }
+        for (key, mask, expected) in [
+            (Some([2u8].as_slice()), None, vec![]),
+            (Some([2u8].as_slice()), Some((Timestamp(100), 2)), vec![(10, 20, vec![2])]),
+            (None, Some((Timestamp(100), 2)), vec![(5, 10, vec![1]), (10, 20, vec![2]), (20, 28, vec![4])]),
+        ] {
+            let mut cursor = crate::open_owned_unique_window(
+                Arc::clone(&context), "alice", &relation, "k", key,
+                Interval::from_micros(5, 28).unwrap(), Timestamp(110), mask, 4,
+            ).await.unwrap().unwrap();
+            let mut claims = Vec::new();
+            while let Some(page) = cursor.next_batch().await.unwrap() {
+                let page = page.batch();
+                let stamp = |name: &str| page.column_by_name(name).unwrap().as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+                let (column, field) = page.schema_ref().column_with_name("k").unwrap();
+                for row in 0..page.num_rows() {
+                    let Value::Binary(key) = rtdb_columnar::read_value(field, page.column(column).as_ref(), row).unwrap()
+                    else { panic!("Expected a full Binary claim"); };
+                    claims.push((stamp("_valid_from").value(row), stamp("_valid_to").value(row), key));
+                }
+            }
+            claims.sort_unstable();
+            assert_eq!(claims, expected);
         }
     }
 

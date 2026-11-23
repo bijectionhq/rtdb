@@ -196,6 +196,9 @@
 -- A held current-valid unique lookup requires the declaration frontier to cover the captured relation.
 -- A hit proves both the full occupancy identity and the winning fact holder's complete Binary key.
 -- A covered miss or verified hit can yield one original held relation witness.
+-- An admitted finite unique window projects complete Binary keys and winning fact holders with clipped valid intervals.
+-- A held decision mask applies to fact assertions before key selection, and a masked or historical window issues no commit witness.
+-- An unmasked present window may issue a relation-frontier witness after admitting the complete bounded result.
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
 -- Key conflicts expose neither the occupied key nor its holder.
 -- A held range requires an exact published covering generation for the captured frontier and serves one page directly from that path.

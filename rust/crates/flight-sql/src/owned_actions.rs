@@ -4,7 +4,7 @@ mod unique;
 
 pub(crate) use hosted_control::READ_HELD_HOSTED_CONTROL_V2;
 pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V5, OBSERVE_HELD_HOSTED_V1, PREPARE_APPLIED_READ_V2};
-pub(crate) use unique::READ_HELD_UNIQUE_V1;
+pub(crate) use unique::{READ_HELD_UNIQUE_V1, READ_HELD_UNIQUE_WINDOW_V1};
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
 

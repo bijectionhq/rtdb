@@ -332,6 +332,58 @@ pub async fn owned_identity_candidates(
     Ok(OwnedIdentityCandidates { keys, _charges: charges })
 }
 
+/// Project winning base facts, including when a decision suffix is hidden.
+pub async fn open_owned_unique_window(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    column: &str,
+    key: Option<&[u8]>,
+    valid: Interval,
+    system: Timestamp,
+    mask: Option<(Timestamp, u32)>,
+    fetch: usize,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || valid.is_empty()
+        || valid.lower() == Timestamp::MIN || valid.upper() == Timestamp::MAX
+        || !(1..=1025).contains(&fetch)
+        || key.is_some_and(|key| key.is_empty() || key.len() > crate::OWNED_UNIQUE_KEY_MAX)
+    {
+        return Err(address_unavailable());
+    }
+    let context = match mask {
+        Some(mask) => owned_context_at_position(context, system, mask)?,
+        None => owned_context_at_system(context, system)?,
+    };
+    let name = QualifiedTable {
+        database: context.catalog.default_database().to_owned(),
+        table: relation.table(owner),
+    };
+    let context = context.for_owned_relation(name.clone(), None);
+    let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
+    let columns = ["_id", "_valid_from", "_valid_to", "_system_from", column]
+        .into_iter().enumerate().map(|(index, name)| Field {
+            id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: table.scan_column_type(name),
+        }).collect::<Vec<_>>();
+    let key_field = columns[4].expression();
+    let predicate = match key {
+        Some(key) => Expr::binary(BinaryOp::Eq, key_field, Expr::Literal(Value::Binary(key.to_vec()))),
+        None => Expr::Unary { op: rtdb_plan::UnaryOp::IsNotNull, expr: Box::new(key_field) },
+    };
+    let timestamp = |time: Timestamp| Expr::Literal(Value::Timestamp {
+        value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+    });
+    let scan = Arc::new(Relation::scan(Scan {
+        table, columns,
+        valid_time: TemporalFilter::FromTo { from: timestamp(valid.lower()), to: timestamp(valid.upper()) },
+        system_time: TemporalFilter::Default, clamp_valid_time: true,
+        iids: None, predicates: vec![predicate], matches: Vec::new(), top_k: None, ordered_top_k: None,
+    })?);
+    let query = Arc::new(scan.limit(None, Some(Expr::Literal(Value::I64(fetch as i64))))?);
+    PreparedQuery::new_in(query, &context.memory)?.execute(context, Vec::new()).await.map(Some)
+}
+
 /// Resolve the winning key projection over a valid window at this snapshot.
 pub async fn open_owned_key_timeline(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
