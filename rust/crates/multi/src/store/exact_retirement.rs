@@ -533,14 +533,16 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         if retires_release { released.insert(release_name.to_owned()); }
         base.forget(bucket, &store, &released).await?;
     }
-    if let Some(replica) = &witness.replica
+    if let (Some(replica), RetirementWork::S3 { version, .. }) = (&witness.replica, &retirement.work)
         && let (Some(trim), Some(anchor)) = (&owner.replica_payload_trim, &owner.replica_anchor)
     {
         crate::residence_trace::record("retirement-recovery-dependency", || serde_json::json!({
             "lineage": owner.lineage, "installation": owner.id, "incarnation": owner.incarnation,
             "epoch": owner.log_epoch, "stream": owner.stream("replica"), "revision": owner.version,
-            "retirement": retirement.token, "key": target.as_str(), "position": replica.position,
+            "residence": retirement.source, "retirement": retirement.token, "key": target.as_str(),
+            "publication": version, "position": replica.position, "frame": replica.frame_sha256,
             "trim_through": trim.through, "anchor": anchor.digest,
+            "journals": trim.journals.iter().filter_map(|endpoint| endpoint.journal()).collect::<Vec<_>>(),
         }));
     }
     Ok(Some(owner.version))

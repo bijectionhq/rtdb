@@ -27,7 +27,34 @@ def trim_scope(event):
     return (*scope(event, ("installation", "incarnation", "epoch", "stream", "revision", "through")), tuple(event["anchor"]))
 
 
-def verify_native(events):
+def verify_catalogs(catalogs):
+    for records in catalogs.values():
+        floor, holds = None, {}
+        # Apply reader changes from a CAS before checking the paths selected at that revision.
+        ordered = sorted(records, key=lambda event: (event["revision"], event["event"] not in {"catalog-hold", "catalog-release"}))
+        for event in ordered:
+            kind = event["event"]
+            if kind == "catalog-release":
+                holds.pop(event["hold"], None)
+            elif kind == "catalog-hold":
+                require(floor is None or (event["through"] is not None and event["through"] >= floor),
+                        "catalog hold precedes the admission floor")
+                holds[event["hold"]] = event["primary_paths"]
+            else:
+                require(floor is None or event["through"] >= floor, "catalog admission floor rewound")
+                floor = event["through"]
+                if kind == "close-catalog-admission":
+                    for path in event["eligible_paths"]:
+                        require(all(paths is not None and path not in paths for paths in holds.values()),
+                                "exact retirement path is reachable by an observed catalog hold")
+
+
+def physical_retirement(event):
+    return (*scope(event, ("lineage", "residence", "retirement", "key")),
+            json.dumps(event["publication"], sort_keys=True))
+
+
+def verify_native(events, *, verify_catalog_history=True):
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
     published_decisions = set()
@@ -55,8 +82,12 @@ def verify_native(events):
                 require(decision in published_decisions and 0 <= event["through"] <= event["decision_through"],
                         "append receipt precedes its observed quorum publication")
             elif kind == "retirement-recovery-dependency":
-                require(digest(event["anchor"]) and event["position"] <= event["trim_through"],
+                require(digest(event["anchor"]) and digest(event["frame"]) and 0 <= event["position"] <= event["trim_through"],
                         "retirement has no matching recovery exclusion")
+                require(event["journals"] and len(set(event["journals"])) == len(event["journals"]),
+                        "retirement has no complete set of physical journals")
+                require(event["key"].startswith(event["residence"] + "/") and event["publication"]["version"],
+                        "retirement has no exact physical publication")
             elif kind == "authorize-trim":
                 checkpoint = event["checkpoint"]
                 require(digest(event["manifest"]) and digest(checkpoint["root_sha256"])
@@ -65,11 +96,17 @@ def verify_native(events):
                 trims.add(trim_scope(event))
             elif kind == "apply-trim":
                 require(trim_scope(event) in trims, "physical trim lacks its exact authorization")
-            elif kind in {"advance-floor", "catalog-hold", "catalog-release"}:
+                if event["settled_revision"] is not None:
+                    require(event["revision"] <= event["settled_revision"] and event["journals"]
+                            and len(set(event["journals"])) == len(event["journals"]),
+                            "settled trim lacks its applied directory revision and physical journals")
+            elif kind in {"advance-floor", "close-catalog-admission", "catalog-hold", "catalog-release"}:
                 key = scoped_catalog(event)
-                catalogs.setdefault(key, []).append((index, event))
+                catalogs.setdefault(key, []).append(event)
                 if kind == "catalog-hold":
                     require(holds.setdefault(event["hold"], key) == key, "reader identity changed catalog scope")
+                    paths = event["primary_paths"]
+                    require(paths is None or paths == sorted(set(paths)), "catalog claim has a noncanonical reachability census")
                 if kind == "catalog-release" and event["hold"] in holds:
                     require(holds[event["hold"]] == key, "release names another reader scope")
             elif kind in {"erasure-obligation", "key-revoked"}:
@@ -112,16 +149,8 @@ def verify_native(events):
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"native observation {index + 1}: {error}") from error
 
-    # Directory revisions order observations that concurrent returns can deliver out of order.
-    for records in catalogs.values():
-        floor = None
-        for index, event in sorted(records, key=lambda item: (item[1]["revision"], item[1]["event"] != "advance-floor")):
-            if event["event"] == "advance-floor":
-                require(floor is None or event["through"] >= floor, f"native observation {index + 1}: floor rewound")
-                floor = event["through"]
-            elif event["event"] == "catalog-hold":
-                require(floor is None or (event["through"] is not None and event["through"] >= floor),
-                        f"native observation {index + 1}: catalog hold precedes the admission floor")
+    if verify_catalog_history:
+        verify_catalogs(catalogs)
 
 
 def replica_scope(event):
@@ -136,18 +165,26 @@ def exact_checkpoint(event, checkpoint, manifest):
 def verify_joined(captures):
     """Join independently captured owner events by immutable identity and authority revision."""
     for events in captures:
-        verify_native(events)
+        verify_native(events, verify_catalog_history=False)
     events = [event for capture in captures for event in capture]
-    published = {}
+    published, catalogs, installed_trims, dependencies = {}, {}, {}, {}
     for event in events:
-        if event["event"] == "publish-checkpoint":
+        kind = event["event"]
+        if kind == "publish-checkpoint":
             identity = exact_checkpoint(event, event, event["manifest"])
             published[identity] = min(event["revision"], published.get(identity, event["revision"]))
-    installed_trims = {}
-    for event in events:
-        if event["event"] == "apply-trim":
-            key = (*replica_scope(event), event["through"], tuple(event["anchor"]))
-            installed_trims[key] = min(event["revision"], installed_trims.get(key, event["revision"]))
+        elif kind in {"advance-floor", "close-catalog-admission", "catalog-hold", "catalog-release"}:
+            catalogs.setdefault(scoped_catalog(event), []).append(event)
+        elif kind == "apply-trim" and event["settled_revision"] is not None:
+            key = (*replica_scope(event), event["through"], tuple(event["anchor"]), frozenset(event["journals"]))
+            revision = event["settled_revision"]
+            installed_trims[key] = min(revision, installed_trims.get(key, revision))
+        elif kind == "retirement-recovery-dependency":
+            key = physical_retirement(event)
+            dependency = (*replica_scope(event), event["position"], tuple(event["frame"]))
+            require(dependencies.setdefault(key, dependency) == dependency,
+                    "retirement changed its certified replica dependency")
+    verify_catalogs(catalogs)
     joined = 0
     for event in events:
         kind = event["event"]
@@ -159,9 +196,13 @@ def verify_joined(captures):
         elif kind == "hosted-recovery-closure":
             identity = exact_checkpoint(event, event, event["manifest"])
         elif kind == "retirement-recovery-dependency":
-            trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]))
+            trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]), frozenset(event["journals"]))
             require(trim in installed_trims and installed_trims[trim] <= event["revision"],
                     "dependent retirement lacks the exact installed recovery exclusion")
+            joined += 1
+            continue
+        elif kind == "remove-version" and "/oversized/" in event["key"]:
+            require(physical_retirement(event) in dependencies, "payload removal lacks a matching recovery dependency")
             joined += 1
             continue
         else:

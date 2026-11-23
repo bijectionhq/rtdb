@@ -160,6 +160,7 @@ impl ReplicaTrimPlan {
 
 impl ReplicaTrimGrant {
     pub(crate) async fn apply(mut self, directory: &dyn Directory) -> Result<i64> {
+        let mut settlement = None;
         if let Some((deployment, pending)) = self.retirement {
             if pending.journals.iter().any(|journal| journal.journal().is_none()) {
                 return Err(Error::Task("Replica payload settlement requires every journal's physical identity".into()).into());
@@ -167,7 +168,7 @@ impl ReplicaTrimGrant {
             self.stream.servers = pending.journals.iter().cloned().collect();
             self.stream.write_quorum = write_quorum(self.stream.servers.len());
             rtdb_logkeeper::trim_all(&self.stream, self.through).await?;
-            crate::admin::update_installation(directory, &deployment, |record| {
+            let stored = crate::admin::update_installation(directory, &deployment, |record| {
                 let matches = pending.belongs_to(record)
                     && record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] == pending.through)
                     && record.replica_payload_trim.as_deref() == Some(&pending)
@@ -180,12 +181,16 @@ impl ReplicaTrimGrant {
                 record.replica_payload_trim.as_mut().unwrap().applied = true;
                 Ok(())
             }).await?;
+            settlement = Some(stored.version);
         } else {
             rtdb_logkeeper::trim(&self.stream, self.through).await?;
         }
         crate::residence_trace::record("apply-trim", || serde_json::json!({
             "installation": self.scope.installation, "incarnation": self.scope.incarnation, "epoch": self.scope.log_epoch,
-            "revision": self.scope.revision, "anchor": self.scope.anchor, "stream": self.stream.stream, "through": self.through.0,
+            "revision": self.scope.revision, "anchor": self.scope.anchor, "stream": self.stream.stream,
+            "through": self.through.0, "settled_revision": settlement,
+            "journals": settlement.map(|_| self.stream.servers.iter()
+                .filter_map(|endpoint| endpoint.journal()).collect::<Vec<_>>()),
         }));
         Ok(self.through.0)
     }

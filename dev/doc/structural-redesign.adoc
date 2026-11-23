@@ -231,12 +231,13 @@ Earlier mixed archives, unbound provider versions and queued active files still 
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
-|Catalog holds bind pool residence and physical cut through query execution and provider drain.
-Revocable stores opt out of shared plaintext and decoded-page caching.
+|Catalog holds bind pool residence and physical cut through queries, compaction and stored artefact builds.
+Checkpoint discovery at startup and coordinated Classic checkpoint loads carry their existing recovery holds into provider drain.
+Revocable stores opt out of shared plaintext and decoded-page caching. Unit-key-backed cursors require bounded delivery grants, including PostgreSQL portals, COPY and Flight statement answers.
 Hosted PostgreSQL feedback follows the exact published recovery root.
 The bounded replay includes quorum publication before acknowledgement and recovery exclusion before deletion.
-Native replay joins checkpoint, trim and dependent retirement observations by exact identities and revisions.
-Universal low-level read and cursor-local key enforcement, production T1 and T2 completion, full cross-owner replay, and execution evidence remain open.
+Native replay joins checkpoint publication and trim to dependent version removal, and checks observed catalog reachability against exact retirement candidates.
+Universal low-level coverage, archive and deployment-key delivery, the production T1 certificate-to-answer and complete T2 recovery-exclusion handoffs, and execution evidence remain open.
 |===
 
 == Placed serving and search

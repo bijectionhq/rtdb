@@ -145,14 +145,16 @@ impl CatalogReaders {
             Ok(())
         }).await?;
         let closed = self.floor(&record).is_some_and(|existing| existing >= installed.through);
-        let allowed = paths.iter().map(|path| closed && readers_allow(&record, &self.storage_root, installed, *path)).collect();
+        let allowed: Vec<_> = paths.iter().map(|path| closed && readers_allow(&record, &self.storage_root, installed, *path)).collect();
         if self.floor(&record) == Some(installed.through)
             && (has_exact_witness || readers_allow(&record, &self.storage_root, installed, None))
         {
             let event = if has_exact_witness { "close-catalog-admission" } else { "advance-floor" };
             crate::residence_trace::record(event, || serde_json::json!({
                 "lineage": record.lineage, "installation": self.deployment, "residence": self.residence, "namespace": self.namespaces.objects,
-                "root": self.storage_root, "revision": record.version, "epoch": self.replica_epoch, "through": installed.through,
+                "root": self.storage_root, "revision": record.version, "epoch": self.replica_epoch,
+                "through": installed.through, "eligible_paths": paths.iter().zip(&allowed)
+                    .filter_map(|(path, allowed)| allowed.then_some(*path).flatten()).collect::<Vec<_>>(),
             }));
         }
         Ok((floor, allowed))
@@ -245,6 +247,8 @@ impl CatalogReaders {
                             "lineage": stored.lineage, "installation": self.deployment, "residence": self.residence,
                             "namespace": self.namespaces.objects, "root": self.storage_root, "revision": stored.version,
                             "epoch": self.replica_epoch, "hold": hold, "through": cut.map(|cut| cut.through),
+                            "primary_paths": stored.catalog_readers.get(hold)
+                                .and_then(|registration| registration.compacted_primary_paths.as_deref()),
                         }));
                     }
                     return Ok(answers);

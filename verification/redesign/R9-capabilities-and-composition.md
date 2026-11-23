@@ -149,3 +149,12 @@ It also checks that each logged receipt follows the observed covering quorum pub
 This join covers the recorded recovery and retirement owners.
 The full native capture still needs the production T1 certificate-to-query handoff, T2's exact reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
 The new model, controls and native joins have source review only.
+
+
+### Native authority follow-through
+
+Compaction and stored artefact builders register the captured catalog and, where the inputs belong to its live census, its compacted-primary paths. Coordinated Classic checkpoint loads hold the recovery deletion gate across discovery and manifest reads. Hosted startup and admitted archive reads carry their existing residence registration through I/O admission. Installed primary reset uses a conservative catalog registration because its manifest includes superseded inputs.
+
+A cursor tracks the exact slots consulted by the immutable-unit cipher across opening, pulls and local buffering. It obtains bounded permission through the provider before releasing results. A delivery grant starts before the confirming lookup, and a fenced withdrawal waits for outstanding grants before reporting completion. The grant follows PostgreSQL rows and COPY chunks into writes and Flight statement data to the stream handoff. The bound assumes that the reader's monotonic clock advances at least half as fast as the settling owner's clock. Archive and deployment-key paths still need their own delivery authorities.
+
+Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. Full replay still requires the production T1 certificate-to-answer and T2 reachability and recovery-exclusion handoffs. These changes have source review only.
