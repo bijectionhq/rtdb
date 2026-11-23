@@ -42,6 +42,7 @@ pub struct NodeServices {
     pub collection_observer: Arc<dyn CollectionObserver>,
     pub external_sources: ExternalSources,
     pub clock: Arc<dyn Clock>,
+    pub decision_clock: Option<Arc<dyn rtdb_tx::DecisionClock>>,
     pub catalog_users: Arc<dyn CatalogUsers>,
     pub catalog_metrics: Arc<dyn CatalogMetrics>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
@@ -110,7 +111,7 @@ impl NodeServices {
         users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>, format: SearchFileFormat) -> Self {
         let search = default_search(format);
         Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
-            compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
+            decision_clock: None, compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
             artefact_kinds: search.artefact_kinds.into_iter().chain([Arc::new(rtdb_spatial::SpatialArtefacts) as Arc<dyn rtdb_maintenance::ArtefactKind>]).collect(), scan_accelerators: search.scan_accelerators }
     }
 }
@@ -236,7 +237,7 @@ impl Node {
         services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, compaction_relay: services.compaction_relay, world_constraints: services.world_constraints, compaction_slots, clock: services.clock, artefact_kinds: services.artefact_kinds,
+            external_sources: services.external_sources, compaction_relay: services.compaction_relay, world_constraints: services.world_constraints, compaction_slots, clock: services.clock, decision_clock: services.decision_clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));
@@ -296,6 +297,13 @@ impl Node {
             let _ = ready.send(Err(hosted_source_unavailable()));
         }
     }
+    pub async fn receiver_time(&self) -> Result<Timestamp> {
+        match &self.factory.decision_clock {
+            Some(clock) => Ok(clock.observe().await?.instant),
+            None => Ok(self.now()),
+        }
+    }
+
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.
     pub fn query_instant(&self) -> rtdb_types::Instant { self.factory.clock.query_instant() }
@@ -527,7 +535,7 @@ impl Node {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let snapshot = match cut {
-                CatalogReadCut::Current => database.partition.snapshot(),
+                CatalogReadCut::Current => replica_capture.map_or_else(|| database.partition.snapshot(), |capture| (*capture.snapshot).clone()),
                 CatalogReadCut::Reserved(reserved) => {
                     let snapshot = database.partition.snapshot();
                     if snapshot.tx_basis() != Some(reserved) {
@@ -587,7 +595,7 @@ impl Node {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(selected.system_time.into())])]) },
             replica_capture: None,
             snapshot_time: Some(selected.system_time),
-            current_time: selected.system_time.into(),
+            current_time: basis.current_time,
             timezone: basis.timezone.clone(),
         });
         let basis = applied_basis.as_ref().unwrap_or(basis);
@@ -783,13 +791,24 @@ impl Node {
     async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
         let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
-        let [installed] = context.catalog.database(database)?.partitions.as_slice() else {
-            return Err(bad_attempt_outcome());
+        let installed_time = match &self.factory.decision_clock {
+            Some(clock) => {
+                context.check_cancelled()?;
+                let sample = clock.observe().await?;
+                context.check_cancelled()?;
+                Some(sample.instant)
+            }
+            None => {
+                let [installed] = context.catalog.database(database)?.partitions.as_slice() else {
+                    return Err(bad_attempt_outcome());
+                };
+                match installed.tx_basis() {
+                    Some(latest) => rtdb_tx::installed_receipt_time(context, latest).await?,
+                    None => None,
+                }
+            }
         };
-        let Some(latest) = installed.tx_basis() else { return Ok(()); };
-        if rtdb_tx::installed_receipt_time(context, latest).await?
-            .is_some_and(|value| value.0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS))
-        {
+        if installed_time.is_some_and(|value| value.0 >= submitted_at.0.saturating_add(rtdb_tx::RECEIPT_WINDOW_MICROS)) {
             return Err(Anomaly::incorrect("rtdb/await-token-expired", "The transaction attempt receipt has expired"));
         }
         Ok(())
@@ -1536,6 +1555,8 @@ impl OwnedReadSession {
     pub fn system_time(&self) -> Timestamp {
         self.historical.as_ref().map_or(self.present.system_time, |scope| scope.system_time)
     }
+
+    pub fn query_time(&self) -> Result<Timestamp> { self.context.current_time.as_micros() }
 
     /// Admit a placed restore only while the original writer and replay
     /// hold still own the destination and no release has sealed it.
@@ -3554,6 +3575,7 @@ impl NativeSession {
                 (Some(present.system_time), CatalogReadCut::Reserved(present))
             }
         };
+        let observed = node.receiver_time().await?;
         let attached = attachment;
         let selected = reserved.or_else(|| replica_capture.as_ref().and_then(|capture| {
             capture.snapshot.tx_basis().map(|key| key.system_time)
@@ -3562,7 +3584,7 @@ impl NativeSession {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![selected.map(Into::into)])]) },
             replica_capture,
             snapshot_time: selected,
-            current_time: reserved.map_or_else(|| node.query_instant(), Into::into),
+            current_time: observed.into(),
             timezone: self.state.session_timezone().to_owned(),
         };
         let context = node.query_context_in_placement(
@@ -3580,8 +3602,7 @@ impl NativeSession {
         let deadline = now.saturating_add(60_000_000);
         let lease_deadline = lease.as_ref().map_or(deadline, |lease| lease.deadline().unwrap_or(now).min(deadline));
         let witness_until = if witness_scope.is_some() {
-            Timestamp(clock.now().0.saturating_add(lease_deadline.saturating_sub(now))
-                .min(present.system_time.0.saturating_add(60_000_000)))
+            Timestamp(observed.0.saturating_add(lease_deadline.saturating_sub(now)))
         } else {
             present.system_time
         };

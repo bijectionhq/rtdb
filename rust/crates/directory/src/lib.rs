@@ -1185,6 +1185,12 @@ pub trait AudienceSeatClaim: Send + Sync {
 
 #[async_trait]
 pub trait Directory: Send + Sync {
+    async fn receiver_clock(&self, _domain: uuid::Uuid) -> Result<Option<ReceiverClockSample>> {
+        Err(Anomaly::unsupported("rtdb.directory/clock-authority", "The directory has no receiver clock authority"))
+    }
+    async fn publish_receiver_clock(&self, _domain: uuid::Uuid, _publisher: uuid::Uuid, _observation: rtdb_types::Timestamp) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.directory/clock-authority", "The directory has no receiver clock authority"))
+    }
     /// Permanently excludes an installed journal's deployment ID from directory admission.
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()>;
     /// Stores a new deployment; refuses if its id or name is taken.
@@ -1306,11 +1312,15 @@ mod lineage;
 pub use lineage::{ExactRetirementGrant, ForkPreparation, ForkPublication, LineageChange, LineageRetirement, LineageState, PreparationOwner, ReferenceDisposal, RetirementWork};
 use lineage::{StoredLineage, lineage_busy};
 
+mod receiver_clock;
+pub use receiver_clock::ReceiverClockSample;
+use receiver_clock::CLOCK_PREFIX;
+
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
 const AUDIENCE_SEAT_PREFIX: &str = "~audience-seat/";
 
 fn reserved_deployment_name(name: &str) -> bool {
-    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(AUDIENCE_SEAT_PREFIX)
+    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(AUDIENCE_SEAT_PREFIX) || name.starts_with(CLOCK_PREFIX)
 }
 
 fn require_deployment_name(name: &str) -> Result<()> {
@@ -1612,6 +1622,8 @@ pub struct MemoryDirectory {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MemoryState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    receiver_clocks: BTreeMap<uuid::Uuid, ReceiverClockSample>,
     deployments: BTreeMap<String, Box<DeploymentRecord>>,
     names: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -1719,6 +1731,20 @@ impl MemoryDirectory {
 
 #[async_trait]
 impl Directory for MemoryDirectory {
+    async fn receiver_clock(&self, domain: uuid::Uuid) -> Result<Option<ReceiverClockSample>> {
+        Ok(self.state()?.receiver_clocks.get(&domain).copied())
+    }
+
+    async fn publish_receiver_clock(&self, domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp) -> Result<()> {
+        let mut state = self.state()?;
+        let previous = state.receiver_clocks.get(&domain).copied();
+        if let Some(sample) = ReceiverClockSample::advance(previous, domain, publisher, observation)? {
+            state.receiver_clocks.insert(domain, sample);
+            self.persist(&mut state)?;
+        }
+        Ok(())
+    }
+
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         let id = installed_journal_id(id)?;
         let mut state = self.state()?;

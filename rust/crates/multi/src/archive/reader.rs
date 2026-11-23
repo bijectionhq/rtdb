@@ -494,6 +494,7 @@ async fn serve_reader(
         return Err(inconsistent("The checkpoint reader lacks its frozen logs"));
     };
     let placed = PlacedOptions {
+        decision_clock: None,
         storage_factories: vec![(
             CELL_STORAGE_TYPE.into(),
             Arc::new(StageStorage {

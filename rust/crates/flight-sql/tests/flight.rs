@@ -1039,7 +1039,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     ]);
     client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
 
-    let reply = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let reply = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
     let hold = &reply[0].body[..16];
     let valid = i64::from_be_bytes(reply[0].body[16..24].try_into().unwrap());
     let mut replace = relation.clone();
@@ -1146,7 +1146,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     assert_eq!(rtdb_columnar::read_entity_id(first.schema_ref().field(0), first.column(0).as_ref(), 0).unwrap(),
         rtdb_columnar::EntityIdRef::String("a"));
 
-    let other = client.action("rtdb.owned.OpenRead.v2", Bytes::new()).await.unwrap();
+    let other = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
     let mut capability = hold.to_vec();
     capability.extend_from_slice(token.as_bytes());
     let mut next = capability.clone();

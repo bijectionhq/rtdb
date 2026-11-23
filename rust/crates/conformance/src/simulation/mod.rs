@@ -120,7 +120,7 @@ impl Trial {
             if let Some(partitions) = &mut partitions { partitions.push(Arc::clone(&recovered.partition)); }
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let node_cancellation = cancellation.child_token();
-            let context = Arc::new(ResolveContext {
+            let context = Arc::new(ResolveContext { decision_clock: None,
                 write_event_origins: false,
                 placed_receipt_retirement: false,
                 owned_witness_scope: None,

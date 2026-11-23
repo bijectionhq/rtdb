@@ -53,6 +53,7 @@ pub trait TransactionAuthorization: Send + Sync {
 }
 
 pub struct ResolveContext {
+    pub decision_clock: Option<Arc<dyn crate::DecisionClock>>,
     pub write_event_origins: bool,
     pub placed_receipt_retirement: bool,
     pub owned_witness_scope: Option<rtdb_types::PlacedAttemptScope>,
@@ -309,6 +310,11 @@ impl TxResolver {
         let default_time = self.smooth(log_time)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
         let attempt = request.placed_attempt(position)?;
+        let decision = match &context.decision_clock {
+            Some(clock) => Some(clock.observe().await?),
+            None => None,
+        };
+        context.check_cancelled()?;
         let slot = request.operations.iter().find_map(|operation| match operation {
             Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
             _ => None,
@@ -357,6 +363,7 @@ impl TxResolver {
             Ok(())
         };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+        tx.decision = decision;
         tx.trace_parent = span.as_ref().map(|span| span.context());
         let replay = match &request.guard {
             Some(SourceGuard::Replay(replay)) => Some(replay),
@@ -417,11 +424,17 @@ impl TxResolver {
             if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
                 return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
             }
-            generation.choose(&base, key, slot, primary, refusal, attempt.map(PlacedAttempt::scope), context)
+            if primary.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::OwnedDeadline { until, .. }) if tx.decision_time() >= *until
+            )) {
+                Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"))
+            } else {
+                generation.choose(&base, key, slot, primary, refusal, attempt.map(PlacedAttempt::scope), context)
                 .map(|(writes, refused)| {
                     prepared_writes = Some(writes);
                     settled = refused;
                 })
+            }
         } else if prepared_landing::is_landing(primary) {
             Err(Anomaly::incorrect("rtdb.owned/prepared-generation-required", "Proposal landing requires a prepared generation"))
         } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay, receipt_time).await {
@@ -497,6 +510,7 @@ impl TxResolver {
         if constraint_failed && !refusal.is_empty() {
             drop(tx);
             tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+            tx.decision = decision;
             tx.trace_parent = span.as_ref().map(|span| span.context());
             outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
@@ -507,6 +521,7 @@ impl TxResolver {
                 if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
                 drop(tx);
                 tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+                tx.decision = decision;
                 TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }
             }
             Err(error) => return Err(error),
@@ -524,7 +539,8 @@ impl TxResolver {
             if !error.is_caller_error() { return Err(error); }
             drop(resolved);
             if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
-            let tx = OpenTransaction::new(base, key, &request.options, context)?;
+            let mut tx = OpenTransaction::new(base, key, &request.options, context)?;
+            tx.decision = decision;
             let result = TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) };
             resolved = tx.finish_source(result, input, log_time, clock, &[], None).await?;
         }
@@ -678,12 +694,17 @@ pub struct OpenTransaction<'a> {
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
+    decision: Option<crate::DecisionObservation>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, decision: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
+
+    fn decision_time(&self) -> Timestamp {
+        self.decision.map_or_else(|| self.tx_key().system_time, |sample| sample.instant)
+    }
 
     async fn finish_source(
         mut self, result: TransactionResult, input: ResolvedInput, log_time: Timestamp,
@@ -699,7 +720,7 @@ impl<'a> OpenTransaction<'a> {
             let worlds = if result.committed() { crate::replica::worlds::source_inventory(selected)? } else { Vec::new() };
             self.retire_placed_outcomes(clock).await?;
             let archive_replay = result.committed() && self.hosted_replay.is_some();
-            self.write_attempt_outcome(attempt, &result, log_time, controls, worlds, archive_replay)?;
+            self.write_attempt_outcome(attempt, &result, clock.time, controls, worlds, archive_replay)?;
         }
         let mut writes = self.buffer.stage()?;
         if let Some(prepared) = prepared {
@@ -1683,7 +1704,7 @@ impl<'a> OpenTransaction<'a> {
             let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
             for world in admitted {
                 let record = rtdb_query::read_owned_world(Arc::clone(&context), owner, world).await?.ok_or_else(unavailable)?;
-                if record.0.dropped || self.tx_key().system_time >= record.0.until {
+                if record.0.dropped || self.decision_time() >= record.0.until {
                     return Err(unavailable());
                 }
                 self.owned_worlds.insert(world, record);
@@ -1694,7 +1715,7 @@ impl<'a> OpenTransaction<'a> {
         }) {
             return Err(unavailable());
         }
-        if deadline.is_some_and(|until| self.tx_key().system_time >= until) {
+        if deadline.is_some_and(|until| self.decision_time() >= until) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         if let Some(root) = operations.iter().find_map(|operation| match operation {
@@ -1822,7 +1843,7 @@ impl<'a> OpenTransaction<'a> {
                                 source.can_retain_parent(&world)
                             };
                             if source.pin != *source_pin || !admits_child
-                                || self.tx_key().system_time >= source.until
+                                || self.decision_time() >= source.until
                                 || world.fork_lineage != source.retained_child_lineage(&world, registered)?
                             {
                                 return Err(unavailable());
@@ -2090,7 +2111,7 @@ impl<'a> OpenTransaction<'a> {
                 if let Some(at) = advance_to.filter(|_| rows != 0) {
                     let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
                     if !matches!(record.mode, rtdb_types::WorldClockMode::Held { .. })
-                        || !record.admits_clock_publication(at, self.tx_key().system_time)
+                        || !record.admits_clock_publication(at, self.decision_time())
                     {
                         return Err(unavailable());
                     }
@@ -2134,7 +2155,7 @@ impl<'a> OpenTransaction<'a> {
                     let reading = match world.mode {
                         WorldClockMode::Retained => world.initial_clock(),
                         WorldClockMode::Held { .. } => self.owned_world_clock(owner, world.id).await?.unwrap_or(world.initial_clock()),
-                        WorldClockMode::Proposal => self.tx_key().system_time,
+                        WorldClockMode::Proposal => self.decision_time(),
                     };
                     if !clock.admits(world, reading) {
                         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-clock-expired",
@@ -2168,7 +2189,7 @@ impl<'a> OpenTransaction<'a> {
                 let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",
                     "Owned range witness is no longer admissible");
                 if Some(*scope) != source_scope || Some(*scope) != self.context.owned_witness_scope
-                    || self.tx_key().system_time >= *until || *frontier < 0 || basis.tx_id.0 < 0
+                    || self.decision_time() >= *until || *frontier < 0 || basis.tx_id.0 < 0
                     || relation.world().is_some() || relation.is_world_catalog()
                     || base.tx_basis().is_none_or(|head| basis.tx_id > head.tx_id || basis.system_time > head.system_time
                         || ((basis.tx_id == head.tx_id) != (basis.system_time == head.system_time)))
@@ -2193,7 +2214,7 @@ impl<'a> OpenTransaction<'a> {
             }
             let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
             let observed = if self.buffer.base_snapshot().contains_table(&relation.lifetime_table(owner)) {
-                let accepted = self.tx_key().system_time;
+                let accepted = self.decision_time();
                 if *valid_at >= accepted {
                     return Err(lifetime_uncovered());
                 }
@@ -2280,7 +2301,7 @@ impl<'a> OpenTransaction<'a> {
                 _ => return Err(OwnedWorld::unavailable()),
             })
         };
-        if next.is_some_and(|next| next <= head || !record.admits_clock_publication(next, self.tx_key().system_time)) {
+        if next.is_some_and(|next| next <= head || !record.admits_clock_publication(next, self.decision_time())) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/clock-bound",
                 "A world publication requires a strictly increasing finite reading"));
         }
@@ -2328,7 +2349,7 @@ impl<'a> OpenTransaction<'a> {
     ) -> Result<()> {
         use rtdb_types::{OwnedChangeKind, OwnedLifetimeFloor};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
-        let ordered = self.tx_key().system_time;
+        let ordered = self.decision_time();
         if !relation.is_root_data() { return Err(lifetime_uncovered()); }
         let lifetime = self.read_owned_schema(owner, relation).await?
             .and_then(|(schema, _)| schema.lifetime_micros()).ok_or_else(lifetime_uncovered)?;
@@ -3225,7 +3246,7 @@ impl<'a> OpenTransaction<'a> {
                 self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
             }
         }
-        let document = StructFields::from([
+        let mut document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
             ("source_log_time".into(), appended.map(time_value).unwrap_or(Value::Null)),
             ("receipt_time".into(), time_value(observed)),
@@ -3233,6 +3254,14 @@ impl<'a> OpenTransaction<'a> {
             (metadata_column.clone(), Value::Null),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
+        if let Some(sample) = self.decision {
+            let mut evidence = Vec::with_capacity(40);
+            evidence.extend_from_slice(&sample.domain);
+            evidence.extend_from_slice(&sample.epoch.to_be_bytes());
+            evidence.extend_from_slice(&sample.sequence.to_be_bytes());
+            evidence.extend_from_slice(&sample.instant.0.to_be_bytes());
+            document.insert("decision_clock".into(), Value::Binary(evidence));
+        }
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
         self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &metadata_type)])
     }
@@ -3629,7 +3658,7 @@ mod tests {
         let state = rtdb_index::PartitionState::empty(Default::default()).unwrap();
         state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -3666,7 +3695,7 @@ mod tests {
     #[tokio::test]
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);
-        let resolve = ResolveContext {
+        let resolve = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -3750,7 +3779,7 @@ mod tests {
         }
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-capacity", 1)?),
@@ -3802,7 +3831,7 @@ mod tests {
 
         let scope = PlacedAttemptScope::new("spatial-catalog", 1)?;
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(scope),
@@ -3910,7 +3939,7 @@ mod tests {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, OwnedWorld, WorldClockMode, WorldSchemas, WorldShadow};
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
@@ -3997,7 +4026,7 @@ mod tests {
         }
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-unique", 1)?),
@@ -4094,7 +4123,7 @@ mod tests {
         }
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-capacity", 1)?),
@@ -4218,7 +4247,7 @@ mod tests {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema};
 
         let memory = MemoryBudget::new(1 << 24);
-        let context = ResolveContext {
+        let context = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("valid-unique", 1)?),
@@ -4419,7 +4448,7 @@ mod tests {
     #[tokio::test]
     async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
         let memory = MemoryBudget::new(1 << 26);
-        let resolve = ResolveContext {
+        let resolve = ResolveContext { decision_clock: None,
             write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,

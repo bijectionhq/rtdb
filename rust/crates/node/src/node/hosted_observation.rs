@@ -385,7 +385,7 @@ impl OwnedReadSession {
         }
         self.check()?;
         current.check_cancelled()?;
-        let observed_at = self.node.now();
+        let observed_at = self.node.receiver_time().await?;
         if observed_at >= until {
             return Err(unavailable());
         }

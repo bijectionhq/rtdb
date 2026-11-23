@@ -63,11 +63,11 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
     for _ in 0..2 {
         let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
         let body = request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0);
-        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v4", body))
+        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v5", body))
             .await.unwrap().into_inner();
         let result = results.message().await.unwrap().unwrap();
         assert!(results.message().await.unwrap().is_none());
-        assert_eq!(result.body.len(), 32);
+        assert_eq!(result.body.len(), 40);
         assert_eq!(&result.body[16..24], &floor.system_time.0.to_be_bytes());
         assert_eq!(&result.body[24..32], &floor.tx_id.0.to_be_bytes());
         let pinned = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
@@ -79,7 +79,7 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
         scoped.extend_from_slice(&1u16.to_be_bytes());
         scoped.extend_from_slice(&6u16.to_be_bytes());
         scoped.extend_from_slice(b"orders");
-        let error = match raw.do_action(action("rtdb.owned.OpenOwnedScopedRead.v1", scoped)).await {
+        let error = match raw.do_action(action("rtdb.owned.OpenOwnedScopedRead.v2", scoped)).await {
             Ok(response) => response.into_inner().message().await.unwrap_err(),
             Err(error) => error,
         };
@@ -101,7 +101,7 @@ async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_p
         request(id, floor.tx_id.0, floor.system_time.0, prior.system_time.0 - 1),
         request(uuid::Uuid::new_v4(), floor.tx_id.0, floor.system_time.0, prior.system_time.0),
     ] {
-        let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v4", body)).await {
+        let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v5", body)).await {
             Ok(response) => response.into_inner().message().await.unwrap_err(),
             Err(error) => error,
         };

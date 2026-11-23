@@ -296,6 +296,7 @@ pub(crate) struct DatabaseFactory {
     pub memory: Arc<MemoryBudget>,
     pub cache: Arc<CacheBudget>,
     pub clock: Arc<dyn Clock>,
+    pub decision_clock: Option<Arc<dyn rtdb_tx::DecisionClock>>,
     pub authorization: Arc<dyn TransactionAuthorization>,
     pub observer: Arc<dyn CollectionObserver>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
@@ -388,6 +389,7 @@ impl DatabaseFactory {
             let event_history = !read_only && self.options.artefact_threads != 0
                 && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
+                decision_clock: self.decision_clock.clone(),
                 write_event_origins: event_history,
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {

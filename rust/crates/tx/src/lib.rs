@@ -1,3 +1,6 @@
+mod decision_clock;
+pub use decision_clock::{DecisionClock, DecisionObservation};
+
 mod values;
 mod ipc;
 mod source;
