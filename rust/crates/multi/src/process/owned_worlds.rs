@@ -161,6 +161,12 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>> {
         Box::pin(HeldCheckpointWorld::ranked_search(self, partitions, query, offset, limit, valid))
     }
+    fn ranked_search_at<'a>(
+        &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp, system: Timestamp, parent_only: bool,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>> {
+        Box::pin(HeldCheckpointWorld::ranked_search_at(self, partitions, query, offset, limit, valid, system, parent_only))
+    }
     fn range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {
