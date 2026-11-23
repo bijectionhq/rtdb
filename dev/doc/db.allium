@@ -437,6 +437,8 @@ variant TxMessage : SourceMessage {
     -- A document layout retains its schema and column metadata while releasing translation scratch after construction.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
+    -- Transit COPY and embedded Transit puts and patches with compatible document IDs submit Arrow columns in the row writer's source layout.
+    -- Coalescing those documents uses submitted field presence and type order to preserve the source layout.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
     -- Source decoding retains the Arrow columns and presence policy for compatible legacy Root, publication, and world shadow writes.

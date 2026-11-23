@@ -82,7 +82,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
-    if matches!(plan.kind, StaticMutationKind::Put) && let Some(args) = args && let Some(pages) = args.uniform_arrow_pages() {
+    if matches!(plan.kind, StaticMutationKind::Put) && let Some(args) = args && !args.built_from_rows() && let Some(pages) = args.uniform_arrow_pages() {
         let canonical_row = args.has_single_canonical_arrow_row();
         let projected = if plan.input.schema().fields().iter().any(|field| valid_time_column(&field.name)) {
             projected_timed_puts(&plan.input, &pages, canonical_row, &plan.table.table, &options.default_tz, &scope, memory)

@@ -35,11 +35,23 @@ pub trait TransitReadBuilder {
     fn array_handler(&self, _tag: &str) -> bool { false }
     fn start_array(&mut self, tag: Option<&str>, size: usize) -> Result<Self::Array>;
     fn array_item(&mut self, array: &mut Self::Array, value: Self::Value) -> Result<()>;
+    fn array_float(&mut self, array: &mut Self::Array, value: f64) -> Result<()> {
+        let value = self.float(value)?;
+        self.array_item(array, value)
+    }
+    fn array_floats(&mut self, array: &mut Self::Array, values: Vec<f64>) -> Result<()> {
+        for value in values { self.array_float(array, value)?; }
+        Ok(())
+    }
     fn finish_array(&mut self, array: Self::Array) -> Result<Self::Value>;
     fn start_map(&mut self, size: usize) -> Result<Self::Map>;
     fn map_entry(&mut self, map: &mut Self::Map, key: Self::Value, value: Self::Value) -> Result<()>;
     fn finish_map(&mut self, map: Self::Map) -> Result<Self::Value>;
     fn tagged(&mut self, tag: String, representation: Self::Value) -> Result<Self::Value>;
+    fn tagged_float(&mut self, tag: String, value: f64) -> Result<Self::Value> {
+        let representation = self.float(value)?;
+        self.tagged(tag, representation)
+    }
 }
 
 struct WireValues;
@@ -61,7 +73,7 @@ impl TransitReadBuilder for WireValues {
     fn start_map(&mut self, size: usize) -> Result<Self::Map> { Ok(Vec::with_capacity(size)) }
     fn map_entry(&mut self, map: &mut Self::Map, key: TransitValue, value: TransitValue) -> Result<()> { map.push((key,value));Ok(()) }
     fn finish_map(&mut self, map: Self::Map) -> Result<TransitValue> { Ok(TransitValue::Map(map)) }
-    fn tagged(&mut self, tag: String, representation: TransitValue) -> Result<TransitValue> { tagged(tag, representation) }
+    fn tagged(&mut self, tag: String, representation: TransitValue) -> Result<TransitValue> { resolve_tag(tag, representation) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +127,7 @@ impl<V: Clone> ReadCache<V> {
 enum Packed {
     Null, Bool(bool), Integer(i64), Float(f64), String(String),
     Array(Vec<Packed>), Map(Vec<(Packed, Packed)>),
+    Floats(Vec<f64>), TaggedFloats(Box<(String, Vec<f64>)>),
 }
 
 pub fn decode_msgpack(bytes: &[u8]) -> Result<TransitValue> {
@@ -124,10 +137,16 @@ pub fn decode_msgpack(bytes: &[u8]) -> Result<TransitValue> {
 /// Decodes one MessagePack value, admitting wire containers and cache expansion before allocation.
 /// Retain the returned lease until the value is dropped or adopted by another charged owner.
 pub fn decode_msgpack_in(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<(TransitValue, Arc<MemoryReservation>)> {
+    decode_msgpack_with_in(bytes, memory, &mut WireValues)
+}
+
+pub fn decode_msgpack_with_in<B: TransitReadBuilder>(
+    bytes: &[u8], memory: &Arc<MemoryBudget>, builder: &mut B,
+) -> Result<(B::Value, Arc<MemoryReservation>)> {
     let mut cursor = Cursor { bytes, offset: 0, admission: ReadAdmission::new(memory)? };
     let packed = cursor.complete_value()?;
     let mut cache = ReadCache { admission: ReadAdmission::new(memory)?, ..ReadCache::new() };
-    let value = unpack_value(packed, false, &mut cache, 0, &mut WireValues)?;
+    let value = unpack_value(packed, false, &mut cache, 0, builder)?;
     Ok((value, cache.admission.0.expect("tracked Transit decode has a reservation")))
 }
 
@@ -137,7 +156,11 @@ fn packed_msgpack(bytes: &[u8]) -> Result<Packed> {
 
 /// Decodes Transit JSON, retaining object entry order for Transit cache references.
 pub fn decode_json(bytes: &[u8]) -> Result<TransitValue> {
-    unpack_value(packed_json(bytes)?, false, &mut ReadCache::new(), 0, &mut WireValues)
+    decode_json_with(bytes, &mut WireValues)
+}
+
+pub fn decode_json_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Result<B::Value> {
+    unpack_value(packed_json(bytes)?, false, &mut ReadCache::new(), 0, builder)
 }
 
 fn packed_json(bytes: &[u8]) -> Result<Packed> {
@@ -155,8 +178,12 @@ pub fn decode_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Resu
 
 /// Reads consecutive top-level values, resetting Transit cache indices for each value.
 pub fn decode_json_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
+    decode_json_sequence_with(bytes, &mut WireValues)
+}
+
+pub fn decode_json_sequence_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Result<Vec<B::Value>> {
     serde_json::Deserializer::from_slice(bytes).into_iter::<JsonPacked>()
-        .map(|packed| unpack_value(packed.map_err(|error| json_parse(bytes, error))?.0, false, &mut ReadCache::new(), 0, &mut WireValues)).collect()
+        .map(|packed| unpack_value(packed.map_err(|error| json_parse(bytes, error))?.0, false, &mut ReadCache::new(), 0, builder)).collect()
 }
 
 /// Malformed JSON is the reference's `xtdb.error/json-parse`; a stray close marker carries Jackson's wording.
@@ -172,9 +199,13 @@ fn json_parse(bytes: &[u8], error: serde_json::Error) -> Anomaly {
 
 /// Reads consecutive top-level values; a truncated trailing value is an error.
 pub fn decode_msgpack_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
+    decode_msgpack_sequence_with(bytes, &mut WireValues)
+}
+
+pub fn decode_msgpack_sequence_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Result<Vec<B::Value>> {
     let mut cursor = Cursor { bytes, offset: 0, admission: ReadAdmission::default() };
     let mut values = Vec::new();
-    while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut ReadCache::new(), 0, &mut WireValues)?); }
+    while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut ReadCache::new(), 0, builder)?); }
     Ok(values)
 }
 
@@ -236,32 +267,105 @@ struct JsonPacked(Packed);
 
 impl<'de> serde::Deserialize<'de> for JsonPacked {
     fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = JsonPacked;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("a Transit JSON value") }
-            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Null)) }
-            fn visit_bool<E: serde::de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Bool(value))) }
-            fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Integer(value))) }
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
-                Ok(JsonPacked(Packed::Integer(i64::try_from(value).map_err(E::custom)?)))
-            }
-            fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Float(value))) }
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::String(value.into()))) }
-            fn visit_string<E: serde::de::Error>(self, value: String) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::String(value))) }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(value) = sequence.next_element::<JsonPacked>()? { values.push(value.0); }
-                Ok(JsonPacked(Packed::Array(values)))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some((key, value)) = map.next_entry::<String, JsonPacked>()? { values.push((Packed::String(key), value.0)); }
-                Ok(JsonPacked(Packed::Map(values)))
-            }
-        }
-        decoder.deserialize_any(Visitor)
+        decoder.deserialize_any(JsonVisitor(None)).map(|packed| Self(packed.expect("root JSON value")))
     }
+}
+
+struct JsonVisitor<'a>(Option<&'a mut Vec<Packed>>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for JsonVisitor<'_> {
+    type Value = Option<Packed>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> std::result::Result<Self::Value, D::Error> {
+        decoder.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonVisitor<'_> {
+    type Value = Option<Packed>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("a Transit JSON value") }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(Some(Packed::Null)) }
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> { Ok(Some(Packed::Bool(value))) }
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> { Ok(Some(Packed::Integer(value))) }
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(Some(Packed::Integer(i64::try_from(value).map_err(E::custom)?)))
+    }
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+        if let Some(array) = self.0 {
+            push_float(array, value);
+            Ok(None)
+        } else {
+            Ok(Some(Packed::Float(value)))
+        }
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> { Ok(Some(Packed::String(value.into()))) }
+    fn visit_string<E: serde::de::Error>(self, value: String) -> std::result::Result<Self::Value, E> { Ok(Some(Packed::String(value))) }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(JsonVisitor(Some(&mut values)))? {
+            if let Some(value) = value { values.push(value); }
+        }
+        if let Some(array) = self.0 {
+            push_item(array, values);
+            Ok(None)
+        } else {
+            Ok(Some(Packed::Array(values)))
+        }
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some((key, value)) = map.next_entry::<String, JsonPacked>()? {
+            values.push((Packed::String(key), value.0));
+        }
+        Ok(Some(Packed::Map(values)))
+    }
+}
+
+fn push_float(array: &mut Vec<Packed>, value: f64) {
+    match array.last_mut() {
+        Some(item @ Packed::Float(_)) => {
+            let Packed::Float(first) = *item else { unreachable!() };
+            *item = Packed::Floats(vec![first, value]);
+        }
+        Some(Packed::Floats(values)) => values.push(value),
+        _ => array.push(Packed::Float(value)),
+    }
+}
+
+fn push_item(array: &mut Vec<Packed>, values: Vec<Packed>) {
+    if let [Packed::String(marker), Packed::Float(float)] = values.as_slice()
+        && (marker == "~#f32" || marker.starts_with('^') && marker != "^ ")
+    {
+        match array.last_mut() {
+            Some(Packed::TaggedFloats(run)) if &run.0 == marker => run.1.push(*float),
+            _ => array.push(Packed::TaggedFloats(Box::new((marker.clone(), vec![*float])))),
+        }
+    } else {
+        array.push(Packed::Array(values));
+    }
+}
+
+fn packed_array_len(values: &[Packed]) -> usize {
+    values.iter().map(|value| match value { Packed::Floats(values) => values.len(), Packed::TaggedFloats(run) => run.1.len(), _ => 1 }).sum()
+}
+
+fn packed_items(values: impl Iterator<Item = Packed>) -> impl Iterator<Item = Packed> {
+    values.flat_map(|value| {
+        let (mut single, marker, mut floats) = match value {
+            Packed::Floats(values) => (None, None, values.into_iter()),
+            Packed::TaggedFloats(run) => (None, Some(run.0), run.1.into_iter()),
+            value => (Some(value), None, Vec::new().into_iter()),
+        };
+        std::iter::from_fn(move || {
+            if let Some(value) = single.take() { return Some(value); }
+            let value = Packed::Float(floats.next()?);
+            Some(match &marker {
+                Some(marker) => Packed::Array(vec![Packed::String(marker.clone()), value]),
+                None => value,
+            })
+        })
+    })
 }
 
 /// Bounds MessagePack output capacity, temporary text and the encoder's string cache for this value.
@@ -359,6 +463,7 @@ fn unpack<B: TransitReadBuilder>(packed: Packed, key: bool, cache: &mut ReadCach
         Packed::Bool(value) => builder.boolean(value)?,
         Packed::Integer(value) => builder.integer(value)?,
         Packed::Float(value) => builder.float(value)?,
+        Packed::Floats(_) | Packed::TaggedFloats(_) => unreachable!("float runs are unpacked by their parent array"),
         Packed::String(value) => return string_value(value, key, cache, builder),
         Packed::Array(values) => return unpack_array(values,None,cache,depth,builder).map(Decoded::Value),
         Packed::Map(entries) => {
@@ -386,7 +491,11 @@ fn unpack_tagged<B: TransitReadBuilder>(tag: String,representation: Packed,cache
     }
     cache.admission.items::<B::Value>(1)?;
     if let ("cmap", Packed::Array(values)) = (tag.as_str(), &representation) {
-        cache.admission.items::<(B::Value, B::Value)>(values.len() / 2)?;
+        cache.admission.items::<(B::Value, B::Value)>(packed_array_len(values) / 2)?;
+    }
+    if let Packed::Float(value) = representation {
+        if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+        return builder.tagged_float(tag, value);
     }
     let representation = unpack_value(representation,false,cache,depth,builder)?;
     builder.tagged(tag,representation)
@@ -394,35 +503,74 @@ fn unpack_tagged<B: TransitReadBuilder>(tag: String,representation: Packed,cache
 
 fn unpack_array<B: TransitReadBuilder>(values: Vec<Packed>,tag: Option<&str>,cache: &mut ReadCache<B::Value>,depth: usize,builder: &mut B) -> Result<B::Value> {
     if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
-    let size = values.len();let mut values = values.into_iter();
+    let size = packed_array_len(&values);
+    let mut values = values.into_iter().peekable();
     cache.admission.items::<B::Value>(size)?;
-    let mut array = builder.start_array(tag,size)?;
-    if let Some(first) = values.next() {
-        if matches!(&first,Packed::String(marker) if marker == "^ ") {
+    let mut array = builder.start_array(tag, size)?;
+    if matches!(values.peek(), Some(Packed::String(_))) {
+        let first = values.next().expect("first string");
+        if matches!(&first, Packed::String(marker) if marker == "^ ") {
             cache.admission.items::<(B::Value, B::Value)>(size / 2)?;
             let mut map = builder.start_map(size / 2)?;
+            let mut values = packed_items(values);
             while let Some(key) = values.next() {
-                let value = values.next().ok_or_else(||invalid("Transit map has an unmatched key"))?;
-                let key = unpack_value(key,true,cache,depth + 1,builder)?;
-                let value = unpack_value(value,false,cache,depth + 1,builder)?;
-                builder.map_entry(&mut map,key,value)?;
+                let value = values.next().ok_or_else(|| invalid("Transit map has an unmatched key"))?;
+                let key = unpack_value(key, true, cache, depth + 1, builder)?;
+                let value = unpack_value(value, false, cache, depth + 1, builder)?;
+                builder.map_entry(&mut map, key, value)?;
             }
             return builder.finish_map(map);
         }
-        match unpack(first,false,cache,depth + 1,builder)? {
+        match unpack(first, false, cache, depth + 1, builder)? {
             Decoded::Tag(tag) => {
-                let representation = values.next().ok_or_else(||invalid("Transit tag has no representation"))?;
-                if values.next().is_some() { return Err(invalid("Tagged Transit array has more than two entries")); }
-                return unpack_tagged(tag,representation,cache,depth + 1,builder);
+                if size == 1 { return Err(invalid("Transit tag has no representation")); }
+                if size > 2 { return Err(invalid("Tagged Transit array has more than two entries")); }
+                let representation = packed_items(values).next().expect("tag representation");
+                return unpack_tagged(tag, representation, cache, depth + 1, builder);
             }
-            Decoded::Value(first) => builder.array_item(&mut array,first)?,
+            Decoded::Value(first) => builder.array_item(&mut array, first)?,
         }
-        for value in values { let value = unpack_value(value,false,cache,depth + 1,builder)?;builder.array_item(&mut array,value)?; }
+    }
+    for value in values {
+        match value {
+            Packed::Float(value) => {
+                if depth == MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+                builder.array_float(&mut array, value)?;
+            }
+            Packed::Floats(values) => {
+                if depth == MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+                builder.array_floats(&mut array, values)?;
+            }
+            Packed::TaggedFloats(run) => {
+                if depth == MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+                for value in run.1 {
+                    cache.admission.items::<B::Value>(2)?;
+                    let mut pair = builder.start_array(None, 2)?;
+                    if depth + 1 == MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+                    let value = match string_value(run.0.clone(), false, cache, builder)? {
+                        Decoded::Tag(tag) => {
+                            cache.admission.items::<B::Value>(1)?;
+                            builder.tagged_float(tag, value)?
+                        }
+                        Decoded::Value(first) => {
+                            builder.array_item(&mut pair, first)?;
+                            builder.array_float(&mut pair, value)?;
+                            builder.finish_array(pair)?
+                        }
+                    };
+                    builder.array_item(&mut array, value)?;
+                }
+            }
+            value => {
+                let value = unpack_value(value, false, cache, depth + 1, builder)?;
+                builder.array_item(&mut array, value)?;
+            }
+        }
     }
     builder.finish_array(array)
 }
 
-fn tagged(tag: String, representation: TransitValue) -> Result<TransitValue> {
+pub fn resolve_tag(tag: String, representation: TransitValue) -> Result<TransitValue> {
     if tag == "'" { return Ok(representation); }
     if tag == "cmap" {
         let TransitValue::Array(values) = representation else { return Err(invalid("Composite map representation is not an array")); };
@@ -477,8 +625,23 @@ impl<'a> Cursor<'a> {
     fn array(&mut self, count: usize, depth: usize) -> Result<Packed> {
         if count > self.bytes.len().saturating_sub(self.offset) { return Err(invalid("MessagePack array exceeds its input")); }
         self.admission.items::<Packed>(count)?;
-        let mut values = Vec::with_capacity(count);
-        for _ in 0..count { values.push(self.value(depth + 1)?); }
+        let mut values = Vec::new();
+        for _ in 0..count {
+            if values.len() == values.capacity() {
+                let next = (values.len() * 2).clamp(1, count);
+                values.reserve_exact(next - values.len());
+            }
+            if depth < MAX_DEPTH && let Some(tag @ (0xca | 0xcb)) = self.bytes.get(self.offset).copied() {
+                self.offset += 1;
+                let value = self.float(tag)?;
+                push_float(&mut values, value);
+            } else {
+                match self.value(depth + 1)? {
+                    Packed::Array(items) => push_item(&mut values, items),
+                    value => values.push(value),
+                }
+            }
+        }
         Ok(Packed::Array(values))
     }
 
@@ -488,6 +651,11 @@ impl<'a> Cursor<'a> {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count { entries.push((self.value(depth + 1)?, self.value(depth + 1)?)); }
         Ok(Packed::Map(entries))
+    }
+
+    fn float(&mut self, tag: u8) -> Result<f64> {
+        if tag == 0xca { Ok(f32::from_bits(self.unsigned(4)? as u32) as f64) }
+        else { Ok(f64::from_bits(self.unsigned(8)?)) }
     }
 
     fn value(&mut self, depth: usize) -> Result<Packed> {
@@ -500,8 +668,7 @@ impl<'a> Cursor<'a> {
             0xa0..=0xbf => return self.text(usize::from(tag & 0x1f)),
             0xc0 => Packed::Null,
             0xc2 => Packed::Bool(false), 0xc3 => Packed::Bool(true),
-            0xca => Packed::Float(f32::from_bits(self.unsigned(4)? as u32) as f64),
-            0xcb => Packed::Float(f64::from_bits(self.unsigned(8)?)),
+            0xca | 0xcb => Packed::Float(self.float(tag)?),
             0xcc => Packed::Integer(self.unsigned(1)? as i64),
             0xcd => Packed::Integer(self.unsigned(2)? as i64),
             0xce => Packed::Integer(self.unsigned(4)? as i64),
@@ -716,4 +883,27 @@ fn anomaly_category(category: &str) -> Result<AnomalyCategory> {
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-transit", error.to_string())
+}
+
+#[cfg(test)]
+mod compact_array_tests {
+    use super::*;
+
+    #[test]
+    fn both_syntax_readers_group_plain_and_tagged_float_components() {
+        let tagged = |value| TransitValue::Tagged { tag: "f32".into(), representation: Box::new(TransitValue::Float(value)) };
+        let value = TransitValue::Array(vec![TransitValue::Float(-0.0), TransitValue::Float(1.0), tagged(2.0), tagged(3.0), tagged(4.0)]);
+        let json = packed_json(br#"[-0.0,1.0,["~#f32",2.0],["^0",3.0],["^0",4.0]]"#).unwrap();
+        let msgpack = packed_msgpack(&encode_msgpack(&value).unwrap()).unwrap();
+        for packed in [json, msgpack] {
+            let Packed::Array(items) = packed else { panic!("expected array"); };
+            let [Packed::Floats(floats), Packed::TaggedFloats(first), Packed::TaggedFloats(cached)] = items.as_slice() else {
+                panic!("expected compact float runs, got {items:?}");
+            };
+            assert_eq!(floats[0].to_bits(), (-0.0f64).to_bits());
+            assert_eq!(first.as_ref(), &("~#f32".into(), vec![2.0]));
+            assert_eq!(cached.as_ref(), &("^0".into(), vec![3.0, 4.0]));
+            assert_eq!(unpack_array(items, None, &mut ReadCache::new(), 0, &mut WireValues).unwrap(), value);
+        }
+    }
 }

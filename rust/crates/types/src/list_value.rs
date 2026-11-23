@@ -358,6 +358,14 @@ impl ListBuilder {
         if !self.try_push_numeric(value) { self.push(value.into_value()); }
     }
 
+    pub fn push_f32(&mut self, value: f32) {
+        self.push_numeric(NumericCell::F32(value));
+    }
+
+    pub fn push_f64(&mut self, value: f64) {
+        self.push_numeric(NumericCell::F64(value));
+    }
+
     pub fn finish(self) -> ListValue {
         match self.0 {
             BuildingList::Numeric(builder) => finish_numeric(builder),

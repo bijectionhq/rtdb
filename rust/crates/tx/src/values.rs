@@ -193,7 +193,14 @@ pub struct ArrowDocuments {
     array: StructArray,
     layout: Arc<DecodedDocumentLayout>,
     source_bytes: Option<usize>,
-    legacy_owned_presence: Option<LegacyOwnedPresence>,
+    input: DocumentInput,
+}
+
+#[derive(Clone, Debug)]
+enum DocumentInput {
+    Arrow,
+    LegacyOwned(LegacyOwnedPresence),
+    SubmittedRows(Documents),
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +224,25 @@ impl ArrowDocuments {
         Self::from_record_batch(batch.batch(), memory)
     }
 
+    pub fn from_submitted_rows(documents: &Documents, memory: &Arc<MemoryBudget>) -> Option<Self> {
+        // The row writer reports invalid or missing IDs using the original document.
+        if documents.rows().is_empty() || documents.rows().iter().any(|row| {
+            !row.get("_id").is_some_and(|id| id.entity_id().is_ok())
+        }) {
+            return None;
+        }
+        crate::source::owned_row_documents(documents, memory).ok().map(|arrow| {
+            Self { input: DocumentInput::SubmittedRows(documents.clone()), ..arrow }
+        })
+    }
+
+    pub(crate) fn submitted_rows(&self) -> Option<&Documents> {
+        match &self.input {
+            DocumentInput::SubmittedRows(rows) => Some(rows),
+            _ => None,
+        }
+    }
+
     /// Validates an upload and prepares its Arrow document columns for source storage.
     pub fn from_ingest_batch(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         Self::from_external_pages(&[batch.batch()], memory)
@@ -228,7 +254,7 @@ impl ArrowDocuments {
             let fields = Fields::from(Vec::<Arc<arrow_schema::Field>>::new());
             let layout = DecodedDocumentLayout::new(&fields, memory)?;
             let array = StructArray::new_empty_fields(0, None);
-            return Ok(Some(Self { array, layout, source_bytes: None, legacy_owned_presence: None }));
+            return Ok(Some(Self { array, layout, source_bytes: None, input: DocumentInput::Arrow }));
         };
         if let Some(documents) = Self::from_canonical_ingest_pages(pages, IngestMode::External, memory)? {
             return Ok(Some(documents));
@@ -343,7 +369,7 @@ impl ArrowDocuments {
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, batch.num_rows())
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
-        Ok(Some(Self { array, layout, source_bytes: None, legacy_owned_presence: None }))
+        Ok(Some(Self { array, layout, source_bytes: None, input: DocumentInput::Arrow }))
     }
 
     fn compatible(field: &arrow_schema::Field, normalize: bool) -> bool {
@@ -377,7 +403,7 @@ impl ArrowDocuments {
                 rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
             }
         }
-        Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes), legacy_owned_presence: None }))
+        Ok(Some(Self { array: array.clone(), layout, source_bytes: Some(source_bytes), input: DocumentInput::Arrow }))
     }
 
     pub(crate) fn requires_legacy_receipt(&self, patch: bool) -> bool {
@@ -447,7 +473,7 @@ impl ArrowDocuments {
             return Ok(None);
         }
         let layout = DecodedDocumentLayout::new(batch.schema_ref().fields(), memory)?;
-        Ok(Some(Self { array: StructArray::from(batch.clone()), layout, source_bytes: None, legacy_owned_presence: None }))
+        Ok(Some(Self { array: StructArray::from(batch.clone()), layout, source_bytes: None, input: DocumentInput::Arrow }))
     }
 
     /// Retains compatible legacy document columns with complete entity IDs.
@@ -464,7 +490,7 @@ impl ArrowDocuments {
         }
         let array = StructArray::from(source.clone());
         let layout = DecodedDocumentLayout::new(fields, memory)?;
-        let documents = Self { array, layout, source_bytes: None, legacy_owned_presence: None };
+        let documents = Self { array, layout, source_bytes: None, input: DocumentInput::Arrow };
         if !(0..documents.row_count()).all(|row| documents.owned_id_ref(row).is_ok()) {
             return Ok(None);
         }
@@ -479,7 +505,7 @@ impl ArrowDocuments {
                 return Ok(None);
             }
         }
-        Ok(Some(Self { legacy_owned_presence: Some(LegacyOwnedPresence::Submitted), ..documents }))
+        Ok(Some(Self { input: DocumentInput::LegacyOwned(LegacyOwnedPresence::Submitted), ..documents }))
     }
 
     pub(crate) fn owned_id(&self, row: usize) -> Result<EntityId> {
@@ -504,7 +530,7 @@ impl ArrowDocuments {
         let layout = DecodedDocumentLayout::new(&fields, memory)?;
         let array = StructArray::try_new_with_length(fields, columns, None, self.array.len())
             .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?;
-        Ok(Self { array, layout, source_bytes: self.source_bytes, legacy_owned_presence: None })
+        Ok(Self { array, layout, source_bytes: self.source_bytes, input: DocumentInput::Arrow })
     }
 
     pub fn row_count(&self) -> usize { self.array.len() }
@@ -515,12 +541,15 @@ impl ArrowDocuments {
     pub(crate) fn source_bytes(&self) -> Option<usize> { self.source_bytes }
 
     pub(crate) fn legacy_owned_presence(&self) -> Option<&LegacyOwnedPresence> {
-        self.legacy_owned_presence.as_ref()
+        match &self.input {
+            DocumentInput::LegacyOwned(presence) => Some(presence),
+            _ => None,
+        }
     }
 
     pub(crate) fn with_legacy_owned_presence(mut self, fields: Option<Vec<BTreeSet<String>>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let Some(fields) = fields else {
-            self.legacy_owned_presence = Some(LegacyOwnedPresence::Implicit);
+            self.input = DocumentInput::LegacyOwned(LegacyOwnedPresence::Implicit);
             return Ok(self);
         };
         if fields.len() != self.row_count() {
@@ -536,7 +565,7 @@ impl ArrowDocuments {
                 bytes = bytes.checked_add(name.capacity() + 128).ok_or_else(overflow)?;
             }
         }
-        self.legacy_owned_presence = Some(LegacyOwnedPresence::Exact(Arc::new(OwnedFieldPresence { fields, _reservation: memory.reserve(bytes)? })));
+        self.input = DocumentInput::LegacyOwned(LegacyOwnedPresence::Exact(Arc::new(OwnedFieldPresence { fields, _reservation: memory.reserve(bytes)? })));
         Ok(self)
     }
 
@@ -1220,7 +1249,7 @@ enum ArgumentChunk {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SourceArgumentLayout { Uploaded, Canonical, CanonicalRow }
+enum SourceArgumentLayout { Uploaded, Canonical, CanonicalRow, BuiltFromRows }
 
 impl ArgumentChunk {
     fn len(&self) -> usize {
@@ -1321,6 +1350,11 @@ impl SqlArguments {
         Self::arrow(batch, SourceArgumentLayout::CanonicalRow, memory)
     }
 
+    /// The batch must use the canonical field names and physical layouts emitted by the row encoder.
+    pub fn from_row_encoded_arrow(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Self::arrow(batch, SourceArgumentLayout::BuiltFromRows, memory)
+    }
+
     fn arrow(batch: OwnedBatch, source_layout: SourceArgumentLayout, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = batch.batch().schema();
         let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
@@ -1338,6 +1372,24 @@ impl SqlArguments {
         }
         Self::new(types, rows, memory)
     }
+    pub fn from_packed_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut arguments = Self::from_rows(rows, memory)?;
+        // These columns use the row encoder's exact source layout, including the null representation.
+        if let Ok(batch) = arguments.source_columnar_batch(memory) {
+            arguments.chunks = Arc::new(vec![(0, Arc::new(ArgumentChunk::Arrow {
+                batch, types: Arc::clone(&arguments.types), source_layout: SourceArgumentLayout::BuiltFromRows,
+                _reservation: Arc::clone(&arguments.schema_reservation),
+            }))]);
+        }
+        Ok(arguments)
+    }
+
+    pub(crate) fn built_from_rows(&self) -> bool {
+        self.chunks.iter().any(|(_, chunk)| matches!(chunk.as_ref(), ArgumentChunk::Arrow {
+            source_layout: SourceArgumentLayout::BuiltFromRows, ..
+        }))
+    }
+
     pub fn types(&self) -> &[LogicalType] { &self.types }
     /// Opened-vector field types for query or DML binding; source payload fields remain available through `types`.
     pub fn execution_types(&self) -> impl Iterator<Item = LogicalType> + '_ { self.types.iter().map(rtdb_columnar::execution_type) }
@@ -1560,6 +1612,9 @@ pub struct OwnedClockSlot {
     pub funded: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ArrowDocumentWrite { Put, Patch }
+
 #[derive(Clone, Debug)]
 pub enum TxOp {
     Sql { sql: String, args: Option<SqlArguments> },
@@ -1620,6 +1675,7 @@ pub enum TxOp {
     InsertDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutArrowDocs { table: TableRef, documents: ArrowDocuments },
+    WriteArrowDocs { table: TableRef, documents: ArrowDocuments, write: ArrowDocumentWrite, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PatchDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     DeleteDocs { table: TableRef, ids: EntityIds, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     EraseDocs { table: TableRef, ids: EntityIds },

@@ -45,6 +45,9 @@
 -- Pgwire accepts one-dimensional real and double precision arrays with nullable elements in text and binary format.
 -- Pgwire emits floating-point list results from Arrow components with PostgreSQL array framing.
 -- The embedded Transit row cursor writes the typed wire representation from Arrow cell positions.
+-- Transit JSON and MessagePack readers collect floating-point components in typed buffers and resolve tags and cache references in wire order.
+-- Embedded Transit SQL binds and transaction arguments retain compatible parameters in Arrow with the row writer's source layout.
+-- Embedded Transit deletes and erases bind packed signed IDs from their Arrow buffers.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
 -- The authenticated session and original attachment authorize redemption of its ticket.

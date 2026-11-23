@@ -5,6 +5,8 @@ use crate::interval::parse as interval;
 
 mod column;
 pub use column::read_text_column;
+mod transit_input;
+pub use transit_input::{decode_transit_msgpack, decode_transit_sequence};
 
 /// The caller covers decoding allocations and the returned value with its own reservation.
 /// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
@@ -32,7 +34,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
             Value::TimestampTzRange { lower: bound(lower, i64::MIN)?, upper: bound(upper, i64::MAX)? }
         },
         26 | 2205 | 24 => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-text-type", format!("Pinned PgType has no text reader for OID {oid}"))),
-        16384 => transit(rtdb_format::transit::decode_json(text.as_bytes())?)?,
+        16384 => transit_input::decode_json(text.as_bytes())?,
         _ => Value::Utf8(text.to_owned()),
     })
 }
@@ -236,11 +238,7 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                         _ => Value::RegProc(oid),
                     }
                 }
-                "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
-                    let value = transit(*representation)?;
-                    let scalar = match tag.as_str() { "i8" => rtdb_types::ScalarType::I8, "i16" => rtdb_types::ScalarType::I16, "i32" => rtdb_types::ScalarType::I32, "i64" => rtdb_types::ScalarType::I64, "f32" => rtdb_types::ScalarType::F32, _ => rtdb_types::ScalarType::F64 };
-                    rtdb_expr::cast(&value, &rtdb_types::LogicalType::Scalar(scalar), "UTC")?
-                }
+                "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => cast_transit_number(&tag, transit(*representation)?)?,
                 "set" => { let T::Array(values) = *representation else { return Err(invalid("Transit set requires an array")); }; Value::Set(unique(values.into_iter().map(transit).collect::<Result<_>>()?)) },
                 "list" => {
                     let T::Array(values) = *representation else { return Err(invalid("Transit list requires an array")); };
@@ -266,6 +264,18 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         }
         T::Symbol(_) => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-symbol", "Source symbols have no Arrow document value type")),
     })
+}
+fn cast_transit_number(tag: &str, value: Value) -> Result<Value> {
+    use rtdb_types::ScalarType;
+    let scalar = match tag {
+        "i8" => ScalarType::I8,
+        "i16" => ScalarType::I16,
+        "i32" => ScalarType::I32,
+        "i64" => ScalarType::I64,
+        "f32" => ScalarType::F32,
+        _ => ScalarType::F64,
+    };
+    rtdb_expr::cast(&value, &rtdb_types::LogicalType::Scalar(scalar), "UTC")
 }
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.postgres/invalid-column-value", error.to_string()) }
 

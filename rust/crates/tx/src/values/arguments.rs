@@ -9,6 +9,10 @@ use super::{ArgumentChunk, SourceArgumentLayout, SqlArguments, normalized_docume
 
 impl SqlArguments {
     pub(crate) fn source_columnar_batch(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+        if let [(_, chunk)] = self.chunks.as_slice()
+            && let ArgumentChunk::Arrow { batch, source_layout: SourceArgumentLayout::BuiltFromRows, .. } = chunk.as_ref() {
+            return Ok(batch.clone());
+        }
         let mut output = BatchBuilder::new(super::schema_bytes(&self.types)?, memory)?;
         let mut fields = Vec::with_capacity(self.types.len());
         let mut columns = Vec::with_capacity(self.types.len());
@@ -54,7 +58,8 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
             let array = batch.column(position);
             let source = &types[position];
             // A decoded row already has the writer's masked bytes, which are included in the source digest.
-            if *source_layout == SourceArgumentLayout::CanonicalRow && source == ty && field.data_type() == target.data_type() {
+            if matches!(source_layout, SourceArgumentLayout::CanonicalRow | SourceArgumentLayout::BuiltFromRows)
+                && source == ty && field.data_type() == target.data_type() {
                 return Ok((Arc::clone(array), None));
             }
             if (*source_layout == SourceArgumentLayout::Uploaded || canonical_argument_field(field))

@@ -6,11 +6,10 @@ mod output;
 mod text;
 
 pub use output::{Format, SessionEnvironment, encode, encode_arrow, encode_error, encode_timestamp, encode_value, to_transit};
-pub use text::{from_transit, read_text, read_text_column};
+pub use text::{decode_transit_msgpack, decode_transit_sequence, from_transit, read_text, read_text_column};
 
-use std::{mem::size_of, sync::Arc};
+use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::transit::{TransitValue, decode_msgpack_in};
 use rtdb_types::{Anomaly, PgType, Result, Value};
 
 pub struct DecodedValue { value: Value, _reservation: Arc<MemoryReservation> }
@@ -138,36 +137,6 @@ fn array_argument(child: arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef>
 fn fixed_binary<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     if bytes.len() < N { return Err(invalid("Truncated PostgreSQL binary value")); }
     bytes.try_into().map_err(|_| invalid("Trailing bytes in PostgreSQL binary value"))
-}
-
-/// Admits the wire graph and its native conversion separately, then retains the native value's storage.
-pub fn decode_transit_msgpack(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<DecodedValue> {
-    let (wire, wire_reservation) = decode_msgpack_in(bytes, memory)?;
-    let bound = transit_conversion_bound(&wire)?.checked_add(8192).ok_or_else(size_error)?;
-    let mut reservation = memory.reserve(bound)?;
-    let value = from_transit(wire)?;
-    drop(wire_reservation);
-    let retained = value.retained_bytes()?.checked_add(8192).ok_or_else(size_error)?;
-    Arc::get_mut(&mut reservation).expect("Transit conversion owns its reservation").shrink_to(retained)?;
-    Ok(DecodedValue { value, _reservation: reservation })
-}
-
-fn transit_conversion_bound(wire: &TransitValue) -> Result<usize> {
-    use TransitValue as T;
-    let add = |left: usize, right: usize| left.checked_add(right).ok_or_else(size_error);
-    let text = |length: usize| length.checked_mul(8).ok_or_else(size_error);
-    let inline = size_of::<Value>() * 8 + 256;
-    let map_entry = size_of::<(String, Value)>() * 16 + 256;
-    match wire {
-        T::String(value) | T::Keyword(value) | T::Symbol(value) => add(inline, text(value.len())?),
-        T::Bytes(value) => add(inline, text(value.len())?),
-        T::Array(values) => values.iter().try_fold(inline, |bytes, value| add(bytes, transit_conversion_bound(value)?)),
-        T::Map(entries) => entries.iter().try_fold(inline, |bytes, (key, value)| {
-            add(add(add(bytes, map_entry)?, transit_conversion_bound(key)?)?, transit_conversion_bound(value)?)
-        }),
-        T::Tagged { tag, representation } => add(add(inline, text(tag.len())?)?, transit_conversion_bound(representation)?),
-        _ => Ok(inline),
-    }
 }
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.pgwire/invalid-arg-representation", error.to_string()) }

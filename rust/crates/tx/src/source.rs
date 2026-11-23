@@ -10,7 +10,7 @@ use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
-use crate::{ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
+use crate::{ArrowDocumentWrite, ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::bounded_retry::{BOUNDED_RETRY_METADATA_KEY, BoundedRetry};
 use crate::values::{DecodedDocumentLayout, LegacyOwnedPresence, contains_fixed_size_list};
 use crate::values::arguments::{canonical_float_field, compatible_float_cell, float_field};
@@ -193,7 +193,7 @@ impl SourceTransaction {
                 }
                 Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
-                Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
+                Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::WriteArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
                 Operation::InsertIids { table, iids, .. } | Operation::InsertArrowIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } | Operation::PatchArrowIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::PutReplayArrow { table, iids, .. } => {
                     (0, Some(table), iids.as_ref().map_or(0, Vec::capacity).checked_mul(16).ok_or_else(overflow)?)
@@ -434,7 +434,7 @@ impl SourceTransaction {
                     })?;
                     names.checked_mul(documents.array().len()).ok_or_else(overflow)?
                 }
-                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::InsertArrowIids { documents, .. } | Operation::PutReplayArrow { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
+                Operation::Public(TxOp::PutArrowDocs { documents, .. } | TxOp::WriteArrowDocs { documents, .. }) | Operation::InsertArrowIids { documents, .. } | Operation::PutReplayArrow { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
                     documents.array().len().checked_mul(64).ok_or_else(overflow)?
                 }
                 Operation::Public(TxOp::Sql { sql, args }) => {
@@ -997,16 +997,24 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
                 _ => "put-docs",
             }
         }
-        Operation::Public(TxOp::PutArrowDocs { table, documents }) => {
+        Operation::Public(operation @ (TxOp::PutArrowDocs { table, documents } | TxOp::WriteArrowDocs { table, documents, .. })) => {
             let reader = documents.id_reader()?;
             let iids = (0..documents.array().len()).map(|row| {
                 documents.iid(row, reader.as_ref(), memory)
             }).collect::<Result<_>>()?;
             identities = Cow::Owned(iids);
             body.insert("iids".into(), Value::Null);
-            time_fields(&mut body, None, None);
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
-            "put-docs"
+            match operation {
+                TxOp::WriteArrowDocs { write, valid_from, valid_to, .. } => {
+                    time_fields(&mut body, *valid_from, *valid_to);
+                    match write { ArrowDocumentWrite::Put => "put-docs", ArrowDocumentWrite::Patch => "patch-docs" }
+                }
+                _ => {
+                    time_fields(&mut body, None, None);
+                    "put-docs"
+                }
+            }
         }
         Operation::InsertArrowIids { table, documents, iids, valid_from, valid_to } => {
             identities = Cow::Borrowed(iids);
@@ -1283,7 +1291,16 @@ fn iid_vector(lists: &[Cow<'_, [Iid]>], field: &Field, arrays: &mut BatchBuilder
     })
 }
 
-fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+fn document_leg(mut lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
+    if lists.len() > 1 {
+        // Coalescing sees the original field presence and the first occurrence of each logical type.
+        for list in &mut lists {
+            if let SourceDocuments::Arrow(documents) = list
+                && let Some(rows) = documents.submitted_rows() {
+                *list = SourceDocuments::Rows(rows);
+            }
+        }
+    }
     if lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
         && lists.iter().any(|list| matches!(list, SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some()))
     {
@@ -2850,7 +2867,7 @@ pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
 }
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
-        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::WriteArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
         | Operation::InsertIids { table, .. } | Operation::InsertArrowIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutReplayArrow { table, .. } | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => table,
         _ => return Ok(()),
     };
@@ -3265,6 +3282,40 @@ mod tests {
         let error = encode_arguments(&arguments, &memory).unwrap_err();
 
         assert_eq!(error.code, "rtdb/column-type-mismatch");
+    }
+
+    #[test]
+    fn submitted_arrow_document_writes_keep_row_source_bytes_and_receipts() {
+        let memory = budget();
+        let table = TableRef::new("public", "docs");
+        let first = Documents::new(vec![
+            StructFields::from([("_id".into(), Value::I64(1)), ("vec".into(), Value::list(vec![Value::F64(-0.0), Value::Null]))]),
+            StructFields::from([("_id".into(), Value::I64(2))]),
+        ], &memory).unwrap();
+        let second = Documents::new(vec![
+            StructFields::from([("_id".into(), Value::I64(3)), ("vec".into(), Value::list(vec![Value::F32(-0.0), Value::F64(f64::from_bits(0x7ff8_0000_0000_0007))]))]),
+            StructFields::from([("_id".into(), Value::I64(4)), ("vec".into(), Value::Null)]),
+        ], &memory).unwrap();
+        let valid_from = Some(Timestamp(123));
+        let valid_to = Some(Timestamp(456));
+
+        for write in [ArrowDocumentWrite::Put, ArrowDocumentWrite::Patch] {
+            let legacy = |docs: &Documents| match write {
+                ArrowDocumentWrite::Put => TxOp::PutDocs { table: table.clone(), documents: docs.clone(), valid_from, valid_to },
+                ArrowDocumentWrite::Patch => TxOp::PatchDocs { table: table.clone(), documents: docs.clone(), valid_from, valid_to },
+            };
+            let arrow = |docs: &Documents| TxOp::WriteArrowDocs {
+                table: table.clone(), documents: ArrowDocuments::from_submitted_rows(docs, &memory).unwrap(), write, valid_from, valid_to,
+            };
+            for pages in [&[&first][..], &[&first, &second][..]] {
+                let build = |ops| SourceTransaction::new(ops, SubmitOptions::default(), &memory).unwrap();
+                let old = build(pages.iter().map(|docs| legacy(docs)).collect());
+                let new = build(pages.iter().map(|docs| arrow(docs)).collect());
+                assert_eq!(new.encode().unwrap().as_slice(), old.encode().unwrap().as_slice());
+                assert_eq!(new.body_digest().unwrap(), old.body_digest().unwrap());
+                assert_eq!(roundtrip(&new).body_digest().unwrap(), roundtrip(&old).body_digest().unwrap());
+            }
+        }
     }
 
     #[test]

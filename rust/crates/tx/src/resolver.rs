@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bounded_retry::is_bounded_receipts_table;
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
 use crate::values::{BoundArgumentRow, IngestMode, LegacyOwnedPresence, plain_scalar_field};
-use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
+use crate::{ArrowDocumentWrite, ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
 mod prepared_landing;
@@ -1106,7 +1106,7 @@ impl<'a> OpenTransaction<'a> {
         };
         let span = match operation {
             Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => self.context.transaction_span(self.trace_parent, "xtdb.transaction.sql", &[("query.text", rtdb_plan::TraceValue::Text(sql))]),
-            Operation::Public(TxOp::PatchDocs { table, .. }) | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => self.context.transaction_span(self.trace_parent, "xtdb.transaction.patch-docs", &[("db", rtdb_plan::TraceValue::Text(&self.context.database)), ("schema", rtdb_plan::TraceValue::Text(&table.schema)), ("table", rtdb_plan::TraceValue::Text(&table.table))]),
+            Operation::Public(TxOp::PatchDocs { table, .. } | TxOp::WriteArrowDocs { table, write: ArrowDocumentWrite::Patch, .. }) | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => self.context.transaction_span(self.trace_parent, "xtdb.transaction.patch-docs", &[("db", rtdb_plan::TraceValue::Text(&self.context.database)), ("schema", rtdb_plan::TraceValue::Text(&table.schema)), ("table", rtdb_plan::TraceValue::Text(&table.table))]),
             _ => None,
         };
         let parent = self.trace_parent;
@@ -1146,6 +1146,10 @@ impl<'a> OpenTransaction<'a> {
                 Ok(())
             }
             Operation::Public(TxOp::PutArrowDocs { table, documents }) => self.put_arrow_documents(table, documents, None, None, None, false).await,
+            Operation::Public(TxOp::WriteArrowDocs { table, documents, write, valid_from, valid_to }) => match write {
+                ArrowDocumentWrite::Put => self.put_arrow_documents(table, documents, None, *valid_from, *valid_to, false).await,
+                ArrowDocumentWrite::Patch => self.patch_arrow_documents(table, documents, None, *valid_from, *valid_to).await,
+            },
             Operation::PutReplayArrow { table, documents, iids, valid_from, valid_to } => self.put_arrow_documents(table, documents, iids.as_deref(), *valid_from, *valid_to, false).await,
             Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                 self.declare_owned_relation(relation, schema).await,
@@ -3884,11 +3888,11 @@ fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Re
             (table, documents.columns(), "insert", put_columns),
         Operation::Public(TxOp::PutDocs { table, documents, .. }) | Operation::PutIids { table, documents, .. } =>
             (table, documents.columns(), "put", put_columns),
-        Operation::Public(TxOp::PutArrowDocs { table, documents }) | Operation::PutReplayArrow { table, documents, .. } =>
+        Operation::Public(TxOp::PutArrowDocs { table, documents } | TxOp::WriteArrowDocs { table, documents, write: ArrowDocumentWrite::Put, .. }) | Operation::PutReplayArrow { table, documents, .. } =>
             (table, documents.columns(), "put", put_columns),
         Operation::Public(TxOp::PatchDocs { table, documents, .. }) | Operation::PatchIids { table, documents, .. } =>
             (table, documents.columns(), "patch", &["_id", "_fn"][..]),
-        Operation::PatchArrowIids { table, documents, .. } =>
+        Operation::Public(TxOp::WriteArrowDocs { table, documents, write: ArrowDocumentWrite::Patch, .. }) | Operation::PatchArrowIids { table, documents, .. } =>
             (table, documents.columns(), "patch", &["_id", "_fn"][..]),
         _ => return Ok(()),
     };
@@ -3909,7 +3913,7 @@ fn validate_document_columns(table: &TableRef, columns: &[String], verb: &str, p
 /// Its patch path has no such wrapper.
 fn document_table(operation: &Operation) -> Option<&TableRef> {
     match operation {
-        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
+        Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::WriteArrowDocs { table, write: ArrowDocumentWrite::Put, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
         | Operation::InsertIids { table, .. } | Operation::InsertArrowIids { table, .. } | Operation::PutIids { table, .. } | Operation::PutReplayArrow { table, .. } => Some(table),
         _ => None,
     }

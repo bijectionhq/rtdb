@@ -278,10 +278,7 @@ pub unsafe extern "C" fn rtdb_v1_statement_bind_transit(handle: u64, input: *con
     unsafe { call(error, || {
         let statement = handles::statement(handle)?; let _admitted = statement.session.region.enter()?;
         let memory = statement.session.region.memory();
-        let (value, _decode_reservation) = rtdb_pg_codec::decode_transit_msgpack(bytes(input, length)?, memory)?.into_parts();
-        let rtdb_types::Value::List(rows) = value else { return Err(invalid("Transit bind requires an array of argument rows")); };
-        let rows = rows.into_values().into_iter().map(|row| match row { rtdb_types::Value::List(row) => Ok(row.into_values()), _ => Err(invalid("Each Transit argument row must be an array")) }).collect::<Result<Vec<_>>>()?;
-        let arguments = rtdb_tx::SqlArguments::from_rows(rows, memory)?;
+        let arguments = transit::bind_arguments(bytes(input, length)?, memory)?;
         let reservation = memory.reserve(add(mul(arguments.types().len(), 64)?, 4096)?)?;
         let names = (0..arguments.types().len()).map(|index| format!("${}", index + 1)).collect();
         statement.bind(arrow::BoundArguments { arguments, names, _reservation: reservation })

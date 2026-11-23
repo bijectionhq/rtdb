@@ -116,8 +116,7 @@ impl CopyInput {
                 let size = usize::try_from(self.length).map_err(io_error)?;
                 let _scratch = node.memory().reserve(size.checked_mul(256).and_then(|n| n.checked_add(65_536)).ok_or_else(|| protocol("COPY allocation overflow"))?)?;
                 self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; let mut bytes = Vec::with_capacity(size); self.file.read_to_end(&mut bytes).map_err(io_error)?;
-                let values = if self.format == CopyFormat::TransitJson { rtdb_format::transit::decode_json_sequence(&bytes)? } else { rtdb_format::transit::decode_msgpack_sequence(&bytes)? };
-                let rows = values.into_iter().map(|value| match rtdb_pg_codec::from_transit(value)? { Value::Struct(fields) => Ok(fields), _ => Err(protocol("COPY Transit values must be documents")) }).collect::<Result<Vec<_>>>()?;
+                let rows = self.transit_rows(&bytes)?;
                 let count = rows.len() as u64;
                 self.submit(|| self.put_rows(rows, node.memory()), session, node, cancellation).await?;
                 Ok(count)
@@ -146,8 +145,18 @@ impl CopyInput {
             }
         }
     }
+    fn transit_rows(&self, bytes: &[u8]) -> Result<Vec<StructFields<Value>>> {
+        rtdb_pg_codec::decode_transit_sequence(bytes, self.wire_format(), |value| match value {
+            Value::Struct(fields) => Ok(fields),
+            _ => Err(protocol("COPY Transit values must be documents")),
+        })
+    }
     fn put_rows(&self, rows: Vec<StructFields<Value>>, memory: &Arc<MemoryBudget>) -> Result<TxOp> {
-        Ok(TxOp::PutDocs { table: self.table.clone(), documents: Documents::new(rows, memory)?, valid_from: None, valid_to: None })
+        let documents = Documents::new(rows, memory)?;
+        if let Some(documents) = ArrowDocuments::from_submitted_rows(&documents, memory) {
+            return Ok(TxOp::PutArrowDocs { table: self.table.clone(), documents });
+        }
+        Ok(TxOp::PutDocs { table: self.table.clone(), documents, valid_from: None, valid_to: None })
     }
     async fn submit(&self, operation: impl FnOnce() -> Result<TxOp>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
         let owns_transaction = session.state().status() == TransactionStatus::Idle;
@@ -217,6 +226,34 @@ fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transit_copy_builds_arrow_documents_in_the_existing_log_layout() {
+        use arrow_array::Array;
+        use rtdb_types::ListView;
+        use rtdb_format::transit::{self, TransitValue as T};
+        use rtdb_tx::SourceTransaction;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let message = T::Map(vec![
+            (T::String("_id".into()), T::Integer(1)),
+            (T::String("vec".into()), T::Array(vec![T::Float(-0.0), T::Null, T::Float(2.5)])),
+        ]);
+        for format in [CopyFormat::TransitJson, CopyFormat::TransitMsgpack] {
+            let copy = CopyInput::new(vec![Identifier { text: "docs".into(), quoted: false }], Some(format), &memory, 4096).unwrap();
+            let bytes = if format == CopyFormat::TransitJson { transit::encode_json(&message) } else { transit::encode_msgpack(&message) }.unwrap();
+            let rows = copy.transit_rows(&bytes).unwrap();
+            let operation = copy.put_rows(rows.clone(), &memory).unwrap();
+            let TxOp::PutArrowDocs { ref documents, .. } = operation else { panic!("expected Arrow document operation"); };
+            assert_eq!(documents.row_count(), 1);
+            let ListView::F64(child) = rows[0].get("vec").unwrap().list_view().unwrap() else { panic!("expected a packed vector"); };
+            assert_eq!(child.value(0).to_bits(), (-0.0f64).to_bits());
+            assert!(child.is_null(1));
+            let legacy = TxOp::PutDocs { table: copy.table.clone(), documents: Documents::new(rows, &memory).unwrap(), valid_from: None, valid_to: None };
+            let encode = |op| SourceTransaction::new(vec![op], Default::default(), &memory).unwrap().encode().unwrap();
+            assert_eq!(encode(operation).as_slice(), encode(legacy).as_slice());
+        }
+    }
 
     #[test]
     fn missing_and_unrecognized_copy_formats_fail_before_table_or_file_admission() {
