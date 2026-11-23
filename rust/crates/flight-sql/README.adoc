@@ -813,6 +813,8 @@ The fact payload retains the authored expression for landing.
 Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
 The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
 Root kind 6 lands a reviewed Proposal under the original live Root and Proposal holds.
+The assigned-clock landing may carry signed Root count limits.
+The hosted owner adds the guarded membership delta of later reviewed roots to each original maximum and the receiver checks the resulting limit against the final Root population.
 Its acceptance-valid writes may replace the same complete key in order after the first checked create or replacement.
 Every write occupies a separate assertion position, and the first write binds the original Root presence or absence for that key.
 The original held Proposal supplies its final local point check for the same key.
