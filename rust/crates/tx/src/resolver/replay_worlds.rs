@@ -13,9 +13,62 @@ use rtdb_types::{
 };
 
 use super::{OpenTransaction, no_owned_principal, overflow, validate_owned_schema};
-use crate::hosted_control::{HostedReplay, ReplayWorlds, ReplayedWorldParent};
+use crate::hosted_control::{
+    HostedControlWrite, HostedReplay, ReplayWorlds, ReplayedWorldParent, WorldReadmission,
+    replayed_archive_cut, replayed_parent_logical_time, replayed_world_parent,
+};
 
 impl OpenTransaction<'_> {
+    pub(super) async fn readmit_replayed_world<'a>(
+        &mut self,
+        context: &Arc<rtdb_query::QueryContext>,
+        admission: WorldReadmission,
+        controls: impl Iterator<Item = &'a HostedControlWrite> + Clone,
+    ) -> Result<()> {
+        let unavailable = OwnedWorld::unavailable;
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty())
+            .ok_or_else(no_owned_principal)?;
+        let id = Iid(admission.world);
+        let (mut world, _reservation) = rtdb_query::read_owned_world(Arc::clone(context), owner, id)
+            .await?.ok_or_else(unavailable)?;
+        let (active, _) = replay_control(context, "restore").await?;
+        let (archive, _) = replay_control(context, "archive").await?;
+        let (frontier, _) = replay_control(context, "native-frontier.v1").await?;
+        let source_cut = replayed_archive_cut(&frontier, admission.binding, &archive)?;
+        if active != admission.binding || source_cut != admission.source_cut
+            || world.dropped || world.pin.0 != admission.pin || world.until <= source_cut
+            || world.basis.system_time > source_cut
+        {
+            return Err(unavailable());
+        }
+        let (proof, _) = replay_control(context, &ReplayedWorldParent::locator(id, world.pin)).await?;
+        let proven = replayed_world_parent(&proof, admission.binding, &world)?;
+        let locator = format!("native-transaction/{}", world.basis.tx_id.0);
+        let (parent, restored) = replay_control(context, &locator).await?;
+        let logical = replayed_parent_logical_time(&parent, admission.binding, &archive, world.basis)?;
+        let ordered = self.tx_key();
+        let remaining = world.until.0.checked_sub(source_cut.0).ok_or_else(unavailable)?;
+        let lease_start = Timestamp(admission.until.0.checked_sub(remaining).ok_or_else(unavailable)?);
+        let inherited = world.inherited_clock();
+        if admission.basis.system_time != proven || restored != proven
+            || admission.basis.tx_id >= ordered.tx_id
+            || inherited > world.basis.system_time
+            || (world.mode == WorldClockMode::Proposal && inherited != logical)
+            || lease_start < proven || lease_start > ordered.system_time
+            || admission.until <= ordered.system_time
+        {
+            return Err(unavailable());
+        }
+        admission.require_application(&world, controls)?;
+        world.capture = Iid(admission.capture);
+        world.suffix = admission.suffix.map(Iid);
+        world.manifest = admission.manifest;
+        world.basis = admission.basis;
+        world.parent_publication = Some(inherited);
+        world.until = admission.until;
+        self.buffer.put(OwnedRelation::world_catalog().table(owner), world.record(), Interval::ALL)
+    }
+
     pub(super) async fn restore_owned_worlds(
         &mut self,
         replay: &HostedReplay,
@@ -216,4 +269,18 @@ impl OpenTransaction<'_> {
             Interval::new(Timestamp(0), Timestamp::MAX)?,
         )
     }
+}
+
+async fn replay_control(
+    context: &Arc<rtdb_query::QueryContext>, locator: &str,
+) -> Result<(Vec<u8>, Timestamp)> {
+    let (row, revision) = rtdb_query::read_hosted_control_point(
+        Arc::clone(context), TableRef::new("public", "bj_rtdb_restore_hold"),
+        &EntityId::String(locator.to_owned()), true,
+    ).await?.row.ok_or_else(OwnedWorld::unavailable)?;
+    let body = row.batch().column_by_name("binding")
+        .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+        .filter(|column| column.is_valid(0) && column.value(0).len() <= 4096)
+        .ok_or_else(OwnedWorld::unavailable)?;
+    Ok((body.value(0).to_vec(), revision))
 }

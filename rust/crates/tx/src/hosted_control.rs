@@ -4,7 +4,9 @@ use rtdb_types::{
 };
 
 mod replay_worlds;
+mod world_readmission;
 pub(crate) use replay_worlds::ReplayWorlds;
+pub(crate) use world_readmission::{WorldReadmission, world_readmission_control};
 
 pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
 const RESTORE: &str = "bj_rtdb_restore_hold";
@@ -106,6 +108,9 @@ pub fn hosted_replay_controls<'a>(
     controls: impl Iterator<Item = &'a HostedControlWrite> + Clone,
 ) -> Result<Option<HostedReplay>> {
     if !controls.clone().any(|control| control.name() == RESTORE && !control.is_check()) {
+        return Ok(None);
+    }
+    if world_readmission_control(controls.clone())?.is_some() {
         return Ok(None);
     }
     let selected = |relation: &str, id: &str| controls.clone().find(|control| {

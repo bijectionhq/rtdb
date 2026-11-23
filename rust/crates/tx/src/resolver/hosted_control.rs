@@ -16,6 +16,7 @@ impl OpenTransaction<'_> {
         if controls.clone().next().is_none() {
             return Ok(());
         }
+        let readmission = crate::hosted_control::world_readmission_control(controls.clone())?;
         let unavailable = || {
             Anomaly::new(
                 AnomalyCategory::Forbidden,
@@ -52,6 +53,11 @@ impl OpenTransaction<'_> {
         }
         let validating_world = !self.owned_worlds.is_empty();
         let hosted_world_reads = validating_world && crate::hosted_control::hosted_root_world_reads(operations);
+        if readmission.is_some() && (replay.is_some() || validating_world || operations.iter().any(|operation| {
+            !matches!(operation, Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::HostedControl(_)))
+        })) {
+            return Err(unavailable());
+        }
         if let Some(replay) = &replay {
             replay.check_order(self.tx_key().system_time)?;
             if validating_world || operations.iter().any(|operation| !matches!(operation,
@@ -106,7 +112,8 @@ impl OpenTransaction<'_> {
         ));
         // An exact native replay transaction can consist entirely of source
         // effects whose Original key was withdrawn. Its clock still advances.
-        if !has_fact_write && replay.is_none() && !fork_with_controls && !retained_release && !proposal_overlay
+        if !has_fact_write && replay.is_none() && readmission.is_none()
+            && !fork_with_controls && !retained_release && !proposal_overlay
             && controls.clone().any(|control| !control.is_check())
         {
             return Err(unavailable());
@@ -123,7 +130,7 @@ impl OpenTransaction<'_> {
         let mut selected_tables = BTreeSet::new();
         let mut charges = Vec::new();
         let mut rows = 0usize;
-        for control in controls {
+        for control in controls.clone() {
             self.context.check_cancelled()?;
             let table = control.table();
             rows += 1;
@@ -179,6 +186,9 @@ impl OpenTransaction<'_> {
         if let Some(replay) = &replay {
             self.restore_owned_lifetime_floors(replay, &context).await?;
             self.restore_owned_worlds(replay, &context).await?;
+        }
+        if let Some(readmission) = readmission {
+            self.readmit_replayed_world(&context, readmission, controls).await?;
         }
         self.hosted_replay = replay;
         Ok(())
