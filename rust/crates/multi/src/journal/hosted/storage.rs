@@ -567,8 +567,10 @@ impl ObjectStore for ServingStore {
     ) -> rtdb_storage::Result<ReplicaPayload> {
         let owner = self.writer.as_ref()
             .ok_or_else(|| Error::Task("The store has no installed replica payload broker".into()))?;
+        let scope = custody.installed_scope()
+            .ok_or_else(|| Error::Task("The payload permit does not name an installed placement".into()))?;
         self.with_serving_lease(owner, |deadline| async move {
-            let store = owner.replica_objects.open(custody.scope(), deadline).await?;
+            let store = owner.replica_objects.open(scope, deadline).await?;
             custody.read_from(store.as_ref(), memory).await
         }).await
     }

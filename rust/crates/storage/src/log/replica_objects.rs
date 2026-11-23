@@ -22,7 +22,7 @@ pub struct ReplicaObjectScope {
 /// the object named at that position and retains admission through provider I/O.
 #[derive(Clone)]
 pub struct ReplicaObjectCustody {
-    scope: ReplicaObjectScope,
+    authority: ReplicaPayloadAuthority,
     position: LogOffset,
     key: ObjectKey,
     digest: [u8; 32],
@@ -30,9 +30,34 @@ pub struct ReplicaObjectCustody {
     hold: Arc<dyn Send + Sync>,
 }
 
+#[derive(Clone)]
+enum ReplicaPayloadAuthority {
+    Installed(ReplicaObjectScope),
+    Brokered(Arc<dyn ReplicaPayloadBroker>),
+}
+
+#[async_trait::async_trait]
+pub trait ReplicaPayloadBroker: Send + Sync {
+    async fn read(&self, custody: &ReplicaObjectCustody, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload>;
+}
+
 impl ReplicaObjectCustody {
     pub fn from_delivery(
         scope: ReplicaObjectScope, position: LogOffset, frame: &[u8],
+        version: StorageVersion, epoch: StorageEpoch, hold: Arc<dyn Send + Sync>,
+    ) -> Result<Option<Self>> {
+        Self::new(ReplicaPayloadAuthority::Installed(scope), position, frame, version, epoch, hold)
+    }
+
+    pub fn from_brokered_delivery(
+        broker: Arc<dyn ReplicaPayloadBroker>, position: LogOffset, frame: &[u8],
+        version: StorageVersion, epoch: StorageEpoch, hold: Arc<dyn Send + Sync>,
+    ) -> Result<Option<Self>> {
+        Self::new(ReplicaPayloadAuthority::Brokered(broker), position, frame, version, epoch, hold)
+    }
+
+    fn new(
+        authority: ReplicaPayloadAuthority, position: LogOffset, frame: &[u8],
         version: StorageVersion, epoch: StorageEpoch, hold: Arc<dyn Send + Sync>,
     ) -> Result<Option<Self>> {
         let invalid = |error: rtdb_types::Anomaly| Error::Task(error.to_string());
@@ -47,10 +72,26 @@ impl ReplicaObjectCustody {
         let key = envelope.oversized_payload(version, epoch).map_err(invalid)?
             .ok_or_else(|| Error::Task("A delivered replica pointer has no object".into()))?;
         let publication = envelope.offload_publication().map_err(invalid)?.map(|(_, version)| version);
-        Ok(Some(Self { scope, position, key: ObjectKey::new(key)?, digest, publication, hold }))
+        Ok(Some(Self { authority, position, key: ObjectKey::new(key)?, digest, publication, hold }))
     }
 
-    pub fn scope(&self) -> ReplicaObjectScope { self.scope }
+    pub fn installed_scope(&self) -> Option<ReplicaObjectScope> {
+        match &self.authority {
+            ReplicaPayloadAuthority::Installed(scope) => Some(*scope),
+            ReplicaPayloadAuthority::Brokered(_) => None,
+        }
+    }
+
+    pub fn position(&self) -> LogOffset { self.position }
+
+    pub async fn redeem(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
+        IoRegion::retaining(Arc::clone(&self.hold), async {
+            match &self.authority {
+                ReplicaPayloadAuthority::Installed(_) => store.read_replica_payload(self, memory).await,
+                ReplicaPayloadAuthority::Brokered(broker) => broker.read(self, memory).await,
+            }
+        }).await
+    }
 
     pub fn matches(&self, position: LogOffset, key: &ObjectKey) -> bool {
         self.position == position && &self.key == key
@@ -58,6 +99,17 @@ impl ReplicaObjectCustody {
 
     /// The storage broker calls this only after validating the original scope.
     pub async fn read_from(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
+        self.read_publication(store, memory, self.publication.as_ref()).await
+    }
+
+    /// An authenticated transfer binds its own copy by the original body digest.
+    pub async fn read_transferred_copy(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
+        self.read_publication(store, memory, None).await
+    }
+
+    async fn read_publication(
+        &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, publication: Option<&PhysicalObjectVersion>,
+    ) -> Result<ReplicaPayload> {
         IoRegion::retaining(Arc::clone(&self.hold), async {
             let length = usize::try_from(store.head_fresh(&self.key).await?.size)
                 .map_err(|_| payload_size())?;
@@ -65,7 +117,7 @@ impl ReplicaObjectCustody {
             let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(payload_size)?;
             let charge = memory.reserve(charge).map_err(|error| Error::Task(error.to_string()))?;
             let observed = IoRegion::retaining(charge.clone(), store.observe_fresh_exact(&self.key, length)).await?;
-            if self.publication.as_ref().is_some_and(|expected| observed.version.as_ref() != Some(expected))
+            if publication.is_some_and(|expected| observed.version.as_ref() != Some(expected))
                 || ring::digest::digest(&ring::digest::SHA256, &observed.value).as_ref() != self.digest.as_slice()
             {
                 return Err(Error::ConflictingObject(self.key.to_string()));
@@ -81,14 +133,19 @@ fn payload_size() -> Error {
 
 impl fmt::Debug for ReplicaObjectCustody {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("ReplicaObjectCustody").field("scope", &self.scope)
+        formatter.debug_struct("ReplicaObjectCustody").field("installed_scope", &self.installed_scope())
             .field("position", &self.position).finish_non_exhaustive()
     }
 }
 
 impl PartialEq for ReplicaObjectCustody {
     fn eq(&self, other: &Self) -> bool {
-        self.scope == other.scope && self.position == other.position && self.key == other.key
+        let same_owner = match (&self.authority, &other.authority) {
+            (ReplicaPayloadAuthority::Installed(left), ReplicaPayloadAuthority::Installed(right)) => left == right,
+            (ReplicaPayloadAuthority::Brokered(left), ReplicaPayloadAuthority::Brokered(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        };
+        same_owner && self.position == other.position && self.key == other.key
             && self.digest == other.digest && self.publication == other.publication
     }
 }

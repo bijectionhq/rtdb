@@ -64,7 +64,7 @@ pub struct LogMetadata {
 }
 
 mod replica_objects;
-pub use replica_objects::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload};
+pub use replica_objects::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload, ReplicaPayloadBroker};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {

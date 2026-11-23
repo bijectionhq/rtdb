@@ -561,7 +561,7 @@ impl SealedTail {
         if let Some(hold) = &self.hold {
             covered = records.partition_point(|record| record.metadata.offset <= hold.through);
             for record in &mut records[..covered] {
-                record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
+                hold.retain_record(record)?;
             }
             if records.last().is_some_and(|record| record.metadata.offset >= hold.through) { self.hold = None; }
         }
@@ -745,7 +745,8 @@ mod tests {
             previous_servers: None,
         };
         let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
-        let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
+        let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(),
+            storage: crate::deployment::CellStorage::Local { root: files.path().to_owned() }, custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
         let factory = LogkeeperLogFactory::new(1024, Default::default(), holds);
 
         let refused = factory.open(&configuration, LogAccess::ReadWrite, CancellationToken::new()).await.err().unwrap();
@@ -781,6 +782,7 @@ mod tests {
         let files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap()),
+            storage: crate::deployment::CellStorage::Local { root: files.path().to_owned() },
             custody: ReplayCustody::Local, tasks: Default::default(),
         });
         let replica = SealedLog::for_serving(provider.clone(), &[7; 32], &config, holds.clone()).unwrap();
@@ -837,6 +839,7 @@ mod tests {
         let directory_files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(directory_files.path()).unwrap()),
+            storage: crate::deployment::CellStorage::Local { root: directory_files.path().to_owned() },
             custody: ReplayCustody::Local, tasks: Default::default(),
         });
         let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &[7; 32], &config, holds.clone()).unwrap();
@@ -847,7 +850,8 @@ mod tests {
         replica.enqueue(Bytes::from(proxy.encode()), Timestamp(1)).await.unwrap().durable().await.unwrap();
         let mut records = tail.poll(Duration::from_secs(1)).await.unwrap();
         assert_eq!(records.len(), 2);
-        let delivery = records.pop().unwrap().payload;
+        let delivery = records.pop().unwrap();
+        let permit = delivery.replica_objects.as_ref().unwrap();
         drop((tail, records));
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -861,6 +865,11 @@ mod tests {
         let first_required = current.required_replica_offsets(0).min().unwrap();
         assert_eq!(crate::replica_retention::replica_trim_through(3, first_required), Some(0));
 
+        let ticket = *current.storage_regions.keys().next().unwrap();
+        crate::store::release_region(directory.as_ref(), &record.id, ticket, false).await.unwrap();
+        let store = rtdb_storage::MemoryStore::default();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        assert!(matches!(permit.redeem(&store, &memory).await, Err(rtdb_storage::Error::Closed(_))));
         drop(delivery);
         holds.tasks.close();
         tokio::time::timeout(Duration::from_secs(5), holds.tasks.wait()).await.unwrap();

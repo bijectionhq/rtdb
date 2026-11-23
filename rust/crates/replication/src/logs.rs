@@ -262,7 +262,7 @@ impl PartitionLogs {
                 return Err(Anomaly::fault("rtdb.replication/oversized-delivery",
                     "The replica payload permit does not match this delivery"));
             }
-            let payload = self.store.read_replica_payload(custody, &self.memory).await?;
+            let payload = custody.redeem(self.store.as_ref(), &self.memory).await?;
             return self.decode_oversized(record, payload.as_ref());
         }
         IoRegion::retaining(Arc::new(delivery), async {

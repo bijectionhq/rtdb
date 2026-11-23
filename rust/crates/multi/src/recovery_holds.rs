@@ -3,14 +3,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
-use rtdb_format::envelope::ReplicaFrame;
-use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord}};
-use rtdb_types::Anomaly;
+use rtdb_columnar::MemoryBudget;
+use rtdb_format::{envelope::ReplicaFrame, keys::CURRENT_STORAGE_VERSION};
+use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, Result,
+    log::{LogOffset, LogRecord, ReplicaObjectCustody, ReplicaPayload, ReplicaPayloadBroker}};
+use rtdb_types::{Anomaly, StorageEpoch};
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-use crate::deployment::LogkeeperLogConfig;
+use crate::deployment::{CellStorage, LogkeeperLogConfig};
 use crate::keys::KeyService;
 use crate::hosted_recovery::replay_start;
 
@@ -18,6 +20,7 @@ pub(crate) struct RecoveryHolds {
     pub directory: Arc<dyn Directory>,
     pub keys: Arc<dyn KeyService>,
     pub custody: ReplayCustody,
+    pub storage: CellStorage,
     pub tasks: TaskTracker,
 }
 
@@ -32,10 +35,19 @@ pub(crate) struct RecoveryAdmission {
 
 pub(crate) struct ReplayHold {
     pub through: LogOffset,
+    broker: Arc<DirectoryPayloadBroker>,
     _release: oneshot::Sender<()>,
 }
 
 impl ReplayHold {
+    pub fn retain_record(self: &Arc<Self>, record: &mut LogRecord) -> Result<()> {
+        record.replica_objects = ReplicaObjectCustody::from_brokered_delivery(
+            self.broker.clone(), record.metadata.offset, &record.payload, CURRENT_STORAGE_VERSION, StorageEpoch(0), self.clone(),
+        )?;
+        record.payload = self.retain_delivery(std::mem::take(&mut record.payload));
+        Ok(())
+    }
+
     pub fn retain_delivery(self: &Arc<Self>, payload: Bytes) -> Bytes {
         struct Delivery {
             payload: Bytes,
@@ -98,8 +110,13 @@ impl RecoveryAdmission {
                 }
             }
         });
-        admitted.await.map_err(|_| Error::Closed(self.stream.clone()))??;
-        Ok(Some(ReplayHold { through, _release: release }))
+        let residence = admitted.await.map_err(|_| Error::Closed(self.stream.clone()))??;
+        let broker = Arc::new(DirectoryPayloadBroker {
+            admission: self.clone(),
+            residence,
+            ticket: id,
+        });
+        Ok(Some(ReplayHold { through, broker, _release: release }))
     }
 
     pub(crate) async fn retain_offloaded(&self, records: &mut [LogRecord]) -> Result<()> {
@@ -115,7 +132,7 @@ impl RecoveryAdmission {
         let hold = self.hold(LogOffset(after), last.metadata.offset).await?
             .map(Arc::new).ok_or_else(|| Error::Task("The offloaded replica delivery has no replay hold".into()))?;
         for record in offloaded {
-            record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
+            hold.retain_record(record)?;
         }
         Ok(())
     }
@@ -149,7 +166,7 @@ impl RecoveryAdmission {
         Ok((record, first_required))
     }
 
-    async fn register(&self, id: Uuid, after: LogOffset, through: LogOffset, attempted: &mut bool) -> Result<()> {
+    async fn register(&self, id: Uuid, after: LogOffset, through: LogOffset, attempted: &mut bool) -> Result<String> {
         for _ in 0..8 {
             let (mut record, first_required) = self.checked_record(after).await?;
             let version = record.version;
@@ -160,7 +177,7 @@ impl RecoveryAdmission {
                     "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation, "revision": stored.version,
                     "stream": self.stream, "epoch": self.log_epoch, "hold": id, "first_required": first_required, "through": through.0,
                 }));
-                return Ok(());
+                return Ok(stored.storage_prefix());
             }
         }
         Err(Error::Remote { key: self.stream.clone(), message: "The directory kept changing while registering a replay hold".into() })
@@ -171,6 +188,63 @@ impl RecoveryAdmission {
     }
 }
 
+struct DirectoryPayloadBroker {
+    admission: RecoveryAdmission,
+    residence: String,
+    ticket: Uuid,
+}
+
+#[async_trait::async_trait]
+impl ReplicaPayloadBroker for DirectoryPayloadBroker {
+    async fn read(&self, custody: &ReplicaObjectCustody, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
+        let owner = &self.admission;
+        let position = custody.position().0;
+        let closed = || Error::Closed(owner.stream.clone());
+        let record = owner.holds.directory.deployment(&owner.deployment).await.map_err(|error| owner.directory_error(error))?
+            .filter(|record| {
+                record.stream("replica") == owner.stream && record.log_epoch == owner.log_epoch
+                    && record.storage_prefix() == self.residence
+                    && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                    && matches!(record.storage_regions.get(&self.ticket),
+                        Some(StorageRegion::ReplicaReplay { first_required, through, .. })
+                            if *first_required >= 0 && (*first_required..=*through).contains(&position))
+            })
+            .ok_or_else(closed)?;
+
+        let io = IoRegion::new();
+        let bucket = owner.holds.storage.bucket(io).await.map_err(|error| owner.directory_error(error))?;
+        if record.storage_namespaces.is_some() {
+            let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await
+                .map_err(|error| owner.directory_error(error))?.ok_or_else(closed)?;
+            let keys = owner.holds.keys.namespace_id().await.map_err(|error| owner.directory_error(error))?;
+            crate::deployment::require_storage_namespaces(&record, rtdb_directory::StorageNamespaces { objects, keys })
+                .map_err(|error| owner.directory_error(error))?;
+        }
+        let key_id = record.key_id();
+        let material = owner.holds.keys.existing(&key_id).await.map_err(|error| owner.directory_error(error))?;
+        let root = crate::archive::checkpoint_storage_root().map_err(|error| owner.directory_error(error))?;
+        let prefix = format!("{}/{root}", self.residence);
+        let files = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
+        let marker = ObjectKey::new(crate::store::ROOT_MARKER)?;
+        if files.get_fresh_exact(&marker, record.id.len()).await?.as_ref() != record.id.as_bytes() {
+            return Err(closed());
+        }
+        let store = crate::store::EncryptingStore::new(files, &material).map_err(|error| owner.directory_error(error))?;
+        let detached = record.checkpoint_transfer_activation.as_ref().is_some_and(|activation| {
+            let terminal = &activation.replica.bootstrap.terminal;
+            let stage = &terminal.fence.destination;
+            stage.intent.destination.to_string() == record.id
+                && stage.source_log_epoch == record.log_epoch
+                && position > stage.checkpoint.boundary && position <= terminal.replica_through
+        });
+        if detached {
+            custody.read_transferred_copy(&store, memory).await
+        } else {
+            custody.read_from(&store, memory).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +252,20 @@ mod tests {
     #[tokio::test]
     async fn a_delivered_reference_keeps_its_replay_hold_through_provider_drain() {
         let (release, closed) = oneshot::channel();
-        let hold = Arc::new(ReplayHold { through: LogOffset(3), _release: release });
+        let root = tempfile::tempdir().unwrap();
+        let holds = Arc::new(RecoveryHolds {
+            directory: rtdb_directory::MemoryDirectory::new(),
+            keys: Arc::new(crate::keys::LocalKeyService::new(root.path()).unwrap()),
+            custody: ReplayCustody::Local,
+            storage: CellStorage::Local { root: root.path().to_owned() },
+            tasks: TaskTracker::new(),
+        });
+        let broker = Arc::new(DirectoryPayloadBroker {
+            admission: RecoveryAdmission { holds, deployment: "d".into(), stream: "d/1/replica".into(), log_epoch: 0, writer_epoch: 1 },
+            residence: "d/1".into(),
+            ticket: Uuid::new_v4(),
+        });
+        let hold = Arc::new(ReplayHold { through: LogOffset(3), broker, _release: release });
         let delivery = hold.retain_delivery(Bytes::from_static(b"last record"));
         drop(hold);
 

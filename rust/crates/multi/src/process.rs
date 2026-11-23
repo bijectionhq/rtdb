@@ -120,6 +120,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let holds = Arc::new(crate::recovery_holds::RecoveryHolds {
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
+        storage: settings.agent.storage.clone(),
         custody: if local_witnesses.is_some() { rtdb_directory::ReplayCustody::Local }
             else { rtdb_directory::ReplayCustody::Hosted { owner: settings.hosted_task.clone() } },
         tasks: storage_regions.clone(),
