@@ -156,6 +156,7 @@ impl ArtefactBuilder for Builder {
             scope: None,
             file_size: Some(i64::try_from(size).map_err(fault)?),
             published_version,
+            pack_members: Vec::new(),
         })
     }
 }

@@ -6,6 +6,7 @@
 -- The unit indexed is the text run: every version of one entity in a trie data file whose indexed values are the same, with the rectangles of valid time × system time where one of them is visible, as the scan's own resolver decides them over the file.
 -- A trie may carry one search file per index definition over its own data file's runs.
 -- The members of a partition group (trie-cat.allium: PartGroup) may share one search file over their runs, deleted with the last member.
+-- A search pack may also cover a set of settled tries with disjoint IID prefixes and one recency.
 -- A search file only nominates candidates.
 -- Which version of an entity is visible at the query's valid and system time is decided by the scan's bitemporal resolution, as it is for every other predicate, and MATCH is re-checked on the resolved row.
 -- So a search file that is missing costs a query time and never changes its result.
@@ -78,6 +79,13 @@ value Rectangle {
     system_to: Instant
 }
 
+value SearchRowVersion {
+    -- A logical event identity scoped to one table and database history.
+    iid: Bytes
+    system_from: Instant
+    commit_position: Integer
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -92,7 +100,7 @@ entity SearchDefinitions {
 entity SearchJob {
     -- An artefact job of kind `search`; ephemeral, like compaction.allium's CompactionJob.
     table: trie_cat/TableRef
-    owner: trie_cat/TrieKey | trie_cat/PartGroup
+    owner: trie_cat/TrieKey | trie_cat/PartGroup | trie_cat/ArtefactPack
     definition: SearchIndexDefinition
 }
 
@@ -158,6 +166,8 @@ rule SearchJobRuns {
     -- An on-demand build reads its input directly from the retained data-file cache lease.
     -- Both reserve the segment's indexing heap up front in proportion to the input size, build the segment on disk, and stream the bundle to the object store.
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
+    -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
+    -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
     when: job: SearchJob.created
 
     ensures:
@@ -174,6 +184,8 @@ rule RetireSearchFiles {
     -- While a definition is in force, such an object needs no sweep: its job stays available, and the next builder writes the same bytes under the same key and records them.
     -- The lane looks at every table when it starts, at a table whenever its definitions in force change, and again at a table whose last look, or one of whose jobs, failed; it looks only while no job of its own is running.
     -- GC collects an artefact under a retired trie or under a group with no remaining members.
+    -- A format 15 file and every superseded singleton stay available to pinned readers.
+    -- Sealed level-0 search files retire once their trie is obsolete in the checkpoint and all reader holds have expired.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
     -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
     when: DefinitionsInForceChanged(table)
@@ -322,6 +334,13 @@ contract SearchFileLayout {
         -- Coalesced remote reads retain only the selected ranges in the decoded page cache.
         -- A sparse query can read visibility for an IID in a source that did not nominate it.
 
+    @invariant PackedDirectoriesAndVersions
+        -- Format 15 authenticates term, posting, rank and IID visibility data against the root named by the held catalog.
+        -- A bounded root may travel in that catalog receipt, with terminal range references that eliminate intermediate directory reads.
+        -- Table routing is computed from one held catalog and uses negative term or time evidence only to omit nominations.
+        -- Every primary event has its logical version, valid interval, operation, member and primary Arrow position in the visibility directory.
+        -- A physical rewrite may change the member and Arrow position of an event while preserving its logical version.
+
     @invariant OneDocPerRun
         -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
         -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
@@ -369,6 +388,10 @@ contract SearchCorrectness {
         -- The first document in an unread rank range supplies a lower UUID bound for the range because the tree assigns document ordinals in nondecreasing IID order.
         -- An uncertified tree, an overlapping legacy search file, or missing live identity evidence leaves the UUID cutoff score-only.
         -- Any unread candidate or window with an unknown tie bound remains eligible at an equal score.
+        -- Independently searched partitions may share a cutoff backed by sufficiently many distinct SQL-verified rows.
+        -- A shared score-only cutoff excludes a branch only when the branch's upper bound is strictly below it.
+        -- With a single supported MATCH residual, an authenticated run can stand in for a payload until its version is among the finalists.
+        -- The scan checks a finalist's resolved version and score on its primary Arrow row before emitting it.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.
@@ -380,6 +403,14 @@ contract SearchCorrectness {
     @invariant VisibilityIsResolved
         -- Whether a row is visible is decided by the scan's resolution over the candidate's full history.
         -- A document's rectangles only ever rule a candidate out: an event in another trie or the live index can cut a run's rectangles and never widen them.
+        -- A packed point query can batch complete IID histories from the held packs and live segments into that same resolver.
+        -- If a relevant source lacks complete version evidence, the primary history resolves those candidates.
+
+    @invariant LiveSearchSharesTheCommitCut
+        -- A committed native snapshot holds its admitted search postings alongside the primary live rows of that cut.
+        -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
+        -- A partially admitted segment keeps its coverage frontier.
+        -- If a query cannot cover the frontier within the accelerated tail budget, ordinary SQL evaluation supplies the answer.
 
     @invariant SearchFilesFromTheSnapshot
         -- A scan reads the search files its snapshot's catalog records, and those its node builds from the snapshot's data files, and no others.

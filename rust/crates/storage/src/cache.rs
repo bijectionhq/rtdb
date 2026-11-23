@@ -211,7 +211,7 @@ impl Drop for EmptyEntryCleanup<'_> {
     }
 }
 
-fn reserve_read(length: usize, allocation: ObjectReadAllocation, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<ReadReservation> {
+pub(crate) fn reserve_read(length: usize, allocation: ObjectReadAllocation, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<ReadReservation> {
     let retained = reserve(allocation.retained_bytes)?;
     let scratch = (allocation.scratch_bytes > 0).then(|| reserve(allocation.scratch_bytes)).transpose()?;
     Ok(ReadReservation::funded(length, retained, scratch))
@@ -230,6 +230,35 @@ pub struct BufferPool {
     memory: Arc<MemoryBudget>,
     id: u64,
     metadata: Option<Arc<MemoryBudget>>,
+    scan_timing: ScanTiming,
+}
+
+struct ScanTiming { latency_micros: AtomicU64, bytes_per_millisecond: AtomicU64 }
+
+impl Default for ScanTiming {
+    fn default() -> Self {
+        Self { latency_micros: AtomicU64::new(4000), bytes_per_millisecond: AtomicU64::new(32 * 1024) }
+    }
+}
+
+impl ScanTiming {
+    fn observe(&self, len: usize, elapsed: std::time::Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX).max(1);
+        let (estimate, sample) = if len <= 64 * 1024 {
+            (&self.latency_micros, micros.clamp(50, 200_000))
+        } else {
+            let latency = self.latency_micros.load(Ordering::Relaxed);
+            let rate = (len as u64).saturating_mul(1000) / micros.saturating_sub(latency).max(100);
+            (&self.bytes_per_millisecond, rate.clamp(1024, 512 * 1024))
+        };
+        let _ = estimate.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some((old * 7 + sample) / 8));
+    }
+
+    fn merge_gap(&self) -> u64 {
+        let latency = self.latency_micros.load(Ordering::Relaxed);
+        let rate = self.bytes_per_millisecond.load(Ordering::Relaxed);
+        (latency * rate / 2000).clamp(8192, 256 * 1024)
+    }
 }
 
 impl BufferPool {
@@ -245,7 +274,7 @@ impl BufferPool {
     fn open(store: Arc<dyn ObjectStore>, budget: Arc<CacheBudget>, metadata: Option<Arc<MemoryBudget>>) -> Self {
         let id = budget.pools.fetch_add(1, Ordering::Relaxed);
         let memory = budget.memory.scope();
-        Self { store, budget, memory, id, metadata }
+        Self { store, budget, memory, id, metadata, scan_timing: ScanTiming::default() }
     }
 
     /// Charges the bookkeeping of retained objects to `metadata`, and their bytes and every view to `budget`.
@@ -262,6 +291,8 @@ impl BufferPool {
 
     pub fn retained_bytes(&self) -> usize { self.budget.retained_bytes() }
     pub fn budget(&self) -> &Arc<CacheBudget> { &self.budget }
+    pub fn scan_merge_gap(&self) -> u64 { self.scan_timing.merge_gap() }
+    pub fn scan_byte_limit(&self) -> usize { self.memory.limit_bytes() }
 
     /// Bytes charged to this pool, including decoded views and outstanding read leases.
     pub fn pool_retained_bytes(&self) -> usize { self.memory.used_bytes() }
@@ -330,10 +361,11 @@ impl BufferPool {
         (start <= end && end <= allocation.len()).then(|| CacheLease { allocation: allocation.clone(), range: start..end })
     }
 
-    async fn fetch(&self, key: &ObjectKey, range: Range<u64>, reserve: impl FnOnce(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
+    async fn fetch(&self, key: &ObjectKey, range: Range<u64>, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
         let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
             .ok_or_else(|| Error::Task("Object range is inverted or exceeds addressable memory".into()))?;
-        let reservation = ReadReservation::new(length, reserve(length)?);
+        let allocation = self.store.scan_range_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, reserve)?;
         let allocation = Arc::new(self.store.get_reserved_range(key, range, reservation).await?);
         Ok(CacheLease { allocation, range: 0..length })
     }
@@ -373,7 +405,9 @@ impl BufferPool {
             .ok_or_else(|| Error::Task("Scan range is inverted or exceeds addressable memory".into()))?;
         let allocation = self.store.scan_range_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, reserve)?;
+        let started = std::time::Instant::now();
         let allocation = Arc::new(self.store.get_reserved_scan_range(key, range, reservation).await?);
+        self.scan_timing.observe(length, started.elapsed());
         Ok(CacheLease { allocation, range: 0..length })
     }
 

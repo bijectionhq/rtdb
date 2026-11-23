@@ -6,7 +6,7 @@ use futures::{StreamExt, stream};
 use rtdb_format::{
     catalog::{BlockCatalog, TableEntry},
     keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key},
-    log::proto::{ArtefactScope, PublishedObjectVersion},
+    log::proto::PublishedObjectVersion,
 };
 use rtdb_index::{PartitionState, TrieCatalog};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
@@ -136,19 +136,38 @@ impl TrieCollector {
             let release = release.clone();
             let collection = Arc::clone(&collection);
             async move {
-                let keys = match self.leased_out(&entry.table, collection.eligible(&entry.table, as_of)) {
+                let mut eligible = collection.eligible(&entry.table, as_of);
+                eligible.extend(collection.eligible_l0_artefacts(&entry.table, as_of).cloned());
+                let (seals, keys): (Vec<_>, Vec<_>) = match self.leased_out(&entry.table, eligible) {
                     Ok(keys) => keys,
                     Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
-                };
+                }.into_iter().partition(|key| key.level() == 0);
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
-                let result = IoRegion::retaining(collection.clone(), self.collect_table(
-                    &entry, &keys, &groups, cut, collection.current().trie_catalog(), &release,
-                )).await;
+                let result = IoRegion::retaining(collection.clone(), async {
+                    self.collect_table(&entry, &keys, &groups, cut, collection.current().trie_catalog(), &release).await?;
+                    self.collect_search_seals(&entry, &seals, cut, cancellation).await
+                }).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
         });
         tasks.buffer_unordered(self.config.table_parallelism).for_each(|_| async {}).await;
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
+    }
+
+    async fn collect_search_seals(&self, entry: &TableEntry, seals: &[TrieKey], cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
+        if seals.is_empty() { return Ok(()); }
+        if self.store.defers_trie_releases() {
+            let Some(cut) = cut else { return Ok(()); };
+            if !self.store.advance_catalog_floor(cut).await? { return Ok(()); }
+        }
+        let prefix = ObjectKey::new(entry.slug.artefacts_prefix())?;
+        let seals: BTreeSet<_> = seals.iter().collect();
+        for object in self.store.list(Some(&prefix)).await? {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let Some((ArtefactOwner::Trie(owner), kind, id, _)) = entry.slug.parse_artefact_key(object.key.as_str()) else { continue; };
+            if seals.contains(&owner) && kind == "search" && id.ends_with("f15") { self.store.delete(&object.key).await?; }
+        }
+        Ok(())
     }
 
     async fn collect_table(&self, entry: &TableEntry, keys: &[TrieKey], groups: &BTreeSet<PartGroup>, cut: Option<CatalogCut>, catalog: &TrieCatalog, release: &FileRelease) -> Result<()> {
@@ -166,6 +185,18 @@ impl TrieCollector {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let prefix = ObjectKey::new(entry.slug.group_artefact_prefix(&group))?;
             group_files.entry(batch).or_default().extend(self.store.list(Some(&prefix)).await?.into_iter().map(|file| file.key));
+        }
+        if !keys.is_empty() {
+            let scheduled: BTreeMap<_, _> = keys.iter().enumerate().map(|(index, key)| (key, index / chunk_size)).collect();
+            let prefix = ObjectKey::new(entry.slug.packs_prefix())?;
+            for object in self.store.list(Some(&prefix)).await? {
+                if cancellation.is_cancelled() { return Err(crate::closed()); }
+                let Some((ArtefactOwner::Pack(pack), _, _, _)) = entry.slug.parse_artefact_key(object.key.as_str()) else { continue; };
+                let held = pack.members().iter().filter(|key| catalog.trie(&entry.table, key).is_some());
+                let Some(batches) = held.map(|key| scheduled.get(key).copied()).collect::<Option<Vec<_>>>() else { continue; };
+                let batch = batches.into_iter().max().unwrap_or((keys.len() - 1) / chunk_size);
+                group_files.entry(batch).or_default().push(object.key);
+            }
         }
 
         let mut batches = Vec::new();
@@ -233,14 +264,11 @@ impl TrieCollector {
 
 fn published_artefact<'a>(catalog: &'a TrieCatalog, entry: &TableEntry, key: &ObjectKey) -> Option<&'a PublishedObjectVersion> {
     let (owner, kind, id, version) = entry.slug.parse_artefact_key(key.as_str())?;
-    let scope = match &owner {
-        ArtefactOwner::Trie(_) => ArtefactScope::Trie,
-        ArtefactOwner::Group(_) => ArtefactScope::PartGroup,
-    };
     let mut versions = owner.tries().into_iter()
-        .filter_map(|key| catalog.trie(&entry.table, &key))
-        .filter_map(|trie| trie.artefact(&kind, &id, version))
-        .filter(|record| record.scope() == scope)
+        .filter_map(|key| {
+            let record = catalog.trie(&entry.table, &key)?.artefact(&kind, &id, version)?;
+            (ArtefactOwner::of(&key, record).ok().as_ref() == Some(&owner)).then_some(record)
+        })
         .map(|record| record.published_version.as_ref());
     let first = versions.next().flatten()?;
     versions.all(|version| version == Some(first)).then_some(first)

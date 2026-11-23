@@ -176,7 +176,8 @@ impl DiskCache {
         if lease.entry.file.get().is_none() {
             let object = self.cancellation.run_until_cancelled(store.head(remote_key)).await.ok_or_else(cache_closed)??;
             let mut temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
-            let chunk_size = if store.supports_scan_ranges(remote_key) {
+            let ranges = store.supports_scan_ranges(remote_key);
+            let chunk_size = if ranges {
                 (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1) as u64
             } else {
                 object.size.max(1)
@@ -185,8 +186,17 @@ impl DiskCache {
             while offset < object.size {
                 let end = object.size.min(offset.saturating_add(chunk_size));
                 let length = usize::try_from(end - offset).map_err(|error| Error::Task(error.to_string()))?;
-                let reservation = ReadReservation::new(length, self.reserve(length)?);
-                let bytes = self.cancellation.run_until_cancelled(store.get_reserved_range(remote_key, offset..end, reservation)).await.ok_or_else(cache_closed)??;
+                let bytes = self.cancellation.run_until_cancelled(async {
+                    if ranges {
+                        let allocation = store.scan_range_allocation(remote_key, length)?;
+                        let reservation = crate::cache::reserve_read(length, allocation, |bytes| self.reserve(bytes))?;
+                        store.get_reserved_range(remote_key, offset..end, reservation).await
+                    } else {
+                        let allocation = store.whole_object_allocation(remote_key, length)?;
+                        let reservation = crate::cache::reserve_read(length, allocation, |bytes| self.reserve(bytes))?;
+                        store.get_reserved_object(remote_key, reservation).await
+                    }
+                }).await.ok_or_else(cache_closed)??;
                 temporary.write_all(bytes.as_slice()).map_err(|error| Error::io(temporary.path(), error))?;
                 offset = end;
             }
@@ -369,6 +379,7 @@ impl ObjectStore for DiskCachedStore {
         }).await
     }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_scan_ranges(key) }
+    fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool { self.remote.supports_observed_scan_ranges(key) }
 
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         let scope = self.io.admit()?;

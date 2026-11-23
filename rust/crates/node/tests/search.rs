@@ -1093,10 +1093,11 @@ async fn compatible_writers_keep_both_search_formats_through_restart() {
     let template = services();
     let table = TableRef::new("public", "docs");
     let mut published = std::collections::BTreeSet::new();
-    for (phase, format) in [11, 12, 13, 14, 11].into_iter().enumerate() {
+    for (phase, format) in [11, 12, 13, 14, 15, 11].into_iter().enumerate() {
         let runtime = match format {
             11 => rtdb_search::SearchRuntime::with_tantivy_files(16 << 20),
             14 => rtdb_search::SearchRuntime::with_tree_files(16 << 20),
+            15 => rtdb_search::SearchRuntime::with_search_packs(16 << 20),
             _ => rtdb_search::SearchRuntime::with_paged_files(16 << 20, format == 13),
         };
         let services = NodeServices {
@@ -1121,7 +1122,7 @@ async fn compatible_writers_keep_both_search_formats_through_restart() {
             database.compaction().unwrap().compact_all().await.unwrap();
         }
         database.build_artefacts().await.unwrap();
-        published.insert(match format { 11 => "f11", 12 => "f12", 13 => "f13", _ => "f14" });
+        published.insert(match format { 11 => "f11", 12 => "f12", 13 => "f13", 14 => "f14", _ => "f15" });
         let catalog = database.trie_catalog();
         let seen: std::collections::BTreeSet<_> = catalog.current_tries(&table).into_iter()
             .flat_map(|trie| trie.artefacts.iter())
@@ -1502,4 +1503,74 @@ async fn same_transaction_writes_score_only_the_visible_document() {
     assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn packed_search_preserves_rank_across_commit_flush_correction_and_restart() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use tokio_util::sync::CancellationToken;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut settings = options();
+    settings.automatic_artefacts = false;
+    settings.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: path("store"), epoch: Some(0) })),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let template = services();
+    let statement = "SELECT _id, body, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, '\"audit report\"') ORDER BY score DESC, _id ASC LIMIT 1";
+    let exhaustive = "SELECT _id, body, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, '\"audit report\"') OR _id = -99 ORDER BY score DESC, _id ASC LIMIT 1";
+    let table = TableRef::new("public", "docs");
+    let stop = CancellationToken::new();
+    for restart in [false, true] {
+        let runtime = rtdb_search::SearchRuntime::with_search_packs(16 << 20);
+        let services = NodeServices {
+            resources: Arc::new(NativeResources::default().with_local_log_clock(Arc::clone(&template.clock), false)),
+            artefact_kinds: vec![runtime.artefacts()],
+            scan_accelerators: vec![runtime.accelerator()],
+            ..template.clone()
+        };
+        let (node, driver) = Node::open(settings.clone(), services).await.unwrap();
+        let driver = tokio::spawn(driver.run());
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+        if !restart {
+            for statement in [
+                "CREATE SEARCH INDEX docs_body ON docs (body)",
+                "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report report'}, {_id: 2, body: 'audit report'}",
+            ] {
+                assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
+            }
+            let before = rows(session.query_sql(exhaustive, vec![]).await.unwrap()).await;
+            assert_eq!(before[0][0], Value::I64(1));
+            assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, before);
+            let pinned = session.query_sql(statement, vec![]).await.unwrap();
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+            assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, before);
+            assert!(session.state_mut().execute_tx(
+                vec![sql("INSERT INTO docs RECORDS {_id: 1, body: 'report no longer under audit'}")],
+                AutonomousTxOptions::default(),
+            ).await.unwrap().committed());
+            assert_eq!(rows(pinned).await, before);
+            let corrected = rows(session.query_sql(statement, vec![]).await.unwrap()).await;
+            assert_eq!(corrected[0][0], Value::I64(2));
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+        }
+        let catalog = database.trie_catalog();
+        assert_eq!(catalog.current_tries(&table).into_iter().filter(|trie| trie.key.level() == 0 &&
+            trie.artefacts.iter().any(|record| record.definition_id().ends_with("f15"))).count(), 2);
+        let expected = rows(session.query_sql(exhaustive, vec![]).await.unwrap()).await;
+        assert_eq!(expected[0][0], Value::I64(2));
+        assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);
+        node.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+    }
 }

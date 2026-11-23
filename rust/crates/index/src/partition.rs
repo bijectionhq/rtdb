@@ -6,7 +6,7 @@ use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey};
 
-use crate::{CatalogCut, CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
+use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
 
 #[derive(Clone, Copy, Debug)]
@@ -106,14 +106,23 @@ impl TrieCollection {
 
     pub fn eligible(&self, table: &TableRef, as_of: Timestamp) -> Vec<TrieKey> {
         self.current.trie_catalog().garbage_tries(table, as_of).into_iter()
-            .filter(|candidate| {
-                let checkpoint_requires = self.current.checkpoint_tries.as_ref()
-                    .is_some_and(|checkpoint| checkpoint.requires(table, &candidate.key));
-                !any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
-                    self.readers[index].trie(table, &candidate.key).is_some_and(|trie| trie.state == TrieState::Live)
-                })
-            })
+            .filter(|candidate| !self.protected(table, &candidate.key))
             .map(|trie| trie.key.clone()).collect()
+    }
+
+    pub fn eligible_l0_artefacts(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &TrieKey> {
+        self.current.trie_catalog().iter_tries(table).filter(move |trie| {
+            trie.key.level() == 0 && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)
+                && !trie.artefacts.is_empty()
+                && !self.protected(table, &trie.key)
+        }).map(|trie| &trie.key)
+    }
+
+    fn protected(&self, table: &TableRef, key: &TrieKey) -> bool {
+        let checkpoint_requires = self.current.checkpoint_tries.as_ref().is_some_and(|checkpoint| checkpoint.requires(table, key));
+        any_reference_requires(checkpoint_requires, self.readers.len(), |index| {
+            self.readers[index].trie(table, key).is_some_and(|trie| trie.state == TrieState::Live)
+        })
     }
 }
 
@@ -121,6 +130,16 @@ impl TrieCollection {
 pub struct PartitionState {
     value: RwLock<Arc<PartitionValue>>,
     retention: Mutex<Retention>,
+}
+
+pub struct PreparedWrite {
+    predecessor: Arc<LiveIndex>,
+    next: PartitionValue,
+    written: Vec<TableRef>,
+}
+
+impl PreparedWrite {
+    pub fn snapshot(&self) -> Snapshot { self.next.snapshot() }
 }
 
 impl PartitionState {
@@ -207,11 +226,34 @@ impl PartitionState {
 
     pub fn apply(&self, write: &StagedWrite) -> Result<()> {
         let mut value = self.value.write();
-        let live = value.live.apply(write)?;
+        let mut live = value.live.apply(write)?;
+        live.search = None;
         let table_catalog = value.table_catalog.with_entries_for(write.tables().keys().cloned())?;
         let mut next = value.as_ref().clone();
         next.live = Arc::new(live);
         next.table_catalog = Arc::new(table_catalog);
+        *value = Arc::new(next);
+        Ok(())
+    }
+
+    pub fn prepare_write(&self, write: &StagedWrite) -> Result<PreparedWrite> {
+        let captured = self.value();
+        let written: Vec<_> = write.tables().keys().cloned().collect();
+        let mut next = captured.as_ref().clone();
+        next.live = Arc::new(captured.live.apply(write)?);
+        next.table_catalog = Arc::new(captured.table_catalog.with_entries_for(written.iter().cloned())?);
+        Ok(PreparedWrite { predecessor: Arc::clone(&captured.live), next, written })
+    }
+
+    pub fn install_write(&self, mut prepared: PreparedWrite, search: Option<ServingSearch>) -> Result<()> {
+        let mut value = self.value.write();
+        if !Arc::ptr_eq(&prepared.predecessor, &value.live) {
+            return Err(invalid("Prepared search data no longer follows the live index"));
+        }
+        Arc::make_mut(&mut prepared.next.live).search = search;
+        let mut next = value.as_ref().clone();
+        next.table_catalog = Arc::new(value.table_catalog.with_entries_for(prepared.written)?);
+        next.live = prepared.next.live;
         *value = Arc::new(next);
         Ok(())
     }

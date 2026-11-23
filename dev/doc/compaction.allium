@@ -4,6 +4,7 @@
 -- Merges small tries into larger ones for better query performance.
 -- The consumer of this work is the scan operator.
 -- It reads the trie catalog to understand which files it has to read for a given query.
+-- Native compaction reserves the temporary buffers for each authenticated input range or for a whole-object input before downloading it.
 --
 -- This assumes understanding of the "Building a Bitemporal Index" trilogy:
 -- https://xtdb.com/blog/building-a-bitemp-index-1-taxonomy
@@ -138,6 +139,7 @@ config {
 -- These fragments are disjoint and preserve the winning command at every valid-time point.
 -- Owned landing assertions retain their valid-time intervals and commit positions until erased.
 -- L0 normalization retains the latest erase marker and excludes every older event for the same entity.
+-- Other exact entity keys in the same IID bucket remain eligible for normalization.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.
 -- The merge heap admits pages ordered by ascending IID and descending system position.
 -- It holds one cursor per nonempty page and advances the page that supplied the minimum key.
@@ -280,6 +282,7 @@ contract OutputSegmentLayout {
         -- An output's artefact records are those its node's artefact kinds built for the definitions in force in its snapshot, so two nodes may record different sets.
         -- Each artefact is deterministic in its own key.
         -- Tiered compaction writes one bucket per job and leaves potential group artefacts to the lane, which sees the completed group in the catalog.
+        -- Native packed search describes a retained event with the same logical version after compaction and records its position in the new primary file.
 }
 
 ------------------------------------------------------------

@@ -32,6 +32,7 @@ impl Definition {
             version: self.generation,
             historical: true,
             group_bytes: None,
+            packed: false,
         }
     }
 }

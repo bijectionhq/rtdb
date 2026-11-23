@@ -6,7 +6,7 @@ use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
 use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch};
 use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
-use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, Value};
 
 use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
 
@@ -342,8 +342,7 @@ impl LiveTable {
         Ok(RowSource { batch: Arc::clone(&self.chunks[index].1), row: offset as usize })
     }
 
-    /// Returns the stored headers for an IID in the live snapshot's history order.
-    pub fn iid_headers(&self, iid: Iid) -> Result<impl Iterator<Item = EventHeader>> {
+    fn iid_rows(&self, iid: Iid, prepaid: Option<&Arc<MemoryBudget>>) -> Result<(Option<Arc<LocatedRows>>, std::ops::Range<usize>)> {
         let mut node = self.trie.root().as_ref();
         let leaf = loop {
             match node {
@@ -355,13 +354,40 @@ impl LiveTable {
                 }
             }
         };
-        let rows = leaf.map(|leaf| self.located_rows(leaf)).transpose()?;
+        let rows = leaf.map(|leaf| match prepaid {
+            Some(memory) => self.located_rows_in(leaf, memory),
+            None => self.located_rows(leaf),
+        }).transpose()?;
         let (first, end) = rows.as_ref().map_or((0, 0), |rows| {
             let first = rows.headers.partition_point(|header| header.iid < iid);
             let end = first + rows.headers[first..].partition_point(|header| header.iid == iid);
             (first, end)
         });
-        Ok((first..end).map(move |row| rows.as_ref().expect("nonempty history has a leaf").headers[row]))
+        Ok((rows, first..end))
+    }
+
+    /// Returns the stored headers for an IID in the live snapshot's history order.
+    pub fn iid_headers(&self, iid: Iid) -> Result<impl Iterator<Item = EventHeader>> {
+        let (rows, range) = self.iid_rows(iid, None)?;
+        Ok(range.map(move |row| rows.as_ref().expect("nonempty history has a leaf").headers[row]))
+    }
+
+    pub fn iid_sources(&self, iid: Iid, memory: &Arc<MemoryBudget>) -> Result<impl Iterator<Item = Result<(EventHeader, RowSource)>>> {
+        let (rows, range) = self.iid_rows(iid, memory.is_prepaid().then_some(memory))?;
+        Ok(range.map(move |row| {
+            let rows = rows.as_ref().expect("nonempty history has a leaf");
+            Ok((rows.headers[row], self.row_at(rows.located[row])?))
+        }))
+    }
+
+    pub fn row_of_version(&self, version: RowVersion) -> Result<Option<u32>> {
+        let (rows, range) = self.iid_rows(version.iid, None)?;
+        let Some(rows) = rows else { return Ok(None); };
+        let mut matches = range.filter(|&row| rows.headers[row].version() == version);
+        let Some(row) = matches.next() else { return Ok(None); };
+        if matches.next().is_some() { return Ok(None); }
+        let (chunk, offset) = rows.located[row];
+        Ok(self.chunks[chunk as usize].0.checked_add(offset))
     }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
         if self.last_system_time.is_some_and(|previous| previous > system_time) { return Err(invalid("Live table system time moved backwards")); }
@@ -545,11 +571,27 @@ pub struct LiveIndex {
     latest_completed_tx: Option<TransactionKey>,
     block_row_count: u64,
     tables: BTreeMap<TableRef, Arc<LiveTable>>,
+    pub(crate) search: Option<ServingSearch>,
     config: TrieConfig,
 }
+
+#[derive(Clone)]
+pub struct ServingSearch(Arc<dyn std::any::Any + Send + Sync>);
+
+impl ServingSearch {
+    pub fn new(index: impl std::any::Any + Send + Sync) -> Self { Self(Arc::new(index)) }
+    pub fn get<T: std::any::Any>(&self) -> Option<&T> { self.0.downcast_ref() }
+}
+
+impl std::fmt::Debug for ServingSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServingSearch").finish_non_exhaustive()
+    }
+}
+
 impl LiveIndex {
     pub fn new(block_index: BlockIndex, latest_completed_tx: Option<TransactionKey>, config: TrieConfig) -> Self {
-        Self { block_index, latest_completed_tx, block_row_count: 0, tables: BTreeMap::new(), config }
+        Self { block_index, latest_completed_tx, block_row_count: 0, tables: BTreeMap::new(), search: None, config }
     }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn latest_completed_tx(&self) -> Option<TransactionKey> { self.latest_completed_tx }

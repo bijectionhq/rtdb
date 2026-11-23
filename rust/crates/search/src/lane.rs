@@ -66,6 +66,54 @@ impl SearchBuilder {
 impl ArtefactBuilder for SearchBuilder {
     fn builds_live_pages(&self) -> bool { true }
 
+    fn prepares_serving_search(&self) -> bool { self.runtime.write_format() == crate::file::PACKED_FORMAT_VERSION }
+
+    fn retire_with_owner(&self, record: &ArtefactRecord) -> bool {
+        record.definition_id().ends_with("f15")
+    }
+
+    async fn prepare_serving_search(&self, snapshot: rtdb_index::Snapshot, cancellation: &CancellationToken)
+        -> Result<Option<rtdb_index::ServingSearch>> {
+        let result = async {
+            let now = (self.clock)();
+            let public = self.runtime.definitions(&self.database, std::slice::from_ref(&snapshot), &self.storage, &self.memory, now, cancellation).await?;
+            let owned = crate::definitions::owned_definitions_in(&self.database, snapshot.clone(), &self.storage, &self.memory, now, cancellation).await?;
+            let definitions: Vec<_> = public.iter().cloned().chain(owned).collect();
+            let runtime = Arc::clone(&self.runtime);
+            let cancellation = cancellation.clone();
+            tokio::task::spawn_blocking(move || runtime.prepare_serving_search(&snapshot, &definitions, &cancellation).map(Some))
+                .await.map_err(fault)?
+        }.await;
+        match result {
+            Err(error) if is_search_gap(&error, cancellation) => {
+                self.runtime.record_serving_gap();
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
+    async fn seal_serving_search(&self, snapshot: &Arc<PartitionValue>, table: &rtdb_types::TableRef, trie: &rtdb_format::keys::TrieKey,
+        file: &std::path::Path, size: u64, cancellation: &CancellationToken) -> Result<Vec<ArtefactRecord>> {
+        let definitions = match self.definitions(snapshot, cancellation).await {
+            Err(error) if is_search_gap(&error, cancellation) => {
+                self.runtime.record_serving_gap();
+                return Ok(Vec::new());
+            }
+            result => result?,
+        };
+        let mut records = Vec::new();
+        for definition in definitions.into_iter().filter(|definition| &definition.table == table) {
+            let job = ArtefactJob { definition, owner: ArtefactOwner::Trie(trie.clone()) };
+            match self.build(&job, rtdb_maintenance::ArtefactSource::Local { data: file, size }, snapshot, cancellation).await {
+                Ok(record) => records.push(record),
+                Err(error) if is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(records)
+    }
+
     async fn build_live_pages(&self, partition: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<()> {
         let snapshot = partition.snapshot();
         let definitions = self.runtime.definitions(&self.database, std::slice::from_ref(&snapshot), &self.storage, &self.memory,
@@ -89,17 +137,18 @@ impl ArtefactBuilder for SearchBuilder {
         let mut columns = self.columns.lock();
         Ok(definitions.iter().map(|definition| {
             let id = definition.artefact_id_for(self.runtime.write_format());
-            for format in [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION] {
+            for format in [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION] {
                 columns.insert((definition.table.clone(), definition.artefact_id_for(format), definition.version), definition.columns.clone());
             }
-            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version, historical: definition.history, group_bytes: Some(group_bytes(&self.memory)) }
+            ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version,
+                historical: definition.history, group_bytes: Some(group_bytes(&self.memory)), packed: self.prepares_serving_search() }
         }).collect())
     }
 
     fn retained_definitions(&self, definitions: &[ArtefactDefinition]) -> Vec<ArtefactDefinition> {
         definitions.iter().flat_map(|definition| {
             let prefix = definition.id.rsplit_once('f').map_or(definition.id.as_str(), |(prefix, _)| prefix);
-            [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION]
+            [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION]
                 .map(|format| ArtefactDefinition { id: format!("{prefix}f{format}"), ..definition.clone() })
         }).collect()
     }
@@ -115,11 +164,12 @@ impl ArtefactBuilder for SearchBuilder {
                 continue;
             };
             let job = ArtefactJob { definition: definition.clone(), owner: suspect.owner.clone() };
-            let scope = job.scope();
             let catalog = snapshot.trie_catalog();
             let recorded = job.tries().iter().filter_map(|key| catalog.trie(&suspect.table, key))
                 .filter(|trie| trie.state == rtdb_index::TrieState::Live)
-                .any(|trie| trie.artefact(KIND, &suspect.artefact_id, suspect.version).is_some_and(|record| record.scope() == scope));
+                .any(|trie| trie.artefact(KIND, &suspect.artefact_id, suspect.version).is_some_and(|record| {
+                    ArtefactOwner::of(&trie.key, record).is_ok_and(|owner| owner == suspect.owner)
+                }));
             if recorded { jobs.push(job); }
             else { self.runtime.clear(&suspect); }
         }
@@ -133,7 +183,7 @@ impl ArtefactBuilder for SearchBuilder {
         let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), owner: job.owner.clone(), artefact_id: definition.id.clone(), version: definition.version };
         let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
         let format = definition.id.rsplit_once('f').and_then(|(_, format)| format.parse::<i32>().ok())
-            .filter(|format| matches!(*format, crate::file::TANTIVY_FORMAT_VERSION | crate::file::LEGACY_FORMAT_VERSION | crate::file::FORMAT_VERSION | crate::file::TREE_FORMAT_VERSION))
+            .filter(|format| matches!(*format, crate::file::TANTIVY_FORMAT_VERSION | crate::file::LEGACY_FORMAT_VERSION | crate::file::FORMAT_VERSION | crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION))
             .ok_or_else(|| fault("Search artefact definition has an unsupported format"))?;
         let record = |stats: Vec<u8>, size: u64| -> Result<ArtefactRecord> {
             Ok(ArtefactRecord {
@@ -144,6 +194,7 @@ impl ArtefactBuilder for SearchBuilder {
                 scope: None,
                 file_size: Some(i64::try_from(size).map_err(fault)?),
                 published_version: None,
+                pack_members: Vec::new(),
             })
         };
         let known = self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned();
@@ -159,9 +210,10 @@ impl ArtefactBuilder for SearchBuilder {
             self.runtime.forget_file(&self.database, &key);
             self.storage.invalidate(&key).await?;
             let stats = job.tries().iter().filter_map(|trie| snapshot.trie_catalog().trie(&definition.table, trie))
-                .filter_map(|trie| trie.artefact(KIND, &definition.id, definition.version))
+                .filter_map(|trie| trie.artefact(KIND, &definition.id, definition.version)
+                    .filter(|record| ArtefactOwner::of(&trie.key, record).is_ok_and(|owner| owner == job.owner)))
                 .find_map(|record| record.stats.as_deref());
-            if format == crate::file::TREE_FORMAT_VERSION {
+            if format >= crate::file::TREE_FORMAT_VERSION {
                 let locator = stats.and_then(crate::file::decode_tree_locator)
                     .ok_or_else(|| fault("Recorded search tree has no root locator"))?;
                 match self.runtime.tree_file(&self.storage, &key, &locator, &columns, &identity, definition.version, true).await {
@@ -202,6 +254,15 @@ impl ArtefactBuilder for SearchBuilder {
             }
         }
         let workdir = tempfile::Builder::new().prefix("rtdb-search-").tempdir().map_err(fault)?;
+        let seal = match (&job.owner, source) {
+            (ArtefactOwner::Trie(trie), rtdb_maintenance::ArtefactSource::Local { .. })
+                if format == crate::file::PACKED_FORMAT_VERSION && trie.level() == 0 => {
+                    let view = snapshot.snapshot();
+                    view.iter_segments(&definition.table).next().cloned()
+                        .map(|segment| (view.clone(), segment))
+                }
+            _ => None,
+        };
         let (inputs, size) = match source {
             rtdb_maintenance::ArtefactSource::Local { data, size } => {
                 if !matches!(job.owner, ArtefactOwner::Trie(_)) {
@@ -227,6 +288,7 @@ impl ArtefactBuilder for SearchBuilder {
         let recency = match &job.owner {
             ArtefactOwner::Trie(trie) => trie.recency(),
             ArtefactOwner::Group(group) => group.recency(),
+            ArtefactOwner::Pack(pack) => pack.recency(),
         };
         let ceiling = crate::file::ceiling_of(recency);
         let version = definition.version;
@@ -234,18 +296,19 @@ impl ArtefactBuilder for SearchBuilder {
         let recorded_stats = tokio::task::spawn_blocking(move || -> Result<_> {
             let opened = inputs.into_iter().map(|input| open_input(input, &memory)).collect::<Result<Vec<_>>>()?;
             let file = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
-            let uuid_iids = (format == crate::file::TREE_FORMAT_VERSION && !owned).then(|| Arc::new(AtomicBool::new(true)));
+            let uuid_iids = (format >= crate::file::TREE_FORMAT_VERSION && !owned).then(|| Arc::new(AtomicBool::new(true)));
             let members = opened.into_iter().map(|(reader, opening)| {
                 let mut rows = PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), owned);
                 rows.uuid_iids.clone_from(&uuid_iids);
+                rows.seal = seal.clone();
                 rows
             });
             let sections = write_versioned_group(&columns, members, &identity, version, ceiling, file, Some(indexing), format)?;
             let mut file = std::fs::File::open(output).map_err(fault)?;
             match format {
-                crate::file::TREE_FORMAT_VERSION => {
+                crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION => {
                     let canonical = uuid_iids.is_some_and(|proof| proof.load(Ordering::Relaxed));
-                    let locator = crate::file::TreeLocator::read(&mut file)?.with_uuid_iid_evidence(canonical);
+                    let locator = crate::file::TreeLocator::read(&mut file, format)?.with_uuid_iid_evidence(canonical);
                     crate::file::encode_tree_stats(&sections, &locator)
                 }
                 crate::file::FORMAT_VERSION => crate::file::encode_catalog_stats(&sections, Some(&crate::file::FooterLocator::read(&mut file)?)),
@@ -266,13 +329,24 @@ pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
-fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool) -> Result<IndexedRow<'a>> {
+fn is_search_gap(error: &Anomaly, cancellation: &CancellationToken) -> bool {
+    !cancellation.is_cancelled() && error.category != rtdb_types::AnomalyCategory::Interrupted
+}
+
+fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
+    seal: Option<&(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>) -> Result<IndexedRow<'a>> {
+    let header = event.header();
+    let cached = seal.and_then(|(snapshot, segment)| {
+        let postings = snapshot.serving_search::<crate::runtime::ServingPostings>()?;
+        let row = segment.row_of_version(header.version()).ok().flatten()?;
+        Some((postings, segment, row))
+    });
     let values = columns.iter().map(|column| Ok(match event.put_text(column)? {
         PutText::Missing => None,
-        PutText::Utf8(text) => Some(rtdb_text::analyze(text)),
+        PutText::Utf8(text) => Some(cached.and_then(|(postings, segment, row)| postings.tokens_for_row(segment, column, row))
+            .unwrap_or_else(|| rtdb_text::analyze(text))),
         PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
     })).collect::<Result<_>>()?;
-    let header = event.header();
     let key = if with_identity {
         let key = event.physical_entity_key().ok_or_else(|| fault("Owned search event is missing its complete identity"))?;
         let identity = EntityIdRef::from_handle_bytes(key)?;
@@ -312,7 +386,7 @@ pub(crate) fn test_row(row: IndexedRow<'_>) -> Result<SearchRow> {
 
 #[cfg(test)]
 fn search_batch(batch: &EventBatch, columns: &[String], owned: bool) -> Result<Vec<SearchRow>> {
-    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned).and_then(test_row)).collect()
+    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, None).and_then(test_row)).collect()
 }
 
 pub(crate) struct ArrowSearchPage {
@@ -320,6 +394,7 @@ pub(crate) struct ArrowSearchPage {
     _owned: OwnedBatch,
     with_identity: bool,
     uuid_iids: Option<Arc<AtomicBool>>,
+    seal: Option<(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>,
 }
 
 impl SearchPage for ArrowSearchPage {
@@ -332,7 +407,7 @@ impl SearchPage for ArrowSearchPage {
         {
             proof.store(false, Ordering::Relaxed);
         }
-        search_row(event, columns, self.with_identity)
+        search_row(event, columns, self.with_identity, self.seal.as_ref())
     }
 }
 
@@ -344,12 +419,13 @@ pub(crate) struct PageRows {
     page: usize,
     with_identity: bool,
     uuid_iids: Option<Arc<AtomicBool>>,
+    seal: Option<(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>,
 }
 
 impl PageRows {
     fn new(reader: ArrowFile, opening: Arc<MemoryReservation>, memory: Arc<MemoryBudget>,
            cancellation: CancellationToken, with_identity: bool) -> Self {
-        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity, uuid_iids: None }
+        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity, uuid_iids: None, seal: None }
     }
 }
 
@@ -365,7 +441,7 @@ impl Iterator for PageRows {
         self.page += 1;
         Some(read_page(&mut self.reader, page, &self.memory).and_then(|owned| {
             let events = EventBatch::new(owned.batch().clone())?;
-            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone() })
+            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone(), seal: self.seal.clone() })
         }))
     }
 }

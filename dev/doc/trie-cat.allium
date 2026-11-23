@@ -46,6 +46,8 @@ value ArtefactRecord {
     stats: Bytes
     -- A record without one is its trie's.
     scope: ArtefactScope
+    -- The ordered member list for an artefact whose owner is a pack.
+    pack_members: List<TrieKey>
     -- Published object length. A shared group object is counted once.
     file_size: Long?
     -- Exact provider identity supplied by the write response or verified idempotent publication.
@@ -61,8 +63,14 @@ value PublishedObjectVersion {
 }
 
 -- trie: derived from its trie's data file alone, and stored under the trie's artefact prefix.
--- part_group: derived from every member's data file of its trie's partition group, stored once under the group's artefact prefix, and recorded alike on each member's entry.
-enum ArtefactScope { trie | part_group }
+-- part_group: derived from the data files of its trie's partition group and recorded alike on each member.
+-- pack is stored under its ordered member list and recorded alike on each member.
+enum ArtefactScope { trie | part_group | pack }
+
+value ArtefactPack {
+    -- Settled primary tries in IID-prefix order, with one recency and mutually disjoint IID prefixes.
+    members: List<TrieKey>
+}
 
 value PartGroup {
     -- The branch_factor sibling outputs of tiered compaction at one block (rule InsertTrie_General): the same level, recency and parent part, one per bucket.
@@ -451,6 +459,9 @@ rule AddArtefact {
     -- A trie keeps the first record for each (kind, definition id, definition version).
     -- A live trie can replace its group-scoped record with its own after an original member becomes obsolete.
     -- Later group records leave the replacement in place.
+    -- A singleton record on a live trie can be replaced by a pack record naming that trie.
+    -- A live member of a pack with an obsolete member can receive a replacement singleton.
+    -- pack_has_obsolete_member holds when any of the receipt's original members is absent or garbage in the table catalog.
     -- The record is part of the trie's TrieDetails, so the table-block files a block upload writes carry it, and a recovery restores it.
     when: AddArtefact(table, trie_key, record)
     requires: trie_catalog.holds(table, trie_key)
@@ -464,6 +475,10 @@ rule AddArtefact {
            and existing.any(r => r.scope = :part_group)
            and group_has_obsolete_member(table, trie_key)
            and trie_catalog.is_live(table, trie_key):
+            trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key).filter(r => not (r.kind = record.kind and r.definition_id = record.definition_id and r.definition_version = record.definition_version)) + [record]
+        if trie_catalog.is_live(table, trie_key)
+           and ((record.scope = :pack and existing.any(r => r.scope = :trie))
+                or (record.scope = :trie and existing.any(r => r.scope = :pack and pack_has_obsolete_member(table, r)))):
             trie_catalog.artefacts(table, trie_key) = trie_catalog.artefacts(table, trie_key).filter(r => not (r.kind = record.kind and r.definition_id = record.definition_id and r.definition_version = record.definition_version)) + [record]
 }
 

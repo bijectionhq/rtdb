@@ -38,8 +38,9 @@ pub(crate) use layout::FooterLocator;
 
 pub const FORMAT_VERSION: i32 = 13;
 pub(crate) const TREE_FORMAT_VERSION: i32 = 14;
+pub(crate) const PACKED_FORMAT_VERSION: i32 = 15;
 pub(crate) use page_tree::PageCache;
-pub(crate) use tree_file::{TreeFile, TreeLocator};
+pub(crate) use tree_file::{MAX_ROOT_BYTES, TreeFile, TreeLocator};
 pub(crate) use tree_rank::{TreeRankOrder, TreeRanked};
 pub(crate) fn encode_tantivy_stats(sections: &[Section]) -> Vec<u8> { legacy11::encode_catalog(sections) }
 pub(crate) const LEGACY_FORMAT_VERSION: i32 = 12;
@@ -1323,7 +1324,7 @@ mod tests {
         rows.sort_unstable_by_key(|row| row.iid);
         let mut on_disk = tempfile::tempfile().unwrap();
         write_versioned_group(&columns, [[Ok(rows.clone())]], "remote-v14", 42, None, &mut on_disk, None, TREE_FORMAT_VERSION).unwrap();
-        let locator = TreeLocator::read(&mut on_disk).unwrap();
+        let locator = TreeLocator::read(&mut on_disk, TREE_FORMAT_VERSION).unwrap();
         use std::io::{Read, Seek};
         on_disk.rewind().unwrap();
         let mut bytes = Vec::new();

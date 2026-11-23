@@ -264,7 +264,7 @@ impl TxResolver {
         self.resolve_source_for_writer(durable, position, log_time, request, context, None).await
     }
 
-    pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext,
+    pub async fn resolve_source_for_writer(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, mut request: SourceTransaction, context: &ResolveContext,
         writer: Option<WriterPublication<'_>>,
     ) -> Result<Arc<ResolvedTx>> {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
@@ -293,6 +293,13 @@ impl TxResolver {
         let attempt = request.placed_attempt(position)?;
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.trace_parent = span.as_ref().map(|span| span.context());
+        let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
+            && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
+        let placement = if selected_time.is_ok() {
+            request.place_owned_periods(key.system_time, placed_periods)
+        } else {
+            Ok(())
+        };
         let replay = match &request.guard {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
@@ -322,7 +329,7 @@ impl TxResolver {
             _ => None,
         });
         let mut constraint_failed = false;
-        let mut outcome = if let Some(error) = plan_error.or(retry_error) {
+        let mut outcome = if let Some(error) = placement.err().or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
             Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
@@ -1003,6 +1010,9 @@ impl<'a> OpenTransaction<'a> {
                 self.delete_owned(relation, id, *valid_from, *valid_to).await,
             Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
                 self.write_owned(relation, documents, None, *valid_from, *valid_to, true).await,
+            Operation::Public(TxOp::OwnedRelativePeriod { .. }) => Err(Anomaly::incorrect(
+                "rtdb.owned/validity-policy", "The Root period must be placed before staging",
+            )),
             Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) =>
                 self.write_owned(relation, documents, None, *valid_from, *valid_to, false).await,
             Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } =>
@@ -1593,7 +1603,12 @@ impl<'a> OpenTransaction<'a> {
             let root = write.relation.root_relation().ok_or_else(unavailable)?;
             let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
             let bounded = record.schemas.relation(&root).is_some_and(|schema| schema.requires_bounded_period());
-            if ((bounded || write.create_only) && proposal_overlay != Some(world))
+            let held = matches!(record.mode, rtdb_types::WorldClockMode::Held { .. });
+            let publishes_overlay = publications.iter().any(|(published, _, _, advance, drop, settlement, _)| {
+                *published == world && advance.is_none() && !*drop && settlement.is_none()
+            });
+            if !publishes_overlay
+                || ((bounded && !held || write.create_only) && proposal_overlay != Some(world))
                 || (proposal_overlay == Some(world) && bounded != (write.from.is_some() && write.to.is_some()))
             {
                 return Err(unavailable());
@@ -1718,7 +1733,9 @@ impl<'a> OpenTransaction<'a> {
             }
             for (world, attempt, own_fingerprint, advance_to, drop_world, settlement_pin, _) in publications {
                 let (rows, witnesses) = counts.remove(&world).ok_or_else(unavailable)?;
-                if (witnesses == 0 && (drop_world || (proposal_overlay.is_some() && settlement_pin.is_none())))
+                let proposal_drop = drop_world && self.owned_worlds.get(&world).is_none_or(|(record, _)|
+                    record.mode == rtdb_types::WorldClockMode::Proposal);
+                if (witnesses == 0 && (proposal_drop || (proposal_overlay.is_some() && settlement_pin.is_none())))
                     || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
                     || (rows == 0) != (advance_to.is_some() || drop_world || settlement_pin.is_some())
                     || drop_world && advance_to.is_some()
@@ -2212,7 +2229,6 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
             if schema.requires_bounded_period() {
-                if !explicit || record.mode != WorldClockMode::Proposal { return Err(unavailable()); }
                 schema.require_root_write_period(Some(from), Some(to))?;
             } else {
                 schema.require_write_validity(explicit)?;
@@ -2232,12 +2248,19 @@ impl<'a> OpenTransaction<'a> {
                     self.require_proposal_create_absence(owner, &root, relation, &id).await?;
                 }
             }
+            let bounded_held = schema.requires_bounded_period() && matches!(record.mode, WorldClockMode::Held { .. });
             if self.context.world_constraints.is_none() {
                 self.require_noncharging_world_write(owner, &root, schema, documents.rows()).await?;
                 if snapshot.contains_table(&root.unique_table(owner))
                     && !documents.rows().iter().all(rtdb_types::WorldShadow::is_tombstone)
                 {
                     return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
+                }
+            }
+            if bounded_held {
+                for row in documents.rows() {
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    self.reserve_bounded_period_write(relation, id)?;
                 }
             }
             return self.put_documents(&table, documents, iids, Some(from), Some(to),
@@ -3206,6 +3229,20 @@ mod tests {
             tx.write_owned(&overlay, &allowed, None, None, None, false).await?;
             assert_eq!(tx.read_owned_revision("owner", &overlay, &id, Interval::at(valid)?).await?, Some(ordered.system_time));
             tx.write_owned(&overlay, &withdrawn, None, None, None, false).await?;
+            if matches!(mode, WorldClockMode::Held { .. }) {
+                let period_schema = OwnedSchema::from_json(br#"{"fields":[{"name":"partition","type":{"kind":"binary"},"optional":false,"nullable":false}],"validity":"bounded_period"}"#)?;
+                let (world, _) = tx.owned_worlds.get_mut(&world).expect("original test world");
+                world.schemas = WorldSchemas::new(BTreeMap::from([(relation.name().into(), period_schema)]))?;
+                let from = Timestamp(10);
+                let to = Timestamp(30);
+                let error = tx.write_owned(&overlay, &allowed, None, Some(from), Some(Timestamp::MAX), false).await.unwrap_err();
+                assert_eq!(error.code, "rtdb.owned/validity-policy");
+                tx.write_owned(&overlay, &allowed, None, Some(from), Some(to), false).await?;
+                assert_eq!(tx.read_owned_revision("owner", &overlay, &id, Interval::at(from)?).await?, Some(ordered.system_time));
+                assert_eq!(tx.read_owned_revision("owner", &overlay, &id, Interval::at(to)?).await?, None);
+                let error = tx.write_owned(&overlay, &withdrawn, None, Some(from), Some(to), false).await.unwrap_err();
+                assert_eq!(error.code, "rtdb.owned/repeated-period");
+            }
         }
         Ok(())
     }

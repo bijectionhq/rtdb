@@ -126,7 +126,14 @@ impl TableSlug {
     /// Every artefact derived from a partition group's data files lives under this prefix, so collecting its last member can list and delete them all.
     pub fn group_artefact_prefix(&self, group: &PartGroup) -> String { self.owner_prefix(&ArtefactOwner::Group(group.clone())) }
 
-    fn owner_prefix(&self, owner: &ArtefactOwner) -> String { format!("{}/artefacts/{owner}", self.table_prefix()) }
+    fn owner_prefix(&self, owner: &ArtefactOwner) -> String {
+        match owner {
+            ArtefactOwner::Pack(_) => format!("{}/{owner}", self.packs_prefix()),
+            _ => format!("{}/artefacts/{owner}", self.table_prefix()),
+        }
+    }
+
+    pub fn packs_prefix(&self) -> String { format!("{}/artefacts/packs", self.table_prefix()) }
 
     /// Every artefact of the table, under each of its tries' and partition groups' prefixes.
     pub fn artefacts_prefix(&self) -> String { format!("{}/artefacts", self.table_prefix()) }
@@ -134,6 +141,7 @@ impl TableSlug {
     /// The owner, kind, definition id and version an artefact key was made from, or `None` for a key `owner_artefact_key` does not make.
     pub fn parse_artefact_key(&self, key: &str) -> Option<(ArtefactOwner, String, String, i64)> {
         let rest = key.strip_prefix(&self.artefacts_prefix())?.strip_prefix('/')?;
+        let rest = rest.strip_prefix("packs/").unwrap_or(rest);
         let mut parts = rest.split('/');
         let (owner, kind, file, None) = (parts.next()?, parts.next()?, parts.next()?, parts.next()) else { return None };
         let (id, version) = file.strip_suffix(".bin")?.rsplit_once("-v")?;
@@ -249,7 +257,28 @@ impl FromStr for PartGroup {
 
 /// What an artefact is derived from, and so the prefix its objects live under.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
-pub enum ArtefactOwner { Trie(TrieKey), Group(PartGroup) }
+pub enum ArtefactOwner { Trie(TrieKey), Group(PartGroup), Pack(ArtefactPack) }
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct ArtefactPack(Vec<TrieKey>);
+
+impl ArtefactPack {
+    pub const MAX_MEMBERS: usize = 8;
+
+    pub fn new(mut members: Vec<TrieKey>) -> Result<Self> {
+        members.sort_by(|a, b| a.part().cmp(b.part()));
+        let length = members.iter().map(|key| key.to_string().len() + 1).sum::<usize>();
+        if !(2..=Self::MAX_MEMBERS).contains(&members.len()) || length > 512
+            || members.iter().any(|key| key.level() == 0 || key.recency() != members[0].recency())
+            || members.windows(2).any(|pair| pair[1].part().starts_with(pair[0].part())) {
+            return Err(Anomaly::incorrect("rtdb.format/invalid-artefact-pack", "An artefact pack needs bounded, disjoint primary members with a shared recency"));
+        }
+        Ok(Self(members))
+    }
+
+    pub fn members(&self) -> &[TrieKey] { &self.0 }
+    pub fn recency(&self) -> Option<CivilDate> { self.0[0].recency() }
+}
 
 impl ArtefactOwner {
     /// The owner of a record on `trie`'s entry: the trie, or its partition group for a group-scoped record.
@@ -258,17 +287,33 @@ impl ArtefactOwner {
             crate::log::proto::ArtefactScope::Trie => Ok(Self::Trie(trie.clone())),
             crate::log::proto::ArtefactScope::PartGroup => trie.part_group().map(Self::Group)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.format/invalid-artefact-scope", format!("Trie {trie} belongs to no partition group"))),
+            crate::log::proto::ArtefactScope::Pack => {
+                if record.pack_members.len() > ArtefactPack::MAX_MEMBERS { return Err(invalid_key("artefact pack members")); }
+                let members = record.pack_members.iter().map(|key| key.parse()).collect::<Result<Vec<_>>>()?;
+                let pack = ArtefactPack::new(members)?;
+                if !pack.members().contains(trie) || !pack.members().iter().map(ToString::to_string).eq(record.pack_members.iter().cloned()) {
+                    return Err(invalid_key("artefact pack owner"));
+                }
+                Ok(Self::Pack(pack))
+            }
         }
     }
     /// The tries whose data files the artefact is derived from.
     pub fn tries(&self) -> Vec<TrieKey> {
-        match self { Self::Trie(trie) => vec![trie.clone()], Self::Group(group) => group.members() }
+        match self { Self::Trie(trie) => vec![trie.clone()], Self::Group(group) => group.members(), Self::Pack(pack) => pack.members().to_vec() }
     }
 }
 
 impl fmt::Display for ArtefactOwner {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self { Self::Trie(trie) => trie.fmt(output), Self::Group(group) => group.fmt(output) }
+        match self {
+            Self::Trie(trie) => trie.fmt(output), Self::Group(group) => group.fmt(output),
+            Self::Pack(pack) => {
+                output.write_str("pack")?;
+                for key in pack.members() { write!(output, "~{key}")?; }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -276,7 +321,13 @@ impl FromStr for ArtefactOwner {
     type Err = Anomaly;
 
     fn from_str(key: &str) -> Result<Self> {
-        if key.starts_with('g') { key.parse().map(Self::Group) } else { key.parse().map(Self::Trie) }
+        if let Some(members) = key.strip_prefix("pack~") {
+            if members.len() > 512 || members.split('~').count() > ArtefactPack::MAX_MEMBERS { return Err(invalid_key(key)); }
+            let pack = ArtefactPack::new(members.split('~').map(str::parse).collect::<Result<Vec<_>>>()?)?;
+            let owner = Self::Pack(pack);
+            if owner.to_string() != key { return Err(invalid_key(key)); }
+            Ok(owner)
+        } else if key.starts_with('g') { key.parse().map(Self::Group) } else { key.parse().map(Self::Trie) }
     }
 }
 

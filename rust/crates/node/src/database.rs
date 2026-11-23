@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::TrieKey, log::proto::{ArtefactsAdded, ArtefactsRemoved, TriesAdded}};
 use rtdb_index::PartitionState;
-use rtdb_maintenance::{ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionHandle, CompactionJob, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
+use rtdb_maintenance::{ArtefactBuilder, ArtefactDatabase, ArtefactDriver, ArtefactHandle, ArtefactKind, ArtefactPublisher, BlockCollector, CollectionObserver, CompactionDriver, CompactionExecutor, CompactionHandle, CompactionJob, CompactionPublisher, CycleDriver, CycleHandle, SegmentCompactor, SnapshotSource, TrieCollector, TrieDeletionPublisher};
 use rtdb_replication::{BlockStore, PartitionLogs, ProgressMonitor, ReplicationDriver, ReplicationHandle, Role, TermHandle};
 use rtdb_storage::{IoRegion, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_tx::{ResolveContext, TransactionAuthorization};
@@ -349,6 +349,10 @@ impl DatabaseFactory {
                     Ok((Arc::clone(kind), kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?))
                 }).collect::<Result<Vec<_>>>()?
             };
+            let replica_driver = match builders.iter().find(|(_, builder)| builder.prepares_serving_search()) {
+                Some((_, builder)) => replica_driver.with_serving_search(Arc::new(PrepareSearch(Arc::clone(builder)))),
+                None => replica_driver,
+            };
             let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
                 _ if self.options.compaction_threads == 0 => None,
                 (_, false) => Some(Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() })),
@@ -368,7 +372,7 @@ impl DatabaseFactory {
             let mut artefacts = Vec::new();
             let mut live_artefacts = Vec::new();
             for (kind, builder) in builders {
-                if builder.builds_live_pages() { live_artefacts.push(Arc::clone(&builder)); }
+                if builder.builds_live_pages() && !builder.prepares_serving_search() { live_artefacts.push(Arc::clone(&builder)); }
                 let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
                     self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
@@ -404,6 +408,20 @@ impl DatabaseFactory {
         };
         if opened.is_err() { io.close_and_wait().await; }
         opened
+    }
+}
+
+struct PrepareSearch(Arc<dyn ArtefactBuilder>);
+
+#[async_trait::async_trait]
+impl rtdb_replication::ServingSearchBuilder for PrepareSearch {
+    async fn prepare(&self, snapshot: rtdb_index::Snapshot, cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
+        self.0.prepare_serving_search(snapshot, cancellation).await
+    }
+
+    async fn seal(&self, value: &Arc<rtdb_index::PartitionValue>, table: &rtdb_types::TableRef, trie: &TrieKey,
+        file: &std::path::Path, size: u64, cancellation: &CancellationToken) -> Result<Vec<rtdb_format::log::proto::ArtefactRecord>> {
+        self.0.seal_serving_search(value, table, trie, file, size, cancellation).await
     }
 }
 

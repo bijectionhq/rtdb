@@ -257,11 +257,19 @@ impl TrieCatalog {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
+                let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, &record) else { continue; };
                 let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
                 let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
                 let held = trie.artefacts.iter_mut().find(|held| same_artefact(held, kind, id, version));
                 match held {
                     None => trie.artefacts.push(record),
+                    Some(held) if trie.state == TrieState::Live && held.scope() == log_pb::ArtefactScope::Trie
+                        && matches!(owner, rtdb_format::keys::ArtefactOwner::Pack(_)) => *held = record,
+                    Some(held) if trie.state == TrieState::Live && held.scope() == log_pb::ArtefactScope::Pack
+                        && record.scope() == log_pb::ArtefactScope::Trie
+                        && rtdb_format::keys::ArtefactOwner::of(&key, held).is_ok_and(|owner| owner.tries().iter().any(|member| {
+                            self.trie(table, member).is_none_or(|trie| matches!(trie.state, TrieState::Garbage { .. }))
+                        })) => *held = record,
                     Some(held) if held.scope() == log_pb::ArtefactScope::PartGroup
                         && record.scope() == log_pb::ArtefactScope::Trie
                         && trie.state == TrieState::Live

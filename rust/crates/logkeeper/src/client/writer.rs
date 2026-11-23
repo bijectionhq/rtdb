@@ -1,9 +1,10 @@
 //! The writer of one stream at one epoch: recovery on open, pipelined appends, quorum commit, lazy repair of lagging servers.
 
+use super::connection::CALL_TIMEOUT;
 use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::CopyFrom;
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Append, Commit, Entry, RequestBody, Sealed};
+use crate::protocol::{Accepted, Commit, Entry, PageDigest, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -76,6 +77,55 @@ struct Confirming {
     next: Option<Arc<Round>>,
 }
 
+/// A guarded entry is the only pending entry. It first needs a quorum of
+/// original observed appends, then a quorum storing that commit decision.
+struct GuardedFlight {
+    lsn: i64,
+    originals: Vec<Mark>,
+    witnesses: Option<Vec<Mark>>,
+}
+
+#[derive(Clone, Copy)]
+enum GuardedReply { Original(i64), Commit(i64) }
+
+impl GuardedFlight {
+    fn record_reply(&mut self, server: usize, reply: Option<GuardedReply>, ack: &Result<Ack>) {
+        let (marks, committed) = match reply {
+            Some(GuardedReply::Original(lsn)) if lsn == self.lsn => (&mut self.originals, false),
+            Some(GuardedReply::Commit(lsn)) if lsn == self.lsn => {
+                let Some(witnesses) = &mut self.witnesses else { return };
+                (witnesses, true)
+            }
+            _ => return,
+        };
+        if marks[server] == Mark::Pending {
+            let exact = matches!(ack, Ok(Ack::Accepted(reply)) if reply.last_lsn == self.lsn
+                && (!committed || reply.commit_lsn == self.lsn));
+            marks[server] = if exact { Mark::Confirmed } else { Mark::Failed };
+        }
+    }
+
+    fn has_quorum(marks: &[Mark], quorum: usize) -> bool {
+        marks.iter().filter(|&&mark| mark == Mark::Confirmed).count() >= quorum
+    }
+
+    fn begin_commit(&mut self, quorum: usize) -> bool {
+        if self.witnesses.is_some() || !Self::has_quorum(&self.originals, quorum) { return false; }
+        self.witnesses = Some(self.originals.iter().map(|&mark| {
+            if mark == Mark::Failed { Mark::Failed } else { Mark::Pending }
+        }).collect());
+        true
+    }
+
+    fn releasable(&self, quorum: usize) -> bool {
+        self.witnesses.as_ref().is_some_and(|witnesses| Self::has_quorum(witnesses, quorum))
+    }
+
+    fn can_reach_quorum(&self, quorum: usize) -> bool {
+        self.witnesses.as_ref().unwrap_or(&self.originals).iter().filter(|&&mark| mark != Mark::Failed).count() >= quorum
+    }
+}
+
 impl Round {
     fn new() -> Arc<Self> { Arc::new(Self { outcome: watch::channel(None).0 }) }
 }
@@ -90,6 +140,7 @@ struct Pipeline {
     buffered_bytes: usize,
     replicas: Vec<Replica>,
     confirming: Option<Confirming>,
+    guarded: Option<GuardedFlight>,
 }
 
 enum State {
@@ -236,10 +287,105 @@ async fn sync_quorum(ensemble: &Ensemble, epoch: u64, replies: &[(usize, Sealed)
     Ok(synced)
 }
 
-fn sealed_history(replies: &[(usize, Sealed)]) -> (usize, Holding) {
+fn winning_seal(replies: &[(usize, Sealed)]) -> &(usize, Sealed) {
     let sealed: Vec<Sealed> = replies.iter().map(|(_, sealed)| sealed.clone()).collect();
-    let (source, winning) = &replies[winner(&sealed)];
-    (*source, Holding::from(winning))
+    &replies[winner(&sealed)]
+}
+
+enum TailDecision { Keep, Discard, Unknown }
+
+struct GuardedEvidence {
+    possible: usize,
+    observed: usize,
+}
+
+impl GuardedEvidence {
+    fn record_exact(&mut self, proof: &PageDigest) {
+        match (proof.original_append, proof.synced_clock_upper_micros) {
+            (Some(true), Some(upper)) if upper > 0 => self.observed += 1,
+            (Some(false), None) => self.possible -= 1,
+            // An original that survived without its post-sync sample still
+            // may have synced before the cutoff. An incomplete probe is open.
+            _ => {}
+        }
+    }
+
+    fn decision(&self, quorum: usize) -> TailDecision {
+        if self.observed >= quorum { TailDecision::Keep }
+        else if self.possible < quorum { TailDecision::Discard }
+        else { TailDecision::Unknown }
+    }
+}
+
+async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, history: &Holding, replies: &[(usize, Sealed)]) -> Result<TailDecision> {
+    let offset = history.last;
+    let unknown = || Error::Remote { key: ensemble.stream(), message: format!("guarded tail at position {offset} has an unknown outcome") };
+    let entry_epoch = history.epoch_at(offset).filter(|entry_epoch| *entry_epoch < epoch).ok_or_else(unknown)?;
+    let mut holding = Vec::new();
+    let mut possible = ensemble.len() - replies.len();
+    for (server, sealed) in replies {
+        if sealed.trim_lsn >= offset {
+            // Trimming can hide an original observation. Its removal is not a negative vote.
+            possible += 1;
+        } else if Holding::from(sealed).epoch_at(offset) == Some(entry_epoch) {
+            // The sole writer assigns an entry at most once at this epoch and position.
+            // A durable commit covering it already attests the original quorum.
+            if sealed.commit_lsn >= offset { return Ok(TailDecision::Keep); }
+            holding.push(*server);
+            possible += 1;
+        }
+    }
+    let quorum = ensemble.config.write_quorum;
+    if possible < quorum { return Ok(TailDecision::Discard); }
+
+    let Ok(exact) = ensemble.guarded_digest(source, offset, epoch).await else { return Ok(TailDecision::Unknown); };
+    if exact.through_lsn != offset || exact.digest.len() != 32 { return Ok(TailDecision::Unknown); }
+    let mut evidence = GuardedEvidence { possible, observed: 0 };
+    evidence.record_exact(&exact);
+    let mut pending: FuturesUnordered<_> = holding.into_iter().filter(|server| *server != source)
+        .map(|server| ensemble.guarded_digest(server, offset, epoch)).collect();
+    while matches!(evidence.decision(quorum), TailDecision::Unknown) && let Some(reply) = pending.next().await {
+        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest {
+            evidence.record_exact(&proof);
+        }
+    }
+    Ok(evidence.decision(quorum))
+}
+
+/// An unsettled guarded flight is exclusive at the tip. Unlike an ordinary
+/// suffix, recovery needs its original quorum or definite exclusion before
+/// transferring it. Availability can require journals beyond the seal quorum.
+async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usize, Sealed)>) -> Result<(usize, Holding)> {
+    let mut checked_remaining = false;
+    loop {
+        let (source, winning) = winning_seal(replies);
+        let source = *source;
+        let mut history = Holding::from(winning);
+        if !winning.guarded_tail || winning.commit_lsn >= history.last { return Ok((source, history)); }
+        if !ensemble.supports_guarded() { return Err(Error::GuardedAppendUnsupported); }
+        match settle_guarded_tail(ensemble, epoch, source, &history, replies).await? {
+            TailDecision::Keep => return Ok((source, history)),
+            TailDecision::Discard => {
+                history.discard_last();
+                return Ok((source, history));
+            }
+            TailDecision::Unknown if !checked_remaining && replies.len() < ensemble.len() => {
+                let mut pending: FuturesUnordered<_> = (0..ensemble.len())
+                    .filter(|server| !replies.iter().any(|(replied, _)| replied == server))
+                    .map(|server| async move { (server, ensemble.seal(server, epoch).await) }).collect();
+                while let Some((server, sealed)) = pending.next().await {
+                    if let Ok(sealed) = sealed {
+                        if sealed.promised > epoch { return Err(Error::Deposed { epoch, promised: sealed.promised }); }
+                        replies.push((server, sealed));
+                    }
+                }
+                checked_remaining = true;
+            }
+            TailDecision::Unknown => return Err(Error::Remote {
+                key: ensemble.stream(), message: format!("guarded tail at position {} has an unknown outcome", history.last),
+            }),
+        }
+    }
 }
 
 async fn bootstrap_replica_page(
@@ -304,15 +450,15 @@ async fn bootstrap_replica_page(
 
 impl Writer {
     pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
-        let replies = seal_quorum(&ensemble, epoch).await?;
-        let (source, history) = sealed_history(&replies);
+        let mut replies = seal_quorum(&ensemble, epoch).await?;
+        let (source, history) = sealed_history(&ensemble, epoch, &mut replies).await?;
         let recovered = Recovered { source: (&ensemble, source), start: history.trim + 1, history };
         Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
     }
 
     pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<i64> {
-        let replies = seal_quorum(ensemble, epoch).await?;
-        let (source, history) = sealed_history(&replies);
+        let mut replies = seal_quorum(ensemble, epoch).await?;
+        let (source, history) = sealed_history(ensemble, epoch, &mut replies).await?;
         let last = history.last;
         let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history };
         sync_quorum(ensemble, epoch, &replies, &recovered, last).await?;
@@ -322,8 +468,8 @@ impl Writer {
     /// Recovers the same history used by a local ensemble move and by a
     /// copy to a different physical stream.
     async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
-        let previous_replies = seal_quorum(previous, epoch).await?;
-        let (source, history) = sealed_history(&previous_replies);
+        let mut previous_replies = seal_quorum(previous, epoch).await?;
+        let (source, history) = sealed_history(previous, epoch, &mut previous_replies).await?;
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
         let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
         sync_quorum(previous, epoch, &previous_replies, &in_place, start - 1).await?;
@@ -382,28 +528,29 @@ impl Writer {
         let last = recovered.history.last;
         let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
         // Predecessor recovery also syncs replicas at this epoch. Only the writer's own ensemble activates.
-        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| ensemble.activate(server, epoch)).collect();
-        let mut activated = 0;
-        while let Some(reply) = activating.next().await {
+        let ensemble_ref = &ensemble;
+        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| async move { (server, ensemble_ref.activate(server, epoch).await) }).collect();
+        let mut active = Vec::new();
+        while let Some((server, reply)) = activating.next().await {
             match reply {
-                Ok(Ack::Accepted(_)) => activated += 1,
+                Ok(Ack::Accepted(_)) => active.push(server),
                 Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
                 _ => (),
             }
-            if activated >= ensemble.config.write_quorum { break; }
+            if active.len() >= ensemble.config.write_quorum { break; }
         }
         drop(activating);
-        if activated < ensemble.config.write_quorum {
+        if active.len() < ensemble.config.write_quorum {
             return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
-                "activated {activated} journals, a write quorum is {}", ensemble.config.write_quorum) });
+                "activated {} journals, a write quorum is {}", active.len(), ensemble.config.write_quorum) });
         }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
-        let replicas = (0..ensemble.len()).map(|server| if synced.contains(&server) {
+        let replicas = (0..ensemble.len()).map(|server| if active.contains(&server) {
             Replica { acked: last, link: Link::Live }
         } else {
             Replica { acked: -1, link: Link::Down(long_ago) }
         }).collect();
-        let pipeline = Pipeline { next_lsn: last + 1, commit: last, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None };
+        let pipeline = Pipeline { next_lsn: last + 1, commit: last, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
         let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0 });
         {
             let mut state = writer.state.lock();
@@ -429,28 +576,60 @@ impl Writer {
         };
         let lsn = pipeline.next_lsn;
         let next = lsn.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        if pipeline.guarded.is_some() { return Err(self.guarded_outcome_unknown()); }
+        let guarded = if matches!(time, AppendTime::Guarded(_)) {
+            if !self.ensemble.supports_guarded() { return Err(Error::GuardedAppendUnsupported); }
+            let ready = pipeline.replicas.iter().filter(|replica| {
+                matches!(replica.link, Link::Live) && replica.acked >= pipeline.commit
+            }).count();
+            if pipeline.commit != lsn - 1 || ready < self.ensemble.config.write_quorum {
+                self.repair_down(pipeline);
+                return Err(Error::GuardedAppendUnavailable);
+            }
+            Some(GuardedFlight { lsn, originals: pipeline.replicas.iter().map(|replica| {
+                if matches!(replica.link, Link::Live) { Mark::Pending } else { Mark::Failed }
+            }).collect(), witnesses: None })
+        } else { None };
         // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
         let payload = Bytes::copy_from_slice(&payload);
-        let (timestamp, observe_sync) = match time {
-            AppendTime::Ordinary(timestamp) => (timestamp, false),
-            AppendTime::Guarded(guard) => (guard.sample()?, true),
+        let timestamp = match time {
+            AppendTime::Ordinary(timestamp) => timestamp,
+            AppendTime::Guarded(guard) => guard.sample()?,
         };
+        pipeline.guarded = guarded;
         pipeline.next_lsn = next;
-        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, payload };
+        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, guarded: pipeline.guarded.is_some(), payload };
         pipeline.history.push(lsn, self.epoch);
         let (receipt, durable) = oneshot::channel();
         pipeline.buffered_bytes += entry.payload.len();
         pipeline.buffer.push_back(Buffered { entry: entry.clone(), receipt: Some(receipt) });
         for server in 0..pipeline.replicas.len() {
-            if matches!(pipeline.replicas[server].link, Link::Live) {
-                let append = Append { stream: self.ensemble.stream(), epoch: self.epoch,
-                    first_lsn: lsn, entries: vec![entry.clone()], commit_lsn: pipeline.commit };
-                let body = if observe_sync { RequestBody::AppendObserved(append) } else { RequestBody::Append(append) };
+            let eligible = pipeline.guarded.as_ref().map_or_else(
+                || matches!(pipeline.replicas[server].link, Link::Live),
+                |flight| flight.originals[server] == Mark::Pending,
+            );
+            if eligible {
+                let body = self.ensemble.append_request(self.epoch, entry.clone(), pipeline.commit);
                 self.send(pipeline, server, body);
             }
         }
-        self.repair_down(pipeline);
-        Ok(AppendReceipt::new(durable))
+        let receipt = AppendReceipt::new(durable);
+        if pipeline.guarded.is_some() {
+            // A lost reply bounds only the wait. The dispatched entry still
+            // owns the tail and must be settled by its evidence.
+            let due = tokio::time::Instant::now() + CALL_TIMEOUT;
+            let unknown = self.guarded_outcome_unknown();
+            Ok(AppendReceipt::observed(async move {
+                tokio::time::timeout_at(due, receipt.durable()).await.unwrap_or(Err(unknown))
+            }))
+        } else {
+            self.repair_down(pipeline);
+            Ok(receipt)
+        }
+    }
+
+    fn guarded_outcome_unknown(&self) -> Error {
+        Error::Remote { key: self.ensemble.stream(), message: "guarded append outcome is unknown after dispatch".into() }
     }
 
     /// Sends a pipeline request; its reply also answers the confirmation round in flight when it was sent.
@@ -458,8 +637,15 @@ impl Writer {
         let writer = Arc::downgrade(self);
         let ensemble = Arc::clone(&self.ensemble);
         let round = pipeline.confirming.as_ref().map(|confirming| Arc::clone(&confirming.round));
+        let guarded_reply = match &body {
+            RequestBody::AppendObserved(append) => Some(GuardedReply::Original(append.first_lsn)),
+            RequestBody::Commit(commit) if pipeline.guarded.as_ref().is_some_and(|flight| flight.lsn == commit.commit_lsn) => {
+                Some(GuardedReply::Commit(commit.commit_lsn))
+            }
+            _ => None,
+        };
         self.ensemble.links[server].send(body, Box::new(move |reply| {
-            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply), round); }
+            if let Some(writer) = Weak::upgrade(&writer) { writer.acknowledged(server, ensemble.ack(server, reply), round, guarded_reply); }
         }));
     }
 
@@ -477,11 +663,20 @@ impl Writer {
         }));
     }
 
-    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>, round: Option<Arc<Round>>) {
+    fn acknowledged(self: &Arc<Self>, server: usize, ack: Result<Ack>, round: Option<Arc<Round>>, guarded_reply: Option<GuardedReply>) {
         let mut state = self.state.lock();
         if let Ok(Ack::Refused(refused)) = ack && refused.promised > self.epoch { return self.depose(&mut state, refused.promised); }
         let State::Open(pipeline) = &mut *state else { return };
         if let Some(round) = &round { self.mark(pipeline, round, server, matches!(ack, Ok(Ack::Accepted(_)))); }
+        if let Some(flight) = &mut pipeline.guarded {
+            flight.record_reply(server, guarded_reply, &ack);
+            if !flight.can_reach_quorum(self.ensemble.config.write_quorum)
+                && let Some(buffered) = pipeline.buffer.back_mut()
+                && let Some(receipt) = buffered.receipt.take()
+            {
+                let _ = receipt.send(Err(self.guarded_outcome_unknown()));
+            }
+        }
         match ack {
             Ok(Ack::Accepted(accepted)) => {
                 let replica = &mut pipeline.replicas[server];
@@ -498,10 +693,25 @@ impl Writer {
     }
 
     fn advance(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        let write_quorum = self.ensemble.config.write_quorum;
+        if let Some(flight) = &mut pipeline.guarded && flight.begin_commit(write_quorum) {
+            let flight = pipeline.guarded.as_ref().expect("started under the writer lock");
+            let witnesses = flight.witnesses.as_ref().expect("commit started");
+            for (server, mark) in witnesses.iter().enumerate() {
+                if *mark == Mark::Pending {
+                    self.send(pipeline, server, RequestBody::Commit(Commit {
+                        stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: flight.lsn,
+                    }));
+                }
+            }
+            return;
+        }
+        if pipeline.guarded.as_ref().is_some_and(|flight| !flight.releasable(write_quorum)) { return; }
         let mut acked: Vec<i64> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
         acked.sort_unstable_by(|left, right| right.cmp(left));
-        let quorum = acked[self.ensemble.config.write_quorum - 1].min(pipeline.next_lsn - 1);
+        let quorum = acked[write_quorum - 1].min(pipeline.next_lsn - 1);
         if quorum <= pipeline.commit { return; }
+        let guarded = pipeline.guarded.take();
         let previous = pipeline.commit;
         pipeline.commit = quorum;
         self.tip.send_replace(Tip::Open(quorum));
@@ -512,7 +722,7 @@ impl Writer {
                 let _ = receipt.send(Ok(record(&buffered.entry).metadata));
             }
         }
-        if pipeline.commit == pipeline.next_lsn - 1 {
+        if guarded.is_none() && pipeline.commit == pipeline.next_lsn - 1 {
             for server in 0..pipeline.replicas.len() {
                 if matches!(pipeline.replicas[server].link, Link::Live) {
                     self.send(pipeline, server, RequestBody::Commit(Commit { stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: quorum }));
@@ -525,6 +735,7 @@ impl Writer {
             pipeline.buffered_bytes -= dropped.entry.payload.len();
             pipeline.buffer_first += 1;
         }
+        if guarded.is_some() { self.repair_down(pipeline); }
     }
 
     fn depose(&self, state: &mut State, promised: u64) {
@@ -580,6 +791,7 @@ impl Writer {
                 let mut state = self.state.lock();
                 let pipeline = match &mut *state { State::Open(pipeline) => pipeline, State::Deposed { promised } => return Err(Error::Deposed { epoch, promised: *promised }) };
                 if from >= pipeline.buffer_first {
+                    if pipeline.guarded.is_some() { return Err(self.guarded_outcome_unknown()); }
                     let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
                     let body = ensemble.repair_request(epoch, from, entries, pipeline.commit);
                     pipeline.replicas[server].link = Link::Live;
@@ -727,4 +939,101 @@ impl Writer {
     }
 
     pub fn epoch(&self) -> u64 { self.epoch }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guarded_quorum_requires_exact_original_replies_from_distinct_dispatched_journals() {
+        let marks = vec![Mark::Pending, Mark::Pending, Mark::Failed];
+        let mut flight = GuardedFlight { lsn: 12, originals: marks.clone(), witnesses: None };
+        let accepted = |last_lsn, commit_lsn| Ok(Ack::Accepted(Accepted { last_lsn, commit_lsn }));
+        let original = Some(GuardedReply::Original(12));
+        let commit = Some(GuardedReply::Commit(12));
+
+        flight.record_reply(0, original, &accepted(12, 11));
+        flight.record_reply(0, original, &accepted(12, 11));
+        flight.record_reply(1, None, &accepted(12, 11));
+        flight.record_reply(1, commit, &accepted(12, 12));
+        flight.record_reply(1, Some(GuardedReply::Original(11)), &accepted(12, 11));
+        flight.record_reply(2, original, &accepted(12, 11));
+        assert!(!flight.begin_commit(2));
+        assert!(flight.can_reach_quorum(2));
+
+        flight.record_reply(1, original, &accepted(12, 11));
+        assert!(flight.begin_commit(2));
+        assert!(!flight.releasable(2));
+        flight.record_reply(0, commit, &accepted(12, 12));
+        flight.record_reply(0, commit, &accepted(12, 12));
+        flight.record_reply(1, original, &accepted(12, 12));
+        flight.record_reply(2, commit, &accepted(12, 12));
+        assert!(!flight.releasable(2));
+        flight.record_reply(1, commit, &accepted(12, 12));
+        assert!(flight.releasable(2));
+
+        let mut flight = GuardedFlight { lsn: 12, originals: marks, witnesses: None };
+        flight.record_reply(1, original, &accepted(13, 11));
+        assert!(!flight.can_reach_quorum(2));
+    }
+
+    #[tokio::test]
+    async fn guarded_recovery_excludes_a_minority_and_requires_original_evidence_to_commit() {
+        use crate::client::StreamConfig;
+        use crate::server::{PreparedJournal, ServerOptions};
+        use rtdb_types::JournalEndpoint;
+        use tokio::net::TcpListener;
+        use tokio_util::sync::CancellationToken;
+
+        let cancellation = CancellationToken::new();
+        let mut endpoints = Vec::new();
+        let mut directories = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let options = ServerOptions { data_dir: directory.path().to_owned(), fsync: true, cache_bytes: 0 };
+            let (provider, journal) = PreparedJournal::open_for_member(options, uuid::Uuid::new_v4().to_string()).await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoints.push(JournalEndpoint::Member { address: listener.local_addr().unwrap().to_string(), journal });
+            servers.push(tokio::spawn(provider.serve(listener, cancellation.clone())));
+            directories.push(directory);
+        }
+
+        for (stream, originals, copies, expected) in [
+            ("minority", 1, 0, -1), ("quorum", 2, 0, 0), ("copied", 1, 1, -1),
+        ] {
+            let ensemble = Ensemble::new(StreamConfig { servers: endpoints.clone(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
+            let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true };
+            for server in 0..3 {
+                deposed_by(1, ensemble.overwrite(server, 1, 0, Vec::new(), true).await.unwrap()).unwrap();
+                deposed_by(1, ensemble.activate(server, 1).await.unwrap()).unwrap();
+                if server < originals {
+                    let (done, durable) = oneshot::channel();
+                    let request = ensemble.append_request(1, entry.clone(), -1);
+                    ensemble.links[server].send(request, Box::new(move |reply| { let _ = done.send(reply); }));
+                    let reply = tokio::time::timeout(CALL_TIMEOUT, durable).await.unwrap().unwrap();
+                    deposed_by(1, ensemble.ack(server, reply).unwrap()).unwrap();
+                } else if server < originals + copies {
+                    let sealed = ensemble.seal(server, 2).await.unwrap();
+                    assert_eq!(sealed.last_lsn, -1);
+                    // Partial recovery can leave a newer epoch's copy without any original observation.
+                    deposed_by(2, ensemble.overwrite(server, 2, 0, vec![entry.clone()], false).await.unwrap()).unwrap();
+                }
+            }
+            assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), expected);
+        }
+
+        cancellation.cancel();
+        for server in servers { server.await.unwrap().unwrap(); }
+        drop(directories);
+    }
+
+    #[test]
+    fn an_original_without_a_sample_is_possible_but_has_no_positive_vote() {
+        let mut evidence = GuardedEvidence { possible: 2, observed: 0 };
+        evidence.record_exact(&PageDigest { original_append: Some(true), synced_clock_upper_micros: Some(10), ..Default::default() });
+        evidence.record_exact(&PageDigest { original_append: Some(true), ..Default::default() });
+        assert!(matches!(evidence.decision(2), TailDecision::Unknown));
+    }
 }

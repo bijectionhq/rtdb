@@ -2,13 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StructArray, cast::AsArray, types::{Int64Type, UInt32Type}};
-use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::EntityIdRef;
 use rtdb_text::{Query, RankScorer, stored_length};
 use rtdb_types::{Iid, Result, TemporalBounds};
 
 use super::{corrupt, meets, layout::{Table, table}, paged::{self, Block, Frequencies}, postings::Impact, rank_tree::{self, RankLeaf, RankNode, WindowIds},
-    tree_file::{DOCUMENT, DOCUMENT_ROWS, POSTING, TERM, TreeFile, term_key}};
+    tree_file::{DOCUMENT, DOCUMENT_ROWS, POSTING, TreeFile}};
 use crate::{member_bounds::{MemberStart, document_member}, rank_cutoff::RankKey, rank_windows::document_range};
 
 struct Term {
@@ -20,8 +19,8 @@ struct Term {
 type RankBlock = (Arc<Block>, Impact, WindowIds);
 
 impl Term {
-    async fn read(file: &TreeFile, column: u32, text: &str) -> Result<Option<Self>> {
-        let Some(page) = file.find(TERM, &term_key(column, text)).await? else { return Ok(None); };
+    fn read(page: Option<arrow_array::RecordBatch>, column: u32, text: &str) -> Result<Option<Self>> {
+        let Some(page) = page else { return Ok(None); };
         let terms = table(&page, Table::Terms);
         let columns = terms.column(0).as_primitive::<UInt32Type>();
         let names = terms.column(1).as_string::<i32>();
@@ -104,6 +103,7 @@ pub(crate) enum TreeRankOrder { Score, Integer, Uuid }
 pub(crate) struct TreeCandidate {
     pub iid: Iid,
     pub member: u32,
+    pub document: u32,
     pub key: RankKey,
     pub rectangles: Vec<[i64; 4]>,
 }
@@ -114,11 +114,8 @@ impl TreeRanked {
         let term_ids: BTreeMap<_, _> = matching.terms().iter().chain(scoring.scorer().query().terms())
             .collect::<BTreeSet<_>>().into_iter().enumerate().map(|(index, term)| (term.as_str(), index)).collect();
         let names = term_ids.keys().map(|term| term.to_string()).collect::<Vec<_>>();
-        let terms = futures::stream::iter(names).map(|term| {
-            let file = Arc::clone(&file);
-            async move { Term::read(&file, column as u32, &term).await }
-        })
-            .buffered(8).try_collect::<Vec<_>>().await?;
+        let pages = file.term_pages(column as u32, &names).await?;
+        let terms = pages.into_iter().zip(names).map(|(page, term)| Term::read(page, column as u32, &term)).collect::<Result<Vec<_>>>()?;
         let phrases = matching.phrases().iter().map(|phrase| phrase.iter().map(|term| term_ids[term.as_str()]).collect()).collect();
         let matching: Vec<_> = matching.terms().iter().map(|term| term_ids[term.as_str()]).collect();
         let score_terms: Vec<_> = scoring.scorer().query().terms().iter().map(|term| term_ids[term.as_str()]).collect();
@@ -329,7 +326,7 @@ impl TreeRanked {
             frequencies.clear();
             frequencies.extend(self.scoring.iter().map(|&term| in_window(term, window).map_or(0, |posting| posting.frequency(doc))));
             let score = self.scorer.scorer().score(&frequencies, stored_length(record.length as usize));
-            candidates.push(TreeCandidate { iid: record.iid, member: document_member(&self.members, doc) as u32,
+            candidates.push(TreeCandidate { iid: record.iid, member: document_member(&self.members, doc) as u32, document: doc,
                 key: self.key(score, record.id, Some(record.iid)), rectangles: record.visibility });
         }
         Ok(candidates)

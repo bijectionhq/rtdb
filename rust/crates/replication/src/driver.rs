@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
-use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, TrieCatalog};
+use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
 use rtdb_storage::{log::{LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
@@ -19,7 +19,7 @@ use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, Pro
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
-use crate::logs::{DecodedReplica, STRICT_DISPATCH_CUTOFF, replica_decode_bound};
+use crate::logs::{DecodedReplica, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::matching_present_integer;
 use crate::state::fail_pending;
@@ -34,6 +34,14 @@ pub trait DatabaseEffects: Send + Sync {
 /// Supplies UTC timestamps in Unix microseconds for replication.
 /// The driver, term appender and cloned handles can sample it concurrently.
 pub type ReplicationClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
+#[async_trait]
+pub trait ServingSearchBuilder: Send + Sync {
+    async fn prepare(&self, snapshot: Snapshot, cancellation: &CancellationToken) -> Result<Option<ServingSearch>>;
+
+    async fn seal(&self, value: &Arc<rtdb_index::PartitionValue>, table: &TableRef, trie: &TrieKey,
+        file: &std::path::Path, size: u64, cancellation: &CancellationToken) -> Result<Vec<proto::ArtefactRecord>>;
+}
 
 #[derive(Clone, Debug)]
 pub struct ReplicationConfig {
@@ -360,6 +368,7 @@ pub struct ReplicationDriver {
     config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, partition: Arc<PartitionState>, progress: Arc<ProgressMonitor>,
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
+    serving_search: Option<Arc<dyn ServingSearchBuilder>>,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
     track_catalog_cut: bool,
@@ -408,7 +417,19 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None }))
+    }
+
+    pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
+        self.serving_search = Some(builder);
+        self
+    }
+
+    async fn apply_transaction(&mut self, write: &StagedWrite) -> Result<()> {
+        let Some(builder) = &self.serving_search else { return self.partition.apply(write); };
+        let prepared = self.partition.prepare_write(write)?;
+        let search = builder.prepare(prepared.snapshot(), &self.cancellation).await?;
+        self.partition.install_write(prepared, search)
     }
     pub async fn run(mut self) -> Result<()> {
         let result = self.run_inner().await;
@@ -514,7 +535,7 @@ impl ReplicationDriver {
                 Event::Appender(result) => {
                     if let Some(leader) = &mut self.leader { leader.job = None; }
                     match result {
-                        Err(error) if error.code == STRICT_DISPATCH_CUTOFF => {
+                        Err(error) if matches!(error.code.as_str(), STRICT_DISPATCH_CUTOFF | STRICT_DISPATCH_UNAVAILABLE) => {
                             // Drop the speculative suffix before the source can be resolved again.
                             for held in self.demote().await? { self.apply_admitted(held).await?; }
                             self.start_claim()?;
@@ -962,9 +983,10 @@ impl ReplicationDriver {
                         let head = leader.resolver_mut()?.take_head();
                         let (pending, expected) = leader.pending_tx_at(record.envelope.term_sequence).ok_or_else(|| readback_mismatch(message.tx_id))?;
                         let pending = Arc::clone(pending);
+                        let expected = Arc::clone(expected);
                         let applied: Result<_> = async {
-                            let head = head.filter(|head| Arc::ptr_eq(head, expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
-                            self.partition.apply(head.writes())?;
+                            let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
+                            self.apply_transaction(head.writes()).await?;
                             if head.result().committed() && let Some(operation) = head.db_op() {
                                 self.effects.apply_db_op(operation).await?;
                             }
@@ -991,7 +1013,7 @@ impl ReplicationDriver {
                         }
                         let value = self.partition.value();
                         let rtdb_tx::ReplayedTransaction { writes, result, placed_attempt } = rtdb_tx::decode_replica(message, value.live().latest_completed_tx(), value.live().block_index(), &self.resolve.memory)?;
-                        self.partition.apply(&writes)?;
+                        self.apply_transaction(&writes).await?;
                         if !leading && message.committed.unwrap_or(false) {
                             if let Some(operation) = &message.db_op {
                                 if let Err(error) = self.effects.apply_db_op(operation).await { if !error.is_caller_error() { return Err(error); } }
@@ -1112,10 +1134,13 @@ impl ReplicationDriver {
         let boundary = pending.boundary.clone();
         let databases = self.effects.secondary_databases()?;
         let blocks = Arc::clone(&self.blocks);
+        let search = self.serving_search.clone();
         let leader = self.leader.as_mut().ok_or_else(|| invalid("Follower attempted block production"))?;
         if leader.production.is_some() { return Err(invalid("Block production is already running")); }
         let cancellation = leader.cancellation.clone();
-        leader.production = Some(Production::Writing(Box::pin(async move { blocks.produce_cancellable(&prepared, &boundary, databases, &cancellation).await })));
+        leader.production = Some(Production::Writing(Box::pin(async move {
+            blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref()).await
+        })));
         Ok(())
     }
     async fn production_finished(&mut self, result: ProductionResult) -> Result<()> {
@@ -1386,8 +1411,8 @@ fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::S
     let mut rejected = BTreeSet::new();
     for entry in entries {
         let (Ok(key), Some(record)) = (entry.trie_key.as_deref().unwrap_or_default().parse::<TrieKey>(), &entry.record) else { continue };
-        if catalog.trie(&table, &key).is_some_and(|trie| trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
         let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, record) else { continue };
+        if catalog.trie(&table, &key).is_some_and(|trie| trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
         if owner.tries().iter().any(|member| member != &key && catalog.trie(&table, member).is_some()) { continue; }
         if let Some(object) = slug.as_ref().and_then(|slug| slug.owner_artefact_key(&owner, record.kind(), record.definition_id(), record.definition_version()).ok()).and_then(|key| rtdb_storage::ObjectKey::new(key).ok()) {
             rejected.insert(object);

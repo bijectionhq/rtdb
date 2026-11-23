@@ -26,7 +26,7 @@ impl From<&Sealed> for Holding {
 }
 
 impl Holding {
-    fn epoch_at(&self, lsn: i64) -> Option<u64> {
+    pub(super) fn epoch_at(&self, lsn: i64) -> Option<u64> {
         if lsn <= self.trim || lsn > self.last { return None; }
         self.runs.iter().rev().find(|run| run.start_lsn <= lsn).map(|run| run.epoch)
     }
@@ -35,6 +35,12 @@ impl Holding {
         debug_assert_eq!(lsn, self.last + 1);
         if self.runs.last().is_none_or(|run| run.epoch != epoch) { self.runs.push(EpochRun { start_lsn: lsn, epoch }); }
         self.last = lsn;
+    }
+
+    pub(super) fn discard_last(&mut self) {
+        debug_assert!(self.last > self.trim);
+        self.last -= 1;
+        if self.runs.last().is_some_and(|run| run.start_lsn > self.last) { self.runs.pop(); }
     }
 
     fn trimmed_through(&self, through: i64) -> Self {
@@ -91,7 +97,7 @@ mod tests {
     fn a_server_partly_copied_by_a_dead_recovery_still_wins_over_a_staler_one() {
         use crate::protocol::{Entry, ResponseBody};
         use crate::server::state::StreamState;
-        let entry = |lsn: i64| Entry { lsn, epoch: 1, timestamp: lsn, payload: Default::default() };
+        let entry = |lsn: i64| Entry { lsn, epoch: 1, timestamp: lsn, ..Default::default() };
         let sealed = |state: &mut StreamState, epoch: u64| match state.seal(epoch).reply { ResponseBody::Sealed(sealed) => sealed, other => panic!("{other:?}") };
         let synced_at_1 = |lsns: std::ops::RangeInclusive<i64>| {
             let mut state = StreamState::default();

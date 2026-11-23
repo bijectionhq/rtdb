@@ -170,7 +170,8 @@ fn search_write_format_defaults_to_tantivy_and_accepts_only_supported_versions()
     assert_eq!(configured("search: {writeFormat: 12}"), SearchFileFormat::Arrow);
     assert_eq!(configured("search: {writeFormat: 13}"), SearchFileFormat::Paged);
     assert_eq!(configured("search: {writeFormat: 14}"), SearchFileFormat::Tree);
-    assert!(decode("search: {writeFormat: 15}").is_err());
+    assert_eq!(configured("search: {writeFormat: 15}"), SearchFileFormat::Packed);
+    assert!(decode("search: {writeFormat: 16}").is_err());
 }
 
 

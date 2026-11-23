@@ -1295,6 +1295,8 @@ rule LeaderUploadsBlockOnBoundary {
     -- By log order the durable live index now holds exactly this block's transactions and no more — which is precisely what the block-cut pause buys: nothing was resolved and applied between the boundary and here, so a durable L0 block never contains rows from a later block.
     --
     -- The block is held from here, and the adopt waits for an upload of it to come back (LeaderAdoptsOwnBlock).
+    -- Native format 15 writers upload admitted L0 search files before checkpointing the block that receives them.
+    -- The per-table checkpoint holds the search receipts with their primary tries, so adoption and restart restore the same coverage.
     when: ApplyOwnRecord(record)
     requires: record.kind = BlockBoundaryMessage
 

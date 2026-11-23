@@ -171,6 +171,10 @@ pub struct TableBlock {
 
 impl PartialEq for TableBlock { fn eq(&self, other: &Self) -> bool { self.wire == other.wire } }
 
+impl TrieDetails {
+    pub fn encoded_size(&self) -> usize { self.encoded_len() }
+}
+
 impl TableBlock {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let wire = pb::TableBlock::decode(bytes).map_err(invalid)?;

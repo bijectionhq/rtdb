@@ -4,10 +4,11 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeBinaryArray, Float64Array, Int64Array, builder::FixedSizeBinaryBuilder};
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_index::Snapshot;
+use rtdb_format::keys::TrieKey;
+use rtdb_index::{RowSource, Snapshot};
 use rtdb_plan::{ColumnId, Expr, Scan, Schema};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Iid, Result, TemporalBounds, Value};
+use rtdb_types::{Iid, Result, RowVersion, TemporalBounds, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::context::Execution;
@@ -64,8 +65,83 @@ impl ScanRequest<'_> {
 pub trait CandidateVerifier: Send + Sync {
     fn permits_search_witness(&self) -> bool { false }
 
+    fn partition_ranking(&self) -> Option<&PartitionRanking> { None }
+
     /// Resolves the scan, applies its predicates, and scores each surviving UTF-8 cell.
     async fn score_visible(&self, iids: BTreeSet<Iid>, column: ColumnId, ascending_id: Option<ColumnId>, scorer: &rtdb_text::Scorer) -> Result<CandidateScores>;
+
+    async fn score_resolved(&self, _rows: Vec<ResolvedSearchRow>, _column: ColumnId, _ascending_id: Option<ColumnId>,
+        _scorer: &rtdb_text::Scorer) -> Result<Option<CandidateScores>> { Ok(None) }
+}
+
+pub struct PartitionRanking {
+    winners: parking_lot::Mutex<PartitionWinners>,
+    memory: Arc<MemoryBudget>,
+}
+
+#[derive(Default)]
+struct PartitionWinners {
+    keys: BTreeSet<ScoredIid>,
+    scores: BTreeMap<Iid, f64>,
+    charge: Option<Arc<MemoryReservation>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ScoredIid { iid: Iid, score: f64 }
+
+impl Eq for ScoredIid {}
+impl PartialOrd for ScoredIid {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for ScoredIid {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score.total_cmp(&other.score).then_with(|| self.iid.cmp(&other.iid))
+    }
+}
+
+impl PartitionRanking {
+    pub(crate) fn new(memory: Arc<MemoryBudget>) -> Self { Self { winners: Default::default(), memory } }
+
+    pub fn add_verified(&self, limit: usize, rows: impl IntoIterator<Item = (Iid, f64)>) {
+        if !(1..=4096).contains(&limit) { return; }
+        let mut winners = self.winners.lock();
+        if winners.charge.is_none() {
+            let Ok(charge) = self.memory.reserve(256 + limit * 160) else { return; };
+            winners.charge = Some(charge);
+        }
+        for (iid, score) in rows {
+            if !score.is_finite() { continue; }
+            let score = if score == 0.0 { 0.0 } else { score };
+            if let Some(&previous) = winners.scores.get(&iid) {
+                if previous >= score { continue; }
+                winners.keys.remove(&ScoredIid { iid, score: previous });
+            }
+            winners.scores.insert(iid, score);
+            winners.keys.insert(ScoredIid { iid, score });
+            if winners.keys.len() > limit {
+                let removed = winners.keys.pop_first().expect("ranking exceeded its limit");
+                winners.scores.remove(&removed.iid);
+            }
+        }
+    }
+
+    pub fn cutoff(&self, limit: usize) -> Option<f64> {
+        let winners = self.winners.lock();
+        (winners.keys.len() == limit).then(|| winners.keys.first().map(|key| key.score)).flatten()
+    }
+}
+
+#[derive(Clone)]
+pub enum SearchRowLocation {
+    Persisted { trie: TrieKey, page: u32, row: u32 },
+    Live(RowSource),
+}
+
+#[derive(Clone)]
+pub struct ResolvedSearchRow {
+    pub version: RowVersion,
+    pub location: SearchRowLocation,
+    pub visibility: TemporalBounds,
 }
 
 #[derive(Clone)]
@@ -261,5 +337,22 @@ impl ConstantEvaluator for ExecutionConstants<'_> {
         if !matches!(expression, Expr::Literal(_) | Expr::Parameter { .. }) { return Ok(None); }
         let scope = self.0.scope()?;
         Ok(Some(self.0.evaluate(&scope, expression, &Schema::default(), &[]).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_cutoff_counts_distinct_finite_winners_from_each_partition() {
+        let ranking = PartitionRanking::new(MemoryBudget::new(4096));
+        let (first, second, third) = (Iid([1; 16]), Iid([2; 16]), Iid([3; 16]));
+        ranking.add_verified(2, [(first, 3.0), (first, 4.0), (second, f64::NAN)]);
+        assert_eq!(ranking.cutoff(2), None);
+        ranking.add_verified(2, [(second, -0.0)]);
+        assert_eq!(ranking.cutoff(2).unwrap().to_bits(), 0.0f64.to_bits());
+        ranking.add_verified(2, [(third, 5.0), (first, 2.0)]);
+        assert_eq!(ranking.cutoff(2), Some(4.0));
     }
 }

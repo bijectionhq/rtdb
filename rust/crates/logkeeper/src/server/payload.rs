@@ -42,6 +42,7 @@ pub(crate) struct Item {
     pub lsn: i64,
     pub epoch: u64,
     pub timestamp: i64,
+    pub guarded: bool,
     pub source: Source,
 }
 

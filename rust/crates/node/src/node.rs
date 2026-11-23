@@ -78,7 +78,7 @@ pub(crate) struct HostedSourceReceipt {
     pub(crate) applied: Option<TransactionKey>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchFileFormat { Tantivy, Arrow, Paged, Tree }
+pub enum SearchFileFormat { Tantivy, Arrow, Paged, Tree, Packed }
 
 fn default_search(_format: SearchFileFormat) -> SearchServices {
     #[cfg(feature = "search")] {
@@ -88,6 +88,7 @@ fn default_search(_format: SearchFileFormat) -> SearchServices {
             SearchFileFormat::Arrow => rtdb_search::SearchRuntime::with_paged_files(bytes, false),
             SearchFileFormat::Paged => rtdb_search::SearchRuntime::with_paged_files(bytes, true),
             SearchFileFormat::Tree => rtdb_search::SearchRuntime::with_tree_files(bytes),
+            SearchFileFormat::Packed => rtdb_search::SearchRuntime::with_search_packs(bytes),
         };
         SearchServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()] }
     }
@@ -2853,7 +2854,7 @@ impl NativeSession {
             || fork.root.as_ref().and_then(|section| section.publication.as_ref()).is_some_and(|root| {
                 root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                    | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                    | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                     _ => true,
                 })
             })
@@ -2957,7 +2958,7 @@ impl NativeSession {
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
-                | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
+                | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                 _ => true,
             }) {
                 return Err(unavailable());
@@ -2977,7 +2978,8 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
-            let standing = !proposal_overlay && matches!(&section.effect, OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_));
+            let standing = !proposal_overlay && matches!(&section.effect,
+                OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop);
             if !worlds.insert(section.world)
                 || (section.checks.is_empty() && !standing && !retained_release && !terminal_proposal && !proposal_close)
                 || section.checks.len() > 128

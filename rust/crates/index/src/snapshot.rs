@@ -49,6 +49,7 @@ impl Snapshot {
         self.catalog_read.as_ref().map(|read| Arc::clone(&read._permit))
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
+    pub fn serving_search<T: std::any::Any>(&self) -> Option<&T> { self.durable.search.as_ref()?.get() }
     /// Whether a transaction's own uncommitted writes are layered over this snapshot.
     pub fn has_overlays(&self) -> bool { !self.layered.is_empty() }
     pub fn system_time_cap(&self) -> Option<Timestamp> { self.system_time_cap }
@@ -72,6 +73,7 @@ impl Snapshot {
     }
     pub fn block_index(&self) -> BlockIndex { self.durable.block_index() }
     pub fn trie_catalog(&self) -> &TrieCatalog { &self.trie_catalog }
+    pub fn trie_catalog_ref(&self) -> &Arc<TrieCatalog> { &self.trie_catalog }
     pub fn table_catalog(&self) -> &TableCatalog { &self.table_catalog }
     pub fn table_entry(&self, table: &TableRef) -> Option<&TableEntry> { self.table_catalog.entry(table) }
     pub fn trie_entries(&self, table: &TableRef) -> Vec<&CatalogTrie> { self.trie_catalog.current_tries(table) }

@@ -42,6 +42,7 @@ impl Payload for Bytes {
 pub struct Held<P = Bytes> {
     pub epoch: u64,
     pub timestamp: i64,
+    pub guarded: bool,
     pub payload: P,
     pub(super) observed_sync: Option<Arc<OnceLock<i64>>>,
 }
@@ -134,13 +135,21 @@ impl<P: Payload> StreamState<P> {
         self.entries.get_mut((lsn - self.trim - 1) as usize)
     }
 
-    pub(super) fn sync_observation(&self, lsn: i64) -> Option<Arc<OnceLock<i64>>> {
+    pub(super) fn held(&self, lsn: i64) -> Option<&Held<P>> {
         if lsn <= self.trim { return None; }
-        self.entries.get((lsn - (self.trim + 1)) as usize)?.observed_sync.clone()
+        self.entries.get((lsn - (self.trim + 1)) as usize)
+    }
+
+    pub(super) fn guarded_at_seal(&self, epoch: u64, lsn: i64) -> bool {
+        self.promised == epoch && self.held(lsn).is_some_and(|held| held.guarded && held.epoch < epoch)
+    }
+
+    pub(super) fn sync_observation(&self, lsn: i64) -> Option<Arc<OnceLock<i64>>> {
+        self.held(lsn)?.observed_sync.clone()
     }
 
     pub(super) fn track_sync(&mut self, lsn: i64, observation: Arc<OnceLock<i64>>) -> bool {
-        let Some(held) = self.held_mut(lsn).filter(|held| held.observed_sync.is_none()) else { return false; };
+        let Some(held) = self.held_mut(lsn).filter(|held| held.guarded && held.observed_sync.is_none()) else { return false; };
         held.observed_sync = Some(observation);
         self.retained_bytes += SYNC_OBSERVATION_OVERHEAD;
         true
@@ -168,7 +177,7 @@ impl<P: Payload> StreamState<P> {
             }
             Event::Append(entry) => {
                 self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
-                    payload: P::decided(&entry.payload), observed_sync: None });
+                    guarded: entry.guarded, payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
             Event::Trim(through) => {
@@ -223,6 +232,13 @@ impl<P: Payload> StreamState<P> {
         self.persist(events, Self::accepted)
     }
 
+    pub(super) fn append_observed(&mut self, epoch: u64, first: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32]) -> Decision {
+        if !self.writer_authority().confirms(epoch, ensemble) {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        self.append(epoch, first, entries, commit)
+    }
+
     pub fn overwrite(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
         if self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }
@@ -237,6 +253,13 @@ impl<P: Payload> StreamState<P> {
         let own = |held: &Held<P>| held.epoch == epoch;
         if from <= self.last() && (self.synced == Some(epoch) || self.entries.iter().skip((from - self.trim - 1) as usize).any(own)) {
             return invalid(format!("an overwrite at epoch {epoch} from {from} would drop entries its own writer placed, up to {}", self.last()));
+        }
+        // The same entry already held here is never repaired by replacing it.
+        // That would turn this journal's original append into a copy.
+        if from <= self.last() && entries.iter().any(|entry| {
+            self.held(entry.lsn).is_some_and(|held| held.epoch == entry.epoch && held.observed_sync.is_some())
+        }) {
+            return invalid("an overwrite would replace the original guarded append with a copy");
         }
         let mut events = Vec::new();
         if epoch > self.promised { events.push(Event::Promise(epoch)); }
@@ -322,6 +345,7 @@ impl<P: Payload> StreamState<P> {
             last_lsn: self.last(),
             commit_lsn: self.commit,
             runs: self.runs(),
+            guarded_tail: self.entries.back().is_some_and(|entry| entry.guarded),
         })
     }
 
@@ -346,7 +370,7 @@ impl<P: Payload> StreamState<P> {
 #[cfg(any(test, feature = "simulation"))]
 impl StreamState<Bytes> {
     pub fn entries(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Entries {
-        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload: held.payload.clone() });
+        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload: held.payload.clone() });
         Entries { entries: window.items, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn }
     }
 }
@@ -355,7 +379,7 @@ impl StreamState<Bytes> {
 mod tests {
     use super::*;
 
-    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
+    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
 
     fn synced(epoch: u64) -> StreamState {
         let mut state = <StreamState>::default();
@@ -376,6 +400,19 @@ mod tests {
         assert_eq!(reply(state.append(1, 0, vec![entry(0, 1), entry(1, 1)], -1)), ResponseBody::Accepted(Accepted { last_lsn: 1, commit_lsn: -1 }));
         assert_eq!(reply(state.append(1, 3, vec![entry(3, 1)], -1)), ResponseBody::Refused(Refused { promised: 1, last_lsn: 1 }), "a gap");
         assert_eq!(reply(state.append(1, 1, vec![entry(1, 1)], -1)), ResponseBody::Refused(Refused { promised: 1, last_lsn: 1 }), "a repeat");
+    }
+
+    #[test]
+    fn an_observed_append_requires_this_ensemble_at_the_current_activation() {
+        let mut state = synced(1);
+        let guarded = Entry { guarded: true, ..entry(0, 1) };
+        assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [1; 32])), ResponseBody::Refused(_)));
+        state.activate(1, [1; 32]);
+        assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [2; 32])), ResponseBody::Refused(_)));
+        assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [1; 32])), ResponseBody::Accepted(_)));
+        state.seal(2);
+        let next = Entry { lsn: 1, ..guarded };
+        assert!(matches!(reply(state.append_observed(1, 1, vec![next], 0, [1; 32])), ResponseBody::Refused(Refused { promised: 2, .. })));
     }
 
     #[test]

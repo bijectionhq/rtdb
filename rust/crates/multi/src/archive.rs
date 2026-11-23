@@ -45,7 +45,10 @@ use rtdb_storage::{
     IoRegion,
     ObjectKey,
     ObjectObservation,
+    ObjectReadAllocation,
     ObjectStore,
+    ReadReservation,
+    RetainedBytes,
 };
 use rtdb_types::{
     Anomaly,
@@ -317,7 +320,20 @@ impl ArchivedCheckpoint {
         }))
     }
 
-    pub(crate) fn supports_audience_reads(&self) -> bool { self.audience_transport }
+    pub(crate) fn supports_audience_reads(&self) -> bool {
+        self.audience_transport
+    }
+
+    fn has_legacy_trie_data(&self) -> bool {
+        self.objects.iter().any(|(name, object)| object.is_legacy_trie(name))
+    }
+
+    fn require_transferable(&self) -> Result<()> {
+        if self.has_legacy_trie_data() {
+            return Err(unavailable("Cell transfer requires framed trie data in the selected serving archive"));
+        }
+        Ok(())
+    }
 
     async fn read_plaintext(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
         object.require_audience_frame(name)?;
@@ -365,7 +381,7 @@ impl ArchivedCheckpoint {
             Err(_) if crate::cipher::object::framed(name) => self.serving_cipher.open(name.as_str(), original)?,
             result => result?,
         };
-        if object.bytes != crate::cipher::object::sealed_size(name, plaintext.len())? as u64 { return Ok(false); }
+        if object.plaintext_bytes(name)? != plaintext.len() as u64 { return Ok(false); }
         Ok(self.read_plaintext(name, object).await? == plaintext)
     }
 
@@ -420,6 +436,33 @@ impl ArchivedCheckpoint {
     }
 }
 
+pub(crate) async fn require_transferable_serving_archive(
+    directory: &dyn Directory, keys: &dyn KeyService, source: &DeploymentRecord,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
+) -> Result<Option<Uuid>> {
+    let Some(selected) = serving_archive(source)? else { return Ok(None); };
+    let archive = selected.media()?;
+    let operation = selected.point.operation;
+    Box::pin(stage::with_region(
+        directory, keys, &source.id, &archive, hosted_task, Some((operation, None)), None,
+        |current| {
+            if current.lifecycle != Lifecycle::Live || current.epoch != source.epoch
+                || current.storage_prefix() != source.storage_prefix()
+                || serving_archive(current)?.as_ref() != Some(&selected)
+            {
+                return Err(inconsistent("The source changed before verifying archive transfer"));
+            }
+            Ok(None)
+        },
+        |record, owner, io| Box::pin(async move {
+            let retained = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io, false)).await?
+                .ok_or_else(|| inconsistent("The transfer lost its admitted serving archive"))?;
+            retained.require_transferable()?;
+            Ok(Some(operation))
+        }),
+    )).await
+}
+
 /// Transfer the repair overlay under a temporary admission in its original
 /// custody. The destination uses its separate publication region.
 pub(crate) async fn materialize_serving_archive(
@@ -450,6 +493,7 @@ pub(crate) async fn materialize_serving_archive(
         |record, owner, io| Box::pin(async move {
             let repair = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io, false)).await?
                 .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
+            repair.require_transferable()?;
             Box::pin(repair.materialize(target, destination)).await
         }),
     )).await
@@ -463,9 +507,13 @@ struct CheckpointStore {
 #[async_trait::async_trait]
 impl ObjectStore for CheckpointStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool {
+        !self.archive.objects.contains_key(key) && self.serving.supports_scan_ranges(key)
+    }
+
+    fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool {
         match self.archive.objects.get(key) {
-            Some(object) => crate::cipher::object::framed(key) && object.frame_header_sha256.is_some(),
-            None => self.serving.supports_scan_ranges(key),
+            Some(object) => object.frame_header_sha256.is_some() && self.archive.files.supports_observed_scan_ranges(key),
+            None => self.serving.supports_observed_scan_ranges(key),
         }
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
@@ -521,10 +569,19 @@ impl ObjectStore for CheckpointStore {
         let Some(object) = self.archive.objects.get(key) else {
             return self.serving.observe_range(key, range).await;
         };
-        if crate::cipher::object::framed(key) {
+        if object.frame_header_sha256.is_some() {
             self.archive.observe_frame_range(key, object, range).await
         } else {
-            Ok(ObjectObservation { value: self.get_range(key, range).await?, version: None })
+            let length = object.serving_bytes(key)?;
+            if range.start > range.end || range.end > length {
+                return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
+            }
+            let length = usize::try_from(length).map_err(|_| Error::ConflictingObject(key.to_string()))?;
+            let observed = self.observe_fresh_exact(key, length).await?;
+            Ok(ObjectObservation {
+                value: Bytes::copy_from_slice(&observed.value[range.start as usize..range.end as usize]),
+                version: observed.version,
+            })
         }
     }
 
@@ -540,11 +597,38 @@ impl ObjectStore for CheckpointStore {
         }
     }
 
+    fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        let Some(object) = self.archive.objects.get(key) else { return self.serving.whole_object_allocation(key, length); };
+        if object.serving_bytes(key)? != length as u64 { return Err(Error::ConflictingObject(key.to_string())); }
+        let scratch_bytes = usize::try_from(object.bytes).ok().and_then(|size| size.checked_mul(3))
+            .ok_or_else(|| Error::Task("Archive object allocation size overflow".into()))?;
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes })
+    }
+
+    async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        if !self.archive.objects.contains_key(key) { return self.serving.get_reserved_object(key, reservation).await; }
+        if !reservation.covers(&self.whole_object_allocation(key, reservation.length())?) {
+            return Err(Error::Closed("Archive object read has no scratch reservation".into()));
+        }
+        let serving = reservation.retaining_io(self.get(key)).await?;
+        reservation.finish(serving)
+    }
+
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         match self.archive.objects.get(key) {
             Some(object) => self.archive.seal_for_serving(key, object).await,
             None => self.serving.get_fresh(key).await,
         }
+    }
+
+    async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        let Some(object) = self.archive.objects.get(key) else {
+            return self.serving.get_reserved_range(key, range, reservation).await;
+        };
+        if range != (0..object.serving_bytes(key)?) {
+            return Err(Error::Closed("Archive ciphertext needs a whole-object reservation".into()));
+        }
+        self.get_reserved_object(key, reservation).await
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
@@ -561,7 +645,7 @@ impl ObjectStore for CheckpointStore {
             });
         }
         let bytes = self.archive.seal_for_serving(key, object).await?;
-        Ok(bytes.slice(range.start as usize..range.end as usize))
+        Ok(Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]))
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
@@ -2153,7 +2237,7 @@ pub(crate) async fn restore_checkpoint(
         .ok_or_else(|| inconsistent("Missing the accepted checkpoint restore"))?;
     await_storage_drain(directory, storage, keys, &fenced).await?;
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
-    let sealed = rtdb_logkeeper::seal(&source, pending.epoch).await?;
+    let sealed = rtdb_logkeeper::seal_recover_committed(&source, pending.epoch).await?;
     let cutoff = ReplicaPosition::from_epoch_offset(StorageEpoch(fenced.log_epoch), sealed.0)?;
     if cutoff.0 < pending.checkpoint.boundary {
         return Err(inconsistent("The sealed replica history ends before the archived checkpoint"));
@@ -2562,6 +2646,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_legacy_replay_archive_still_serves_its_exact_recovery_inventory() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let raw: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
+        let files = PrefixedStore::new(raw.clone(), "capture/objects");
+        let material = [3; crate::keys::KEY_BYTES];
+        let archive_cipher = Cipher::new(&material)?;
+        let mut objects = BTreeMap::new();
+        for (name, plaintext) in &fixture.files {
+            let sealed = archive_cipher.seal_deterministic(name.as_str(), plaintext)?;
+            objects.insert(name.clone(), ArchivedObject {
+                name: name.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None,
+            });
+            files.put(name, sealed).await?;
+        }
+        let capture = Capture { point: fixture.point, format: CheckpointContents::Replay, objects: objects.values().cloned().collect() };
+        let encoded = encode(&capture)?;
+        let loaded = serde_json::from_slice::<Capture>(&encoded).unwrap();
+        assert_eq!(encode(&loaded)?, encoded);
+        let archive_cipher = crate::keys::legacy_archive_key(&material)?;
+        loaded.verify(raw, "capture", &archive_cipher).await?;
+
+        let serving_material = [7; crate::keys::KEY_BYTES];
+        let archive = ArchivedCheckpoint { files, audience_transport: false, objects, archive_cipher,
+            serving_cipher: Cipher::new(&serving_material)? };
+        let name = &fixture.retained[0];
+        let expected = &fixture.files[name];
+        let legacy = archive.serving_cipher.seal_deterministic(name.as_str(), expected)?;
+        assert!(archive.matches_original(name, &legacy).await?);
+        assert!(!archive.supports_audience_reads());
+        let transfer = archive.require_transferable().unwrap_err();
+        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires framed trie data in the selected serving archive"));
+        let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
+        let plaintext = EncryptingStore::new(serving.clone(), &serving_material)?;
+        assert!(!plaintext.supports_scan_ranges(name));
+        assert!(plaintext.whole_object_allocation(name, expected.len())?.scratch_bytes > expected.len());
+        assert_eq!(plaintext.observe_head(name).await?.value.size, expected.len() as u64);
+        assert_eq!(plaintext.observe_fresh_exact(name, expected.len()).await?.value, *expected);
+        assert!(plaintext.get_range(name, 0..3).await.is_err());
+        assert_eq!(plaintext.get(name).await?, *expected);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = rtdb_storage::disk_cache::DiskCache::open(directory.path(), 1 << 20,
+            rtdb_columnar::MemoryBudget::new(1 << 20))?;
+        let cached = cache.scope(key("live-envelope")?, serving)?;
+        assert_eq!(EncryptingStore::new(cached, &serving_material)?.get(name).await?, *expected);
+        let expected_inventory = rtdb_storage::MemoryStore::default();
+        for (name, bytes) in &fixture.files { expected_inventory.put(name, bytes.clone()).await?; }
+        assert_eq!(
+            recovery_manifest_sha256(&plaintext, loaded.point.checkpoint, StorageEpoch(0)).await?,
+            recovery_manifest_sha256(&expected_inventory, loaded.point.checkpoint, StorageEpoch(0)).await?,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_legacy_archive_range_observation_carries_its_authenticated_version() -> Result<()> {
+        let name = key("tables/t/data/l00-rc-b00.arrow")?;
+        let provider = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let files = PrefixedStore::new(provider, "capture/objects");
+        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
+        let serving_cipher = Cipher::new(&[7; crate::keys::KEY_BYTES])?;
+        let original = archive_cipher.seal_deterministic(name.as_str(), b"retained rows")?;
+        files.put(&name, original.clone()).await?;
+        let version = files.observe_head(&name).await?.version.unwrap();
+        let expected = serving_cipher.seal_object(&name, b"retained rows")?;
+        let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
+        let archive = ArchivedCheckpoint { files, audience_transport: false, archive_cipher, serving_cipher,
+            objects: BTreeMap::from([(name.clone(), ArchivedObject {
+                name: name.to_string(), bytes: original.len() as u64, sha256: digest(&original), frame_header_sha256: None,
+            })]) };
+        let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
+        assert!(!serving.supports_scan_ranges(&name) && !serving.supports_observed_scan_ranges(&name));
+        let observed = serving.observe_range(&name, 0..8).await?;
+        assert_eq!(observed.version, Some(version));
+        assert_eq!(observed.value, expected.slice(..8));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn serving_recovery_manifest_requires_the_complete_inventory_and_stable_versions() -> Result<()> {
         let fixture = replay_fixture()?;
         let store = crate::packing::tests::VersionedPacks::default();
@@ -2715,7 +2877,10 @@ mod tests {
                 archive_cipher: Arc::clone(&archive_cipher),
                 serving_cipher: Cipher::new(&material)?,
             };
-            EncryptingStore::new(archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default())), &material)
+            let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
+            assert!(!serving.supports_scan_ranges(&name));
+            assert!(serving.supports_observed_scan_ranges(&name));
+            EncryptingStore::new(serving, &material)
         };
         let range = FRAME_BYTES - 11..FRAME_BYTES + 17;
         let store = read(archived.clone())?;

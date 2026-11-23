@@ -472,10 +472,21 @@ contract LogService {
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
 
     @invariant GuardedSyncObservationsFollowTheOriginalAppend
+        -- A guarded record's durable frame records whether it was originally appended here or copied.
         -- A journal samples its clock after the durable sync containing an original guarded append.
         -- It persists the sample with that exact retained entry before replying.
         -- Compaction preserves the sample and a replacement or copied entry starts without one.
         -- An audit can bound the first quorum sync for one entry only with matching samples from a write quorum, under the installed clock bounds.
+
+    @invariant GuardedTailRequiresOriginalQuorum
+        -- A guarded append owns the pending tip in an identified, intersecting ensemble.
+        -- Each original append requires this ensemble's activation in the same journal decision as the epoch and position checks.
+        -- The owner first attests an exact quorum of original appends, then durably records its decision on a write quorum before release.
+        -- Copies preserve the admission kind but supply no original reply or observation.
+        -- A sealed tip can be recovered from a durable commit witness or original observations for the exact record on a write quorum.
+        -- Recovery drops the guarded tip only if surviving and unobserved holders combined could not have supplied a quorum.
+        -- A journal proved to hold only an exact copy is excluded from that upper bound. An original with a missing sample is still possible.
+        -- If neither decision follows from the evidence, the successor remains closed and the outcome stays unknown.
 
     @invariant SealIsAPromise
         -- A seal at epoch e durably raises the server's promised epoch for the deployment to at least e, and returns the epoch it is synced at, its last lsn, and the epoch of every record above the deployment's trim point.
@@ -485,7 +496,8 @@ contract LogService {
 
     @invariant NothingCommittedIsLost
         -- Every record committed in a loglet is held by at least one server of any seal quorum of that loglet.
-        --   So recovery from a seal quorum can always find it (RecoverTail).
+        -- Recovery can always locate a committed record from a seal quorum (RecoverTail).
+        -- Certifying an unsettled guarded tip can also require journals outside that sealing quorum.
 
     @invariant ReadsAreDemultiplexed
         -- A read or subscription for one deployment is served from that deployment's own index and returns only its records.
@@ -2842,6 +2854,10 @@ rule RetainServingReplayArchive {
     -- A parked root can select an independently verified replay capture of its exact current checkpoint.
     -- The installation publishes the capture and the recovery inventory digest observed in its archive custody together.
     -- A new region opens that source under its own admission before rechecking the published inventory.
+    -- A retained capture preserves its accepted manifest and envelope for each object.
+    -- A capture with whole-object authenticated trie data supplies the same logical contents through a bounded whole-object read after framed writes begin.
+    -- The source retains its residence while its selected capture still requires an envelope conversion for cell transfer.
+    -- A held stage can serve whole-object reads before conversion, and requires the current serving envelope before terminal transfer.
     -- Later captures can inherit the admitted source and a newer verified checkpoint can replace it.
     -- A completed restore can advance to a newer replay capture after the root parks at that checkpoint.
     -- A superseded archive stays available to readers admitted under its identity until their work drains.

@@ -89,6 +89,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
     let replay_directory = Arc::clone(&directory);
     let hosted_task_for_write = hosted_task.clone();
     with_stage(directory, storage, keys, selector, hosted_task, |authority, record, verified| async move {
+        verified.require_serving_envelope()?;
         if verified.contents != CheckpointContents::Replay
             || record.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
             || authority.stage != terminal.fence.destination

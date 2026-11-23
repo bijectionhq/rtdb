@@ -8,11 +8,11 @@ use arrow_buffer::Buffer;
 use arrow_ipc::{MetadataVersion, reader::FileDecoder};
 use parking_lot::Mutex;
 use futures::{StreamExt, TryStreamExt};
-use rtdb_storage::{ObjectKey, cache::BufferPool};
+use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
 use rtdb_types::Result;
 use tokio::sync::OnceCell;
 
-use super::{TREE_FORMAT_VERSION, corrupt, fault, layout::{PageRef, Table, Writer, schema, table}};
+use super::{corrupt, fault, layout::{PageRef, Table, Writer, schema, table}};
 
 const FANOUT: usize = 128;
 const MAX_HEIGHT: u8 = 8;
@@ -84,6 +84,39 @@ pub(super) struct Child {
     pub lower: Vec<u8>,
     pub upper: Vec<u8>,
     pub page: PageRef,
+}
+
+pub(super) fn inline_routes(routes: &[(u8, Child)]) -> Result<StructArray> {
+    let mut lower = BinaryBuilder::new();
+    let mut upper = BinaryBuilder::new();
+    for (_, child) in routes {
+        lower.append_value(&child.lower);
+        upper.append_value(&child.upper);
+    }
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(UInt8Array::from_iter_values(routes.iter().map(|(kind, _)| *kind))),
+        Arc::new(lower.finish()), Arc::new(upper.finish())];
+    columns.extend(locator_columns(routes.iter().map(|(_, child)| child.page))?);
+    Table::Routes.array(columns)
+}
+
+pub(super) fn read_inline_routes(root: &RecordBatch, directories: &BTreeMap<u8, DirectoryRef>) -> Result<BTreeMap<u8, Vec<Child>>> {
+    let routes = table(root, Table::Routes);
+    if routes.len() > 48 || routes.columns().iter().any(|column| column.null_count() != 0) {
+        return Err(corrupt("Search root has an invalid inline directory"));
+    }
+    let (kinds, lower, upper) = (routes.column(0).as_primitive::<UInt8Type>(), routes.column(1).as_binary::<i32>(), routes.column(2).as_binary::<i32>());
+    let mut by_kind = BTreeMap::<u8, Vec<Child>>::new();
+    for row in 0..routes.len() {
+        let kind = kinds.value(row);
+        let page = locator_at(&routes, 3, row)?;
+        let children = by_kind.entry(kind).or_default();
+        if !directories.get(&kind).is_some_and(|directory| directory.height == 1 && page.range().is_ok_and(|range| range.end <= directory.page.offset))
+            || lower.value(row) > upper.value(row) || children.last().is_some_and(|child| child.upper.as_slice() >= lower.value(row)) {
+            return Err(corrupt("Search root has unordered inline directory children"));
+        }
+        children.push(Child { lower: lower.value(row).to_vec(), upper: upper.value(row).to_vec(), page });
+    }
+    Ok(by_kind)
 }
 
 fn locator_columns(locators: impl IntoIterator<Item = PageRef>) -> Result<Vec<ArrayRef>> {
@@ -245,17 +278,24 @@ pub(super) struct TreeReader {
     source: PageSource,
     length: u64,
     decoder: FileDecoder,
+    packed: bool,
 }
 
 impl TreeReader {
-    pub fn new(source: PageSource, length: u64) -> Self {
-        Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(TREE_FORMAT_VERSION)), MetadataVersion::V5) }
+    pub fn new(source: PageSource, length: u64, format: i32) -> Self {
+        Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(format)), MetadataVersion::V5), packed: format == super::PACKED_FORMAT_VERSION }
+    }
+
+    pub fn inline_page(&self, page: PageRef, bytes: Arc<[u8]>) -> Result<RecordBatch> {
+        audience_work::decode_bytes(bytes.len())?;
+        page.decode(Buffer::from(bytes::Bytes::from_owner(bytes)), &self.decoder)
     }
 
     pub async fn page(&self, page: PageRef, kind: PageKind) -> Result<RecordBatch> {
         let range = page.range()?;
         if range.end > self.length { return Err(corrupt("Search directory points outside its object")); }
         let len = usize::try_from(range.end - range.start).map_err(fault)?;
+        audience_work::decode_bytes(len)?;
         match &self.source {
             PageSource::Local { bytes, owner } => {
                 let start = usize::try_from(range.start).map_err(fault)?;
@@ -292,23 +332,27 @@ impl TreeReader {
         };
         let storage = owner.storage()?;
         let (object, cache) = (&owner.object, &owner.cache);
+        let gap = if self.packed { storage.scan_merge_gap() } else { 64 * 1024 };
+        let max_range = if self.packed { (storage.scan_byte_limit() as u64 / 16).clamp(64 * 1024, 4 * 1024 * 1024) } else { 1024 * 1024 };
         let mut result = BTreeMap::new();
         let mut needed = BTreeMap::new();
         for reference in references {
             let range = reference.range()?;
             if range.end > self.length { return Err(corrupt("Search directory points outside its object")); }
             let len = usize::try_from(range.end - range.start).map_err(fault)?;
+            audience_work::decode_bytes(len)?;
             let fill = cache.entry(&storage, object, reference, len);
             if let Some(batch) = fill.get() { observe_hit(); result.insert(reference, batch.clone()); }
             else { needed.insert(reference, (range, fill)); }
         }
         let bytes = needed.values().map(|(range, _)| range.end - range.start).sum::<u64>();
-        let whole = !needed.is_empty() && bytes >= self.length - self.length / 4;
+        let whole = !needed.is_empty() && bytes >= self.length - self.length / 4
+            && (!self.packed || self.length <= storage.scan_byte_limit() as u64 / 4);
         let mut groups: Vec<(std::ops::Range<u64>, Vec<_>)> = Vec::new();
         for (reference, (range, fill)) in needed {
             let entry = (reference, range.clone(), fill);
             if let Some((previous, pages)) = groups.last_mut()
-                && (whole || range.start.saturating_sub(previous.end) <= 64 * 1024 && range.end - previous.start <= 1024 * 1024) {
+                && (whole || range.start.saturating_sub(previous.end) <= gap && range.end - previous.start <= max_range) {
                 previous.end = previous.end.max(range.end);
                 pages.push(entry);
             } else { groups.push((range, vec![entry])); }
@@ -348,6 +392,10 @@ impl TreeReader {
 
     async fn children(&self, parent: PageRef) -> Result<Vec<Child>> {
         let page = self.page(parent, PageKind::Directory).await?;
+        Self::decode_children(parent, &page)
+    }
+
+    fn decode_children(parent: PageRef, page: &RecordBatch) -> Result<Vec<Child>> {
         let children = table(&page, Table::Directory);
         if children.len() > FANOUT || children.columns().iter().any(|column| column.null_count() != 0) {
             return Err(corrupt("Search directory page is invalid"));
@@ -364,6 +412,25 @@ impl TreeReader {
             decoded.push(Child { lower: lower.value(row).to_vec(), upper: upper.value(row).to_vec(), page });
         }
         Ok(decoded)
+    }
+
+    pub async fn covering(&self, directory: DirectoryRef, ranges: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<PageRef>> {
+        if ranges.is_empty() { return Ok(Vec::new()); }
+        let mut level = BTreeMap::from([(directory.page, 0..ranges.len())]);
+        for _ in 0..directory.height {
+            let pages = self.pages(level.keys().copied().collect(), PageKind::Directory).await?;
+            let mut following = BTreeMap::new();
+            for (parent, scope) in level {
+                let candidates = &ranges[scope.clone()];
+                for child in Self::decode_children(parent, &pages[&parent])? {
+                    let first = candidates.partition_point(|(_, last)| last.as_slice() < child.lower.as_slice());
+                    let end = candidates.partition_point(|(first, _)| first.as_slice() <= child.upper.as_slice());
+                    if first < end { following.insert(child.page, scope.start + first..scope.start + end); }
+                }
+            }
+            level = following;
+        }
+        Ok(level.into_keys().collect())
     }
 
     pub async fn find(&self, directory: DirectoryRef, key: &[u8]) -> Result<Option<PageRef>> {

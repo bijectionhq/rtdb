@@ -14,18 +14,20 @@ When `CREATE SEARCH INDEX IF NOT EXISTS` finds an existing definition at its ord
 `MATCH` can still narrow candidates if a search file covers its column.
 The node configuration's `search: {enabled, threads}` switches the lane and the scan accelerator together.
 The server option `search: {writeFormat: 14}` selects the bounded Arrow layout for newly built files.
+The option `search: {writeFormat: 15}` adds snapshot-native search packs and commit-time serving postings.
 The server defaults to format 11.
 Upgrade all readers and maintenance lanes sharing the database before enabling Arrow writes.
 
 == Pieces
 
 `file`::
-A search file covers a trie or an eligible partition group.
-Formats 12, 13 and 14 use Arrow IPC, and format 11 uses Tantivy.
+A search file covers a trie, an eligible partition group or a pack of settled tries with disjoint IID prefixes.
+Formats 12 through 15 use Arrow IPC, and format 11 uses Tantivy.
 Its manifest maps events, text runs and data pages to the group's members and records each run's bitemporal visibility.
 The term directory locates the Arrow frequency and position batches and records score bounds for ranked search.
 The artefact format version identifies the Arrow layout.
 Format 14 follows authenticated range references from its root to term, posting, document and IID visibility pages.
+Format 15 also records stable event versions and their primary Arrow positions.
 The maintenance lane builds the configured version from primary data and can repair files in any of these formats.
 
 `definitions`::

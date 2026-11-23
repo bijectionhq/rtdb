@@ -1229,6 +1229,12 @@ async fn prepare_cell_move(
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-journal", "Cell moves require independent replica journals"));
     }
 
+    let serving_archive = if current.lifecycle == Lifecycle::Live {
+        Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.keys, &current, hosted_task.as_ref())).await?
+    } else {
+        crate::archive::serving_archive_operation(&current)?
+    };
+
     let source = update_installation(from.directory.as_ref(), &current.id, |record| {
         if record.lifecycle == Lifecycle::Moving && intent_matches(record, intent) && same_media(record) {
             return Ok(());
@@ -1239,6 +1245,7 @@ async fn prepare_cell_move(
             || record.ensemble != current.ensemble || record.replica_journals != current.replica_journals
             || record.log_copy_servers != current.log_copy_servers || record.log_epoch != current.log_epoch
             || record.engine_pin != current.engine_pin || record.move_from.is_some()
+            || crate::archive::serving_archive_operation(record)? != serving_archive
         {
             return Err(conflict());
         }
@@ -1974,9 +1981,10 @@ pub async fn audit_acceptance_quorum(
 
     let mut entries = rtdb_logkeeper::copy_certified_range(&stream, &proof, maximum_message_bytes.saturating_add(64), 1).await?;
     let entry = entries.pop().filter(|entry| entry.lsn == offset).ok_or_else(unavailable)?;
+    let not_strict = || Anomaly::incorrect("rtdb.multi/acceptance-audit-record", "The certified record is not a strict placed acceptance");
+    if !entry.guarded { return Err(not_strict()); }
     let cipher = crate::cipher::Cipher::new(&keys.existing(&current.key_id()).await?)?;
     let payload = cipher.open(&current.replica_seal_scope(), &entry.payload)?;
-    let not_strict = || Anomaly::incorrect("rtdb.multi/acceptance-audit-record", "The certified record is not a strict placed acceptance");
     let Some(ReplicaEnvelope { term, message: ReplicaBody::ResolvedTx(tx), .. }) = ReplicaEnvelope::decode(&payload)? else {
         return Err(not_strict());
     };

@@ -110,10 +110,15 @@ impl Store {
     pub async fn mutate(&self, body: RequestBody, frame_bytes: usize) -> Outcome {
         let observed_lsn = match &body {
             RequestBody::AppendObserved(append) => {
-                if !self.journal.is_durable() || append.entries.len() != 1 {
-                    return Outcome::Now(failed("a guarded sync observation requires one entry on a durable journal"));
+                if !self.journal.is_durable() || !matches!(append.entries.as_slice(), [entry] if entry.guarded)
+                    || append.first_lsn.checked_sub(1) != Some(append.commit_lsn)
+                {
+                    return Outcome::Now(failed("a guarded sync observation requires one guarded entry after a committed prefix"));
                 }
                 Some(append.first_lsn)
+            }
+            RequestBody::Append(append) if !append.guarded_ensemble.is_empty() || append.entries.iter().any(|entry| entry.guarded) => {
+                return Outcome::Now(failed("guarded metadata requires the observed append request"));
             }
             _ => None,
         };
@@ -123,9 +128,17 @@ impl Store {
         };
         if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
         let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
-            RequestBody::Append(append) | RequestBody::AppendObserved(append) => (append.stream, Box::new(move |state| {
+            RequestBody::Append(append) => (append.stream, Box::new(move |state| {
                 state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn)
             })),
+            RequestBody::AppendObserved(append) => {
+                let Ok(ensemble) = append.guarded_ensemble.as_ref().try_into() else {
+                    return Outcome::Now(failed("invalid guarded ensemble identity"));
+                };
+                (append.stream, Box::new(move |state| {
+                    state.append_observed(append.epoch, append.first_lsn, append.entries, append.commit_lsn, ensemble)
+                }))
+            }
             RequestBody::Overwrite(overwrite) if overwrite.activate_ensemble.is_empty() => (overwrite.stream, Box::new(move |state| {
                 state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn)
             })),
@@ -266,7 +279,7 @@ impl Store {
 
     /// Selects entries in `[from, to]` and where to find each payload, under the stream's lock.
     fn select(&self, state: &StreamState<Stored>, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Window<Item> {
-        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, source: self.journal.source(&held.payload) })
+        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, source: self.journal.source(&held.payload) })
     }
 
     /// Held entries in `[from, to)`, committed or not; a selection with payloads still on disk is resolved by `entries`.
@@ -303,20 +316,26 @@ impl Store {
         };
         let Ok(_page) = self.digest_pages.try_acquire() else { return failed("history proof capacity exhausted"); };
         let Some(slot) = self.existing(&page.stream) else { return failed("the stream was not found"); };
-        let (window, durable, observation) = {
+        let (window, durable, observation, original_append) = {
             let state = slot.state.lock();
-            if state.dropped || page.from_lsn <= state.trim || page.through_lsn > state.commit {
-                return failed("the digest interval is outside the committed retained window");
+            let admitted = match page.sealed_epoch {
+                None => page.through_lsn <= state.commit,
+                Some(epoch) => page.from_lsn == page.through_lsn && page.preceding_digest.is_empty()
+                    && state.guarded_at_seal(epoch, page.from_lsn),
+            };
+            if state.dropped || page.from_lsn <= state.trim || !admitted {
+                return failed("the digest interval is outside the committed or sealed guarded window");
             }
             let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
             let observation = (page.from_lsn == page.through_lsn)
                 .then(|| state.sync_observation(page.from_lsn)).flatten();
+            let original_append = page.sealed_epoch.map(|_| observation.is_some());
             let (done, durable) = oneshot::channel();
             // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
             if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
                 return failed("the journal has stopped");
             }
-            (window, durable, observation)
+            (window, durable, observation, original_append)
         };
         if !matches!(durable.await, Ok(Ok(()))) { return failed("the digest interval was not made durable"); }
         let journal = Arc::clone(&self.journal);
@@ -334,7 +353,7 @@ impl Store {
             }
             ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn,
                 digest: Bytes::copy_from_slice(&chain.bytes()),
-                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()) })
+                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()), original_append })
         }).await {
             Ok(reply) => reply,
             Err(error) => failed(error.to_string()),
@@ -378,7 +397,7 @@ impl Selected {
         let Window { items, commit_lsn, trim_lsn, last_lsn } = self.0;
         let entries = items.into_iter().map(|item| {
             let Source::Ready(payload) = item.source else { unreachable!("checked above") };
-            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, payload }
+            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, payload }
         }).collect();
         Ok(ResponseBody::Entries(Entries { entries, commit_lsn, trim_lsn, last_lsn }))
     }
@@ -479,7 +498,7 @@ mod tests {
             stream: "drop-me".into(),
             epoch: 1,
             from_lsn: 0,
-            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, payload: Bytes::from(vec![1; 2 << 20]) }],
+            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, guarded: false, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
             commit_lsn: 0, activate_ensemble: Bytes::new(),
         }), 2 << 20).await, Outcome::Durable(_, _)));

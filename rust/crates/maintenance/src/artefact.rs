@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use rtdb_format::{keys::{ArtefactOwner, TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactScope, ArtefactsAdded, ArtefactsRemoved}};
+use rtdb_format::{keys::{ArtefactOwner, ArtefactPack, TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactScope, ArtefactsAdded, ArtefactsRemoved}};
 use rtdb_index::{PartitionValue, TrieCatalog, TrieState};
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, StorageEpoch, StorageVersion, TableRef};
@@ -18,7 +18,7 @@ use crate::driver::Completion;
 /// One that is not `historical` covers the current side alone.
 /// With `group_bytes`, a partition group whose members' data files hold at most that many bytes together takes one artefact over all of them, rather than one per member.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i64, pub historical: bool, pub group_bytes: Option<i64> }
+pub struct ArtefactDefinition { pub table: TableRef, pub kind: String, pub id: String, pub version: i64, pub historical: bool, pub group_bytes: Option<i64>, pub packed: bool }
 
 /// One artefact to build: over one trie's data file, or over every member's of a partition group.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,11 +28,14 @@ impl ArtefactJob {
     /// The tries whose catalog entries record the built artefact, in bucket order.
     pub fn tries(&self) -> Vec<TrieKey> { self.owner.tries() }
     /// The scope the artefact's records carry.
-    pub fn scope(&self) -> ArtefactScope { match self.owner { ArtefactOwner::Trie(_) => ArtefactScope::Trie, ArtefactOwner::Group(_) => ArtefactScope::PartGroup } }
+    pub fn scope(&self) -> ArtefactScope { match self.owner { ArtefactOwner::Trie(_) => ArtefactScope::Trie, ArtefactOwner::Group(_) => ArtefactScope::PartGroup, ArtefactOwner::Pack(_) => ArtefactScope::Pack } }
     fn first_trie(&self) -> TrieKey { self.tries().swap_remove(0) }
 
     fn entries(&self, mut record: ArtefactRecord) -> Vec<ArtefactEntry> {
         record.scope = Some(self.scope() as i32);
+        if let ArtefactOwner::Pack(pack) = &self.owner {
+            record.pack_members = pack.members().iter().map(ToString::to_string).collect();
+        }
         self.tries().into_iter().map(|trie| ArtefactEntry {
             trie_key: Some(trie.to_string()),
             record: Some(record.clone()),
@@ -47,6 +50,15 @@ pub enum ArtefactSource<'a> { Local { data: &'a std::path::Path, size: u64 }, St
 #[async_trait]
 pub trait ArtefactBuilder: Send + Sync {
     fn builds_live_pages(&self) -> bool { false }
+
+    fn prepares_serving_search(&self) -> bool { false }
+
+    async fn prepare_serving_search(&self, _snapshot: rtdb_index::Snapshot, _cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> { Ok(None) }
+
+    async fn seal_serving_search(&self, _snapshot: &Arc<PartitionValue>, _table: &TableRef, _trie: &TrieKey,
+        _file: &std::path::Path, _size: u64, _cancellation: &CancellationToken) -> Result<Vec<ArtefactRecord>> { Ok(Vec::new()) }
+
+    fn retire_with_owner(&self, _record: &ArtefactRecord) -> bool { false }
 
     async fn build_live_pages(&self, _snapshot: &Arc<PartitionValue>, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
 
@@ -87,7 +99,8 @@ pub trait ArtefactPublisher: Send + Sync {
 
 /// Whether a definition wants an artefact on a trie: above level 0, other than a level-1 current trie below the file size target, which is rewritten within a block or two, and historical only for a historical definition.
 pub fn wants(definition: &ArtefactDefinition, trie: &TrieKey, size: i64, file_size_target: i64) -> bool {
-    trie.level() > 0 && (definition.historical || trie.recency().is_none()) && !(trie.level() == 1 && trie.recency().is_none() && size < file_size_target)
+    (definition.historical || trie.recency().is_none()) && (definition.packed
+        || (trie.level() > 0 && !(trie.level() == 1 && trie.recency().is_none() && size < file_size_target)))
 }
 
 /// Live tries above level 0 that lack an artefact for a definition, current side first, then higher levels first; historical tries only for a historical definition.
@@ -96,6 +109,10 @@ pub fn wants(definition: &ArtefactDefinition, trie: &TrieKey, size: i64, file_si
 pub fn available_artefact_jobs(catalog: &TrieCatalog, definitions: &[ArtefactDefinition]) -> Vec<ArtefactJob> {
     let mut jobs = Vec::new();
     for definition in definitions {
+        if definition.packed {
+            jobs.extend(packed_jobs(catalog, definition));
+            continue;
+        }
         let lacking = |trie: &rtdb_index::CatalogTrie| trie.state == TrieState::Live && trie.artefact(&definition.kind, &definition.id, definition.version).is_none();
         let mut grouped = BTreeSet::new();
         for trie in catalog.current_tries(&definition.table).into_iter()
@@ -115,6 +132,43 @@ pub fn available_artefact_jobs(catalog: &TrieCatalog, definitions: &[ArtefactDef
         }
     }
     jobs.sort_by_cached_key(|job| { let trie = job.first_trie(); (trie.recency().is_some(), std::cmp::Reverse(trie.level()), trie, job.definition.clone()) });
+    jobs
+}
+
+fn packed_jobs(catalog: &TrieCatalog, definition: &ArtefactDefinition) -> Vec<ArtefactJob> {
+    let mut groups = Vec::<(Vec<&rtdb_index::CatalogTrie>, i64)>::new();
+    let mut jobs = Vec::new();
+    let record = |trie: &rtdb_index::CatalogTrie| trie.artefact(&definition.kind, &definition.id, definition.version).map(ArtefactRecord::scope);
+    let limit = definition.group_bytes.unwrap_or(0);
+    for trie in catalog.current_tries(&definition.table).into_iter()
+        .filter(|trie| wants(definition, &trie.key, trie.data_file_size, catalog.file_size_target())) {
+        let scope = record(trie);
+        if scope.is_some_and(|scope| scope != ArtefactScope::Trie) { continue; }
+        if trie.key.level() == 0 || trie.key.part().is_empty() || trie.data_file_size > limit {
+            if scope.is_none() { jobs.push(ArtefactJob { definition: definition.clone(), owner: ArtefactOwner::Trie(trie.key.clone()) }); }
+            continue;
+        }
+        if let Some((members, bytes)) = groups.iter_mut().find(|(members, bytes)| {
+            members.len() < ArtefactPack::MAX_MEMBERS && bytes.saturating_add(trie.data_file_size) <= limit
+                && members.iter().all(|member| member.key.recency() == trie.key.recency()
+                    && !trie.key.part().starts_with(member.key.part()) && !member.key.part().starts_with(trie.key.part()))
+        }) {
+            members.push(trie);
+            *bytes += trie.data_file_size;
+        } else {
+            groups.push((vec![trie], trie.data_file_size));
+        }
+    }
+    for (members, _) in groups {
+        let keys = members.iter().map(|member| member.key.clone()).collect();
+        if let Ok(pack) = ArtefactPack::new(keys) {
+            jobs.push(ArtefactJob { definition: definition.clone(), owner: ArtefactOwner::Pack(pack) });
+        } else {
+            jobs.extend(members.into_iter().filter(|member| record(member).is_none()).map(|member| ArtefactJob {
+                definition: definition.clone(), owner: ArtefactOwner::Trie(member.key.clone()),
+            }));
+        }
+    }
     jobs
 }
 
@@ -151,18 +205,19 @@ async fn build_entries(job: &ArtefactJob, builder: &dyn ArtefactBuilder, snapsho
         Ok(record) => return Ok(job.entries(record)),
         Err(error) => error,
     };
-    let ArtefactOwner::Group(group) = &job.owner else { return Err(error) };
+    if matches!(job.owner, ArtefactOwner::Trie(_)) { return Err(error); }
+    let members = job.tries();
     let table = &job.definition.table;
     let snapshot = snapshots.snapshot();
     let catalog = snapshot.trie_catalog();
     let Some(table_entry) = snapshot.table_catalog().entry(table) else { return Err(error) };
     let slug = &table_entry.slug;
-    if !group.members().iter().any(|key| input_collected(&error, catalog, table, slug, key)) {
+    if !members.iter().any(|key| input_collected(&error, catalog, table, slug, key)) {
         return Err(error);
     }
 
     let mut entries = Vec::new();
-    for trie in catalog.group_members(table, group).into_iter().filter(|trie| trie.state == TrieState::Live) {
+    for trie in members.iter().filter_map(|key| catalog.trie(table, key)).filter(|trie| trie.state == TrieState::Live) {
         if trie.artefact(&job.definition.kind, &job.definition.id, job.definition.version).is_some_and(|record| record.scope() == ArtefactScope::Trie) {
             continue;
         }
@@ -210,7 +265,7 @@ struct Retirement { kind: String, store: Arc<dyn ObjectStore>, publisher: Arc<dy
 
 impl Retirement {
     /// Retires the artefacts of every table whose definitions changed since the last look or that is to be looked at again, or of every table on the first look.
-    async fn retire(&mut self, snapshot: &PartitionValue, definitions: &[ArtefactDefinition]) {
+    async fn retire(&mut self, snapshot: &PartitionValue, definitions: &[ArtefactDefinition], builder: &dyn ArtefactBuilder) {
         let mut current: BTreeMap<TableRef, BTreeSet<(String, i64)>> = BTreeMap::new();
         for definition in definitions { current.entry(definition.table.clone()).or_default().insert((definition.id.clone(), definition.version)); }
         let snapshot = snapshot.snapshot();
@@ -224,7 +279,8 @@ impl Retirement {
         for table in tables {
             let Some(entry) = snapshot.table_entry(&table) else { continue };
             let outcome: Result<()> = async {
-                let records = retired_artefacts(snapshot.trie_catalog(), &table, &self.kind, definitions, basis);
+                let mut records = retired_artefacts(snapshot.trie_catalog(), &table, &self.kind, definitions, basis);
+                records.retain(|(_, record)| !builder.retire_with_owner(record));
                 if !records.is_empty() {
                     // A group's members each record its one object.
                     let keys = records.iter().map(|(trie, record)| entry.slug.recorded_artefact_key(trie, record).map_err(crate::invalid).and_then(|key| ObjectKey::new(key).map_err(crate::invalid))).collect::<Result<BTreeSet<_>>>()?;
@@ -273,7 +329,7 @@ impl ArtefactDriver {
         let snapshot = self.snapshots.snapshot();
         let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;
-        if idle { self.retirement.retire(&snapshot, &self.builder.retained_definitions(&definitions)).await; }
+        if idle { self.retirement.retire(&snapshot, &self.builder.retained_definitions(&definitions), self.builder.as_ref()).await; }
         jobs.extend(available_artefact_jobs(snapshot.trie_catalog(), &definitions));
         Ok(jobs)
     }

@@ -774,7 +774,7 @@ pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Wr
         Arc::new(UInt32Array::from(sidecar.column_docs.clone())), Arc::new(UInt64Array::from_iter_values(inverted.iter().map(|index| index.as_ref().map_or(0, |index| index.total_num_tokens()))))])?;
     let sections = sidecar.sections.iter().copied().map(Section::into_arrow).collect::<Vec<_>>();
     writer.page([(Table::Header, header), (Table::Members, members), (Table::Pages, pages), (Table::Columns, column_table),
-        (Table::Events, events.finish()?), (Table::Runs, runs.finish()?), (Table::RowRuns, row_runs),
+        (Table::Events, events.finish()?.0), (Table::Runs, runs.finish()?), (Table::RowRuns, row_runs),
         (Table::Terms, term_table), (Table::Sections, super::sections_array(&sections)?)])?;
     let mut groups = Vec::with_capacity(POSTING_TERMS);
     for index in inverted.iter().flatten() {

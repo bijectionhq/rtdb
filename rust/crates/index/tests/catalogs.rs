@@ -249,7 +249,7 @@ fn catalog_allocates_the_first_free_suffix_for_colliding_table_slugs() {
 }
 
 fn artefact(definition_id: &str, version: i64, stats: u8) -> rtdb_format::log::proto::ArtefactRecord {
-    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None, file_size: None, published_version: None }
+    rtdb_format::log::proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some(definition_id.into()), definition_version: Some(version), stats: Some(vec![stats]), scope: None, file_size: None, published_version: None, pack_members: Vec::new() }
 }
 
 #[test]

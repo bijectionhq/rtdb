@@ -137,4 +137,16 @@ impl EventHeader {
     pub fn system_position(self) -> (Timestamp, u32) {
         (self.system_from, self.commit_position)
     }
+
+    pub fn version(self) -> RowVersion {
+        RowVersion { iid: self.iid, system_from: self.system_from, commit_position: self.commit_position }
+    }
+}
+
+/// A version's logical identity within a table and transaction history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RowVersion {
+    pub iid: Iid,
+    pub system_from: Timestamp,
+    pub commit_position: u32,
 }

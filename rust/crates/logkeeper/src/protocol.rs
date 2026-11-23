@@ -19,6 +19,9 @@ pub struct Entry {
     pub timestamp: i64,
     #[prost(bytes = "bytes", tag = "4")]
     pub payload: Bytes,
+    /// A guarded entry retains its admission kind through repair and replay.
+    #[prost(bool, tag = "5")]
+    pub guarded: bool,
 }
 
 /// Entries from `start_lsn` up to the next run's start (or the holder's last lsn) were written at `epoch`.
@@ -42,6 +45,9 @@ pub(crate) struct Append {
     pub entries: Vec<Entry>,
     #[prost(sint64, tag = "5")]
     pub commit_lsn: i64,
+    /// The exact ensemble whose activation authorizes an observed append.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub guarded_ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -167,6 +173,9 @@ pub(crate) struct DigestPage {
     pub through_lsn: i64,
     #[prost(bytes = "bytes", tag = "4")]
     pub preceding_digest: Bytes,
+    /// An exact guarded entry may be inspected before commit only at this seal.
+    #[prost(uint64, optional, tag = "5")]
+    pub sealed_epoch: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -261,6 +270,8 @@ pub struct Sealed {
     pub commit_lsn: i64,
     #[prost(message, repeated, tag = "6")]
     pub runs: Vec<EpochRun>,
+    #[prost(bool, tag = "7")]
+    pub guarded_tail: bool,
 }
 
 /// A read at or below `trim_lsn` returns no entries; the client reports the trimmed range.
@@ -290,6 +301,9 @@ pub struct PageDigest {
     pub digest: Bytes,
     #[prost(sfixed64, optional, tag = "3")]
     pub synced_clock_upper_micros: Option<i64>,
+    /// For an exact guarded probe at a durable seal, this journal's local origin.
+    #[prost(bool, optional, tag = "4")]
+    pub original_append: Option<bool>,
 }
 
 /// Confirms only the promised writer. It conveys no append or commit position.
