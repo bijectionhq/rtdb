@@ -437,6 +437,8 @@ impl BlockStore {
         Ok(())
     }
 
+    pub(crate) fn object_store(&self) -> &dyn ObjectStore { self.store.as_ref() }
+
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
         let block = self.load_fresh_catalog(index).await?;
         let tables = self.load_tables(&block).await?;

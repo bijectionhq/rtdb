@@ -1558,7 +1558,7 @@ fn cached_objects(value: &rtdb_index::PartitionValue, table: &TableRef, keys: &B
     objects.into_iter().filter_map(|key| rtdb_storage::ObjectKey::new(key).ok()).collect()
 }
 
-fn artefact_entries(entries: &[proto::ArtefactEntry]) -> Vec<(TrieKey, proto::ArtefactRecord)> {
+pub(crate) fn artefact_entries(entries: &[proto::ArtefactEntry]) -> Vec<(TrieKey, proto::ArtefactRecord)> {
     entries.iter().filter_map(|entry| Some((entry.trie_key.as_deref()?.parse().ok()?, entry.record.clone()?))).collect()
 }
 

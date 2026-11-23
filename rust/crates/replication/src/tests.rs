@@ -43,13 +43,19 @@ async fn fixture_with_clock(config: ReplicationConfig, replica_message_limit: us
 
 async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
     wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>) -> Fixture {
+    let store = Arc::new(MemoryStore::default());
+    fixture_over(config, replica_message_limit, clock, wrap_replica, Arc::clone(&store), store).await
+}
+
+/// The driver reads `store` through `objects`.
+async fn fixture_over(config: ReplicationConfig, replica_message_limit: usize, clock: Option<ReplicationClock>,
+    wrap_replica: impl FnOnce(Arc<MemoryLog>) -> Arc<dyn Log>, store: Arc<MemoryStore>, objects: Arc<dyn ObjectStore>) -> Fixture {
     let memory = MemoryBudget::new(1 << 30);
     let source = Arc::new(MemoryLog::new(1 << 28));
     let replica = Arc::new(MemoryLog::new(replica_message_limit));
-    let store = Arc::new(MemoryStore::default());
-    let cache = Arc::new(BufferPool::new(store.clone(), 1 << 27));
-    let logs = PartitionLogs::new(source.clone(), wrap_replica(replica.clone()), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
+    let cache = Arc::new(BufferPool::new(Arc::clone(&objects), 1 << 27));
+    let logs = PartitionLogs::new(source.clone(), wrap_replica(replica.clone()), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), Arc::clone(&objects), Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+    let blocks = BlockStore::new(objects, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let resolve = Arc::new(ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
@@ -2671,4 +2677,171 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
         assert_eq!(selected.block.unwrap().block_index(), BlockIndex(0));
         assert_eq!(selected.compaction_replay_cutoff, cutoff);
     }
+}
+
+struct RecordingStore { inner: Arc<MemoryStore>, reads: Mutex<BTreeSet<rtdb_storage::ObjectKey>> }
+impl RecordingStore {
+    fn read(&self, key: &rtdb_storage::ObjectKey) { self.reads.lock().insert(key.clone()); }
+    fn take(&self) -> BTreeSet<rtdb_storage::ObjectKey> { std::mem::take(&mut *self.reads.lock()) }
+}
+#[async_trait]
+impl ObjectStore for RecordingStore {
+    async fn head(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> { self.read(key); self.inner.head(key).await }
+    async fn head_fresh(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> { self.read(key); self.inner.head_fresh(key).await }
+    async fn get(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get(key).await }
+    async fn get_fresh(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_fresh(key).await }
+    async fn get_fresh_exact(&self, key: &rtdb_storage::ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_fresh_exact(key, length).await }
+    async fn get_range(&self, key: &rtdb_storage::ObjectKey, range: std::ops::Range<u64>) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_range(key, range).await }
+    async fn put(&self, key: &rtdb_storage::ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.inner.put(key, bytes).await }
+    async fn put_file(&self, key: &rtdb_storage::ObjectKey, path: &std::path::Path) -> rtdb_storage::Result<()> { self.inner.put_file(key, path).await }
+    async fn list(&self, key: Option<&rtdb_storage::ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::StoredObject>> { self.inner.list(key).await }
+    async fn delete(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<()> { self.inner.delete(key).await }
+}
+
+/// A suffix replayed onto block 0 by a follower whose every object read was recorded.
+struct ReplayedSuffix {
+    base: BTreeSet<rtdb_storage::ObjectKey>,
+    tail: BTreeSet<rtdb_storage::ObjectKey>,
+    payloads: BTreeSet<rtdb_storage::ObjectKey>,
+    reads: BTreeSet<rtdb_storage::ObjectKey>,
+    stale_payload: rtdb_storage::ObjectKey,
+    adopted: BTreeSet<rtdb_storage::ObjectKey>,
+    checkpoint: rtdb_format::catalog::BlockCatalog,
+    envelopes: Vec<ReplicaEnvelope>,
+    blocks: Arc<BlockStore>,
+}
+
+fn produced_upload(produced: &ProducedBlock, index: i64, source: i64) -> ReplicaBody {
+    ReplicaBody::BlockUploaded(proto::BlockUploaded {
+        storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source),
+        tries: produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
+        external_source_token: None, catalog_sha256: Some(produced.catalog.publication_sha256().unwrap().to_vec()),
+    })
+}
+
+async fn offloaded(store: &MemoryStore, position: i64, sequence: i64, body: ReplicaBody, block: BlockIndex) -> (LogRecord, rtdb_storage::ObjectKey) {
+    let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)), message: body };
+    let payload = envelope.encode();
+    let id = format!("closure-{sequence}");
+    let proxy = envelope.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), block, id.clone(), &payload);
+    let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::oversized_key(block, &id).unwrap()).unwrap();
+    store.put(&key, payload.into()).await.unwrap();
+    (LogRecord::new(LogMetadata { offset: LogOffset(position), timestamp: Timestamp(position * 100 + 1) }, proxy.encode().into()), key)
+}
+
+async fn replayed_suffix(oversized_upload: bool) -> ReplayedSuffix {
+    let config = || ReplicationConfig { may_lead: false, ..Default::default() };
+    let store = Arc::new(MemoryStore::default());
+    let mut producer = fixture_over(config(), 1 << 27, None, |replica| replica, Arc::clone(&store), store.clone()).await;
+    let table = TableRef::new("public", "docs");
+    let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+    let mut write = TransactionBuffer::new(producer.driver.partition.value().snapshot(), key, Arc::clone(&producer.memory)).unwrap();
+    write.put(table.clone(), StructFields::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
+    producer.driver.partition.apply(&write.stage().unwrap()).unwrap();
+    producer.handle.progress().applied(None, Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key }).into()), None).unwrap();
+    producer.driver.consume(raw(0, 1, 0, boundary(0, -1))).await.unwrap();
+    let pending = producer.driver.pending_block.as_ref().unwrap();
+    let first = producer.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let mut suffix = vec![raw(1, 1, 1, produced_upload(&first, 0, -1))];
+    producer.driver.consume(suffix[0].clone()).await.unwrap();
+
+    let recording = Arc::new(RecordingStore { inner: Arc::clone(&store), reads: Mutex::new(BTreeSet::new()) });
+    let mut replayer = fixture_over(config(), 1 << 27, None, |replica| replica, Arc::clone(&store), recording.clone()).await;
+    let (base, base_tables) = producer.blocks.load(BlockIndex(0)).await.unwrap();
+    let base_keys = checkpoint_dependencies(&base, &base_tables).unwrap();
+    let recovery = recording.take();
+    assert!(recovery.is_subset(&base_keys), "recovery read outside the checkpoint closure: {:?}", recovery.difference(&base_keys).collect::<Vec<_>>());
+
+    suffix.extend([raw(2, 1, 2, resolved(1, -1)), raw(3, 1, 3, boundary(1, -1))]);
+    for record in &suffix[1..] { producer.driver.consume(record.clone()).await.unwrap(); }
+    let pending = producer.driver.pending_block.as_ref().unwrap();
+    let second = producer.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let mut payloads = BTreeSet::new();
+    if oversized_upload {
+        let (record, payload) = offloaded(&store, 4, 4, produced_upload(&second, 1, -1), BlockIndex(1)).await;
+        suffix.push(record);
+        payloads.insert(payload);
+    } else {
+        suffix.push(raw(4, 1, 4, produced_upload(&second, 1, -1)));
+    }
+
+    let artefact = proto::ArtefactRecord { kind: Some("search".into()), definition_id: Some("body".into()), definition_version: Some(1), ..Default::default() };
+    let compacted = rtdb_format::keys::TrieKey::l0(BlockIndex(5)).unwrap();
+    suffix.push(raw(5, 1, 5, ReplicaBody::TriesAdded(proto::TriesAdded {
+        storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), source_msg_id: Some(2),
+        tries: vec![proto::TrieDetails { table_name: Some(table.schema_and_table()), trie_key: Some(compacted.to_string()), trie_state: Some(proto::TrieState::Live as i32),
+            artefacts: vec![artefact.clone()], ..Default::default() }],
+    })));
+    let flushed = first.tries[&table][0].key.clone();
+    suffix.push(raw(6, 1, 6, ReplicaBody::ArtefactsAdded(proto::ArtefactsAdded {
+        storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), table_name: Some(table.schema_and_table()), source_msg_id: Some(3),
+        entries: vec![proto::ArtefactEntry { trie_key: Some(flushed.to_string()), record: Some(artefact.clone()) }],
+    })));
+    let (stale, stale_payload) = offloaded(&store, 7, 7, produced_upload(&first, 0, -1), BlockIndex(0)).await;
+    suffix.push(stale);
+    payloads.insert(stale_payload.clone());
+
+    for record in &suffix { replayer.driver.consume(record.clone()).await.unwrap(); }
+    assert_eq!(replayer.driver.partition.value().table_catalog().block_index(), Some(BlockIndex(1)));
+    let reads = recording.take();
+
+    let envelopes = suffix.iter().map(|record| ReplicaEnvelope::decode(&record.payload).unwrap().unwrap()).collect::<Vec<_>>();
+    let tail = tail_dependencies(replay_base(&base), &envelopes, producer.blocks.as_ref()).await.unwrap();
+    let slug = base.table_entries().unwrap().into_iter().find(|entry| entry.table == table).unwrap().slug;
+    let adopted = [rtdb_format::keys::block_key(BlockIndex(1)).unwrap(), slug.block_key(BlockIndex(1)).unwrap()]
+        .into_iter().map(|key| rtdb_storage::ObjectKey::new(key).unwrap()).collect();
+    for expected in [slug.data_key(&compacted), slug.metadata_key(&compacted),
+        slug.recorded_artefact_key(&compacted, &artefact).unwrap(), slug.recorded_artefact_key(&flushed, &artefact).unwrap()]
+    {
+        assert!(tail.contains(&rtdb_storage::ObjectKey::new(expected.clone()).unwrap()), "the added trie or artefact {expected} is not enumerated");
+    }
+    ReplayedSuffix { base: base_keys, tail, payloads, reads, stale_payload, adopted, checkpoint: base, envelopes, blocks: Arc::clone(&producer.blocks) }
+}
+
+fn replay_base(checkpoint: &rtdb_format::catalog::BlockCatalog) -> ReplayBase<'_> {
+    ReplayBase { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: StorageEpoch(0), checkpoint: Some(checkpoint) }
+}
+
+impl ReplayedSuffix {
+    fn outside(&self, closure: &BTreeSet<rtdb_storage::ObjectKey>) -> Vec<&rtdb_storage::ObjectKey> {
+        self.reads.iter().filter(|key| !self.base.contains(key) && !closure.contains(key)).collect()
+    }
+}
+
+#[tokio::test]
+async fn inline_upload_replay_reads_only_its_typed_dependency_closure() {
+    let replayed = replayed_suffix(false).await;
+    assert_eq!(replayed.outside(&replayed.tail), Vec::<&rtdb_storage::ObjectKey>::new());
+    assert!(replayed.adopted.is_subset(&replayed.reads), "the inline upload adopts block 1's root and table block");
+    assert!(replayed.reads.contains(&replayed.stale_payload), "a stale oversized body still fetches its payload");
+    assert!(replayed.tail.contains(&replayed.stale_payload));
+}
+
+#[tokio::test]
+async fn oversized_upload_replay_reads_only_its_typed_dependency_closure() {
+    let replayed = replayed_suffix(true).await;
+    assert_eq!(replayed.outside(&replayed.tail), Vec::<&rtdb_storage::ObjectKey>::new());
+    assert!(replayed.adopted.is_subset(&replayed.reads), "the decoded upload adopts block 1's root and table block");
+    assert!(replayed.payloads.is_subset(&replayed.reads) && replayed.payloads.is_subset(&replayed.tail));
+}
+
+#[tokio::test]
+async fn payload_only_closure_misses_the_catalog_an_upload_adopts() {
+    for oversized_upload in [false, true] {
+        let replayed = replayed_suffix(oversized_upload).await;
+        let missed = replayed.outside(&replayed.payloads);
+        assert!(!missed.is_empty(), "a payload-only closure must miss a recorded read");
+        assert!(replayed.adopted.iter().all(|key| missed.contains(&key)), "it misses the adopted root and table block, read {missed:?}");
+    }
+}
+
+#[tokio::test]
+async fn stale_and_foreign_bodies_contribute_only_an_oversized_payload() {
+    let replayed = replayed_suffix(false).await;
+    let stale = replayed.envelopes.last().unwrap();
+    let ReplicaBody::TriesAdded(mut foreign) = replayed.envelopes[4].message.clone() else { panic!("expected the added tries"); };
+    foreign.storage_epoch = Some(1);
+    let foreign = ReplicaEnvelope { message: ReplicaBody::TriesAdded(foreign), ..replayed.envelopes[4].clone() };
+    let tail = tail_dependencies(replay_base(&replayed.checkpoint), [stale, &foreign], replayed.blocks.as_ref()).await.unwrap();
+    assert_eq!(tail, BTreeSet::from([replayed.stale_payload.clone()]));
 }
