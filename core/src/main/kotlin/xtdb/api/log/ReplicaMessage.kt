@@ -133,7 +133,7 @@ sealed interface ReplicaMessage {
                 .toHeaderedBytes(PROTOBUF_HEADER)
     }
 
-    data class ResolvedTx(
+    data class ResolvedTx @JvmOverloads constructor(
         val txId: MessageId,
         val systemTime: Instant,
         val committed: Boolean,
