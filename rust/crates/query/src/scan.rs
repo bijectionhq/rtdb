@@ -1510,8 +1510,9 @@ impl PartitionScan {
         self.initialized = true;
         Ok(())
     }
-    /// Whether a leaf's statistics leave it possible that a put of its page satisfies the scan's pushdowns and predicates.
+    /// A redacted candidate needs temporal resolution even when no put can satisfy the predicates.
     fn leaf_matches(&self, columns: &rtdb_format::metadata::LeafStatistics<'_>, page_test: &crate::page_metadata::PageTest) -> Result<bool> {
+        if columns.has_redacted_assertions() { return Ok(true); }
         Ok(self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
             && may_satisfy_not_null(&self.scan, columns) && page_test.matches(columns)?)
     }
@@ -2183,6 +2184,36 @@ mod tests {
             outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
         };
         (scan, execution, memory)
+    }
+
+    #[tokio::test]
+    async fn persisted_redaction_survives_payload_predicate_pruning() {
+        let (state, table, events) = live_table();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let captured = state.value();
+        let put_fields = captured.live().tables()[&table].column_types().clone();
+        let (mut scan, execution, _) = descriptor_scan(captured.snapshot(), table, storage);
+        scan.predicates.push(Expr::unary(UnaryOp::IsNotNull, scan.columns[0].expression()));
+        let cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let part = cursor.front_partition().unwrap();
+        let test = crate::page_metadata::PageTest::for_scan(&part.scan, &part.execution).await.unwrap();
+
+        for (operation, retained) in [(StoredOperation::Delete, false), (StoredOperation::Redacted, true)] {
+            let id = EntityId::Integer(1);
+            let event = StoredEvent {
+                iid: id.iid(), entity_key: Some(id.handle_bytes().into()), commit_position: 1,
+                origin: Some(rtdb_types::EventOrigin([9; 32])), operation, ..events[0].clone()
+            };
+            let page = build_event_batch(&[event], Some(put_fields.clone()), None).unwrap();
+            let mut builder = MetadataBuilder::new(false, false);
+            builder.write_leaf(&page).unwrap();
+            let (metadata, _) = builder.finish().unwrap();
+            let stored = MetadataFile::read(metadata.write().unwrap().into()).unwrap();
+            let MetadataNode::Leaf { columns, .. } = &stored.nodes()[0] else { panic!("Expected a leaf"); };
+            let columns = columns.statistics().unwrap();
+            assert!(!may_satisfy_not_null(&part.scan, &columns));
+            assert_eq!(part.leaf_matches(&columns, &test).unwrap(), retained);
+        }
     }
 
     #[tokio::test]

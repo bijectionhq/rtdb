@@ -24,17 +24,25 @@ struct Statistics {
 
 pub fn columns_for_event_page(batch: &RecordBatch, calculate_blooms: bool) -> Result<Vec<Value>> {
     let schema = batch.schema();
+    let op_index = schema.index_of("op").map_err(invalid)?;
+    let op = downcast::<UnionArray>(batch.column(op_index).as_ref())?;
+    let DataType::Union(fields, _) = op.data_type() else { return Err(invalid("Missing event operation fields")); };
+    let has_redacted = fields.iter().find(|(_, field)| field.name() == "redacted")
+        .is_some_and(|(id, _)| op.type_ids().contains(&id));
     let mut output = Vec::new();
     for name in ["_iid", "_valid_from", "_valid_to", "_system_from", "_recency"] {
         match schema.index_of(name) {
-            Ok(index) => { column_metadata(schema.field(index), batch.column(index).as_ref(), true, calculate_blooms, &mut output)?; }
+            Ok(index) => {
+                let column = column_metadata(schema.field(index), batch.column(index).as_ref(), true, calculate_blooms, &mut output)?;
+                if name == "_system_from" && has_redacted {
+                    let Value::Struct(stats) = &mut output[column] else { return Err(invalid("Column metadata must be a struct")); };
+                    stats.insert("redacted?".into(), Value::Bool(true));
+                }
+            }
             Err(_) if name == "_recency" => {}
             Err(error) => return Err(invalid(error)),
         }
     }
-    let op_index = schema.index_of("op").map_err(invalid)?;
-    let op = downcast::<UnionArray>(batch.column(op_index).as_ref())?;
-    let DataType::Union(fields, _) = op.data_type() else { return Err(invalid("Missing event operation fields")); };
     if let Some((id, field)) = fields.iter().find(|(_, field)| field.name() == "put") {
         let put = downcast::<StructArray>(op.child(id).as_ref())?;
         let DataType::Struct(fields) = field.data_type() else { return Err(invalid("Put operation must be a struct")); };

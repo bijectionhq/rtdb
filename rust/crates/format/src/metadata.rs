@@ -88,6 +88,10 @@ impl LeafStatistics<'_> {
     pub fn root_column(&self, name: &str) -> Option<ColumnStatistics<'_>> {
         self.columns().find(|column| column.name() == Some(name) && column.flag("root-col?") == Some(true))
     }
+
+    pub fn has_redacted_assertions(&self) -> bool {
+        self.root_column("_system_from").and_then(|column| column.flag("redacted?")) == Some(true)
+    }
 }
 
 impl<'a> StatisticCell<'a> {

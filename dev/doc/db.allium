@@ -46,6 +46,7 @@
 -- A redacted event participates at its original system position and valid interval.
 -- Temporal resolution can report the selected rectangles of a redacted event or a retraction along with the selected rectangles of values.
 -- Value scans refuse when a selected fragment belongs to a redacted event.
+-- Value-predicate statistics preserve pages that may contribute a redacted winner.
 -- Redaction by itself confers no entity-wide shortcut.
 -- In an owned IID bucket this shortcut requires the exact requested entity key.
 -- A scan narrowed to one ordinary IID can also skip loading pages whose greatest system time is older than a covering assertion.
