@@ -234,14 +234,16 @@ async fn same_time_clipping_and_erase_preserve_the_surrounding_history() {
 }
 
 #[tokio::test]
-async fn l0_merge_splits_recency_retries_identically_and_removes_temporary_files() {
+async fn l0_merge_splits_one_history_across_recency_files_and_pages() {
     let temp = tempfile::tempdir().unwrap();
     let table = TableRef::new("public", "docs");
     let slug = TableSlug::for_unrecorded_table(&table).unwrap();
     let key = TrieKey::l0(BlockIndex(0)).unwrap();
     let store = Arc::new(MemoryStore::default());
     let fields = BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
-    let rows: Vec<_> = (1..=7).rev().map(|time| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(time), valid_time: Interval::new(Timestamp(0), Timestamp::MAX).unwrap(),
+    let week = 7 * 86_400_000_000i64;
+    let rows: Vec<_> = (1..=13).rev().map(|time| if time <= 6 { time } else { week + time })
+        .map(|time| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(time), valid_time: Interval::new(Timestamp(0), Timestamp::MAX).unwrap(),
         operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(time))])), recency: None }).collect();
     let data = build_event_batch(&rows, Some(fields.into()), None).unwrap();
     let mut metadata = MetadataBuilder::new(false, true);
@@ -257,22 +259,38 @@ async fn l0_merge_splits_recency_retries_identically_and_removes_temporary_files
     }).unwrap();
     let job = CompactionJob { table, inputs: vec![key], part: vec![], output: TrieKey::new(1, None, vec![], BlockIndex(0)).unwrap(), recency_mode: RecencyMode::Partition };
     let notification = executor.execute(&job, &CancellationToken::new()).await.unwrap();
-    assert_eq!(notification.tries.len(), 2);
+    assert_eq!(notification.tries.len(), 3);
     let mut counts = BTreeMap::new();
+    let mut versions = Vec::new();
     for detail in &notification.tries {
         let key: TrieKey = detail.trie_key.as_ref().unwrap().parse().unwrap();
         let bytes = store.get(&ObjectKey::new(slug.data_key(&key)).unwrap()).await.unwrap();
         let mut reader = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
         let mut count = 0;
-        for page in 0..reader.page_count() { count += EventBatch::new(reader.read_page(page).unwrap()).unwrap().len(); }
-        counts.insert(key.recency().is_some(), count);
+        for page in 0..reader.page_count() {
+            let page = EventBatch::new(reader.read_page(page).unwrap()).unwrap();
+            assert!(page.len() <= 2);
+            count += page.len();
+            for row in 0..page.len() {
+                let header = page.header(row).unwrap();
+                assert_eq!(header.iid, Iid([0; 16]));
+                versions.push(header.system_from);
+            }
+        }
+        counts.insert(key.recency(), count);
         if key.recency().is_some() {
             assert!(reader.page_count() >= 3);
             let metadata = store.get(&ObjectKey::new(slug.metadata_key(&key)).unwrap()).await.unwrap();
             assert!(MetadataFile::read(Arc::from(metadata.as_ref())).unwrap().nodes().iter().any(|node| matches!(node, MetadataNode::RecencyBranch(_))));
         }
     }
-    assert_eq!(counts, BTreeMap::from([(false, 1), (true, 6)]));
+    assert_eq!(counts, BTreeMap::from([
+        (None, 1),
+        (Some(recency_partition(Timestamp(6), RecencyPartition::Week).unwrap()), 5),
+        (Some(recency_partition(Timestamp(week + 7), RecencyPartition::Week).unwrap()), 7),
+    ]));
+    versions.sort_unstable();
+    assert_eq!(versions, rows.iter().rev().map(|row| row.system_from).collect::<Vec<_>>());
     assert_eq!(executor.execute(&job, &CancellationToken::new()).await.unwrap(), notification);
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     assert_eq!(memory.used_bytes(), 0);

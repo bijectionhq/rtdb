@@ -170,6 +170,8 @@ config {
 --   If a branch has fewer rows than the page size: coalesce all descendant leaves into a single page.
 --
 -- A file whose data carries `_recency` is laid out as RecencyCellLayout sets out instead.
+-- In native compaction, one IID's history can occupy several historical files when its assertions have different recency partitions.
+-- Each recency-enabled file can hold several pages for the same IID.
 -- More than a page of versions of one entity can't split on IID: in a file without `_recency` they stay one page.
 --
 -- This ensures output pages are consistently sized (~1024 rows), regardless of input distribution.
