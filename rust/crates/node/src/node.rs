@@ -96,7 +96,7 @@ fn default_search(_format: SearchFileFormat) -> SearchServices {
 struct SearchServices { artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>, scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>> }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self::local_with_search_format(authorization, observer, users, metrics, SearchFileFormat::Paged)
+        Self::local_with_search_format(authorization, observer, users, metrics, SearchFileFormat::Tantivy)
     }
 
     pub fn local_with_search_format(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>,

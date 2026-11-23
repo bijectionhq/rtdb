@@ -30,7 +30,7 @@ struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
 fn services() -> NodeServices {
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
-    NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) }
+    NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, ..NodeServices::local_with_search_format(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures), rtdb_node::SearchFileFormat::Paged) }
 }
 fn options() -> NodeOptions {
     let mut options = NodeOptions::default();
