@@ -33,10 +33,9 @@ pub(crate) struct Inner {
 
 pub(crate) struct AudienceAdmission {
     calls: Arc<Semaphore>,
-    pub holds: Arc<Semaphore>,
+    session_slots: Arc<Semaphore>,
     memory: Arc<MemoryBudget>,
     sessions: Registry<String, Session>,
-    owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
 }
 
 #[derive(Clone, Copy)]
@@ -58,7 +57,7 @@ impl Admission {
 }
 impl Drop for Admission { fn drop(&mut self) { self.permit.take(); self.service.0.status.send_modify(|status| status.active_calls -= 1); self.service.publish(); } }
 struct AcquiredSession { service: Service, session: Arc<Session> }
-impl Drop for AcquiredSession { fn drop(&mut self) { self.service.sessions(self.session.audience_source.is_some()).release(&self.session.id); self.service.publish(); } }
+impl Drop for AcquiredSession { fn drop(&mut self) { self.service.sessions(self.session.audience_source().is_some()).release(&self.session.id); self.service.publish(); } }
 impl Drop for Call {
     fn drop(&mut self) { self.cancellation.cancel(); self._lease.take(); }
 }
@@ -70,7 +69,7 @@ impl Call {
         } else if self.minted {
             response.metadata_mut().insert("set-cookie", format!("{}={}", auth::COOKIE, self.session.id).parse().map_err(arrow)?);
             if self.session.caller.mac.is_some() { response.metadata_mut().insert("authorization", format!("Bearer {}", self.session.id).parse().map_err(arrow)?); }
-            if let Some(source) = self.session.audience_source {
+            if let Some(source) = self.session.audience_source() {
                 let audience = self.service.0.config.audience.filter(|profile| profile.source() == source)
                     .ok_or_else(unsupported)?;
                 response.metadata_mut().insert(AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().map_err(arrow)?);
@@ -80,12 +79,9 @@ impl Call {
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
-    pub fn owned_reads(&self) -> &Registry<Bytes, crate::owned_actions::OwnedReadResource> {
-        if self.session.audience_source.is_some() {
-            &self.service.0.audience.as_ref().expect("reserved session has an installed audience").owned_reads
-        } else {
-            &self.service.0.owned_reads
-        }
+    pub fn close_session(&self) {
+        let sessions = self.service.sessions(self.session.audience_source().is_some());
+        if let Lookup::Found(session) = sessions.take(&self.session.id) { session.close(); }
     }
     pub fn error(&self, mut error: Status) -> Status {
         if let Ok(response) = self.response(()) { for key in ["set-cookie", "authorization"] { if let Some(value) = response.metadata().get(key) { error.metadata_mut().insert(key, value.clone()); } } }
@@ -99,9 +95,8 @@ impl Service {
             let memory = memory.prepay(profile.execution_bytes())?;
             Some(AudienceAdmission {
                 calls: Arc::new(Semaphore::new(profile.permits())),
-                holds: Arc::new(Semaphore::new(profile.permits())),
+                session_slots: Arc::new(Semaphore::new(profile.permits())),
                 sessions: Registry::new(clock.clone(), memory.clone()),
-                owned_reads: Registry::new(clock.clone(), memory.clone()),
                 memory,
             })
         } else { None };
@@ -118,14 +113,12 @@ impl Service {
     pub fn sweep(&self) {
         if let Some(audience) = &self.0.audience {
             audience.sessions.sweep();
-            audience.owned_reads.sweep();
         }
         self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
         self.publish();
     }
     pub fn close(&self) {
         if let Some(audience) = &self.0.audience {
-            audience.owned_reads.close();
             audience.sessions.close();
         }
         self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
@@ -183,7 +176,7 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.audience_source != audience_source || audience_source.is_some() && !matches!(kind, CallKind::Action) {
+            if session.audience_source() != audience_source || audience_source.is_some() && !matches!(kind, CallKind::Action) {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
             if let Some(raw) = credentials.raw() {
@@ -222,7 +215,12 @@ impl Service {
             }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
             let memory = audience.map_or(self.memory(), |audience| &audience.memory);
-            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_source, memory.reserve(capacity).map_err(status)?));
+            let audience_slot = audience.zip(audience_source).map(|(audience, source)| {
+                let permit = Arc::clone(&audience.session_slots).try_acquire_owned()
+                    .map_err(|_| Status::resource_exhausted("Flight audience session slots are occupied"))?;
+                Ok::<_, Status>((source, permit))
+            }).transpose()?;
+            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)

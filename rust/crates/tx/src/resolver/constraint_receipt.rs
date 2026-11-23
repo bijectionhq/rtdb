@@ -9,6 +9,8 @@ const ATTEMPTS: &str = "fact_attempts";
 const PUBLICATIONS: &str = "fact_publications";
 const ROOT_HEAD: &str = "head";
 const RECEIPT_HEAD: &str = "sync_receipt_head";
+const DECISION_PREFIX: &str = "root_decision:";
+const MAX_DECISION_BYTES: usize = 1 << 20;
 
 fn invalid() -> Anomaly {
     Anomaly::incorrect(
@@ -27,7 +29,7 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     let primary = &ops[..index];
     let refusal = &ops[index + 1..];
     if !placed
-        || refusal.len() != 6
+        || !matches!(refusal.len(), 6 | 7)
         || !(primary.iter().all(primary_op)
             || crate::hosted_control::hosted_root_world_reads(primary))
     {
@@ -81,7 +83,8 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         .count();
     // Each alternative replacement is matched below. Counting both sets also
     // rules out silently dropping an unrelated control or attempt on refusal.
-    if control_writes != 4 || marker_writes != 2 {
+    let records_decision = refusal.len() == 7;
+    if control_writes != 4 + usize::from(records_decision) || marker_writes != 2 {
         return Err(invalid());
     }
 
@@ -135,7 +138,8 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         }
         types |= bit;
     }
-    if types != 63 {
+    let expected_types = if records_decision { 127 } else { 63 };
+    if types != expected_types {
         return Err(invalid());
     }
     Ok((primary, refusal))
@@ -209,6 +213,20 @@ fn control_choice(original: &HostedControlWrite, refusal: &HostedControlWrite) -
             if refusal.expected().is_some() && before == after && id == "sync_public_pending" =>
         {
             Ok(8)
+        }
+        ADMISSION
+            if refusal.expected().is_none()
+                && id.strip_prefix(DECISION_PREFIX).is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                })
+                && [before, after].iter().all(|document| {
+                    matches!(document.get("admission"), Some(Value::Binary(body))
+                        if !body.is_empty() && body.len() <= MAX_DECISION_BYTES)
+                })
+                && same_binding(before, after, &["admission"]) =>
+        {
+            Ok(64)
         }
         _ => Err(invalid()),
     }

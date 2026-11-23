@@ -258,9 +258,10 @@ Relations without a declaration continue to infer their schema.
 
 Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
 The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
-`rtdb.owned.OpenAppliedRead.v3` requests an already-applied hosted catalog from the current recovered holder.
+`rtdb.owned.OpenAppliedRead.v4` requests an already-applied hosted catalog from the current recovered holder.
 Its input is the 16-byte source installation UUID, a one-byte count from one to four, and that many exact transaction keys.
 Each key is a signed big-endian i64 transaction ID followed by a signed big-endian i64 ordered microsecond time.
+The final field is a big-endian u64 generation. Use zero outside a reserved audience session.
 Its result uses the same held handle and cut format.
 The selected transaction must equal or advance both coordinates of each supplied transaction in the same history.
 The node pins the exact installed storage catalog in the serving residence, confirms the recovered holder's source identity and checks the supplied transactions in that catalog.
@@ -269,20 +270,21 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder.
-The authenticated hosted owner sends that value as `x-rtdb-audience-flight-v2` during the handshake.
+The authenticated hosted owner sends that value as `x-rtdb-audience-flight-v3` during the handshake.
 The gateway and holder must acknowledge the exact source and turn count.
-The sealed route then uses its own gateway call permits, backend connection pool, holder call permits and retained-read permits.
+The sealed route then uses its own gateway call permits, backend connection pool, holder call permits and session slots.
 Each pool has two permits per turn and two for preparation and cleanup.
 Before serving, the holder reserves an execution pool of 16 MiB per permit. It refuses startup if the node cannot fund the pool.
-Audience sessions and held reads have their own registries. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
+Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
+A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
 Handshake routing and authentication use ordinary admission. Socket buffers, storage service, and scheduling still need their own capacity.
-The reservation admits applied open and confirmation, held point and historical point reads, hosted control reads, and held close.
+The reservation admits applied open and confirmation, held point and historical point reads, hosted control reads, and closure of the hold or session.
 The gateway routes only action RPCs on a reserved session.
 
 `rtdb.owned.ConfirmAppliedHosted.v5` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
 The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
 An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.
-The original handle must come from `rtdb.owned.OpenAppliedRead.v3`.
+The original handle must come from `rtdb.owned.OpenAppliedRead.v4`.
 Every control must be a check from the placed attachment's installed allowlist.
 The point must be an ordinary Root point at the original held valid instant.
 The node proves the supplied floor and the original transaction on one newly pinned applied catalog.
@@ -814,6 +816,8 @@ The refusal section contains a length-prefixed fact group stream followed by the
 An optional held-world read prefix uses the same count, handles, and witness nonces as CommitHostedWorldReads.v2.
 An ordinary or counted hosted commit follows.
 Its placed live Root owner supplies the same attempt marker, the receipt publication marker, the same dispatch retirement and alternative bodies for the exact business and private execution receipt slots.
+A public decision may also supply one absent-checked `root_decision:<sha256>` admission slot in both alternatives.
+The identity and all fields other than its outcome body must match between the alternatives.
 Only uniqueness, capacity and final-count violations found after evaluating the primary candidate select the refusal.
 The resolver discards the candidate buffer and orders the alternative under the same transaction key and the original deadline, Root point and range guards, hosted-control guards, and any retained-world scope, pin, purge, overlay and point guards.
 A receipt-only request with a final count condition moves the Sync receipt head for either result.
