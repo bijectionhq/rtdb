@@ -1060,38 +1060,48 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(!changed.writes().tables().contains_key(&facts.table("owner")));
 
     let staging_deadline = || TxOp::OwnedDeadline { until: Timestamp(200), recheck_at_staging: true };
-    let expired = resolver.resolve_source_with_clock(state.snapshot(), SourcePosition(4), Timestamp(104),
-        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context, Some(&|| Timestamp(199)),
+    let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication { clock: &|| Timestamp(199), maximum_inline_bytes: Some(1 << 20) }),
     ).await.unwrap();
     assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
     assert!(expired.placed_attempt().is_some());
     assert!(!expired.writes().tables().contains_key(&table));
     assert!(!expired.writes().tables().contains_key(&facts.table("owner")));
 
-    let accepted = resolver.resolve_source_with_clock(state.snapshot(), SourcePosition(5), Timestamp(105),
-        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context, Some(&|| Timestamp(198)),
+    let oversized = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(5), Timestamp(105),
+        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(100) }),
+    ).await.unwrap();
+    assert_eq!(oversized.result().error().unwrap().code, "rtdb.owned/replica-inline-bound");
+    assert!(oversized.placed_attempt().is_some());
+    assert!(!oversized.writes().tables().contains_key(&table));
+    assert!(!oversized.writes().tables().contains_key(&facts.table("owner")));
+
+    let accepted = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(1 << 20) }),
     ).await.unwrap();
     assert!(accepted.result().committed(), "{:?}", accepted.result().error());
     assert!(accepted.writes().tables().contains_key(&table));
     assert!(accepted.writes().tables().contains_key(&facts.table("owner")));
-    let replica = accepted.to_replica_body(&context.memory).unwrap();
-    let rtdb_format::envelope::ReplicaBody::ResolvedTx(message) = replica.body() else { panic!("expected a resolved replica transaction"); };
-    let replayed = rtdb_tx::decode_replica(message, Some(expired.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
+    let Some(rtdb_format::envelope::ReplicaBody::ResolvedTx(message)) = accepted.inline_replica_body() else { panic!("expected an inline replica transaction"); };
+    let replayed = rtdb_tx::decode_replica(message, Some(oversized.result().tx_key()), accepted.writes().block_index(), &context.memory).unwrap();
     assert!(replayed.writes.tables().contains_key(&table));
     assert!(replayed.writes.tables().contains_key(&facts.table("owner")));
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
-        source(vec![deadline(), replacement(105, 3), native_fact()]), &context).await.unwrap();
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+        source(vec![deadline(), replacement(106, 3), native_fact()]), &context).await.unwrap();
     assert!(!refused.result().committed());
     assert!(!refused.writes().tables().contains_key(&table));
 
-    let malformed = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+    let malformed = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
         source(vec![TxOp::PutDocs {
             table: table.clone(), documents: Documents::new(vec![control_row(4)], &context.memory).unwrap(),
             valid_from: Some(Timestamp(12)), valid_to: None,
         }]), &context).await.unwrap();
     assert!(malformed.result().committed());
-    let refused_slice = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
-        source(vec![deadline(), check(107)]), &context).await.unwrap();
+    let refused_slice = resolver.resolve_source(state.snapshot(), SourcePosition(9), Timestamp(109),
+        source(vec![deadline(), check(108)]), &context).await.unwrap();
     assert_eq!(refused_slice.result().error().unwrap().code, "rtdb.hosted/control-scope");
     assert!(!refused_slice.writes().tables().contains_key(&table));
 }

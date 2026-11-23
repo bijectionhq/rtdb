@@ -6,6 +6,7 @@ mod key;
 mod maintenance;
 mod postings;
 mod projection;
+mod replay_coverage;
 mod seek;
 mod tree;
 mod usage;

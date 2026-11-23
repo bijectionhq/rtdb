@@ -111,7 +111,7 @@ The collector resumes those intents after restart regardless of the age threshol
 A repaired local store reopened with a fresh journal can publish a catalog cut after it adopts the first checkpoint in that journal.
 The native reset regression keeps the old files with a catalog reader held across restart, then settles the durable intent after that reader has drained without another block adoption.
 [Verus](../verus/reset_retirement/proof.rs) checks the production adoption predicate and [TLC](../tla/ResetRetirement.tla) checks the bounded restart and release protocol.
-The L0-inventory reset and ordered-index replay still depend on the original L0 inputs, and those files stay outside automatic collection.
+The L0-inventory reset still depends on the original L0 inputs, and those files stay outside automatic collection.
 
 ## Retained checkpoint reset
 
@@ -120,7 +120,22 @@ It uses the maintenance writer's existing journal authority and synchronizes its
 The term refuses the replacement if the catalog or transaction head moved during preparation.
 Compacted pairs from the rebuilt base use a name derived from the successor block in a range reserved for recovery.
 The runtime preserves original L0 source descriptors for ordered replay and reconstructs absent pairs in the journal suffix.
-Automatic L0 reclamation still needs a replacement for the original event source used by ordered indexes and replay archives.
+Native ordered-index maintenance can rebuild a full projection from a synchronized epoch-zero journal when an adopted L0 data file is missing.
+It checks the exact captured boundary, admitted intervening uploads, per-block L0 event counts and the total table event count, and establishes erase cuts before writing pages.
+[Verus](../verus/ordered_replay/proof.rs) checks the production decisions for each recorded block and the complete inventory.
+The native regression reopens a writer, removes a historical L0 input and the ordered pages, and compares the rebuilt bytes and indexed queries with the L0-based projection across an erasure.
+Automatic L0 reclamation still requires coverage for replay archives, replay inputs outside the supported native journal, and journal and offload retention through the agreed recovery interval.
+
+## Replay archive handoff model
+
+[ReplaySourceHandoff](../tla/ReplaySourceHandoff.tla) checks the proposed switch from original L0 custody to a separately verified archive at a single checkpoint.
+The archive owns its serving inventory and its exact-cut event source before new reads route to it.
+An admitted source copy keeps its journal through provider drain.
+An already admitted reader or an outstanding startup block confirmation keeps the original files after the switch.
+The model reaches a state with an admitted archive reader and both original sources removed.
+TLC checks 420 states and rejects publication before synchronization, a foreign replay cut, retirement during an original read or pending confirmation, and trimming before the copy drains.
+The model takes the exact-cut check and independent durable archive content as inputs.
+The runtime still needs an archive format and a custody admission that supply both.
 
 ## Source retention through copy completion
 

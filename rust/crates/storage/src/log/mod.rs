@@ -127,6 +127,9 @@ pub trait LogReplayTail: Send {
 pub trait Log: Send + Sync {
     /// The reopened journal retains its synced prefix, and reads expose only that durable history.
     fn retains_synced_history(&self) -> bool { false }
+    /// The provider's fixed size limit for one append, before any provider-specific wrapping.
+    /// Absence means callers cannot admit an inline-only write using this provider.
+    fn maximum_append_bytes(&self) -> Option<usize> { None }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     fn latest(&self) -> Result<LogOffset>;

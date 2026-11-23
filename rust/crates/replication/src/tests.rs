@@ -736,6 +736,10 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
+    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), Timestamp(100), false, |_| Ok(())).await
+        else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
+    assert_eq!(error.code, "rtdb.storage/message-too-large");
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
     fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
     let record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
     assert!(matches!(ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
@@ -745,6 +749,27 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
     let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()) });
     fixture.driver.consume(raw(2, 1, 1, missing)).await.unwrap();
     assert_eq!(fixture.driver.read_position, rtdb_types::ReplicaPosition(2));
+}
+
+#[tokio::test]
+async fn retained_replay_requires_the_offload_even_when_readback_cached_it() {
+    let fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
+    let envelope = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(0)),
+        message: ReplicaBody::TriesDeleted(proto::TriesDeleted {
+            table_name: Some("public/docs".into()),
+            trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect(),
+        }),
+    };
+    fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
+    let record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
+    let record = fixture.logs.decode_replica(record).unwrap().unwrap();
+    let stored = record.envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap();
+    let cached = fixture.logs.resolve_oversized(record.clone()).await.unwrap();
+    assert!(matches!(cached.envelope.message, ReplicaBody::TriesDeleted(_)));
+    fixture.store.delete(&rtdb_storage::ObjectKey::new(stored).unwrap()).await.unwrap();
+    assert!(fixture.logs.resolve_oversized(record.clone()).await.is_ok());
+    assert_eq!(fixture.logs.resolve_oversized_fresh(record).await.unwrap_err().code, "rtdb.storage/missing-object");
 }
 
 #[tokio::test]

@@ -11,6 +11,7 @@ use rtdb_maintenance::{
     CycleWorker, SnapshotSource,
     input::{open_input, read_page},
 };
+use rtdb_replication::{PartitionLogs, RetainedTableReplay};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Definition, INDEX_ROOT, checkpoint, definitions, format_error,
     projection::{Changes, EventOrder, KeyLayout, RevisionRoots},
+    replay_coverage::{classify_replay_block, replay_complete},
     tree::{Address, AddressRef, Root, Tree},
 };
 
@@ -27,6 +29,7 @@ pub(crate) struct OrderedIndexMaintenance {
     memory: Arc<MemoryBudget>,
     clock: Arc<dyn crate::Clock>,
     snapshots: Arc<dyn SnapshotSource>,
+    logs: Arc<PartitionLogs>,
 }
 
 impl OrderedIndexMaintenance {
@@ -36,6 +39,7 @@ impl OrderedIndexMaintenance {
         memory: Arc<MemoryBudget>,
         clock: Arc<dyn crate::Clock>,
         snapshots: Arc<dyn SnapshotSource>,
+        logs: Arc<PartitionLogs>,
     ) -> Self {
         Self {
             database,
@@ -43,6 +47,7 @@ impl OrderedIndexMaintenance {
             memory,
             clock,
             snapshots,
+            logs,
         }
     }
 
@@ -84,6 +89,22 @@ impl OrderedIndexMaintenance {
     }
 
     async fn refresh_index(
+        &self,
+        snapshot: &Snapshot,
+        definition: &Definition,
+        directory: &ObjectKey,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let result = self.refresh_from_files(snapshot, definition, directory, cancellation).await;
+        match result {
+            Err(error) if error.code == "rtdb.ordered-index/missing-source" => {
+                self.refresh_from_journal(snapshot, definition, directory, cancellation).await?.ok_or(error)
+            }
+            result => result,
+        }
+    }
+
+    async fn refresh_from_files(
         &self,
         snapshot: &Snapshot,
         definition: &Definition,
@@ -150,6 +171,47 @@ impl OrderedIndexMaintenance {
             checkpoint::publish(&tree, through, expected, roots.archived, cancellation).await?;
         checkpoint.collect(&tree, cancellation).await
     }
+
+    async fn refresh_from_journal(
+        &self,
+        snapshot: &Snapshot,
+        definition: &Definition,
+        directory: &ObjectKey,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>> {
+        let Some(target) = snapshot.table_catalog().block() else { return Ok(None); };
+        let Some(mut replay) = RetainedTableReplay::open(&self.logs, target, &definition.table).await? else { return Ok(None); };
+        let through = source_frontier(snapshot, &definition.table);
+        let expected = source_rows(snapshot, &definition.table);
+        let sources = source_files(snapshot, &definition.table, -1, through)?;
+        let mut cuts = ErasureCuts::default();
+        let mut coverage = ReplayCoverage::new(&sources);
+        while let Some((block, rows)) = replay.next_block(cancellation, |block, batch| {
+            cuts.record(block.0, batch, &self.memory, cancellation)
+        }).await? {
+            coverage.observe(block.0, rows)?;
+        }
+        coverage.finish(expected)?;
+
+        let tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
+        checkpoint::request_collection(&tree, through).await?;
+        let mut replay = RetainedTableReplay::open(&self.logs, target, &definition.table).await?.ok_or_else(incomplete_source)?;
+        let mut coverage = ReplayCoverage::new(&sources);
+        let mut roots = RevisionRoots::default();
+        let mut changes = Changes::default();
+        while let Some((block, rows)) = replay.next_block(cancellation, |_, batch| {
+            changes.add_batch(batch, 0, &definition.columns, &tree.memory, cancellation, KeyLayout::for_table(&definition.table),
+                |header, address| cuts.retains(header, address))
+        }).await? {
+            if coverage.observe(block.0, rows)? {
+                apply_block(&tree, block.0, &mut roots, std::mem::take(&mut changes), cancellation).await?;
+            }
+        }
+        coverage.finish(expected)?;
+        let checkpoint = checkpoint::publish(&tree, through, expected, roots.archived, cancellation).await?;
+        checkpoint.collect(&tree, cancellation).await?;
+        Ok(Some(()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -171,11 +233,11 @@ async fn read_flushed(
         return Err(cancelled());
     }
     let store = storage.object_store();
-    if store.head_fresh(&source.object).await?.size != source.size as u64 {
+    if store.head_fresh(&source.object).await.map_err(source_read_error)?.size != source.size as u64 {
         return Err(format_error("An ordered index source differs from the adopted file"));
     }
     let _input_bytes = memory.reserve(source.size)?;
-    let bytes = store.get_fresh(&source.object).await?;
+    let bytes = store.get_fresh(&source.object).await.map_err(source_read_error)?;
     if bytes.len() != source.size {
         return Err(format_error("An ordered index source file changed length"));
     }
@@ -195,10 +257,47 @@ async fn read_flushed(
     Ok(rows)
 }
 
+fn source_read_error(error: rtdb_storage::Error) -> Anomaly {
+    if matches!(error, rtdb_storage::Error::MissingObject(_)) {
+        return Anomaly::new(AnomalyCategory::NotFound, "rtdb.ordered-index/missing-source", error.to_string());
+    }
+    error.into()
+}
+
 #[derive(Default)]
 struct ErasureCuts {
     scope: u64,
     by_address: BTreeMap<Address, (Timestamp, Arc<MemoryReservation>)>,
+}
+
+impl ErasureCuts {
+    fn record(&mut self, block: i64, batch: &EventBatch, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<()> {
+        for row in 0..batch.len() {
+            if cancellation.is_cancelled() { return Err(cancelled()); }
+            let header = batch.header(row)?;
+            if header.op == EventOp::Erase {
+                self.scope = (block as u64 + 1).max(self.scope);
+                let key = batch.entity_key(row)?.unwrap_or_default();
+                let _scratch = memory.reserve(key.len().saturating_add(128))?;
+                if !key.is_empty() { rtdb_types::EntityId::from_handle_bytes(key)?; }
+                let address = AddressRef { iid: header.iid, key };
+                match self.by_address.entry(address.owned()) {
+                    Entry::Occupied(mut entry) => {
+                        let cut = &mut entry.get_mut().0;
+                        *cut = (*cut).max(header.system_from);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert((header.system_from, memory.reserve(key.len().saturating_add(128))?));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retains(&self, header: rtdb_types::EventHeader, address: AddressRef<'_>) -> bool {
+        self.by_address.get(&address.owned()).is_none_or(|(cut, _)| header.system_from >= *cut)
+    }
 }
 
 async fn erase_cuts(
@@ -209,32 +308,7 @@ async fn erase_cuts(
 ) -> Result<ErasureCuts> {
     let mut cuts = ErasureCuts::default();
     for source in sources {
-        read_flushed(storage, memory, source, cancellation, |batch| {
-            for row in 0..batch.len() {
-                if cancellation.is_cancelled() {
-                    return Err(cancelled());
-                }
-                let header = batch.header(row)?;
-                if header.op == EventOp::Erase {
-                    cuts.scope = (source.block as u64 + 1).max(cuts.scope);
-                    let key = batch.entity_key(row)?.unwrap_or_default();
-                    let _scratch = memory.reserve(key.len().saturating_add(128))?;
-                    if !key.is_empty() { rtdb_types::EntityId::from_handle_bytes(key)?; }
-                    let address = AddressRef { iid: header.iid, key };
-                    match cuts.by_address.entry(address.owned()) {
-                        Entry::Occupied(mut entry) => {
-                            let cut = &mut entry.get_mut().0;
-                            *cut = (*cut).max(header.system_from);
-                        }
-                        Entry::Vacant(entry) => {
-                            entry.insert((header.system_from, memory.reserve(key.len().saturating_add(128))?));
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await?;
+        read_flushed(storage, memory, source, cancellation, |batch| cuts.record(source.block, batch, memory, cancellation)).await?;
     }
     Ok(cuts)
 }
@@ -272,20 +346,19 @@ async fn replay_flushed(
 ) -> Result<i64> {
     let mut rows = 0_i64;
     for source in sources {
-        let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header, address| {
-            cuts.by_address.get(&address.owned())
-                .is_none_or(|(cut, _)| header.system_from >= *cut)
-        })
-        .await?;
+        let (count, changes) = flushed_changes(tree, definition, source, cancellation, |header, address| cuts.retains(header, address)).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
-        roots
-            .apply(tree, changes, EventOrder::NewestFirst, cancellation)
-            .await?;
-        // A rebuild and incremental replay must write identical addresses for the same block.
-        roots.archived = checkpoint::store_roots(tree, source.block, roots, cancellation).await?;
-        roots.changes.clear();
+        apply_block(tree, source.block, roots, changes, cancellation).await?;
     }
     Ok(rows)
+}
+
+async fn apply_block(tree: &Tree, block: i64, roots: &mut RevisionRoots, changes: Changes, cancellation: &CancellationToken) -> Result<()> {
+    roots.apply(tree, changes, EventOrder::NewestFirst, cancellation).await?;
+    // A rebuild and incremental replay must write identical addresses for the same block.
+    roots.archived = checkpoint::store_roots(tree, block, roots, cancellation).await?;
+    roots.changes.clear();
+    Ok(())
 }
 
 const MAX_TAIL_FILES: usize = 8;
@@ -384,6 +457,31 @@ struct SourceFile {
     block: i64,
     object: ObjectKey,
     size: usize,
+    rows: Option<i64>,
+}
+
+struct ReplayCoverage<'a> {
+    pending: &'a [SourceFile],
+    rows: i64,
+}
+
+impl<'a> ReplayCoverage<'a> {
+    fn new(sources: &'a [SourceFile]) -> Self { Self { pending: sources, rows: 0 } }
+
+    fn observe(&mut self, block: i64, rows: i64) -> Result<bool> {
+        let next = self.pending.first().map(|source| (source.block, source.rows));
+        if !classify_replay_block(next, block, rows).ok_or_else(incomplete_source)? {
+            return Ok(false);
+        }
+        let Some((_, remaining)) = self.pending.split_first() else { return Err(incomplete_source()); };
+        self.rows = self.rows.checked_add(rows).ok_or_else(incomplete_source)?;
+        self.pending = remaining;
+        Ok(true)
+    }
+
+    fn finish(self, expected: i64) -> Result<()> {
+        if replay_complete(self.pending.is_empty(), self.rows, expected) { Ok(()) } else { Err(incomplete_source()) }
+    }
 }
 
 fn source_files(
@@ -406,6 +504,7 @@ fn source_files(
                 block: trie.key.block_index().0,
                 object: ObjectKey::new(storage.slug.data_key(&trie.key))?,
                 size: usize::try_from(trie.data_file_size).map_err(format_error)?,
+                rows: trie.metadata.as_ref().and_then(|metadata| metadata.row_count),
             })
         })
         .collect::<Result<Vec<_>>>()?;

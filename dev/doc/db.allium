@@ -1782,7 +1782,7 @@ contract CompactorReset {
         -- Replay verifies both endpoints and stops at the adopted transaction head and table registry.
         -- Rebuilt pairs are synchronized before the successor is published.
         -- Rebuilt compacted pairs use names disjoint from prior resets and normal compactor outputs.
-        -- Original L0 identities continue to supply consumers of source-order replay.
+        -- Original L0 identities remain available to bind the inputs of source-order replay.
 
     @invariant PublicationPrecedesDeletion
         -- A reset with a completed transaction publishes the replacement catalog in a new block.
@@ -1807,6 +1807,18 @@ contract CompactorReset {
     @invariant DryRunPlan
         -- A dry run performs the initial catch-up flush and reports the prospective primary catalog and retirements.
         -- Its plan leaves the catalog and files as they stood after that catch-up.
+}
+
+contract OrderedIndexReplay {
+    @invariant AdoptedEventCoverage
+        -- Ordered-index maintenance checks its flushed inputs against the captured table's adopted L0 inventory.
+        -- If a data object is missing, a native local database can rebuild from a retained journal from the first block through the captured checkpoint.
+        -- The journal admits the captured boundary and transaction head, confirms the intervening blocks, and reproduces the event count of each recorded nonempty block.
+        -- Publication requires complete inventory and total row coverage.
+
+    @invariant ErasureBeforePublication
+        -- A journal rebuild identifies the last erase of each entity across the captured inputs before projecting events into the ordered index.
+        -- The rebuilt historical roots exclude events from before that erase.
 }
 
 contract LocalCheckpointRepair {

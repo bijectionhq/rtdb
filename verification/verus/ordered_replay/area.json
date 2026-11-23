@@ -1,0 +1,76 @@
+{
+  "summary": "Local ordered replay consumes exact adopted table blocks and publishes only with complete block and row coverage.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "coverage",
+    "--verify-root"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "skip_adopted_block": {
+      "defect": "An empty replay block can skip a recorded nonempty block.",
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "find": "if rows == 0 && block < expected_block =>",
+          "replace": "if rows == 0 && block <= expected_block =>"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "function": "classify_replay_block",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "function": "classify_replay_block",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "accept_different_count": {
+      "defect": "An observed block substitutes another event count for the adopted one.",
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "find": "(block, rows) == (expected_block, expected_rows)",
+          "replace": "block == expected_block"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "function": "classify_replay_block",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "function": "classify_replay_block",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "ignore_remaining_inventory": {
+      "defect": "A matching aggregate count authorizes publication with an unconsumed adopted block.",
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "find": "    exhausted && observed == expected",
+          "replace": "    observed == expected"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/node/src/ordered_index/replay_coverage.rs",
+          "function": "replay_complete",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

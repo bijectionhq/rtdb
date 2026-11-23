@@ -266,6 +266,7 @@ impl Drop for LocalLogDriver {
 #[async_trait]
 impl Log for LocalLog {
     fn retains_synced_history(&self) -> bool { true }
+    fn maximum_append_bytes(&self) -> Option<usize> { Some(self.maximum_message_bytes) }
 
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
         super::read_only::file_range(Arc::clone(&self.path), self.maximum_message_bytes, from, to, Some(self.progress.latest()?))

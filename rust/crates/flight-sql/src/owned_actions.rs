@@ -2092,7 +2092,7 @@ impl Service {
         }.map_err(status)?;
         if witnesses.len() != relations.len() { return Err(Status::internal("Incomplete retained search evidence")); }
         if let Some(scope) = staged_scope {
-            if witnesses.iter().any(|witness| !witness.matches_scope(Some(scope))) {
+            if witnesses.iter().any(|witness| !witness.matches_scope(scope)) {
                 return Err(Status::failed_precondition("Staged search did not retain its original placed corpus"));
             }
         }

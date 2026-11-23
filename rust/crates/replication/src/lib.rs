@@ -13,6 +13,7 @@ mod repair;
 mod repair_decision;
 mod retirement_receipt;
 mod state;
+mod table_replay;
 
 pub use admission::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
@@ -21,3 +22,4 @@ pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
 pub use repair::{LocalRepair, PublishedReplayedPrimary, RepairCheckpoint, ReplayedPrimary, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};
+pub use table_replay::RetainedTableReplay;
