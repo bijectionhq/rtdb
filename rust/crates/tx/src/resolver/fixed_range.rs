@@ -1,13 +1,11 @@
-use std::collections::BTreeSet;
-
 use rtdb_types::{
     EntityId, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS, FixedRangeEvidence, FixedRangeKey,
-    FixedRangeRule, OwnedChange, OwnedRelation,
+    FixedRangeRule, OwnedRelation,
 };
 
 use super::*;
 
-const MAX_SIDE_BYTES: usize = 256 * 1024;
+pub(super) const MAX_SIDE_BYTES: usize = 256 * 1024;
 
 impl OpenTransaction<'_> {
     pub(super) async fn declare_fixed_range(
@@ -72,79 +70,51 @@ impl OpenTransaction<'_> {
         )
     }
 
-    pub(super) async fn fixed_range_keys(
-        &self,
-        base: &Snapshot,
-        next: &Snapshot,
-        owner: &str,
-        relation: &OwnedRelation,
-        touches: &[Value],
-    ) -> Result<Option<(Value, Vec<Arc<MemoryReservation>>)>> {
-        let context = self.context.query_context(
-            next.clone(),
-            self.tx_key().system_time,
-            &self.options.default_tz,
-            self.trace_parent,
-        )?;
-        let Some(rule) = rtdb_query::read_owned_fixed_range_rule(context, owner, relation).await?
-        else {
+    pub(super) async fn fixed_range_before(
+        &self, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+    ) -> Result<Option<(FixedRangeRule, Value)>> {
+        let rules = relation.fixed_range_table(owner);
+        if !self.buffer.base_snapshot().contains_table(&rules) && !self.buffer.has_pending_table(&rules) {
             return Ok(None);
+        }
+        let context = self.context.query_context(
+            self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+        )?;
+        let rule = rtdb_query::read_owned_fixed_range_rule(context, owner, relation).await?
+            .ok_or_else(rtdb_types::change_feed_uncovered)?;
+        if !valid.contains(rule.valid_at) {
+            return Ok(None);
+        }
+        let previous = self.owned_changes.get(relation.name())
+            .and_then(|group| group.fixed_sides.as_ref())
+            .and_then(|sides| sides.iter().rev().find(|side| &side.id == id));
+        let before = match previous {
+            Some(side) => side.after.clone(),
+            None => self.fixed_key_at(
+                self.buffer.base_snapshot(), owner, relation, id, &rule.column, Interval::at(rule.valid_at)?,
+            ).await?,
         };
+        Ok(Some((rule, before)))
+    }
 
-        let mut ids = BTreeSet::new();
-        let mut reservations = Vec::new();
-        for touch in touches {
-            let touch = OwnedChange::from_value(touch)?;
-            if !touch.valid.contains(rule.valid_at) || ids.contains(&touch.id) {
-                continue;
-            }
-            if ids.len() == FIXED_RANGE_MAX_IDS
-                || !matches!(&touch.id, EntityId::String(id) if id.len() <= rtdb_types::FIXED_RANGE_COMPONENT_BYTES)
-            {
-                return Ok(None);
-            }
-            reservations.push(
-                self.context.memory.reserve(
-                    touch
-                        .id
-                        .as_value()
-                        .retained_bytes()?
-                        .checked_add(512)
-                        .ok_or_else(overflow)?,
-                )?,
-            );
-            ids.insert(touch.id);
+    pub(super) fn fixed_range_pair(
+        &self, id: &EntityId, before: Result<Option<(FixedRangeRule, Value)>>,
+        projected: impl FnOnce(&str) -> Result<Option<FixedRangeKey>>,
+    ) -> Result<Option<(super::FixedRangeSide, Arc<MemoryReservation>)>> {
+        let Some((rule, before)) = before? else { return Ok(None); };
+        let EntityId::String(text) = id else { return Err(rtdb_types::change_feed_uncovered()); };
+        if text.len() > rtdb_types::FIXED_RANGE_COMPONENT_BYTES {
+            return Err(rtdb_types::change_feed_uncovered());
         }
-        let valid = Interval::at(rule.valid_at)?;
-        let mut sides = Vec::with_capacity(ids.len());
-        let mut bytes = 0usize;
-        for id in ids {
-            let before = self
-                .fixed_key_at(base.clone(), owner, relation, &id, &rule.column, valid)
-                .await?;
-            let after = self
-                .fixed_key_at(next.clone(), owner, relation, &id, &rule.column, valid)
-                .await?;
-            let pair = Value::list(vec![before, after]);
-            let size = pair
-                .retained_bytes()?
-                .checked_add(128)
-                .ok_or_else(overflow)?;
-            bytes = bytes.checked_add(size).ok_or_else(overflow)?;
-            if bytes > MAX_SIDE_BYTES {
-                return Ok(None);
-            }
-            reservations.push(self.context.memory.reserve(size)?);
-            sides.push(pair);
+        let after = projected(&rule.column)?.map_or(Value::Null, |key| key.to_value());
+        let size = before.retained_bytes()?.checked_add(after.retained_bytes()?)
+            .and_then(|size| size.checked_add(text.len()))
+            .and_then(|size| size.checked_add(512)).ok_or_else(overflow)?;
+        if size > MAX_SIDE_BYTES {
+            return Err(rtdb_types::change_feed_uncovered());
         }
-        let event_count = i64::try_from(touches.len()).map_err(|_| overflow())?;
-        Ok(Some((
-            Value::Struct(StructFields::from([
-                ("event_count".into(), Value::I64(event_count)),
-                ("sides".into(), Value::list(sides)),
-            ])),
-            reservations,
-        )))
+        let charge = self.context.memory.reserve(size)?;
+        Ok(Some((super::FixedRangeSide { id: id.clone(), before, after }, charge)))
     }
 
     async fn fixed_key_at(

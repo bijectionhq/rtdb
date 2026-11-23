@@ -169,7 +169,7 @@
 -- Historical ordered pages and counts use a fully covered index revision at the admitted system cut and explicit valid instant.
 -- Historical index coverage includes ordered erasures, and historical pages and counts carry no commit evidence.
 
--- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys at the authored instant.
+-- A declared fixed-valid Binary and Utf8 identity path journals both old and new covered keys for each assertion at the authored instant, including assertions shadowed later in the same commit.
 -- A held full-span fixed witness permits intervening relation writes only when every covered journal side lies outside its bounds.
 -- Missing exact evidence leaves relation-frontier validation in force.
 -- An admitted placed hosted writer may replace checked ordinary control rows with owned root facts in one ordered transaction.

@@ -611,11 +611,19 @@ fn batch_observers_exclude_the_publishing_world_and_include_clock_only_worlds() 
     Ok(())
 }
 
+struct FixedRangeSide {
+    id: EntityId,
+    before: Value,
+    after: Value,
+}
+
 #[derive(Default)]
 struct PendingOwnedChanges {
     bytes: usize,
     erased: bool,
     touches: Vec<Value>,
+    fixed_sides: Option<Vec<FixedRangeSide>>,
+    fixed_bytes: usize,
     reservations: Vec<Arc<MemoryReservation>>,
 }
 
@@ -2153,7 +2161,7 @@ impl<'a> OpenTransaction<'a> {
         // The full handle, including its type, is the erasure target even
         // when the locality prefix is shared or the key has no live winner.
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
-        self.record_owned_change(relation, id.clone(), kind, Interval::ALL)?;
+        let fixed_before = self.fixed_range_before(owner, relation, id, Interval::ALL).await;
         self.buffer.append(table, StoredEvent {
             origin: None,
             commit_position: 0,
@@ -2161,6 +2169,8 @@ impl<'a> OpenTransaction<'a> {
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Erase, recency: None,
         })?;
+        let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
+        self.record_owned_change(relation, id.clone(), kind, Interval::ALL, fixed)?;
         let floors = relation.purge_floor_table(owner);
         self.buffer.put(floors.clone(), bucket.advance(id, ordered.system_time)?, Interval::ALL)?;
         if first_erase {
@@ -2224,11 +2234,13 @@ impl<'a> OpenTransaction<'a> {
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
         self.track_unique_mutation(owner, relation, id, valid).await?;
         self.track_capacity_mutation(owner, relation, id, valid).await?;
+        let fixed_before = self.fixed_range_before(owner, relation, id, valid).await;
         let system_from = self.tx_key().system_time;
         self.buffer.append(relation.table(owner), StoredEvent { origin: None, commit_position: 0, entity_key: Some(id.handle_bytes().into()),
             iid: id.iid(), system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
         })?;
-        self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid)
+        let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
+        self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid, fixed)
     }
 
     async fn write_owned(&mut self, relation: &rtdb_types::OwnedRelation, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool) -> Result<()> {
@@ -2607,11 +2619,24 @@ impl<'a> OpenTransaction<'a> {
                 Some(valid) => valid,
                 None => interval(valid_from, valid_to)?,
             };
-            let key = self.admit_owned_put(&table, relation, owner, id, iid, valid_time, create_only, rtdb_types::OwnedChangeKind::Put).await?
+            let key = self.admit_owned_put(&table, relation, owner, &id, iid, valid_time, create_only).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.owned/missing-entity-key", "Governed put has no complete key"))?;
             let content = rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None)?;
             let header = EventHeader { commit_position: 0, iid, system_from: base_time, valid_time, op: EventOp::Put };
+            let fixed_before = self.fixed_range_before(owner, relation, &id, valid_time).await;
+            let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
+                let content = content.as_any().downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(rtdb_types::change_feed_uncovered)?;
+                let Some((field, values)) = content.fields().iter().zip(content.columns())
+                    .find(|(field, _)| field.name() == column)
+                else { return Err(rtdb_types::change_feed_uncovered()); };
+                let size = rtdb_columnar::estimate_read_value_bytes(field, values.as_ref(), 0)?;
+                let _charge = memory.reserve(size.checked_add(512).ok_or_else(overflow)?)?;
+                let value = rtdb_columnar::read_value(field, values.as_ref(), 0)?;
+                rtdb_types::FixedRangeKey::from_cells(&value, &id).map(Some)
+            });
             self.buffer.append_owned_put(&table, content, header, &key, documents.source_bytes())?;
+            self.record_owned_change(relation, id, rtdb_types::OwnedChangeKind::Put, valid_time, fixed)?;
         }
         if let Some(floor) = lifetime_floor {
             self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
@@ -2621,7 +2646,7 @@ impl<'a> OpenTransaction<'a> {
 
     async fn admit_owned_put(
         &mut self, table: &TableRef, relation: &rtdb_types::OwnedRelation, owner: &str,
-        id: EntityId, iid: Iid, valid: Interval, create_only: bool, kind: rtdb_types::OwnedChangeKind,
+        id: &EntityId, iid: Iid, valid: Interval, create_only: bool,
     ) -> Result<Option<Arc<[u8]>>> {
         let key = if relation.is_world_catalog() {
             None
@@ -2629,18 +2654,15 @@ impl<'a> OpenTransaction<'a> {
             if iid != id.iid() {
                 return Err(Anomaly::incorrect("rtdb.owned/invalid-locality", "Owned row locality differs from the canonical key"));
             }
-            self.track_unique_mutation(owner, relation, &id, valid).await?;
-            self.track_capacity_mutation(owner, relation, &id, valid).await?;
+            self.track_unique_mutation(owner, relation, id, valid).await?;
+            self.track_capacity_mutation(owner, relation, id, valid).await?;
             Some(id.handle_bytes().into())
         };
         if self.snapshot()?.contains_table(table) {
-            let _ = self.read_owned_revision(owner, relation, &id, Interval::ALL).await?;
-            if create_only && self.read_owned_revision(owner, relation, &id, valid).await?.is_some() {
+            let _ = self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+            if create_only && self.read_owned_revision(owner, relation, id, valid).await?.is_some() {
                 return Err(insert_exists());
             }
-        }
-        if !relation.is_world_catalog() {
-            self.record_owned_change(relation, id, kind, valid)?;
         }
         Ok(key)
     }
@@ -2692,9 +2714,17 @@ impl<'a> OpenTransaction<'a> {
             } else {
                 rtdb_types::OwnedChangeKind::Put
             };
-            let entity_key = self.admit_owned_put(table, relation, owner, id, iid, valid_time, create_only, kind).await?;
+            let entity_key = self.admit_owned_put(table, relation, owner, &id, iid, valid_time, create_only).await?;
+            let fixed_before = self.fixed_range_before(owner, relation, &id, valid_time).await;
+            let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
+                let value = document.get(column).ok_or_else(rtdb_types::change_feed_uncovered)?;
+                rtdb_types::FixedRangeKey::from_cells(value, &id).map(Some)
+            });
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
             self.buffer.append_to(table, StoredEvent { origin: None, commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
+            if !relation.is_world_catalog() {
+                self.record_owned_change(relation, id, kind, valid_time, fixed)?;
+            }
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
@@ -2704,10 +2734,25 @@ impl<'a> OpenTransaction<'a> {
     fn record_owned_change(
         &mut self, relation: &rtdb_types::OwnedRelation, id: rtdb_types::EntityId,
         kind: rtdb_types::OwnedChangeKind, valid: Interval,
+        fixed: Result<Option<(FixedRangeSide, Arc<MemoryReservation>)>>,
     ) -> Result<()> {
         let too_large = || Anomaly::incorrect("rtdb.owned/change-group-too-large", "An owned relation's change group exceeds its byte limit");
         use rtdb_types::{OwnedChange, OwnedChangeKind};
-        let group = self.owned_changes.entry(relation.name().to_owned()).or_default();
+        let group = self.owned_changes.entry(relation.name().to_owned()).or_insert_with(|| PendingOwnedChanges {
+            fixed_sides: Some(Vec::new()), ..PendingOwnedChanges::default()
+        });
+        match (group.fixed_sides.as_mut(), fixed) {
+            (Some(sides), Ok(Some((pair, charge))))
+                if sides.len() < rtdb_types::FIXED_RANGE_MAX_IDS
+                    && group.fixed_bytes.saturating_add(charge.bytes()) <= fixed_range::MAX_SIDE_BYTES =>
+            {
+                group.fixed_bytes += charge.bytes();
+                sides.push(pair);
+                group.reservations.push(charge);
+            },
+            (_, Ok(None)) | (None, _) => (),
+            (Some(_), _) => group.fixed_sides = None,
+        }
         if group.erased || matches!(kind, OwnedChangeKind::Erase | OwnedChangeKind::Expired(_)) {
             for previous in &group.touches {
                 let previous = OwnedChange::from_value(previous)?;
@@ -2734,7 +2779,6 @@ impl<'a> OpenTransaction<'a> {
         if self.owned_changes.is_empty() { return Ok(()); }
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let base = self.buffer.base_snapshot();
-        let mut next = None;
         for (name, group) in std::mem::take(&mut self.owned_changes) {
             self.context.check_cancelled()?;
             let relation = OwnedRelation::from_source(name)?;
@@ -2764,20 +2808,20 @@ impl<'a> OpenTransaction<'a> {
                 return Err(Anomaly::incorrect("rtdb.owned/change-feed-exhausted", "The owned change feed revision space is exhausted"));
             }
             let rule_table = relation.fixed_range_table(owner);
-            let keys = if base.contains_table(&rule_table) || self.buffer.has_pending_table(&rule_table) {
-                if next.is_none() { next = Some(self.snapshot()?); }
-                self.fixed_range_keys(&base, next.as_ref().expect("captured buffered snapshot"), owner, &relation, &group.touches)
-                    .await.unwrap_or(None)
-            } else { None };
-            self.context.check_cancelled()?;
             let mut entry = StructFields::from([
                 ("_id".into(), Value::I64(revision)), ("entry".into(), Value::list(group.touches)),
                 ("through_events".into(), Value::I64(through)),
             ]);
-            let _keys_charge = if let Some((keys, charge)) = keys {
-                entry.insert("fixed_keys".into(), keys);
-                Some(charge)
-            } else { None };
+            if let Some(sides) = group.fixed_sides
+                && (base.contains_table(&rule_table) || self.buffer.has_pending_table(&rule_table))
+            {
+                let events = through - previous;
+                entry.insert("fixed_assertion_keys".into(), Value::Struct(StructFields::from([
+                    ("event_count".into(), Value::I64(events)),
+                    ("sides".into(), Value::list(sides.into_iter()
+                        .map(|side| Value::list(vec![side.before, side.after])).collect())),
+                ])));
+            }
             self.buffer.put(journal, entry, Interval::ALL)?;
         }
         Ok(())

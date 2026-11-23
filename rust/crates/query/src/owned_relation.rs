@@ -1046,7 +1046,7 @@ pub async fn read_owned_change_entry(
 pub async fn read_owned_fixed_range_changes(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, revision: i64,
 ) -> Result<OwnedChangeEntry> {
-    read_owned_journal_cell(context, owner, relation, revision, "fixed_keys").await
+    read_owned_journal_cell(context, owner, relation, revision, "fixed_assertion_keys").await
 }
 
 async fn read_owned_journal_cell(

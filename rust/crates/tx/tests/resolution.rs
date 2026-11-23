@@ -1218,6 +1218,13 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
     let stale_empty = resolver.resolve_source(state.snapshot(), SourcePosition(6), Timestamp(106),
         source(vec![check(leave.result().tx_key(), 4, 3)]), &context).await.unwrap();
     assert_eq!(stale_empty.result().error().unwrap().code, "rtdb.owned/stale-range");
+
+    let shadowed = resolver.resolve_source(state.snapshot(), SourcePosition(7), Timestamp(107),
+        source(vec![put("briefly", 5, 400, 500), put("briefly", 8, 400, 500)]), &context).await.unwrap();
+    assert!(shadowed.result().committed(), "{:?}", shadowed.result().error());
+    let stale_shadowed = resolver.resolve_source(state.snapshot(), SourcePosition(8), Timestamp(108),
+        source(vec![check(enter.result().tx_key(), 5, 4)]), &context).await.unwrap();
+    assert_eq!(stale_shadowed.result().error().unwrap().code, "rtdb.owned/stale-range");
 }
 
 #[tokio::test]

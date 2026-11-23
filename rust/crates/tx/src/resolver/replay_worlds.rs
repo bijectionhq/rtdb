@@ -282,7 +282,7 @@ impl OpenTransaction<'_> {
                     recency: None,
                 },
             )?;
-            self.record_owned_change(&relation, shadow.id, change, shadow.valid)?;
+            self.record_owned_change(&relation, shadow.id, change, shadow.valid, Ok(None))?;
         }
         Ok(())
     }
