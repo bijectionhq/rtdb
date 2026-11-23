@@ -18,7 +18,7 @@ use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, Own
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
-use rtdb_tx::{Documents, TxOp};
+use rtdb_tx::{Documents, OwnedRelativePeriod, TxOp};
 use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
@@ -1058,14 +1058,11 @@ impl Service {
             let from_offset = optional_micros(row.remove("_valid_from_offset_micros"))?;
             let to_offset = optional_micros(row.remove("_valid_to_offset_micros"))?;
             if from_offset.is_some() || to_offset.is_some() {
-                let (Some(from), Some(to)) = (from_offset, to_offset) else {
-                    return Err(invalid("A relative Root period requires both offsets"));
-                };
-                if !relation.is_root_data() || matches!(effects, CommitEffects::Replay)
-                    || valid_from.is_some() || valid_to.is_some() || from >= to
-                {
+                if !relation.is_root_data() || matches!(effects, CommitEffects::Replay) {
                     return Err(invalid("Invalid relative Root period"));
                 }
+                let period = OwnedRelativePeriod::from_fields(valid_from, valid_to, from_offset, to_offset)
+                    .ok_or_else(|| invalid("A relative Root period needs one coordinate for each finite bound"))?;
                 let effect = match operation.as_str() {
                     "create" => rtdb_tx::OwnedPeriodEffect::Create(Documents::new(vec![row], self.memory()).map_err(status)?),
                     "replace" => rtdb_tx::OwnedPeriodEffect::Replace(Documents::new(vec![row], self.memory()).map_err(status)?),
@@ -1073,7 +1070,7 @@ impl Service {
                     _ => return Err(invalid("A relative Root period requires a fact write")),
                 };
                 writes.push(TxOp::OwnedRelativePeriod {
-                    relation: relation.clone(), effect, from_micros: from.0, to_micros: to.0,
+                    relation: relation.clone(), effect, period,
                 });
                 continue;
             }
