@@ -106,7 +106,7 @@ pub(crate) async fn find_held_publication(
         }
         cipher.open_page(&mut entries)?;
         for entry in entries {
-            let envelope = admit_record(&entry, &mut fence, &mut writer, record.epoch)?;
+            let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
             let payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
                 payload = payloads.read(&envelope).await?;
@@ -181,7 +181,7 @@ pub(crate) async fn capture(
                             cipher.open_page(&mut entries)?;
                             artifact.put_segment(&entries, &mut chain).await?;
                             for entry in entries {
-                                let envelope = progress.admit(&entry, pin)?;
+                                let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
                                 if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
                                     let payload = payloads.read(&envelope).await?;
                                     let resolved = envelope.unwrap_payload(&payload.bytes)?;
@@ -261,7 +261,7 @@ pub(super) async fn apply_archived(
         let _charge = memory.reserve(MAX_SEGMENT_BYTES * 4 + 4096 + MAX_SEGMENT_ENTRIES * 128)?;
         let entries = artifact.read_segment(progress.next, pin.replica_through, &mut chain).await?;
         for entry in entries {
-            let envelope = progress.admit(&entry, pin)?;
+            let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
             let payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
                 payload = artifact.read_payload(entry.lsn, &mut chain, memory).await?;
@@ -358,10 +358,8 @@ impl TerminalReplayProgress {
     pub(super) fn admit(
         &mut self, entry: &ArchivedReplicaEntry, fence: &rtdb_directory::CheckpointTransferFence,
         recovered: &mut rtdb_replication::RecoveredPartition,
-    ) -> Result<ReplicaEnvelope> {
-        if self.last_offset.checked_add(1) != Some(entry.lsn)
-            || !matches!(recovered.fence.position(), rtdb_replication::TermPosition::Expecting(_))
-        {
+    ) -> Result<Option<ReplicaEnvelope>> {
+        if self.last_offset.checked_add(1) != Some(entry.lsn) {
             return Err(suffix_unavailable());
         }
         let envelope = admit_record(entry, &mut recovered.fence, &mut self.writer_epoch, fence.source_writer_epoch)?;
@@ -421,7 +419,7 @@ pub(super) async fn replay_certified_terminal(
             let _charge = memory.reserve(bytes)?;
             cipher.open_page(&mut entries)?;
             for entry in entries {
-                let envelope = progress.admit(&entry, fence, recovered)?;
+                let Some(envelope) = progress.admit(&entry, fence, recovered)? else { continue; };
                 let payload;
                 let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
                     payload = payloads.read(&envelope).await?;
@@ -525,7 +523,7 @@ impl SuffixProgress {
         })
     }
 
-    fn admit(&mut self, entry: &ArchivedReplicaEntry, pin: &CheckpointSuffixPin) -> Result<ReplicaEnvelope> {
+    fn admit(&mut self, entry: &ArchivedReplicaEntry, pin: &CheckpointSuffixPin) -> Result<Option<ReplicaEnvelope>> {
         if entry.lsn != self.next || entry.lsn > pin.replica_through {
             return Err(suffix_unavailable());
         }
@@ -695,10 +693,10 @@ pub(super) fn transfer_control(
     }.encode().into()))
 }
 
-fn admit_record(
+pub(super) fn admit_record(
     entry: &ArchivedReplicaEntry, fence: &mut rtdb_replication::TermFence,
     previous_writer: &mut Option<u64>, writer_epoch: u64,
-) -> Result<ReplicaEnvelope> {
+) -> Result<Option<ReplicaEnvelope>> {
     if !(1..=writer_epoch).contains(&entry.epoch) || previous_writer.is_some_and(|prior| prior > entry.epoch) {
         return Err(suffix_unavailable());
     }
@@ -707,22 +705,46 @@ fn admit_record(
         return Err(suffix_unavailable());
     }
     let admitted = fence.admit(envelope.term, envelope.term_sequence)?;
-    if admitted.verdict != rtdb_replication::Verdict::Apply
-        || (admitted.opens_term() && !matches!(&envelope.message,
-            ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none()))
+    if admitted.opens_term() && !matches!(&envelope.message,
+        ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none())
     {
         return Err(suffix_unavailable());
     }
     *previous_writer = Some(entry.epoch);
-    Ok(envelope)
+    Ok((admitted.verdict == rtdb_replication::Verdict::Apply).then_some(envelope))
 }
 
 #[cfg(test)]
 mod custody_tests {
     use rtdb_directory::{Checkpoint, CheckpointCapture, JournalAnchor, MemberId, MemoryDirectory};
+    use rtdb_format::log::proto::OversizedMessage;
+    use rtdb_replication::{TermFence, TermPosition};
+    use rtdb_types::{Term, TermSequence};
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn archived_records_retain_fenced_offsets_without_admitting_their_payloads() -> Result<()> {
+        let mut fence = TermFence::from_boundary(Term(2), Some(TermSequence(5)))?;
+        let mut writer = None;
+        let mut admit = |term, sequence, epoch, message| {
+            let envelope = ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message };
+            let entry = ArchivedReplicaEntry { epoch, payload: envelope.encode().into(), ..Default::default() };
+            admit_record(&entry, &mut fence, &mut writer, 3)
+        };
+        let offloaded = || ReplicaBody::OversizedMessage(OversizedMessage::default());
+        let claim = || ReplicaBody::NoOp(NoOp { src_msg_id: None });
+        assert!(admit(1, 1, 1, offloaded())?.is_none());
+        assert!(admit(2, 5, 1, offloaded())?.is_none());
+        assert!(admit(2, 7, 2, offloaded())?.is_none());
+        assert!(admit(2, 6, 2, offloaded())?.is_none());
+        assert!(admit(3, 0, 3, claim())?.is_some());
+        assert!(admit(3, 0, 3, claim())?.is_none());
+        assert!(admit(3, 1, 3, offloaded())?.is_some());
+        assert_eq!(fence.position(), TermPosition::Expecting(TermSequence(2)));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn a_suffix_copy_keeps_journal_custody_through_provider_drain() -> Result<()> {

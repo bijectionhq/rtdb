@@ -2,12 +2,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{CheckpointTransferBootstrap, Directory, HostedTask, Lifecycle};
-use rtdb_format::catalog::CheckpointContents;
-use rtdb_format::{CURRENT_STORAGE_VERSION, envelope::{ReplicaEnvelope, ReplicaFrame}};
-use rtdb_logkeeper::ArchivedReplicaEntry;
+use rtdb_format::{CURRENT_STORAGE_VERSION, catalog::{BlockCatalog, CheckpointContents}, envelope::ReplicaEnvelope, keys::block_key};
 use rtdb_node::{NodeOptions, ReadFence};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, read_owned_schema_catalog};
-use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint, RecoveredPartition};
+use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint, RecoveredPartition, TermFence};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::{BufferPool, CacheBudget}};
 use rtdb_types::{BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Timestamp, TransactionKey};
 use serde::Serialize;
@@ -152,7 +150,7 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                         source_cipher.open_page(&mut entries)?;
                         artifact.put_segment(&entries, &mut chain).await?;
                         for entry in entries {
-                            let envelope = replay.admit(&entry, fence, &mut recovered)?;
+                            let Some(envelope) = replay.admit(&entry, fence, &mut recovered)? else { continue; };
                             if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
                                 let payload = payloads.read(&envelope).await?;
                                 let resolved = envelope.unwrap_payload(&payload.bytes)?;
@@ -213,7 +211,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
 ) -> Result<rtdb_directory::CheckpointTransferReplica> {
     use crate::{
         admin::{choose_ensemble, replica_servers},
-        archive::{checkpoint_storage_root, replica_suffix, stage::{RegionPublication, with_region}},
+        archive::{checkpoint_storage_root, replica_suffix, stage::{RegionPublication, with_region}, verify_cut},
         reference::{PrefixedStore, key},
         store::{EncryptingStore, ROOT_MARKER},
     };
@@ -252,6 +250,25 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             let expected = artifact.read_manifest(ordered.ciphertext_sha256).await?;
             let start = transfer_first(stage)?;
             let through = terminal.replica_through;
+            let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
+            let files = PrefixedStore::new(Arc::clone(&bucket), root);
+            let marker = files.observe_fresh_exact(&key(ROOT_MARKER)?, target.id.len()).await?;
+            if marker.value.as_ref() != target.id.as_bytes() {
+                return Err(inconsistent("The replica payload store has another target owner"));
+            }
+            let media = keys.existing_key(&target.key_id()).await?
+                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
+            let serving = EncryptingStore::new(Arc::new(files), &media)?;
+            let initial_fence = {
+                let root_key = key(&block_key(BlockIndex(stage.checkpoint.block))?)?;
+                let bytes = PayloadBytes::read(&serving, &root_key, &memory).await?;
+                let catalog = BlockCatalog::decode(&bytes.bytes)?;
+                verify_cut(&catalog, stage.checkpoint, StorageEpoch(stage.source_log_epoch))?;
+                TermFence::from_catalog(&catalog)?
+            };
+            let source_epoch = terminal.fence.source_writer_epoch;
+            let mut fence = initial_fence.clone();
+            let mut writer = None;
             let mut next = start;
             let mut chain = artifact.chain();
             // Confirm the complete ordered artifact before provisioning the
@@ -260,7 +277,9 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
                 let entries = artifact.read_segment(next, through, &mut chain).await?;
                 for entry in &entries {
-                    let _ = observe_transfer_record(&artifact, entry, &mut chain, &memory).await?;
+                    if let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? {
+                        let _ = observe_transfer_record(&artifact, entry.lsn, envelope, &mut chain, &memory).await?;
+                    }
                 }
                 next += entries.len() as i64;
             }
@@ -291,15 +310,8 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 return Ok(reserved);
             }
             let scope = target.replica_seal_scope();
-            let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
-            let files = PrefixedStore::new(Arc::clone(&bucket), root);
-            let marker = files.observe_fresh_exact(&key(ROOT_MARKER)?, target.id.len()).await?;
-            if marker.value.as_ref() != target.id.as_bytes() {
-                return Err(inconsistent("The replica payload store has another target owner"));
-            }
-            let media = keys.existing_key(&target.key_id()).await?
-                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
-            let serving = EncryptingStore::new(Arc::new(files), &media)?;
+            let mut fence = initial_fence;
+            let mut writer = None;
             let mut next = start;
             let mut chain = artifact.chain();
             while next <= through {
@@ -307,7 +319,8 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 let first = next;
                 let mut entries = artifact.read_segment(first, through, &mut chain).await?;
                 for entry in &mut entries {
-                    let (envelope, offloaded) = observe_transfer_record(&artifact, entry, &mut chain, &memory).await?;
+                    let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? else { continue; };
+                    let (envelope, offloaded) = observe_transfer_record(&artifact, entry.lsn, envelope, &mut chain, &memory).await?;
                     if let Some(control) = replica_suffix::transfer_control(&envelope, stage.checkpoint)? {
                         entry.payload = control;
                     } else if let Some((key, payload)) = offloaded {
@@ -340,15 +353,13 @@ pub(crate) async fn seed_checkpoint_transfer_target(
 }
 
 async fn observe_transfer_record(
-    artifact: &ReplicaArtifact<'_>, entry: &ArchivedReplicaEntry, chain: &mut Context,
+    artifact: &ReplicaArtifact<'_>, offset: i64, envelope: ReplicaEnvelope, chain: &mut Context,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(ReplicaEnvelope, Option<(ObjectKey, PayloadBytes)>)> {
-    let envelope = ReplicaFrame::decode(&entry.payload)?.into_envelope()
-        .ok_or_else(|| inconsistent("The target replica artifact has no admitted envelope"))?;
     let Some(relative) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? else {
         return Ok((envelope, None));
     };
-    let payload = artifact.read_payload(entry.lsn, chain, memory).await?;
+    let payload = artifact.read_payload(offset, chain, memory).await?;
     let resolved = envelope.unwrap_payload(&payload.bytes)?;
     Ok((resolved, Some((crate::reference::key(&relative)?, payload))))
 }

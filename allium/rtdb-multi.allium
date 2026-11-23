@@ -1503,6 +1503,8 @@ rule TrimCertifiedReplicaPrefix {
     -- A separately captured suffix retains its capture until explicit archive retirement.
     -- A world-parent suffix protects its capture for the duration of its preparation lease, held restore, and retained world references.
     -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
+    -- Archive certification covers every replica offset and replay applies only the messages admitted by the checkpoint's term fence.
+    -- Fenced, discarded and voided records survive a transfer at their original offsets and require no offloaded payload.
     when: ReplicaPrefixCertified(holding, through, digest)
 
     requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
