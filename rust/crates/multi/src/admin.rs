@@ -600,7 +600,7 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
     crate::archive::require_plain_fork_cut(bucket.clone(), source, &source_key, selected).await?;
     if tail.iter().any(|envelope| matches!(&envelope.message,
         rtdb_format::envelope::ReplicaBody::ResolvedTx(tx)
-            if tx.table_data.keys().any(|name| rtdb_types::TableRef::is_owned_lifetime_replica_table(name))
+            if tx.table_data.keys().any(|name| name.split_once('/').is_some_and(|(schema, _)| rtdb_types::TableRef::owned_schema(schema)))
     )) {
         return Err(fork_unavailable(&source.name));
     }
