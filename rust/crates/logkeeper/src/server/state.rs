@@ -237,6 +237,12 @@ impl<P: Payload> StreamState<P> {
         self.persist(events, Self::accepted)
     }
 
+    pub fn trim_durable(&mut self, through: i64) -> Decision {
+        if self.dropped { return invalid("the stream was dropped"); }
+        // A no-op decision produces no journal bytes to sync.
+        self.persist(vec![Event::Trim(self.trim.max(through))], Self::accepted)
+    }
+
     pub fn check(&self, epoch: u64) -> ResponseBody {
         if self.promised > epoch { self.refused() }
         else if self.dropped { invalid("the stream was dropped").reply }

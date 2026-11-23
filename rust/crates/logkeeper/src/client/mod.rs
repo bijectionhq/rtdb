@@ -245,18 +245,36 @@ pub async fn seal_recover_committed(config: &StreamConfig, epoch: u64) -> rtdb_t
 
 /// Lets every server drop entries at or below `through`, which must be committed.
 pub async fn trim(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
-    trim_on(config, through, config.write_quorum).await
+    trim_on(config, through, TrimPolicy::Quorum).await
 }
 
+/// Requires a fresh durable trim acknowledgement from each configured journal, including on retry.
 pub async fn trim_all(config: &StreamConfig, through: LogOffset) -> rtdb_types::Result<()> {
-    trim_on(config, through, config.servers.len()).await
+    trim_on(config, through, TrimPolicy::DurableAll).await
 }
 
-async fn trim_on(config: &StreamConfig, through: LogOffset, required: usize) -> rtdb_types::Result<()> {
+#[derive(Clone, Copy)]
+enum TrimPolicy { Quorum, DurableAll }
+
+async fn trim_on(config: &StreamConfig, through: LogOffset, policy: TrimPolicy) -> rtdb_types::Result<()> {
     validate(config)?;
     let ensemble = Ensemble::new(config.clone());
-    let replies: Vec<_> = (0..ensemble.len()).map(|server| ensemble.trim(server, through.0)).collect::<FuturesUnordered<_>>().collect().await;
-    let trimmed = replies.iter().filter(|reply| matches!(reply, Ok(Ack::Accepted(_)))).count();
+    let required = match policy {
+        TrimPolicy::Quorum => config.write_quorum,
+        TrimPolicy::DurableAll => ensemble.len(),
+    };
+    let ensemble = &ensemble;
+    let requests = (0..ensemble.len()).map(|server| async move {
+        match policy {
+            TrimPolicy::Quorum => ensemble.trim(server, through.0).await,
+            TrimPolicy::DurableAll => ensemble.trim_durable(server, through.0).await,
+        }
+    });
+    let mut replies: FuturesUnordered<_> = requests.collect();
+    let mut trimmed = 0;
+    while let Some(reply) = replies.next().await {
+        if matches!(reply, Ok(Ack::Accepted(_))) { trimmed += 1; }
+    }
     if trimmed < required {
         return Err(Error::Remote { key: config.stream.clone(), message: format!("trimmed {trimmed} servers, {required} are required") }.into());
     }

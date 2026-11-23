@@ -209,13 +209,15 @@ pub(crate) enum RequestBody {
     ReadIndex(LogletCheck),
     #[prost(message, tag = "16")]
     Identify(Identify),
+    #[prost(message, tag = "18")]
+    TrimDurable(Trim),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -343,6 +345,26 @@ async fn a_frame_is_charged_for_its_wire_bytes_even_if_decoding_discards_unknown
     assert_eq!(bytes, 3);
     assert_eq!(request.encoded_len(), 0);
     assert!(frame.is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn a_legacy_peer_cannot_decode_a_durable_trim_as_an_ordinary_trim() {
+    #[derive(Message)]
+    struct LegacyTrimRequest {
+        #[prost(message, optional, tag = "8")]
+        trim: Option<Trim>,
+        #[prost(string, tag = "17")]
+        target_journal: String,
+    }
+
+    let trim = Trim { stream: "scope".into(), through_lsn: 4 };
+    let request = |body| Request { id: 1, body: Some(body), target_journal: "journal".into() }.encode_to_vec();
+    let ordinary = LegacyTrimRequest::decode(request(RequestBody::Trim(trim.clone())).as_slice()).unwrap();
+    assert!(ordinary.trim == Some(trim.clone()));
+    let durable = LegacyTrimRequest::decode(request(RequestBody::TrimDurable(trim)).as_slice()).unwrap();
+    assert!(durable.trim.is_none());
+    assert_eq!(durable.target_journal, "journal");
 }
 
 /// Groups consecutive lsns written at the same epoch.

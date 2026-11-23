@@ -23,13 +23,17 @@ impl Server {
     pub async fn start_at(data_dir: &Path, address: SocketAddr) -> Self { Self::start_with(data_dir, address, ServerOptions::DEFAULT_CACHE_BYTES).await }
 
     pub async fn start_with(data_dir: &Path, address: SocketAddr, cache_bytes: usize) -> Self {
+        Self::start_with_durability(data_dir, address, cache_bytes, true).await
+    }
+
+    pub async fn start_with_durability(data_dir: &Path, address: SocketAddr, cache_bytes: usize, fsync: bool) -> Self {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_reuseaddr(true).unwrap();
         socket.bind(address).unwrap();
         let listener = socket.listen(1024).unwrap();
         let address = listener.local_addr().unwrap();
         let cancellation = CancellationToken::new();
-        let options = ServerOptions { data_dir: data_dir.to_path_buf(), fsync: true, cache_bytes };
+        let options = ServerOptions { data_dir: data_dir.to_path_buf(), fsync, cache_bytes };
         let task = tokio::spawn(serve(listener, options, cancellation.clone()));
         Self { address, data_dir: data_dir.to_path_buf(), cancellation, task }
     }
