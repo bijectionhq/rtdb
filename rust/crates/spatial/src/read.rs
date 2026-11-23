@@ -11,7 +11,7 @@ use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_storage::ObjectKey;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
 
 use crate::{
     Predicate, Projection, definition,
@@ -46,32 +46,24 @@ pub struct NearestPosition<'a> {
     pub id: EntityIdRef<'a>,
 }
 
-pub struct Hit {
-    pub id: EntityId,
-    pub distance_m: Option<f64>,
-    pub(super) _reservation: Arc<MemoryReservation>,
-}
-
 pub(super) struct SelectedHit {
-    pub(super) hit: Hit,
     pub(super) source: Arc<OwnedBatch>,
     pub(super) row: usize,
+    pub(super) distance_m: Option<f64>,
 }
 
 pub struct Page {
-    pub hits: Vec<Hit>,
     pub more: bool,
     pub next_distance_m: Option<f64>,
     pub(super) rows: Option<OwnedBatch>,
     pub(super) includes_documents: bool,
-    pub(super) ranked_distances: Option<Float64Array>,
-    pub(super) _reservation: Arc<MemoryReservation>,
+    pub(super) distances: Float64Array,
+    pub(super) _distance_reservation: Arc<MemoryReservation>,
 }
 
 impl Page {
     pub fn distance_column(&self) -> Float64Array {
-        self.ranked_distances.clone()
-            .unwrap_or_else(|| Float64Array::from_iter(self.hits.iter().map(|hit| hit.distance_m)))
+        self.distances.clone()
     }
 
     pub fn documents(&self) -> Option<&OwnedBatch> {
@@ -306,9 +298,6 @@ pub async fn read_prepared(
         return Err(kernel::invalid("Invalid spatial page size or continuation"));
     }
     let capacity = request.limit;
-    let reservation = context
-        .memory
-        .reserve(capacity * std::mem::size_of::<Hit>())?;
     let _selection = context
         .memory
         .reserve(capacity * std::mem::size_of::<SelectedHit>())?;
@@ -316,20 +305,13 @@ pub async fn read_prepared(
     let mut more = false;
     let projection_layout =
         visit_matches(Arc::clone(&context), owner, relation, path, region, &request, projection, false, |source, row, id, _, distance_m| {
-                let index = selected
-                    .partition_point(|previous| order(&previous.hit, id, distance_m).is_lt());
+                let index = selection_position(&selected, id, distance_m)?;
                 if index < capacity {
                     if selected.len() == capacity {
                         selected.pop();
                         more = true;
                     }
-                    let reservation = context.memory.reserve(id.owned_payload_bytes().saturating_add(128))?;
-                    let hit = Hit {
-                        id: id.into_owned(),
-                        distance_m,
-                        _reservation: reservation,
-                    };
-                    selected.insert(index, SelectedHit { hit, source: Arc::clone(source), row });
+                    selected.insert(index, SelectedHit { source: Arc::clone(source), row, distance_m });
                 } else {
                     more = true;
                 }
@@ -352,15 +334,15 @@ pub async fn read_prepared(
         };
         gather_selected(&selected, columns, &context.memory)?
     };
-    let hits = selected.into_iter().map(|selected| selected.hit).collect();
+    let reservation = context.memory.reserve(4096 + selected.len() * 16)?;
+    let distances = Float64Array::from_iter(selected.iter().map(|hit| hit.distance_m));
     Ok(Page {
-        hits,
         more,
         next_distance_m: None,
         rows,
         includes_documents: projection.has_documents(),
-        ranked_distances: None,
-        _reservation: reservation,
+        distances,
+        _distance_reservation: reservation,
     })
 }
 
@@ -555,15 +537,21 @@ fn partition_matches(
     Ok(true)
 }
 
-fn order(hit: &Hit, id: EntityIdRef<'_>, distance: Option<f64>) -> std::cmp::Ordering {
-    match (hit.distance_m, distance) {
-        (Some(left), Some(right)) => compare_nearest(left, EntityIdRef::from(&hit.id), right, id),
-        _ => EntityIdRef::from(&hit.id).cmp(&id),
+fn selection_position(selected: &[SelectedHit], id: EntityIdRef<'_>, distance: Option<f64>) -> Result<usize> {
+    let mut lower = 0;
+    let mut upper = selected.len();
+    while lower < upper {
+        let mid = lower + (upper - lower) / 2;
+        let hit = &selected[mid];
+        let batch = hit.source.batch();
+        let previous = read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), hit.row)?;
+        let order = match (hit.distance_m, distance) {
+            (Some(left), Some(right)) => left.total_cmp(&right).then_with(|| previous.cmp(&id)),
+            _ => previous.cmp(&id),
+        };
+        if order.is_lt() { lower = mid + 1; } else { upper = mid; }
     }
-}
-
-fn compare_nearest(left: f64, left_id: EntityIdRef<'_>, right: f64, right_id: EntityIdRef<'_>) -> std::cmp::Ordering {
-    left.total_cmp(&right).then_with(|| left_id.cmp(&right_id))
+    Ok(lower)
 }
 
 struct Candidates {
@@ -612,4 +600,28 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
         .filter(|bytes| *bytes <= limit)
         .ok_or_else(postings::work_limit)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_columnar::{entity_id_array, entity_id_type, to_field};
+
+    #[test]
+    fn spatial_selection_orders_ties_by_the_typed_arrow_identity() -> Result<()> {
+        let memory = MemoryBudget::new(64 << 10);
+        let ids = entity_id_array([EntityIdRef::String("same"), EntityIdRef::Integer(3), EntityIdRef::Uuid([0; 16])])?;
+        let schema = Arc::new(Schema::new(vec![to_field("_id", &entity_id_type())?]));
+        let batch = RecordBatch::try_new(schema, vec![ids]).unwrap();
+        let source = Arc::new(OwnedBatch::new(batch, &memory)?);
+        let selected = [2.0, 2.0, 3.0].into_iter().enumerate().map(|(row, distance_m)| SelectedHit {
+            source: Arc::clone(&source), row, distance_m: Some(distance_m),
+        }).collect::<Vec<_>>();
+
+        assert_eq!(selection_position(&selected, EntityIdRef::Keyword("same"), Some(2.0))?, 1);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(1.0))?, 0);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(2.0))?, 2);
+        assert_eq!(selection_position(&selected, EntityIdRef::Integer(9), Some(4.0))?, 3);
+        Ok(())
+    }
 }

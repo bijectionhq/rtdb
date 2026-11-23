@@ -14,7 +14,7 @@ use rtdb_types::{Anomaly, Iid, OwnedRelation, Result, Timestamp};
 use crate::{
     NearestPosition, Page, PageOrder, Predicate, PreparedRegion, Projection, Request, kernel,
     postings::work_limit,
-    read::{Hit, SelectedHit, empty_projected_documents, gather_selected, visit_matches},
+    read::{SelectedHit, empty_projected_documents, gather_selected, visit_matches},
 };
 
 pub struct PreparedNearest {
@@ -96,7 +96,7 @@ impl PreparedNearest {
         let end = keys.len().min(start + limit);
         let more = end < keys.len();
         let next_distance_m = more.then(|| distances.value(end));
-        let reservation = context.memory.reserve(4096 + (end - start) * 256)?;
+        let _selection = context.memory.reserve(4096 + (end - start) * 256)?;
         let positions = (start..end)
             .map(|row| Ok((EntityIdRef::from_handle_bytes(keys.value(row))?, row)))
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -141,13 +141,9 @@ impl PreparedNearest {
                         return Err(inconsistent_ranking());
                     }
                     *destination = Some(SelectedHit {
-                        hit: Hit {
-                            _reservation: context.memory.reserve(id.owned_payload_bytes() + 128)?,
-                            id: id.into_owned(),
-                            distance_m: Some(distances.value(rank)),
-                        },
                         source: Arc::clone(&source),
                         row,
+                        distance_m: Some(distances.value(rank)),
                     });
                 }
             }
@@ -179,13 +175,12 @@ impl PreparedNearest {
             gather_selected(&selected, columns, &context.memory)?
         };
         Ok(Page {
-            hits: selected.into_iter().map(|selected| selected.hit).collect(),
             more,
             next_distance_m,
             rows,
             includes_documents: projection.has_documents(),
-            ranked_distances: Some(distances.slice(start, end - start)),
-            _reservation: reservation,
+            distances: distances.slice(start, end - start),
+            _distance_reservation: Arc::clone(self.ranking.reservation()),
         })
     }
 }

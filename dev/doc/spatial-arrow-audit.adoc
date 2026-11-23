@@ -56,6 +56,7 @@ Each page gathers only its selected documents at the original held cut.
 | The scan selected a separate one-row document batch for each provisional hit and copied those rows again into the result.
 | Selection retains the source pages and winning positions.
 Identity-only and document responses gather the final Arrow row positions.
+Selection compares typed identity cells directly and returns the distances as an Arrow column.
 The response reuses the identifier buffers when their layout conforms to the existing wire schema.
 The legacy full-document action carries the identity in both locations defined by that version.
 

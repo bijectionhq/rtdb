@@ -62,6 +62,7 @@ entity SpatialPostings {
 -- When a nearest page has a successor, the page carries the exact distance of the first omitted hit.
 -- A document projection includes the resolved document and its system revision in hit order at the original hold.
 -- Selection retains the winning row positions until it gathers the final identities and requested document projection.
+-- Selection compares complete identity cells on the retained Arrow pages.
 -- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
 -- An empty selected document page carries the same projection schema as a populated page at the same hold.
 -- An observed read with an admitted placed witness scope, including an empty page, binds the relation frontier for ordered validation.
