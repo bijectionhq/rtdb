@@ -1,4 +1,5 @@
 mod catalog;
+mod event_revision;
 mod live;
 mod partition;
 mod reader_retention;

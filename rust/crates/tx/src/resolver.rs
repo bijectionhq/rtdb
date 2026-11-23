@@ -24,6 +24,7 @@ use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult,
 
 mod hosted_control;
 mod constraint_receipt;
+mod control_order;
 mod retry;
 mod retention;
 pub use retention::installed_receipt_time;
@@ -157,7 +158,7 @@ impl ResolvedTx {
         }
         // The effect and receipt are encoded, and the candidate can still be discarded.
         // Round up the sampled clock because its microsecond coordinate was truncated.
-        let Some(upper) = (writer.clock)().0.checked_add(1).filter(|upper| 0 < *upper && *upper < until.0) else {
+        let Some(upper) = control_order::staging_clock_upper((writer.clock)().0, until.0) else {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before staging"));
         };
         let ReplicaBody::ResolvedTx(WireResolvedTx { acceptance_stage: Some(stage), .. }) = &mut body.body else {
@@ -488,7 +489,7 @@ impl TxResolver {
                 (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
                     .ok_or_else(overflow)?,
             )?;
-            let operations = primary.iter().filter(constraint_receipt::shared_check)
+            let operations = primary.iter().filter_map(constraint_receipt::shared_check)
                 .chain(refusal).cloned().collect::<Vec<_>>();
             outcome = tx.apply_constraint_refusal(&operations, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
@@ -580,11 +581,14 @@ impl TxResolver {
         let position = resolved.source_position();
         if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
         let key = resolved.result.tx_key();
-        if resolved.placed_attempt().is_some() && key.tx_id.0 != position.0 {
-            return Err(Anomaly::fault("rtdb.tx/placed-attempt-position", "A placed attempt must match its transaction result"));
-        }
-        if self.resolved_head.is_some_and(|head| head.tx_id >= key.tx_id) {
-            return Err(Anomaly::fault("rtdb.tx/transaction-order", "Resolved transaction position does not advance its predecessor"));
+        match control_order::source_order(
+            resolved.placed_attempt().is_some(), position.0, self.resolved_head.map(|head| head.tx_id.0), key.tx_id.0,
+        ) {
+            control_order::SourceOrder::PlacedPositionMismatch =>
+                return Err(Anomaly::fault("rtdb.tx/placed-attempt-position", "A placed attempt must match its transaction result")),
+            control_order::SourceOrder::Nonadvancing =>
+                return Err(Anomaly::fault("rtdb.tx/transaction-order", "Resolved transaction position does not advance its predecessor")),
+            control_order::SourceOrder::Admitted => (),
         }
         if resolved.writes.tx_key() != key || !crate::system_time::advances(self.previous_system_time(), key.system_time.0) {
             return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction does not advance its predecessor's system time"));
@@ -2239,9 +2243,9 @@ impl<'a> OpenTransaction<'a> {
         if self.read_owned_revision(owner, &relation, &id, Interval::ALL).await?.is_some() {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/context-used", "The attempt context has already published"));
         }
-        let docs = crate::Documents::new(vec![StructFields::from([
-            ("_id".into(), id.as_value()), ("fingerprint".into(), Value::Binary(fingerprint.to_vec())),
-        ])], &self.context.memory)?;
+        let docs = crate::Documents::new(
+            vec![attempt_marker_document(attempt, fingerprint)], &self.context.memory,
+        )?;
         self.write_owned(&relation, &docs, None, Some(Timestamp::MIN), Some(Timestamp::MAX), true).await
     }
 
@@ -3151,6 +3155,14 @@ pub const HISTORICAL_KEYED_TRANSACTION_SQL: &str = "SELECT _id, system_time FROM
 
 /// How long, from source-log admission, a receipt answers retries of its identity.
 pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;
+
+pub fn attempt_marker_document(attempt: &str, fingerprint: [u8; 32]) -> StructFields<Value> {
+    StructFields::from([
+        ("_id".into(), Value::Utf8(attempt.to_owned())),
+        ("fingerprint".into(), Value::Binary(control_order::fingerprint_bytes(&fingerprint))),
+    ])
+}
+
 fn receipts_table() -> TableRef { TableRef::new("xt", "idempotency_receipts") }
 
 fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {

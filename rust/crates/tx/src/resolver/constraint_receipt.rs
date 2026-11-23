@@ -2,6 +2,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Result, StructFields, Value
 
 use crate::{HostedControlWrite, TxOp, source::Operation};
 
+use super::control_order::{fingerprint_matches, hosted_check_for_refusal};
+
 const BUSINESS: &str = "bj_fact_root_receipts";
 const EXECUTION: &str = "bj_private_execution_receipts";
 const ADMISSION: &str = "bj_fact_root_admission";
@@ -196,7 +198,7 @@ fn attempt_marker(
         && to == Some(rtdb_types::Timestamp::MAX)
         && row.len() == 2
         && matches!(row.get("_id"), Some(Value::Utf8(id)) if id == attempt)
-        && matches!(row.get("fingerprint"), Some(Value::Binary(bytes)) if bytes.as_slice() == fingerprint)
+        && matches!(row.get("fingerprint"), Some(Value::Binary(bytes)) if fingerprint_matches(bytes.as_slice(), fingerprint))
 }
 
 fn landing_slot(control: &HostedControlWrite) -> Option<usize> {
@@ -526,7 +528,7 @@ fn primary_op(op: &Operation) -> bool {
     }
 }
 
-pub(super) fn shared_check(op: &&Operation) -> bool {
+pub(super) fn shared_check(op: &Operation) -> Option<&Operation> {
     match op {
         Operation::Public(
             TxOp::OwnedDeadline { .. }
@@ -534,9 +536,9 @@ pub(super) fn shared_check(op: &&Operation) -> bool {
             | TxOp::OwnedCheckRange { .. }
             | TxOp::OwnedCheckWorldScope { .. }
             | TxOp::OwnedCheckWorldPurge { .. },
-        ) => true,
-        Operation::Public(TxOp::HostedControl(control)) => control.is_check(),
-        _ => false,
+        ) => Some(op),
+        Operation::Public(TxOp::HostedControl(control)) => hosted_check_for_refusal(op, control.is_check()),
+        _ => None,
     }
 }
 
@@ -748,7 +750,7 @@ mod tests {
         let (primary, refusal) = split(&ops, true)?;
         let selected = primary
             .iter()
-            .filter(shared_check)
+            .filter_map(shared_check)
             .chain(refusal)
             .cloned()
             .collect::<Vec<_>>();

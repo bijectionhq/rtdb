@@ -8,7 +8,7 @@ require logkeeper from git
 
 lean_lib OrderedModels where
   srcDir := "lean"
-  roots := #[`OrderedCapacity, `OrderedJournal, `OrderedQuorum, `ReplayClosure]
+  roots := #[`OrderedCapacity, `OrderedJournal, `OrderedQuorum, `ReplayClosure, `HeldWorldsOrder]
 
 @[default_target]
 lean_lib RecoveryComposition where

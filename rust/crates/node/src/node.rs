@@ -3084,10 +3084,9 @@ impl NativeSession {
 
     fn decision_attempt_marker(&self, attempt: &str, fingerprint: [u8; 32]) -> Result<TxOp> {
         let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ATTEMPT_RELATION)?;
-        let documents = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([
-            ("_id".into(), rtdb_types::Value::Utf8(attempt.to_owned())),
-            ("fingerprint".into(), rtdb_types::Value::Binary(fingerprint.to_vec())),
-        ])], self.service.node.memory())?;
+        let documents = rtdb_tx::Documents::new(
+            vec![rtdb_tx::attempt_marker_document(attempt, fingerprint)], self.service.node.memory(),
+        )?;
         Ok(TxOp::OwnedInsertDocs {
             relation, documents, valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
         })

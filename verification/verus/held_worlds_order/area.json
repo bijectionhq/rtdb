@@ -1,0 +1,135 @@
+{
+  "summary": "Checks the shipped hosted revision comparison, exact selection of original refusal checks, marker payload and event revision decisions, and placement of a publication after its recovered predecessor.",
+  "flags": [
+    "--no-external-by-default"
+  ],
+  "min_verified_functions": 19,
+  "controls": {
+    "accept_a_different_writer_revision": {
+      "defect": "Treat any live installation authority as the submitted revision.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "(Some(observed), Some(expected)) => observed == expected,",
+          "replace": "(Some(_observed), Some(_expected)) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "revision_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "omit_the_primary_writer_check_from_refusal": {
+      "defect": "Discard the primary check-only operation when selecting the refusal.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "if check_only { Some(original) } else { None }\n}",
+          "replace": "let _ = (original, check_only);\n    None\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "hosted_check_for_refusal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "substitute_the_refusal_fingerprint": {
+      "defect": "Accept a refusal marker with altered bytes.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "if observed[index] != submitted[index] {\n            return false;\n        }",
+          "replace": "if observed[index] != submitted[index] {\n            return true;\n        }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "fingerprint_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "write_a_different_fingerprint": {
+      "defect": "Flip a bit when building the marker document.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "bytes.push(submitted[index]);",
+          "replace": "bytes.push(submitted[index] ^ 1);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "fingerprint_bytes",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "stage_a_marker_at_another_revision": {
+      "defect": "Stage an event whose revision is earlier than the transaction's.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/event_revision.rs",
+          "find": "\n    system_from == transaction_revision\n}",
+          "replace": "\n    system_from <= transaction_revision\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/event_revision.rs",
+          "function": "matches_transaction",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "reuse_the_predecessor_source_position": {
+      "defect": "Allow the first placed publication to reuse its predecessor's position.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "Some(previous) if transaction <= previous => SourceOrder::Nonadvancing,",
+          "replace": "Some(previous) if transaction < previous => SourceOrder::Nonadvancing,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "source_order",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    },
+    "stage_at_the_exclusive_bound": {
+      "defect": "Treat the exclusive staging deadline as inclusive.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "Some(upper) if 0 < upper && upper < until => Some(upper),",
+          "replace": "Some(upper) if 0 < upper && upper <= until => Some(upper),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "staging_clock_upper",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 18
+    }
+  }
+}
