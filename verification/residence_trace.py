@@ -107,11 +107,13 @@ def verify_certificate(event):
 
 
 def verify_certified_reads(events):
-    decisions, probes, captured = set(), {}, {}
+    decisions, probes, captured = {}, {}, {}
     for event in events:
         kind = event["event"]
         if kind == "certified-decision":
-            decisions.add(verify_certificate(event))
+            identity = verify_certificate(event)
+            require(decisions.setdefault(identity[-1], identity) == identity,
+                    "decision fingerprint changed its certified scope")
         elif kind == "certified-read-index":
             invocation, identity = certified_invocation(event)
             require(probes.setdefault(invocation, identity) == identity, "a read probe changed its certified decision")
@@ -119,12 +121,17 @@ def verify_certified_reads(events):
             invocation, identity = certified_invocation(event)
             require(captured.setdefault(invocation, identity) == identity, "a catalog capture changed its certified decision")
     for invocation, identity in probes.items():
-        require(identity in decisions, "read probe lacks its exact installed certificate")
+        require(decisions.get(identity[-1]) == identity, "read probe lacks its exact installed certificate")
     for invocation, identity in captured.items():
         require(probes.get(invocation) == identity, "catalog capture lacks its exact certified read probe")
     answers = 0
     for event in events:
-        if event["event"] == "certified-answer":
+        if event["event"] == "publish-checkpoint" and event.get("decision") is not None:
+            require(digest(event["decision"]), "checkpoint names an invalid decision fingerprint")
+            decision = decisions.get(tuple(event["decision"]))
+            require(decision is not None and decision[0] == event["stream"] and decision[1] == event["writer_epoch"]
+                    and decision[3] >= event["through"], "checkpoint lacks its covering certified decision")
+        elif event["event"] == "certified-answer":
             invocation, identity = certified_invocation(event)
             require(captured.get(invocation) == identity, "answer lacks its exact certified catalog capture")
             answers += 1
@@ -135,6 +142,11 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
     published_decisions, installed_grants, certificates = set(), set(), set()
+    certified_stages = {}
+    preceding_stage = {
+        "certified-catalog-capture": "certified-read-index",
+        "certified-answer": "certified-catalog-capture",
+    }
     for index, event in enumerate(events):
         try:
             kind = event["event"]
@@ -157,7 +169,8 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
             elif kind == "certified-decision":
                 certificates.add(verify_certificate(event))
             elif kind in {"certified-read-index", "certified-catalog-capture", "certified-answer"}:
-                certified_invocation(event)
+                identity = certified_invocation(event)
+                certified_stages.setdefault((kind, identity), index)
             elif kind == "quorum-publication":
                 peers = event["installed"]
                 require(digest(event["ensemble"]) and event["epoch"] > 0 and event["through"] >= 0
@@ -247,6 +260,10 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"native observation {index + 1}: {error}") from error
 
+    for (kind, identity), index in certified_stages.items():
+        prior = certified_stages.get((preceding_stage.get(kind), identity))
+        # An independently captured owner may supply the earlier stage in its own file.
+        require(prior is None or prior < index, f"{kind} precedes its exact prerequisite in the same capture")
     if verify_catalog_history:
         verify_catalogs(catalogs)
     if verify_certificate_history:

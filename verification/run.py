@@ -5012,6 +5012,30 @@ def verify_native_recovery_trace(args, source):
             raise
     else:
         raise ValueError(f"{label}: native residence validator accepted a different answer cut")
+    reordered = native.copy()
+    answer_index = next(index for index, event in enumerate(reordered) if event["event"] == "certified-answer")
+    answer = reordered.pop(answer_index)
+    capture_index = next(index for index, event in enumerate(reordered)
+                         if event["event"] == "certified-catalog-capture" and event["invocation"] == answer["invocation"])
+    reordered.insert(capture_index, answer)
+    try:
+        verify_joined([reordered])
+    except ValueError as error:
+        if "certified-answer precedes its exact prerequisite" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted an answer before capture")
+    bad_checkpoint = copy.deepcopy(native)
+    checkpoint = next(event for event in bad_checkpoint
+                      if event["event"] == "publish-checkpoint" and event.get("decision") is not None)
+    checkpoint["decision"][0] ^= 1
+    try:
+        verify_joined([bad_checkpoint])
+    except ValueError as error:
+        if "checkpoint lacks its covering certified decision" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted a substituted checkpoint decision")
     bad_root = copy.deepcopy(native)
     published = next(event for event in bad_root if event["event"] == "authorize-trim")
     published["manifest"][0] ^= 1
