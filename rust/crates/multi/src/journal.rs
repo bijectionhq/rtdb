@@ -416,6 +416,18 @@ impl InstalledJournal {
         }
     }
 
+    pub(super) async fn withdraw_object(
+        &self, route: &Route, object: ordered_logkeeper::ordered::ObjectWithdrawal,
+    ) -> Result<Option<ordered_logkeeper::ordered::ObjectFence>> {
+        let decision = self.execute(&self.request(route, Command::WithdrawObject { object })?).await?;
+        match decision.receipt.outcome {
+            Ok(Outcome::ObjectWithdrawn(fence)) if fence.object == object => Ok(Some(fence)),
+            Err(Refusal::Conflict | Refusal::Unavailable | Refusal::Capacity) => Ok(None),
+            Err(reason) => Err(refused(reason)),
+            Ok(_) => Err(mismatch("The journal withdrew a different object publication")),
+        }
+    }
+
     pub async fn close_checkpoint(&self, route: &Route, checkpoint: Checkpoint) -> Result<()> {
         let request = self.request(route, Command::CloseCheckpoint { checkpoint })?;
         let decision = self.execute(&request).await?;

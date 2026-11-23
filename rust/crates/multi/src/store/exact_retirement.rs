@@ -269,6 +269,44 @@ async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvi
     Ok(())
 }
 
+/// The canonical journal name identifies one physical path in its provider
+/// namespace. The version is bound separately so a competing withdrawal cannot
+/// authorize a different publication under the same fenced name.
+pub(crate) fn installed_object_withdrawal(version: &PhysicalObjectVersion) -> Result<ordered_logkeeper::ordered::ObjectWithdrawal> {
+    use ring::digest::{SHA256, digest};
+
+    let exact = serde_json::to_vec(version).map_err(|error| Error::Task(error.to_string()))?;
+    let identity = serde_json::to_vec(&(&version.namespace, &version.key)).map_err(|error| Error::Task(error.to_string()))?;
+    let sealed = |bytes: &[u8]| digest(&SHA256, bytes).as_ref().try_into().expect("SHA-256 width");
+    Ok(ordered_logkeeper::ordered::ObjectWithdrawal { name: sealed(&identity), version: sealed(&exact) })
+}
+
+pub(crate) struct InstalledVersionDeletionGrant<'a> {
+    key: &'a ObjectKey,
+    version: &'a PhysicalObjectVersion,
+    fence: ordered_logkeeper::ordered::ObjectFence,
+}
+
+impl<'a> InstalledVersionDeletionGrant<'a> {
+    pub(crate) fn from_journal(
+        key: &'a ObjectKey, version: &'a PhysicalObjectVersion, fence: ordered_logkeeper::ordered::ObjectFence,
+    ) -> Result<Self> {
+        if installed_object_withdrawal(version)? != fence.object { return Err(changed()); }
+        Ok(Self { key, version, fence })
+    }
+
+    pub(crate) async fn settle(self, provider: &rtdb_s3::VersionedInventory) -> Result<()> {
+        let observed = || serde_json::json!({
+            "position": self.fence.position, "name": self.fence.object.name,
+            "key": self.key.as_str(), "publication": self.version,
+        });
+        crate::residence_trace::record("authorize-installed-version", observed);
+        provider.retire_observed_version(self.key, self.version).await?;
+        crate::residence_trace::record("remove-installed-version", observed);
+        Ok(())
+    }
+}
+
 fn replica_payload_store(owner: &DeploymentRecord) -> Result<String> {
     let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
     Ok(format!("{}/{root}", owner.storage_prefix()))

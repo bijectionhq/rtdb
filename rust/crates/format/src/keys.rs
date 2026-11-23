@@ -123,17 +123,20 @@ pub fn is_compacted_primary_file(key: &str) -> bool {
         .is_some_and(|trie| trie.level() > 0)
 }
 
+/// The data and metadata objects of an engine receipt table.
+pub fn is_receipt_trie_file(key: &str) -> bool { receipt_trie_key(key).is_some() }
+
 /// The dedicated L0 data and metadata objects of an engine receipt table.
 pub fn is_receipt_l0_file(key: &str) -> bool {
-    let Some((slug, file)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else {
-        return false;
-    };
-    let Some(table) = slug.strip_prefix("xt$") else { return false; };
-    TableRef::new("xt", table).stores_expiring_transaction_metadata()
-        && file.strip_prefix("data/").or_else(|| file.strip_prefix("meta/"))
-            .and_then(|file| file.strip_suffix(".arrow"))
-            .and_then(|name| name.parse::<TrieKey>().ok())
-            .is_some_and(|trie| trie.level() == 0)
+    receipt_trie_key(key).is_some_and(|trie| trie.level() == 0)
+}
+
+fn receipt_trie_key(key: &str) -> Option<TrieKey> {
+    let (slug, file) = key.strip_prefix("tables/")?.split_once('/')?;
+    let table = slug.strip_prefix("xt$")?;
+    if !TableRef::new("xt", table).stores_expiring_transaction_metadata() { return None; }
+    file.strip_prefix("data/").or_else(|| file.strip_prefix("meta/"))?
+        .strip_suffix(".arrow")?.parse().ok()
 }
 
 impl TableSlug {

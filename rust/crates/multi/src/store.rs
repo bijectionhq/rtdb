@@ -36,7 +36,7 @@ use crate::reference::custody::ReferenceReads;
 
 #[path = "key_enrollment.rs"]
 mod key_enrollment;
-mod exact_retirement;
+pub(crate) mod exact_retirement;
 mod replay_retirement;
 
 /// The protobuf type name the cell's storage factory is registered under.

@@ -694,6 +694,12 @@ impl Placement {
         Ok(())
     }
 
+    pub(crate) async fn settle_serving_receipts(
+        &self, storage: &crate::deployment::CellStorage, keys: &Arc<dyn KeyService>,
+    ) -> Result<()> {
+        reclamation::settle_receipts(self, storage, keys).await
+    }
+
     /// Serving prefixes are separate from checkpoint archives: each belongs
     /// to one writer grant and is retired against the journal's evidence.
     pub(crate) async fn retire_serving_prefixes(

@@ -4616,8 +4616,9 @@ def verify_native_exact_marker(args, source):
     cases = {
         "skip-marker": (
             "rust/crates/multi/src/store/exact_retirement.rs",
-            "    if let Some(release_version) = release_version {\n        provider.erase(&release, release_version).await?;\n    }",
-            "    let _ = release_version;", "the release marker needs its own absence evidence",
+            "for (key, publication) in [(&target, version), (&release, release_version)] {",
+            "let _ = (&release, release_version);\n            for (key, publication) in [(&target, version)] {",
+            "the release marker needs its own absence evidence",
         ),
         "orphan-owner-fence": (
             "rust/crates/directory/src/lineage.rs", "next_owner.storage_regions.remove(&retirement.token);",

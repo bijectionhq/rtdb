@@ -272,7 +272,7 @@ pub(super) fn grant_prefix(storage_prefix: &str, generation: u64, writer_epoch: 
     format!("{storage_prefix}/~ordered/{generation}/{writer_epoch}")
 }
 
-fn source_prefix(
+pub(super) fn source_prefix(
     storage_prefix: &str,
     generation: u64,
     writer_epoch: u64,
@@ -553,7 +553,16 @@ impl ObjectStore for ServingStore {
         files.sort_by_key(|file| file.release_order());
         for file in files {
             let key = ObjectKey::new(&file.key)?;
-            writer.reclamation.enqueue(self.upper.as_ref(), self.lower.as_deref(), &key).await?;
+            if rtdb_format::keys::is_receipt_trie_file(key.as_str()) {
+                let version = file.version.as_ref().filter(|_| file.matches_publication);
+                if let Some(version) = version {
+                    writer.reclamation.enqueue_receipt(
+                        self.upper.as_ref(), self.lower.as_deref(), &key, receipt, installed.cut(), version,
+                    ).await?;
+                }
+            } else {
+                writer.reclamation.enqueue(self.upper.as_ref(), self.lower.as_deref(), &key).await?;
+            }
         }
         Ok(true)
     }
