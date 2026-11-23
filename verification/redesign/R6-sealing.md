@@ -66,10 +66,10 @@ Directory-managed Multi objects, primary staged objects, and live journal seedin
 Classic local, S3, Azure and GCS object stores can enroll in the same sealed format with a private filesystem vault supplied through `RTDB_CLASSIC_KEY_VAULT`.
 The vault directory must already exist and belong to the original installation outside payload and disk-cache backup roots.
 The immutable provider marker selects the vault lineage and refuses enrollment over existing unsealed data.
-The local trie release authority authenticates the installed receipt and drains the eligible root before it asks the vault to withdraw the selected slots.
+The coordinated trie release authority authenticates the installed receipt and drains the eligible root before it asks the vault to withdraw the selected slots.
 Classic local source and replica logs seal each frame under a fresh publication slot, with the physical offset and sampled timestamp authenticated.
 Reopening a configured sealed log requires its original key lineage.
-Classic sealed-log retirement, Kafka logs, remote exact key retirement and deployment-wide collection of installed unit slots remain open.
+Classic sealed-log retirement, Kafka logs, non-trie remote key retirement and deployment-wide collection of installed unit slots remain open.
 Provider verification includes ranged reads, object naming, lost create replies, redundant compaction jobs, independent-copy isolation, cache fencing, and nonce uniqueness.
 
 [Current cipher](../../rust/crates/storage/src/sealing/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

@@ -82,7 +82,11 @@ Detached replica objects inherit the servicing lease for cryptography and open i
 Installed log and object key operations have a local monotonic time limit.
 These bounds cover the key operations and affected storage responses; decoded pages, query results, and other working copies require their own drain evidence.
 Independent checkpoint member slots allow a staged successor to open with no dependency on the prior writer or checkpoint allocation's object keys.
-The SQL path still needs an authority that closes admission for the exact target census, rewrites the complete survivor closure, attests the two recovery slots, and confirms destruction after the drain.
+The current provider profile keeps the order-relative 120-second operational target.
+A fixed SQL deadline requires an enforcing custody authority.
+The pinned Logkeeper application API publishes a checkpoint and rotates its writer key in distinct decisions.
+It supplies no authenticated application response covering both crash-selectable durable slots.
+A production fixed-deadline adapter requires a journal decision that orders closure with the survivor-root selection, authenticated recovery images from both slots, bounded plaintext and egress drain, and evidenced key destruction.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

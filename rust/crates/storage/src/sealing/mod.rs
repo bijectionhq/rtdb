@@ -258,8 +258,11 @@ impl ObjectStore for EncryptingStore {
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog(cut).await
     }
-    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
-        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+    async fn retain_catalog_with_primary(
+        &self,
+        cut: Option<rtdb_types::CatalogCut>,
+        paths: Arc<[String]>,
+    ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog_with_primary(cut, paths).await
     }
     fn defers_trie_releases(&self) -> bool {
@@ -281,7 +284,6 @@ impl ObjectStore for EncryptingStore {
             ));
         }
         if self.classic_control.is_some()
-            && self.inner.local_maintenance_store().is_some()
             && let ObjectKeys::Units(ledger) = &self.keys
         {
             return crate::classic_retirement::retire_with_keys(
