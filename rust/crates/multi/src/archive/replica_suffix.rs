@@ -35,7 +35,7 @@ pub(crate) const MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 4096;
 const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
 
-struct ServingPayloads<'a> {
+pub(super) struct ServingPayloads<'a> {
     record: &'a DeploymentRecord,
     storage: &'a CellStorage,
     keys: &'a dyn KeyService,
@@ -45,14 +45,14 @@ struct ServingPayloads<'a> {
 }
 
 impl<'a> ServingPayloads<'a> {
-    fn new(
+    pub(super) fn new(
         record: &'a DeploymentRecord, storage: &'a CellStorage, keys: &'a dyn KeyService,
         io: Arc<IoRegion>, memory: &'a Arc<MemoryBudget>,
     ) -> Self {
         Self { record, storage, keys, io, memory, store: tokio::sync::OnceCell::new() }
     }
 
-    async fn read(&self, envelope: &ReplicaEnvelope) -> Result<PayloadBytes> {
+    pub(super) async fn read(&self, envelope: &ReplicaEnvelope) -> Result<PayloadBytes> {
         let name = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
             .ok_or_else(suffix_unavailable)?;
         let store = self.store.get_or_try_init(|| async {
@@ -326,49 +326,42 @@ impl TerminalReplayProgress {
         Self { writer_epoch: None, last_offset: checkpoint.boundary, source: checkpoint.source }
     }
 
-    pub(super) fn apply_segment(
-        &mut self, entries: &[ArchivedReplicaEntry], fence: &rtdb_directory::CheckpointTransferFence,
-        recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
+    pub(super) fn admit(
+        &mut self, entry: &ArchivedReplicaEntry, fence: &rtdb_directory::CheckpointTransferFence,
+        recovered: &mut rtdb_replication::RecoveredPartition,
+    ) -> Result<ReplicaEnvelope> {
+        if self.last_offset.checked_add(1) != Some(entry.lsn)
+            || !matches!(recovered.fence.position(), rtdb_replication::TermPosition::Expecting(_))
+        {
+            return Err(suffix_unavailable());
+        }
+        let envelope = admit_record(entry, &mut recovered.fence, &mut self.writer_epoch, fence.source_writer_epoch)?;
+        self.last_offset = entry.lsn;
+        Ok(envelope)
+    }
+
+    pub(super) fn apply(
+        &mut self, envelope: ReplicaEnvelope, fence: &rtdb_directory::CheckpointTransferFence,
+        recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
         let checkpoint = fence.destination.checkpoint;
         let log_epoch = StorageEpoch(fence.destination.source_log_epoch);
-        for entry in entries {
-            let body = ReplicaFrame::decode(&entry.payload)?;
-            if self.last_offset.checked_add(1) != Some(entry.lsn)
-                || !(1..=fence.source_writer_epoch).contains(&entry.epoch)
-                || self.writer_epoch.is_some_and(|previous| entry.epoch < previous)
-                || body.term.0 <= 0
-                || body.term_sequence.is_none_or(|sequence| sequence.0 < 0)
-                || !matches!(recovered.fence.position(), rtdb_replication::TermPosition::Expecting(_))
-            {
-                return Err(suffix_unavailable());
+        match envelope.message {
+            ReplicaBody::ResolvedTx(message) => {
+                let next = message.src_msg_id.map(SourcePosition)
+                    .map(|position| position.after_offset(log_epoch))
+                    .filter(|offset| *offset > self.source)
+                    .ok_or_else(suffix_unavailable)?;
+                recovered.apply_archived_transaction(&message, memory)?;
+                self.source = next;
             }
-            let admission = recovered.fence.admit(body.term, body.term_sequence)?;
-            if admission.verdict != rtdb_replication::Verdict::Apply
-                || (admission.opens_term() && !matches!(&body.message,
-                    Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none()))
-            {
-                return Err(suffix_unavailable());
-            }
-            self.writer_epoch = Some(entry.epoch);
-            self.last_offset = entry.lsn;
-            match body.message {
-                Some(ReplicaBody::ResolvedTx(message)) => {
-                    let next = message.src_msg_id.map(SourcePosition)
-                        .map(|position| position.after_offset(log_epoch))
-                        .filter(|offset| *offset > self.source)
-                        .ok_or_else(suffix_unavailable)?;
-                    recovered.apply_archived_transaction(&message, memory)?;
-                    self.source = next;
-                }
-                Some(ReplicaBody::BlockUploaded(upload)) if upload.block_index == Some(checkpoint.block)
-                    && upload.storage_epoch == Some(fence.destination.source_log_epoch)
-                    && upload.latest_processed_msg_id.map(SourcePosition)
-                        .map(|pos| pos.after_offset(StorageEpoch(fence.destination.source_log_epoch))) == Some(checkpoint.source)
-                    && upload.external_source_token.is_none() => (),
-                Some(ReplicaBody::NoOp(noop)) if noop.src_msg_id.is_none() => (),
-                _ => return Err(suffix_unavailable()),
-            }
+            ReplicaBody::BlockUploaded(upload) if upload.block_index == Some(checkpoint.block)
+                && upload.storage_epoch == Some(fence.destination.source_log_epoch)
+                && upload.latest_processed_msg_id.map(SourcePosition)
+                    .map(|pos| pos.after_offset(log_epoch)) == Some(checkpoint.source)
+                && upload.external_source_token.is_none() => (),
+            ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none() => (),
+            _ => return Err(suffix_unavailable()),
         }
         Ok(())
     }
@@ -381,7 +374,8 @@ impl TerminalReplayProgress {
 
 /// Reopen the original certified source interval without accumulating its raw bytes.
 pub(super) async fn replay_certified_terminal(
-    source: &DeploymentRecord, keys: &dyn KeyService, stream: &rtdb_logkeeper::StreamConfig,
+    source: &DeploymentRecord, storage: &CellStorage, io: Arc<IoRegion>,
+    keys: &dyn KeyService, stream: &rtdb_logkeeper::StreamConfig,
     certificate: Option<&JournalDigest>, fence: &rtdb_directory::CheckpointTransferFence, through: i64,
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
 ) -> Result<i64> {
@@ -393,6 +387,7 @@ pub(super) async fn replay_certified_terminal(
     if let Some(certificate) = certificate {
         if certificate.interval != [first, through] { return Err(suffix_unavailable()); }
         let cipher = TerminalReplicaCipher::open(source, keys).await?;
+        let payloads = ServingPayloads::new(source, storage, keys, io, memory);
         let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, certificate)?;
         while let Some(mut entries) = pages.next_page().await? {
             let bytes = entries.iter().try_fold(0usize, |total, entry|
@@ -400,7 +395,17 @@ pub(super) async fn replay_certified_terminal(
                     .ok_or_else(suffix_unavailable))?;
             let _charge = memory.reserve(bytes)?;
             cipher.open_page(&mut entries)?;
-            progress.apply_segment(&entries, fence, recovered, memory)?;
+            for entry in entries {
+                let envelope = progress.admit(&entry, fence, recovered)?;
+                let payload;
+                let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                    payload = payloads.read(&envelope).await?;
+                    envelope.unwrap_payload(&payload.bytes)?
+                } else {
+                    envelope
+                };
+                progress.apply(envelope, fence, recovered, memory)?;
+            }
         }
     }
     progress.finish(through)

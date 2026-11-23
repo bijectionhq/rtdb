@@ -105,11 +105,30 @@ pub(crate) fn admits_checkpoint_transfer_object(
 ) -> bool {
     let prefix = checkpoint_transfer_prefix(record, stage.intent.operation);
     if name == format!("{prefix}/manifest") { return true; }
-    name.strip_prefix(&format!("{prefix}/segments/")).is_some_and(|suffix| {
-        suffix.parse::<i64>().is_ok_and(|first| {
-            first > stage.checkpoint.boundary && suffix == format!("{first:020}")
+    if ["segments", "payloads"].into_iter().any(|kind| {
+        name.strip_prefix(&format!("{prefix}/{kind}/")).is_some_and(|suffix| {
+            suffix.parse::<i64>().is_ok_and(|first| {
+                first > stage.checkpoint.boundary && suffix == format!("{first:020}")
+            })
         })
+    }) {
+        return true;
+    }
+    checkpoint_storage_root().ok().is_some_and(|root| {
+        name.strip_prefix(&format!("{}/{root}/", record.storage_prefix()))
+            .is_some_and(|relative| admits_seeded_transfer_payload(record, stage, relative))
     })
+}
+
+fn admits_seeded_transfer_payload(
+    record: &DeploymentRecord, stage: &rtdb_directory::CheckpointStage, relative: &str,
+) -> bool {
+    record.checkpoint_transfer_replica.as_deref().is_some_and(|replica| {
+        record.checkpoint_transfer_bootstrap.as_deref() == Some(&replica.bootstrap)
+            && &replica.bootstrap.terminal.fence.destination == stage
+    }) && relative.strip_prefix("oversized/").filter(|file| !file.contains('/'))
+        .and_then(rtdb_format::keys::oversized_block_index)
+        .is_some_and(|block| block.0 >= stage.checkpoint.block)
 }
 
 fn digest(ciphertext: &[u8]) -> String {
@@ -1490,7 +1509,7 @@ pub(crate) async fn seal_checkpoint_transfer(
             manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
         },
         CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-        Some(read_world::TerminalReplay { fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+        Some(read_world::TerminalReplay { storage, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
         |context, basis, source_through| async move {
             let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
             Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))

@@ -187,6 +187,7 @@ where
 }
 
 pub(super) struct TerminalReplay<'a> {
+    pub storage: &'a CellStorage,
     pub fence: &'a rtdb_directory::CheckpointTransferFence,
     pub stream: &'a rtdb_logkeeper::StreamConfig,
     pub certificate: Option<&'a rtdb_logkeeper::JournalDigest>,
@@ -258,7 +259,7 @@ where
         |record, _, region| async move {
             resources.cancellation.run_until_cancelled(async {
                 let (capture, suffix) = admit(&record)?;
-                let bucket = archive.bucket(region).await?;
+                let bucket = archive.bucket(Arc::clone(&region)).await?;
                 if read(
                     bucket.as_ref(),
                     &archive_witness(selected.deployment, selected.capture)?,
@@ -354,7 +355,7 @@ where
                 }
                 let terminal_source = if let Some(terminal) = terminal {
                     Some(replica_suffix::replay_certified_terminal(
-                        &record, keys, terminal.stream, terminal.certificate, terminal.fence,
+                        &record, terminal.storage, region, keys, terminal.stream, terminal.certificate, terminal.fence,
                         terminal.through, &mut recovered, &memory,
                     ).await?)
                 } else {

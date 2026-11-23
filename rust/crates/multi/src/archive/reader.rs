@@ -354,7 +354,9 @@ async fn open_inventory(
         .into_iter()
         .map(|object| object.key)
         .collect::<BTreeSet<_>>();
-    if observed != expected {
+    if !expected.is_subset(&observed) || observed.difference(&expected).any(|object| {
+        !super::admits_seeded_transfer_payload(record, stage, object.as_str())
+    }) {
         return Err(inconsistent(
             "The staged storage root differs from its accepted inventory",
         ));
