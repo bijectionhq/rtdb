@@ -44,6 +44,7 @@ enum ArchiveRead {
     PathColumns {
         relation: OwnedRelation,
         path: OwnedRelation,
+        expected_schema: Option<rtdb_types::OwnedSchema>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<Vec<String>>>,
     },
@@ -179,16 +180,23 @@ impl HeldCheckpointWorld {
 
     pub async fn path_touch(
         &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
-        group: Timestamp, valid: Timestamp,
+        group: Timestamp, valid: Timestamp, images: bool,
     ) -> Result<[(Option<WorldFact>, bool); 2]> {
         self.check_relation(relation)?;
+        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
+        if images && (schema.has_opaque_columns() || schema.lifetime_micros().is_some()) {
+            return Err(OwnedWorld::unavailable());
+        }
         let (columns, [before, after]) = self.open.snapshot.world_path_touch(
             self.open.record.id, relation, path, id, group, valid,
         ).await?;
-        self.require_parent_path(relation, path, &columns).await?;
+        self.require_parent_path(relation, path, &columns, images.then_some(schema)).await?;
         let mut sides = [(None, false), (None, false)];
-        for (local, side) in [before, after].into_iter().zip(&mut sides) {
+        for (index, (local, side)) in [before, after].into_iter().zip(&mut sides).enumerate() {
             let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
+            if images && index == 1 && local.as_ref().is_none_or(|fact| fact.revision != group) {
+                return Err(OwnedWorld::unavailable());
+            }
             let shadowed = local.is_some();
             let mut fact = match local {
                 Some(fact) => match WorldShadow::from_record(fact.row)? {
@@ -201,9 +209,13 @@ impl HeldCheckpointWorld {
             };
             if let Some(fact) = &mut fact {
                 if !fact.row.contains_key("_id") { return Err(OwnedWorld::unavailable()); }
-                fact.row.retain(|name, _| name == "_id" || columns.contains(name));
-                for column in &columns {
-                    if !fact.row.contains_key(column) { fact.row.insert(column.clone(), Value::Null); }
+                if images {
+                    schema.validate_row(&fact.row)?;
+                } else {
+                    fact.row.retain(|name, _| name == "_id" || columns.contains(name));
+                    for column in &columns {
+                        if !fact.row.contains_key(column) { fact.row.insert(column.clone(), Value::Null); }
+                    }
                 }
             }
             *side = (fact, shadowed);
@@ -212,36 +224,13 @@ impl HeldCheckpointWorld {
         Ok(sides)
     }
 
-    pub async fn path_touch_after(
-        &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
-        group: Timestamp, valid: Timestamp,
-    ) -> Result<WorldFact> {
-        self.check_relation(relation)?;
-        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
-        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
-            return Err(OwnedWorld::unavailable());
-        }
-        let (columns, local) = self.open.snapshot.world_path_touch_after(
-            self.open.record.id, relation, path, id, group, valid,
-        ).await?;
-        self.require_parent_path(relation, path, &columns).await?;
-        let fact = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?
-            .filter(|fact| fact.revision == group).ok_or_else(OwnedWorld::unavailable)?;
-        let WorldShadow::Present(row) = WorldShadow::from_record(fact.row)? else {
-            return Err(OwnedWorld::unavailable());
-        };
-        schema.validate_row(&row)?;
-        self.check_relation(relation)?;
-        Ok(WorldFact { row, revision: fact.revision, lifetime: None, _reservation: fact._reservation })
-    }
-
     async fn require_parent_path(
-        &self, relation: &OwnedRelation, path: &OwnedRelation, columns: &[String],
+        &self, relation: &OwnedRelation, path: &OwnedRelation, columns: &[String], expected_schema: Option<&rtdb_types::OwnedSchema>,
     ) -> Result<()> {
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::PathColumns {
-            relation: relation.clone(), path: path.clone(), guard, reply,
+            relation: relation.clone(), path: path.clone(), expected_schema: expected_schema.cloned(), guard, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let parent_columns = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
@@ -824,10 +813,16 @@ pub(crate) async fn open_held_checkpoint_world(
                                     ));
                                     let _ = reply.send(coverage);
                                 }
-                                ArchiveRead::PathColumns { relation, path, guard, mut reply } => {
+                                ArchiveRead::PathColumns { relation, path, expected_schema, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        if let Some(expected) = expected_schema {
+                                            let schema = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &owner, &relation).await?;
+                                            if !schema.is_some_and(|(schema, _)| schema == expected) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                        }
                                         rtdb_node::path_columns_at_cut(&context, &owner, &relation, &path).await
                                     };
                                     let response = tokio::select! {

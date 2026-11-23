@@ -178,7 +178,7 @@ pub(crate) const OPEN_APPLIED_OWNED_READ_V1: &str = "rtdb.owned.OpenAppliedRead.
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_WORLD_VERSION_V1: &str = "rtdb.owned.ReadHeldWorldVersion.v1";
-pub(crate) const HELD_WORLD_TOUCH_AFTER_V1: &str = "rtdb.owned.ReadHeldWorldTouchAfter.v1";
+pub(crate) const HELD_WORLD_TOUCH_IMAGES_V1: &str = "rtdb.owned.ReadHeldWorldTouchImages.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
@@ -1180,31 +1180,21 @@ impl Service {
         Ok(replies)
     }
 
-    pub(crate) async fn held_world_touch_after_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
-        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World touch after-image has no held handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
-        let (_, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
-        let result = held.snapshot.path_touch_after(&relation, &path, &id, group, valid).await.map_err(status)?;
-        let reply = self.world_point_reply(call, result, valid, None)?;
-        held.snapshot.check_relation(&relation).map_err(status)?;
-        Ok(reply)
-    }
-
     pub(crate) async fn held_world_path_touch_action(
-        &self, call: &Call, body: &[u8],
+        &self, call: &Call, body: &[u8], images: bool,
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World path touch has no held handle"))?;
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
-        let [prior, accepted] = held.snapshot.path_touch(&relation, &path, &id, before, group, valid).await.map_err(status)?;
-        let replies = vec![
-            Ok(self.world_point_reply(call, prior, valid, None)?),
-            Ok(self.world_point_reply(call, accepted, valid, None)?),
-        ];
+        let [prior, accepted] = held.snapshot.path_touch(&relation, &path, &id, before, group, valid, images).await.map_err(status)?;
+        let prior = self.world_point_reply(call, prior, valid, None)?;
+        let accepted = self.world_point_reply(call, accepted, valid, None)?;
+        if images && wire::add(prior.encoded_len(), accepted.encoded_len())? > self.0.config.maximum_message_bytes {
+            return Err(Status::resource_exhausted("World touch images exceed the Flight response limit"));
+        }
         held.snapshot.check_relation(&relation).map_err(status)?;
-        Ok(replies)
+        Ok(vec![Ok(prior), Ok(accepted)])
     }
 
     pub(crate) async fn held_owned_path_touch_action(
