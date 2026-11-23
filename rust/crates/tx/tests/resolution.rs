@@ -911,7 +911,7 @@ async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_wi
     assert_eq!(error.code, "rtdb/idempotency-duplicate");
     assert_eq!(error.context["original-tx-id"], original.result().tx_key().tx_id.0);
     assert_eq!(duplicate.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "idempotency_receipts"), &TableRef::new("xt", "txs")], "a duplicate writes only its own outcome and expiring metadata");
-    let conflict = resolve(keyed("alice", 2), 300).await;
+    let conflict = resolve(keyed("alice", 2), RECEIPT_WINDOW_MICROS).await;
     assert_eq!(conflict.result().error().unwrap().code, "rtdb/idempotency-conflict");
     assert!(resolve(keyed("bob", 2), 400).await.result().committed(), "another principal's identity is independent");
     let regressed = resolve(keyed("alice", 1), 99).await;

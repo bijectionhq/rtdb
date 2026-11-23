@@ -210,7 +210,7 @@ impl Node {
         for entry in entries {
             let table = tables.get(&entry.table).ok_or_else(|| invalid("Checkpoint table manifest is unavailable"))?;
             files.push(ObjectKey::new(entry.slug.block_key(block_index)?)?);
-            for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Primary)? {
+            for file in table.checkpoint_trie_files(&entry, CheckpointContents::Primary)? {
                 files.push(ObjectKey::new(file)?);
             }
         }

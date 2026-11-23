@@ -142,6 +142,9 @@ config {
 -- Owned landing assertions retain their valid-time intervals and commit positions.
 -- A redacted owned event retains its original origin, system position and full valid-time interval.
 -- The redacted event participates in the ceiling at that position and preserves older history outside its effect.
+-- An expiring transaction metadata table merges its earliest live L0 with all older active primary inputs into one unpartitioned successor.
+-- Its merge consumes ordered erase events to exclude older puts, then omits those erase events from the complete successor.
+-- The installed successor supersedes its covered inputs irrespective of the ordinary partial-file size limit.
 -- L0 normalization retains the latest erase marker and excludes every older event for the same entity.
 -- Other exact entity keys in the same IID bucket remain eligible for normalization.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.

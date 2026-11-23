@@ -753,6 +753,8 @@ config {
 -- Roots without this manifest use the existing table-block load.
 -- New archive captures and independent fork copies derive their dependency inventory from the verified table blocks.
 -- The replay inventory includes data and metadata for live and nascent tries and retained level-zero sources.
+-- A receipt table's covered L0 is outside its successor checkpoint's dependency set.
+-- A retained replay suffix still protects uploads it consumes before reaching that successor.
 -- It includes recorded artefacts for live and nascent members, with one object per shared group key.
 -- A copy uses its verified root bytes or rechecks them on a fresh read.
 -- It also rechecks table bytes read for copying against those used to derive the inventory.
@@ -2091,7 +2093,9 @@ open question "How should operator-selected skipped transactions be represented 
     -- The pinned resolver persists the source payload under skipped-txs before staging an aborted xt.txs row carrying xtdb/skipped-tx.
     -- Each ordered source transaction carries the raw append observation and the greatest such observation through its predecessor.
     -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
-    -- Source-log metadata is stored in finite-lived rows outside durable transaction-result history.
+    -- New transaction metadata is stored in finite-lived rows outside durable transaction-result history.
+    -- Placed intake retains submitted bytes through installation of their replica outcome.
+    -- Intake release follows the applied source prefix even when the holder receives no further submissions.
     -- Ordered erasures remove eligible payloads from later reads and compaction products without changing the transaction coordinate.
     -- A placed outcome record contains exactly one put naming the current attempt.
     -- A deployment admitted to the versioned outcome format may also carry bounded erasures of distinct expired outcomes.

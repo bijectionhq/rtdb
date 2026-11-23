@@ -411,7 +411,9 @@ value CommitOpts {
     --                   A later explicit time aborts the transaction with rtdb/future-system-time.
     --                   The engine projects automatic history time strictly forward even at equal or regressed append timestamps.
     --   user_metadata — per-transaction metadata.
-    --                   New source-log submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   A reusable application key has separate stored receipt identities for separate hour buckets.
+    --                   Lookup covers the current and previous buckets and checks the exclusive expiry.
     --                   The installed catalog determines retention even when a query selects an earlier system time.
     --                   A settled retry keeps its original causal coordinate after that metadata expires.
     --                   An idempotency_key field names a retry identity scoped to the database and principal: a same-body retry within the receipt window is answered with the original's outcome, and a different body aborts with rtdb/idempotency-conflict.

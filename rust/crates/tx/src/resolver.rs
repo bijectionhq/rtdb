@@ -266,7 +266,7 @@ impl TxResolver {
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, None, Some((log_time, receipt_time)))?;
+        tx.write_result(&result, None, log_time, receipt_time)?;
         if let Some(attempt) = attempt {
             tx.retire_placed_outcomes(clock).await?;
             tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new(), false)?;
@@ -540,7 +540,9 @@ impl TxResolver {
                 (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, user_metadata)
             }
         };
-        tx.write_result(&result, metadata.as_ref(), None)?;
+        let clock = tx.observe_retention_clock(now).await?;
+        tx.retire_expired_receipts(clock).await?;
+        tx.write_result(&result, metadata.as_ref(), now, clock.time)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(self.source_position), token, None, context)
     }
@@ -559,7 +561,7 @@ impl TxResolver {
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
-        tx.write_result(&result, None, Some((log_time, receipt_time)))?;
+        tx.write_result(&result, None, log_time, receipt_time)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
     }
@@ -680,7 +682,7 @@ impl<'a> OpenTransaction<'a> {
         clock: retention::RetentionClock, selected: &[Operation],
     ) -> Result<ResolvedTx> {
         let options = self.options;
-        self.write_result(&result, options.user_metadata.as_ref(), Some((log_time, clock.time)))?;
+        self.write_result(&result, options.user_metadata.as_ref(), log_time, clock.time)?;
         if let ResolvedInput::Placed { attempt, .. } = input {
             let controls = selected.iter().filter_map(|operation| match operation {
                 Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
@@ -770,9 +772,10 @@ impl<'a> OpenTransaction<'a> {
     /// Whether a live receipt names this retry identity: the same body is a duplicate of the original, a different one a conflict.
     async fn receipt_outcome(&self, id: &str, digest: &str, log_time: Timestamp) -> Result<Result<()>> {
         if !self.snapshot()?.contains_table(&receipts_table()) { return Ok(Ok(())); }
+        let bucket = receipt_bucket(log_time);
         let mut query = self.open_query(
-            "SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts FOR ALL VALID_TIME               WHERE _id = ? AND (_valid_to IS NULL OR _valid_to > ?) ORDER BY tx_system_time DESC LIMIT 1",
-            vec![Value::Utf8(id.into()), time_value(log_time)],
+            "SELECT digest, tx_id, tx_system_time FROM xt.idempotency_receipts FOR ALL VALID_TIME WHERE _id IN (?, ?) AND (_valid_to IS NULL OR _valid_to > ?) ORDER BY tx_system_time DESC LIMIT 1",
+            vec![receipt_id(id, bucket), receipt_id(id, bucket - 1), time_value(log_time)],
         ).await?;
         while let Some(batch) = query.next_batch().await? {
             let batch = batch.batch();
@@ -796,7 +799,7 @@ impl<'a> OpenTransaction<'a> {
     fn put_receipt(&mut self, id: &str, digest: &str, log_time: Timestamp) -> Result<()> {
         let key = self.tx_key();
         let document = StructFields::from([
-            ("_id".into(), Value::Utf8(id.into())), ("digest".into(), Value::Utf8(digest.into())),
+            ("_id".into(), receipt_id(id, receipt_bucket(log_time))), ("digest".into(), Value::Utf8(digest.into())),
             ("tx_id".into(), Value::I64(key.tx_id.0)), ("tx_system_time".into(), time_value(key.system_time)),
         ]);
         let expires = Timestamp(log_time.0.saturating_add(RECEIPT_WINDOW_MICROS));
@@ -3109,7 +3112,7 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(replay_table(), document, interval(replay.submitted_at(), replay.expires_at())?)
     }
 
-    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, source_times: Option<(Timestamp, Timestamp)>) -> Result<()> {
+    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, appended: Timestamp, observed: Timestamp) -> Result<()> {
         let key = result.tx_key();
         let error = result.encoded_error()?;
         let bound = error.as_ref().map_or(0, |error| error.as_slice().len()).checked_add(metadata.map(|value| value.value().retained_bytes()).transpose()?.unwrap_or(0)).and_then(|bytes| bytes.checked_add(16_384)).ok_or_else(overflow)?;
@@ -3121,25 +3124,20 @@ impl<'a> OpenTransaction<'a> {
             || LogicalType::Struct(StructFields::new()).maybe(),
             |metadata| metadata.value().logical_type().maybe(),
         );
-        let embedded_metadata = match (source_times, metadata) {
-            (Some((_, observed)), Some(metadata)) => {
-                let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
-                let retained = StructFields::from([
-                    ("_id".into(), Value::I64(key.tx_id.0)),
-                    (metadata_column.clone(), metadata.value().clone()),
-                ]);
-                self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
-                Value::Null
-            }
-            (None, Some(metadata)) => metadata.value().clone(),
-            (_, None) => Value::Null,
-        };
+        if let Some(metadata) = metadata {
+            let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
+            let retained = StructFields::from([
+                ("_id".into(), Value::I64(key.tx_id.0)),
+                (metadata_column.clone(), metadata.value().clone()),
+            ]);
+            self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
+        }
         let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
-            ("source_log_time".into(), source_times.map(|(appended, _)| time_value(appended)).unwrap_or(Value::Null)),
-            ("receipt_time".into(), source_times.map(|(_, observed)| time_value(observed)).unwrap_or(Value::Null)),
+            ("source_log_time".into(), time_value(appended)),
+            ("receipt_time".into(), time_value(observed)),
             ("committed".into(), Value::Bool(result.committed())),
-            (metadata_column.clone(), embedded_metadata),
+            (metadata_column.clone(), Value::Null),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
@@ -3151,6 +3149,9 @@ pub const HISTORICAL_KEYED_TRANSACTION_SQL: &str = "SELECT _id, system_time FROM
 
 /// How long, from source-log admission, a receipt answers retries of its identity.
 pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;
+fn receipt_bucket(time: Timestamp) -> i64 { time.0.div_euclid(RECEIPT_WINDOW_MICROS) }
+fn receipt_id(id: &str, bucket: i64) -> Value { Value::Utf8(format!("{bucket}/{id}")) }
+
 fn receipts_table() -> TableRef { TableRef::new("xt", "idempotency_receipts") }
 
 fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {

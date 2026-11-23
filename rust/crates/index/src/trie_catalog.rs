@@ -120,13 +120,19 @@ impl TableTries {
         self.l1h_recencies.clear();
         std::sync::Arc::make_mut(&mut self.search).retire_all(at);
     }
-    fn apply(&mut self, mut trie: CatalogTrie, file_size_target: i64, as_of: Timestamp) -> Result<()> {
+    fn apply(&mut self, mut trie: CatalogTrie, file_size_target: i64, as_of: Timestamp, expiring_metadata: bool) -> Result<()> {
         let shard = Shard::of(&trie.key);
         let block = trie.key.block_index();
         if self.shards.get(&shard).is_some_and(|state| state.max_block_index >= block) { return Ok(()); }
         if let Some(metadata) = &mut trie.metadata { metadata.iid_bloom = None; }
         if let Some(retired) = self.retired {
             trie.garbage(retired);
+            self.shards.entry(shard).or_default().insert(trie);
+            return Ok(());
+        }
+        if expiring_metadata && shard == Shard::root(1, None) {
+            for covered in self.shards.values_mut() { covered.supersede(block, None, as_of); }
+            trie.state = TrieState::Live;
             self.shards.entry(shard).or_default().insert(trie);
             return Ok(());
         }
@@ -286,6 +292,7 @@ impl TrieCatalog {
 
     pub fn with_tries(&self, table: TableRef, tries: impl IntoIterator<Item = CatalogTrie>, as_of: Timestamp) -> Result<Self> {
         let mut next = self.clone();
+        let expiring_metadata = table.stores_expiring_transaction_metadata();
         let state = next.tables.entry(table).or_default();
         for mut trie in tries {
             trie.artefacts.retain(|record| {
@@ -297,7 +304,7 @@ impl TrieCatalog {
                 }
                 false
             });
-            state.apply(trie, self.file_size_target, as_of)?;
+            state.apply(trie, self.file_size_target, as_of, expiring_metadata)?;
         }
         Ok(next)
     }

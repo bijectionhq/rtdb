@@ -1368,6 +1368,8 @@ rule ResolveAndAppend {
     -- The holder resolves against its state, pipelining later transactions against speculative state.
     -- An asynchronous submission returns an authenticated, opaque receipt for the deployment history, writer epoch, local sequence, principal and fresh nonce.
     -- A placed session accepts only receipts and causal tokens from the same deployment history and principal.
+    -- The holder keeps intake records until their source positions are installed from the replica log.
+    -- It releases the installed intake prefix independently of subsequent submissions.
     -- The resolved replica record carries the exact attempt identity.
     -- Only its durable applied outcome supplies a causal basis.
     when: TxArrived(holding, tx, key)

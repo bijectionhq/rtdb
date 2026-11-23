@@ -388,6 +388,10 @@ impl CompactionExecutor for SegmentCompactor {
                 let event = &rows[stream].events[row];
                 let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
                 let Some(mut recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
+                // This merge covers every older primary input for an expiring table.
+                if event.op == EventOp::Erase && job.table.stores_expiring_transaction_metadata() {
+                    continue;
+                }
                 if event.commit_position != 0 || event.op == EventOp::Redacted {
                     recency = recency.max(event.system_from);
                 }

@@ -1266,7 +1266,7 @@ async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, co
         if closure.insert(path, Some(observed)).is_some() {
             return Err(inconsistent("Two checkpoint tables use the same storage path"));
         }
-        for object in metadata.checkpoint_trie_files(&table.slug, contents)? {
+        for object in metadata.checkpoint_trie_files(&table, contents)? {
             closure.entry(key(&object)?).or_insert(None);
         }
     }

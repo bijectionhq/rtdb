@@ -119,7 +119,7 @@ impl OpenTransaction<'_> {
     }
 
     /// Progressively replaces expired payloads with committed erase events.
-    /// Reused legacy keys are grouped by their newest interval before erasure.
+    /// Legacy retries admitted in different windows have independent stored identities.
     pub(super) async fn retire_expired_receipts(&mut self, clock: RetentionClock) -> Result<()> {
         if !clock.collect_at(self.tx_key().tx_id) { return Ok(()); }
         let observed = clock.time;

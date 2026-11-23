@@ -92,16 +92,16 @@ Legacy application keys remain reusable after their window ends.
 Placed attempt redemption checks the installed receipt clock.
 An applied prefix remains a causal token independently of the attempt receipt.
 
-New source-log submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
+New source-log and external submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
 The immutable result row keeps the transaction coordinate, commit flag and structured result error.
 A newly resolved legacy-guard duplicate carries its original coordinate in the structured outcome, so historical redemption does not require keeping the expiring application key.
 A structured result error may carry application-provided context, including an assertion message.
 Redacting arbitrary historical error text is a separate policy from retiring user metadata.
 Current reads of `xt.txs.user_metadata` select the payload at the installed receipt clock, including when the requested system time is earlier.
 Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
-The collector retains a legacy key's predecessors while a newer interval of that key is still active.
-Formerly embedded metadata and metadata from external writers lack the new source admission record and need migration.
-Old readers omit newly separated metadata until they support the retained projection.
+Legacy application keys use a separate stored identity per hour bucket, so a fresh use cannot keep the older receipt alive.
+Lookup checks the current and previous bucket against the ordered expiry.
+Existing stores that predate this layout require a reset to use it.
 Arbitrary user metadata has no typed association with another storage unit, so early privacy erasure of such an association still needs an explicit data contract.
 For a placed deployment enrolled in the versioned outcome format, each frame carries its exact current outcome and at most 128 distinct older erasures per collection step.
 An operator confirms format support in every eligible serving and recovery image and parks the deployment before pinning a compatible engine.
@@ -119,3 +119,18 @@ They grant no authority to delete an immutable source-log segment, a replica seg
 A physically retired scope requires an exact successor checkpoint, release of every recovery reference and entitlement, and settlement by each copy's custodian.
 An archive's recorded key withdrawal or empty-inventory receipt only attests its own authority and provider scope.
 A report on R8 must retain the physical-closure gap until all copy classes, versions and recovery holds are accounted for.
+
+## Successor copy closure
+
+The four engine retention tables compact into a single unpartitioned primary per table.
+Each job merges the first live L0 with its older primary inputs, so an erase can remove a receipt written into a different block or historical shard.
+The output excludes that receipt and the erase marker, while surviving entries keep their original coordinates.
+The installed successor retires the covered compacted files through ordinary trie collection.
+Replay checkpoints exclude covered receipt L0 files, and a compactor reset starts from the installed primary closure.
+An admitted suffix still requires the original objects for records it replays before that checkpoint.
+Placed intake releases the installed source prefix without waiting for later submissions.
+
+M1 remains open for durable source and replica copies beyond a trimmed prefix, covered L0 and packed input objects, older checkpoints and archives with live recovery rights, and skipped payloads.
+Closure needs exact custodian settlement after the successor and all such references are released.
+A quiet history still needs ordered receipt-clock progress to trigger collection.
+Early erasure for metadata naming an application unit still requires an explicit association and custody contract.

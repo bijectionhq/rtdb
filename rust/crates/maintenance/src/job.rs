@@ -24,8 +24,21 @@ pub fn available_jobs(catalog: &TrieCatalog) -> Result<Vec<CompactionJob>> {
     let target = catalog.file_size_target();
     let epoch = catalog.naming_epoch();
     for table in catalog.tables() {
+        let current = catalog.current_tries(table);
+        if table.stores_expiring_transaction_metadata() {
+            // Include older receipt puts even when the erase arrived long after their first compaction.
+            if let Some(block) = current.iter().filter(|trie| trie.key.level() == 0)
+                .map(|trie| trie.key.block_index()).min()
+            {
+                let inputs = current.iter().filter(|trie| trie.key.block_index() <= block)
+                    .map(|trie| trie.key.clone()).collect();
+                jobs.push(CompactionJob { table: table.clone(), inputs, part: Vec::new(),
+                    output: TrieKey::new(1, None, Vec::new(), block)?.with_epoch(epoch), recency_mode: RecencyMode::Preserve });
+            }
+            continue;
+        }
         let mut shards: BTreeMap<Shard, Vec<&CatalogTrie>> = BTreeMap::new();
-        for trie in catalog.current_tries(table) { shards.entry(Shard::of(&trie.key)).or_default().push(trie); }
+        for trie in current { shards.entry(Shard::of(&trie.key)).or_default().push(trie); }
         for tries in shards.values_mut() { tries.sort_by_key(|trie| trie.key.block_index()); }
         let root = |level, recency| Shard { level, recency, part: Vec::new() };
         if let Some(l0) = shards.get(&root(0, None)).and_then(|tries| tries.first()) {

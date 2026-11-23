@@ -114,7 +114,7 @@ impl RetainRepairBase {
                 return Err(invalid("The repair base must bind every table block"));
             }
             let _scratch = memory.reserve(table_manifest_reservation(table.encoded_len())?)?;
-            for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Primary)? {
+            for file in table.checkpoint_trie_files(&entry, CheckpointContents::Primary)? {
                 cancelled(cancellation)?;
                 base_store.sync_existing(&ObjectKey::new(file)?).await?;
             }
@@ -457,7 +457,7 @@ async fn stage_primary_base(
             return Err(invalid("The repair base must bind every table block"));
         }
         let _scratch = memory.reserve(table_manifest_reservation(table.encoded_len())?)?;
-        for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Primary)? {
+        for file in table.checkpoint_trie_files(&entry, CheckpointContents::Primary)? {
             cancelled(cancellation)?;
             let file = ObjectKey::new(file)?;
             base_storage.copy_to(&file, &destination, &file).await?;
