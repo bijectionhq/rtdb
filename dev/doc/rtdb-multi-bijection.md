@@ -51,7 +51,8 @@ The lease key in every read set that the `WorldStore` contract uses for "single 
 The `CommitHostedStaged.v6` Flight action carries the exclusive journal cutoff and
 SHA-256 of the exact verified receiver clock certificate envelope. A guarded
 replica provider must retain this pair through original-journal recovery.
-The timed acceptance audit returns the envelope digest with the original voter evidence.
+The writer seals the cutoff and digest in the record's acceptance stage and derives the guarded journal frame from that stage.
+The timed acceptance audit requires the frame to repeat the sealed pair and returns the envelope digest with the original voter evidence.
 The provider samples under the journal writer lock after encryption and payload copying, before assigning the offset or sending a replica request.
 For a strict placed acceptance, `rtdb-multi audit-acceptance` reads one replica offset for the exact installation, incarnation and log epoch.
 It requires a matching write quorum, checks the sealed record against that quorum's digest, and exports the original staging sample, cutoff and append timestamp.

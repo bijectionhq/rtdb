@@ -2013,6 +2013,14 @@ pub async fn audit_acceptance_quorum(
         return Err(not_strict());
     };
     let stage = tx.checked_acceptance_stage()?.ok_or_else(not_strict)?;
+    // The journal frame's cutoff and certificate are outside the deployment seal. They must
+    // repeat the sealed stage, so the reported clock evidence is the writer's own decision.
+    let sealed = stage.journal.map(|cutoff| (cutoff.before().0, cutoff.certificate_sha256()));
+    let framed = entry.guarded_before.zip(entry.timed_origin.as_ref().map(|origin| &origin.clock_certificate_sha256[..]));
+    if sealed.as_ref().map(|(before, certificate)| (*before, certificate.as_slice())) != framed {
+        return Err(Anomaly::fault("rtdb.multi/acceptance-audit-clock-evidence",
+            "The journal frame does not repeat the sealed cutoff and clock certificate"));
+    }
     let (original_journals, required_original_quorum, journal_sync_observations) = match &entry.timed_origin {
         Some(origin) => {
             let members = members(directory).await?;
@@ -2041,8 +2049,8 @@ pub async fn audit_acceptance_quorum(
         authority, incarnation, log_epoch, replica_stream: proof.stream, replica_digest: proof.digest,
         required_replica_quorum: stream.write_quorum,
         original_replica_stream: entry.timed_origin.as_ref().map(|origin| origin.stream.clone()),
-        clock_certificate_sha256: entry.timed_origin.as_ref().map(|origin| {
-            origin.clock_certificate_sha256.iter().map(|byte| format!("{byte:02x}")).collect()
+        clock_certificate_sha256: sealed.map(|(_, certificate)| {
+            certificate.iter().map(|byte| format!("{byte:02x}")).collect()
         }),
         original_journals, required_original_quorum,
         acceptance: AuditAcceptanceStage {
@@ -2051,7 +2059,7 @@ pub async fn audit_acceptance_quorum(
             cutoff_micros: stage.cutoff.0,
         },
         replica_append_sample_micros: entry.timestamp,
-        journal_cutoff_micros: entry.guarded_before,
+        journal_cutoff_micros: sealed.map(|(before, _)| before),
         quorum_observed_clock_upper_micros,
         journal_sync_observations: journal_sync_observations.into_iter()
             .map(|observation| (observation.journal, observation.synced_clock_upper_micros)).collect(),

@@ -142,7 +142,7 @@ impl PartitionLogs {
         if matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
             return Err(Anomaly::fault("rtdb.replication/strict-dispatch-clock", "Strict replica writes require the live writer clock"));
         }
-        self.enqueue_replica_with(envelope, block, || now, true, None, |_| Ok(())).await
+        self.enqueue_replica_with(envelope, block, || now, true, |_| Ok(())).await
     }
     pub(crate) fn data_suspended(&self) -> bool { self.data_suspended.load(Ordering::Acquire) }
     pub(crate) fn suspend_data(&self, suspend: bool) { self.data_suspended.store(suspend, Ordering::Release); }
@@ -163,7 +163,7 @@ impl PartitionLogs {
         self.replica.maximum_timed_original_append_bytes()
     }
     pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
-        allow_offload: bool, journal_before: Option<rtdb_types::TimedJournalCutoff>, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
+        allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
         let stage = match &envelope.message {
             ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?,
             _ => None,
@@ -171,7 +171,7 @@ impl PartitionLogs {
         let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
         before_enqueue(&payload)?;
         if let Some(stage) = stage {
-            let guard = GuardedAppend::new(&clock, stage.clock_upper, stage.cutoff, journal_before);
+            let guard = GuardedAppend::new(&clock, stage.clock_upper, stage.cutoff, stage.journal);
             let receipt = self.replica.enqueue_guarded(payload, guard).await.map_err(|error| match error {
                 error @ StorageError::GuardedAppendCutoff => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_CUTOFF, error.to_string()),
                 error @ StorageError::GuardedAppendUnavailable => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_UNAVAILABLE, error.to_string()),
@@ -179,7 +179,6 @@ impl PartitionLogs {
             })?;
             return Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch });
         }
-        if journal_before.is_some() { return Err(Anomaly::fault("rtdb.replication/journal-cutoff", "The journal deadline has no prepared acceptance stage")); }
         let now = clock();
         // Only the term's initial claim and the block close can consume reserved journal space.
         // Keep that class when a large block upload is represented by an offload reference.

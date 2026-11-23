@@ -31,7 +31,7 @@ fn a_strict_replica_record_preserves_and_checks_its_original_staging_sample() {
         .identify(source, Some("owner")).unwrap();
     let tx = pb::ResolvedTx { tx_id: Some(source.0), system_time_micros: Some(100),
         src_msg_id: Some(source.0), committed: Some(true), placed_attempt: Some(placement.encode().to_vec()),
-        acceptance_stage: Some(pb::AcceptanceStage { clock_upper_micros: Some(198), cutoff_micros: Some(200) }),
+        acceptance_stage: Some(pb::AcceptanceStage { clock_upper_micros: Some(198), cutoff_micros: Some(200), ..Default::default() }),
         ..Default::default() };
     let encode = |tx| ReplicaEnvelope { term: Term(5), term_sequence: Some(TermSequence(3)), message: ReplicaBody::ResolvedTx(tx) }.encode();
     let encoded = encode(tx.clone());
@@ -56,6 +56,31 @@ fn a_strict_replica_record_preserves_and_checks_its_original_staging_sample() {
     let mut aborted = tx;
     aborted.committed = Some(false);
     assert!(ReplicaEnvelope::decode(&encode(aborted)).is_err());
+}
+
+#[test]
+fn a_physical_acceptance_stage_seals_its_journal_cutoff_with_the_clock_certificate() {
+    let source = SourcePosition(1);
+    let placement = PlacedAttemptScope::new("replica", 1).unwrap().issue()
+        .identify(source, Some("owner")).unwrap();
+    let stage = |journal_cutoff_micros, clock_certificate_sha256| pb::ResolvedTx {
+        tx_id: Some(source.0), system_time_micros: Some(100), src_msg_id: Some(source.0), committed: Some(true),
+        placed_attempt: Some(placement.encode().to_vec()),
+        acceptance_stage: Some(pb::AcceptanceStage {
+            clock_upper_micros: Some(198), cutoff_micros: Some(200), journal_cutoff_micros, clock_certificate_sha256,
+        }),
+        ..Default::default()
+    };
+    let journal = stage(Some(210), Some(vec![7; 32])).checked_acceptance_stage().unwrap().unwrap().journal.unwrap();
+    assert_eq!(journal.before(), Timestamp(210));
+    assert_eq!(journal.certificate_sha256(), [7; 32]);
+    assert!(stage(None, None).checked_acceptance_stage().unwrap().unwrap().journal.is_none());
+    for (cutoff, certificate) in [
+        (Some(210), None), (None, Some(vec![7; 32])), (Some(199), Some(vec![7; 32])),
+        (Some(210), Some(vec![0; 32])), (Some(210), Some(vec![7; 31])),
+    ] {
+        assert!(stage(cutoff, certificate).checked_acceptance_stage().is_err());
+    }
 }
 
 #[test]

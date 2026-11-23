@@ -754,7 +754,7 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
-    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), || Timestamp(100), false, None, |_| Ok(())).await
+    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), || Timestamp(100), false, |_| Ok(())).await
         else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
     assert_eq!(error.code, "rtdb.storage/message-too-large");
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
@@ -785,7 +785,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
             committed: Some(true),
             placed_attempt: Some(attempt.encode().to_vec()),
             acceptance_stage: Some(proto::AcceptanceStage {
-                clock_upper_micros: Some(120), cutoff_micros: Some(125),
+                clock_upper_micros: Some(120), cutoff_micros: Some(125), ..Default::default()
             }),
             ..Default::default()
         }),
@@ -793,7 +793,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
     let wall = AtomicI64::new(119);
     for sample in [118, 124, 130] {
         let Err(error) = fixture.logs.enqueue_replica_with(
-            &envelope, BlockIndex(0), || Timestamp(wall.load(Ordering::Relaxed)), false, None,
+            &envelope, BlockIndex(0), || Timestamp(wall.load(Ordering::Relaxed)), false,
             |_| { wall.store(sample, Ordering::Relaxed); Ok(()) },
         ).await else { panic!("An invalid dispatch clock must leave the replica log untouched"); };
         assert_eq!(error.code, crate::logs::STRICT_DISPATCH_CUTOFF);
@@ -804,7 +804,7 @@ async fn strict_dispatch_checks_the_clock_after_preparing_the_exact_frame() {
     assert!(fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(119)).await.is_err());
     assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
     let receipt = fixture.logs.enqueue_replica_with(
-        &envelope, BlockIndex(0), || Timestamp(123), false, None, |_| Ok(()),
+        &envelope, BlockIndex(0), || Timestamp(123), false, |_| Ok(()),
     ).await.unwrap();
     assert_eq!(receipt.durable().await.unwrap().position, ReplicaPosition(0));
 }

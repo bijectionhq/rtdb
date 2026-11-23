@@ -184,12 +184,8 @@ impl ReplicaAppender {
                         Some(charge)
                     } else { None };
                     let guarded = matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
-                    let journal_before = match &request.write.body {
-                        WriteBody::Resolved(tx, _) => tx.journal_before(),
-                        WriteBody::Message(_) => None,
-                    };
                     let observation = self.durable_commit_observation(&request.write.body);
-                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, || (self.clock)(), allow_offload, journal_before,
+                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, || (self.clock)(), allow_offload,
                         |frame| request.write.stamp_append(sequence, frame));
                     let enqueued = observe_enqueue(enqueue, &self.cancellation, &mut receipts).await;
                     drop(envelope);

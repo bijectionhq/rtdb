@@ -132,6 +132,8 @@ pub struct AcceptanceStageWitness {
     pub ordered_at: Timestamp,
     pub clock_upper: Timestamp,
     pub cutoff: Timestamp,
+    /// The sealed original-journal cutoff and receiver clock certificate, for a physically bounded acceptance.
+    pub journal: Option<rtdb_types::TimedJournalCutoff>,
 }
 
 const RETIREMENT_MARKER: &[u8] = b"rtdb/placed-receipt-retirement/v1\0";
@@ -171,9 +173,17 @@ impl crate::log::proto::ResolvedTx {
         {
             return Err(invalid("Strict acceptance stage does not match a committed placed transaction"));
         }
+        let journal = match (stage.journal_cutoff_micros, stage.clock_certificate_sha256.as_deref()) {
+            (None, None) => None,
+            (Some(before), Some(certificate)) if before >= cutoff => {
+                let certificate = certificate.try_into().map_err(|_| invalid("Invalid clock certificate digest length"))?;
+                Some(rtdb_types::TimedJournalCutoff::new(Timestamp(before), certificate)?)
+            }
+            _ => return Err(invalid("Strict acceptance stage has an incomplete journal cutoff")),
+        };
         Ok(Some(AcceptanceStageWitness {
             source_position: SourcePosition(source), ordered_at: Timestamp(ordered_at),
-            clock_upper: Timestamp(upper), cutoff: Timestamp(cutoff),
+            clock_upper: Timestamp(upper), cutoff: Timestamp(cutoff), journal,
         }))
     }
 }

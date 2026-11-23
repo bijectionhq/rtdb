@@ -525,7 +525,10 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
         message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
             tx_id: Some(3), src_msg_id: Some(3), system_time_micros: Some(100), committed: Some(true),
             placed_attempt: Some(placed.encode().to_vec()),
-            acceptance_stage: Some(proto::AcceptanceStage { clock_upper_micros: Some(120), cutoff_micros: Some(150) }),
+            acceptance_stage: Some(proto::AcceptanceStage {
+                clock_upper_micros: Some(120), cutoff_micros: Some(150),
+                journal_cutoff_micros: Some(i64::MAX), clock_certificate_sha256: Some(vec![7; 32]),
+            }),
             ..Default::default()
         }),
     };

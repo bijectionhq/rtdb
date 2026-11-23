@@ -63,6 +63,11 @@ message ResolvedTx {
 message AcceptanceStage {
     sfixed64 clock_upper_micros = 1;
     sfixed64 cutoff_micros = 2;
+    // Present together for a physically bounded acceptance: the exclusive
+    // cutoff for original journal syncs and the SHA-256 of the exact receiver
+    // clock certificate envelope that justified it.
+    sfixed64 journal_cutoff_micros = 3;
+    bytes clock_certificate_sha256 = 4;
 }
 
 message BlockBoundary {

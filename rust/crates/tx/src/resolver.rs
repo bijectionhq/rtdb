@@ -106,7 +106,6 @@ pub struct ResolvedTx {
     external_token: Option<Vec<u8>>,
     db_op: Option<DbOp>,
     inline_replica: Option<OwnedReplicaBody>,
-    journal_before: Option<rtdb_types::TimedJournalCutoff>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -115,7 +114,7 @@ impl ResolvedTx {
         let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
         let reservation = context.memory.reserve(bound)?;
         let writes = if context.write_event_origins && result.committed() && writes.row_count()? > 0 { writes.assign_event_origins(&context.memory)? } else { writes };
-        Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, journal_before: None, _reservation: reservation })
+        Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, _reservation: reservation })
     }
 
     pub fn writes(&self) -> &Arc<StagedWrite> { &self.writes }
@@ -127,7 +126,6 @@ impl ResolvedTx {
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
     pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_replica.as_ref().map(OwnedReplicaBody::body) }
-    pub fn journal_before(&self) -> Option<rtdb_types::TimedJournalCutoff> { self.journal_before }
     pub fn staging_clock_upper(&self) -> Option<Timestamp> {
         self.inline_replica.as_ref()?.acceptance_stage()?.clock_upper_micros.map(Timestamp)
     }
@@ -143,10 +141,14 @@ impl ResolvedTx {
             writer.and_then(|writer| writer.maximum_inline_bytes.map(|maximum| (writer, maximum)))
                 .ok_or_else(|| Anomaly::unsupported("rtdb.owned/replica-inline-unavailable", "The writer has no installed inline replica limit"))?
         };
-        // Both coordinates use fixed-width fields. Reserving them before the
+        // The sample uses a fixed-width field. Reserving it before the
         // capacity check makes substituting the live sample size invariant.
+        // The sealed journal cutoff and certificate digest are the only source
+        // for the guarded append, so the frame cannot name other clock evidence.
         let mut body = self.encode_replica_body(memory, Some(AcceptanceStage {
             clock_upper_micros: Some(0), cutoff_micros: Some(until.0),
+            journal_cutoff_micros: journal_before.map(|cutoff| cutoff.before().0),
+            clock_certificate_sha256: journal_before.map(|cutoff| cutoff.certificate_sha256().to_vec()),
         }))?;
         if ReplicaEnvelope::maximum_encoded_len(body.body()) > maximum {
             return Err(Anomaly::incorrect("rtdb.owned/replica-inline-bound", "The resolved transaction exceeds the writer's inline replica limit"));
@@ -160,7 +162,6 @@ impl ResolvedTx {
             return Err(Anomaly::fault("rtdb.tx/acceptance-stage", "Prepared replica body has no acceptance stage"));
         };
         stage.clock_upper_micros = Some(upper);
-        self.journal_before = journal_before;
         self.inline_replica = Some(body);
         Ok(())
     }
