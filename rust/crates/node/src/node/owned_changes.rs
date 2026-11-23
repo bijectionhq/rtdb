@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use rtdb_columnar::MemoryReservation;
 use rtdb_index::Snapshot;
+use rtdb_plan::Catalog;
 use rtdb_query::{OwnedJournalHeader, read_owned_change_entry, read_owned_journal_header};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, OWNED_CHANGE_GROUP_BYTES,

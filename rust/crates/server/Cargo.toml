@@ -30,6 +30,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 serde.workspace = true
 rtdb-node.workspace = true
+rtdb-tx.workspace = true
 rtdb-query.workspace = true
 rtdb-auth.workspace = true
 rtdb-pgwire.workspace = true
@@ -68,7 +69,6 @@ reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"]
 fs2.workspace = true
 
 [dev-dependencies]
-rtdb-tx.workspace = true
 tempfile.workspace = true
 
 [lints]
