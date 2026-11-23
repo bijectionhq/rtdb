@@ -1576,9 +1576,16 @@ impl OwnedReadSession {
     }
 
     pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
+        Ok(self.world_registration_with_revision(world).await?
+            .map(|(record, _, charge)| (record, charge)))
+    }
+
+    pub async fn world_registration_with_revision(
+        &self, world: rtdb_types::Iid,
+    ) -> Result<Option<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        let record = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;
+        let record = rtdb_query::read_owned_world_with_revision(Arc::clone(&self.context), &self.owner, world).await?;
         self.check()?;
         Ok(record)
     }

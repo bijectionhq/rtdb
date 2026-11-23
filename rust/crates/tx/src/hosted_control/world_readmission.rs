@@ -138,6 +138,7 @@ impl WorldReadmission {
             || next.dropped
             || next.mode != prior.mode
             || next.schemas != prior.schemas
+            || next.fork_lineage != prior.fork_lineage
             || next.parent_publication != Some(prior.root_clock())
             || self.retained_ancestor(prior)? != next.ancestor.as_ref()
             || next.ancestor.as_ref().is_some_and(|ancestor| ancestor.basis.system_time >= logical)
@@ -268,6 +269,10 @@ mod tests {
             until: Timestamp(100),
             schemas: WorldSchemas::from_bytes(b"{}")?,
             ancestor: Some(original.clone()),
+            fork_lineage: vec![rtdb_types::OwnedWorldForkLink {
+                world: original.world, pin: original.pin, registered: Timestamp(16),
+                system: original.system, logical: original.logical,
+            }],
             dropped: false,
         };
         let mut retained = original.clone();

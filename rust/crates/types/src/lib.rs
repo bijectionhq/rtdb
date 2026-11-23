@@ -37,7 +37,7 @@ mod owned_schema;
 mod owned_world;
 mod owned_changes;
 pub use owned_changes::{OwnedChange, OwnedChangeGroup, OwnedChangeKind, OwnedEntityRegion, OwnedRangeEvidence, OWNED_CHANGE_GROUP_BYTES, OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, change_feed_uncovered, expired_lifetime_interval};
-pub use owned_world::{OwnedWorld, OwnedWorldAncestor, OwnedWorldAssertion, WorldClockLimit, WorldClockMode, WorldSchemas, WorldShadow};
+pub use owned_world::{OwnedWorld, OwnedWorldAncestor, OwnedWorldAssertion, OwnedWorldForkLink, WorldClockLimit, WorldClockMode, WorldSchemas, WorldShadow};
 pub use owned_schema::{OwnedLifetimeFloor, OwnedRetirement, OwnedSchema};
 mod memory;
 mod allocation;

@@ -12,7 +12,7 @@ use super::WorldReadmission;
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP4";
+const MAGIC: &[u8] = b"BJWP5";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
@@ -46,6 +46,7 @@ struct ArchivedWorld {
     mode: ArchivedMode,
     parent: ArchivedParent,
     ancestor: Option<OwnedWorldAncestor>,
+    fork_lineage: Vec<rtdb_types::OwnedWorldForkLink>,
     until: i64,
     dropped: bool,
 }
@@ -81,6 +82,7 @@ impl ArchivedWorld {
         let schemas = serde_json::to_vec(&self.parent.schemas).map_err(|_| invalid())?;
         let world = OwnedWorld {
             ancestor: self.ancestor,
+            fork_lineage: self.fork_lineage,
             id: Iid(self.id),
             pin: Iid(self.pin),
             capture: Iid(self.parent.capture),

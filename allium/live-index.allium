@@ -24,6 +24,8 @@
 --   The owned relation's routing inventory reads the applied data, change-journal and purge event frontiers under the same snapshot.
 --   A relation is exhausted when its data and purge frontiers are zero and its serving trie inventory is empty.
 --   A feed is exhausted when the relation is exhausted and its change journal also has a zero frontier and no serving tries.
+--   A nested retained world stores an ordered, bounded prefix of original parent registrations and selected cuts in its own world record.
+--   The resolver compares every inherited link and the appended parent edge with the accepted predecessor before it can publish the child.
 --   Row-based operations carry homogeneous floating-point lists as typed Arrow component buffers.
 --   Staged rows ARE read, by the transactions resolving behind them (read-your-writes), and that stays within the discipline only because the reader is the same owner — the term's own coroutine.
 --   Nothing else may read staged rows.

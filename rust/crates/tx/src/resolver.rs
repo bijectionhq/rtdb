@@ -1721,17 +1721,22 @@ impl<'a> OpenTransaction<'a> {
                             }
                             let base = self.buffer.base_snapshot();
                             let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                            let (source, _charge) = rtdb_query::read_owned_world(context, owner, *source_id)
+                            let (source, registered, _charge) = rtdb_query::read_owned_world_with_revision(context, owner, *source_id)
                                 .await?.ok_or_else(unavailable)?;
                             let admits_child = if world.ancestor.is_some() {
                                 source.can_retain_overlay(&world)
                             } else {
                                 source.can_retain_parent(&world)
                             };
-                            if source.pin != *source_pin || !admits_child {
+                            if source.pin != *source_pin || !admits_child
+                                || self.tx_key().system_time >= source.until
+                                || world.fork_lineage != source.retained_child_lineage(&world, registered)?
+                            {
                                 return Err(unavailable());
                             }
-                        } else if world.ancestor.is_some() {
+                        } else if world.ancestor.is_some()
+                            || (previous.is_none() && !world.fork_lineage.is_empty())
+                        {
                             return Err(unavailable());
                         }
                         if let Some(previous) = previous {
@@ -3810,7 +3815,8 @@ mod tests {
         for (mode, valid) in [(WorldClockMode::Proposal, Timestamp(200)), (WorldClockMode::Held { start: Timestamp(100) }, Timestamp(101))] {
             let world = Iid([1; 16]);
             let record = OwnedWorld {
-            ancestor: None,
+                ancestor: None,
+                fork_lineage: Vec::new(),
                 id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
                 manifest: "a".repeat(43), basis: cut, parent_publication: None,
                 mode, until: Timestamp(1000), dropped: false,
@@ -3910,7 +3916,7 @@ mod tests {
         };
         for mode in [WorldClockMode::Proposal, WorldClockMode::Held { start: cut.system_time }] {
             let record = OwnedWorld {
-                ancestor: None, id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
+                ancestor: None, fork_lineage: Vec::new(), id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
                 manifest: "a".repeat(43), basis: cut, parent_publication: None, mode,
                 until: Timestamp(1000), dropped: false,
                 schemas: WorldSchemas::new(BTreeMap::from([(relation.name().into(), schema.clone())]))?,
@@ -4004,6 +4010,7 @@ mod tests {
         let overlay = relation.in_world(world)?;
         let record = OwnedWorld {
             ancestor: None,
+            fork_lineage: Vec::new(),
             id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None, manifest: "a".repeat(43),
             basis: cut, parent_publication: None, mode: WorldClockMode::Proposal, until: Timestamp(1000), dropped: false,
             schemas: WorldSchemas::new(BTreeMap::from([(relation.name().into(), schema)]))?,

@@ -273,6 +273,9 @@ impl HeldCheckpointWorld {
         &self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> Result<rtdb_node::OwnedForkCut> {
         self.check()?;
+        if self.open.record.fork_lineage.len() >= OwnedWorld::MAX_FORK_LINEAGE {
+            return Err(OwnedWorld::unavailable());
+        }
         if self.open.record.ancestor.is_none() && system == self.open.record.basis.system_time {
             let cut = self.open.snapshot.fork_inherited_root_cut(scope, &self.open.record).await?;
             self.check()?;

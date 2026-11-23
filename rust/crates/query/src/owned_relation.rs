@@ -646,7 +646,7 @@ pub async fn read_owned_worlds(context: Arc<QueryContext>, catalog: TableRef) ->
     use rtdb_types::{OwnedWorld, StructFields};
 
     if catalog.owned_world_catalog().as_ref() != Some(&catalog) { return Err(OwnedWorld::unavailable()); }
-    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor"];
+    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor", "fork_lineage"];
     let memory = Arc::clone(&context.memory);
     let Some(mut cursor) = open_private_catalog(context, catalog, &names, None).await? else { return Ok(Vec::new()); };
     let mut worlds = Vec::new();
@@ -1021,11 +1021,18 @@ pub async fn select_owned_world_clock(
 pub async fn read_owned_world(
     context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid,
 ) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
+    Ok(read_owned_world_with_revision(context, owner, world)
+        .await?.map(|(record, _, retained)| (record, retained)))
+}
+
+pub async fn read_owned_world_with_revision(
+    context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid,
+) -> Result<Option<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)>> {
     use rtdb_types::{OwnedWorld, StructFields};
 
     let memory = Arc::clone(&context.memory);
     let id = EntityId::Uuid(world.0);
-    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor"];
+    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor", "fork_lineage"];
     let Some(mut cursor) = open_owned_point(
         context, owner, &OwnedRelation::world_catalog(), &id, None, Some(&names),
     ).await? else { return Ok(None); };
@@ -1050,7 +1057,8 @@ pub async fn read_owned_world(
             let retained = memory.reserve(schema_bytes * 32 + 4096)?;
             let decoded = OwnedWorld::from_record(&fields)?;
             if decoded.id != world { return Err(OwnedWorld::unavailable()); }
-            record = Some((decoded, retained));
+            let registered = owned_row_revision(batch, row, &id, &memory)?;
+            record = Some((decoded, registered, retained));
         }
     }
     Ok(record)

@@ -621,6 +621,7 @@ fn world_record(
 ) -> OwnedWorld {
     OwnedWorld {
         ancestor: world_ancestor(retained),
+        fork_lineage: Vec::new(),
         id: Iid(*retained.world.as_bytes()),
         pin: Iid(*pin.as_bytes()),
         capture: Iid(*retained.capture.as_bytes()),
@@ -675,8 +676,9 @@ pub(crate) async fn fork_checkpoint_world_selected(
         let binding = CheckpointWorldRetention {
             world: child, until, mode: WorldClockMode::Retained, ..retained.clone()
         };
-        let registration = world_record(child, &binding, opened.record.schemas.clone());
+        let mut registration = world_record(child, &binding, opened.record.schemas.clone());
         if !opened.record.can_retain_parent(&registration) { return Err(unavailable()); }
+        registration.fork_lineage = opened.record.retained_child_lineage(&registration, opened.registered)?;
         drop(opened);
         update_installation(directory.as_ref(), &deployment, |current| {
             let active = now();
@@ -717,13 +719,15 @@ pub(crate) async fn fork_checkpoint_world_selected(
         }
         let source_retention = source.checkpoint_worlds.get(&Uuid::from_bytes(pin.0)).ok_or_else(unavailable)?;
         let live = session.open_owned_read().await?;
-        let (registered, _charge) = live.world_registration(world).await?.ok_or_else(unavailable)?;
-        let registration = world_record(child, retained, registered.schemas.clone());
+        let (registered, registered_at, _charge) = live.world_registration_with_revision(world)
+            .await?.ok_or_else(unavailable)?;
+        let mut registration = world_record(child, retained, registered.schemas.clone());
         if registered.pin != pin || !matches_retention(&registered, source_retention)
             || registered.schemas.digest() != retained.schema_digest || !registered.can_retain_overlay(&registration)
         {
             return Err(unavailable());
         }
+        registration.fork_lineage = registered.retained_child_lineage(&registration, registered_at)?;
         admit_world_media(&source, archive, deployment_id, retained)?;
         live.check()?;
         drop(live);
@@ -847,12 +851,12 @@ pub(crate) async fn fork_checkpoint_world_selected(
         return Err(OwnedWorld::unavailable());
     }
     // A renewal keeps the parent already admitted at this exact archive.
-    let (schemas, parent_publication) = match predecessor {
+    let (schemas, parent_publication, fork_lineage) = match predecessor {
         Some((prior, _charge)) if schemas.includes(&prior.schemas) => {
-            (prior.schemas, prior.parent_publication)
+            (prior.schemas, prior.parent_publication, prior.fork_lineage)
         }
         Some(_) => return Err(OwnedWorld::unavailable()),
-        None => (schemas, parent_publication),
+        None => (schemas, parent_publication, Vec::new()),
     };
     let inherited = parent_publication.unwrap_or(basis.system_time);
     let mode = match fork.requested {
@@ -935,7 +939,8 @@ pub(crate) async fn fork_checkpoint_world_selected(
     })
     .await?;
     admit_session(session, &installed, &retained.owner)?;
-    let registration = world_record(pin, &retained, schemas);
+    let mut registration = world_record(pin, &retained, schemas);
+    registration.fork_lineage = fork_lineage;
     let previous = if fork.sibling.is_some() { None } else { fork.previous.map(|previous| Uuid::from_bytes(previous.0)) };
     let outcome = session.register_owned_world_checked(&registration, fork).await?;
     if !outcome.committed() {
@@ -1002,6 +1007,7 @@ struct OpenWorld {
     retained: CheckpointWorldRetention,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
+    registered: Timestamp,
     publication: Option<(Timestamp, Timestamp)>,
     _schema_charge: Arc<MemoryReservation>,
 }
@@ -1014,8 +1020,8 @@ async fn open_world(
     id: Uuid,
 ) -> Result<OpenWorld> {
     let snapshot = session.open_owned_read().await?;
-    let (world, charge) = snapshot
-        .world_registration(Iid(*id.as_bytes()))
+    let (world, registered, charge) = snapshot
+        .world_registration_with_revision(Iid(*id.as_bytes()))
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     let installation = directory
@@ -1032,6 +1038,8 @@ async fn open_world(
     }
     admit_world_media(&installation, archive, deployment, retained)?;
     if world.dropped
+        || registered > snapshot.present().system_time
+        || world.fork_lineage.last().is_some_and(|link| link.registered >= registered)
         || snapshot.present().system_time >= retained.until
         || !matches_retention(&world, retained)
     {
@@ -1047,6 +1055,7 @@ async fn open_world(
         retained: retained.clone(),
         snapshot,
         record: world,
+        registered,
         publication,
         _schema_charge: charge,
     })
