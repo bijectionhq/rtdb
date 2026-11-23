@@ -1148,6 +1148,12 @@ impl<T> Cas<T> {
 }
 
 #[async_trait]
+pub trait AudienceSeatClaim: Send + Sync {
+    async fn acquire(&self) -> Result<bool>;
+    async fn release(&self) -> Result<()>;
+}
+
+#[async_trait]
 pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
@@ -1183,6 +1189,11 @@ pub trait Directory: Send + Sync {
     /// These strongly consistent point reads leave the exact writer epoch check to the holder and journal.
     async fn audience_authority(&self, _id: &str, _member: &MemberId) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
         Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
+    }
+    /// Prepares a revision-fenced claim for one of the deployment's prepaid Flight seats.
+    async fn prepare_audience_seat(&self, _source: uuid::Uuid, _index: usize, _member: &MemberId,
+        _epoch: u64, _task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
+        Err(Anomaly::unsupported("rtdb.directory/audience-seats", "The directory has no audience seat authority"))
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
@@ -1259,9 +1270,14 @@ pub use lineage::{ForkPreparation, ForkPublication, LineageChange, LineageRetire
 use lineage::{StoredLineage, lineage_busy};
 
 const REFERENCE_REVISION_PREFIX: &str = "~reference-revision/";
+const AUDIENCE_SEAT_PREFIX: &str = "~audience-seat/";
+
+fn reserved_deployment_name(name: &str) -> bool {
+    name.starts_with(REFERENCE_REVISION_PREFIX) || name.starts_with(AUDIENCE_SEAT_PREFIX)
+}
 
 fn require_deployment_name(name: &str) -> Result<()> {
-    if name.starts_with(REFERENCE_REVISION_PREFIX) {
+    if reserved_deployment_name(name) {
         return Err(Anomaly::incorrect("rtdb.directory/name", "The name is reserved for the directory"));
     }
     Ok(())
@@ -1742,7 +1758,7 @@ impl Directory for MemoryDirectory {
     }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> { Ok(self.state()?.deployments.get(id).map(Box::as_ref).cloned()) }
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
-        if name.starts_with(REFERENCE_REVISION_PREFIX) { return Ok(None); }
+        if reserved_deployment_name(name) { return Ok(None); }
         let state = self.state()?;
         Ok(state.names.get(name).and_then(|id| state.deployments.get(id)).map(Box::as_ref).cloned())
     }

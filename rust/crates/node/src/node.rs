@@ -71,6 +71,11 @@ pub trait ReadFence: Send + Sync {
     async fn confirm_audience(&self, _database: &Database, _require_quorum: bool) -> Result<String> {
         Err(hosted_source_unavailable())
     }
+    /// Reserves one deployment seat until the final session owner drops its release guard.
+    async fn hold_audience_seat(&self, _database: Weak<Database>, _index: usize, ready: oneshot::Sender<Result<()>>,
+        _release: CancellationToken) {
+        let _ = ready.send(Err(hosted_source_unavailable()));
+    }
 }
 
 pub(crate) struct HostedSourceReceipt {
@@ -276,6 +281,14 @@ impl Node {
             return Err(hosted_source_unavailable());
         }
         Ok(())
+    }
+    pub async fn hold_audience_seat(&self, database: Weak<Database>, index: usize, ready: oneshot::Sender<Result<()>>,
+        release: CancellationToken) {
+        if let Some(fence) = self.read_fence.as_ref() && self.ensure_open().is_ok() {
+            fence.hold_audience_seat(database, index, ready, release).await;
+        } else {
+            let _ = ready.send(Err(hosted_source_unavailable()));
+        }
     }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
     /// Captures the query clock without narrowing to the durable timestamp unit.

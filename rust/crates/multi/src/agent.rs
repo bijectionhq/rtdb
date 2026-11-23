@@ -607,6 +607,20 @@ impl NodeAgent {
         self.confirm_placed_read(database, check).await
     }
 
+    pub(crate) async fn prepare_audience_seat(&self, database: Weak<Database>, index: usize,
+        task: Option<&rtdb_directory::HostedTask>) -> Result<Option<Box<dyn rtdb_directory::AudienceSeatClaim>>> {
+        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable,
+            "rtdb.multi/audience-seat-unavailable", "The audience seat is not available at this placement");
+        let (id, epoch) = {
+            let database = database.upgrade().ok_or_else(unavailable)?;
+            self.holdings.lock().get(database.name())
+                .filter(|holding| holding.linearizable && holding.database.as_ptr() == Arc::as_ptr(&database))
+                .map(|holding| (holding.id.clone(), holding.epoch)).ok_or_else(unavailable)?
+        };
+        let source = uuid::Uuid::parse_str(&id).map_err(|_| unavailable())?;
+        self.directory.prepare_audience_seat(source, index, &self.member(), epoch, task).await
+    }
+
     async fn confirm_placed_read(&self, database: &Database, check: HostedReadCheck) -> Result<String> {
         let name = database.name();
         let unavailable = || Anomaly::new(

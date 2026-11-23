@@ -114,11 +114,17 @@ The server computes the retained digest from the selected entry in the requested
 The proof takes journal identity and sample provenance, the retained chain's binding to exact bytes, the validity of the recorded origin, and the installed physical clock bounds as premises.
 
 The installed audience Flight gateway discovers its existing holder with its own DynamoDB client.
-It reads the exact deployment and that deployment's member by key and dials the configured audience port on the member's advertised host.
+It makes strongly consistent point reads of the installed deployment and its assigned member, then dials the configured audience port on the member's advertised host.
 A missing, stale, or parked placement makes the audience handshake unavailable.
 The writer lifecycle remains with the placement owners. At the holder, acquisition verifies the recovered source and writer quorum.
 
-Each installed holder reserves two Flight session seats per prepaid turn.
+Each installed holder prepays two Flight session seats per turn, and a shared directory claim makes each position exclusive across the cell's holders.
+The off-turn mint reserves its local permit and then conditionally claims the deployment and seat index in DynamoDB.
+The transaction checks the exact holder and writer epoch with the seat predecessor, so even a placement change after the gateway's read can fence a stale mint.
+The running holder relinquishes the claim after the session and its retained I/O drain.
+A successor can replace a charged claim with an exact ECS task-stop observation.
+An interrupted or ambiguous claim is retired by advancing its revision from either the observed predecessor or the attempted claim revision.
+A delayed duplicate write can only apply to its original predecessor.
 The gateway and holder parse the same seat selector, and the gateway requires the holder to acknowledge the exact selector and mint attempt before wrapping a new session token.
 A live seat can recover its original session under the same credential and exact mint attempt.
 For the same deployment, the holder compares the candidate with the current local attachment before retiring a displaced or expired occupant.
@@ -129,8 +135,23 @@ On 2026-11-23, Verus 0.2026.11.20.9da409b checked seven obligations and rejected
 See [the area manifest](../../verification/verus/audience_session_seats/area.json) for the mutations and expected diagnostics.
 The area checks the shipped alternate parser, registry size and indexing, attachment and admission decisions, and a lost-close model that invokes the shipped admission decision.
 Source inspection ties vacancy to an acquired semaphore permit, retry to lookup of the original live registry entry, and retained provider I/O to a strong reference to the session through its I/O admission.
-The checked bound applies to one installed holder reservation and assumes those runtime ownership and serialization rules, the sampled catalog, and authenticated identity comparisons.
-Cross-holder placement and the time for provider I/O to drain require their own evidence.
+The local bound assumes those runtime ownership and serialization rules, the sampled catalog, and authenticated identity comparisons.
+
+**Cross-holder proof checked on 2026-11-23.**
+TLC 2026.11.19.180144 exhausted 9,522 distinct states for one assignment move and 25,252 for two moves, with two holders, two alternates for one prepaid turn, a three-tick ceiling and a two-tick sweep.
+[The model](../../verification/tla/CrossHolderAudienceSeats.tla) checks seven invariants and one progress property, including capacity across holders, current routing and mint authority, local drain before reuse, retained I/O custody, cleanup-only standing, and registry retirement by ceiling plus sweep.
+Nine controls failed their declared laws, and a witness served a replacement while an earlier holder still retained already-admitted I/O in the other seat.
+Verus 0.2026.11.20.9da409b verified three shipped decisions for the shared claim, and all six production mutations failed their declared checks.
+[The claim proof area](../../verification/verus/audience_cross_holder_claim/area.json) covers admission against the exact free or stopped predecessor and release before or after a pending claim commits.
+
+**Cross-holder source inspection.**
+The claim uses the ordinary holder directory client off-turn.
+Each data action uses the independent audience read path to check current standing, and an authenticated close can act on the original session without opening a native connection.
+The holder fixes the 180-second deadline before its claim attempt, and the installed listener requests a sweep every 10 seconds.
+The 190-second registry-retirement bound assumes a progressing monotonic clock and that the installed listener completes an expiry sweep within 10 seconds of the deadline.
+Physical release also requires retained I/O to drain and the directory to accept or observe the fenced release, or exact task-stop evidence to arrive.
+The correspondence assumes DynamoDB conditional-write atomicity and consistent reads within the cell, unique claim revisions, authenticated bearer routes, exact ECS stop records, and the session ownership and clock wiring inspected in Rust.
+Cross-cell transfers and provider I/O drain time require separate evidence.
 
 #### Journal provenance evidence
 

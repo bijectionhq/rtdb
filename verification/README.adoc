@@ -139,6 +139,10 @@ It also exercises the Azure adapter against a loopback provider and separately m
 
 == Evidence boundaries
 
+* link:tla/CrossHolderAudienceSeats.tla[Cross-holder audience seats] checks two holders and two positions of a prepaid turn through placement moves, lost replies and closes, retained I/O, and periodic expiry.
+  On 2026-11-23 TLC 2026.11.19.180144 exhausted 9,522 and 25,252 distinct states in the one- and two-move bounds, rejected nine mutations at their named laws, and reached the concurrent replacement witness.
+  On 2026-11-23 Verus 0.2026.11.20.9da409b verified three shipped decisions in link:verus/audience_cross_holder_claim/area.json[the shared seat claim area] and rejected all six controls at their declared diagnostics.
+  The production correspondence and timing premises are in link:../dev/doc/rtdb-multi-bijection.md[the Bijection integration notes].
 * link:verus/guarded_tail_recovery/area.json[Guarded-tail recovery] imports the Rust decisions called by the Logkeeper writer.
   On 2026-11-23 Verus 0.2026.11.20.9da409b checked 12 items, and all 16 production mutations failed at their declared laws.
   The checked decisions correspond to Bijection's `recoverGuardedTail` and `decideFromSealedProbes`, with post-sync clock samples required to be strictly below the cutoff before counting an original.

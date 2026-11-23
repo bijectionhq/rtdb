@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::{Arc, Mutex, Weak}, time::Duration};
+use std::{pin::Pin, sync::{Arc, Weak}, time::Duration};
 use arrow_flight::{self as flight, flight_service_server::FlightService, sql::{Any, Command, ProstMessageExt, TicketStatementQuery}};
 use bytes::Bytes;
 use futures::Stream;
@@ -7,8 +7,8 @@ use rtdb_auth::Authenticator;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Clock, DatabaseAccess, Node, SessionIdentity};
 use rtdb_storage::cache::CacheBudget;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
@@ -46,7 +46,7 @@ pub(crate) struct AudienceAdmission {
 
 struct AudienceSessionSeat {
     permit: Arc<Semaphore>,
-    original: Mutex<Weak<Session>>,
+    original: tokio::sync::Mutex<Weak<Session>>,
 }
 
 #[derive(Clone, Copy)]
@@ -130,7 +130,7 @@ impl Service {
             Some(AudienceAdmission {
                 calls: Arc::new(Semaphore::new(profile.permits())),
                 seats: (0..profile.session_seats()).map(|_| AudienceSessionSeat {
-                    permit: Arc::new(Semaphore::new(1)), original: Mutex::new(Weak::new()),
+                    permit: Arc::new(Semaphore::new(1)), original: tokio::sync::Mutex::new(Weak::new()),
                 }).collect(),
                 sessions: Registry::new(clock.clone(), memory.clone()),
                 cache,
@@ -295,10 +295,11 @@ impl Service {
             };
             let session = if let Some(((audience, source), requested)) = audience.zip(audience_source).zip(seat) {
                 let slot = &audience.seats[requested.index()];
-                let mut original = slot.original.lock().expect("audience session seat lock");
                 let occupied = || Status::resource_exhausted("The audience reader seat still owns a session");
                 let displaced = || Status::unavailable("The audience Flight writer attachment changed during handshake");
                 let authenticated = placement.as_ref().ok_or_else(displaced)?;
+                self.0.node.confirm_audience_route(authenticated, source).await.map_err(status)?;
+                let mut original = slot.original.try_lock().map_err(|_| occupied())?;
                 let current = catalog.database(authenticated.name()).map_err(|_| displaced())?;
                 let candidate_is_current = Arc::ptr_eq(authenticated, &current);
                 let existing = match original.upgrade() {
@@ -344,8 +345,12 @@ impl Service {
                     },
                     SeatDecision::Mint(permit) => {
                         let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
+                        let claim = self.reserve_audience_seat(Arc::downgrade(authenticated), requested.index(), permit).await?;
+                        if tokio::time::Instant::now() >= expires_at {
+                            return Err(Status::deadline_exceeded("The audience session ceiling elapsed during handshake"));
+                        }
                         let session = mint(Some(AudienceSession { source, seat: requested,
-                            cache: Arc::clone(&audience.cache), expires_at, _permit: permit }))?;
+                            cache: Arc::clone(&audience.cache), expires_at, _claim: claim }))?;
                         *original = Arc::downgrade(&session);
                         session
                     }
@@ -379,6 +384,21 @@ impl Service {
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
         self.publish(); Ok(call)
     }
+    async fn reserve_audience_seat(&self, database: Weak<rtdb_node::Database>, index: usize,
+        permit: OwnedSemaphorePermit) -> Result<DropGuard, Status> {
+        let (ready, acquired) = oneshot::channel();
+        let release = CancellationToken::new();
+        let guard = release.clone().drop_guard();
+        let node = self.0.node.clone();
+        tokio::spawn(async move {
+            // An interrupted handshake still owns the permit until its directory write is resolved.
+            let _permit = permit;
+            node.hold_audience_seat(database, index, ready, release).await;
+        });
+        acquired.await.map_err(|_| cancelled())?.map_err(status)?;
+        Ok(guard)
+    }
+
     pub async fn admit_database(&self, database: &str) -> Result<bool, Status> {
         if self.0.config.playground { self.0.node.database_or_attach(database.into(), Default::default()).await.map(|database| database.is_some()).map_err(status) }
         else { Ok(self.0.node.catalog().database(database).is_ok()) }

@@ -110,7 +110,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let writers: crate::logs::Writers = Default::default();
-    let fence = Arc::new(FenceSlot::default());
+    let fence = Arc::new(FenceSlot { agent: Default::default(), hosted_task: settings.hosted_task.clone() });
     let cache_bytes = settings.configuration.disk_cache.as_ref().and_then(|cache| cache.maximum_bytes).unwrap_or(u64::MAX);
     let fragmenter = crate::fragments::CellFragmenter::new(Arc::clone(&directory), storage_namespaces.objects, &settings.agent.fragments, cache_bytes, settings.capabilities.clone());
     let storage_regions = TaskTracker::new();
@@ -200,7 +200,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
     let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoint, settings.agent, storage_namespaces, writers, ordered, storage_regions.clone(), settings.capabilities.clone());
-    let _ = fence.0.set(Arc::downgrade(&agent));
+    let _ = fence.agent.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -254,31 +254,71 @@ impl RunningNode {
 }
 
 /// The read fence, filled once the agent that answers it exists.
-#[derive(Default)]
-struct FenceSlot(std::sync::OnceLock<std::sync::Weak<NodeAgent>>);
+struct FenceSlot {
+    agent: std::sync::OnceLock<std::sync::Weak<NodeAgent>>,
+    hosted_task: Option<rtdb_directory::HostedTask>,
+}
 
 #[async_trait::async_trait]
 impl rtdb_node::ReadFence for FenceSlot {
     fn hold_active_call(&self, database: &rtdb_node::Database) -> Option<Box<dyn Send + Sync>> {
-        self.0.get()?.upgrade()?.hold_active_call(database)
+        self.agent.get()?.upgrade()?.hold_active_call(database)
     }
 
     async fn confirm(&self, database: &str) -> Result<()> {
-        match self.0.get() {
+        match self.agent.get() {
             Some(agent) => agent.upgrade().ok_or_else(stopped_agent)?.confirm_read(database).await,
             None => Ok(()),
         }
     }
 
     async fn confirm_hosted(&self, database: &rtdb_node::Database) -> Result<String> {
-        let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
+        let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_hosted_read(database).await
     }
 
     async fn confirm_audience(&self, database: &rtdb_node::Database, require_quorum: bool) -> Result<String> {
-        let agent = self.0.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
+        let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
         agent.confirm_audience_read(database, require_quorum).await
     }
+
+    async fn hold_audience_seat(&self, database: std::sync::Weak<rtdb_node::Database>, index: usize,
+        ready: tokio::sync::oneshot::Sender<Result<()>>, release: CancellationToken) {
+        let Some(agent) = self.agent.get().and_then(std::sync::Weak::upgrade) else {
+            let _ = ready.send(Err(stopped_agent()));
+            return;
+        };
+        let prepared = agent.prepare_audience_seat(database, index, self.hosted_task.as_ref()).await;
+        drop(agent);
+        let claim = match prepared {
+            Ok(Some(claim)) if !release.is_cancelled() => claim,
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                let _ = ready.send(Err(audience_seat_unavailable()));
+                return;
+            }
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        };
+        let acquired = claim.acquire().await.and_then(|owned| owned.then_some(()).ok_or_else(audience_seat_unavailable));
+        let owns_seat = acquired.is_ok();
+        if ready.send(acquired).is_ok() && owns_seat {
+            release.cancelled().await;
+        }
+        // The write may have committed after losing its reply. Fence the
+        // claim and its predecessor before returning the local permit.
+        while let Err(error) = claim.release().await {
+            tracing::warn!(%error, index, "Audience seat release will retry");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+fn audience_seat_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/audience-seat-unavailable",
+        "The audience seat is not available at this placement")
 }
 
 fn stopped_agent() -> Anomaly {

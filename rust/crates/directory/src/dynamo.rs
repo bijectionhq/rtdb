@@ -25,12 +25,15 @@ use serde::de::DeserializeOwned;
 
 use crate::{Cas, ChangeFeed, DeploymentRecord, Directory, ForkPublication, ReferenceDisposal, HostedTask, LineageChange, LineageRetirement, LineageState, MemberId, MemberRecord, REFERENCE_REVISION_PREFIX, Version, exists, fork_conflict, fork_parent_id, require_deployment_name, shared_fork_lineage};
 use crate::lineage::{disposal_changed, lineage_busy};
+use crate::{AUDIENCE_SEAT_PREFIX, AudienceSeatClaim, reserved_deployment_name};
+use audience_seat::{SeatCondition, SeatPredecessor, SeatRevision, acquire_condition, claim_predecessor, release_condition};
 use crate::{
     CheckpointTransferActivation, CheckpointTransferBootstrap, CheckpointTransferFence, CheckpointTransferReplica, CheckpointTransferSelection, CheckpointTransferTerminal, ForkPreparation, fork_stage_changed,
     fork_stage_version, prepare_checkpoint_transfer, prepare_checkpoint_transfer_activation, prepare_checkpoint_transfer_bootstrap, prepare_checkpoint_transfer_replica, prepare_checkpoint_transfer_terminal, require_fork_stage_update,
     require_transfer_update, stage_hosted_fork_record, transfer_changed,
 };
 
+mod audience_seat;
 mod parked;
 mod streams;
 
@@ -230,6 +233,86 @@ impl DynamoDirectory {
     }
 }
 
+const SEAT_REVISION: &str = "seat_revision";
+const SEAT_CHARGED: &str = "seat_charged";
+
+struct DynamoAudienceSeat {
+    client: Client,
+    names: String,
+    deployment: ConditionCheck,
+    name: String,
+    predecessor: SeatPredecessor,
+    claimed: u128,
+    released: u128,
+    task: Option<HostedTask>,
+}
+
+impl DynamoAudienceSeat {
+    fn write(&self, condition: &SeatCondition, revision: u128, charged: bool) -> Result<Put> {
+        let value = |revision| AttributeValue::S(uuid::Uuid::from_u128(revision).to_string());
+        let mut item = Item::from([
+            (NAME.to_owned(), AttributeValue::S(self.name.clone())),
+            (SEAT_REVISION.to_owned(), value(revision)),
+            (SEAT_CHARGED.to_owned(), AttributeValue::Bool(charged)),
+        ]);
+        if let Some(task) = self.task.as_ref().filter(|_| charged) {
+            item.insert(RECORD.to_owned(), blob(task)?);
+        }
+        let put = Put::builder().table_name(&self.names).set_item(Some(item));
+        let put = match *condition {
+            SeatCondition::Missing => put.condition_expression("attribute_not_exists(#name)")
+                .expression_attribute_names("#name", NAME),
+            SeatCondition::Exact(revision) => put.condition_expression("#revision = :prior")
+                .expression_attribute_names("#revision", SEAT_REVISION).expression_attribute_values(":prior", value(revision)),
+            SeatCondition::MissingOr(claimed) => put.condition_expression("attribute_not_exists(#name) OR #revision = :claim")
+                .expression_attribute_names("#name", NAME).expression_attribute_names("#revision", SEAT_REVISION)
+                .expression_attribute_values(":claim", value(claimed)),
+            SeatCondition::Either(prior, claimed) => put.condition_expression("#revision IN (:prior, :claim)")
+                .expression_attribute_names("#revision", SEAT_REVISION)
+                .expression_attribute_values(":prior", value(prior)).expression_attribute_values(":claim", value(claimed)),
+        };
+        put.build().map_err(build_fault)
+    }
+}
+
+#[async_trait]
+impl AudienceSeatClaim for DynamoAudienceSeat {
+    async fn acquire(&self) -> Result<bool> {
+        let condition = acquire_condition(&self.predecessor);
+        let put = self.write(&condition, self.claimed, true)?;
+        let placement = TransactWriteItem::builder().condition_check(self.deployment.clone()).build();
+        let seat = TransactWriteItem::builder().put(put).build();
+        write_conditional_transaction(&self.client, vec![placement, seat]).await
+    }
+
+    async fn release(&self) -> Result<()> {
+        let condition = release_condition(&self.predecessor, self.claimed);
+        let put = self.write(&condition, self.released, false)?;
+        let request = self.client.put_item().table_name(&self.names).set_item(Some(put.item))
+            .set_condition_expression(put.condition_expression)
+            .set_expression_attribute_names(put.expression_attribute_names)
+            .set_expression_attribute_values(put.expression_attribute_values);
+        match request.send().await {
+            Ok(_) => Ok(()),
+            Err(error) if error.as_service_error().is_some_and(|error| error.is_conditional_check_failed_exception()) => Ok(()),
+            Err(error) => Err(sdk_anomaly("PutItem", error)),
+        }
+    }
+}
+
+async fn write_conditional_transaction(client: &Client, items: Vec<TransactWriteItem>) -> Result<bool> {
+    use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+    match client.transact_write_items().set_transact_items(Some(items)).send().await {
+        Ok(_) => Ok(true),
+        Err(error) => match error.as_service_error() {
+            Some(TransactWriteItemsError::TransactionCanceledException(refusal))
+                if refusal.cancellation_reasons().iter().any(|reason|
+                    matches!(reason.code(), Some("ConditionalCheckFailed" | "TransactionConflict"))) => Ok(false),
+            _ => Err(sdk_anomaly("TransactWriteItems", error)),
+        },
+    }
+}
+
 async fn scan_items(client: &Client, table: &str) -> Result<Vec<Item>> {
     let mut pages = client.scan().table_name(table).consistent_read(true).into_paginator().send();
     let mut items = Vec::new();
@@ -387,16 +470,7 @@ impl DynamoDirectory {
     }
 
     async fn write_retirement(&self, items: Vec<TransactWriteItem>) -> Result<bool> {
-        use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-        match self.client.transact_write_items().set_transact_items(Some(items)).send().await {
-            Ok(_) => Ok(true),
-            Err(error) => match error.as_service_error() {
-                Some(TransactWriteItemsError::TransactionCanceledException(refusal))
-                    if refusal.cancellation_reasons().iter().any(|reason|
-                        matches!(reason.code(), Some("ConditionalCheckFailed" | "TransactionConflict"))) => Ok(false),
-                _ => Err(sdk_anomaly("TransactWriteItems", error)),
-            },
-        }
+        write_conditional_transaction(&self.client, items).await
     }
 
     async fn write_owner_and_lineage(&self, record: DeploymentRecord, expected: Version,
@@ -609,12 +683,52 @@ impl Directory for DynamoDirectory {
         Ok(record.zip(member))
     }
 
+    async fn prepare_audience_seat(&self, source: uuid::Uuid, index: usize, member: &MemberId,
+        epoch: u64, task: Option<&HostedTask>) -> Result<Option<Box<dyn AudienceSeatClaim>>> {
+        let name = format!("{AUDIENCE_SEAT_PREFIX}{source}/{index}");
+        let revision = match self.get(&self.tables.deployment_names, NAME, &name).await? {
+            None => SeatRevision::Missing,
+            Some(item) => {
+                let revision = uuid::Uuid::parse_str(string_attribute(&item, SEAT_REVISION)?)
+                    .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-revision", error.to_string()))?.as_u128();
+                match item.get(SEAT_CHARGED) {
+                    Some(AttributeValue::Bool(false)) => SeatRevision::Free(revision),
+                    Some(AttributeValue::Bool(true)) => {
+                        let stopped = match item.get(RECORD) {
+                            Some(AttributeValue::S(record)) => {
+                                let owner: HostedTask = serde_json::from_str(record)
+                                    .map_err(|error| Anomaly::fault("rtdb.directory/audience-seat-owner", error.to_string()))?;
+                                self.hosted_task_stopped(&owner).await?
+                            }
+                            None => false,
+                            _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-owner", "Invalid audience seat owner")),
+                        };
+                        SeatRevision::Charged { revision, stopped }
+                    }
+                    _ => return Err(Anomaly::fault("rtdb.directory/audience-seat-state", "Invalid audience seat state")),
+                }
+            }
+        };
+        let Some(predecessor) = claim_predecessor(revision) else { return Ok(None); };
+        let deployment = ConditionCheck::builder().table_name(&self.tables.deployments)
+            .key(ID, AttributeValue::S(source.to_string()))
+            .condition_expression("#holder = :holder AND #epoch = :epoch")
+            .expression_attribute_names("#holder", HOLDER).expression_attribute_names("#epoch", EPOCH)
+            .expression_attribute_values(":holder", AttributeValue::S(member.as_str().to_owned()))
+            .expression_attribute_values(":epoch", number(epoch))
+            .build().map_err(build_fault)?;
+        Ok(Some(Box::new(DynamoAudienceSeat {
+            client: self.client.clone(), names: self.tables.deployment_names.clone(), deployment, name, predecessor,
+            claimed: uuid::Uuid::new_v4().as_u128(), released: uuid::Uuid::new_v4().as_u128(), task: task.cloned(),
+        })))
+    }
+
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {
         self.get(&self.tables.deployments, ID, id).await?.as_ref().map(decode_deployment).transpose()
     }
 
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>> {
-        if name.starts_with(REFERENCE_REVISION_PREFIX) { return Ok(None); }
+        if reserved_deployment_name(name) { return Ok(None); }
         let Some(named) = self.get(&self.tables.deployment_names, NAME, name).await? else { return Ok(None) };
         self.deployment(string_attribute(&named, ID)?).await
     }

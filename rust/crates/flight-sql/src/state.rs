@@ -4,8 +4,7 @@ use rtdb_auth::Principal;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Database, NativeSession, Node};
 use rtdb_storage::cache::CacheBudget;
-use tokio::sync::OwnedSemaphorePermit;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::Status;
 use uuid::Uuid;
 use crate::{error::status, lease::Leased, owned_actions::OwnedReadResource, wire::BoundParameters};
@@ -55,7 +54,7 @@ pub(crate) struct AudienceSession {
     pub seat: crate::AudienceSeat,
     pub cache: Arc<CacheBudget>,
     pub expires_at: tokio::time::Instant,
-    pub _permit: OwnedSemaphorePermit,
+    pub _claim: DropGuard,
 }
 
 pub(crate) struct Session {
@@ -64,7 +63,7 @@ pub(crate) struct Session {
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
-    // Drop the seat permit after the registered session state and its charge.
+    // Release the directory claim after the registered session state and its charge.
     audience: Option<AudienceSession>,
 }
 impl Session {

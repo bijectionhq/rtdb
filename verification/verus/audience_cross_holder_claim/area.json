@@ -1,0 +1,119 @@
+{
+  "summary": "The shared Flight seat claim pins its exact free or stopped predecessor, and cancellation fences a pending write before or after it commits.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production"
+  ],
+  "min_verified_functions": 3,
+  "controls": {
+    "claim_running_owner": {
+      "defect": "A charged seat can be claimed without proof its former task has stopped.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "find": "SeatRevision::Charged { stopped: false, .. } => None,",
+          "replace": "SeatRevision::Charged { revision, stopped: false } => Some(SeatPredecessor::Exact(revision)),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "function": "claim_predecessor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "forget_predecessor": {
+      "defect": "A free revision is replaced using the predicate for a missing row.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "find": "            Some(SeatPredecessor::Exact(version)),\n        SeatRevision::Charged { stopped: false",
+          "replace": "            Some(SeatPredecessor::Missing),\n        SeatRevision::Charged { stopped: false"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "function": "claim_predecessor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "refuse_missing_row": {
+      "defect": "A seat with no previous claims is unavailable.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "find": "SeatRevision::Missing => Some(SeatPredecessor::Missing),\n        SeatRevision::Free(version) | SeatRevision::Charged { revision",
+          "replace": "SeatRevision::Missing => None,\n        SeatRevision::Free(version) | SeatRevision::Charged { revision"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "function": "claim_predecessor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "cancel_misses_unstarted_claim": {
+      "defect": "Canceling a pending first claim leaves the missing row eligible for its delayed write.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "find": "        SeatPredecessor::Missing => SeatCondition::MissingOr(claimed),\n        SeatPredecessor::Exact(version) => SeatCondition::Either(version, claimed),\n    }\n}",
+          "replace": "        SeatPredecessor::Missing => SeatCondition::Exact(claimed),\n        SeatPredecessor::Exact(version) => SeatCondition::Either(version, claimed),\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "function": "release_condition",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "cancel_misses_committed_claim": {
+      "defect": "Canceling a pending replacement cannot clear its write if it has already committed.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "find": "        SeatPredecessor::Exact(version) => SeatCondition::Either(version, claimed),\n    }\n}",
+          "replace": "        SeatPredecessor::Exact(version) => SeatCondition::Exact(version),\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "function": "release_condition",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "acquire_wrong_revision": {
+      "defect": "Acquisition permits a different revision than the one read.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "find": "        SeatPredecessor::Exact(version) => SeatCondition::Exact(version),\n    }\n}",
+          "replace": "        SeatPredecessor::Exact(version) => SeatCondition::Exact(version ^ 1),\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/directory/src/dynamo/audience_seat.rs",
+          "function": "acquire_condition",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    }
+  }
+}
