@@ -177,6 +177,16 @@ pub(crate) struct BoundArguments {
 /// Foreign buffers are copied into native Arrow allocations before returning, including on zero-row binds.
 /// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
 pub(crate) unsafe fn import_arguments(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<BoundArguments> {
+    unsafe { import_arguments_with_lifetime(array, schema, memory, false) }
+}
+
+pub(crate) unsafe fn import_retained_arguments(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<BoundArguments> {
+    unsafe { import_arguments_with_lifetime(array, schema, memory, true) }
+}
+
+unsafe fn import_arguments_with_lifetime(
+    array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>, retain: bool,
+) -> Result<BoundArguments> {
     if array.release.is_none() || schema.release.is_none() { return Err(super::invalid("Arrow bind inputs have already been released")); }
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
@@ -202,16 +212,22 @@ pub(crate) unsafe fn import_arguments(array: &mut FFI_ArrowArray, schema: &mut F
         rtdb_columnar::validate_readable_column(field, column.as_ref(), &logical, memory)?;
     }
     let names = fields.fields().iter().map(|field| field.name().clone()).collect();
-    let bound = super::add(4096, super::mul(array.get_array_memory_size(), 4)?)?;
-    let mut reservation = memory.reserve(bound)?;
-    let columns = array.columns().iter().map(|column| {
-        copy_foreign_data(column.to_data()).map(make_array)
-    }).collect::<Result<Vec<_>>>()?;
     let options = RecordBatchOptions::new().with_row_count(Some(array.len()));
+    let fields = Arc::new(fields);
+    let batch = if retain {
+        let batch = RecordBatch::try_new_with_options(fields, array.columns().to_vec(), &options).map_err(arrow_error)?;
+        OwnedBatch::new(batch, memory)?
+    } else {
+        let bound = super::add(4096, super::mul(array.get_array_memory_size(), 4)?)?;
+        let mut reservation = memory.reserve(bound)?;
+        let columns = array.columns().iter().map(|column| copy_foreign_data(column.to_data()).map(make_array))
+            .collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new_with_options(fields, columns, &options).map_err(arrow_error)?;
+        Arc::get_mut(&mut reservation).expect("Arrow import owns its reservation").shrink_to(batch.get_array_memory_size())?;
+        OwnedBatch::with_reservation(batch, reservation)?
+    };
     drop(array);
-    let batch = RecordBatch::try_new_with_options(Arc::new(fields), columns, &options).map_err(arrow_error)?;
-    Arc::get_mut(&mut reservation).expect("Arrow import owns its reservation").shrink_to(batch.get_array_memory_size())?;
-    let arguments = SqlArguments::from_arrow_with_canonical_source(OwnedBatch::with_reservation(batch, reservation)?, memory)?;
+    let arguments = SqlArguments::from_arrow_with_canonical_source(batch, memory)?;
     Ok(BoundArguments { arguments, names, _reservation: schema_charge })
 }
 

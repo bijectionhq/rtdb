@@ -245,7 +245,7 @@ impl CapacityPolicy {
         }
         let rules = rules
             .iter()
-            .map(CapacityRule::decode)
+            .map(|value| CapacityRule::decode(value.as_ref()))
             .collect::<Result<Vec<_>>>()?;
         if rules
             .windows(2)

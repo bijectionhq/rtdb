@@ -111,7 +111,11 @@ pub fn from_transit(value: rtdb_format::transit::TransitValue) -> Result<Value> 
 fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     Ok(match value {
-        T::Null => Value::Null, T::Bool(value) => Value::Bool(value), T::Integer(value) => Value::I64(value), T::Float(value) => Value::F64(value), T::String(value) => Value::Utf8(value), T::Keyword(value) => Value::Keyword(rtdb_types::Keyword::from_name(&value)), T::Bytes(value) => Value::Binary(value), T::Array(values) => Value::list(values.into_iter().map(transit).collect::<Result<_>>()?),
+        T::Null => Value::Null, T::Bool(value) => Value::Bool(value), T::Integer(value) => Value::I64(value), T::Float(value) => Value::F64(value), T::String(value) => Value::Utf8(value), T::Keyword(value) => Value::Keyword(rtdb_types::Keyword::from_name(&value)), T::Bytes(value) => Value::Binary(value), T::Array(values) => {
+            let mut list = rtdb_types::ListBuilder::with_capacity(values.len());
+            for value in values { list.push(transit(value)?); }
+            Value::List(list.finish())
+        },
         T::Float32(value) => Value::F64(f64::from(value)),
         T::Map(entries) => {
             let mut fields = StructFields::new();

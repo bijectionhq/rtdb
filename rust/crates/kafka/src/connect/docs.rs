@@ -74,6 +74,7 @@ fn convert_document(value: Value) -> Result<Value> {
             for (key, value) in entries { fields.insert(map_key(key)?, convert_document(value)?); }
             Value::Struct(fields)
         }
+        Value::List(values) if values.array().is_some() => Value::List(values),
         Value::List(values) => Value::list(values.into_values().into_iter().map(convert_document).collect::<Result<_>>()?),
         Value::Timestamp { value, unit: rtdb_types::TimeUnit::Millisecond, timezone } => Value::Timestamp {
             value: value.checked_mul(1000).ok_or_else(|| error("conversion-error", "Timestamp exceeds the document writer's microsecond range"))?, unit: rtdb_types::TimeUnit::Microsecond, timezone,
@@ -109,6 +110,11 @@ fn convert_schema_value(value: Value, schema: Option<&super::ConnectSchema>, dep
             }
             Ok(Value::Struct(result))
         }
+        (Value::List(values), Some(SchemaKind::Array(element)))
+            if depth < 128 && values.array().is_some()
+                && !matches!(element.resolved().name.as_deref(),
+                    Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp"))
+            => Ok(Value::List(values)),
         (Value::List(values), Some(SchemaKind::Array(element))) => Ok(Value::list(values.into_values().into_iter().map(|value| convert_schema_value(value, Some(element), depth + 1)).collect::<Result<_>>()?)),
         (Value::Map { entries, .. }, Some(SchemaKind::Map(_, value_schema))) => {
             let mut result = StructFields::new();

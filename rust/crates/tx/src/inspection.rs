@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray, UnionArray};
 use arrow_schema::{DataType, Field};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field, leg_name, read_value};
-use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
+use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, Value};
 
 pub enum OperationValue {
     Scalar(Value),
@@ -61,7 +61,16 @@ fn cell(field: &Field, array: &dyn Array, row: usize) -> Result<OperationValue> 
         }
         DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
             let logical = from_field(field)?;
-            if logical.legs().iter().any(|ty| matches!(ty, LogicalType::List { kind: ListKind::TimestampTzRange, .. })) { OperationValue::Scalar(read_value(field, array, row)?) }
+            let packed = logical.legs().iter().any(|ty| matches!(ty, LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), .. }))
+                && ListValue::supports_numeric_arrow(child)
+                && match child.data_type() {
+                    DataType::Union(fields, _) => fields.iter().all(|(_, field)| from_field(field).and_then(|ty| leg_name(&ty))
+                        .is_ok_and(|name| name == field.name().as_str())),
+                    _ => true,
+                };
+            if packed || logical.legs().iter().any(|ty| matches!(ty, LogicalType::List { kind: ListKind::TimestampTzRange, .. })) {
+                OperationValue::Scalar(read_value(field, array, row)?)
+            }
             else {
                 let values = if let Some(array) = array.as_any().downcast_ref::<ListArray>() { array.value(row) }
                     else if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() { array.value(row) }

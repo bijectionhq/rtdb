@@ -32,7 +32,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 if ids.len() != bodies.len() {
                     return Err(invalid_documents());
                 }
-                let (rtdb_types::ListView::Values(ids), rtdb_types::ListView::Values(bodies)) = (ids.view(), bodies.view()) else {
+                let (Some(ids), Some(bodies)) = (ids.scalar_values(), bodies.scalar_values()) else {
                     return Err(invalid_documents());
                 };
                 let pairs = ids.iter().zip(bodies).map(|(id, body)| match (id, body) {

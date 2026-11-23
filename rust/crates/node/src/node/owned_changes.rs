@@ -488,7 +488,7 @@ impl OwnedReadSession {
                 let charge = self.context.memory.reserve(retained)?;
                 let touches = touches
                     .iter()
-                    .map(OwnedChange::from_value)
+                    .map(|value| OwnedChange::from_value(value.as_ref()))
                     .collect::<Result<Vec<_>>>()?;
                 let sequence =
                     u64::try_from(journal.revision).map_err(|_| change_feed_uncovered())?;
@@ -942,8 +942,8 @@ async fn read_versions_at_cut(
                 return Err(change_feed_uncovered());
             }
             let mut touched = false;
-            for touch in &touches {
-                touched |= &OwnedChange::from_value(touch)?.id == id;
+            for touch in touches.iter() {
+                touched |= &OwnedChange::from_value(touch.as_ref())?.id == id;
             }
             let revision = u64::try_from(current).map_err(|_| change_feed_uncovered())?;
             if touched {

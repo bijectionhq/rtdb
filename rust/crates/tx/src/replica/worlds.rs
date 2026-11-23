@@ -211,7 +211,7 @@ pub(super) fn verify(
         } else if kind == Kind::RootRetainedDrop {
             hosted = HostedEffects::RetainedWrite;
         }
-        for relation in relations {
+        for relation in relations.scalar_values().ok_or_else(mismatch)? {
             let Value::Utf8(name) = relation else { return Err(mismatch()); };
             let relation = OwnedRelation::from_source(name.clone()).map_err(|_| mismatch())?;
             if relation.is_world_catalog() || matches!(name.as_str(), OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION)

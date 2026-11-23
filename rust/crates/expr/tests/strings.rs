@@ -78,7 +78,7 @@ fn test_cast_any_to_text_retains_original_collections_binary_and_uri_assertions(
 fn reader_text_keeps_nested_extension_and_transit_forms() {
     let decimal = V::Decimal(rtdb_types::DecimalValue::new(123i128.to_be_bytes().to_vec(), 3, 2, 128).unwrap());
     assert_eq!(call("str", &[decimal.clone()]), text("1.23"));
-    assert_eq!(call("str", &[V::List(vec![decimal, V::Keyword(rtdb_types::Keyword::from_name("foo/bar")), V::Uuid([0; 16]), V::Uri("https://example.org/é".into())])]),
+    assert_eq!(call("str", &[V::list(vec![decimal, V::Keyword(rtdb_types::Keyword::from_name("foo/bar")), V::Uuid([0; 16]), V::Uri("https://example.org/é".into())])]),
         text("[1.23M :foo/bar #uuid \"00000000-0000-0000-0000-000000000000\" #xt/uri \"https://example.org/%C3%A9\"]"));
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     let value = V::Transit(encode_msgpack(&T::Array(vec![T::Keyword("x".into()), T::String("hello".into())])).unwrap());
@@ -112,7 +112,7 @@ fn temporal_text_casts_keep_java_spelling_and_format_reads_primitive_units() {
     use rtdb_types::TimeUnit as U;
     assert_eq!(call("str", &[V::DateMilli(-1)]), text("1969-12-31"));
     assert_eq!(call("str", &[V::DateMilli(-86_400_001)]), text("1969-12-30"));
-    assert_eq!(call("str", &[V::List(vec![V::DateMilli(-1)])]), text("[#time/date \"1969-12-31\"]"));
+    assert_eq!(call("str", &[V::list(vec![V::DateMilli(-1)])]), text("[#time/date \"1969-12-31\"]"));
     assert_eq!(call("str", &[V::Timestamp { value: 1, unit: U::Nanosecond, timezone: None }]), text("1970-01-01T00:00:00.000000001"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("UTC".into()) }]), text("1970-01-01T00:00Z[UTC]"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("+02:30".into()) }]), text("1970-01-01T02:30+02:30"));

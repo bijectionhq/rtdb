@@ -132,6 +132,12 @@ int32_t rtdb_v1_statement_new(RtdbHandle session, const uint8_t *source, size_t 
 int32_t rtdb_v1_statement_set_sql(RtdbHandle statement, const uint8_t *source, size_t length, RtdbHandle *error);
 int32_t rtdb_v1_statement_prepare(RtdbHandle statement, RtdbHandle operation, RtdbHandle *error);
 int32_t rtdb_v1_statement_bind(RtdbHandle statement, struct ArrowArray *array, struct ArrowSchema *schema, RtdbHandle *error);
+/* Retained C Data bind extends the lifetime of the input Arrow buffers.
+ * The producer must keep the buffers immutable until release and allow release
+ * from any thread. Release can follow statement replacement and cursor closure.
+ * The input structs are moved on the same terms as rtdb_v1_statement_bind.
+ */
+int32_t rtdb_v1_statement_bind_retained(RtdbHandle statement, struct ArrowArray *array, struct ArrowSchema *schema, RtdbHandle *error);
 int32_t rtdb_v1_statement_bind_transit(RtdbHandle statement, const uint8_t *msgpack_rows, size_t length, RtdbHandle *error);
 
 /* Arrow output structs must be zero-initialized or released.

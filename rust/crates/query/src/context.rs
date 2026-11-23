@@ -376,14 +376,6 @@ impl rtdb_expr::ParameterLookup for ExpressionInputs<'_> {
 }
 
 impl Execution {
-    pub fn with_scalar_parameters(&self) -> Result<Self> {
-        let mut execution = self.clone();
-        if let Some(parameters) = self.parameters.materialize(&self.context.memory)? {
-            execution.parameters = Arc::new(parameters);
-        }
-        Ok(execution)
-    }
-
     pub async fn bind_arguments(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: Arc<crate::cursor::OwnedRow>) -> Result<Self> {
         self.bind_outer(arguments, schema, OuterInput::Values(row)).await
     }

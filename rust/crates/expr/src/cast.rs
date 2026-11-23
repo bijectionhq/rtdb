@@ -312,7 +312,11 @@ pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str
                 Value::Utf8(text) => { parsed = pg_array_text(text)?; rtdb_types::ListView::Values(&parsed) }
                 _ => return Err(inapplicable("list", &[value])),
             };
-            Ok(Value::list(values.iter().map(|value| cast_target(value.as_ref(), element, timezone)).collect::<Result<_>>()?))
+            let mut output = rtdb_types::ListBuilder::with_capacity(values.len());
+            for value in values.iter() {
+                output.push(cast_target(value.as_ref(), element, timezone)?);
+            }
+            Ok(Value::List(output.finish()))
         }
     }
 }

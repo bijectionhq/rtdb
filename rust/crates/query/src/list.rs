@@ -51,7 +51,14 @@ impl crate::columnar::BatchCursor for ListCursor {
         let values = batch.values();
         let memory = &self.context.memory;
         let mut output = crate::columnar::ColumnBatch::settled(Vec::new(), values.len(), memory.reserve(256)?)?;
-        let (column, charge) = crate::columnar::pack_evaluated_column(values, memory)?;
+        let (column, charge) = if let Some((field, array)) = values.packed_column() {
+            let charge = memory.reserve(array.get_array_memory_size().checked_add(field.size())
+                .ok_or_else(|| invalid("column-size", "List column exceeds addressable memory"))?)?;
+            let field = Arc::new(field.as_ref().clone().with_name("value"));
+            (crate::columnar::Column::Arrow { array, field, logical: None }, charge)
+        } else {
+            crate::columnar::pack_evaluated_column(values.scalar_values().expect("unpacked list"), memory)?
+        };
         output.append_column(column, charge, memory)?;
         Ok(Some(output))
     }
@@ -65,9 +72,9 @@ impl PageCursor for ListCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         let Some(batch) = self.next_list_batch().await? else { return Ok(None); };
         let mut page = PageBuilder::new(batch.values().len(), &self.context.memory)?;
-        for value in batch.values() {
+        for value in batch.values().iter() {
             self.context.check_cancelled()?;
-            page.push(OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &self.context.memory)?)?;
+            page.push(OwnedRow::copy_parts(&[std::slice::from_ref(value.as_ref())], 0, 0, &self.context.memory)?)?;
         }
         Ok(Some(page.finish()))
     }

@@ -8,7 +8,7 @@ pub fn allocation_bound(value: &Value) -> Result<usize> {
     let extra = match value {
         Value::Uri(text) => rtdb_types::UriParts::parse(text)?.ascii_allocation_bound()?,
         Value::Transit(bytes) => bytes.len().checked_mul(bytes.len()).and_then(|bytes| bytes.checked_mul(16)).ok_or_else(overflow)?,
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
+        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => value.list_view().unwrap().iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value.as_ref())?).ok_or_else(overflow))?,
         Value::Struct(fields) => fields.values().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
         Value::Map { entries, .. } => entries.iter().try_fold(0usize, |bytes, (key, value)| bytes.checked_add(allocation_bound(key)?).and_then(|bytes| bytes.checked_add(allocation_bound(value).ok()?)).ok_or_else(overflow))?,
         _ => 0,

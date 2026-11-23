@@ -81,6 +81,16 @@ pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str, allocati
             let (left, right) = (left.list_view().unwrap(), right.list_view().unwrap());
             if left.len() != right.len() { return Ok(Some(false)); }
             let mut unknown = false;
+            if left.is_float() && right.is_float() {
+                for index in 0..left.len() {
+                    match (left.float_component(index), right.float_component(index)) {
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(_), Some(_)) => return Ok(Some(false)),
+                        _ => unknown = true,
+                    }
+                }
+                return Ok(if unknown { None } else { Some(true) });
+            }
             for (a, b) in left.iter().zip(right.iter()) { match sql_eq_value(a.as_ref(), b.as_ref(), timezone, allocation)? { Some(false) => return Ok(Some(false)), None => unknown = true, _ => () } }
             Ok(if unknown { None } else { Some(true) })
         }
@@ -195,6 +205,9 @@ pub(crate) fn strict_eq_scoped(left: &Value, right: &Value, allocation: Option<&
         (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) => {
             let (a, b) = (left.list_view().unwrap(), right.list_view().unwrap());
             if a.len() != b.len() { return Ok(false); }
+            if a.is_float() && b.is_float() {
+                return Ok((0..a.len()).all(|index| a.float_component(index) == b.float_component(index)));
+            }
             for (a, b) in a.iter().zip(b.iter()) { if !strict_eq_scoped(a.as_ref(), b.as_ref(), allocation)? { return Ok(false); } }
             Ok(true)
         }
@@ -291,6 +304,21 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
         (Value::Duration { .. }, Value::Duration { .. }) | (Value::Time { .. }, Value::Time { .. }) => temporal_order(left, right, timezone),
         (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) => {
             let (a, b) = (left.list_view().unwrap(), right.list_view().unwrap());
+            if a.is_float() && b.is_float() {
+                let null_first = if nulls_first { Ordering::Less } else { Ordering::Greater };
+                for index in 0..a.len().min(b.len()) {
+                    let order = match (a.float_component(index), b.float_component(index)) {
+                        (Some(left), Some(right)) if left.is_nan() => if right.is_nan() { Ordering::Equal } else { Ordering::Greater },
+                        (Some(_), Some(right)) if right.is_nan() => Ordering::Less,
+                        (Some(left), Some(right)) => left.total_cmp(&right),
+                        (None, Some(_)) => null_first,
+                        (Some(_), None) => null_first.reverse(),
+                        (None, None) => Ordering::Equal,
+                    };
+                    if order != Ordering::Equal { return Ok(order); }
+                }
+                return Ok(a.len().cmp(&b.len()));
+            }
             for (a, b) in a.iter().zip(b.iter()) { let order = compare_in_timezone(a.as_ref(), b.as_ref(), nulls_first, timezone)?; if order != Ordering::Equal { return Ok(order); } }
             Ok(a.len().cmp(&b.len()))
         }

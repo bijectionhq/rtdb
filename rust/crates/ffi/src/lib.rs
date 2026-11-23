@@ -265,6 +265,15 @@ pub unsafe extern "C" fn rtdb_v1_statement_bind(handle: u64, array: *mut FFI_Arr
     }) }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_statement_bind_retained(handle: u64, array: *mut FFI_ArrowArray, schema: *mut FFI_ArrowSchema, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let statement = handles::statement(handle)?;
+        let _admitted = statement.session.region.enter()?;
+        let arguments = arrow::import_retained_arguments(output(array)?, output(schema)?, statement.session.region.memory())?;
+        statement.bind(arguments)
+    }) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_bind_transit(handle: u64, input: *const u8, length: usize, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let statement = handles::statement(handle)?; let _admitted = statement.session.region.enter()?;

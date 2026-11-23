@@ -57,6 +57,9 @@ Array buffers and release-callback metadata retain their reservations independen
 Each child release owner carries the lease, including when a consumer moves a child out of a parent array.
 Bind imports consume valid Arrow structs and copy values into native ownership before returning.
 The caller may then close its original vectors and allocator.
+Immutable producers can call `rtdb_v1_statement_bind_retained` to transfer the C Data buffers without a snapshot copy.
+Those buffers must stay immutable and the producer must support release callbacks on any thread until the last native batch drops.
+The Java ADBC adapter exports through the allocator of the supplied vectors and normalizes batches whose columns belong to different allocator roots.
 Decimal C formats carry true signed 32-bit precision and scale for all four coefficient widths.
 Native carrier metadata is absent from exports and rejected on imports.
 Replacement C format strings share each schema child's retained release owner, so moving a child out of its parent preserves both its format and reservation.

@@ -99,7 +99,7 @@ impl Service {
         };
         let basis_bytes = basis.snapshot.databases.iter().try_fold(8192usize, |size, (database, times)| wire::add(size, wire::add(wire::mul(database.len(), 8)?, wire::mul(times.len(), 128)?)?))?;
         let params = params.as_ref().map(|params| wire::parameter_ipc(params.batch(), self.memory())).transpose()?.flatten();
-        let _ticket = self.memory().reserve(wire::add(basis_bytes, wire::mul(wire::add(source.len(), params.as_ref().map_or(0, Bytes::len))?, 8)?)?).map_err(status)?;
+        let _ticket = self.memory().reserve(wire::add(basis_bytes, wire::mul(source.len(), 2)?)?).map_err(status)?;
         let ticket = Ticket::run(native.state().database().into(), source.into(), params, &basis)?.encode(self.memory())?;
         Ok((schema, query_ticket(ticket, self.memory())?))
     }

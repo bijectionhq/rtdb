@@ -19,6 +19,9 @@ impl RetainedBytes {
         Ok(Self { data: Arc::new(data), _reservation: reservation })
     }
     pub fn as_slice(&self) -> &[u8] { &self.data }
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Arc<MemoryReservation>) {
+        (Arc::unwrap_or_clone(self.data), self._reservation)
+    }
     pub fn into_bytes(self) -> bytes::Bytes { bytes::Bytes::from_owner(self) }
     pub fn with_reservation(data: Vec<u8>, reservation: Arc<MemoryReservation>) -> Result<Self> {
         if data.capacity() > reservation.bytes() { return Err(Anomaly::fault("rtdb.tx/byte-reservation", "Encoded payload exceeds its reservation")); }

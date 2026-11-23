@@ -77,7 +77,7 @@ impl ResolveContext {
     }
 }
 
-pub struct OwnedReplicaBody { body: ReplicaBody, _reservation: Arc<MemoryReservation> }
+pub struct OwnedReplicaBody { body: ReplicaBody, _reservation: Arc<MemoryReservation>, _table_reservations: Vec<Arc<MemoryReservation>> }
 impl OwnedReplicaBody {
     pub fn body(&self) -> &ReplicaBody { &self.body }
     fn acceptance_stage(&self) -> Option<&AcceptanceStage> {
@@ -161,13 +161,16 @@ impl ResolvedTx {
 
     fn encode_replica_body(&self, memory: &Arc<MemoryBudget>, acceptance_stage: Option<AcceptanceStage>) -> Result<OwnedReplicaBody> {
         let mut tables = Vec::new();
+        let mut table_reservations = Vec::new();
         let mut bound = 65_536usize.checked_add(db_op_bytes(self.db_op.as_ref())?).ok_or_else(overflow)?;
         for (table, write) in self.writes.tables() {
             let batch = write.batch().ok_or_else(|| Anomaly::fault("rtdb.tx/missing-table-batch", "Resolved table declaration has no Arrow batch"))?;
             let bytes = crate::ipc::encode(batch.arrow().schema().as_ref(), [batch.arrow()], memory)?;
             let name = format!("{}/{}", table.schema, table.table);
-            bound = bound.checked_add(bytes.as_slice().len()).and_then(|bound| bound.checked_add(name.capacity())).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
+            bound = bound.checked_add(name.capacity()).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
+            let (bytes, reservation) = bytes.into_parts();
             tables.push((name, bytes));
+            table_reservations.push(reservation);
         }
         let error = self.result.encoded_error()?;
         bound = bound.checked_add(error.as_ref().map_or(0, |error| error.as_slice().len())).and_then(|bound| bound.checked_add(self.external_token.as_ref().map_or(0, Vec::capacity))).ok_or_else(overflow)?;
@@ -179,11 +182,11 @@ impl ResolvedTx {
         };
         let body = ReplicaBody::ResolvedTx(WireResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
-            table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),
+            table_data: tables.into_iter().collect(),
             db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position().0),
             placed_attempt, acceptance_stage,
         });
-        Ok(OwnedReplicaBody { body, _reservation: reservation })
+        Ok(OwnedReplicaBody { body, _reservation: reservation, _table_reservations: table_reservations })
     }
 }
 
@@ -1222,7 +1225,7 @@ impl<'a> OpenTransaction<'a> {
                         if !matches_text("_id", name.name())? || !matches_text("schema_name", &target.schema)?
                             || !matches_text("table_name", &target.table)?
                             || stored_columns.len() != columns.len()
-                            || !stored_columns.iter().zip(columns).all(|(value, expected)| matches!(value, Value::Utf8(column) if column == expected))
+                            || !stored_columns.iter().zip(columns).all(|(value, expected)| matches!(value.as_ref(), Value::Utf8(column) if column == expected))
                         {
                             return Err(different());
                         }

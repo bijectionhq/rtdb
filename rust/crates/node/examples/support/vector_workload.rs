@@ -82,11 +82,11 @@ fn scope_scan(relation: &Arc<Relation>, iids: &BTreeSet<Iid>) -> Arc<Relation> {
     Arc::new(Relation::new(relation.schema().clone(), node).unwrap())
 }
 
-async fn search(context: &Arc<QueryContext>, query: &[f32], valid: Timestamp, filter: Filter, iids: Option<&BTreeSet<Iid>>) -> Rows {
+async fn search(context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter, iids: Option<&BTreeSet<Iid>>) -> Rows {
     search_with_scorer(context, query, valid, filter, iids, false).await
 }
 
-async fn search_with_scorer(context: &Arc<QueryContext>, query: &[f32], valid: Timestamp, filter: Filter,
+async fn search_with_scorer(context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter,
     iids: Option<&BTreeSet<Iid>>, scalar: bool) -> Rows {
     if iids.is_some_and(BTreeSet::is_empty) { return Rows::new(); }
     let predicate = filter.sql();
@@ -106,7 +106,7 @@ async fn search_with_scorer(context: &Arc<QueryContext>, query: &[f32], valid: T
         *relation = scope_scan(relation, iids);
     }
     let item = Arc::new(Field::new("item", DataType::Float32, false));
-    let query = FixedSizeListArray::try_new(item, i32::try_from(query.len()).unwrap(), Arc::new(Float32Array::from(query.to_vec())), None).unwrap();
+    let query = FixedSizeListArray::try_new(item, i32::try_from(query.len()).unwrap(), Arc::new(query.clone()), None).unwrap();
     let mut args: Vec<ArrayRef> = vec![Arc::new(query), Arc::new(TimestampMicrosecondArray::from(vec![valid.0]).with_timezone("UTC"))];
     if scalar { args.push(Arc::new(BooleanArray::from(vec![true]))); }
     let fields = args.iter().enumerate().map(|(index, array)| Field::new(format!("?{index}"), array.data_type().clone(), false)).collect::<Vec<_>>();
@@ -170,14 +170,14 @@ struct CapturedIndex<'a> {
 }
 
 impl CapturedIndex<'_> {
-    async fn approximate(&self, context: &Arc<QueryContext>, query: &[f32], valid: Timestamp, filter: Filter, probes: usize) -> (Rows, Json) {
+    async fn approximate(&self, context: &Arc<QueryContext>, query: &Float32Array, valid: Timestamp, filter: Filter, probes: usize) -> (Rows, Json) {
         let started = Instant::now();
         let Some(mut ids) = self.coverage.tail(context, self.table, valid) else {
             let rows = search(context, query, valid, filter, None).await;
             return (rows, json!({"route": "exact", "ms": started.elapsed().as_secs_f64() * 1000.0}));
         };
         let changed = ids.len();
-        let candidates = self.index.candidates(self.cache, query, filter, probes, 64, &ids).await;
+        let candidates = self.index.candidates(self.cache, query.values(), filter, probes, 64, &ids).await;
         assert!(candidates.rows.iter().all(|(id, _)| *id >= 0 && (*id as usize) < self.coverage.rows));
         ids.extend(candidates.rows.into_iter().map(|(_, iid)| iid));
         let rows = search(context, query, valid, filter, Some(&ids)).await;
@@ -204,7 +204,8 @@ async fn compare_routes(
 ) -> Vec<Json> {
     let exhaustive = Arc::clone(context).with_accelerators(Arc::from([]));
     let mut samples = Vec::new();
-    for (number, query) in data.queries.values().chunks_exact(data.dimensions).take(query_count).enumerate() {
+    for number in 0..query_count.min(data.queries.len() / data.dimensions) {
+        let query = &data.queries.slice(number * data.dimensions, data.dimensions);
         for &filter in filters {
             let paths = [(&exhaustive, false), (context, false), (&exhaustive, true)];
             let mut measured = std::array::from_fn(|_| (Rows::new(), 0.0));
@@ -239,9 +240,9 @@ async fn compare_routes(
 
 async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedIndex<'_>, data: &Embeddings,
     query_count: usize, filters: &[Filter], probes: &[usize]) -> Json {
-    let query = &data.queries.values()[..data.dimensions];
+    let query = &data.queries.slice(0, data.dimensions);
     let all_clusters = data.centroids.len() / data.dimensions;
-    let stale = captured.index.candidates(captured.cache, query, Filter::All, all_clusters, 64, &BTreeSet::new()).await;
+    let stale = captured.index.candidates(captured.cache, query.values(), Filter::All, all_clusters, 64, &BTreeSet::new()).await;
     assert_eq!(stale.rows.len(), 64);
     let removed: BTreeSet<_> = stale.rows.into_iter().map(|(id, _)| id).collect();
     let entity_ids = |ids: &[i64]| {
@@ -259,7 +260,7 @@ async fn churn(node: &Node, session: &mut NativeSession, captured: &CapturedInde
     let filter = Filter::RandomBelow(10);
     assert!(search(&initial, query, VALID_AT, filter, Some(&reassigned_only)).await.is_empty());
 
-    let documents = documents(node, [(reassigned as i64, data.vector(reassigned), 0, 0), (fresh, query, 0, 0)], data.dimensions, VALID_AT, None);
+    let documents = documents(node, [(reassigned as i64, data.vector(reassigned), 0, 0), (fresh, query.values().as_ref(), 0, 0)], data.dimensions, VALID_AT, None);
     let operations = vec![
         TxOp::DeleteDocs { table: captured.table.clone(), ids: entity_ids(&deleted), valid_from: Some(VALID_AT), valid_to: None },
         TxOp::EraseDocs { table: captured.table.clone(), ids: entity_ids(&erased) },
@@ -350,10 +351,10 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
         compare_routes(&active, &captured_index, &data, query_count, filters, probes).await
     };
 
-    let query = &data.queries.values()[..data.dimensions];
+    let query = &data.queries.slice(0, data.dimensions);
     let before = search(&active, query, VALID_AT, Filter::All, None).await;
     let update_started = Instant::now();
-    put(&mut session, &table, documents(&node, [(count as i64, query, 0, 0)], data.dimensions, VALID_AT, None)).await;
+    put(&mut session, &table, documents(&node, [(count as i64, query.values().as_ref(), 0, 0)], data.dimensions, VALID_AT, None)).await;
     let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
     let newer = session.query_context().await.unwrap();
     let expected = search(&newer, query, VALID_AT, Filter::All, None).await;
@@ -368,7 +369,7 @@ async fn fixture(data: Embeddings, query_count: usize, filters: &[Filter], probe
     let previous = data.vector(affected as usize);
     let reversed: Vec<_> = previous.iter().map(|value| -*value).collect();
     put(&mut session, &table, documents(&node, [(affected, reversed.as_slice(), 999, 999)], data.dimensions, VALID_AT, Some(Timestamp(1)))).await;
-    put(&mut session, &table, documents(&node, [(-1, query, 0, 0)], data.dimensions, Timestamp(1), None)).await;
+    put(&mut session, &table, documents(&node, [(-1, query.values().as_ref(), 0, 0)], data.dimensions, Timestamp(1), None)).await;
     let erased = EntityIds::new(vec![EntityId::Integer(count as i64)], node.memory()).unwrap();
     commit(&mut session, vec![TxOp::EraseDocs { table: table.clone(), ids: erased }]).await;
 

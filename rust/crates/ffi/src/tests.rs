@@ -330,6 +330,28 @@ fn adbc_unnamed_parameters_are_bound_by_ordinal_and_copied() {
 }
 
 #[test]
+fn retained_c_data_binding_owns_the_original_child_until_the_last_batch_clone_drops() {
+    let memory = MemoryBudget::new(16 << 20);
+    let producer = MemoryBudget::new(16 << 20);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![3, 7]))],
+    ).unwrap();
+    let original = batch.column(0).to_data().buffers()[0].as_ptr();
+    let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(batch, &producer).unwrap(), &producer).unwrap();
+    let bound = unsafe { arrow::import_retained_arguments(&mut array, &mut schema, &memory) }.unwrap();
+    assert!(array.release.is_none() && schema.release.is_none());
+    let batch = bound.arguments.single_arrow_page().unwrap().clone();
+    drop(bound);
+    assert_eq!(batch.batch().column(0).to_data().buffers()[0].as_ptr(), original);
+    assert!(producer.used_bytes() > 0);
+    assert!(memory.used_bytes() > 0);
+    std::thread::spawn(move || drop(batch)).join().unwrap();
+    assert_eq!(producer.used_bytes(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn adbc_unsigned_parameter_buffers_execute_as_signed_and_preserve_typed_nulls() {
     let mut native = Native::open();
     let operation = native.operation();

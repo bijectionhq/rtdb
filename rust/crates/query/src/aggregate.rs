@@ -767,18 +767,20 @@ impl AggregateColumn {
                         percentile(Box::new(selected),*kind,*fraction,*descending,&scope,execution).await?
                     } else {
                         let mut selected = selected;
-                        let mut values = Vec::new();
+                        let mut values = rtdb_types::ListBuilder::with_capacity(0);
+                        let mut count = 0usize;
+                        let mut capacity = 0usize;
                         while let Some(value) = selected.next().await? {
                             let value = &value.values[0];
-                            if values.len() == values.capacity() {
-                                let capacity = values.len().checked_mul(2).map(|capacity|capacity.max(1)).ok_or_else(||invalid("aggregate-size","Array aggregate capacity overflow"))?;
+                            if count == capacity {
+                                capacity = count.checked_mul(2).map(|capacity|capacity.max(1)).ok_or_else(||invalid("aggregate-size","Array aggregate capacity overflow"))?;
                                 scope.reserve(capacity.checked_mul(std::mem::size_of::<Value>()).ok_or_else(||invalid("aggregate-size","Array aggregate capacity overflow"))?)?;
-                                values.reserve_exact(capacity - values.len());
                             }
                             scope.reserve(value.retained_bytes()?)?;
                             values.push(if matches!(value,Value::Undefined) { Value::Null } else { value.clone() });
+                            count += 1;
                         }
-                        if values.is_empty() && (aggregate.function == AggregateFunction::ArrayAgg || present) { Value::Null } else { Value::list(values) }
+                        if count == 0 && (aggregate.function == AggregateFunction::ArrayAgg || present) { Value::Null } else { Value::List(values.finish()) }
                     };
                     row.replace_value(column,value,&execution.context.memory)?;
                 }

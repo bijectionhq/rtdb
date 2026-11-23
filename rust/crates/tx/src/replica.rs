@@ -100,6 +100,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
             .collect();
         match world_effects {
             Some(Value::List(effects)) => {
+                let effects = effects.scalar_values().ok_or_else(|| invalid("Resolved world effects have an invalid layout"))?;
                 let hosted = worlds::verify(&tables, effects, key, memory)?;
                 let has_controls = !controls.is_empty()
                     || proof.is_some_and(|proof| proof.contains_key(crate::hosted_control::CONTROL_TABLES));
@@ -209,7 +210,7 @@ fn verify_hosted_controls(
         return Err(mismatch());
     }
     let mut expected = BTreeSet::new();
-    for name in names {
+    for name in names.scalar_values().ok_or_else(mismatch)? {
         let Value::Utf8(name) = name else {
             return Err(mismatch());
         };

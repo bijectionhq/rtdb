@@ -852,7 +852,7 @@ async fn explicit_search_statistics_rank_the_admitted_corpus() {
         r#"SELECT SEARCH_TERMS('"Invoice paid" invoice')"#,
         vec![],
     ).await.unwrap()).await;
-    assert_eq!(terms, [vec![Value::List(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
+    assert_eq!(terms, [vec![Value::list(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
     let fingerprint = rows(session.query_sql(
         "SELECT SEARCH_LENGTH(42), SEARCH_LENGTH(''), \
          SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']) = \

@@ -267,7 +267,19 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 let count = (size - position).min(batch_rows);
                 let scope = crate::EvaluationScope::new(allocation.memory_budget())?;
                 scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-                let mut values = Vec::with_capacity(count);
+                if let EvalValue::List(_, reader) = &value
+                    && let ListReader::Stored(items) = reader.as_ref()
+                    && let Some(values) = items.slice_packed(position, count)
+                {
+                    scope.reserve(values.retained_payload_bytes()?)?;
+                    if let Some((field, array)) = values.packed_column() {
+                        rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
+                    }
+                    position += count;
+                    yield super::ListEvent::Batch(super::ListBatch { values, _scope: scope });
+                    continue;
+                }
+                let mut values = rtdb_types::ListBuilder::with_capacity(count);
                 {
                     let page_context = context.with_allocation(&scope);
                     let page_frame = EvaluationFrame { schema, row: ExpressionRow::Values(row), context: &page_context, asynchronous: true, replacements: Some(replacements) };
@@ -280,7 +292,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                     }
                 }
                 position += count;
-                yield super::ListEvent::Batch(super::ListBatch { values, _scope: scope });
+                yield super::ListEvent::Batch(super::ListBatch { values: values.finish(), _scope: scope });
             }
         }
     })
@@ -433,14 +445,31 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                         Kind::Set => unreachable!("set storage is not a list"),
                     });
                 }
+                if let EvalValue::List(_, reader) = &value
+                    && let ListReader::Arrow(cell) = reader.as_ref()
+                    && !matches!(kind, Kind::Set)
+                    && cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field))
+                {
+                    frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
+                    return rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row);
+                }
                 let size = len(&value)?;
                 frame.context.reserve(size.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-                let mut values = Vec::with_capacity(size);
+                if matches!(kind, Kind::Set) {
+                    let mut values = Vec::with_capacity(size);
+                    for index in 0..size {
+                        values.push(materialize(nth(clone_value(&value,frame)?,index,frame)?.await?,frame)?.await?);
+                        if frame.asynchronous && index % 1024 == 1023 { tokio::task::yield_now().await; }
+                    }
+                    return Ok(Value::Set(values));
+                }
+                let mut values = rtdb_types::ListBuilder::with_capacity(size);
                 for index in 0..size {
                     values.push(materialize(nth(clone_value(&value,frame)?,index,frame)?.await?,frame)?.await?);
                     if frame.asynchronous && index % 1024 == 1023 { tokio::task::yield_now().await; }
                 }
-                Ok(match kind { Kind::List => Value::list(values),Kind::Set => Value::Set(values),Kind::Fixed => Value::FixedSizeList(values.into()) })
+                let values = values.finish();
+                Ok(if matches!(kind, Kind::Fixed) { Value::FixedSizeList(values) } else { Value::List(values) })
             }
         }
     },frame)

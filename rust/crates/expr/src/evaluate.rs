@@ -115,9 +115,9 @@ enum ListEvent {
 }
 
 /// A completed list slice retaining all cell evaluation charges until it is dropped.
-pub struct ListBatch { values: Vec<Value>, _scope: crate::EvaluationScope }
+pub struct ListBatch { values: rtdb_types::ListValue, _scope: crate::EvaluationScope }
 impl ListBatch {
-    pub fn values(&self) -> &[Value] { &self.values }
+    pub fn values(&self) -> &rtdb_types::ListValue { &self.values }
 }
 
 /// Caller-polled list evaluation, with its descriptor selected once at opening.
@@ -174,9 +174,11 @@ impl IndexedListBatches {
         let count = (self.series.len() - self.position).min(self.rows_per_batch);
         if count == 0 { return Ok(None); }
         let scope = crate::EvaluationScope::new(&self.memory)?;
-        scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+        scope.reserve(count.checked_mul(std::mem::size_of::<i64>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?)?;
         let end = self.position + count;
-        let values = (self.position..end).map(|index| self.series.nth(index)).collect();
+        let array = arrow_array::Int64Array::from_iter_values((self.position..end).map(|index| self.series.at(index)));
+        let field = Arc::new(arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false));
+        let values = rtdb_types::ListValue::from_numeric_arrow(field, Arc::new(array)).expect("i64 series is numeric");
         self.position = end;
         Ok(Some(ListBatch { values, _scope: scope }))
     }
@@ -427,9 +429,9 @@ macro_rules! expression_body {
         Expr::Subscript { expr, index, .. } => $call!("nth", &[$eval!(expr)?, $eval!(index)?]),
         Expr::List(items) => {
             context.reserve(items.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-            let mut values = Vec::with_capacity(items.len());
+            let mut values = rtdb_types::ListBuilder::with_capacity(items.len());
             for item in items { values.push($eval!(item)?); }
-            Ok(Value::list(values))
+            Ok(Value::List(values.finish()))
         }
         Expr::Struct(fields) => {
             let mut values = StructFields::new();
@@ -526,6 +528,7 @@ pub fn validate_projection_value(value: &Value) -> Result<()> {
         Value::Set(values) => values.iter().try_for_each(validate_projection_value),
         Value::List(values) | Value::FixedSizeList(values) => match values.view() {
             rtdb_types::ListView::Values(values) => values.iter().try_for_each(validate_projection_value),
+            rtdb_types::ListView::Numeric(values) => rtdb_columnar::validate_projected_decimals(values.field(), values.array().as_ref()),
             _ => Ok(()),
         },
         Value::Struct(fields) => fields.values().try_for_each(validate_projection_value),

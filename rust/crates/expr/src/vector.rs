@@ -1,4 +1,7 @@
-use rtdb_types::{Anomaly, ListView, Result, Value};
+use arrow_array::{Array, Float32Array, Float64Array, UnionArray, cast::AsArray, types::{Float16Type, Float32Type, Float64Type}};
+use arrow_schema::{DataType, Field};
+use rtdb_columnar::ArrowCell;
+use rtdb_types::{Anomaly, ListValue, ListView, Result, Value};
 
 use crate::{compare::nullish, numeric::number};
 
@@ -6,9 +9,49 @@ pub(crate) fn cosine_distance(left: &Value, right: &Value) -> Result<Value> {
     if nullish(left) || nullish(right) {
         return Ok(Value::Null);
     }
-    let left = components(left)?;
-    let right = components(right)?;
-    if left.is_empty() || left.len() != right.len() {
+    score_pair(VectorInput::Stored(components(left)?), VectorInput::Stored(components(right)?))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VectorInput<'a> {
+    Stored(ListView<'a>),
+    Floats { values: ListView<'a>, offset: usize, len: usize },
+    Arrow { field: &'a Field, array: &'a dyn Array, offset: usize, len: usize },
+}
+
+impl<'a> VectorInput<'a> {
+    pub(crate) fn from_arrow(cell: ArrowCell<'a>) -> Option<Self> {
+        let (field, array, range) = cell.sequence_range()?;
+        if field.metadata().is_empty() {
+            let floats = match array.data_type() {
+                DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().map(ListView::F32),
+                DataType::Float64 => array.as_any().downcast_ref::<Float64Array>().map(ListView::F64),
+                ty if ListValue::supports_float_union(ty) => array.as_any().downcast_ref::<UnionArray>().map(ListView::Union),
+                _ => None,
+            };
+            if let Some(values) = floats {
+                return Some(Self::Floats { values, offset: range.start, len: range.len() });
+            }
+        }
+        Some(Self::Arrow { field, array, offset: range.start, len: range.len() })
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self { Self::Stored(values) => values.len(), Self::Floats { len, .. } | Self::Arrow { len, .. } => len }
+    }
+
+    pub(crate) fn component(self, index: usize) -> Result<f64> {
+        match self {
+            Self::Stored(values) => component_at(values, index),
+            Self::Floats { values, offset, .. } => values.float_component(offset + index)
+                .filter(|value| value.is_finite()).ok_or_else(invalid_component),
+            Self::Arrow { field, array, offset, .. } => arrow_number(ArrowCell { field, array, row: offset + index }),
+        }
+    }
+}
+
+pub(crate) fn score_pair(left: VectorInput<'_>, right: VectorInput<'_>) -> Result<Value> {
+    if left.len() == 0 || left.len() != right.len() {
         return Err(Anomaly::incorrect("rtdb.vector/dimensions", "Cosine distance requires vectors of the same positive dimension"));
     }
 
@@ -19,8 +62,8 @@ pub(crate) fn cosine_distance(left: &Value, right: &Value) -> Result<Value> {
     let mut left_squared = 0.0;
     let mut right_squared = 0.0;
     for index in 0..left.len() {
-        let left = component_at(left, index)? / left_scale;
-        let right = component_at(right, index)? / right_scale;
+        let left = left.component(index)? / left_scale;
+        let right = right.component(index)? / right_scale;
         dot += left * right;
         left_squared += left * left;
         right_squared += right * right;
@@ -94,10 +137,10 @@ fn components(vector: &Value) -> Result<ListView<'_>> {
     }
 }
 
-fn scale(values: ListView<'_>) -> Result<f64> {
+fn scale(values: VectorInput<'_>) -> Result<f64> {
     let mut scale = 0.0_f64;
     for index in 0..values.len() {
-        scale = scale.max(component_at(values, index)?.abs());
+        scale = scale.max(values.component(index)?.abs());
     }
     if scale == 0.0 {
         return Err(Anomaly::incorrect("rtdb.vector/zero-norm", "Cosine distance requires a nonzero vector"));
@@ -106,10 +149,32 @@ fn scale(values: ListView<'_>) -> Result<f64> {
 }
 
 fn component_at(values: ListView<'_>, index: usize) -> Result<f64> {
-    if let ListView::Values(values) = values { return component(&values[index]); }
+    match values {
+        ListView::Values(values) => return component(&values[index]),
+        ListView::Numeric(_) => return component(values.get(index).as_deref().unwrap_or(&Value::Null)),
+        _ => {}
+    }
     let value = values.float_component(index);
     value.filter(|value| value.is_finite())
         .ok_or_else(|| Anomaly::incorrect("rtdb.vector/component", "Vector components must be finite numbers"))
+}
+
+fn invalid_component() -> Anomaly {
+    Anomaly::incorrect("rtdb.vector/component", "Vector components must be finite numbers")
+}
+
+fn arrow_number(cell: ArrowCell<'_>) -> Result<f64> {
+    let cell = cell.physical()?;
+    if cell.is_null()? { return Err(invalid_component()); }
+    if let Some(value) = cell.signed_integer() { return Ok(value as f64); }
+    let value = match cell.field.data_type() {
+        DataType::Float16 if cell.field.metadata().is_empty() => cell.array.as_primitive::<Float16Type>().value(cell.row).to_f64(),
+        DataType::Float32 if cell.field.metadata().is_empty() => f64::from(cell.array.as_primitive::<Float32Type>().value(cell.row)),
+        DataType::Float64 if cell.field.metadata().is_empty() => cell.array.as_primitive::<Float64Type>().value(cell.row),
+        ty if rtdb_columnar::decimal_parameters(ty).is_some() => rtdb_columnar::decimal_cell_as_f64(cell.field, cell.array, cell.row)?,
+        _ => return Err(invalid_component()),
+    };
+    value.is_finite().then_some(value).ok_or_else(invalid_component)
 }
 
 fn component(value: &Value) -> Result<f64> {

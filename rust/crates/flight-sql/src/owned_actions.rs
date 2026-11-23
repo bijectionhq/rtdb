@@ -651,7 +651,7 @@ impl Service {
         let (Some(Value::Utf8(name)), Some(Value::List(columns))) = (row.get("_id"), row.get("columns")) else {
             return Err(invalid("Owned path declaration requires a text name and text column list"));
         };
-        let columns = columns.iter().map(|column| match column {
+        let columns = columns.iter().map(|column| match column.as_ref() {
             Value::Utf8(column) => Ok(column.clone()),
             _ => Err(invalid("Owned path key column is not text")),
         }).collect::<Result<Vec<_>, _>>()?;
@@ -3816,8 +3816,8 @@ fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), 
         Some(Value::List(fields)) if fields.len() <= 128 => fields,
         _ => return Err(invalid("Owned _absent must be a list of at most 128 field names")),
     };
-    for field in absent {
-        let Value::Utf8(name) = field else { return Err(invalid("Owned _absent field must be text")); };
+    for field in absent.iter() {
+        let Value::Utf8(name) = field.as_ref() else { return Err(invalid("Owned _absent field must be text")); };
         if name.starts_with('_') || !matches!(row.get(name.as_str()), Some(Value::Null | Value::Undefined)) {
             return Err(invalid("Owned _absent may name only distinct null payload cells"));
         }

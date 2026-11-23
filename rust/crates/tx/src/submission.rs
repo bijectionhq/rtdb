@@ -7,7 +7,7 @@ use arrow_schema::DataType;
 use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::{Catalog, Expr, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
-use rtdb_types::{Anomaly, Result, Timestamp, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Timestamp, Value};
 use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
@@ -351,9 +351,19 @@ fn infer_document_decimals(value: &mut Value) -> Result<()> {
     match value {
         Value::Decimal(decimal) => *decimal = rtdb_expr::infer_decimal(decimal)?,
         Value::Set(values) => for value in values { infer_document_decimals(value)?; },
-        Value::List(values) | Value::FixedSizeList(values) => if let Some(values) = values.values_mut() {
-            for value in values { infer_document_decimals(value)?; }
-        },
+        Value::List(values) | Value::FixedSizeList(values) => {
+            if let Some(items) = values.values_mut() {
+                for value in items { infer_document_decimals(value)?; }
+            } else if values.element_type().legs().iter().any(|ty| matches!(ty, LogicalType::Scalar(ScalarType::Decimal { .. }))) {
+                let mut inferred = rtdb_types::ListBuilder::with_capacity(values.len());
+                for value in values.iter() {
+                    let mut value = value.into_owned();
+                    infer_document_decimals(&mut value)?;
+                    inferred.push(value);
+                }
+                *values = inferred.finish();
+            }
+        }
         Value::Struct(fields) => for value in fields.values_mut() { infer_document_decimals(value)?; },
         Value::Map { entries, .. } => for (key, value) in entries { infer_document_decimals(key)?; infer_document_decimals(value)?; },
         _ => {}

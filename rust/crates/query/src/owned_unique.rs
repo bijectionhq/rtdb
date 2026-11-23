@@ -84,8 +84,8 @@ pub async fn read_owned_unique_policy(
         return Err(uncovered());
     }
     let mut installed = BTreeMap::new();
-    for path in paths {
-        let Value::Struct(path) = path else {
+    for path in paths.iter() {
+        let Value::Struct(path) = path.as_ref() else {
             return Err(uncovered());
         };
         let (Some(Value::Utf8(name)), Some(Value::Utf8(column))) =

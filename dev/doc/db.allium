@@ -383,6 +383,7 @@ entity SourceMessage {
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
+    -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.

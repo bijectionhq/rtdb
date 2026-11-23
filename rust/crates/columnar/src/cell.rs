@@ -291,6 +291,11 @@ impl<'a> ArrowCell<'a> {
 
     /// Borrows the selected children of a physical list, fixed-size list, or map.
     pub fn sequence(self) -> Option<impl ExactSizeIterator<Item = Self> + 'a> {
+        let (field, array, range) = self.sequence_range()?;
+        Some(range.map(move |row| Self { field, array, row }))
+    }
+
+    pub fn sequence_range(self) -> Option<(&'a Field, &'a dyn Array, std::ops::Range<usize>)> {
         let Self { field, array, row } = self.physical().ok()?;
         if array.is_null(row) {
             return None;
@@ -329,11 +334,7 @@ impl<'a> ArrowCell<'a> {
                 }
                 _ => return None,
             };
-        Some((from..to).map(move |row| Self {
-            field: element,
-            array: values,
-            row,
-        }))
+        (from <= to && to <= values.len()).then_some((element, values, from..to))
     }
 
     /// Counts the selected physical payload using only the active children.

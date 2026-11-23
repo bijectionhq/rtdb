@@ -410,11 +410,15 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
         (ListKind::List, DataType::List(item)) => Some((item, None)),
         _ => None,
     };
-    if let Some((item, width)) = packed_schema
-        && item.metadata().is_empty()
-        && let Some(array) = build_float_lists(item, width, values)?
-    {
-        return Ok(array);
+    if let Some((item, width)) = packed_schema {
+        if item.metadata().is_empty() && let Some(array) = build_float_lists(item, width, values)? {
+            return Ok(array);
+        }
+        if ListValue::supports_numeric_arrow(item)
+            && let Some(array) = build_numeric_lists(item, width, values, check_precision)?
+        {
+            return Ok(array);
+        }
     }
     let mut flat = Vec::new();
     let mut offsets = vec![0i32];
@@ -457,9 +461,6 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
 
 fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) -> Result<Option<ArrayRef>> {
     if width.is_some_and(|width| width <= 0) { return Ok(None); }
-    if ListValue::supports_float_union(item.data_type()) {
-        return build_float_union_lists(item, width, values);
-    }
     if !matches!(item.data_type(), DataType::Float32 | DataType::Float64) { return Ok(None); }
     let total = values.iter().try_fold(0usize, |length, value| {
         let add = match value {
@@ -509,7 +510,8 @@ fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) ->
     }
 }
 
-fn build_float_union_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) -> Result<Option<ArrayRef>> {
+fn build_numeric_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], check_precision: bool) -> Result<Option<ArrayRef>> {
+    if width.is_some_and(|width| width <= 0) { return Ok(None); }
     let padding = width.map(|width| arrow_array::new_null_array(item.data_type(), width as usize));
     let mut children = Vec::with_capacity(values.len());
     let mut offsets = vec![0];
@@ -519,16 +521,22 @@ fn build_float_union_lists(item: &Arc<Field>, width: Option<i32>, values: &[Valu
             Value::Null | Value::Undefined => padding.as_ref().cloned(),
             Value::List(list) | Value::FixedSizeList(list) => {
                 if width.is_some_and(|width| list.len() != width as usize) { return Ok(None); }
-                let source: ArrayRef = match list.view() {
-                    ListView::F32(array) => Arc::new(array.clone()),
-                    ListView::F64(array) => Arc::new(array.clone()),
-                    ListView::Union(array) => Arc::new(array.clone()),
-                    ListView::Values(_) if list.is_empty() => arrow_array::new_empty_array(item.data_type()),
+                let (source_field, source): (Field, ArrayRef) = match list.view() {
+                    ListView::Numeric(values) => (values.field().as_ref().clone(), Arc::clone(values.array())),
+                    ListView::F32(array) => (Field::new(item.name(), DataType::Float32, array.null_count() != 0), Arc::new(array.clone())),
+                    ListView::F64(array) => (Field::new(item.name(), DataType::Float64, array.null_count() != 0), Arc::new(array.clone())),
+                    ListView::Union(array) => (Field::new(item.name(), array.data_type().clone(), false), Arc::new(array.clone())),
+                    ListView::Values(_) if list.is_empty() => (item.as_ref().clone(), arrow_array::new_empty_array(item.data_type())),
                     ListView::Values(_) => return Ok(None),
                 };
-                let source_field = Field::new(item.name(), source.data_type().clone(), source.null_count() != 0);
-                let Ok((_, array)) = crate::relayout_arrow_column(source, &source_field, item) else { return Ok(None); };
-                if array.data_type() != item.data_type() { return Ok(None); }
+                let array = if source.is_empty() { arrow_array::new_empty_array(item.data_type()) } else {
+                    let Ok((_, array)) = crate::relayout_arrow_column(source, &source_field, item) else { return Ok(None); };
+                    if array.data_type() != item.data_type() { return Ok(None); }
+                    array
+                };
+                if check_precision {
+                    crate::validate_projected_decimals(item, array.as_ref())?;
+                }
                 Some(array)
             }
             _ => return Ok(None),
@@ -541,15 +549,22 @@ fn build_float_union_lists(item: &Arc<Field>, width: Option<i32>, values: &[Valu
             offsets.push(i32::try_from(length).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
         }
     }
-    let child = if children.is_empty() { arrow_array::new_empty_array(item.data_type()) } else {
-        let arrays = children.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
-        arrow_select::concat::concat(&arrays).map_err(super::arrow_error)?
+    let child = match children.as_slice() {
+        [] => arrow_array::new_empty_array(item.data_type()),
+        [array] => Arc::clone(array),
+        arrays => {
+            let arrays = arrays.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+            arrow_select::concat::concat(&arrays).map_err(super::arrow_error)?
+        }
     };
-    let array: ArrayRef = match width {
-        Some(width) => Arc::new(FixedSizeListArray::try_new(Arc::clone(item), width, child, validity(values)).map_err(super::arrow_error)?),
-        None => Arc::new(ListArray::try_new(Arc::clone(item), OffsetBuffer::new(ScalarBuffer::from(offsets)), child, validity(values)).map_err(super::arrow_error)?),
+    let data_type = match width {
+        Some(width) => DataType::FixedSizeList(Arc::clone(item), width),
+        None => DataType::List(Arc::clone(item)),
     };
-    Ok(Some(array))
+    let mut data = arrow_data::ArrayData::builder(data_type).len(values.len())
+        .nulls(validity(values)).add_child_data(child.to_data());
+    if width.is_none() { data = data.add_buffer(ScalarBuffer::from(offsets).into_inner()); }
+    Ok(Some(make_array(data.build().map_err(super::arrow_error)?)))
 }
 
 fn build_union(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
@@ -778,13 +793,16 @@ fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn 
         if matches!(ty, LogicalType::Scalar(ScalarType::F64)) && let Some(array) = values.as_any().downcast_ref::<Float64Array>() {
             return Ok(admit(rtdb_types::ListValue::from_f64(array.iter().collect())));
         }
-        if ListValue::supports_float_union(values.data_type()) {
-            let end = i32::try_from(values.len()).map_err(|_| layout_error())?;
-            let indices = Int32Array::from_iter_values(0..end);
-            let copied = arrow_select::take::take(values.as_ref(), &indices, None).map_err(super::arrow_error)?;
-            let packed = ListValue::from_float_union(downcast::<UnionArray>(copied.as_ref())?.clone()).ok_or_else(layout_error)?;
-            return Ok(admit(packed));
-        }
+    }
+    if matches!(kind, ListKind::List | ListKind::FixedSizeList(_))
+        && ListValue::supports_numeric_arrow(child_field)
+        && &from_field(child_field)? == element
+    {
+        let end = i32::try_from(values.len()).map_err(|_| layout_error())?;
+        let indices = Int32Array::from_iter_values(0..end);
+        let copied = arrow_select::take::take(values.as_ref(), &indices, None).map_err(super::arrow_error)?;
+        let packed = ListValue::from_numeric_arrow(Arc::clone(child_field), copied).ok_or_else(layout_error)?;
+        return Ok(if matches!(kind, ListKind::List) { Value::List(packed) } else { Value::FixedSizeList(packed) });
     }
     let values = (0..values.len()).map(|index| read_typed(element, child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
     match kind {

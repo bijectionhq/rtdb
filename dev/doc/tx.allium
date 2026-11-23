@@ -29,6 +29,8 @@
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
 -- A pgwire portal can encode numeric coefficients and structured JSON, JSON-LD, and Transit results from their Arrow cells.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
+-- A versioned Flight SQL run ticket carries Arrow IPC arguments within its binary frame.
+-- The Flight SQL server also redeems run tickets issued with the earlier JSON envelope.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
@@ -57,6 +59,8 @@
 -- Those spill pages retain each record's fields and preserve their original page boundaries.
 -- Computed VALUES and replayed literal pages admit their results column by column.
 -- Column tables preserve one semantic page across the input list's batches.
+-- Numeric list expression pages retain typed child arrays and validity through the list cursor.
+-- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
 -- Computed UNNEST gathers the original payload from Arrow positions and evaluates only its list operands.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.

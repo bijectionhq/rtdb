@@ -105,7 +105,7 @@ impl ScanFragmenter for CellFragmenter {
         let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-cell-secret", "Fragments are read elsewhere only in a cell with a secret"))?;
         let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone(), grant: secret.node_grant(fragment.database()) };
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let stream = control::start_fragment(&address, request, deadline, &control::ControlKey(self.secret.clone())).await.inspect_err(|_| {
+        let stream = control::start_fragment(&address, request, deadline, &control::ControlKey(self.secret.clone()), memory).await.inspect_err(|_| {
             self.failures.fetch_add(1, Ordering::Relaxed);
         })?;
         let memory = Arc::clone(memory);

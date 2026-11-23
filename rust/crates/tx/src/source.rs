@@ -293,7 +293,7 @@ impl SourceTransaction {
         let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
         let bytes = crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?;
         let metadata = self.options.user_metadata.as_ref().map(|metadata| encode_metadata(metadata, &self.memory)).transpose()?;
-        let body_size = bytes.as_slice().len().checked_add(metadata.as_ref().map_or(0, |bytes| bytes.as_slice().len())).and_then(|bytes| bytes.checked_add(self.options.default_tz.capacity())).and_then(|bytes| bytes.checked_add(self.options.user.as_ref().map_or(0, String::capacity))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+        let body_size = self.options.default_tz.capacity().checked_add(self.options.user.as_ref().map_or(0, String::capacity)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let _body_reservation = self.memory.reserve(body_size)?;
         use rtdb_format::generated::xtdb::log::proto;
         let (idempotency_guard, replay_submission, bounded_retry) = match &self.guard {
@@ -313,10 +313,12 @@ impl SourceTransaction {
             })),
             None => (None, None, None),
         };
+        let (tx_ops, _tx_ops_reservation) = bytes.into_parts();
+        let (user_metadata, _user_metadata_reservation) = metadata.map(RetainedBytes::into_parts).unzip();
         let tx = rtdb_format::generated::xtdb::log::proto::Tx {
-            tx_ops: Some(bytes.as_slice().to_vec()), system_time_micros: self.options.system_time.map(|time| time.0),
+            tx_ops: Some(tx_ops), system_time_micros: self.options.system_time.map(|time| time.0),
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
-            user_metadata: metadata.as_ref().map(|bytes| bytes.as_slice().to_vec()), external_source_token: None,
+            user_metadata, external_source_token: None,
             idempotency_guard,
             replay_submission,
             bounded_retry,
@@ -450,12 +452,12 @@ fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections
         Value::List(rows) => rows,
         _ => return Err(invalid("Owned field presence is not a row list")),
     };
-    let rows = rows.into_iter().map(|row| {
-        let Value::List(fields) = row else { return Err(invalid("Owned field presence is not a field list")); };
+    let rows = rows.iter().map(|row| {
+        let Value::List(fields) = row.as_ref() else { return Err(invalid("Owned field presence is not a field list")); };
         let mut names = std::collections::BTreeSet::new();
-        for field in fields {
-            let Value::Utf8(name) = field else { return Err(invalid("Owned field presence name is not text")); };
-            if !names.insert(name) { return Err(invalid("Duplicate owned field presence name")); }
+        for field in fields.iter() {
+            let Value::Utf8(name) = field.as_ref() else { return Err(invalid("Owned field presence name is not text")); };
+            if !names.insert(name.clone()) { return Err(invalid("Duplicate owned field presence name")); }
         }
         Ok(names)
     }).collect::<Result<Vec<_>>>()?;
@@ -1570,8 +1572,8 @@ impl SourceOperationReader<'_> {
                 let (Value::Utf8(relation), Value::Utf8(name), Value::List(columns)) =
                     (value("relation")?, value("name")?, value("columns")?)
                 else { return Err(invalid("Owned path declaration has invalid fields")); };
-                let columns = columns.into_iter().map(|column| match column {
-                    Value::Utf8(column) => Ok(column),
+                let columns = columns.iter().map(|column| match column.as_ref() {
+                    Value::Utf8(column) => Ok(column.clone()),
                     _ => Err(invalid("Owned path names a non-text column")),
                 }).collect::<Result<_>>()?;
                 let relation = rtdb_types::OwnedRelation::new(relation)?;
@@ -2377,7 +2379,7 @@ mod tests {
     fn row_and_arrow_puts_share_the_source_layout_in_transaction_order() {
         let memory = budget();
         let table = TableRef::new("public", "docs");
-        let values = [vec![Value::I64(7), Value::Null], vec![Value::List(vec![Value::Bool(true)])]];
+        let values = [vec![Value::I64(7), Value::Null], vec![Value::list(vec![Value::Bool(true)])]];
         let rows = {
             let mut first = StructFields::from([("row_field".into(), Value::Bool(true)), ("_id".into(), Value::I64(1))]);
             first.insert("v".into(), values[0][0].clone());
@@ -2607,8 +2609,8 @@ mod tests {
 
         let docs = result.as_list::<i32>().values().as_struct();
         let (field, array) = document_column(docs, "items").unwrap();
-        assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), Value::FixedSizeList(vec![Value::I64(5)]));
-        assert_eq!(read_value(field, array.as_ref(), 1).unwrap(), Value::FixedSizeList(vec![Value::I64(7)]));
+        assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), Value::FixedSizeList(vec![Value::I64(5)].into()));
+        assert_eq!(read_value(field, array.as_ref(), 1).unwrap(), Value::FixedSizeList(vec![Value::I64(7)].into()));
         assert!(result.get_array_memory_size() < width as usize);
     }
 
@@ -2624,7 +2626,7 @@ mod tests {
         let left = Arc::new(ListArray::try_new(child_field, OffsetBuffer::new(vec![0_i32, 1, 1001].into()), entries, None).unwrap());
         let item = Arc::new(Field::new("$data$", left.data_type().clone(), false));
         let left = arrow_array::FixedSizeListArray::try_new(item, 1, left, Some(NullBuffer::from(vec![true, false]))).unwrap();
-        let right = Value::FixedSizeList(vec![Value::List(vec![Value::Struct(StructFields::from([
+        let right = Value::FixedSizeList(vec![Value::list(vec![Value::Struct(StructFields::from([
             ("n".into(), Value::I64(44)), ("payload".into(), Value::FixedSizeBinary(vec![8; width])),
         ]))])].into());
         let right = build_array(&right.logical_type(), &[right]).unwrap();
@@ -2640,7 +2642,7 @@ mod tests {
 
         let docs = list.as_list::<i32>().values().as_struct();
         let (field, array) = document_column(docs, "items").unwrap();
-        let expected = Value::FixedSizeList(vec![Value::List(vec![Value::Struct(StructFields::from([
+        let expected = Value::FixedSizeList(vec![Value::list(vec![Value::Struct(StructFields::from([
             ("n".into(), Value::I64(0)), ("payload".into(), Value::Null),
         ]))])].into());
         assert_eq!(read_value(field, array.as_ref(), 0).unwrap(), expected);
@@ -2700,7 +2702,7 @@ mod tests {
         let memory = budget();
         let documents = Documents::new(vec![StructFields::from([
             ("_id".into(), Value::I64(1)),
-            ("items".into(), Value::FixedSizeList(vec![Value::Undefined])),
+            ("items".into(), Value::FixedSizeList(vec![Value::Undefined].into())),
         ])], &memory).unwrap();
         let source = SourceTransaction::new(vec![TxOp::PutDocs {
             table: TableRef::new("public", "docs"), documents, valid_from: None, valid_to: None,

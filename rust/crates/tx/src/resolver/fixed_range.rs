@@ -256,15 +256,15 @@ impl OpenTransaction<'_> {
             {
                 return Ok(false);
             }
-            for side in sides {
-                let Value::List(pair) = side else {
+            for side in sides.iter() {
+                let Value::List(pair) = side.as_ref() else {
                     return Ok(false);
                 };
                 if pair.len() != 2 {
                     return Ok(false);
                 }
-                for key in pair {
-                    if *key != Value::Null && evidence.contains(&FixedRangeKey::from_value(key)?) {
+                for key in pair.iter() {
+                    if *key != Value::Null && evidence.contains(&FixedRangeKey::from_value(key.as_ref())?) {
                         return Ok(false);
                     }
                 }

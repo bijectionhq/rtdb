@@ -1,7 +1,7 @@
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
+use arrow_array::{Array, ArrayRef, Int32Array, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -254,10 +254,19 @@ impl MetadataBuilder {
             for (name, value) in fields {
                 match (name.as_str(), value) {
                     ("list" | "set", Value::I32(index)) => *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?,
-                    ("struct", Value::List(children)) => for child in children.values_mut().ok_or_else(|| invalid("Struct metadata children must be integers"))? {
-                        let Value::I32(index) = child else { return Err(invalid("Struct metadata child must be an integer")); };
-                        *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?;
-                    },
+                    ("struct", Value::List(children)) if !children.is_empty() => {
+                        let indices = children.array().and_then(|array| array.as_any().downcast_ref::<Int32Array>())
+                            .filter(|indices| indices.null_count() == 0)
+                            .ok_or_else(|| invalid("Struct metadata children must be integers"))?;
+                        let mut shifted = arrow_array::builder::Int32Builder::with_capacity(indices.len());
+                        for &index in indices.values().iter() {
+                            shifted.append_value(index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?);
+                        }
+                        let array = shifted.finish();
+                        let field = Arc::new(Field::new("item", DataType::Int32, false));
+                        *children = rtdb_types::ListValue::from_numeric_arrow(field, Arc::new(array))
+                            .expect("metadata uses i32 indices");
+                    }
                     _ => {}
                 }
             }

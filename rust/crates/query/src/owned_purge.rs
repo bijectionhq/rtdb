@@ -123,8 +123,8 @@ pub async fn read_owned_purge_bucket(
         if floors.is_empty() || floors.len() > MAX_BUCKET {
             return Err(uncovered());
         }
-        for floor in floors {
-            let Value::Struct(entry) = floor else {
+        for floor in floors.iter() {
+            let Value::Struct(entry) = floor.as_ref() else {
                 return Err(uncovered());
             };
             let (Some(Value::Binary(handle)), Some(Value::I64(time))) =

@@ -104,8 +104,26 @@ fn hash_value_with(value: &Value, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) 
             bytes[8..].copy_from_slice(&nanoseconds.to_le_bytes());
             hash_bytes(&bytes, seed) as i32
         }
-        Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap().iter()
-            .try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value.as_ref(), seed)?)))?,
+        Value::List(_) | Value::FixedSizeList(_) => {
+            let values = value.list_view().unwrap();
+            if values.is_float() {
+                (0..values.len()).fold(0, |hash, index| {
+                    combine(hash, values.float_component(index).map_or(0, |value| float_hash(value, seed)))
+                })
+            } else if let rtdb_types::ListView::Numeric(values) = values {
+                let array = values.array().as_ref();
+                (0..array.len()).try_fold(0, |hash, row| {
+                    let cell = crate::ArrowCell { field: values.field(), array, row }.physical()?;
+                    let next = if cell.array.is_null(cell.row) { 0 } else {
+                        scalar_hash_with(cell.field, cell.array, cell.row, seed, hash_bytes)?
+                            .ok_or_else(layout_error)?
+                    };
+                    Ok::<i32, Anomaly>(combine(hash, next))
+                })?
+            } else {
+                values.iter().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value.as_ref(), seed)?)))?
+            }
+        },
         Value::Set(values) => values.iter().try_fold(0i32, |hash, value| Ok::<i32, Anomaly>(hash.wrapping_add(nested(value, seed)?)))?,
         Value::Struct(fields) => fields.values().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value, seed)?)))?,
         Value::Map { entries, .. } => entries.iter().try_fold(0, |hash, (key, value)| {
@@ -143,7 +161,9 @@ pub fn decimal_cell_as_f64(field: &Field, array: &dyn Array, row: usize) -> Resu
     scaled_double(&coefficient, scale)
 }
 
-fn scalar_hash(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Result<Option<i32>> {
+fn scalar_hash_with(
+    field: &Field, array: &dyn Array, row: usize, seed: u32, hash_bytes: fn(&[u8], u32) -> u32,
+) -> Result<Option<i32>> {
     let extension = field.metadata().get(EXTENSION_NAME_KEY).map(String::as_str);
     if !field.metadata().is_empty() {
         crate::decimal_field_parameters(field)?;
@@ -157,12 +177,14 @@ fn scalar_hash(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Resul
             _ => return Ok(None),
         }
     }
-    let bytes = |bytes: &[u8]| xxhash32(bytes, seed) as i32;
+    let bytes = |bytes: &[u8]| hash_bytes(bytes, seed) as i32;
     let double = |value: f64| bytes(&value.to_bits().to_be_bytes());
     macro_rules! cell {
         ($ty:ty) => { downcast::<PrimitiveArray<$ty>>(array)?.value(row) };
     }
     Ok(Some(match field.data_type() {
+        DataType::Null => 0,
+        DataType::Float16 => return Err(Anomaly::unsupported("rtdb/jvm-half-float", "The pinned JVM vector factory rejects half-precision floats")),
         DataType::Boolean => if downcast::<BooleanArray>(array)?.value(row) { 17 } else { 19 },
         DataType::Int8 => double(f64::from(cell!(Int8Type))),
         DataType::Int16 => double(f64::from(cell!(Int16Type))),
@@ -261,7 +283,7 @@ pub fn hash_cell(field: &Field, array: &dyn Array, row: usize, seed: u32) -> Res
             let values = downcast::<MapArray>(array)?.value(row);
             (0..values.len()).try_fold(0, |hash, index| Ok::<i32, Anomaly>(combine(hash, hash_cell(child, &values, index, seed)?)))
         }
-        _ => match scalar_hash(field, array, row, seed)? {
+        _ => match scalar_hash_with(field, array, row, seed, xxhash32)? {
             Some(hash) => Ok(hash),
             None => hash_value(&read_value(field, array, row)?, seed),
         },

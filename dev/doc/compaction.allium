@@ -224,6 +224,8 @@ contract OutputSegmentLayout {
 
     @invariant PageMetadataReadsArrowCells
         -- Page metadata derives numeric statistics and logical presence from Arrow cells.
+        -- Ordinary list presence counts valid parent rows independently of the selected child values.
+        -- Numeric list bounds read supported Arrow children at their physical width, including half-precision floats.
 
     @invariant MillisecondDateStatisticsUseEpochDays
         -- A millisecond date's page statistics and value hash use its epoch day, obtained by truncating the stored milliseconds divided by milliseconds per day toward zero.

@@ -7,7 +7,10 @@ publish = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-buffer.workspace = true
+half.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 base64.workspace = true
 unicode-normalization.workspace = true
 serde.workspace = true

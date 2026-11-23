@@ -833,7 +833,11 @@ fn field_name(form: &Edn) -> Result<&str> {
 
 fn page_value(form: &Edn) -> Result<Value> {
     Ok(match &form.kind {
-        EdnKind::List(forms) | EdnKind::Vector(forms) => Value::list(forms.iter().map(page_value).collect::<Result<_>>()?),
+        EdnKind::List(forms) | EdnKind::Vector(forms) => {
+            let mut values = rtdb_types::ListBuilder::with_capacity(forms.len());
+            for form in forms { values.push(page_value(form)?); }
+            Value::List(values.finish())
+        }
         EdnKind::Set(forms) => Value::Set(forms.iter().map(page_value).collect::<Result<_>>()?),
         EdnKind::Map(fields) => Value::Struct(fields.iter().map(|(name, value)| Ok((normal(field_name(name)?), page_value(value)?))).collect::<Result<_>>()?),
         _ => crate::literal::value(form)?,

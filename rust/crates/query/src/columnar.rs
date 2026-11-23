@@ -969,7 +969,7 @@ fn projected_partition_keys_release_unrelated_source_buffers() {
     drop(input);
     assert!(memory.used_bytes() < 64 * 1024);
     assert!(matches!(keys.columns[0], Column::Arrow { .. }));
-    assert_eq!(keys.columns[0].value(0).unwrap(), Value::List(vec![Value::I64(20)]));
+    assert_eq!(keys.columns[0].value(0).unwrap(), Value::list(vec![Value::I64(20)]));
 }
 
 #[test]
@@ -1717,7 +1717,7 @@ fn projections_keep_typed_arrays_when_a_page_lacks_the_column() {
     let list = joined_nullable(&lists, &[(0, 0), (1, 0)], field, logical).unwrap().unwrap();
     assert!(matches!(list, Column::Arrow { .. }));
     assert_eq!(list.value(0).unwrap(), Value::Null);
-    assert_eq!(list.value(1).unwrap(), Value::List(vec![Value::I64(2)]));
+    assert_eq!(list.value(1).unwrap(), Value::list(vec![Value::I64(2)]));
 
     let scalars = [column(&int, Value::I64(1)), None, column(&text, Value::Utf8("three".into()))];
     let union = joined_union(&scalars, &[(2, 0), (1, 0), (0, 0)], "v").unwrap().unwrap();
@@ -2719,14 +2719,14 @@ mod tests {
         let homogeneous = ColumnBatch::take_rows(&sources, &[(0, 0)], &[0], &memory).unwrap();
         let (column, _charge) = homogeneous.collect_lists(vec![0, 1], vec![true], &output, &memory).unwrap();
         assert!(matches!(column, Column::Arrow { .. }));
-        assert_eq!(column.value(0).unwrap(), Value::List(vec![first.clone()]));
+        assert_eq!(column.value(0).unwrap(), Value::list(vec![first.clone()]));
 
         let heterogeneous = ColumnBatch::take_rows(&sources, &[(0, 0), (1, 0)], &[0], &memory).unwrap();
         let (column, _charge) = heterogeneous.collect_lists(vec![0, 2], vec![true], &output, &memory).unwrap();
-        assert_eq!(column.value(0).unwrap(), Value::List(vec![first.clone(), second]));
+        assert_eq!(column.value(0).unwrap(), Value::list(vec![first.clone(), second]));
         let sparse = ColumnBatch::take_rows(&sources, &[(0, 0), (2, 0)], &[0], &memory).unwrap();
         let (column, _charge) = sparse.collect_lists(vec![0, 2], vec![true], &output, &memory).unwrap();
-        assert_eq!(column.value(0).unwrap(), Value::List(vec![first, Value::Null]));
+        assert_eq!(column.value(0).unwrap(), Value::list(vec![first, Value::Null]));
     }
 
     #[test]

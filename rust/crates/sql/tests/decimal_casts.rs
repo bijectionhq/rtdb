@@ -134,6 +134,6 @@ async fn decimal_sum_raw_output_survives_identity_and_requires_valid_computed_pr
     assert_eq!(query(&format!("SELECT ARRAY[s] FROM {negative}")).await.unwrap_err().code, "rtdb/decimal-precision");
     assert_eq!(
         query("SELECT ARRAY[s] FROM (VALUES ('-9'::DECIMAL(1,0))) AS t(s)").await.unwrap().1,
-        Value::List(vec![decimal(-9, 1, 0, 128)]),
+        Value::list(vec![decimal(-9, 1, 0, 128)]),
     );
 }

@@ -121,6 +121,9 @@ pub(super) fn coerce(value: Value, schema: &ConnectSchema) -> Result<Value> {
     Ok(match (value, &schema.kind) {
         (Value::I32(value), SchemaKind::I8) => Value::I8(value as i8), (Value::I32(value), SchemaKind::I16) => Value::I16(value as i16),
         (Value::Struct(mut values), SchemaKind::Struct(fields)) => { for field in fields { if let Some(value) = values.remove(&field.name) { values.insert(field.name.clone(), coerce(value, &field.schema)?); } } Value::Struct(values) }
+        (Value::List(values), SchemaKind::Array(element))
+            if values.array().is_some()
+                && !matches!(element.resolved().kind, SchemaKind::I8 | SchemaKind::I16) => Value::List(values),
         (Value::List(values), SchemaKind::Array(element)) => Value::list(values.into_values().into_iter().map(|value| coerce(value, element)).collect::<Result<_>>()?),
         (Value::Map { entries, sorted }, SchemaKind::Map(key, value)) => Value::Map { entries: entries.into_iter().map(|(k, v)| Ok((coerce(k, key)?, coerce(v, value)?))).collect::<Result<_>>()?, sorted },
         (Value::List(values), SchemaKind::Map(key, value)) => Value::Map { entries: values.into_values().into_iter().map(|entry| {

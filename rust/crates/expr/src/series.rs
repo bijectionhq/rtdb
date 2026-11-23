@@ -16,7 +16,8 @@ impl IntegerSeries {
         Ok(Self { start, step, length })
     }
     pub(crate) fn len(self) -> usize { self.length }
-    pub(crate) fn nth(self, index: usize) -> Value { Value::I64(self.start.wrapping_add(self.step.wrapping_mul(index as i64))) }
+    pub(crate) fn at(self, index: usize) -> i64 { self.start.wrapping_add(self.step.wrapping_mul(index as i64)) }
+    pub(crate) fn nth(self, index: usize) -> Value { Value::I64(self.at(index)) }
 }
 
 pub(crate) enum GeneratedSeries { Null, Integer(IntegerSeries), Temporal(TemporalSeries) }

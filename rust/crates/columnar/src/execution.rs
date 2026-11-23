@@ -32,7 +32,11 @@ pub fn admit_execution_value(value: &mut Value) -> Result<()> {
         Value::U32(raw) => *value = Value::I32(*raw as i32),
         Value::U64(raw) => *value = Value::I64(*raw as i64),
         Value::List(values) | Value::FixedSizeList(values) => {
-            if let Some(values) = values.values_mut() { values.iter_mut().try_for_each(admit_execution_value)?; }
+            if let Some(values) = values.values_mut() {
+                values.iter_mut().try_for_each(admit_execution_value)?;
+            } else {
+                values.admit_signed();
+            }
         }
         Value::Set(values) => values.iter_mut().try_for_each(admit_execution_value)?,
         Value::Struct(fields) => fields.values_mut().try_for_each(admit_execution_value)?,

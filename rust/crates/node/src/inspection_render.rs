@@ -74,7 +74,15 @@ pub(crate) fn render(value: &Value) -> Result<String> {
             let endpoint = |value: i64, infinite: i64| if value == infinite { Ok("nil".into()) } else { render(&Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }) };
             format!("#xt/tstz-range [{} {}]", endpoint(*lower, i64::MIN)?, endpoint(*upper, i64::MAX)?)
         }
-        Value::List(_) | Value::FixedSizeList(_) => vector(value.list_view().unwrap().iter().map(|value| render(value.as_ref())).collect::<Result<Vec<_>>>()?),
+        Value::List(_) | Value::FixedSizeList(_) => {
+            let mut output = String::from("[");
+            for (index, value) in value.list_view().unwrap().iter().enumerate() {
+                if index > 0 { output.push(' '); }
+                output.push_str(&render(value.as_ref())?);
+            }
+            output.push(']');
+            output
+        }
         Value::Set(values) => format!("#{{{}}}", values.iter().map(render).collect::<Result<Vec<_>>>()?.join(" ")),
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", render(key)?, render(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Struct(fields) => document(fields)?,

@@ -2696,7 +2696,7 @@ mod tests {
         let page = columns.next_batch().await.unwrap().unwrap();
         assert!(page.columns.iter().all(|column| !matches!(column, crate::columnar::Column::Values(_))));
         let actual = page.columns.iter().map(|column| column.value(0).unwrap()).collect::<Vec<_>>();
-        assert_eq!(actual, [Value::List(vec![Value::I64(3), Value::I64(2)]), Value::I64(2), Value::F64(2.25)]);
+        assert_eq!(actual, [Value::list(vec![Value::I64(3), Value::I64(2)]), Value::I64(2), Value::F64(2.25)]);
         assert_eq!(actual, rows.next_page().await.unwrap().unwrap().rows()[0].values);
         assert!(columns.next_batch().await.unwrap().is_none());
     }
@@ -2935,9 +2935,9 @@ mod tests {
         use rtdb_plan::{Relation, RelationNode, Schema};
 
         let (state, table, _) = live_table_with_values(vec![
-            Value::List(vec![Value::I64(10), Value::I64(20)]),
+            Value::list(vec![Value::I64(10), Value::I64(20)]),
             Value::Null,
-            Value::List(vec![Value::I64(30)]),
+            Value::list(vec![Value::I64(30)]),
         ]);
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let (scan, execution, memory) = descriptor_scan(state.value().snapshot(), table, storage);

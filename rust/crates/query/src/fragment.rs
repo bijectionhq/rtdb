@@ -6,10 +6,10 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
 use futures::future::BoxFuture;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{Scan, TemporalFilter};
 use rtdb_storage::IoRegion;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -111,6 +111,93 @@ impl ScanFragment {
     pub fn database(&self) -> &str { &self.scan.table.name.database }
     pub fn table(&self) -> &TableRef { &self.scan.table.name.table }
 
+    pub fn for_wire(&self, memory: &Arc<MemoryBudget>) -> Result<(Self, Vec<(usize, rtdb_plan::Expr)>, FragmentBytes)> {
+        use rtdb_plan::Expr;
+        let mut fragment = self.clone();
+        fragment.scan.predicates.clear();
+        let mut predicates = Vec::new();
+        let mut arguments = Vec::new();
+        for (position, predicate) in self.scan.predicates.iter().enumerate() {
+            let mut predicate = predicate.clone();
+            let start = arguments.len();
+            predicate.rewrite(&mut |expr| {
+                if let Some(value) = numeric_literal(expr) {
+                    let data_type = value.logical_type();
+                    let index = arguments.len();
+                    arguments.push(value);
+                    *expr = Expr::Parameter { index, data_type };
+                }
+            });
+            if arguments.len() == start { fragment.scan.predicates.push(predicate); }
+            else { predicates.push((position, predicate)); }
+        }
+        let mut bytes = FragmentBytes::new(memory)?;
+        if !arguments.is_empty() {
+            let mut builder = rtdb_columnar::BatchBuilder::new(4096, memory)?;
+            let mut fields = Vec::with_capacity(arguments.len());
+            let mut columns = Vec::with_capacity(arguments.len());
+            for (position, value) in arguments.iter().enumerate() {
+                let logical = value.logical_type();
+                let values = std::slice::from_ref(value);
+                let field = rtdb_columnar::to_field(&format!("?{position}"), &logical)?;
+                let bound = rtdb_columnar::estimate_builder_bytes(&logical, values)?;
+                columns.push(builder.column(bound, || rtdb_columnar::copy_array(&logical, values))?);
+                fields.push(field);
+            }
+            let batch = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+                .map_err(|error| invalid("fragment-argument", error))?;
+            let batch = builder.finish(batch)?;
+            let scratch = rtdb_format::ipc::schema_translation_bound(batch.batch().schema_ref())?;
+            let payload = rtdb_columnar::shared_allocation_size(batch.batch())?;
+            let _scratch = memory.reserve(payload.checked_mul(4).and_then(|bytes| bytes.checked_add(scratch))
+                .ok_or_else(|| invalid("fragment-argument", "Argument encoding exceeds addressable memory"))?)?;
+            rtdb_format::ipc::write_stream_to(batch.batch().schema_ref(), [batch.batch()], &mut bytes)?;
+        }
+        Ok((fragment, predicates, bytes))
+    }
+
+    pub fn restore_wire_predicates(
+        &mut self, mut predicates: Vec<(usize, rtdb_plan::Expr)>, bytes: &[u8], memory: &Arc<MemoryBudget>,
+    ) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
+        use rtdb_plan::Expr;
+        let malformed = || invalid("fragment-argument", "Invalid delegated predicate argument");
+        let stream = rtdb_format::ipc::OwnedStream::read(bytes, memory)?;
+        let [page] = stream.pages() else { return Err(malformed()); };
+        let batch = page.batch();
+        if batch.num_rows() != 1 { return Err(malformed()); }
+        let mut arguments = Vec::with_capacity(batch.num_columns());
+        let mut reservation = memory.reserve(4096)?;
+        for (field, array) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+            let bound = rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)?;
+            let charge = Arc::get_mut(&mut reservation).expect("Fragment decoder owns its arguments");
+            charge.grow_to(charge.bytes().checked_add(bound).ok_or_else(malformed)?)?;
+            arguments.push(Some(rtdb_columnar::read_value(field, array.as_ref(), 0)?));
+        }
+        for (_, predicate) in &mut predicates {
+            let mut invalid_parameter = false;
+            predicate.rewrite(&mut |expr| {
+                if let Expr::Parameter { index, data_type } = expr {
+                    match arguments.get_mut(*index).and_then(Option::take) {
+                        Some(value) if value.logical_type() == *data_type => *expr = Expr::Literal(value),
+                        _ => invalid_parameter = true,
+                    }
+                }
+            });
+            if invalid_parameter || !portable(predicate) { return Err(malformed()); }
+        }
+        if arguments.iter().any(Option::is_some) { return Err(malformed()); }
+        let mut previous = None;
+        for (position, predicate) in predicates {
+            if position > self.scan.predicates.len() || previous.is_some_and(|previous| previous >= position) {
+                return Err(malformed());
+            }
+            self.scan.predicates.insert(position, predicate);
+            previous = Some(position);
+        }
+        Ok(reservation)
+    }
+
+
     /// The fragment of `scan` under `prefix`: its predicates and temporal filters stay with the coordinator, which filters
     /// the rows that come back, so the fragment carries only the projection and the bounds already evaluated.
     pub(crate) fn of(scan: &Scan, prefix: TriePrefix, basis: TransactionKey, residence: Option<FragmentResidence>, mut bounds: TemporalBounds, timezone: &str) -> Self {
@@ -123,6 +210,25 @@ impl ScanFragment {
             bounds.system_time = Interval::new(bounds.system_time.lower().min(basis.system_time), upper).expect("a nonempty interval up to the basis");
         }
         Self { scan, prefix, basis, residence, bounds, timezone: timezone.to_owned() }
+    }
+}
+
+fn numeric_literal(expr: &rtdb_plan::Expr) -> Option<Value> {
+    use rtdb_plan::Expr;
+    let scalar = |value: &Value| matches!(value, Value::Null | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_)
+        | Value::F16(_) | Value::F32(_) | Value::F64(_) | Value::Decimal(_));
+    match expr {
+        Expr::Literal(value @ (Value::List(values) | Value::FixedSizeList(values))) =>
+            (!values.is_empty() && values.array().is_some()).then(|| value.clone()),
+        Expr::List(items) if !items.is_empty() && items.iter().all(|expr| matches!(expr, Expr::Literal(value) if scalar(value))) => {
+            let mut values = rtdb_types::ListBuilder::with_capacity(items.len());
+            for item in items {
+                let Expr::Literal(value) = item else { unreachable!("checked literal list") };
+                values.push(value.clone());
+            }
+            Some(Value::List(values.finish()))
+        }
+        _ => None,
     }
 }
 
@@ -212,6 +318,10 @@ impl FragmentBytes {
 
     pub fn as_slice(&self) -> &[u8] { &self.bytes }
     pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+}
+
+impl AsRef<[u8]> for FragmentBytes {
+    fn as_ref(&self) -> &[u8] { self.as_slice() }
 }
 
 impl Write for FragmentBytes {
@@ -373,7 +483,7 @@ pub(crate) fn decode_batches(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result
                         let field: Arc<ArrowField> = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
                         fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?
                     }
-                    Some("values") => Column::Values((0..record.num_rows()).map(|row| read_value(field, array.as_ref(), row)).collect::<Result<_>>()?),
+                    Some("values") => fragment_column(Arc::clone(array), Arc::clone(field), None, memory, metadata_charge)?,
                     _ => return Err(malformed("A fragment column has no encoding")),
                 });
             }
@@ -399,6 +509,38 @@ mod tests {
             assert_eq!(next.to_be_bytes(), pair[1].range().0.0, "{} and {} leave no gap and do not overlap", pair[0], pair[1]);
         }
         assert!(FragmentDepth::new(0).is_err() && FragmentDepth::new(5).is_err() && TriePrefix::new(vec![4]).is_err());
+    }
+
+    #[test]
+    fn delegated_vector_predicates_round_trip_through_arrow_arguments() {
+        use rtdb_plan::{BinaryOp, Expr, QualifiedTable, TableBinding};
+        let vector = Expr::Literal(Value::list(vec![Value::F32(0.5), Value::Null, Value::F64(-1.0)]));
+        let predicates = vec![
+            Expr::Literal(Value::Bool(true)),
+            Expr::binary(BinaryOp::Eq, vector.clone(), vector),
+            Expr::Literal(Value::Bool(false)),
+        ];
+        let scan = Scan {
+            table: TableBinding { name: QualifiedTable { database: "db".into(), table: TableRef::new("public", "docs") },
+                oid: None, columns: Default::default() },
+            columns: Vec::new(), valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+            clamp_valid_time: false, iids: None, predicates: predicates.clone(), top_k: None,
+            ordered_top_k: None, matches: Vec::new(),
+        };
+        let fragment = ScanFragment::of(
+            &scan, TriePrefix::new(vec![]).unwrap(), TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(1) },
+            None, TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, "UTC",
+        );
+        let memory = MemoryBudget::new(4 << 20);
+        let (mut wire, headers, bytes) = fragment.for_wire(&memory).unwrap();
+        assert_eq!(wire.scan.predicates, vec![predicates[0].clone(), predicates[2].clone()]);
+        assert_eq!(headers[0].0, 1);
+        assert_eq!(headers.len(), 1);
+        let args = wire.restore_wire_predicates(headers, bytes.as_slice(), &memory).unwrap();
+        assert_eq!(wire.scan.predicates, predicates);
+        assert!(args.bytes() > 0);
+        drop((wire, bytes, args));
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
@@ -445,7 +587,7 @@ mod tests {
         let ints: arrow_array::ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(1), None, Some(3)]));
         let nested = vec![
             Value::Struct(rtdb_types::StructFields::from([("a".to_owned(), Value::I64(1)), ("b".to_owned(), Value::Utf8("x".into()))])),
-            Value::List(vec![Value::F64(f64::NAN), Value::Null]),
+            Value::list(vec![Value::F64(f64::NAN), Value::Null]),
             Value::Timestamp { value: 7, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) },
         ];
         let columns = vec![

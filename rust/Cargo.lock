@@ -5373,11 +5373,14 @@ name = "rtdb-types"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
+ "arrow-select",
  "base64 0.22.1",
  "bigdecimal",
  "chrono",
  "chrono-tz",
+ "half",
  "indexmap 2.14.2",
  "num-bigint",
  "num-traits",

@@ -10,7 +10,7 @@ fn transaction_object_owners_reject_wide_dates_before_durable_copying() {
         let document = StructFields::from([("d".into(), value.clone())]);
         for error in [
             Documents::new(vec![document.clone()], &memory).unwrap_err(),
-            SqlArguments::from_rows(vec![vec![Value::List(vec![value])]], &memory).unwrap_err(),
+            SqlArguments::from_rows(vec![vec![Value::list(vec![value])]], &memory).unwrap_err(),
             UserMetadata::new(Value::Struct(document), &memory).unwrap_err(),
         ] {
             assert_eq!(error.category, AnomalyCategory::Incorrect);

@@ -406,6 +406,44 @@ XTDB exposes pgwire and Arrow clients as separate interfaces and keeps Arrow buf
 
 The audit cross-checks all 27 entries in the historical inventory below and adds paths discovered by following list consumers and wire envelopes.
 
+### Arrow implementation after merging RTDB main
+
+The numbered rows correspond to the 28 entries above.
+Native execution can retain an Arrow array, retain the array and an index selection, or keep a typed child array inside a scalar list value.
+The latter preserves the numerical payload when an operator needs to own an individual row.
+Durable logs and external protocols still encode their prescribed formats.
+
+| # | Audit path | Implementation and boundary |
+| --- | --- | --- |
+| 1 | Row-created numeric lists | `ListValue` and `ListBuilder` retain signed and unsigned integers, Float16/32/64, decimal coefficients and validity in Arrow. Distinct component types use a dense union. Opened unsigned buffers can be reinterpreted at their signed width. |
+| 2 | SQL and logical-plan literals | SQL expression materialization and EDN literal input append directly to the numeric builder. SQL and EDN still parse their own text and evaluate each expression that contributes a cell. |
+| 3 | List-changing SQL | Casts and array aggregation append computed cells to the typed builder. Compatible trims slice the packed payload. An aggregate collecting whole vectors retains the inner Arrow payload even when its outer list is generic. |
+| 4 | UNNEST and list readers | Stored lists use the scan's Arrow child selections and parent indices. List-expression pages carry typed numeric vectors, indexed integer series generate signed Arrow vectors, and mixed nonnumeric expressions retain their value semantics. |
+| 5 | List indexing, comparison and hashing | Float comparison and ordering read typed components directly. Packed numeric hashing uses the same primitive codecs as Arrow cells. Indexing returns one value, and generic mixed-type comparison still evaluates the cells needed by SQL ordering. |
+| 6 | Generic layout and extensions | Supported numeric child arrays preserve validity, dense union tags and logical decimal metadata. Compatible layout changes use Arrow kernels. Decorated and nonnumeric child types still follow their own logical readers. The native schema reader retains its accepted layout contract. |
+| 7 | Scoring | Direct cosine reads selected Arrow cells. Cosine nested in other expressions reads Arrow or packed views where available, then computes the same score from the supplied components. Reference normalization and score accumulation use native computation state. |
+| 8 | Page presence statistics | Ordinary list presence uses parent validity. Typed page readers compute child numeric statistics, including Float16. |
+| 9 | Generic row spill | Row spill uses Arrow IPC, including per-record schemas for mixed fallback rows. Packed numeric children retain their widths and nulls when the result needs a new layout. |
+| 10 | Arrow bulk writes | Arrow COPY and uploaded Arrow document batches submit typed columns through the node and transaction writer. Admission checks the schema, identifiers and validity. |
+| 11 | Native row writes and DML | Columnar mutation output can pass document cells to the transaction writer. When a caller supplies rows or a mutation computes a row, the engine packs numerical lists before writing them. |
+| 12 | Source coalescing and replay | The source writer coalesces compatible Arrow data and chooses Arrow fields for evolving layouts. The replay path reads eligible record batches under their original source envelope. |
+| 13 | Prepared writes and replay | Native SQL arguments retain Arrow batches and preserve argument order through source IPC and replay. SQL parameters and documents retain separate schema and type rules. |
+| 14 | Event assembly, replay and compaction | Event writers and compaction gather selected Arrow cells, align fields and union legs, and add required temporal, IID and validity metadata. |
+| 15 | Query parameter admission | Native bindings retain typed arguments. The retained C Data ABI transfers immutable buffers with an independent owner. The default C Data ABI guarantees a snapshot from mutable input and the JVM adapter exports directly when all input columns share an allocator root. |
+| 16 | Scans, joins and row operators | Scan selections retain Arrow sources and positions. When evaluation needs an individual numeric list, it reads a typed range and keeps the resulting payload packed. |
+| 17 | Batched joins and aggregates | Compatible join keys and payloads use Arrow positions. Grouping and aggregate arithmetic keep their native algorithm state, and computed numeric list results use typed buffers. |
+| 18 | Bounded top-k and sort | Sort keeps keys and row positions and gathers selected payloads through Arrow. Spill runs use Arrow IPC. |
+| 19 | Result conformance | Arrow result clients receive batches aligned to their declared schema. Compatible arrays retain their original buffers, with Arrow relayout for changed physical fields and typed null padding. |
+| 20 | pgwire | Bind parses the PostgreSQL format and DataRow emits PostgreSQL field framing. Supported outputs encode from Arrow cells. Arrow COPY remains available for clients sending Arrow data. |
+| 21 | Transit COPY and JVM compatibility | Transit and EDN inputs parse their designated formats, and row results render those formats on request. Numeric arrays can enter typed storage during decoding. Arrow clients can remain columnar through C Data or Arrow IPC. |
+| 22 | PostgreSQL source and Kafka Connect | PostgreSQL snapshot and WAL decoding produce typed batches. Kafka decodes JSON or Avro and keeps compatible numeric buffers through document conversion and coercion. Conversions that change schema still apply the connector's coercion rules. |
+| 23 | Requested text and opaque values | Inspection can keep numeric arrays packed through operation decoding and render them directly. JSON, EDN, EXPLAIN and opaque Transit values keep their requested representations. |
+| 24 | Flight tickets | Run tickets carry Arrow IPC bytes in a versioned binary frame. New readers also redeem legacy JSON tickets. In a mixed deployment, route a binary run ticket to a reader that supports its version. |
+| 25 | Distributed scans | Replies carry bounded binary Arrow IPC. Eligible numeric predicate constants travel in a typed frame and return to the same predicate positions. A coordinator can still consume a legacy reply and evaluates its original predicates. |
+| 26 | Durable log envelopes | The encoder transfers uniquely held IPC buffers into protobuf fields with their reservations. Shared inputs may require a copy. The final protobuf frame retains the existing byte format. |
+| 27 | FTS and ordered sidecars | Postings, ordered keys and candidate IIDs serve their index algorithms. The embedding payload stays in primary Arrow data. |
+| 28 | Experimental ANN | Exact reranking binds a slice of the query fixture's Arrow buffer. HDF5 and NumPy remain fixture inputs. Centroids, heaps, range metadata and churn masks are algorithm state. |
+
 ### Remaining scalar paths
 
 **Historical audit before Arrow-backed row operators.**

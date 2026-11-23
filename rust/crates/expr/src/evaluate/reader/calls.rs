@@ -165,6 +165,19 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
                 if let Some(count) = count { return Ok(scalar(Value::I32(i32::try_from(count).map_err(|_| overflow())?))); }
             }
         }
+        if name == "cosine_distance" && let [left, right] = values.as_slice() {
+            fn stored_input<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::VectorInput<'a>> {
+                let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
+                match reader.as_ref() {
+                    ListReader::Stored(list) => Some(crate::vector::VectorInput::Stored(list.view())),
+                    ListReader::Arrow(cell) => crate::vector::VectorInput::from_arrow(*cell),
+                    _ => None,
+                }
+            }
+            if let (Some(left), Some(right)) = (stored_input(left), stored_input(right)) {
+                return Ok(scalar(crate::vector::score_pair(left, right)?));
+            }
+        }
         if name == "nth" { return subscript(values.remove(0),values.remove(0),frame)?.await; }
         if matches!(name.as_str(),"array_upper" | "array_lower" | "array_length") {
             if values.iter().any(is_null) { return Ok(scalar(Value::Null)); }

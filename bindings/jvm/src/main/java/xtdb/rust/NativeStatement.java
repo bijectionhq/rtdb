@@ -8,6 +8,7 @@ import org.apache.arrow.adbc.core.AdbcStatement;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -27,8 +28,12 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
         }
     }
     @Override public void bind(VectorSchemaRoot root) throws AdbcException {
-        try (VectorSchemaRoot copy = VectorSchemaRoot.create(root.getSchema(), connection.allocator);
-             ArrowArray array = ArrowArray.allocateNew(connection.allocator); ArrowSchema schema = ArrowSchema.allocateNew(connection.allocator)) {
+        BufferAllocator allocator = root.getFieldVectors().isEmpty() ? connection.allocator : root.getVector(0).getAllocator();
+        if (root.getFieldVectors().stream().allMatch(vector -> vector.getAllocator().getRoot() == allocator.getRoot())) {
+            bindFromAllocator(root, allocator);
+            return;
+        }
+        try (VectorSchemaRoot copy = VectorSchemaRoot.create(root.getSchema(), connection.allocator)) {
             copy.allocateNew();
             for (int column = 0; column < root.getFieldVectors().size(); column++) {
                 var source = root.getVector(column);
@@ -37,10 +42,18 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
                 target.setValueCount(root.getRowCount());
             }
             copy.setRowCount(root.getRowCount());
+            bindFromAllocator(copy, connection.allocator);
+        }
+    }
+    private void bindFromAllocator(VectorSchemaRoot root, BufferAllocator allocator) throws AdbcException {
+        try (ArrowArray array = ArrowArray.allocateNew(allocator); ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
             try {
-                Data.exportVectorSchemaRoot(connection.allocator, copy, null, array, schema);
+                Data.exportVectorSchemaRoot(allocator, root, null, array, schema);
                 abi.call("statement_bind", handle(), NativeAbi.address(array.memoryAddress()), NativeAbi.address(schema.memoryAddress()));
-            } finally { if (array.snapshot().release != 0) array.release(); if (schema.snapshot().release != 0) schema.release(); }
+            } finally {
+                if (array.snapshot().release != 0) array.release();
+                if (schema.snapshot().release != 0) schema.release();
+            }
         }
     }
     /** Accepts a Transit MessagePack array of positional argument rows; an empty array is an explicit empty batch. */
