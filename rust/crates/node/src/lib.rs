@@ -35,7 +35,7 @@ pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIde
 pub use node::{AppliedOwnedPoint, AppliedReadFloor};
 #[cfg(feature = "search")]
 pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
-pub use node::{archived_versions_at_cut, IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldAcceptedCut, OwnedWorldEffect, OwnedWorldFork, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldVersionRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
+pub use node::{archived_changes_at_cut, archived_versions_at_cut, IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldAcceptedCut, OwnedWorldEffect, OwnedWorldFork, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldVersionRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
 
 mod statement;
 pub use statement::{PreparedSql, ResultSignaturePolicy};

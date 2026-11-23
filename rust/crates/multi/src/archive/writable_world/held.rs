@@ -99,6 +99,17 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<Vec<(Interval, Timestamp)>>>,
     },
+    ParentChangesAt {
+        relation: OwnedRelation,
+        selected: Timestamp,
+        after: Timestamp,
+        through: Timestamp,
+        limit: usize,
+        reverse: bool,
+        schema: rtdb_types::OwnedSchema,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<rtdb_node::OwnedMergedChanges>>,
+    },
     ParentVersionsAt {
         relation: OwnedRelation,
         id: EntityId,
@@ -429,6 +440,29 @@ impl HeldCheckpointWorld {
         self.check_relation(relation)?;
         Ok((schedule, witness))
     }
+     pub async fn parent_changes_at(
+        &self, relation: &OwnedRelation, selected: Timestamp, after: Timestamp,
+        through: Timestamp, limit: usize, reverse: bool,
+    ) -> Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)> {
+        self.check_relation(relation)?;
+        if after > through || through > selected || selected >= self.parent_basis().system_time {
+            return Err(OwnedWorld::unavailable());
+        }
+        let schema = self.historical_parent_schema(relation)?.clone();
+        let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+        if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let guard = self.open.snapshot.relation_release_guard([relation])?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentChangesAt {
+            relation: relation.clone(), selected, after, through, limit, reverse, schema, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let page = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        guard()?;
+        self.check_relation(relation)?;
+        Ok((page, witness))
+    }
+
     pub async fn parent_versions_at(
         &self, relation: &OwnedRelation, id: &EntityId, selected: Timestamp, request: rtdb_node::OwnedVersionRequest,
     ) -> Result<(rtdb_flight_sql::WorldParentVersions, OwnedWorldWitness)> {
@@ -1439,6 +1473,25 @@ pub(crate) async fn open_held_checkpoint_world(
                                         }
                                         context.check_cancelled()?;
                                         Ok(schedule)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::ParentChangesAt { relation, selected, after, through, limit, reverse, schema, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        check_archive_coverage(&context, &owner, [(&relation, 0)])?;
+                                        let capped = exact_historical_parent_context(Arc::clone(&context), &owner, selected, &[]).await?;
+                                        let actual = rtdb_query::read_owned_relation_schema(capped, &owner, &relation).await?;
+                                        if !actual.is_some_and(|(actual, _)| actual == schema) {
+                                            return Err(OwnedWorld::unavailable());
+                                        }
+                                        rtdb_node::archived_changes_at_cut(context, &owner, &relation, after, through, limit, reverse).await
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,

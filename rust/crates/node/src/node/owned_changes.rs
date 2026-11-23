@@ -720,6 +720,85 @@ impl OwnedReadSession {
     }
 }
 
+/// Read whole accepted groups from the original pinned Root archive.
+pub async fn archived_changes_at_cut(
+    context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
+    after: Timestamp, through: Timestamp, limit: usize, reverse: bool,
+) -> Result<OwnedMergedChanges> {
+    let present = context.current_time.as_micros()?;
+    if !relation.is_root_data() || after > through || through > present
+        || !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
+    {
+        return Err(change_feed_uncovered());
+    }
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+    if snapshot.system_time_cap() != Some(present) { return Err(change_feed_uncovered()); }
+    let initial = (1 + limit) * 512;
+    let mut page = OwnedMergedChanges {
+        commits: Vec::with_capacity(limit),
+        retained_bytes: initial,
+        _reservations: vec![context.memory.reserve(initial)?],
+        complete: true,
+        complete_boundary: if reverse { after } else { through },
+    };
+    let Some(journal) = cover_journal(&context, snapshot, owner, relation, present, after).await? else {
+        context.check_cancelled()?;
+        return Ok(page);
+    };
+    let first = if after >= journal.head.committed_at { journal.head_revision + 1 }
+        else { journal_boundary(&context, owner, relation, &journal, after.next()?).await? };
+    let end = if through >= journal.head.committed_at { journal.head_revision + 1 }
+        else { journal_boundary(&context, owner, relation, &journal, through.next()?).await? };
+    if first > end { return Err(change_feed_uncovered()); }
+    let count = usize::try_from(end - first).map_err(|_| change_feed_uncovered())?;
+    for offset in 0..count.min(limit) {
+        context.check_cancelled()?;
+        let offset = i64::try_from(offset).map_err(|_| change_feed_uncovered())?;
+        let seq = if reverse { end - 1 - offset } else { first + offset };
+        let header = read_owned_journal_header(Arc::clone(&context), owner, relation, seq).await?;
+        let previous = if seq == 1 { journal.floor } else {
+            read_owned_journal_header(Arc::clone(&context), owner, relation, seq - 1).await?
+        };
+        let entry = read_owned_change_entry(Arc::clone(&context), owner, relation, seq).await?;
+        let Value::List(touches) = entry.value else { return Err(change_feed_uncovered()); };
+        let events = i64::try_from(touches.len()).map_err(|_| change_feed_uncovered())?;
+        if events == 0 || entry.system_time != header.committed_at || entry.through_events != header.through_events
+            || previous.through_events.checked_add(events) != Some(header.through_events)
+            || (seq == 1 && previous.committed_at != header.committed_at)
+            || (seq > 1 && previous.committed_at >= header.committed_at)
+            || !ordered_or_same(journal.head_revision, seq, journal.head, header)
+            || header.committed_at <= after || header.committed_at > through
+        {
+            return Err(change_feed_uncovered());
+        }
+        let bytes = touches.iter().try_fold(0usize, |bytes, touch| {
+            bytes.checked_add(touch.retained_bytes()?).and_then(|bytes| bytes.checked_add(128))
+                .filter(|bytes| *bytes <= OWNED_CHANGE_GROUP_BYTES).ok_or_else(change_feed_uncovered)
+        })? + 512;
+        if bytes > OWNED_CHANGE_PAGE_BYTES - page.retained_bytes {
+            if page.commits.is_empty() { return Err(change_feed_uncovered()); }
+            break;
+        }
+        let reservation = context.memory.reserve(bytes)?;
+        let touches = touches.iter().map(OwnedChange::from_value).collect::<Result<Vec<_>>>()?;
+        if touches.iter().any(|touch| !matches!(touch.kind,
+            rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete))
+        {
+            return Err(change_feed_uncovered());
+        }
+        page.retained_bytes += bytes;
+        page._reservations.push(reservation);
+        page.commits.push(OwnedChangeCommit {
+            revision: header.committed_at,
+            changes: vec![OwnedRelationChanges { relation: relation.clone(), sequence: seq as u64, touches }],
+        });
+    }
+    page.complete = page.commits.len() == count;
+    context.check_cancelled()?;
+    Ok(page)
+}
+
 /// Pages a single Root address in a caller-admitted, pinned archive generation.
 pub async fn archived_versions_at_cut(
     context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,

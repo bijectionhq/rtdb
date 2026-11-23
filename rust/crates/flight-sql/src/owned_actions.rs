@@ -202,6 +202,7 @@ pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWo
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
+pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
@@ -1524,6 +1525,35 @@ impl Service {
         Ok((relation, id, OwnedVersionRequest { system, after, scan_limit, result_limit, order }, identity))
     }
 
+    pub(crate) async fn held_world_parent_changes_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent changes require a held world"))?;
+        let (selected, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require a selected publication"))?;
+        let (after, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require an exclusive revision"))?;
+        let (through, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require an upper revision"))?;
+        let (limit, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Earlier parent changes require a group limit"))?;
+        let (direction, rest) = rest.split_first().ok_or_else(|| invalid("Earlier parent changes require a direction"))?;
+        let reverse = match *direction {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid earlier parent changes direction")),
+        };
+        let (relation, tail) = split_relation(rest)?;
+        if !tail.is_empty() { return Err(invalid("Earlier parent changes have trailing bytes")); }
+        let selected = Timestamp(i64::from_be_bytes(*selected));
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (page, witness) = held.snapshot.parent_changes_at(
+            &relation, selected, Timestamp(i64::from_be_bytes(*after)),
+            Timestamp(i64::from_be_bytes(*through)), usize::from(u16::from_be_bytes(*limit)), reverse,
+        ).await.map_err(status)?;
+        let nonce = held.remember(call, witness, false)?;
+        let reply = self.owned_merged_changes_reply(&page, selected, reverse, Some(nonce))?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
     pub(crate) async fn held_world_parent_versions_action(
         &self, call: &Call, body: &[u8],
     ) -> Result<Vec<ActionResult>, Status> {
@@ -2177,7 +2207,7 @@ impl Service {
         } else {
             held.snapshot.merged_changes_at(&relations, after, through, limit).await
         }.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending, None)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
@@ -2188,7 +2218,7 @@ impl Service {
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
         let page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending, None)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
@@ -2217,7 +2247,7 @@ impl Service {
     }
 
     fn owned_merged_changes_reply(
-        &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp, descending: bool,
+        &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp, descending: bool, witness: Option<Uuid>,
     ) -> Result<ActionResult, Status> {
         use rtdb_types::{LogicalType, ScalarType};
 
@@ -2229,6 +2259,9 @@ impl Service {
             (OWNED_PRESENT.into(), present.0.to_string()),
             (OWNED_CHANGE_COVERAGE.into(), page.covered_through().map_err(status)?.0.to_string()),
         ]);
+        if let Some(witness) = witness {
+            metadata.insert(WORLD_RANGE_WITNESS.into(), witness.simple().to_string());
+        }
         if descending {
             metadata.insert("rtdb.owned.change_complete".into(), page.is_complete().to_string());
         }
