@@ -194,6 +194,6 @@ fn add(left: usize, right: usize) -> Result<usize> { check_size(left.checked_add
 fn check_size(size: usize) -> Result<usize> { if size > i32::MAX as usize { Err(overflow()) } else { Ok(size) } }
 fn illegal(message: &str) -> Anomaly { Anomaly::incorrect("xtdb.expression/illegal-argument-exception", message) }
 
-fn float_text(value: f64, single: Option<f32>) -> String {
+pub(crate) fn float_text(value: f64, single: Option<f32>) -> String {
     single.map_or_else(|| rtdb_types::java_f64_text(value), rtdb_types::java_f32_text)
 }

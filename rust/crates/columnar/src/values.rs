@@ -4,9 +4,9 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 use arrow_schema::{DataType, Field, Fields, UnionMode};
-use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, ListKind, ListValue, ListView, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
+use rtdb_types::{Anomaly, ListBuilder, DecimalValue, IntervalUnit, ListKind, ListValue, ListView, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
 
-use crate::{from_field, to_field};
+use crate::{from_field, leg_name, to_field};
 
 /// Builds arrays with exact logical value types; numeric coercions belong to expressions.
 /// Undefined cells are accepted only for bottom-typed fields.
@@ -414,8 +414,11 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
         if item.metadata().is_empty() && let Some(array) = build_float_lists(item, width, values)? {
             return Ok(array);
         }
-        if ListValue::supports_numeric_arrow(item)
-            && let Some(array) = build_numeric_lists(item, width, values, check_precision)?
+        let packed_scalars = matches!(item.data_type(), DataType::Utf8 | DataType::Date32 | DataType::Date64
+            | DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(..) | DataType::Duration(_))
+            && values.iter().any(|value| matches!(value.list_view(), Some(ListView::Scalars(_))));
+        if (ListValue::supports_numeric_arrow(item) || packed_scalars)
+            && let Some(array) = build_packed_lists(item, width, values, check_precision)?
         {
             return Ok(array);
         }
@@ -510,7 +513,7 @@ fn build_float_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value]) ->
     }
 }
 
-fn build_numeric_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], check_precision: bool) -> Result<Option<ArrayRef>> {
+fn build_packed_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], check_precision: bool) -> Result<Option<ArrayRef>> {
     if width.is_some_and(|width| width <= 0) { return Ok(None); }
     let padding = width.map(|width| arrow_array::new_null_array(item.data_type(), width as usize));
     let mut children = Vec::with_capacity(values.len());
@@ -526,6 +529,9 @@ fn build_numeric_lists(item: &Arc<Field>, width: Option<i32>, values: &[Value], 
                     ListView::F32(array) => (Field::new(item.name(), DataType::Float32, array.null_count() != 0), Arc::new(array.clone())),
                     ListView::F64(array) => (Field::new(item.name(), DataType::Float64, array.null_count() != 0), Arc::new(array.clone())),
                     ListView::Union(array) => (Field::new(item.name(), array.data_type().clone(), false), Arc::new(array.clone())),
+                    ListView::Scalars(values) if values.field().data_type() == item.data_type()
+                        && values.field().metadata() == item.metadata() => (values.field().as_ref().clone(), Arc::clone(values.array())),
+                    ListView::Scalars(_) => return Ok(None),
                     ListView::Values(_) if list.is_empty() => (item.as_ref().clone(), arrow_array::new_empty_array(item.data_type())),
                     ListView::Values(_) => return Ok(None),
                 };
@@ -804,6 +810,12 @@ fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn 
         let packed = ListValue::from_numeric_arrow(Arc::clone(child_field), copied).ok_or_else(layout_error)?;
         return Ok(if matches!(kind, ListKind::List) { Value::List(packed) } else { Value::FixedSizeList(packed) });
     }
+    if matches!(kind, ListKind::List | ListKind::FixedSizeList(_))
+        && let Some(span) = numeric_list_span(child_field, values.as_ref(), 0..values.len(), element)
+        && let Some(list) = repack_numeric_list(&span, false)
+    {
+        return Ok(if matches!(kind, ListKind::List) { Value::List(list) } else { Value::FixedSizeList(list) });
+    }
     let values = (0..values.len()).map(|index| read_typed(element, child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
     match kind {
         ListKind::List => Ok(Value::list(values)),
@@ -826,6 +838,32 @@ fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn 
             Ok(Value::Map { entries, sorted: *sorted })
         }
     }
+}
+
+pub(crate) fn numeric_list_span<'a>(
+    field: &'a Field, array: &'a dyn Array, range: std::ops::Range<usize>, element: &LogicalType,
+) -> Option<rtdb_types::NumericSpan<'a>> {
+    let span = rtdb_types::NumericSpan::new(field, array, range)?;
+    if &from_field(field).ok()? != element { return None; }
+    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+        if let LogicalType::Union(legs) = element {
+            for (_, child) in fields.iter() {
+                let actual = from_field(child).ok()?;
+                if legs.iter().any(|leg| leg_name(leg).is_ok_and(|name| &name == child.name()) && actual.legs().iter().all(|ty| ty != leg)) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(span)
+}
+
+pub fn repack_numeric_list(span: &rtdb_types::NumericSpan<'_>, signed: bool) -> Option<ListValue> {
+    let mut builder = ListBuilder::with_capacity(span.len());
+    for value in span.iter() {
+        if !builder.try_push_numeric(if signed { value.signed() } else { value }) { return None; }
+    }
+    Some(builder.finish())
 }
 
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
@@ -877,6 +915,39 @@ mod tests {
         assert!(matches!(decoded[2].list_view(), Some(ListView::Union(_))));
         let copied = copy_array(&logical, &decoded).unwrap();
         assert_eq!(copied.to_data(), column.to_data());
+    }
+
+    #[test]
+    fn annotated_numeric_children_repack_their_selected_legs_in_observed_order() {
+        let label = std::collections::HashMap::from([("label".into(), "sample".into())]);
+        let decimal = rtdb_types::decimal_arrow::with_decimal_parameters(
+            Field::new("decimal-12--400-128", DataType::Decimal128(12, 1), false).with_metadata(label.clone()),
+            rtdb_types::decimal_arrow::DecimalParameters { precision: 12, scale: -400, bit_width: 128 },
+        ).unwrap();
+        let tags = arrow_schema::UnionFields::try_new([7, 2, 4], [
+            decimal,
+            Field::new("u32", DataType::UInt32, true).with_metadata(label.clone()),
+            Field::new("f32", DataType::Float32, false),
+        ]).unwrap();
+        let nan = f32::from_bits(0x7fc00071);
+        let child = UnionArray::try_new(tags, vec![7, 4, 2, 2, 7].into(), Some(vec![0, 0, 1, 0, 0].into()), vec![
+            Arc::new(Decimal128Array::from(vec![123]).with_precision_and_scale(12, 1).unwrap()),
+            Arc::new(UInt32Array::from(vec![None, Some(u32::MAX)])),
+            Arc::new(Float32Array::from(vec![nan])),
+        ]).unwrap();
+        let item = Arc::new(Field::new("$data$", child.data_type().clone(), true).with_metadata(label));
+        let list = ListArray::try_new(item, OffsetBuffer::new(vec![0, 1, 5].into()), Arc::new(child), None).unwrap();
+        let field = Field::new("v", list.data_type().clone(), false);
+        let span = crate::ArrowCell { field: &field, array: &list, row: 1 }.numeric_list_span().unwrap();
+        assert!(matches!(span.get(1), Some(rtdb_types::NumericCell::U32(u32::MAX))));
+        let expected = Value::list(vec![
+            Value::F32(nan), Value::U32(u32::MAX), Value::Null,
+            Value::Decimal(DecimalValue::new(123_i128.to_be_bytes().to_vec(), 12, -400, 128).unwrap()),
+        ]);
+        let Value::List(expected) = expected else { unreachable!() };
+        let Value::List(actual) = read_value(&field, &list, 1).unwrap() else { panic!("expected list"); };
+        assert_eq!(actual.element_type(), expected.element_type());
+        assert_eq!(actual.array().unwrap().to_data(), expected.array().unwrap().to_data());
     }
 
     #[test]

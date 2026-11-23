@@ -1,7 +1,7 @@
 use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
 use rtdb_plan::BinaryOp;
-use rtdb_types::{Anomaly, DecimalValue, LogicalType, Result, ScalarType, Value};
+use rtdb_types::{Anomaly, DecimalValue, LogicalType, NumericCell, Result, ScalarType, Value};
 
 pub fn integer(value: &Value) -> Option<i128> {
     match value {
@@ -37,14 +37,7 @@ pub(crate) fn decimal_value(value: BigDecimal, precision: i32, scale: i32, bit_w
 }
 
 pub(crate) fn integer_value(value: i128, ty: &ScalarType) -> Result<Value> {
-    macro_rules! convert { ($ty:ty, $variant:ident) => { <$ty>::try_from(value).map(Value::$variant).map_err(|_| overflow()) }; }
-    match ty {
-        ScalarType::I8 => convert!(i8, I8), ScalarType::I16 => convert!(i16, I16),
-        ScalarType::I32 => convert!(i32, I32), ScalarType::I64 => convert!(i64, I64),
-        ScalarType::U8 => convert!(u8, U8), ScalarType::U16 => convert!(u16, U16),
-        ScalarType::U32 => convert!(u32, U32), ScalarType::U64 => convert!(u64, U64),
-        _ => Err(inapplicable("integer conversion", &[])),
-    }
+    integer_cell(value, ty).map(rtdb_types::NumericCell::into_value)
 }
 
 pub(crate) fn floating_value(value: f64, ty: &ScalarType) -> Value {
@@ -117,25 +110,53 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
     let ty = LogicalType::least_upper_bound(&[left.logical_type(), right.logical_type()]);
     let Some(LogicalType::Scalar(ty)) = ty else { return Err(inapplicable(arithmetic_name(op), &[left, right])); };
     if let (Some(a), Some(b)) = (integer(left), integer(right)) {
-        if op == B::Modulo && let (Ok(a), Ok(b)) = (i64::try_from(a), i64::try_from(b)) {
-            return integer_value(i128::from(signed_modulo(a, b)?), &ty);
-        }
-        if matches!(op, B::Divide | B::Modulo) && b == 0 { return Err(division_by_zero()); }
-        let result = match op {
-            B::Add => a.checked_add(b), B::Subtract => a.checked_sub(b), B::Multiply => a.checked_mul(b),
-            B::Divide => a.checked_div(b), B::Modulo => { let r = a % b; Some(if r != 0 && (r < 0) != (b < 0) { r + b } else { r }) },
-            _ => None,
-        }.ok_or_else(overflow)?;
-        return integer_value(result, &ty);
+        return integer_value(integer_arithmetic(op, a, b)?, &ty);
     }
-    if let (Some(a), Some(b)) = (number(left), number(right)) {
-        if op == B::Divide && b == 0.0 { return Err(division_by_zero()); }
-        let value = match op {
-            B::Add => a + b, B::Subtract => a - b, B::Multiply => a * b, B::Divide => a / b,
-            B::Modulo => float_modulo(a, b)?,
-            _ => return Err(inapplicable(arithmetic_name(op), &[left, right])),
-        };
-        return Ok(floating_value(value, &ty));
+    if let (Some(a), Some(b)) = (number(left), number(right))
+        && let Some(result) = float_arithmetic(op, a, b)
+    {
+        return Ok(floating_value(result?, &ty));
     }
     Err(inapplicable(arithmetic_name(op), &[left, right]))
+}
+
+pub(crate) fn integer_arithmetic(op: BinaryOp, a: i128, b: i128) -> Result<i128> {
+    use BinaryOp as B;
+    if op == B::Modulo && let (Ok(a), Ok(b)) = (i64::try_from(a), i64::try_from(b)) {
+        return signed_modulo(a, b).map(i128::from);
+    }
+    if matches!(op, B::Divide | B::Modulo) && b == 0 { return Err(division_by_zero()); }
+    match op {
+        B::Add => a.checked_add(b), B::Subtract => a.checked_sub(b), B::Multiply => a.checked_mul(b),
+        B::Divide => a.checked_div(b),
+        B::Modulo => {
+            let r = a % b;
+            Some(if r != 0 && (r < 0) != (b < 0) { r + b } else { r })
+        }
+        _ => None,
+    }.ok_or_else(overflow)
+}
+
+pub(crate) fn float_arithmetic(op: BinaryOp, a: f64, b: f64) -> Option<Result<f64>> {
+    use BinaryOp as B;
+    Some(Ok(match op {
+        B::Add => a + b, B::Subtract => a - b, B::Multiply => a * b,
+        B::Divide if b == 0.0 => return Some(Err(division_by_zero())),
+        B::Divide => a / b,
+        B::Modulo => return Some(float_modulo(a, b)),
+        _ => return None,
+    }))
+}
+
+pub(crate) fn integer_cell(value: i128, ty: &ScalarType) -> Result<NumericCell> {
+    use NumericCell as N;
+    use ScalarType as S;
+    macro_rules! checked {
+        ($ty:ty, $variant:ident) => { <$ty>::try_from(value).map(N::$variant).map_err(|_| overflow()) };
+    }
+    match ty {
+        S::I8 => checked!(i8, I8), S::I16 => checked!(i16, I16), S::I32 => checked!(i32, I32), S::I64 => checked!(i64, I64),
+        S::U8 => checked!(u8, U8), S::U16 => checked!(u16, U16), S::U32 => checked!(u32, U32), S::U64 => checked!(u64, U64),
+        _ => Err(crate::numeric::inapplicable("integer conversion", &[])),
+    }
 }

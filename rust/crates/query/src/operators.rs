@@ -1306,7 +1306,14 @@ pub(crate) fn equality_hash(values: &[Value], timezone: &str) -> u32 {
         match value {
             Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
             Value::Set(values) => values.iter().any(temporal),
-            Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(temporal)),
+            Value::List(values) | Value::FixedSizeList(values) => match values.view() {
+                rtdb_types::ListView::Values(values) => values.iter().any(temporal),
+                rtdb_types::ListView::Scalars(values) => {
+                    matches!(values.field().data_type(), arrow_schema::DataType::Timestamp(..) | arrow_schema::DataType::Date32 | arrow_schema::DataType::Date64)
+                        && values.array().null_count() < values.array().len()
+                }
+                _ => false,
+            },
             Value::Struct(fields) => fields.values().any(temporal),
             Value::Map { entries, .. } => entries.iter().any(|(key, value)| temporal(key) || temporal(value)),
             _ => false,
@@ -2023,6 +2030,20 @@ mod uri_equality_tests {
 mod equality_allocation_tests {
     use super::*;
     use rtdb_format::transit::{TransitValue,encode_msgpack};
+
+    #[test]
+    fn packed_temporal_lists_share_the_hash_of_equivalent_scalar_lists() {
+        let target = rtdb_plan::CastTarget::List(Box::new(rtdb_plan::CastTarget::Fixed(
+            LogicalType::Scalar(rtdb_types::ScalarType::DateDay),
+        )));
+        let source = Value::list(vec![Value::Utf8("1970-01-02".into())]);
+        let packed = [rtdb_expr::cast_target(&source, &target, "UTC").unwrap()];
+        let scalar = [Value::list(vec![Value::DateDay(1)])];
+        assert!(matches!(packed[0].list_view(), Some(rtdb_types::ListView::Scalars(_))));
+        assert_eq!(equality_hash(&packed, "UTC"), equality_hash(&scalar, "UTC"));
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        assert!(rows_equal(&packed, &scalar, "UTC", &memory).unwrap());
+    }
 
     #[test]
     fn transit_comparison_scopes_release_between_cells_rows_and_failures() {

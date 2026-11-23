@@ -4,7 +4,7 @@ use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, UnionArray};
 use arrow_schema::{DataType, Field, UnionMode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Anomaly, LogicalType, Result, ScalarType, Value, numeric_list::{self, NumericList, NumericListBuilder}};
+use crate::{Anomaly, ScalarList, LogicalType, Result, ScalarType, Value, numeric_list::{self, NumericCell, NumericList, NumericListBuilder}};
 
 #[derive(Clone)]
 pub struct ListValue(Storage);
@@ -16,6 +16,7 @@ enum Storage {
     F64(Arc<Float64Array>),
     Union(Arc<UnionArray>),
     Numeric(NumericList),
+    Scalars(ScalarList),
 }
 
 #[derive(Clone, Copy)]
@@ -25,6 +26,7 @@ pub enum ListView<'a> {
     F64(&'a Float64Array),
     Union(&'a UnionArray),
     Numeric(&'a NumericList),
+    Scalars(&'a ScalarList),
 }
 
 impl<'a> ListView<'a> {
@@ -35,6 +37,7 @@ impl<'a> ListView<'a> {
             Self::F64(values) => values.len(),
             Self::Union(values) => values.len(),
             Self::Numeric(values) => values.array().len(),
+            Self::Scalars(values) => values.array().len(),
         }
     }
 
@@ -47,6 +50,7 @@ impl<'a> ListView<'a> {
         Some(match self {
             Self::Values(values) => Cow::Borrowed(&values[index]),
             Self::Numeric(values) => Cow::Owned(values.value(index)),
+            Self::Scalars(values) => Cow::Owned(values.value(index)),
             Self::F32(values) => Cow::Owned(if values.is_null(index) { Value::Null } else { Value::F32(values.value(index)) }),
             Self::F64(values) => Cow::Owned(if values.is_null(index) { Value::Null } else { Value::F64(values.value(index)) }),
             Self::Union(values) => {
@@ -65,6 +69,26 @@ impl<'a> ListView<'a> {
         })
     }
 
+    pub fn is_packed_numeric(self) -> bool { !matches!(self, Self::Values(_) | Self::Scalars(_)) }
+
+    pub fn numeric_component(self, index: usize) -> NumericCell {
+        match self {
+            Self::F32(values) => if values.is_null(index) { NumericCell::Null } else { NumericCell::F32(values.value(index)) },
+            Self::F64(values) => if values.is_null(index) { NumericCell::Null } else { NumericCell::F64(values.value(index)) },
+            Self::Union(values) => {
+                let child = values.child(values.type_id(index));
+                let offset = values.value_offset(index);
+                if child.is_null(offset) { return NumericCell::Null; }
+                if let Some(values) = child.as_any().downcast_ref::<Float32Array>() { return NumericCell::F32(values.value(offset)); }
+                if let Some(values) = child.as_any().downcast_ref::<Float64Array>() { return NumericCell::F64(values.value(offset)); }
+                NumericCell::Null
+            }
+            Self::Numeric(values) => values.numeric_component(index),
+            Self::Values(values) => NumericCell::from_value(&values[index]).expect("numeric component"),
+            Self::Scalars(_) => panic!("expected a numeric list"),
+        }
+    }
+
     pub fn float_component(self, index: usize) -> Option<f64> {
         let primitive = |array: &dyn Array, index| {
             if array.is_null(index) { return None; }
@@ -77,7 +101,7 @@ impl<'a> ListView<'a> {
             Self::F32(values) => (!values.is_null(index)).then(|| f64::from(values.value(index))),
             Self::F64(values) => (!values.is_null(index)).then(|| values.value(index)),
             Self::Union(values) => primitive(values.child(values.type_id(index)).as_ref(), values.value_offset(index)),
-            Self::Numeric(_) | Self::Values(_) => None,
+            Self::Numeric(_) | Self::Values(_) | Self::Scalars(_) => None,
         }
     }
 
@@ -107,6 +131,7 @@ impl ListValue {
     pub fn supports_numeric_arrow(field: &Field) -> bool { numeric_list::supported(field) }
 
     pub fn from_numeric_arrow(field: Arc<Field>, values: ArrayRef) -> Option<Self> {
+        if field.data_type() != values.data_type() { return None; }
         if field.metadata().is_empty() {
             if let Some(array) = values.as_any().downcast_ref::<Float32Array>() {
                 return Some(Self::from_f32(array.clone()));
@@ -123,6 +148,10 @@ impl ListValue {
         NumericList::new(field, values).map(|values| Self(Storage::Numeric(values)))
     }
 
+    pub fn from_scalar_arrow(field: Arc<Field>, values: ArrayRef) -> Option<Self> {
+        ScalarList::new(field, values).map(|values| Self(Storage::Scalars(values)))
+    }
+
     pub fn from_float_union(values: UnionArray) -> Option<Self> {
         Self::supports_float_union(values.data_type()).then(|| Self(Storage::Union(Arc::new(values))))
     }
@@ -134,6 +163,7 @@ impl ListValue {
             Storage::F64(values) => ListView::F64(values),
             Storage::Union(values) => ListView::Union(values),
             Storage::Numeric(values) => ListView::Numeric(values),
+            Storage::Scalars(values) => ListView::Scalars(values),
         }
     }
 
@@ -145,6 +175,11 @@ impl ListValue {
             Storage::F64(values) => Some(Self::from_f64(values.slice(offset, length))),
             Storage::Union(values) => Self::from_float_union(values.slice(offset, length)),
             Storage::Numeric(values) => Some(Self(Storage::Numeric(values.slice(offset, length)))),
+            Storage::Scalars(values) => {
+                let slice = values.slice(offset, length);
+                if slice.array().null_count() == length { Self::from_numeric_arrow(Arc::new(Field::new("null", DataType::Null, true)), Arc::new(arrow_array::NullArray::new(length))) }
+                else { Some(Self(Storage::Scalars(slice))) }
+            },
             Storage::Values(_) => None,
         }
     }
@@ -156,6 +191,7 @@ impl ListValue {
             Storage::F64(values) => Some(values.as_ref()),
             Storage::Union(values) => Some(values.as_ref()),
             Storage::Numeric(values) => Some(values.array().as_ref()),
+            Storage::Scalars(values) => Some(values.array().as_ref()),
         }
     }
 
@@ -170,6 +206,7 @@ impl ListValue {
             Storage::F64(array) => array.clone(),
             Storage::Union(array) => array.clone(),
             Storage::Numeric(values) => return Some((Arc::clone(values.field()), Arc::clone(values.array()))),
+            Storage::Scalars(values) => return Some((Arc::clone(values.field()), Arc::clone(values.array()))),
         };
         Some((Arc::new(Field::new("value", array.data_type().clone(), array.is_nullable())), array))
     }
@@ -197,6 +234,7 @@ impl ListValue {
             Storage::F64(values) => values.iter().map(|value| value.map_or(Value::Null, Value::F64)).collect(),
             Storage::Union(values) => ListView::Union(&values).iter().map(Cow::into_owned).collect(),
             Storage::Numeric(values) => ListView::Numeric(&values).iter().map(Cow::into_owned).collect(),
+            Storage::Scalars(values) => ListView::Scalars(&values).iter().map(Cow::into_owned).collect(),
         }
     }
 
@@ -211,6 +249,7 @@ impl ListValue {
             Storage::F64(values) => Ok(values.get_array_memory_size()),
             Storage::Union(values) => Ok(values.get_array_memory_size()),
             Storage::Numeric(values) => values.array().get_array_memory_size().checked_add(values.field().size()).ok_or_else(overflow),
+            Storage::Scalars(values) => values.array().get_array_memory_size().checked_add(values.field().size()).ok_or_else(overflow),
         }
     }
 
@@ -227,23 +266,12 @@ impl ListValue {
                 LogicalType::join_all(&types)
             }
             Storage::Numeric(values) => values.observed_type(),
+            Storage::Scalars(values) => values.observed_type(),
             Storage::F32(values) => packed(ScalarType::F32, values.len(), values.null_count()),
             Storage::F64(values) => packed(ScalarType::F64, values.len(), values.null_count()),
             Storage::Union(values) => {
-                let mut types = Vec::with_capacity(3);
-                for row in 0..values.len() {
-                    let child = values.child(values.type_id(row));
-                    let ty = if child.is_null(values.value_offset(row)) { LogicalType::Null } else {
-                        match child.data_type() {
-                            DataType::Float32 => LogicalType::Scalar(ScalarType::F32),
-                            DataType::Float64 => LogicalType::Scalar(ScalarType::F64),
-                            _ => LogicalType::Null,
-                        }
-                    };
-                    if !types.contains(&ty) { types.push(ty); }
-                    if types.len() == 3 { break; }
-                }
-                LogicalType::join_all(&types)
+                let field = Field::new("", values.data_type().clone(), false);
+                numeric_list::observed_numeric_type(&field, values.as_ref())
             },
         }
     }
@@ -290,13 +318,24 @@ impl ListBuilder {
         match &mut self.0 {
             BuildingList::Values(values) => values.push(value),
             BuildingList::Numeric(builder) => {
-                if builder.push(&value).is_some() { return; }
+                if NumericCell::from_value(&value).is_some_and(|number| builder.push(number).is_some()) { return; }
                 let BuildingList::Numeric(builder) = std::mem::replace(&mut self.0, BuildingList::Values(Vec::new())) else { unreachable!() };
                 let mut values = finish_numeric(builder).into_values();
                 values.push(value);
                 self.0 = BuildingList::Values(values);
             }
         }
+    }
+
+    pub fn try_push_numeric(&mut self, value: NumericCell) -> bool {
+        match &mut self.0 {
+            BuildingList::Numeric(builder) => builder.push(value).is_some(),
+            BuildingList::Values(_) => false,
+        }
+    }
+
+    pub fn push_numeric(&mut self, value: NumericCell) {
+        if !self.try_push_numeric(value) { self.push(value.into_value()); }
     }
 
     pub fn finish(self) -> ListValue {
@@ -321,7 +360,12 @@ impl fmt::Debug for ListValue {
 
 impl PartialEq for ListValue {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().zip(other.iter()).all(|(left, right)| left == right)
+        if self.len() != other.len() { return false; }
+        let (left, right) = (self.view(), other.view());
+        if left.is_packed_numeric() && right.is_packed_numeric() {
+            return (0..left.len()).all(|index| left.numeric_component(index) == right.numeric_component(index));
+        }
+        left.iter().zip(right.iter()).all(|(left, right)| left == right)
     }
 }
 

@@ -65,7 +65,9 @@
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
 -- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.
 -- A list cast to REAL or DOUBLE PRECISION elements converts the packed components of a numeric list in one pass, through binary64 as each scalar cast does.
--- A list of unannotated numbers derives its element type from the legs and validity its elements select.
+-- A packed numeric list derives its observed element type from the first selected occurrence of each present leg and of null.
+-- Native list pages can cast numeric, text, and supported temporal components directly into their result child buffers.
+-- A page applies the conversion and projection checks in component order.
 -- A list parameter enters evaluation as its Arrow cell.
 -- Score calculation and nullable result construction use Arrow input arrays and output buffers.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.

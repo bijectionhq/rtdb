@@ -68,3 +68,77 @@ fn a_nullable_element_target_remaps_union_legs_rather_than_casting_components() 
         assert_eq!(error.code, "xtdb/invalid-argument-types");
     }
 }
+
+#[test]
+fn numeric_lists_use_scalar_integer_and_decimal_rounding() {
+    let decimal = V::Decimal(rtdb_types::DecimalValue::new(125_i128.to_be_bytes().to_vec(), 5, 2, 128).unwrap());
+    let source = V::list(vec![V::I64(42), V::F32(-1.25), V::Null, decimal]);
+    for ty in [S::I16, S::Decimal { precision: 10, scale: 1, bit_width: 128 }] {
+        let element = CastTarget::Fixed(L::Scalar(ty));
+        let expected = V::list(source.list_view().unwrap().iter()
+            .map(|value| rtdb_expr::cast_target(&value, &element, "UTC").unwrap()).collect());
+        let target = CastTarget::List(Box::new(element));
+        let expr = Expr::Cast { expr: Box::new(Expr::Literal(source.clone())), target: target.clone() };
+        let output = evaluate(&expr, &Schema::default(), &[], &EvalContext::default()).unwrap();
+        assert_eq!(output, expected);
+        assert!(output.list_view().unwrap().is_packed_numeric());
+        assert_eq!(rtdb_expr::cast_target(&source, &target, "UTC").unwrap(), expected);
+    }
+}
+
+#[test]
+fn packed_text_and_temporal_casts_match_scalar_cells_and_arrow_layout() {
+    use rtdb_types::TimeUnit;
+    for (source, target) in [
+        (V::list(vec![V::F32(-0.0), V::Null, V::F64(f64::INFINITY)]), CastTarget::Fixed(L::Scalar(S::Utf8))),
+        (V::list(vec![V::Utf8("1969-12-31 23:59:59.9999999".into()), V::Null, V::Utf8("2000-01-01 04:05:06".into())]),
+            CastTarget::Temporal(rtdb_plan::TemporalCast { kind: rtdb_plan::TemporalKind::TimestampLocal, unit: TimeUnit::Microsecond, precision: Some(3) })),
+        (V::list(vec![V::Utf8("2000-02-29".into()), V::Null]), CastTarget::Fixed(L::Scalar(S::DateDay))),
+        (V::list(vec![V::F64(-0.25), V::Null]), CastTarget::Fixed(L::Scalar(S::Duration(TimeUnit::Millisecond)))),
+    ] {
+        let expected = V::list(source.list_view().unwrap().iter()
+            .map(|value| rtdb_expr::cast_target(&value, &target, "UTC").unwrap()).collect());
+        let target = CastTarget::List(Box::new(target));
+        let expr = Expr::Cast { expr: Box::new(Expr::Literal(source.clone())), target: target.clone() };
+        let output = evaluate(&expr, &Schema::default(), &[], &EvalContext::default()).unwrap();
+        let Some(rtdb_types::ListView::Scalars(_)) = output.list_view() else { panic!("expected packed scalar result"); };
+        assert_eq!(output, expected);
+        let ty = expected.logical_type().maybe();
+        let actual = rtdb_columnar::copy_array(&ty, &[V::Null, output]).unwrap();
+        let expected = rtdb_columnar::copy_array(&ty, &[V::Null, expected]).unwrap();
+        assert_eq!(actual.to_data(), expected.to_data());
+        let direct = rtdb_expr::cast_target(&source, &target, "UTC").unwrap();
+        assert!(matches!(direct.list_view(), Some(rtdb_types::ListView::Scalars(_))));
+    }
+}
+
+#[test]
+fn typed_list_casts_report_the_first_scalar_error() {
+    let target = CastTarget::Fixed(L::Scalar(S::I16));
+    let values = [V::Utf8("99999".into()), V::Utf8("bogus".into())];
+    let expected = rtdb_expr::cast_target(&values[0], &target, "UTC").unwrap_err();
+    let list_target = CastTarget::List(Box::new(target));
+    let list = V::list(values.into());
+    let actual = rtdb_expr::cast_target(&list, &list_target, "UTC").unwrap_err();
+    assert_eq!((actual.code, actual.message), (expected.code, expected.message));
+}
+
+#[tokio::test]
+async fn list_cursor_emits_packed_cast_pages_before_later_element_errors() {
+    let input = V::list(vec![V::Utf8("2000-02-29".into()), V::Null, V::Utf8("invalid".into())]);
+    let expr = Expr::Cast {
+        expr: Box::new(Expr::Literal(input)),
+        target: CastTarget::List(Box::new(CastTarget::Fixed(L::Scalar(S::DateDay)))),
+    };
+    let schema = Schema::default();
+    let memory = rtdb_types::MemoryBudget::new(8 << 20);
+    let scope = rtdb_expr::EvaluationScope::new(&memory).unwrap();
+    let context = EvalContext::default().with_allocation(&scope);
+    let invocation = rtdb_expr::ExpressionInvocation::prepare(&expr, &schema, &context).unwrap();
+    let mut pages = invocation.open_list(&[], &context, 2).await.unwrap();
+    let first = pages.next_batch().await.unwrap().unwrap();
+    assert!(matches!(first.values().view(), rtdb_types::ListView::Scalars(_)));
+    assert_eq!(first.values().iter().map(std::borrow::Cow::into_owned).collect::<Vec<_>>(), [V::DateDay(11016), V::Null]);
+    let error = pages.next_batch().await.err().expect("later page contains an invalid date");
+    assert_eq!(error.code, "xtdb.expression/invalid-temporal-string");
+}

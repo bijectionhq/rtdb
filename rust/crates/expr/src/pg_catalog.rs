@@ -86,12 +86,24 @@ pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>
             {
                 return Ok(Value::List(list));
             }
+            if let Value::List(list) | Value::FixedSizeList(list) = value
+                && let Some(list) = crate::list_cast::numeric(
+                    crate::list_cast::Input::Stored(list.view()), element, false, |bytes| context.reserve(bytes),
+                )?
+            {
+                return Ok(Value::List(list));
+            }
             let parsed;
             let values = match value {
                 Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(),
                 Value::Utf8(text) => { parsed = crate::cast::pg_array_text(text)?; rtdb_types::ListView::Values(&parsed) },
                 _ => return crate::cast::cast_target(value, target, context.timezone),
             };
+            if let Some(list) = crate::scalar_list_cast::cast_list(
+                crate::scalar_list_cast::Source::Stored(values), element, context.timezone, false, |bytes| context.reserve(bytes),
+            )? {
+                return Ok(Value::List(list));
+            }
             return Ok(Value::list(values.iter().map(|value| cast(value.as_ref(), element, context)).collect::<Result<_>>()?));
         }
         _ => (),

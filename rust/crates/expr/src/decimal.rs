@@ -36,9 +36,13 @@ pub(crate) fn from_coefficient(value: BigInt, precision: i32, scale: i32, bit_wi
 }
 
 pub(crate) fn validate_write(value: &DecimalValue) -> Result<()> {
-    physical_digits(value.bit_width)?;
-    if value.unscaled.len() != usize::from(value.bit_width / 8) { return Err(overflow()); }
-    if value.precision <= 0 || digits(&coefficient(value)) > value.precision as usize {
+    validate_coefficient(&value.unscaled, value.precision, value.bit_width)
+}
+
+pub(crate) fn validate_coefficient(bytes: &[u8], precision: i32, bit_width: u16) -> Result<()> {
+    physical_digits(bit_width)?;
+    if bytes.len() != usize::from(bit_width / 8) { return Err(overflow()); }
+    if precision <= 0 || digits(&BigInt::from_signed_bytes_be(bytes)) > precision as usize {
         return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
     }
     Ok(())
@@ -91,9 +95,22 @@ pub(crate) fn rescale_coefficient(value: BigInt, source_scale: i64, target_scale
 }
 
 pub(crate) fn from_bigdecimal(value: BigDecimal, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    let params = rtdb_types::decimal_arrow::DecimalParameters { precision, scale, bit_width };
+    let bytes = cast_coefficient(value, params)?;
+    DecimalValue::new(bytes[32 - usize::from(bit_width / 8)..].to_vec(), precision, scale, bit_width)
+}
+
+pub(crate) fn cast_coefficient(value: BigDecimal, params: rtdb_types::decimal_arrow::DecimalParameters) -> Result<[u8; 32]> {
     let (value, source_scale) = value.into_bigint_and_scale();
     let source_scale = i32::try_from(source_scale).map_err(|_| overflow())?;
-    from_coefficient(rescale_coefficient(value, i64::from(source_scale), scale, write_digits(precision, bit_width)?, RoundingMode::HalfEven)?, precision, scale, bit_width)
+    let digits_limit = write_digits(params.precision, params.bit_width)?;
+    let value = rescale_coefficient(value, i64::from(source_scale), params.scale, digits_limit, RoundingMode::HalfEven)?;
+    if digits(&value) > digits_limit { return Err(overflow()); }
+    let bytes = value.to_signed_bytes_be();
+    if bytes.len() > usize::from(params.bit_width / 8) { return Err(overflow()); }
+    let mut extended = [if value.sign() == Sign::Minus { 255 } else { 0 }; 32];
+    extended[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(extended)
 }
 
 /// Applies Java HALF_EVEN scaling and checks the requested vector precision and coefficient width.

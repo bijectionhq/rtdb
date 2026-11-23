@@ -10,7 +10,7 @@ pub fn parse_timestamp(text: &str, timezone: &str) -> Result<Timestamp> {
     rtdb_types::parse_sql_timestamp_instant(text, timezone)?.as_micros()
 }
 
-fn rescale_units(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
+pub(crate) fn rescale_units(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
     let scaled = i128::from(value) * i128::from(target.units_per_second()) / i128::from(source.units_per_second());
     i64::try_from(scaled).map_err(|_| overflow())
 }
@@ -71,22 +71,23 @@ pub fn query_clock_instant(value: &Value, timezone: &str) -> Result<Instant> {
 /// Produces a scalar intermediate, preserving calendar dates until the caller's admission boundary.
 /// Expression outputs use `Value::admit_expression_dates`; object inputs use `Value::admit_object_dates`.
 /// `Byte/parseByte` through `Long/parseLong`, which the reference's text casts call.
-fn parse_java_integer(text: &str, target: &ScalarType) -> Result<Value> {
+pub(crate) fn parse_java_integer(text: &str, target: &ScalarType) -> Result<i128> {
     let invalid = || number_format(format!("For input string: \"{text}\""));
     Ok(match target {
-        ScalarType::I64 => Value::I64(text.parse().map_err(|_| invalid())?),
-        ScalarType::I32 => Value::I32(text.parse().map_err(|_| invalid())?),
+        ScalarType::I64 => i128::from(text.parse::<i64>().map_err(|_| invalid())?),
+        ScalarType::I32 => i128::from(text.parse::<i32>().map_err(|_| invalid())?),
         _ => {
             let value = text.parse::<i32>().map_err(|_| invalid())?;
             let out_of_range = || number_format(format!("Value out of range. Value:\"{text}\" Radix:10"));
-            if *target == ScalarType::I8 { Value::I8(i8::try_from(value).map_err(|_| out_of_range())?) } else { Value::I16(i16::try_from(value).map_err(|_| out_of_range())?) }
+            if *target == ScalarType::I8 { i128::from(i8::try_from(value).map_err(|_| out_of_range())?) }
+            else { i128::from(i16::try_from(value).map_err(|_| out_of_range())?) }
         }
     })
 }
 
 /// `Double/parseDouble`: surrounding control characters and spaces are trimmed, a trailing `f`/`d` is allowed,
 /// and only `NaN` and `Infinity` are spelled out.
-fn parse_java_float(text: &str) -> Result<f64> {
+pub(crate) fn parse_java_float(text: &str) -> Result<f64> {
     let trimmed = text.trim_matches(|ch: char| ch <= ' ');
     if trimmed.is_empty() { return Err(number_format("empty String".into())); }
     let invalid = || number_format(format!("For input string: \"{trimmed}\""));
@@ -96,6 +97,40 @@ fn parse_java_float(text: &str) -> Result<f64> {
     let digits = decimal.strip_prefix(['+', '-']).unwrap_or(decimal);
     if !digits.starts_with(|ch: char| ch.is_ascii_digit() || ch == '.') { return Err(invalid()); }
     decimal.parse().map_err(|_| invalid())
+}
+
+pub(crate) fn decimal_integer(number: f64) -> Result<i128> {
+    if number < i64::MIN as f64 || number > i64::MAX as f64 { return Err(overflow()); }
+    Ok(i128::from(number as i64))
+}
+
+pub(crate) fn float_integer(number: f64) -> Result<i128> {
+    if !number.is_finite() || number < i128::MIN as f64 || number >= i128::MAX as f64 { return Err(overflow()); }
+    Ok(number.trunc() as i128)
+}
+
+pub(crate) fn timestamp_text_raw(text: &str, unit: TimeUnit, zoned: bool) -> Result<i64> {
+    match text {
+        "infinity" => return Ok(i64::MAX),
+        "-infinity" => return Ok(i64::MIN),
+        _ => (),
+    }
+    let nanos = rtdb_types::parse_sql_timestamp_cast(text, zoned)?;
+    let value = nanos.div_euclid(1_000_000_000 / i128::from(unit.units_per_second()));
+    i64::try_from(value).map_err(|_| overflow())
+}
+
+pub(crate) fn duration_seconds(seconds: f64, unit: TimeUnit) -> Result<i64> {
+    let value = seconds * unit.units_per_second() as f64;
+    if !value.is_finite() || value < i64::MIN as f64 || value >= -(i64::MIN as f64) { return Err(overflow()); }
+    Ok(value as i64)
+}
+
+pub(crate) fn timestamp_raw(value: i64, source: TimeUnit, source_zoned: bool, unit: TimeUnit, zoned: bool, timezone: &str) -> Result<i64> {
+    if source_zoned == zoned { return rescale_units(value, source, unit); }
+    let shifted = shift_zone(value, source, timezone, !zoned)?;
+    let scaled = (i128::from(shifted) * i128::from(unit.units_per_second())).div_euclid(i128::from(source.units_per_second()));
+    i64::try_from(scaled).map_err(|_| overflow())
 }
 
 pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Value> {
@@ -132,19 +167,17 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
         S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 => {
             let value = match value {
                 Value::Utf8(text) => match target {
-                    S::I8 | S::I16 | S::I32 | S::I64 => return parse_java_integer(text, target),
+                    S::I8 | S::I16 | S::I32 | S::I64 => parse_java_integer(text, target)?,
                     _ => text.parse::<i128>().map_err(|_| inapplicable("integer", &[value]))?,
                 },
                 Value::Bool(value) => i128::from(*value),
                 Value::Decimal(value) => {
                     let number = crate::decimal_to_f64(value);
-                    if number < i64::MIN as f64 || number > i64::MAX as f64 { return Err(overflow()); }
-                    i128::from(number as i64)
+                    decimal_integer(number)?
                 }
                 value => if let Some(value) = integer(value) { value } else {
                     let number = number(value).ok_or_else(|| inapplicable("integer", &[value]))?;
-                    if !number.is_finite() || number < i128::MIN as f64 || number >= i128::MAX as f64 { return Err(overflow()); }
-                    number.trunc() as i128
+                    float_integer(number)?
                 },
             };
             integer_value(value, target)
@@ -176,12 +209,8 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
         S::Uri => match value { Value::Utf8(text) => { rtdb_types::UriParts::parse(text)?; Ok(Value::Uri(text.clone())) }, _ => Err(inapplicable("uri", &[value])) },
         S::Timestamp { unit, timezone: target_zone } => {
             if let Value::Timestamp { value, unit: source_unit, timezone: source_zone } = value {
-                if source_zone.is_some() == target_zone.is_some() {
-                    return Ok(Value::Timestamp { value: rescale_units(*value, *source_unit, *unit)?, unit: *unit, timezone: target_zone.clone() });
-                }
-                let shifted = shift_zone(*value, *source_unit, timezone, target_zone.is_none())?;
-                let scaled = (i128::from(shifted) * i128::from(unit.units_per_second())).div_euclid(i128::from(source_unit.units_per_second()));
-                return Ok(Value::Timestamp { value: i64::try_from(scaled).map_err(|_| overflow())?, unit: *unit, timezone: target_zone.clone() });
+                let value = timestamp_raw(*value, *source_unit, source_zone.is_some(), *unit, target_zone.is_some(), timezone)?;
+                return Ok(Value::Timestamp { value, unit: *unit, timezone: target_zone.clone() });
             }
             if let Some(days) = crate::temporal::date_days(value) {
                 let seconds = if target_zone.is_some() { zone(timezone)?.start_of_day(CivilDate::from_epoch_day(days)?)? }
@@ -189,10 +218,8 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
                 return Ok(Value::Timestamp { value: seconds.checked_mul(unit.units_per_second()).ok_or_else(overflow)?, unit: *unit, timezone: target_zone.clone() });
             }
             if let Value::Utf8(text) = value {
-                if text == "infinity" || text == "-infinity" { return Ok(Value::Timestamp { value: if text == "infinity" { i64::MAX } else { i64::MIN }, unit: *unit, timezone: target_zone.clone() }); }
-                let nanos = rtdb_types::parse_sql_timestamp_cast(text, target_zone.is_some())?;
-                let value = nanos.div_euclid(1_000_000_000 / i128::from(unit.units_per_second()));
-                return Ok(Value::Timestamp { value: i64::try_from(value).map_err(|_| overflow())?, unit: *unit, timezone: target_zone.clone() });
+                let value = timestamp_text_raw(text, *unit, target_zone.is_some())?;
+                return Ok(Value::Timestamp { value, unit: *unit, timezone: target_zone.clone() });
             }
             Err(inapplicable("timestamp", &[value]))
         }
@@ -223,11 +250,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
                 Ok(Value::Duration { value: rescale_units(*value, *source, *unit)?, unit: *unit })
             }
             Value::Utf8(text) => Ok(Value::Duration { value: rescale_units(crate::temporal_text::duration(text)?, TimeUnit::Nanosecond, *unit)?, unit: *unit }),
-            Value::F64(seconds) => {
-                let value = seconds * unit.units_per_second() as f64;
-                if !value.is_finite() || value < i64::MIN as f64 || value >= -(i64::MIN as f64) { return Err(overflow()); }
-                Ok(Value::Duration { value: value as i64, unit: *unit })
-            }
+            Value::F64(seconds) => Ok(Value::Duration { value: duration_seconds(*seconds, *unit)?, unit: *unit }),
             Value::IntervalYearMonth(_) => Err(Anomaly::incorrect("xtdb.expression/invalid-cast", "Cannot cast a year-month interval to a duration").with_context("interval-unit", "year-month".into())),
             Value::IntervalDayTime { .. } => Err(Anomaly::incorrect("xtdb.expression/invalid-cast", "Cannot cast a day-time interval to a duration").with_context("interval-unit", "day-time".into())),
             value if crate::temporal::IntervalParts::of(value).is_some() => {
@@ -306,12 +329,22 @@ pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str
                 if values.iter().any(|value| !legs.contains(&value.logical_type())) { return Err(inapplicable("list union", &[value])); }
                 return Ok(Value::List(values.clone()));
             }
+            if let Value::List(list) | Value::FixedSizeList(list) = value
+                && let Some(list) = crate::list_cast::numeric(crate::list_cast::Input::Stored(list.view()), element, false, |_| Ok(()))?
+            {
+                return Ok(Value::List(list));
+            }
             let parsed;
             let values = match value {
                 Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(),
                 Value::Utf8(text) => { parsed = pg_array_text(text)?; rtdb_types::ListView::Values(&parsed) }
                 _ => return Err(inapplicable("list", &[value])),
             };
+            if let Some(list) = crate::scalar_list_cast::cast_list(
+                crate::scalar_list_cast::Source::Stored(values), element, timezone, false, |_| Ok(()),
+            )? {
+                return Ok(Value::List(list));
+            }
             let mut output = rtdb_types::ListBuilder::with_capacity(values.len());
             for value in values.iter() {
                 output.push(cast_target(value.as_ref(), element, timezone)?);

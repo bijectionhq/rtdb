@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, Float16Array,
@@ -39,26 +39,15 @@ impl NumericList {
     }
 
     pub(crate) fn value(&self, index: usize) -> Value {
-        number_cell(&self.field, self.array.as_ref(), index)
+        self.numeric_component(index).into_value()
+    }
+
+    pub(crate) fn numeric_component(&self, index: usize) -> NumericCell {
+        read_number(&self.field, self.array.as_ref(), index)
     }
 
     pub(crate) fn observed_type(&self) -> LogicalType {
-        let mut legs = Vec::new();
-        if let DataType::Union(fields, UnionMode::Dense) = self.field.data_type() {
-            let array = self.array.as_any().downcast_ref::<UnionArray>().expect("validated numeric union");
-            for i in 0..array.len() {
-                let id = array.type_id(i);
-                let (_, field) = fields.iter().find(|(tag, _)| *tag == id).expect("validated numeric union tag");
-                let child = array.child(id);
-                let ty = if child.is_null(array.value_offset(i)) { LogicalType::Null } else { scalar_type(field) };
-                if !legs.contains(&ty) { legs.push(ty); }
-            }
-        } else if !self.array.is_empty() {
-            let nulls = self.array.logical_null_count();
-            if nulls < self.array.len() { legs.push(scalar_type(&self.field)); }
-            if nulls > 0 { legs.push(LogicalType::Null); }
-        }
-        LogicalType::join_all(&legs)
+        observed_numeric_type(&self.field, self.array.as_ref())
     }
 }
 
@@ -105,22 +94,182 @@ fn signed_layout(field: &Field, array: &ArrayRef) -> Option<(Field, ArrayRef)> {
 
 pub(crate) fn supported(field: &Field) -> bool {
     if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
-        return field.metadata().is_empty() && fields.iter().all(|(_, field)| supported_scalar(field));
+        return field.metadata().is_empty() && fields.iter().all(|(_, field)| supported_scalar(field, false));
     }
-    supported_scalar(field)
+    supported_scalar(field, false)
 }
 
-fn supported_scalar(field: &Field) -> bool {
+fn supported_scalar(field: &Field, allow_annotations: bool) -> bool {
+    if !inert_metadata(field) { return false; }
     if decimal_parameters(field.data_type()).is_some() {
         return !matches!(field.data_type(), DataType::Dictionary(_, _))
-            && field.metadata().keys().all(|key| matches!(key.as_str(), INTERNAL_DECIMAL_SCALE_KEY | INTERNAL_DECIMAL_PRECISION_KEY))
-            && decimal_field_parameters(field).is_ok();
+            && (allow_annotations || field.metadata().keys().all(|key| matches!(key.as_str(), INTERNAL_DECIMAL_SCALE_KEY | INTERNAL_DECIMAL_PRECISION_KEY)));
     }
     if field.data_type() == &DataType::Null { return field.is_nullable(); }
-    field.metadata().is_empty() && matches!(field.data_type(),
+    (allow_annotations || field.metadata().is_empty()) && matches!(field.data_type(),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
         | DataType::Float16 | DataType::Float32 | DataType::Float64)
+}
+
+pub(crate) fn numeric_input(field: &Field) -> bool {
+    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+        return inert_metadata(field) && fields.iter().all(|(_, field)| supported_scalar(field, true));
+    }
+    supported_scalar(field, true)
+}
+
+fn inert_metadata(field: &Field) -> bool {
+    !field.metadata().contains_key("ARROW:extension:name")
+        && decimal_field_parameters(field).is_ok()
+}
+
+pub(crate) fn observed_numeric_type(field: &Field, array: &dyn Array) -> LogicalType {
+    let mut types = Vec::new();
+    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+        let array = array.as_any().downcast_ref::<UnionArray>().expect("numeric union");
+        let mut present = [false; 128];
+        let mut absent = false;
+        let mut remaining = fields.iter().filter(|(_, field)| field.data_type() != &DataType::Null).count();
+        for (&tag, &offset) in array.type_ids().iter().zip(array.offsets().expect("dense offsets").iter()) {
+            let id = tag as usize;
+            if present[id] && absent { continue; }
+            let child = array.child(tag);
+            if child.data_type() == &DataType::Null || child.is_null(offset as usize) {
+                if !std::mem::replace(&mut absent, true) { types.push(LogicalType::Null); }
+            } else if !std::mem::replace(&mut present[id], true) {
+                let (_, field) = fields.iter().find(|(id, _)| *id == tag).expect("numeric union tag");
+                types.push(scalar_type(field));
+                remaining -= 1;
+            }
+            if remaining == 0 && absent { break; }
+        }
+    } else if !array.is_empty() {
+        let nulls = if array.data_type() == &DataType::Null { array.len() } else { array.null_count() };
+        if nulls < array.len() { types.push(scalar_type(field)); }
+        if nulls > 0 { types.push(LogicalType::Null); }
+    }
+    LogicalType::join_all(&types)
+}
+
+/// A numeric component read directly from a primitive buffer or an active dense union leg.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NumericCell {
+    Null,
+    I8(i8), I16(i16), I32(i32), I64(i64),
+    U8(u8), U16(u16), U32(u32), U64(u64),
+    F16(u16), F32(f32), F64(f64),
+    Decimal([u8; 32], DecimalParameters),
+}
+
+impl NumericCell {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        Some(match value {
+            Value::Null => Self::Null,
+            Value::I8(v) => Self::I8(*v), Value::I16(v) => Self::I16(*v),
+            Value::I32(v) => Self::I32(*v), Value::I64(v) => Self::I64(*v),
+            Value::U8(v) => Self::U8(*v), Value::U16(v) => Self::U16(*v),
+            Value::U32(v) => Self::U32(*v), Value::U64(v) => Self::U64(*v),
+            Value::F16(v) => Self::F16(*v), Value::F32(v) => Self::F32(*v), Value::F64(v) => Self::F64(*v),
+            Value::Decimal(v) => {
+                if !matches!(v.bit_width, 32 | 64 | 128 | 256) || v.unscaled.len() != usize::from(v.bit_width / 8) { return None; }
+                Self::Decimal(extend_coefficient(&v.unscaled), DecimalParameters { precision: v.precision, scale: v.scale, bit_width: v.bit_width })
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn into_value(self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::I8(v) => Value::I8(v), Self::I16(v) => Value::I16(v),
+            Self::I32(v) => Value::I32(v), Self::I64(v) => Value::I64(v),
+            Self::U8(v) => Value::U8(v), Self::U16(v) => Value::U16(v),
+            Self::U32(v) => Value::U32(v), Self::U64(v) => Value::U64(v),
+            Self::F16(v) => Value::F16(v), Self::F32(v) => Value::F32(v), Self::F64(v) => Value::F64(v),
+            Self::Decimal(bytes, p) => Value::Decimal(DecimalValue {
+                unscaled: bytes[32 - usize::from(p.bit_width / 8)..].to_vec(), precision: p.precision, scale: p.scale, bit_width: p.bit_width,
+            }),
+        }
+    }
+
+    pub fn signed(self) -> Self {
+        match self {
+            Self::U8(v) => Self::I8(v as i8), Self::U16(v) => Self::I16(v as i16),
+            Self::U32(v) => Self::I32(v as i32), Self::U64(v) => Self::I64(v as i64),
+            other => other,
+        }
+    }
+
+    pub fn integer(self) -> Option<i128> {
+        Some(match self {
+            Self::I8(v) => v.into(), Self::I16(v) => v.into(), Self::I32(v) => v.into(), Self::I64(v) => v.into(),
+            Self::U8(v) => v.into(), Self::U16(v) => v.into(), Self::U32(v) => v.into(), Self::U64(v) => v.into(),
+            _ => return None,
+        })
+    }
+
+    pub fn as_f64(self) -> Option<f64> {
+        Some(match self {
+            Self::Null => return None,
+            Self::F16(v) => half::f16::from_bits(v).to_f64(),
+            Self::F32(v) => f64::from(v),
+            Self::F64(v) => v,
+            Self::Decimal(bytes, p) => crate::jvm_number::decimal_bytes_to_f64(&bytes, p.scale),
+            integer => integer.integer()? as f64,
+        })
+    }
+
+    pub fn scalar_type(self) -> Option<ScalarType> {
+        Some(match self {
+            Self::Null => return None,
+            Self::I8(..) => ScalarType::I8, Self::I16(..) => ScalarType::I16,
+            Self::I32(..) => ScalarType::I32, Self::I64(..) => ScalarType::I64,
+            Self::U8(..) => ScalarType::U8, Self::U16(..) => ScalarType::U16,
+            Self::U32(..) => ScalarType::U32, Self::U64(..) => ScalarType::U64,
+            Self::F16(..) => ScalarType::F16, Self::F32(..) => ScalarType::F32, Self::F64(..) => ScalarType::F64,
+            Self::Decimal(_, p) => ScalarType::Decimal { precision: p.precision, scale: p.scale, bit_width: p.bit_width },
+        })
+    }
+}
+
+fn extend_coefficient(bytes: &[u8]) -> [u8; 32] {
+    let mut extended = [if bytes[0] & 128 == 0 { 0 } else { 255 }; 32];
+    extended[32 - bytes.len()..].copy_from_slice(bytes);
+    extended
+}
+
+#[derive(Clone)]
+pub struct NumericSpan<'a> {
+    field: &'a Field,
+    array: &'a dyn Array,
+    range: Range<usize>,
+}
+
+impl<'a> NumericSpan<'a> {
+    pub fn new(field: &'a Field, array: &'a dyn Array, range: Range<usize>) -> Option<Self> {
+        (field.data_type() == array.data_type() && numeric_input(field) && range.start <= range.end && range.end <= array.len())
+            .then_some(Self { field, array, range })
+    }
+
+    pub fn len(&self) -> usize { self.range.len() }
+
+    pub fn is_empty(&self) -> bool { self.range.is_empty() }
+
+    pub fn slice(mut self, offset: usize, count: usize) -> Option<Self> {
+        if offset.checked_add(count)? > self.len() { return None; }
+        self.range.start += offset;
+        self.range.end = self.range.start + count;
+        Some(self)
+    }
+
+    pub fn get(&self, index: usize) -> Option<NumericCell> {
+        (index < self.range.len()).then(|| read_number(self.field, self.array, self.range.start + index))
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NumericCell> + '_ {
+        self.range.clone().map(|index| read_number(self.field, self.array, index))
+    }
 }
 
 fn scalar_type(field: &Field) -> LogicalType {
@@ -145,120 +294,92 @@ fn scalar_type(field: &Field) -> LogicalType {
     LogicalType::Scalar(scalar)
 }
 
-fn number_cell(field: &Field, array: &dyn Array, index: usize) -> Value {
-    if array.is_null(index) { return Value::Null; }
+fn read_number(field: &Field, array: &dyn Array, index: usize) -> NumericCell {
+    use NumericCell as N;
+    if array.is_null(index) { return N::Null; }
     macro_rules! cell {
         ($array:ty) => { array.as_any().downcast_ref::<$array>().expect("validated numeric storage").value(index) };
     }
     match field.data_type() {
-        DataType::Null => Value::Null,
-        DataType::Int8 => Value::I8(cell!(Int8Array)),
-        DataType::UInt8 => Value::U8(cell!(UInt8Array)),
-        DataType::Int16 => Value::I16(cell!(Int16Array)),
-        DataType::UInt16 => Value::U16(cell!(UInt16Array)),
-        DataType::Int32 => Value::I32(cell!(Int32Array)),
-        DataType::UInt32 => Value::U32(cell!(UInt32Array)),
-        DataType::Int64 => Value::I64(cell!(Int64Array)),
-        DataType::UInt64 => Value::U64(cell!(UInt64Array)),
-        DataType::Float16 => Value::F16(cell!(Float16Array).to_bits()),
-        DataType::Float32 => Value::F32(cell!(Float32Array)),
-        DataType::Float64 => Value::F64(cell!(Float64Array)),
+        DataType::Null => N::Null,
+        DataType::Int8 => N::I8(cell!(Int8Array)),
+        DataType::UInt8 => N::U8(cell!(UInt8Array)),
+        DataType::Int16 => N::I16(cell!(Int16Array)),
+        DataType::UInt16 => N::U16(cell!(UInt16Array)),
+        DataType::Int32 => N::I32(cell!(Int32Array)),
+        DataType::UInt32 => N::U32(cell!(UInt32Array)),
+        DataType::Int64 => N::I64(cell!(Int64Array)),
+        DataType::UInt64 => N::U64(cell!(UInt64Array)),
+        DataType::Float16 => N::F16(cell!(Float16Array).to_bits()),
+        DataType::Float32 => N::F32(cell!(Float32Array)),
+        DataType::Float64 => N::F64(cell!(Float64Array)),
         DataType::Union(fields, UnionMode::Dense) => {
             let union = array.as_any().downcast_ref::<UnionArray>().expect("validated numeric union");
             let id = union.type_id(index);
             let (_, field) = fields.iter().find(|(tag, _)| *tag == id).expect("validated numeric union tag");
-            number_cell(field, union.child(id).as_ref(), union.value_offset(index))
+            read_number(field, union.child(id).as_ref(), union.value_offset(index))
         }
         ty => {
-            let Some(params) = decimal_field_parameters(field).expect("validated numeric decimal") else { unreachable!() };
+            let params = decimal_field_parameters(field).expect("validated numeric decimal").expect("numeric decimal");
             let unscaled = match ty {
-                DataType::Decimal32(..) => cell!(Decimal32Array).to_be_bytes().to_vec(),
-                DataType::Decimal64(..) => cell!(Decimal64Array).to_be_bytes().to_vec(),
-                DataType::Decimal128(..) => cell!(Decimal128Array).to_be_bytes().to_vec(),
-                DataType::Decimal256(..) => cell!(Decimal256Array).to_be_bytes().to_vec(),
+                DataType::Decimal32(..) => extend_coefficient(&cell!(Decimal32Array).to_be_bytes()),
+                DataType::Decimal64(..) => extend_coefficient(&cell!(Decimal64Array).to_be_bytes()),
+                DataType::Decimal128(..) => extend_coefficient(&cell!(Decimal128Array).to_be_bytes()),
+                DataType::Decimal256(..) => cell!(Decimal256Array).to_be_bytes(),
                 _ => unreachable!(),
             };
-            Value::Decimal(DecimalValue { unscaled, precision: params.precision, scale: params.scale, bit_width: params.bit_width })
+            N::Decimal(unscaled, params)
         }
     }
 }
 
-/// The data type of the leg an undecorated component joins; every such leg is named and typed by `field` alone.
-fn field_type(value: &Value) -> Option<DataType> {
-    Some(match value {
-        Value::Null => DataType::Null,
-        Value::I8(_) => DataType::Int8,
-        Value::U8(_) => DataType::UInt8,
-        Value::I16(_) => DataType::Int16,
-        Value::U16(_) => DataType::UInt16,
-        Value::I32(_) => DataType::Int32,
-        Value::U32(_) => DataType::UInt32,
-        Value::I64(_) => DataType::Int64,
-        Value::U64(_) => DataType::UInt64,
-        Value::F16(_) => DataType::Float16,
-        Value::F32(_) => DataType::Float32,
-        Value::F64(_) => DataType::Float64,
+fn decimal_field(params: DecimalParameters) -> Option<Field> {
+    let DecimalParameters { precision, scale, bit_width } = params;
+    let p = decimal_storage_precision(precision);
+    let s = decimal_storage_scale(scale);
+    let ty = match bit_width {
+        32 => DataType::Decimal32(p, s),
+        64 => DataType::Decimal64(p, s),
+        128 => DataType::Decimal128(p, s),
+        256 => DataType::Decimal256(p, s),
         _ => return None,
+    };
+    with_decimal_parameters(Field::new(format!("decimal-{precision}-{scale}-{bit_width}"), ty, false), params).ok()
+}
+
+fn primitive_type(value: NumericCell) -> Option<(&'static str, DataType)> {
+    use NumericCell::*;
+    Some(match value {
+        Null => ("null", DataType::Null),
+        I8(_) => ("i8", DataType::Int8), U8(_) => ("u8", DataType::UInt8),
+        I16(_) => ("i16", DataType::Int16), U16(_) => ("u16", DataType::UInt16),
+        I32(_) => ("i32", DataType::Int32), U32(_) => ("u32", DataType::UInt32),
+        I64(_) => ("i64", DataType::Int64), U64(_) => ("u64", DataType::UInt64),
+        F16(_) => ("f16", DataType::Float16), F32(_) => ("f32", DataType::Float32), F64(_) => ("f64", DataType::Float64),
+        Decimal(..) => return None,
     })
 }
 
-fn field(value: &Value) -> Option<Field> {
-    let (name, data_type) = match value {
-        Value::Null => ("null", DataType::Null),
-        Value::I8(_) => ("i8", DataType::Int8),
-        Value::U8(_) => ("u8", DataType::UInt8),
-        Value::I16(_) => ("i16", DataType::Int16),
-        Value::U16(_) => ("u16", DataType::UInt16),
-        Value::I32(_) => ("i32", DataType::Int32),
-        Value::U32(_) => ("u32", DataType::UInt32),
-        Value::I64(_) => ("i64", DataType::Int64),
-        Value::U64(_) => ("u64", DataType::UInt64),
-        Value::F16(_) => ("f16", DataType::Float16),
-        Value::F32(_) => ("f32", DataType::Float32),
-        Value::F64(_) => ("f64", DataType::Float64),
-        Value::Decimal(DecimalValue { precision, scale, bit_width, .. }) => {
-            let p = decimal_storage_precision(*precision);
-            let s = decimal_storage_scale(*scale);
-            let ty = match bit_width {
-                32 => DataType::Decimal32(p,s),
-                64 => DataType::Decimal64(p,s),
-                128 => DataType::Decimal128(p,s),
-                256 => DataType::Decimal256(p,s),
-                _ => return None,
-            };
-            let f = Field::new(format!("decimal-{precision}-{scale}-{bit_width}"), ty, false);
-            return with_decimal_parameters(f, DecimalParameters { precision: *precision, scale: *scale, bit_width: *bit_width }).ok();
-        }
-        _ => return None,
-    };
-    Some(Field::new(name, data_type, matches!(value, Value::Null)))
-}
-
-fn append(builder: &mut dyn ArrayBuilder, value: &Value) -> Option<()> {
+fn append(builder: &mut dyn ArrayBuilder, value: NumericCell) -> Option<()> {
+    use NumericCell::*;
     macro_rules! push {
         ($builder:ty,$value:expr) => { builder.as_any_mut().downcast_mut::<$builder>()?.append_value($value) };
     }
     match value {
-        Value::Null => builder.as_any_mut().downcast_mut::<NullBuilder>()?.append_null(),
-        Value::I8(value) => push!(Int8Builder,*value),
-        Value::U8(value) => push!(UInt8Builder,*value),
-        Value::I16(value) => push!(Int16Builder,*value),
-        Value::U16(value) => push!(UInt16Builder,*value),
-        Value::I32(value) => push!(Int32Builder,*value),
-        Value::U32(value) => push!(UInt32Builder,*value),
-        Value::I64(value) => push!(Int64Builder,*value),
-        Value::U64(value) => push!(UInt64Builder,*value),
-        Value::F16(value) => push!(Float16Builder,half::f16::from_bits(*value)),
-        Value::F32(value) => push!(Float32Builder,*value),
-        Value::F64(value) => push!(Float64Builder,*value),
-        Value::Decimal(value) => match value.bit_width {
-            32 => push!(Decimal32Builder,i32::from_be_bytes(value.unscaled.as_slice().try_into().ok()?)),
-            64 => push!(Decimal64Builder,i64::from_be_bytes(value.unscaled.as_slice().try_into().ok()?)),
-            128 => push!(Decimal128Builder,i128::from_be_bytes(value.unscaled.as_slice().try_into().ok()?)),
-            256 => push!(Decimal256Builder,i256::from_be_bytes(value.unscaled.as_slice().try_into().ok()?)),
+        Null => builder.as_any_mut().downcast_mut::<NullBuilder>()?.append_null(),
+        I8(value) => push!(Int8Builder,value), U8(value) => push!(UInt8Builder,value),
+        I16(value) => push!(Int16Builder,value), U16(value) => push!(UInt16Builder,value),
+        I32(value) => push!(Int32Builder,value), U32(value) => push!(UInt32Builder,value),
+        I64(value) => push!(Int64Builder,value), U64(value) => push!(UInt64Builder,value),
+        F16(value) => push!(Float16Builder,half::f16::from_bits(value)),
+        F32(value) => push!(Float32Builder,value), F64(value) => push!(Float64Builder,value),
+        Decimal(bytes, params) => match params.bit_width {
+            32 => push!(Decimal32Builder,i32::from_be_bytes(bytes[28..].try_into().ok()?)),
+            64 => push!(Decimal64Builder,i64::from_be_bytes(bytes[24..].try_into().ok()?)),
+            128 => push!(Decimal128Builder,i128::from_be_bytes(bytes[16..].try_into().ok()?)),
+            256 => push!(Decimal256Builder,i256::from_be_bytes(bytes)),
             _ => return None,
         },
-        _ => return None,
     }
     Some(())
 }
@@ -280,21 +401,28 @@ impl NumericListBuilder {
         }
     }
 
-    pub(crate) fn push(&mut self, value: &Value) -> Option<()> {
-        let existing = field_type(value).and_then(|data_type| self.fields.iter().position(|candidate| *candidate.data_type() == data_type));
-        let leg = if let Some(i) = existing { i } else {
-            let field = field(value)?;
-            if let Some(i) = self.fields.iter().position(|candidate| candidate == &field) { return self.append_leg(i, value); }
-            let i = self.fields.len();
-            if i >= i8::MAX as usize { return None; }
-            self.builders.push(make_builder(field.data_type(), 0));
-            self.fields.push(field);
-            i
+    pub(crate) fn push(&mut self, value: NumericCell) -> Option<()> {
+        let field = if let Some((name, ty)) = primitive_type(value) {
+            if let Some(i) = self.fields.iter().position(|candidate| *candidate.data_type() == ty) {
+                return self.append_leg(i, value);
+            }
+            Field::new(name, ty, value == NumericCell::Null)
+        } else {
+            let NumericCell::Decimal(_, params) = value else { unreachable!() };
+            let field = decimal_field(params)?;
+            if let Some(i) = self.fields.iter().position(|candidate| candidate == &field) {
+                return self.append_leg(i, value);
+            }
+            field
         };
-        self.append_leg(leg, value)
+        let i = self.fields.len();
+        if i >= i8::MAX as usize { return None; }
+        self.builders.push(make_builder(field.data_type(), 0));
+        self.fields.push(field);
+        self.append_leg(i, value)
     }
 
-    fn append_leg(&mut self, leg: usize, value: &Value) -> Option<()> {
+    fn append_leg(&mut self, leg: usize, value: NumericCell) -> Option<()> {
         let builder = self.builders.get_mut(leg)?;
         let id = i8::try_from(leg).ok()?;
         let offset = i32::try_from(builder.len()).ok()?;
@@ -331,7 +459,7 @@ impl NumericListBuilder {
 
 pub(crate) fn pack(values: &[Value]) -> Option<NumericList> {
     let mut builder = NumericListBuilder::new(values.len());
-    for value in values { builder.push(value)?; }
+    for value in values { builder.push(NumericCell::from_value(value)?)?; }
     builder.finish()
 }
 

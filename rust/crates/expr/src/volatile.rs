@@ -1,10 +1,10 @@
 use rand_core::RngCore;
 use rtdb_types::{Anomaly, Result, Value};
 
-pub(crate) fn random() -> Result<Value> {
+pub(crate) fn random() -> Result<f64> {
     let mut bytes = [0u8; 8];
     rand_core::OsRng.try_fill_bytes(&mut bytes).map_err(|error| Anomaly::fault("rtdb.expr/random-source", error.to_string()))?;
-    Ok(Value::F64((u64::from_ne_bytes(bytes) >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)))
+    Ok((u64::from_ne_bytes(bytes) >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0))
 }
 
 pub(crate) fn sleep_millis(value: &Value) -> Result<u64> {

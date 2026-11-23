@@ -79,7 +79,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     }
     match name.as_str() {
         "col_description" | "pg_indexam_has_property" => return Ok(Value::Null),
-        "random" => return crate::volatile::random(),
+        "random" => return crate::volatile::random().map(Value::F64),
         "sleep" => return if crate::volatile::sleep_millis(&args[0])? == 0 { Ok(Value::Null) }
             else { Err(Anomaly::unsupported("rtdb.expr/async-required", "SLEEP requires asynchronous expression evaluation")) },
         "format_type" => {

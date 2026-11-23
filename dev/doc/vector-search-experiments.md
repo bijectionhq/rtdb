@@ -431,7 +431,7 @@ The following paths still cross into scalar values inside the engine or its adap
 
 | Remaining path | When it occurs | Audit entries |
 | --- | --- | --- |
-| Expression and list evaluation | Computed literals, list constructors and casts can append one evaluated value at a time. Noncanonical child layouts still use logical readers. Scalar subqueries, generic comparisons, and unsupported predicates and projections can materialize cells. | 1–7, 16, 17 |
+| Expression and list evaluation | The typed list routes cover numeric Arrow children, primitive arithmetic and random constructors, numeric comparison, and supported casts. Mixed nonnumeric lists, generic element expressions, scalar subqueries, and unsupported predicates and projections can materialize cells. | 1–7, 16, 17 |
 | Relational operators and spill | General join, aggregate, window, and Apply plans can use row cursors. Generic ordered or distinct aggregates and row spill can pack cells into IPC and read them back as values. | 9, 16–18 |
 | Validation and layout evolution | Incompatible Arrow layouts can rebuild affected cells at argument admission, in event assembly and statistics, and at result conformance. | 6, 8, 10, 14, 15, 19 |
 | Document operations | Mixed and unsupported owned-write layouts can decode documents or fields before coalescing, replay, and temporal patch. Receipt and argument handling still have row routes. | 11–15, 26 |
@@ -480,9 +480,9 @@ That code is still present.
 
 | # | Path | Site | What still happens |
 | --- | --- | --- | --- |
-| 1, 6 | Noncanonical list children: field metadata, non-float unions, decorated decimals | `expr/src/evaluate/reader.rs` `materialize`, `columnar/src/values.rs` `read_list` | One value per element. |
-| 2, 3 | `ARRAY[...]` with computed elements; casts to decimal, integer, text or temporal elements | `reader.rs` `ListReader::Expressions` and `ListReader::Cast` | Each element is evaluated and appended to the typed builder in turn. |
-| 5 | Equality and ordering of non-float lists | `expr/src/evaluate/reader/compare.rs`, `expr/src/compare.rs` | Per-element values. |
+| 1, 6 | Decorated numeric list children, including unsigned and non-float dense unions | `expr/src/evaluate/reader.rs` `materialize` and `list_events`, `columnar/src/values.rs` `read_list` | Compatible annotations normalize in typed storage with selected validity and first-observed leg order. Layouts with logical extensions or ambiguous union names retain their logical readers. |
+| 2, 3 | Computed constructors and element casts | `reader.rs` `ListReader::Expressions` and `ListReader::Cast`, `cast.rs` `cast_target`, `pg_catalog.rs` `cast` | Primitive arithmetic and random elements append their result directly in evaluation order. Eligible numeric, text and temporal casts write typed children. General element expressions and casts over incompatible input or target shapes retain scalar evaluation. |
+| 5 | Equality and ordering of numeric lists | `expr/src/evaluate/reader/compare.rs`, `expr/src/compare.rs`, `types/src/list_value.rs` | Arrow-backed numeric lists compare their selected typed components. Mixed nonnumeric collections use scalar comparison. |
 | 9, 16–18 | Row operator tree | `query/src/operators.rs` `build_pages_at` | Unreachable for user tables, but not removed. |
 | 17 | `DISTINCT` and set operations where one key column lacks a direct hash | `query/src/set_keys.rs` `ArrowKey::read` | Decodes the whole row, including packed vectors. |
 | 6, 10 | Admission of ambiguous union layouts | `columnar/src/read_check.rs` | Reads every cell. |
@@ -584,12 +584,12 @@ Durable logs and external protocols still encode their prescribed formats.
 
 | # | Audit path | Implementation and boundary |
 | --- | --- | --- |
-| 1 | Row-created numeric lists | `ListValue` and `ListBuilder` retain signed and unsigned integers, Float16/32/64, decimal coefficients and validity in Arrow. Distinct component types use a dense union. Opened unsigned buffers can be reinterpreted at their signed width. |
-| 2 | SQL and logical-plan literals | SQL expression materialization and EDN literal input append directly to the numeric builder. SQL and EDN still parse their own text and evaluate each expression that contributes a cell. |
-| 3 | List-changing SQL | Casts and array aggregation append computed cells to the typed builder. Compatible trims slice the packed payload. An aggregate collecting whole vectors retains the inner Arrow payload even when its outer list is generic. |
+| 1 | Row-created numeric lists | `ListValue` and `ListBuilder` retain signed and unsigned integers, Float16/32/64, decimal coefficients and validity in Arrow. Distinct component types use a dense union whose observed type follows the first selected occurrence of each leg and of null. Opened unsigned buffers can be reinterpreted at their signed width. |
+| 2 | SQL and logical-plan literals | SQL expression materialization and EDN literal input append to the numeric builder. In computed list construction, primitive arithmetic and random calls write their typed results in expression order. SQL and EDN parse their own text. |
+| 3 | List-changing SQL | Eligible list casts write integer, floating-point, decimal, text and temporal child buffers using the scalar conversion rules. Nullable element targets use union remapping. Compatible trims slice the packed payload. An aggregate collecting whole vectors retains the inner Arrow payload even when its outer list is generic. |
 | 4 | UNNEST and list readers | Stored lists use the scan's Arrow child selections and parent indices. List-expression pages carry typed numeric vectors, indexed integer series generate signed Arrow vectors, and mixed nonnumeric expressions retain their value semantics. |
-| 5 | List indexing, comparison and hashing | Float comparison and ordering read typed components directly. Packed numeric hashing uses the same primitive codecs as Arrow cells. Indexing returns one value, and generic mixed-type comparison still evaluates the cells needed by SQL ordering. |
-| 6 | Generic layout and extensions | Supported numeric child arrays preserve validity, dense union tags and logical decimal metadata. Compatible layout changes use Arrow kernels. Decorated and nonnumeric child types still follow their own logical readers. The native schema reader retains its accepted layout contract. |
+| 5 | List indexing, comparison and hashing | Numeric equality and ordering read typed children directly, including exact integers and decimals and floating-point comparison. Packed numeric hashing uses the same primitive codecs as Arrow cells. Indexing reads one selected child. Generic mixed-type comparison evaluates the cells needed by SQL ordering. |
+| 6 | Generic layout and extensions | Supported numeric child arrays preserve validity, dense union tags and logical decimal metadata. Numeric children with compatible annotations normalize into the same packed layouts as logical cell reads. Logical extensions, incompatible union legs and nonnumeric child types follow their own readers. The native schema reader retains its accepted layout contract. |
 | 7 | Scoring | Direct cosine reads selected Arrow cells. A simple Boolean CASE evaluates its guard and scores only selected rows from Arrow. Other expressions can read Arrow or packed views through the evaluator. Reference normalization and score accumulation use native computation state. |
 | 8 | Page presence statistics | Ordinary list presence uses parent validity. Typed page readers compute child numeric statistics, including Float16. |
 | 9 | Generic row spill | Row spill uses Arrow IPC, including per-record schemas for mixed fallback rows. Packed numeric children retain their widths and nulls when the result needs a new layout. |

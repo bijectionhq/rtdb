@@ -42,17 +42,7 @@ pub(crate) fn cast_resolved(value: &Value, target: &TemporalCast, timezone: &str
     let result_type = target.data_type(timezone);
     let LogicalType::Scalar(scalar) = &result_type else { unreachable!() };
     let nanos = match value {
-        Value::Utf8(text) => match &target.kind {
-            TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_) => {
-                let zoned = matches!(target.kind, TemporalKind::TimestampZone(_));
-                rtdb_types::parse_sql_timestamp_cast(text, zoned).map_err(|error| {
-                    if error.code == "xtdb/invalid-date-time" { error }
-                    else { invalid_temporal_text(text, if zoned { "timestamp with timezone" } else { "timestamp without timezone" }) }
-                })?
-            }
-            TemporalKind::Time => time(text)?,
-            TemporalKind::Duration => crate::temporal_text::duration_nanos(text)?,
-        },
+        Value::Utf8(text) => text_nanos(text, target)?,
         Value::IntervalMonthDayNano { .. } | Value::IntervalMonthDayMicro { .. } if matches!(target.kind, TemporalKind::Duration) => {
             let parts = IntervalParts::of(value).unwrap();
             if parts.months > 0 { return Err(Anomaly::incorrect("xtdb.expression/cannot-cast-mdn-interval-with-months", "Cannot cast month-day-micro/nano intervals when month component is non-zero.")); }
@@ -60,6 +50,34 @@ pub(crate) fn cast_resolved(value: &Value, target: &TemporalCast, timezone: &str
         }
         _ => return crate::cast::cast(value, &result_type, timezone),
     };
+    let raw = quantize(nanos, target)?;
+    Ok(match scalar {
+        rtdb_types::ScalarType::Timestamp { unit, timezone } => Value::Timestamp { value: raw, unit: *unit, timezone: timezone.clone() },
+        rtdb_types::ScalarType::Time { unit, bit_width } => Value::Time { value: raw, unit: *unit, bit_width: *bit_width },
+        rtdb_types::ScalarType::Duration(unit) => Value::Duration { value: raw, unit: *unit },
+        _ => unreachable!(),
+    })
+}
+
+pub(crate) fn text_raw(text: &str, target: &TemporalCast) -> Result<i64> {
+    quantize(text_nanos(text, target)?, target)
+}
+
+fn text_nanos(text: &str, target: &TemporalCast) -> Result<i128> {
+    match &target.kind {
+        TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_) => {
+                let zoned = matches!(target.kind, TemporalKind::TimestampZone(_));
+                rtdb_types::parse_sql_timestamp_cast(text, zoned).map_err(|error| {
+                    if error.code == "xtdb/invalid-date-time" { error }
+                    else { invalid_temporal_text(text, if zoned { "timestamp with timezone" } else { "timestamp without timezone" }) }
+                })
+            }
+        TemporalKind::Time => time(text),
+        TemporalKind::Duration => crate::temporal_text::duration_nanos(text),
+    }
+}
+
+fn quantize(nanos: i128, target: &TemporalCast) -> Result<i64> {
     let nanos = if let Some(precision) = target.precision {
         let factor = 10f64.powf(9i64.wrapping_sub(precision) as f64);
         let fraction = ((nanos.rem_euclid(1_000_000_000) as f64 / factor).floor() * factor) as i64;
@@ -70,13 +88,7 @@ pub(crate) fn cast_resolved(value: &Value, target: &TemporalCast, timezone: &str
     let raw = if matches!(target.kind, TemporalKind::Duration) {
         i128::from(i64::try_from(nanos).map_err(|_| overflow())?) / divisor
     } else { nanos.div_euclid(divisor) };
-    let raw = i64::try_from(raw).map_err(|_| overflow())?;
-    Ok(match scalar {
-        rtdb_types::ScalarType::Timestamp { unit, timezone } => Value::Timestamp { value: raw, unit: *unit, timezone: timezone.clone() },
-        rtdb_types::ScalarType::Time { unit, bit_width } => Value::Time { value: raw, unit: *unit, bit_width: *bit_width },
-        rtdb_types::ScalarType::Duration(unit) => Value::Duration { value: raw, unit: *unit },
-        _ => unreachable!(),
-    })
+    i64::try_from(raw).map_err(|_| overflow())
 }
 
 pub(crate) fn invalid_temporal_text(text: &str, kind: &str) -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-temporal-string", format!("String '{text}' has invalid format for type {kind}")).with_context("s", text.into()).with_context("date-type", kind.into()) }

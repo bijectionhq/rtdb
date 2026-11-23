@@ -1,6 +1,6 @@
 use crate::numeric::{exact_decimal, inapplicable, integer, number};
 use crate::temporal::{date_days, timestamp_units, IntervalParts};
-use rtdb_types::{Anomaly, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, ListView, NumericCell, NumericSpan, Result, TimeUnit, Value};
 use std::cmp::Ordering;
 use crate::EvaluationScope;
 
@@ -48,6 +48,92 @@ fn validate_equality_values(left: &Value, right: &Value) -> Result<()> {
     Ok(())
 }
 
+pub(crate) enum NumericListInput<'a> {
+    Stored(ListView<'a>),
+    Opened(NumericSpan<'a>),
+}
+
+impl<'a> NumericListInput<'a> {
+    pub(crate) fn stored(view: ListView<'a>) -> Option<Self> {
+        view.is_packed_numeric().then_some(Self::Stored(view))
+    }
+
+    fn len(&self) -> usize {
+        match self { Self::Stored(view) => view.len(), Self::Opened(span) => span.len() }
+    }
+
+    fn get(&self, index: usize) -> NumericCell {
+        match self {
+            Self::Stored(view) => view.numeric_component(index),
+            Self::Opened(span) => span.get(index).expect("index in list").signed(),
+        }
+    }
+
+    pub(crate) fn equal(&self, other: &Self, strict: bool) -> Option<bool> {
+        if self.len() != other.len() { return Some(false); }
+        let mut unknown = false;
+        for index in 0..self.len() {
+            let (a, b) = (self.get(index), other.get(index));
+            if a == NumericCell::Null || b == NumericCell::Null {
+                if strict && a != b { return Some(false); }
+                unknown |= !strict;
+            } else if numeric_category(a) != numeric_category(b) {
+                if strict || sql_eq_value(&a.into_value(), &b.into_value(), "UTC", None).expect("numeric equality") != Some(true) {
+                    return Some(false);
+                }
+            } else if !numeric_equal(a, b) {
+                return Some(false);
+            }
+        }
+        if unknown { None } else { Some(true) }
+    }
+
+    pub(crate) fn order(&self, other: &Self, nulls_first: bool) -> Ordering {
+        let null_order = if nulls_first { Ordering::Less } else { Ordering::Greater };
+        for index in 0..self.len().min(other.len()) {
+            let order = match (self.get(index), other.get(index)) {
+                (NumericCell::Null, NumericCell::Null) => Ordering::Equal,
+                (NumericCell::Null, _) => null_order,
+                (_, NumericCell::Null) => null_order.reverse(),
+                (a, b) if numeric_category(a) != numeric_category(b) => {
+                    compare(&a.into_value(), &b.into_value(), nulls_first).expect("numeric ordering")
+                }
+                (a, b) => exact_number_order(a, b).unwrap_or_else(|| float_order(a.as_f64().unwrap(), b.as_f64().unwrap())),
+            };
+            if order != Ordering::Equal { return order; }
+        }
+        self.len().cmp(&other.len())
+    }
+}
+
+fn numeric_category(value: NumericCell) -> u8 {
+    match value {
+        NumericCell::Decimal(..) => 2,
+        NumericCell::F16(_) | NumericCell::F32(_) | NumericCell::F64(_) => 1,
+        _ => 0,
+    }
+}
+
+fn exact_number_order(left: NumericCell, right: NumericCell) -> Option<Ordering> {
+    use num_bigint::BigInt;
+    if let (Some(a), Some(b)) = (left.integer(), right.integer()) { return Some(a.cmp(&b)); }
+    if let (NumericCell::Decimal(a, ap), NumericCell::Decimal(b, bp)) = (left, right)
+        && ap.scale == bp.scale
+    {
+        return Some((a[0] as i8).cmp(&(b[0] as i8)).then_with(|| a[1..].cmp(&b[1..])));
+    }
+    let parts = |value: NumericCell| match value {
+        NumericCell::Decimal(bytes, params) => Some((BigInt::from_signed_bytes_be(&bytes), i64::from(params.scale))),
+        value => value.integer().map(|integer| (BigInt::from(integer), 0)),
+    };
+    let ((a, ls), (b, rs)) = (parts(left)?, parts(right)?);
+    Some(crate::decimal::compare_parts(&a, ls, &b, rs))
+}
+
+fn numeric_equal(left: NumericCell, right: NumericCell) -> bool {
+    exact_number_order(left, right).map_or_else(|| left.as_f64() == right.as_f64(), |order| order == Ordering::Equal)
+}
+
 /// SQL equality in UTC; the scope retains admitted metadata and reached Transit allocations.
 /// NULL yields unknown; callers separately own numeric comparison scratch.
 pub fn sql_eq(left: &Value, right: &Value, allocation: &EvaluationScope) -> Result<Option<bool>> {
@@ -90,6 +176,9 @@ pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str, allocati
                     }
                 }
                 return Ok(if unknown { None } else { Some(true) });
+            }
+            if let (Some(left), Some(right)) = (NumericListInput::stored(left), NumericListInput::stored(right)) {
+                return Ok(left.equal(&right, false));
             }
             for (a, b) in left.iter().zip(right.iter()) { match sql_eq_value(a.as_ref(), b.as_ref(), timezone, allocation)? { Some(false) => return Ok(Some(false)), None => unknown = true, _ => () } }
             Ok(if unknown { None } else { Some(true) })
@@ -208,6 +297,9 @@ pub(crate) fn strict_eq_scoped(left: &Value, right: &Value, allocation: Option<&
             if a.is_float() && b.is_float() {
                 return Ok((0..a.len()).all(|index| a.float_component(index) == b.float_component(index)));
             }
+            if let (Some(a), Some(b)) = (NumericListInput::stored(a), NumericListInput::stored(b)) {
+                return Ok(a.equal(&b, true) == Some(true));
+            }
             for (a, b) in a.iter().zip(b.iter()) { if !strict_eq_scoped(a.as_ref(), b.as_ref(), allocation)? { return Ok(false); } }
             Ok(true)
         }
@@ -325,6 +417,9 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
                 }
                 return Ok(a.len().cmp(&b.len()));
             }
+            if let (Some(a), Some(b)) = (NumericListInput::stored(a), NumericListInput::stored(b)) {
+                return Ok(a.order(&b, nulls_first));
+            }
             for (a, b) in a.iter().zip(b.iter()) { let order = compare_in_timezone(a.as_ref(), b.as_ref(), nulls_first, timezone)?; if order != Ordering::Equal { return Ok(order); } }
             Ok(a.len().cmp(&b.len()))
         }
@@ -332,5 +427,28 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
             (Some(a), Some(b)) => interval_order(left, right, a, b),
             _ => Err(inapplicable("compare", &[left, right])),
         },
+    }
+}
+
+#[cfg(test)]
+mod numeric_lists {
+    use super::*;
+    use rtdb_types::{DecimalValue, ListValue};
+
+    #[test]
+    fn typed_comparison_preserves_exact_decimals_and_nulls() {
+        let decimal = |n: i128, scale| Value::Decimal(DecimalValue::new(n.to_be_bytes().to_vec(), 32, scale, 128).unwrap());
+        let left = ListValue::from(vec![Value::I64(9_007_199_254_740_993), Value::Null, decimal(100, 2)]);
+        let right = ListValue::from(vec![Value::U64(9_007_199_254_740_993), Value::Null, decimal(10, 1)]);
+        let a = NumericListInput::stored(left.view()).unwrap();
+        let b = NumericListInput::stored(right.view()).unwrap();
+        assert_eq!(a.equal(&b, false), None);
+        assert_eq!(a.equal(&b, true), Some(true));
+        assert_eq!(a.order(&b, false), Ordering::Equal);
+        assert_ne!(left, right);
+        let right = ListValue::from(vec![Value::U64(9_007_199_254_740_993), Value::Null, decimal(11, 1)]);
+        let b = NumericListInput::stored(right.view()).unwrap();
+        assert_eq!(a.equal(&b, false), Some(false));
+        assert_eq!(a.order(&b, false), Ordering::Less);
     }
 }

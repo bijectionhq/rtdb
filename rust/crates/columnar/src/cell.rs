@@ -380,6 +380,13 @@ impl<'a> ArrowCell<'a> {
         (from <= to && to <= values.len()).then_some((element, values, from..to))
     }
 
+    pub fn numeric_list_span(self) -> Option<rtdb_types::NumericSpan<'a>> {
+        if !matches!(self.sequence_kind()?, ListKind::List | ListKind::FixedSizeList(_)) { return None; }
+        let (field, array, range) = self.sequence_range()?;
+        let element = crate::from_field(field).ok()?;
+        crate::values::numeric_list_span(field, array, range, &element)
+    }
+
     /// Borrows a floating-point list's child array and the positions used by this cell.
     /// Supports Float32, Float64, and dense unions of those widths with optional nulls.
     pub fn float_list_span(self) -> Option<(rtdb_types::ListView<'a>, std::ops::Range<usize>)> {
@@ -574,22 +581,12 @@ impl LeafLeg<'_> {
 
 /// An element whose observed type depends only on its field and its validity.
 fn leaf(field: &Field) -> bool {
-    field.metadata().is_empty()
-        && matches!(
-            field.data_type(),
-            DataType::Null
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-        )
+    if field.metadata().contains_key(crate::EXTENSION_NAME_KEY) { return false; }
+    matches!(field.data_type(), DataType::Null
+        | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        | DataType::Float16 | DataType::Float32 | DataType::Float64
+        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..))
 }
 
 fn layout() -> Anomaly {

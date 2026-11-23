@@ -1,5 +1,15 @@
 use std::cmp::Ordering;
 use super::*;
+use crate::compare::NumericListInput;
+
+fn typed_numbers<'a>(value: &'a EvalValue<'a>) -> Option<NumericListInput<'a>> {
+    let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
+    match reader.as_ref() {
+        ListReader::Stored(list) => NumericListInput::stored(list.view()),
+        ListReader::Arrow(cell) => cell.numeric_list_span().map(NumericListInput::Opened),
+        _ => None,
+    }
+}
 
 pub(super) fn equal<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Option<bool>>> {
     if !strict { rtdb_plan::validate_equality_types(&value_type(&left,frame)?,&value_type(&right,frame)?)?; }
@@ -36,6 +46,9 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
                         }
                     }
                     return Ok(if unknown { None } else { Some(true) });
+                }
+                if let (Some(left), Some(right)) = (typed_numbers(&left), typed_numbers(&right)) {
+                    return Ok(left.equal(&right, strict));
                 }
                 for index in 0..size {
                     let a = nth(clone_value(&left,frame)?,index,frame)?.await?;
@@ -90,6 +103,9 @@ pub(super) fn order<'a>(left: EvalValue<'a>,right: EvalValue<'a>,frame: &'a Eval
                         if order != Ordering::Equal { return Ok(order); }
                     }
                     return Ok(a.cmp(&b));
+                }
+                if let (Some(left), Some(right)) = (typed_numbers(&left), typed_numbers(&right)) {
+                    return Ok(left.order(&right, false));
                 }
                 for index in 0..a.min(b) {
                     let a = nth(clone_value(&left,frame)?,index,frame)?.await?;

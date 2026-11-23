@@ -33,6 +33,7 @@ impl<'a> VectorInput<'a> {
         Some(match self {
             Self::Stored(ListView::Values(values)) => Self::Stored(ListView::Values(&values[..length])),
             Self::Stored(ListView::Numeric(values)) => Self::Arrow { field: values.field(), array: values.array().as_ref(), offset: 0, len: length },
+            Self::Stored(ListView::Scalars(_)) => return None,
             Self::Stored(values) => Self::Floats { values, offset: 0, len: length },
             Self::Floats { values, offset, .. } => Self::Floats { values, offset, len: length },
             Self::Arrow { field, array, offset, .. } => Self::Arrow { field, array, offset, len: length },
@@ -204,6 +205,14 @@ fn component(value: &Value) -> Result<f64> {
 mod tests {
     use super::{CosineVector, cosine_distance};
     use rtdb_types::Value;
+
+    #[test]
+    fn packed_text_has_no_float_prefix() {
+        let array = std::sync::Arc::new(arrow_array::StringArray::from(vec!["text"]));
+        let field = std::sync::Arc::new(arrow_schema::Field::new("v", arrow_schema::DataType::Utf8, false));
+        let list = rtdb_types::ListValue::from_scalar_arrow(field, array).unwrap();
+        assert!(super::VectorInput::Stored(list.view()).prefix(1).is_none());
+    }
 
     #[test]
     fn prepared_distance_has_the_scalar_bits() {

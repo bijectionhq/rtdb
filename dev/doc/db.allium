@@ -2057,6 +2057,10 @@ surface QueryAccess {
         -- A literal table with stable scalar columns builds one Arrow batch before its consumers run.
         -- Literal tables and stacked scalar projections gather output up to the configured transport row limit before encoding it.
         -- A list expression over inputs with a shared compatible layout interleaves the child values in Arrow.
+        -- Materializing a selected numeric list with compatible child annotations packs its active components and validity into Arrow.
+        -- Computed primitive arithmetic and random list elements append to typed children in expression order.
+        -- Supported list casts write typed child buffers using the scalar conversion rules and preserve nullable element remapping.
+        -- Numeric list predicates read the active child buffers and apply scalar equality and ordering in list order.
         -- A struct expression over compatible Arrow fields retains the child arrays.
         -- Selecting a compatible struct child combines its validity with the parent validity in Arrow.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.

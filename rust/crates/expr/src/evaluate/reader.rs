@@ -6,6 +6,7 @@ use rtdb_types::{Anomaly, ListKind, LogicalType, Result, Value};
 use super::{EvalContext, ExpressionRow, boolean, integer, nullish, overflow};
 
 mod compare;
+mod computed;
 mod calls;
 mod packed;
 mod scalar;
@@ -271,7 +272,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 let scope = crate::EvaluationScope::new(allocation.memory_budget())?;
                 scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
                 let page_context = context.with_allocation(&scope);
-                if let Some(values) = packed_slice(&value, position, count, &page_context)? {
+                if let Some(values) = packed_slice(&value, position, count, true, &page_context)? {
                     if let Some((field, array)) = values.packed_column() {
                         rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
                     }
@@ -284,11 +285,7 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                     let page_context = context.with_allocation(&scope);
                     let page_frame = EvaluationFrame { schema, row: ExpressionRow::Values(row), context: &page_context, asynchronous: true, replacements: Some(replacements) };
                     for index in position..position + count {
-                        let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
-                        let mut cell = materialize(cell, &page_frame)?.await?;
-                        cell.admit_expression_dates()?;
-                        super::validate_projection_value(&cell)?;
-                        values.push(cell);
+                        append_list_element(&value, index, &page_frame, &mut values, true).await?;
                     }
                 }
                 position += count;
@@ -441,7 +438,7 @@ fn borrowed_vector<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::Vector
     }
 }
 
-fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, context: &EvalContext<'_>) -> Result<Option<rtdb_types::ListValue>> {
+fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, projection: bool, context: &EvalContext<'_>) -> Result<Option<rtdb_types::ListValue>> {
     let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return Ok(None); };
     let end = offset.checked_add(count).ok_or_else(overflow)?;
     match reader.as_ref() {
@@ -452,7 +449,9 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, context: &Ev
         }
         ListReader::Arrow(cell) => {
             let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
-            if end > range.len() || !rtdb_types::ListValue::supports_numeric_arrow(field) { return Ok(None); }
+            if end > range.len() { return Ok(None); }
+            let is_packed = rtdb_types::ListValue::supports_numeric_arrow(field);
+            if !is_packed && cell.numeric_list_span().is_none() { return Ok(None); }
             let rows = (range.start + offset)..(range.start + end);
             let bound = rows.clone().try_fold(4096usize, |bytes, row| {
                 rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
@@ -461,16 +460,47 @@ fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, context: &Ev
                     .ok_or_else(overflow)
             })?;
             context.reserve(bound)?;
+            if !is_packed {
+                let span = rtdb_types::NumericSpan::new(field, array, rows).expect("validated numeric child");
+                return Ok(rtdb_columnar::repack_numeric_list(&span, true));
+            }
             let selection = rows.map(|row| (0, row)).collect::<Vec<_>>();
             let array = rtdb_columnar::copy_selected_cells(&[array], &selection)?;
             let values = rtdb_types::ListValue::from_numeric_arrow(Arc::new(field.clone()), array);
             Ok(values)
         }
+        ListReader::Cast { input, element } => packed::cast(input, *element, offset..end, projection, context),
         ListReader::Trim { input, size } if end <= crate::collection::view_size(*size)? => {
-            packed_slice(input, offset, count, context)
+            packed_slice(input, offset, count, projection, context)
         }
         _ => Ok(None),
     }
+}
+
+async fn append_list_element<'a>(
+    value: &EvalValue<'a>, index: usize, frame: &'a EvaluationFrame<'a>,
+    builder: &mut rtdb_types::ListBuilder, projection: bool,
+) -> Result<()> {
+    let computed = if let EvalValue::List(_, reader) = value
+        && let ListReader::Expressions(items) = reader.as_ref()
+    {
+        computed::element(&items[index], frame).await?
+    } else { None };
+    let mut cell = match computed {
+        Some(computed::Element::Number(number)) => {
+            if projection { crate::list_cast::validate_output(number)?; }
+            builder.push_numeric(number);
+            return Ok(());
+        }
+        Some(computed::Element::Scalar(cell)) => cell,
+        None => materialize(nth(clone_value(value, frame)?, index, frame)?.await?, frame)?.await?,
+    };
+    if projection {
+        cell.admit_expression_dates()?;
+        super::validate_projection_value(&cell)?;
+    }
+    builder.push(cell);
+    Ok(())
 }
 
 fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Value>> {
@@ -499,21 +529,28 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 if let EvalValue::List(_, reader) = &value
                     && let ListReader::Arrow(cell) = reader.as_ref()
                     && !matches!(kind, Kind::Set)
-                    && cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field))
                 {
-                    frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
-                    return rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row);
+                    if cell.sequence_range().is_some_and(|(field, _, _)| rtdb_types::ListValue::supports_numeric_arrow(field)) {
+                        frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
+                        return rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row);
+                    }
+                    if let Some(span) = cell.numeric_list_span() {
+                        frame.context.reserve(rtdb_columnar::estimate_read_value_bytes(cell.field, cell.array, cell.row)?)?;
+                        if let Some(list) = rtdb_columnar::repack_numeric_list(&span, true) {
+                            return Ok(if kind == Kind::Fixed { Value::FixedSizeList(list) } else { Value::List(list) });
+                        }
+                    }
                 }
                 if let EvalValue::List(Kind::List, reader) = &value
                     && let ListReader::Cast { input, element } = reader.as_ref()
-                    && let Some(values) = packed::float_cast(input, *element, frame.context)?
+                    && let Some(values) = packed::cast(input, *element, 0..len(input)?, false, frame.context)?
                 {
                     return Ok(Value::List(values));
                 }
                 let size = len(&value)?;
                 if let EvalValue::List(Kind::List, reader) = &value
                     && matches!(reader.as_ref(), ListReader::Trim { .. })
-                    && let Some(values) = packed_slice(&value, 0, size, frame.context)?
+                    && let Some(values) = packed_slice(&value, 0, size, false, frame.context)?
                 {
                     return Ok(Value::List(values));
                 }
@@ -528,7 +565,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 }
                 let mut values = rtdb_types::ListBuilder::with_capacity(size);
                 for index in 0..size {
-                    values.push(materialize(nth(clone_value(&value,frame)?,index,frame)?.await?,frame)?.await?);
+                    append_list_element(&value, index, frame, &mut values, false).await?;
                     if frame.asynchronous && index % 1024 == 1023 { tokio::task::yield_now().await; }
                 }
                 let values = values.finish();
