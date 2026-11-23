@@ -202,6 +202,7 @@ pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWo
 pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
 pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
+pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
@@ -315,6 +316,7 @@ impl OwnedReadResource {
 enum HistoryRead<'a> {
     Observed { read: OwnedValidHistory<'a>, held: &'a OwnedReadResource, relation: &'a OwnedRelation },
     Version(QueryCursor),
+    Archived(std::vec::IntoIter<OwnedBatch>),
 }
 
 impl HistoryRead<'_> {
@@ -322,6 +324,7 @@ impl HistoryRead<'_> {
         match self {
             Self::Observed { read, .. } => read.next_batch().await,
             Self::Version(cursor) => cursor.next_batch().await,
+            Self::Archived(batches) => Ok(batches.next()),
         }
     }
 
@@ -329,6 +332,7 @@ impl HistoryRead<'_> {
         match self {
             Self::Observed { read, .. } => read.runtime_schema(),
             Self::Version(cursor) => Some(cursor.runtime_schema()),
+            Self::Archived(_) => None,
         }
     }
 
@@ -337,7 +341,7 @@ impl HistoryRead<'_> {
             Self::Observed { read, held, relation } => {
                 read.witness().map_err(status)?.map(|evidence| held.remember(call, relation, evidence)).transpose()
             }
-            Self::Version(_) => Ok(None),
+            Self::Version(_) | Self::Archived(_) => Ok(None),
         }
     }
 }
@@ -1478,24 +1482,18 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_versions_action(&self, call: &Call, body: &[u8]) -> Result<Vec<ActionResult>, Status> {
+    fn owned_versions_request(
+        &self, call: &Call, request: &[u8],
+    ) -> Result<(OwnedRelation, EntityId, OwnedVersionRequest, Arc<MemoryReservation>), Status> {
         use rtdb_types::Interval;
 
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned versions has no held handle"))?;
-        let handle = Bytes::copy_from_slice(handle);
-        let held = self.owned_read(call, &handle)?;
-        if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
-            return Err(status(error));
-        }
         let (relation, arrow_bytes) = split_relation(request)?;
         let batch = request_batch(call, arrow_bytes)?;
         let batch = batch.batch();
         if batch.num_columns() != 7 || batch.num_rows() != 1 {
             return Err(invalid("Owned versions requires one row with identity, system endpoints, and pagination fields"));
         }
-        let (id, _identity) = point_identity(call, batch)?;
+        let (id, identity) = point_identity(call, batch)?;
         let from = history_request_endpoint(batch, "system_from_micros")?;
         let to = history_request_endpoint(batch, "system_to_micros")?;
         let system = Interval::new(from, to).map_err(status)?;
@@ -1511,17 +1509,57 @@ impl Service {
             .filter(|values| !values.is_null(0) && field.metadata().is_empty())
             .ok_or_else(|| invalid("Owned versions descending must be a non-null Boolean"))?;
         let order = if descending.value(0) { OwnedVersionOrder::Descending } else { OwnedVersionOrder::Ascending };
-        let request = OwnedVersionRequest { system, after, scan_limit, result_limit, order };
+        Ok((relation, id, OwnedVersionRequest { system, after, scan_limit, result_limit, order }, identity))
+    }
+
+    pub(crate) async fn held_world_parent_versions_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<Vec<ActionResult>, Status> {
+        use rtdb_types::Interval;
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent versions require a held world"))?;
+        let (selected, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent versions have no selected publication"))?;
+        let selected = Timestamp(i64::from_be_bytes(*selected));
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, query, _identity) = self.owned_versions_request(call, request)?;
+        let (page, witness) = held.snapshot.parent_versions_at(&relation, &id, selected, query).await.map_err(status)?;
+        let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
+        let header_charge = call.reserve(64)?;
+        let mut header = owned_version_header(page.next_revision, page.done, page.floor, page.scanned)?;
+        let mut bytes = ActionResult { body: Bytes::from_static(&[0; 35]) }.encoded_len();
+        let mut results = Vec::with_capacity(page.versions.len() + 1);
+        for version in page.versions {
+            let reply = self.history_reply(call, &id, HistoryRead::Archived(version.timeline.into_iter()),
+                Interval::ALL, selected, Some((version.sequence, version.system))).await?;
+            bytes = wire::add(bytes, reply.encoded_len())?;
+            if bytes > self.0.config.maximum_message_bytes {
+                return Err(Status::resource_exhausted("Earlier parent version page exceeds the Flight response limit"));
+            }
+            results.push(reply);
+        }
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        header.extend_from_slice(held.remember(call, witness, false)?.as_bytes());
+        results.insert(0, ActionResult { body: wire::retain(header, header_charge) });
+        Ok(results)
+    }
+
+    pub(crate) async fn held_owned_versions_action(&self, call: &Call, body: &[u8]) -> Result<Vec<ActionResult>, Status> {
+        use rtdb_types::Interval;
+
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned versions has no held handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (relation, id, request, _identity) = self.owned_versions_request(call, request)?;
         let page = held.snapshot.versions(&relation, &id, request).await.map_err(status)?;
         let present = held.snapshot.system_time();
         let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
         let header_charge = call.reserve(64)?;
-        let mut header = Vec::with_capacity(35);
-        header.extend_from_slice(&page.next_revision.to_be_bytes());
-        header.push(u8::from(page.done));
-        header.extend_from_slice(&page.floor.0.to_be_bytes());
-        let scanned = u16::try_from(page.scanned).map_err(|_| invalid("Owned version scan count is out of range"))?;
-        header.extend_from_slice(&scanned.to_be_bytes());
+        let mut header = owned_version_header(page.next_revision, page.done, page.floor, page.scanned)?;
 
         let mut bytes = 0;
         let mut results = Vec::with_capacity(page.versions.len() + 1);
@@ -3307,6 +3345,16 @@ fn point_identity(call: &Call, batch: &RecordBatch) -> Result<(EntityId, Arc<Mem
     let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?)?)?;
     let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;
     Ok((id, identity))
+}
+
+fn owned_version_header(next: u64, done: bool, floor: Timestamp, scanned: usize) -> Result<Vec<u8>, Status> {
+    let scanned = u16::try_from(scanned).map_err(|_| invalid("Owned version scan count is out of range"))?;
+    let mut header = Vec::with_capacity(35);
+    header.extend_from_slice(&next.to_be_bytes());
+    header.push(u8::from(done));
+    header.extend_from_slice(&floor.0.to_be_bytes());
+    header.extend_from_slice(&scanned.to_be_bytes());
+    Ok(header)
 }
 
 fn history_request_endpoint(batch: &RecordBatch, name: &str) -> Result<Timestamp, Status> {

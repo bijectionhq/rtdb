@@ -8,7 +8,7 @@ pub use owned_usage::OwnedStorageUsage;
 mod owned_identities;
 mod owned_unique;
 pub use owned_identities::OwnedIdentityPage;
-pub use owned_changes::{ExpiryCandidate, ExpiryCandidatePage, OwnedChangeCommit, OwnedMergedChanges, OwnedRelationChanges, OwnedWorldVersionRead, OWNED_MERGED_CHANGE_RELATIONS};
+pub use owned_changes::{archived_versions_at_cut, ExpiryCandidate, ExpiryCandidatePage, OwnedChangeCommit, OwnedMergedChanges, OwnedRelationChanges, OwnedWorldVersionRead, OWNED_MERGED_CHANGE_RELATIONS};
 
 use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

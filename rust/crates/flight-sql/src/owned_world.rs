@@ -81,6 +81,20 @@ pub struct WorldIdentityPage {
     pub reservations: Vec<Arc<MemoryReservation>>,
 }
 
+pub struct WorldParentVersion {
+    pub sequence: u64,
+    pub system: Timestamp,
+    pub timeline: Vec<rtdb_columnar::OwnedBatch>,
+}
+
+pub struct WorldParentVersions {
+    pub floor: Timestamp,
+    pub next_revision: u64,
+    pub done: bool,
+    pub scanned: usize,
+    pub versions: Vec<WorldParentVersion>,
+}
+
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
     fn present(&self) -> Timestamp;
@@ -158,6 +172,10 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>,
         limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
+    fn parent_versions_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, selected: Timestamp,
+        request: rtdb_node::OwnedVersionRequest,
+    ) -> BoxFuture<'a, Result<(WorldParentVersions, OwnedWorldWitness)>>;
     fn version<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId,
         from: Timestamp, through: Timestamp, group: Timestamp,

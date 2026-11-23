@@ -99,6 +99,15 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<Vec<(Interval, Timestamp)>>>,
     },
+    ParentVersionsAt {
+        relation: OwnedRelation,
+        id: EntityId,
+        selected: Timestamp,
+        request: rtdb_node::OwnedVersionRequest,
+        schema: rtdb_types::OwnedSchema,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<rtdb_flight_sql::WorldParentVersions>>,
+    },
     ParentPointAt {
         system: Timestamp,
         point: ArchivePoint,
@@ -419,6 +428,27 @@ impl HeldCheckpointWorld {
         guard()?;
         self.check_relation(relation)?;
         Ok((schedule, witness))
+    }
+    pub async fn parent_versions_at(
+        &self, relation: &OwnedRelation, id: &EntityId, selected: Timestamp, request: rtdb_node::OwnedVersionRequest,
+    ) -> Result<(rtdb_flight_sql::WorldParentVersions, OwnedWorldWitness)> {
+        self.check_relation(relation)?;
+        if selected >= self.parent_basis().system_time || request.system.upper() > selected.next()? {
+            return Err(OwnedWorld::unavailable());
+        }
+        let schema = self.historical_parent_schema(relation)?.clone();
+        let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+        if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let guard = self.open.snapshot.parent_point_release_guard(relation, id, request.system.lower()).await?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentVersionsAt {
+            relation: relation.clone(), id: id.clone(), selected, request, schema, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let page = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        guard()?;
+        self.check_relation(relation)?;
+        Ok((page, witness))
     }
 
     fn historical_parent_schema(&self, relation: &OwnedRelation) -> Result<&rtdb_types::OwnedSchema> {
@@ -1405,6 +1435,52 @@ pub(crate) async fn open_held_checkpoint_world(
                                         }
                                         context.check_cancelled()?;
                                         Ok(schedule)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::ParentVersionsAt { relation, id, selected, request, schema, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        let schemas = [(relation.clone(), schema)];
+                                        let (_, actual) = historical_parent_context(Arc::clone(&context), &owner, selected, &schemas).await?;
+                                        if actual != selected { return Err(OwnedWorld::unavailable()); }
+                                        require_parent_journal(&context, &owner, &relation, request.system.lower()).await?;
+                                        let page = rtdb_node::archived_versions_at_cut(
+                                            Arc::clone(&context), &owner, &relation, &id, selected, request,
+                                        ).await?;
+                                        let mut versions = Vec::with_capacity(page.versions.len());
+                                        let mut remaining = 8usize << 20;
+                                        for mut version in page.versions {
+                                            let version_context = context.with_owned_system_cut(version.system_time, &context.cancellation)?;
+                                            let version_schema = rtdb_query::read_owned_relation_schema(version_context, &owner, &relation).await?;
+                                            if !version_schema.is_some_and(|(schema, _)| schema == schemas[0].1) {
+                                                return Err(OwnedWorld::unavailable());
+                                            }
+                                            let mut timeline = Vec::new();
+                                            let mut rows = 0;
+                                            while let Some(batch) = version.timeline.next_batch().await? {
+                                                if batch.batch().num_rows() == 0 { continue; }
+                                                rows += batch.batch().num_rows();
+                                                if rows > MAX_HISTORY_SLICES { return Err(history_limit()); }
+                                                remaining = remaining.checked_sub(batch.batch().get_array_memory_size())
+                                                    .ok_or_else(history_limit)?;
+                                                timeline.push(batch);
+                                            }
+                                            versions.push(rtdb_flight_sql::WorldParentVersion {
+                                                sequence: version.revision, system: version.system_time, timeline,
+                                            });
+                                        }
+                                        context.check_cancelled()?;
+                                        Ok(rtdb_flight_sql::WorldParentVersions {
+                                            floor: page.floor, next_revision: page.next_revision,
+                                            done: page.done, scanned: page.scanned, versions,
+                                        })
                                     };
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
