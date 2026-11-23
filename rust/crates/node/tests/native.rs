@@ -2603,11 +2603,15 @@ async fn a_successor_retires_an_old_leaders_trie_only_after_its_query_finishes()
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if matches!(store.head_fresh(&intent).await, Err(Error::MissingObject(_))) { break; }
+                let retired = futures::future::join_all(files.iter().map(|file| store.head_fresh(file))).await;
+                if matches!(store.head_fresh(&intent).await, Err(Error::MissingObject(_)))
+                    && retired.into_iter().all(|result| matches!(result, Err(Error::MissingObject(_))))
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.expect("the successor must finish the installed retirement after the query releases its hold");
-        for file in &files { assert!(matches!(store.head_fresh(file).await, Err(Error::MissingObject(_)))); }
         drop((reader, writer, previous, current));
         stop(&predecessor, predecessor_driver).await;
         stop(&successor, successor_driver).await;
