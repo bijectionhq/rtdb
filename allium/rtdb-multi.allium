@@ -1366,6 +1366,7 @@ rule ConsumeIntake {
 -- An explicit retained Root position uses that original Root archive under the child's frame and exact schema and purge guards.
 -- Held overlay assertion history reads only exact accepted journal groups in the bounded archived region and resolves them against the same pinned Root.
 -- Ordered history opens the two images around the same accepted Held group and checks that the requested path generation covers both cuts.
+-- An earlier effective read uses a certified Held clock publication inside the retained overlay cap and the same pinned Root.
 -- Dropping the source line leaves both independently retained positions available to the child.
 -- A complete valid window includes covered absence across both sources.
 -- An authenticated placed hold can witness the completed window under its original archive pin and the selected relation's local event and Root purge frontiers.

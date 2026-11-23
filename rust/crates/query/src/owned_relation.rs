@@ -592,6 +592,52 @@ pub async fn read_owned_world_clock_revision(
     Ok(clock)
 }
 
+/// Select an accepted Held or Proposal reading within a certified physical prefix.
+pub async fn select_owned_world_clock(
+    context: &Arc<QueryContext>, owner: &str, world: Iid,
+    floor: Timestamp, initial: Timestamp, requested: Timestamp,
+) -> Result<Option<(Timestamp, Timestamp)>> {
+    let unavailable = rtdb_types::OwnedWorld::unavailable;
+    let cap = context.current_time.as_micros()?;
+    let Some((latest, publication)) = read_owned_world_clock_revision(Arc::clone(context), owner, world).await?
+    else { return Ok(None); };
+    if !(floor < publication && publication <= cap && initial < latest && latest <= publication) {
+        return Err(unavailable());
+    }
+    if latest <= requested {
+        return Ok(Some((publication, latest)));
+    }
+
+    let mut low = i128::from(floor.0);
+    let mut high = i128::from(publication.0);
+    let mut selected = None;
+    while high - low > 1 {
+        context.check_cancelled()?;
+        let mid = Timestamp((low + (high - low) / 2) as i64);
+        let probe = context.with_owned_system_cut(mid, &context.cancellation)?;
+        match read_owned_world_clock_revision(probe, owner, world).await? {
+            Some((reading, revision)) => {
+                if !(floor < revision && revision <= mid && initial < reading && reading < latest && reading <= revision)
+                    || selected.is_some_and(|(prior, prior_reading)| revision < prior || reading < prior_reading
+                        || (revision == prior) != (reading == prior_reading))
+                {
+                    return Err(unavailable());
+                }
+                if reading <= requested {
+                    selected = Some((revision, reading));
+                    low = i128::from(mid.0);
+                } else {
+                    high = i128::from(revision.0);
+                    if high <= low { return Err(unavailable()); }
+                }
+            }
+            None if selected.is_none() => low = i128::from(mid.0),
+            None => return Err(unavailable()),
+        }
+    }
+    Ok(selected)
+}
+
 pub async fn read_owned_world(
     context: Arc<QueryContext>, owner: &str, world: rtdb_types::Iid,
 ) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {

@@ -1874,8 +1874,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = if matches!(order, WorldOrder::ParentRange | WorldOrder::OverlayRange | WorldOrder::ParentCount
-            | WorldOrder::ParentRangeAt | WorldOrder::ParentCountAt) {
+        let held = if !matches!(order, WorldOrder::ParentMeasure) {
             self.owned_world_resource(call, &handle)?
         } else {
             self.owned_world_read(call, &handle)?
@@ -2050,11 +2049,7 @@ impl Service {
         let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world search valid instant"))?;
         let valid = Timestamp(i64::from_be_bytes(*valid));
         let handle = Bytes::copy_from_slice(handle);
-        let held = if !matches!(mode, WorldHistoricalRead::EarlierEffective) {
-            self.owned_world_resource(call, &handle)?
-        } else {
-            self.owned_world_read(call, &handle)?
-        };
+        let held = self.owned_world_resource(call, &handle)?;
         let (overlay, staged_scope, request) = if matches!(mode, WorldHistoricalRead::Current) {
             let (length, request) = request.split_first_chunk::<4>()
                 .ok_or_else(|| invalid("Held world search has no overlay length"))?;
@@ -2589,11 +2584,7 @@ impl Service {
             return Err(invalid("Historical world scope has repeated relations or trailing bytes"));
         }
         let handle = Bytes::copy_from_slice(handle);
-        let held = if !matches!(selection, WorldCutSelection::AsOfLocal) {
-            self.owned_world_resource(call, &handle)?
-        } else {
-            self.owned_world_read(call, &handle)?
-        };
+        let held = self.owned_world_resource(call, &handle)?;
         if matches!(selection, WorldCutSelection::AsOfParent) {
             let selected = held.snapshot.select_parent_as_of(&relations, system).await.map_err(status)?;
             for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
@@ -2631,11 +2622,7 @@ impl Service {
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let handle = Bytes::copy_from_slice(handle);
-        let held = if parent {
-            self.owned_world_resource(call, &handle)?
-        } else {
-            self.owned_world_read(call, &handle)?
-        };
+        let held = self.owned_world_resource(call, &handle)?;
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
         let point = if parent {
@@ -2685,11 +2672,7 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = if !matches!(selection, WorldHistoricalRead::EarlierEffective) {
-            self.owned_world_resource(call, &handle)?
-        } else {
-            self.owned_world_read(call, &handle)?
-        };
+        let held = self.owned_world_resource(call, &handle)?;
         let (system, body) = if !matches!(selection, WorldHistoricalRead::Current) {
             let (system, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world schedule has no revision"))?;
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
@@ -2749,11 +2732,7 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = if matches!(mode, WorldIdentityRead::Effective | WorldIdentityRead::Overlay | WorldIdentityRead::ParentAt) {
-            self.owned_world_resource(call, &handle)?
-        } else {
-            self.owned_world_read(call, &handle)?
-        };
+        let held = self.owned_world_resource(call, &handle)?;
         held.snapshot.check().map_err(status)?;
         let (parent_only, body) = if matches!(mode, WorldIdentityRead::EffectiveAt) {
             let (selector, rest) = body.split_first().ok_or_else(|| invalid("Historical world identities have no selector"))?;
