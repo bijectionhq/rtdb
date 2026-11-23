@@ -1868,9 +1868,11 @@ async fn native_search_rebuilds_from_the_retained_journal_after_loss_of_postings
         database.flush().await.unwrap();
         node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
     }
+    let table = TableRef::new("public", "docs");
+    assert!(database.trie_catalog().search_runs(&table).next().is_none());
+    database.build_artefacts().await.unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
     node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
-    let table = TableRef::new("public", "docs");
     let snapshot = database.snapshot();
     let entry = snapshot.table_entry(&table).unwrap();
     let removed = snapshot.trie_catalog().l0_source(&table, BlockIndex(-1), BlockIndex(i64::MAX))
@@ -1879,17 +1881,19 @@ async fn native_search_rebuilds_from_the_retained_journal_after_loss_of_postings
             trie.key.clone()
         }).collect::<Vec<_>>();
     assert!(!removed.is_empty());
+    let runs = snapshot.trie_catalog().search_runs(&table).collect::<Vec<_>>();
+    assert!(!runs.is_empty());
     for trie in &removed {
+        assert!(runs.iter().any(|run| run.blocks().any(|block| block == trie.block_index())));
         for path in [entry.slug.data_key(trie), entry.slug.metadata_key(trie)] {
             let key = ObjectKey::new(path).unwrap();
             database.storage().invalidate(&key).await.unwrap();
             database.object_store().delete(&key).await.unwrap();
         }
     }
-    let runs = snapshot.trie_catalog().search_runs(&table).collect::<Vec<_>>();
-    assert!(!runs.is_empty());
     for run in runs {
         let key = ObjectKey::new(run.object_key(&entry.slug).unwrap()).unwrap();
+        database.object_store().head(&key).await.unwrap();
         database.storage().invalidate(&key).await.unwrap();
         database.object_store().delete(&key).await.unwrap();
     }
