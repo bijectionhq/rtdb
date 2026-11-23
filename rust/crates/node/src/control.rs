@@ -43,7 +43,7 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
     let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
     let fields = match name.as_str() {
         "clock_time" => vec![(name.as_str(), instant)],
-        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_source_barrier"
+        "snapshot_token" | "timezone" | "transaction_isolation" | "rtdb_ordered_system_time" | "rtdb_bounded_retry" | "rtdb_source_barrier"
         | "rtdb_hosted_source_owner" => vec![(name.as_str(), text)],
         "rtdb_hosted_source_barrier" => vec![(name.as_str(), text), ("tx_id", integer), ("system_time", instant.maybe())],
         "standard_conforming_strings" => vec![(name.as_str(), LogicalType::Scalar(ScalarType::Bool).maybe())],
@@ -312,7 +312,7 @@ impl NativeSession {
                  vec![vec![Value::Timestamp { value: basis.current_time.as_micros()?.0, unit: TimeUnit::Microsecond, timezone: zone }]])
             }
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
-            "rtdb_ordered_system_time" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
+            "rtdb_ordered_system_time" | "rtdb_bounded_retry" | "rtdb_source_barrier" => (vec![(name, text.clone())], vec![vec![Value::Utf8("1".into())]]),
             "rtdb_hosted_source_owner" => {
                 let Some(SourceInspection::Owner(history)) = source else {
                     return Err(Anomaly::fault("rtdb.node/hosted-source-result", "Hosted source confirmation has no history"));

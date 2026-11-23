@@ -11,7 +11,6 @@ import kotlinx.coroutines.sync.Semaphore
 import xtdb.catalog.TableCatalog
 import xtdb.catalog.TableCatalog.Companion.allBlockFiles
 import xtdb.catalog.TableCatalog.Companion.tableBlocks
-import xtdb.api.log.ReplicaMessage.OversizedMessage
 import xtdb.storage.BufferPool
 import xtdb.api.DatabaseName
 import xtdb.util.StringUtil.fromLexHex
@@ -72,13 +71,6 @@ class BlockGarbageCollector(
 
     private val tableBlockDeleteTimer: Timer? = meterRegistry?.let {
         Timer.builder("xtdb.gc.table_block_files.delete.timer")
-            .publishPercentiles(0.75, 0.95, 0.99)
-            .tag("db", dbName)
-            .register(it)
-    }
-
-    private val offloadedPayloadDeleteTimer: Timer? = meterRegistry?.let {
-        Timer.builder("xtdb.gc.offloaded_payloads.delete.timer")
             .publishPercentiles(0.75, 0.95, 0.99)
             .tag("db", dbName)
             .register(it)
@@ -180,17 +172,6 @@ class BlockGarbageCollector(
                         { it.parseBlockIndex() }, tableBlockDeleteTimer,
                     )
                 }
-            }
-        }
-
-        // Needs no replica-log companion, for the same reason the block files above don't: a payload
-        // outlives every record that can still reach a reader replaying from a block this GC has kept.
-        supervisorScope {
-            launch(tableDispatcher) {
-                deleteGarbage(
-                    bufferPool.listAllObjects(OversizedMessage.oversizedDir).asSequence().map { it.key },
-                    OversizedMessage::blockIndexOf, offloadedPayloadDeleteTimer,
-                )
             }
         }
     }

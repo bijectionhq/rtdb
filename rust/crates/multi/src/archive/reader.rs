@@ -310,7 +310,8 @@ async fn open_inventory(
     region: Arc<IoRegion>,
 ) -> Result<VerifiedStage> {
     let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
-    let files = PrefixedStore::new(storage.bucket(region).await?, root);
+    let bucket = storage.bucket(region).await?;
+    let files = PrefixedStore::new(Arc::clone(&bucket), &root);
     if files.get(&key(ROOT_MARKER)?).await?.as_ref() != record.id.as_bytes() {
         return Err(inconsistent(
             "The staged storage root belongs to another installation",
@@ -354,9 +355,7 @@ async fn open_inventory(
         .into_iter()
         .map(|object| object.key)
         .collect::<BTreeSet<_>>();
-    if !expected.is_subset(&observed) || observed.difference(&expected).any(|object| {
-        !super::admits_seeded_transfer_payload(record, stage, object.as_str())
-    }) {
+    if !expected.is_subset(&observed) {
         return Err(inconsistent(
             "The staged storage root differs from its accepted inventory",
         ));
@@ -369,6 +368,11 @@ async fn open_inventory(
         Arc::new(StageObjects { files, objects }),
         &material,
     )?);
+    let extras = observed.difference(&expected).cloned().collect::<BTreeSet<_>>();
+    if !extras.is_empty() {
+        let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(Arc::clone(&bucket), root)), &material)?;
+        Box::pin(owned_inventory::verify_seeded_payloads(bucket.as_ref(), &serving, plaintext.as_ref(), keys, record, stage, extras)).await?;
+    }
     let point = CapturePoint {
         operation: stage.intent.capture,
         deployment: stage.intent.source,

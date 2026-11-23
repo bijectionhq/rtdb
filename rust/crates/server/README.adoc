@@ -111,6 +111,10 @@ The target remains explicit, so an operator can repair to any later retained cut
 It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
 A separate writer must apply its source-log notifications before jobs are acknowledged.
 Concurrent operation therefore requires a log provider that supports multiple source writers; the local log retains its exclusive writer lock.
+`compactor.scanTieOrderFromNamingEpoch` optionally selects scan precedence for same-system-time ties, starting at the specified positive output naming epoch.
+Choose a fresh epoch before enabling it. Stop existing compactor workers, use the exclusive `reset-compactor` workflow to publish that epoch, and start upgraded workers with the same setting before resuming compaction.
+Keep the cutover setting when restarting workers in that epoch or any later epoch.
+Compaction jobs below the cutover use the legacy byte ordering, including when legacy and upgraded workers coexist.
 The pinned JVM command's inspected startup path creates no database compactor registrations, so this useful native command is an explicit behavioral difference awaiting runtime qualification.
 The `read-arrow-file`, `read-arrow-stream-file`, `read-hash-trie-file`, `read-table-block-file` and `read-block-file` commands decode local artifacts without opening a node.
 They accept a file path and an optional memory limit.

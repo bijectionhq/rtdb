@@ -34,6 +34,12 @@ message Tx {
     ReplaySubmission replay_submission = 8;
     // The intake position comes from the log record's metadata.
     bytes placed_attempt_seed = 9;
+    BoundedRetry bounded_retry = 10;
+}
+
+message BoundedRetry {
+    bytes nonce = 1;
+    int64 not_after_micros = 2;
 }
 
 message IdempotencyGuard {

@@ -15,12 +15,17 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::bounded_retry::is_bounded_receipts_table;
 use crate::replay_submission::{ReplaySubmission, duplicate_replay, is_replay_table, replay_table};
+use crate::system_time::{SourceTime, TimeRejection};
 use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
 mod constraint_receipt;
+mod retry;
+mod retention;
+pub use retention::installed_receipt_time;
 mod fixed_range;
 mod ordered_micros;
 mod replay_constraints;
@@ -43,6 +48,7 @@ pub trait TransactionAuthorization: Send + Sync {
 }
 
 pub struct ResolveContext {
+    pub placed_receipt_retirement: bool,
     pub owned_witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     pub world_constraints: Option<Arc<dyn WorldConstraintArchive>>,
     pub database: String,
@@ -83,12 +89,12 @@ impl OwnedReplicaBody {
 #[derive(Clone, Copy)]
 enum ResolvedInput {
     Position(SourcePosition),
-    Placed(PlacedAttempt),
+    Placed { attempt: PlacedAttempt, retirement: bool },
 }
 
 impl ResolvedInput {
     fn position(self) -> SourcePosition {
-        match self { Self::Position(position) => position, Self::Placed(attempt) => attempt.position() }
+        match self { Self::Position(position) => position, Self::Placed { attempt, .. } => attempt.position() }
     }
 }
 
@@ -113,7 +119,7 @@ impl ResolvedTx {
     pub fn result(&self) -> &TransactionResult { &self.result }
     pub fn source_position(&self) -> SourcePosition { self.input.position() }
     pub fn placed_attempt(&self) -> Option<PlacedAttempt> {
-        match self.input { ResolvedInput::Placed(attempt) => Some(attempt), ResolvedInput::Position(_) => None }
+        match self.input { ResolvedInput::Placed { attempt, .. } => Some(attempt), ResolvedInput::Position(_) => None }
     }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
@@ -167,7 +173,10 @@ impl ResolvedTx {
         bound = bound.checked_add(error.as_ref().map_or(0, |error| error.as_slice().len())).and_then(|bound| bound.checked_add(self.external_token.as_ref().map_or(0, Vec::capacity))).ok_or_else(overflow)?;
         let reservation = memory.reserve(bound)?;
         let key = self.result.tx_key();
-        let placed_attempt = self.placed_attempt().map(|attempt| attempt.encode().to_vec());
+        let placed_attempt = match self.input {
+            ResolvedInput::Placed { attempt, retirement } => Some(rtdb_format::envelope::encode_replica_outcome_attempt(attempt, retirement)),
+            ResolvedInput::Position(_) => None,
+        };
         let body = ReplicaBody::ResolvedTx(WireResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),
@@ -224,18 +233,28 @@ impl TxResolver {
     }
 
     /// Stages the skipped transaction outcome after its source payload has been persisted for inspection.
-    pub fn resolve_skipped(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, attempt: Option<PlacedAttempt>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+    pub async fn resolve_skipped(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, attempt: Option<PlacedAttempt>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         let _span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(0))]);
         context.check_cancelled()?;
+        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
         let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
-        tx.write_result(&result, None)?;
-        if let Some(attempt) = attempt { tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?; }
-        self.stage(tx.buffer.stage()?, result, attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed), None, None, context)
+        let clock = tx.observe_retention_clock(log_time).await?;
+        let receipt_time = clock.time;
+        tx.retire_expired_receipts(clock).await?;
+        tx.write_result(&result, None, Some((log_time, receipt_time)))?;
+        if let Some(attempt) = attempt {
+            tx.retire_placed_outcomes(clock).await?;
+            tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new())?;
+        }
+        let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
+            attempt, retirement: context.placed_receipt_retirement,
+        });
+        self.stage(tx.buffer.stage()?, result, input, None, None, context)
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -254,22 +273,19 @@ impl TxResolver {
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let default_time = self.smooth(log_time)?;
-        let invalid_time = request.options.system_time.zip(self.resolved_head)
-            .filter(|(time, previous)| !crate::system_time::advances(Some(previous.system_time.0), time.0));
-        let ahead_of_log = request.options.system_time
-            .filter(|time| invalid_time.is_none() && !crate::system_time::admits_client_time(self.previous_system_time(), time.0, log_time.0));
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
-        let behind_log = request.options.system_time.filter(|time| {
-            *time < log_time && (has_owned_operations
-                || request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time))
-        });
+        let clock_request = match request.options.system_time {
+            None => SourceTime::Automatic,
+            Some(requested) if has_owned_operations => SourceTime::ObservedAppend(requested.0),
+            Some(requested) => SourceTime::ExactSystem {
+                requested: requested.0,
+                require_current_append: request.options.user_metadata.as_ref().is_some_and(UserMetadata::requires_ordered_system_time),
+            },
+        };
+        let selected_time = clock_request.select(self.previous_system_time(), log_time.0, default_time.0);
         let key = TransactionKey {
             tx_id: TxId(position.0),
-            system_time: if invalid_time.is_some() || ahead_of_log.is_some() || behind_log.is_some() {
-                default_time
-            } else {
-                request.options.system_time.unwrap_or(default_time)
-            },
+            system_time: Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
         };
         let attempt = request.placed_attempt(position)?;
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
@@ -277,6 +293,18 @@ impl TxResolver {
         let replay = match &request.guard {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
+        };
+        let clock = tx.observe_retention_clock(log_time).await?;
+        let receipt_time = clock.time;
+        let bounded_receipt = if let Some(SourceGuard::Bounded(retry)) = &request.guard {
+            let scope = retry::RetryScope::new(attempt.map(PlacedAttempt::scope));
+            tx.admit_bounded_retry(&scope, &request, *retry, receipt_time).await?
+        } else {
+            Ok(None)
+        };
+        let (bounded_receipt, retry_error) = match bounded_receipt {
+            Ok(receipt) => (receipt, None),
+            Err(error) => (None, Some(error)),
         };
         let plan = constraint_receipt::split(
             &request.operations,
@@ -291,28 +319,31 @@ impl TxResolver {
             _ => None,
         });
         let mut constraint_failed = false;
-        let mut outcome = if let Some(error) = plan_error {
+        let mut outcome = if let Some(error) = plan_error.or(retry_error) {
             Err(error)
+        } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
+            Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
         } else if has_owned_operations
             && !request.operations.iter().all(Operation::is_owned)
         {
             Err(Anomaly::incorrect("rtdb.owned/mixed-transaction", "Owned and ordinary writes require separate transactions"))
-        } else if let Some((requested, previous)) = invalid_time {
-            Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
-                .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
-                .with_context("latest-completed-tx", tx_key_context(previous)?))
-        } else if let Some(requested) = ahead_of_log {
-            Err(Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
-                .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
-                .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
-        } else if let Some(requested) = behind_log {
-            Err(Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
-                .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
-                .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
+        } else if let Err(rejection) = selected_time {
+            let (requested, error) = match rejection {
+                TimeRejection::BehindHistory(requested) => (requested,
+                    Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+                        .with_context("latest-completed-tx", tx_key_context(self.resolved_head.expect("a nonadvancing time has a predecessor"))?)),
+                TimeRejection::AheadOfAppend(requested) => (requested,
+                    Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
+                        .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?)),
+                TimeRejection::BehindAppend(requested) => (requested,
+                    Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
+                        .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?)),
+            };
+            Err(error.with_context("tx-key", tx_key_context(TransactionKey { tx_id: key.tx_id, system_time: Timestamp(requested) })?))
         } else if staging_deadline.is_some() && (attempt.is_none() || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
             || request.guard.is_some() || request.idempotency_key().is_some()) {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
-        } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay).await {
+        } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay, receipt_time).await {
             Err(error)
         } else {
             let (receipt, mut outcome) = if request.guard.is_none() {
@@ -320,7 +351,7 @@ impl TxResolver {
                     Some(key) => match request.body_digest() {
                         Ok(digest) => {
                             let id = format!("{}\u{1f}{key}", request.options.user.as_deref().unwrap_or(""));
-                            let outcome = tx.receipt_outcome(&id, &digest, log_time).await.and_then(|outcome| outcome);
+                            let outcome = tx.receipt_outcome(&id, &digest, receipt_time).await.and_then(|outcome| outcome);
                             (Some((id, digest)), outcome)
                         }
                         Err(error) => (None, Err(error)),
@@ -346,9 +377,16 @@ impl TxResolver {
                         match &request.guard {
                             Some(SourceGuard::Application(guard)) => {
                                 let guard_time = crate::guard_attribution::guard_time_at(index, guard.after_bootstrap, guard.submitted_at.0);
-                                error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into))
+                                let error = error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into));
+                                if let (Some(sample), Some(id)) = (guard_time, request.idempotency_key())
+                                    && let Some(original) = tx.historical_guard_original(id, Timestamp(sample)).await?
+                                {
+                                    crate::guard_attribution::with_historical_original(error, original)
+                                } else {
+                                    error
+                                }
                             }
-                            Some(SourceGuard::Replay(_)) => error.with_context(IDEMPOTENCY_GUARD_RESULT, false.into()),
+                            Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_)) => error.with_context(IDEMPOTENCY_GUARD_RESULT, false.into()),
                             None => error,
                         }
                     } else { error };
@@ -380,7 +418,7 @@ impl TxResolver {
             }
             outcome.and_then(|()| match (replay, receipt) {
                 (Some(replay), _) => tx.write_replay_marker(replay),
-                (None, Some((id, digest))) => tx.put_receipt(&id, &digest, log_time),
+                (None, Some((id, digest))) => tx.put_receipt(&id, &digest, receipt_time),
                 (None, None) => Ok(()),
             })
         };
@@ -408,9 +446,13 @@ impl TxResolver {
             }
             Err(error) => return Err(error),
         };
-        let input = attempt.map_or(ResolvedInput::Position(position), ResolvedInput::Placed);
+        if let Some(receipt) = bounded_receipt { tx.write_bounded_receipt(receipt, receipt_time)?; }
+        if !has_owned_operations { tx.retire_expired_receipts(clock).await?; }
+        let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
+            attempt, retirement: context.placed_receipt_retirement,
+        });
         let selected = if settled { refusal } else { primary };
-        let mut resolved = tx.finish_source(result, input, log_time, selected)?;
+        let mut resolved = tx.finish_source(result, input, log_time, clock, selected).await?;
         if resolved.result().committed() && let Some(until) = staging_deadline
             && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, &context.memory)
         {
@@ -419,7 +461,7 @@ impl TxResolver {
             if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
             let tx = OpenTransaction::new(base, key, &request.options, context)?;
             let result = TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) };
-            resolved = tx.finish_source(result, input, log_time, &[])?;
+            resolved = tx.finish_source(result, input, log_time, clock, &[]).await?;
         }
         context.check_cancelled()?;
         self.stage_resolved(resolved)
@@ -430,7 +472,6 @@ impl TxResolver {
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head.map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
-        // A source's own commit time labels history only up to this node's clock, so history never leads the clock that assigns it.
         let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.map_or(now, |time| Timestamp(time.0.min(now.0))))? };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base.clone(), key, &options, context)?;
@@ -442,12 +483,13 @@ impl TxResolver {
                 (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, user_metadata)
             }
         };
-        tx.write_result(&result, metadata.as_ref())?;
+        tx.write_result(&result, metadata.as_ref(), None)?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(self.source_position), token, None, context)
     }
 
-    pub fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+    pub async fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
         let (result, operation) = match verdict {
@@ -457,7 +499,10 @@ impl TxResolver {
         };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
-        tx.write_result(&result, None)?;
+        let clock = tx.observe_retention_clock(log_time).await?;
+        let receipt_time = clock.time;
+        tx.retire_expired_receipts(clock).await?;
+        tx.write_result(&result, None, Some((log_time, receipt_time)))?;
         context.check_cancelled()?;
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
     }
@@ -480,6 +525,9 @@ impl TxResolver {
         let key = resolved.result.tx_key();
         if resolved.placed_attempt().is_some() && key.tx_id.0 != position.0 {
             return Err(Anomaly::fault("rtdb.tx/placed-attempt-position", "A placed attempt must match its transaction result"));
+        }
+        if self.resolved_head.is_some_and(|head| head.tx_id >= key.tx_id) {
+            return Err(Anomaly::fault("rtdb.tx/transaction-order", "Resolved transaction position does not advance its predecessor"));
         }
         if resolved.writes.tx_key() != key || !crate::system_time::advances(self.previous_system_time(), key.system_time.0) {
             return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction does not advance its predecessor's system time"));
@@ -532,15 +580,19 @@ impl<'a> OpenTransaction<'a> {
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
-    fn finish_source(mut self, result: TransactionResult, input: ResolvedInput, log_time: Timestamp, selected: &[Operation]) -> Result<ResolvedTx> {
+    async fn finish_source(
+        mut self, result: TransactionResult, input: ResolvedInput, log_time: Timestamp,
+        clock: retention::RetentionClock, selected: &[Operation],
+    ) -> Result<ResolvedTx> {
         let options = self.options;
-        self.write_result(&result, options.user_metadata.as_ref())?;
-        if let ResolvedInput::Placed(attempt) = input {
+        self.write_result(&result, options.user_metadata.as_ref(), Some((log_time, clock.time)))?;
+        if let ResolvedInput::Placed { attempt, .. } = input {
             let controls = selected.iter().filter_map(|operation| match operation {
                 Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
                 _ => None,
             }).collect();
             let worlds = if result.committed() { crate::replica::worlds::source_inventory(selected)? } else { Vec::new() };
+            self.retire_placed_outcomes(clock).await?;
             self.write_attempt_outcome(attempt, log_time, controls, worlds)?;
         }
         ResolvedTx::new(self.buffer.stage()?, result, input, None, None, self.context)
@@ -555,7 +607,9 @@ impl<'a> OpenTransaction<'a> {
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> {
         self.context.check_cancelled()?;
-        if is_replay_table(&table) || table == receipts_table() || TableRef::owned_schema(&table.schema) { check_table(&table)?; }
+        if is_replay_table(&table) || table == receipts_table() || is_bounded_receipts_table(&table) || TableRef::owned_schema(&table.schema) {
+            check_table(&table)?;
+        }
         self.buffer.append(table, event)
     }
     /// Stages a source's Arrow documents in their input order under this transaction's system time.
@@ -563,7 +617,7 @@ impl<'a> OpenTransaction<'a> {
         &mut self, table: &TableRef, documents: arrow_array::ArrayRef, headers: &[EventHeader],
     ) -> Result<()> {
         self.context.check_cancelled()?;
-        if is_replay_table(table) || *table == receipts_table() || TableRef::owned_schema(&table.schema) { check_table(table)?; }
+        if is_replay_table(table) || *table == receipts_table() || is_bounded_receipts_table(table) || TableRef::owned_schema(&table.schema) { check_table(table)?; }
         let batch = rtdb_format::data::owned_put_batch(documents, headers, None, &self.context.memory)?;
         self.buffer.append_batch(table, batch)
     }
@@ -2382,7 +2436,10 @@ impl<'a> OpenTransaction<'a> {
         let batch = rtdb_format::data::owned_put_batch(content, &headers, documents.source_bytes(), &memory)?;
         self.buffer.append_batch(table, batch)
     }
-    async fn check_replay_marker(&self, replay: &ReplaySubmission) -> Result<()> {
+    async fn check_replay_marker(&self, replay: &ReplaySubmission, observed: Timestamp) -> Result<()> {
+        if observed >= replay.not_after() {
+            return Err(Anomaly::incorrect("rtdb.node/replay-window-elapsed", "Replay submission reached its exclusive cutoff in the ordered log"));
+        }
         if !self.snapshot()?.contains_table(&replay_table()) { return Ok(()); }
         let mut cursor = self.open_query(
             "SELECT original_tx_id, _system_from FROM xt.rtdb_replay_keys FOR VALID_TIME FROM ? TO NULL WHERE _id = ? ORDER BY _system_from DESC LIMIT 1",
@@ -2409,7 +2466,7 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.put(replay_table(), document, interval(replay.submitted_at(), replay.expires_at())?)
     }
 
-    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>) -> Result<()> {
+    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>, source_times: Option<(Timestamp, Timestamp)>) -> Result<()> {
         let key = result.tx_key();
         let error = result.encoded_error()?;
         let bound = error.as_ref().map_or(0, |error| error.as_slice().len()).checked_add(metadata.map(|value| value.value().retained_bytes()).transpose()?.unwrap_or(0)).and_then(|bytes| bytes.checked_add(16_384)).ok_or_else(overflow)?;
@@ -2417,16 +2474,37 @@ impl<'a> OpenTransaction<'a> {
         let table = TableRef::new("xt", "txs");
         let error_column = "error".to_owned();
         let metadata_column = "user_metadata".to_owned();
+        let metadata_type = metadata.map_or_else(
+            || LogicalType::Struct(StructFields::new()).maybe(),
+            |metadata| metadata.value().logical_type().maybe(),
+        );
+        let embedded_metadata = match (source_times, metadata) {
+            (Some((_, observed)), Some(metadata)) => {
+                let expiry = Timestamp(observed.0.saturating_add(RECEIPT_WINDOW_MICROS));
+                let retained = StructFields::from([
+                    ("_id".into(), Value::I64(key.tx_id.0)),
+                    (metadata_column.clone(), metadata.value().clone()),
+                ]);
+                self.buffer.put(receipts_table(), retained, interval(observed, expiry)?)?;
+                Value::Null
+            }
+            (None, Some(metadata)) => metadata.value().clone(),
+            (_, None) => Value::Null,
+        };
         let document = StructFields::from([
             ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
+            ("source_log_time".into(), source_times.map(|(appended, _)| time_value(appended)).unwrap_or(Value::Null)),
+            ("receipt_time".into(), source_times.map(|(_, observed)| time_value(observed)).unwrap_or(Value::Null)),
             ("committed".into(), Value::Bool(result.committed())),
-            (metadata_column.clone(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
+            (metadata_column.clone(), embedded_metadata),
             (error_column.clone(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
         ]);
         self.buffer.put(table.clone(), document, interval(key.system_time, Timestamp::MAX)?)?;
-        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &LogicalType::Struct(StructFields::new()).maybe())])
+        self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &metadata_type)])
     }
 }
+
+pub const HISTORICAL_KEYED_TRANSACTION_SQL: &str = "SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM public.rtdb_idempotency_keys FOR SYSTEM_TIME AS OF ? FOR VALID_TIME FROM ? TO NULL AS k WHERE k._id = ? ORDER BY k._system_from DESC LIMIT 1)";
 
 /// How long, from source-log admission, a receipt answers retries of its identity.
 pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;
@@ -2796,6 +2874,7 @@ mod tests {
         state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "xtdb".into(),
@@ -2831,6 +2910,7 @@ mod tests {
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);
         let resolve = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
@@ -2913,6 +2993,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-capacity", 1)?),
             world_constraints: None,
             database: "application".into(),
@@ -2962,6 +3043,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "application".into(),
@@ -3032,6 +3114,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-capacity", 1)?),
             world_constraints: None,
             database: "application".into(),
@@ -3261,6 +3344,7 @@ mod tests {
     async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
         let memory = MemoryBudget::new(1 << 26);
         let resolve = ResolveContext {
+            placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
             database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
