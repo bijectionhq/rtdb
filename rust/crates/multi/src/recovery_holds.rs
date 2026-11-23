@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
-use rtdb_storage::{Error, Result, log::LogOffset};
+use rtdb_format::envelope::ReplicaFrame;
+use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord}};
 use rtdb_types::Anomaly;
 use tokio::sync::oneshot;
 use tokio_util::task::TaskTracker;
@@ -95,7 +96,25 @@ impl RecoveryAdmission {
         Ok(Some(ReplayHold { through, _release: release }))
     }
 
-    async fn check_start(&self, after: LogOffset) -> Result<()> {
+    pub(crate) async fn retain_offloaded(&self, records: &mut [LogRecord]) -> Result<()> {
+        let mut offloaded = Vec::new();
+        for record in records {
+            if ReplicaFrame::has_external_payload(&record.payload).map_err(|error| self.directory_error(error))? {
+                offloaded.push(record);
+            }
+        }
+        let Some((first, last)) = offloaded.first().zip(offloaded.last()) else { return Ok(()); };
+        let after = first.metadata.offset.0.checked_sub(1)
+            .ok_or_else(|| Error::Task("Invalid first offloaded replica offset".into()))?;
+        let hold = self.hold(LogOffset(after), last.metadata.offset).await?
+            .map(Arc::new).ok_or_else(|| Error::Task("The offloaded replica delivery has no replay hold".into()))?;
+        for record in offloaded {
+            record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn check_start(&self, after: LogOffset) -> Result<()> {
         self.checked_record(after).await.map(|_| ())
     }
 

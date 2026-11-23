@@ -126,6 +126,19 @@ pub struct ReplicaFrame {
 }
 
 impl ReplicaFrame {
+    pub fn has_external_payload(bytes: &[u8]) -> Result<bool> {
+        let (&header, mut payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
+        if header != PROTOBUF_LOG_HEADER {
+            return Err(invalid(format!("Unknown replica message header: {header}")));
+        }
+        while !payload.is_empty() {
+            let (field, wire) = wire_key(&mut payload)?;
+            skip_wire(&mut payload, field, wire, 0)?;
+            if field == 8 && wire == 2 { return Ok(true); }
+        }
+        Ok(false)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
         if header != PROTOBUF_LOG_HEADER {

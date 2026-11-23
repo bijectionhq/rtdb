@@ -362,17 +362,21 @@ impl Log for SealedLog {
             None => None,
         };
         Ok(self.inner.recovery_tail(after).await?.map(|inner| {
-            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: hold.map(Arc::new) }) as Box<dyn LogTail>
+            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: hold.map(Arc::new), admission: self.recovery.clone() }) as Box<dyn LogTail>
         }))
     }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
-        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: None }))
+        if let Some(admission) = &self.recovery { admission.check_start(after).await?; }
+        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: None, admission: self.recovery.clone() }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
-        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream) }))
+        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), admission: self.recovery.clone() }))
     }
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {
-        self.inner.read_range(from, to).await?.into_iter().map(|record| opened(&self.cipher, &self.stream, record)).collect()
+        let mut records = self.inner.read_range(from, to).await?.into_iter()
+            .map(|record| opened(&self.cipher, &self.stream, record)).collect::<rtdb_storage::Result<Vec<_>>>()?;
+        if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
+        Ok(records)
     }
 }
 
@@ -381,23 +385,31 @@ struct SealedTail {
     cipher: Arc<Cipher>,
     stream: Arc<str>,
     hold: Option<Arc<ReplayHold>>,
+    admission: Option<RecoveryAdmission>,
 }
 
 impl SealedTail {
-    fn open_record(&mut self, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
-        let mut record = opened(&self.cipher, &self.stream, record)?;
+    async fn retain_deliveries(&mut self, records: &mut [LogRecord]) -> rtdb_storage::Result<()> {
+        let mut covered = 0;
         if let Some(hold) = &self.hold {
-            record.payload = hold.retain_delivery(record.payload);
-            if record.metadata.offset >= hold.through { self.hold = None; }
+            covered = records.partition_point(|record| record.metadata.offset <= hold.through);
+            for record in &mut records[..covered] {
+                record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
+            }
+            if records.last().is_some_and(|record| record.metadata.offset >= hold.through) { self.hold = None; }
         }
-        Ok(record)
+        if let Some(admission) = &self.admission { admission.retain_offloaded(&mut records[covered..]).await?; }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl LogTail for SealedTail {
     async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
-        self.inner.poll(timeout).await?.into_iter().map(|record| self.open_record(record)).collect()
+        let mut records = self.inner.poll(timeout).await?.into_iter()
+            .map(|record| opened(&self.cipher, &self.stream, record)).collect::<rtdb_storage::Result<Vec<_>>>()?;
+        self.retain_deliveries(&mut records).await?;
+        Ok(records)
     }
     fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { if self.inner.replay().is_some() { Some(self) } else { None } }
 }
@@ -411,17 +423,22 @@ impl LogReplayTail for SealedTail {
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
         let sealed = ReplayHead { payload_len: head.payload_len + SEALED_OVERHEAD, ..head };
         let record = self.inner.replay().expect("checked when replay was offered").read_head(sealed, reservation).await?;
-        self.open_record(record)
+        let mut record = opened(&self.cipher, &self.stream, record)?;
+        self.retain_deliveries(std::slice::from_mut(&mut record)).await?;
+        Ok(record)
     }
 }
 
-struct SealedRange { inner: Box<dyn LogRange>, cipher: Arc<Cipher>, stream: Arc<str> }
+struct SealedRange { inner: Box<dyn LogRange>, cipher: Arc<Cipher>, stream: Arc<str>, admission: Option<RecoveryAdmission> }
 
 #[async_trait]
 impl LogRange for SealedRange {
     fn allocation_bound(&self) -> usize { self.inner.allocation_bound() }
     async fn next(&mut self, reservation: ReadReservation) -> rtdb_storage::Result<Option<LogRecord>> {
-        self.inner.next(reservation).await?.map(|record| opened(&self.cipher, &self.stream, record)).transpose()
+        let Some(record) = self.inner.next(reservation).await? else { return Ok(None); };
+        let mut record = opened(&self.cipher, &self.stream, record)?;
+        if let Some(admission) = &self.admission { admission.retain_offloaded(std::slice::from_mut(&mut record)).await?; }
+        Ok(Some(record))
     }
 }
 
@@ -560,6 +577,8 @@ mod tests {
         let Cas::Applied(mut record) = directory.replace_deployment(record, version).await.unwrap() else { panic!("failed to authorize trim"); };
         assert_eq!(provider.first_retained(), LogOffset(0));
         assert!(provider.recovery_tail(LogOffset(3)).await.unwrap().is_some());
+        assert!(matches!(replica.tail(LogOffset(3)).await,
+            Err(Error::UnavailableLogRange { requested: 4, first_retained: 5 })));
         assert!(matches!(replica.recovery_tail(LogOffset(3)).await,
             Err(Error::UnavailableLogRange { requested: 4, first_retained: 5 })), "authorized trim must exclude the required record before it is removed");
         assert!(replica.recovery_tail(LogOffset(4)).await.unwrap().is_some());
@@ -579,6 +598,51 @@ mod tests {
         record.log_epoch += 1;
         assert!(matches!(directory.replace_deployment(record, version).await.unwrap(), Cas::Applied(_)));
         assert!(matches!(replica.recovery_tail(LogOffset(5)).await, Err(Error::Closed(_))));
+    }
+
+    #[tokio::test]
+    async fn a_live_offload_after_the_startup_tip_pins_its_replica_position() {
+        use rtdb_directory::{DeploymentRecord, Directory, MemoryDirectory, ReplayCustody};
+
+        let directory = MemoryDirectory::new();
+        let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
+        let config = LogkeeperLogConfig {
+            servers: vec![], deployment: record.id.clone(), key_id: record.key_id(),
+            replica_stream: record.stream("replica"), replica_seal_scope: record.replica_seal_scope(),
+            write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
+            transferred_source_through: None, frozen_at: None, previous_servers: None,
+        };
+        let directory_files = tempfile::tempdir().unwrap();
+        let holds = Arc::new(RecoveryHolds {
+            directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(directory_files.path()).unwrap()),
+            custody: ReplayCustody::Local, tasks: Default::default(),
+        });
+        let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &[7; 32], &config, holds.clone()).unwrap();
+        let claim = ReplicaEnvelope { term: Term(1), term_sequence: None, message: ReplicaBody::NoOp(Default::default()) };
+        replica.enqueue(Bytes::from(claim.encode()), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        let mut tail = replica.recovery_tail(LogOffset(-1)).await.unwrap().unwrap();
+        let proxy = claim.offloaded(rtdb_format::CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "paused".into(), &claim.encode());
+        replica.enqueue(Bytes::from(proxy.encode()), Timestamp(1)).await.unwrap().durable().await.unwrap();
+        let mut records = tail.poll(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(records.len(), 2);
+        let delivery = records.pop().unwrap().payload;
+        drop((tail, records));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = directory.deployment(&record.id).await.unwrap().unwrap();
+                if current.required_replica_offsets(0).collect::<Vec<_>>() == [1] { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        let first_required = current.required_replica_offsets(0).min().unwrap();
+        assert_eq!(crate::replica_retention::replica_trim_through(3, first_required), Some(0));
+
+        drop(delivery);
+        holds.tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), holds.tasks.wait()).await.unwrap();
+        assert!(directory.deployment(&record.id).await.unwrap().unwrap().storage_regions.is_empty());
     }
 
     async fn append(log: &MemoryLog, message: ReplicaBody) {

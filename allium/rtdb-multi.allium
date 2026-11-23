@@ -1552,6 +1552,11 @@ rule ReleaseReplicaReplay {
         })
 }
 
+-- A serving cursor admits an offloaded delivery before exposing its pointer.
+-- Startup and ordinary delivery use the same directory trim frontier.
+-- The delivered pointer retains the replay hold until its provider read drains or the pointer is discarded.
+-- An inline delivery after startup consumes no replay hold.
+
 ------------------------------------------------------------
 -- Rules: compaction
 --
