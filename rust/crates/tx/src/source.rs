@@ -562,12 +562,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             body.insert("expected".into(), expected.map_or(Value::Null, |expected| Value::I64(expected.0)));
             "rtdb-owned-check-v1"
         }
-        Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, replay_floor }) => {
+        Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, expiry, scope }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("id".into(), id.as_value());
             body.insert("created".into(), Value::I64(created.0));
-            body.insert("replay_floor".into(), Value::I64(replay_floor.0));
-            "rtdb-owned-sweep-expired-v1"
+            body.insert("expiry".into(), Value::I64(expiry.0));
+            body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
+            "rtdb-owned-sweep-expired-v2"
         }
         Operation::Public(TxOp::OwnedErase { relation, id }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1235,7 +1236,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
             "rtdb-owned-erase-v2" => &["relation", "id"],
-            "rtdb-owned-sweep-expired-v1" => &["relation", "id", "created", "replay_floor"],
+            "rtdb-owned-sweep-expired-v2" => &["relation", "id", "created", "expiry", "scope"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
             "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
@@ -1432,14 +1433,15 @@ impl SourceOperationReader<'_> {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
                 TxOp::OwnedDeadline { until: Timestamp(until) }
             }
-            "rtdb-owned-sweep-expired-v1" => {
-                let (Value::Utf8(relation), Value::I64(created), Value::I64(replay_floor)) =
-                    (value("relation")?, value("created")?, value("replay_floor")?) else {
+            "rtdb-owned-sweep-expired-v2" => {
+                let (Value::Utf8(relation), Value::I64(created), Value::I64(expiry), Value::Binary(scope)) =
+                    (value("relation")?, value("created")?, value("expiry")?, value("scope")?) else {
                     return Err(invalid("Owned expiry sweep has incomplete scope"));
                 };
                 TxOp::OwnedSweepExpired {
                     relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()?,
-                    created: Timestamp(created), replay_floor: Timestamp(replay_floor),
+                    created: Timestamp(created), expiry: Timestamp(expiry),
+                    scope: rtdb_types::PlacedAttemptScope::decode(&scope)?,
                 }
             }
             "rtdb-owned-erase-v2" => {
