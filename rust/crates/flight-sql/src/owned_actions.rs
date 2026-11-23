@@ -198,6 +198,7 @@ pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParen
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
 pub(crate) const RETAIN_REPLAYED_WORLD_V1: &str = "rtdb.owned.RetainReplayedWorld.v1";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
+pub(crate) const SELECT_HELD_WORLD_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldAsOf.v1";
 pub(crate) const HELD_WORLD_AT_PREFLIGHT_V1: &str = "rtdb.owned.PreflightHeldWorldAt.v1";
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
@@ -2279,7 +2280,7 @@ impl Service {
         Ok(entry)
     }
 
-    pub(crate) async fn held_world_at_preflight_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_at_preflight_action(&self, call: &Call, body: &[u8], select: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world scope has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world scope has no ordered present"))?;
@@ -2303,8 +2304,16 @@ impl Service {
             rtdb_types::WorldClockMode::Proposal => 2,
             rtdb_types::WorldClockMode::Retained => return Err(status(rtdb_types::OwnedWorld::unavailable())),
         };
-        let clock = held.snapshot.preflight_accepted_scope(&relations, system).await.map_err(status)?;
+        let selected = if select {
+            held.snapshot.select_accepted_scope(&relations, system).await.map_err(status)?
+        } else {
+            let clock = held.snapshot.preflight_accepted_scope(&relations, system).await.map_err(status)?;
+            Some((system, clock))
+        };
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
+        let Some((system, clock)) = selected else {
+            return Ok(ActionResult { body: Bytes::from_static(&[0]) });
+        };
         let mut reply = Vec::with_capacity(17);
         reply.extend_from_slice(&system.0.to_be_bytes());
         reply.extend_from_slice(&clock.0.to_be_bytes());

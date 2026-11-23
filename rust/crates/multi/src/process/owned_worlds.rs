@@ -266,6 +266,12 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn select_accepted_scope<'a>(
+        &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
+    ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>> {
+        Box::pin(HeldCheckpointWorld::select_accepted_scope(self, relations, requested))
+    }
+
     fn preflight_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], system: Timestamp,
     ) -> BoxFuture<'a, Result<Timestamp>> {

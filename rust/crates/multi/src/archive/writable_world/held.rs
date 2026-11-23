@@ -256,6 +256,14 @@ impl HeldCheckpointWorld {
         Ok(clock)
     }
 
+    pub async fn select_accepted_scope(&self, relations: &[OwnedRelation], requested: Timestamp)
+        -> Result<Option<(Timestamp, Timestamp)>> {
+        self.check()?;
+        let selected = self.open.snapshot.select_world_accepted_scope(&self.open.record, relations, requested).await?;
+        self.require_accepted_archive_scope(relations).await?;
+        Ok(selected)
+    }
+
     async fn require_accepted_archive_scope(&self, relations: &[OwnedRelation]) -> Result<()> {
         let guard = self.open.snapshot.relation_release_guard(relations)?;
         let mut schemas = Vec::with_capacity(relations.len());
