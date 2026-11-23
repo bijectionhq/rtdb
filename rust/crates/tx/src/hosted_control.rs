@@ -31,9 +31,20 @@ struct ReplayConstraint {
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OriginalHandoff {
+    handoff: [u8; 32],
+    fence: rtdb_types::TransactionKey,
+    through: rtdb_types::TransactionKey,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostedReplay {
     binding: [u8; 32],
     archive: [u8; 32],
+    original_authority: [u8; 16],
+    captured: rtdb_types::TransactionKey,
+    handoff: Option<OriginalHandoff>,
     through: u64,
     previous: Option<rtdb_types::TransactionKey>,
     source: rtdb_types::TransactionKey,
@@ -98,7 +109,7 @@ pub fn hosted_replay_controls<'a>(
         || !check(RESTORE, "replayed", false)
         || head.expected().is_some() != replay.previous.is_some()
         || receipt.expected().is_some() || replay_body(receipt) != Some(encoded)
-        || source.tx_id.0 < 0 || source.system_time.0 <= 0
+        || !replay.has_original_prefix()
         || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
         || u64::try_from(source.system_time.0).ok().and_then(|time| time.checked_mul(1_000))
             .is_none_or(|time| time < replay.logical_at || time > replay.through)
@@ -152,6 +163,12 @@ fn replay_constraint_mismatch() -> Anomaly {
         "The held transaction does not reproduce the Original constraint effects")
 }
 
+fn original_prefix(event: rtdb_types::TransactionKey, captured: rtdb_types::TransactionKey) -> bool {
+    event.tx_id.0 >= 0 && event.system_time.0 > 0
+        && (event == captured
+            || (event.tx_id < captured.tx_id && event.system_time < captured.system_time))
+}
+
 fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
     control_body(control, 4096)
 }
@@ -163,6 +180,18 @@ fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]>
 }
 
 impl HostedReplay {
+    fn has_original_prefix(&self) -> bool {
+        self.original_authority != [0; 16]
+            && u64::try_from(self.captured.system_time.0).ok()
+                .and_then(|micros| micros.checked_mul(1_000)) == Some(self.through)
+            && original_prefix(self.source, self.captured)
+            && self.handoff.as_ref().is_none_or(|seal| {
+                seal.handoff != [0; 32]
+                    && original_prefix(seal.through, self.captured)
+                    && original_prefix(seal.fence, seal.through)
+            })
+    }
+
     fn matches_coordinates(&self, control: &HostedControlWrite) -> bool {
         let Some(document) = control.replacement() else { return false; };
         let matches_bytes = |name: &str, bytes: &[u8]| {
@@ -209,6 +238,8 @@ impl HostedReplay {
                 if bytes.len() > 4096 { return Err(replay_invalid()); }
                 let previous: Self = serde_json::from_slice(bytes).map_err(|_| replay_invalid())?;
                 previous.binding == self.binding && previous.archive == self.archive && previous.through == self.through
+                    && previous.original_authority == self.original_authority
+                    && previous.captured == self.captured && previous.handoff == self.handoff
                     && Some(previous.source) == self.previous && previous.logical_at < self.logical_at
             }
             _ => true,
@@ -527,9 +558,13 @@ mod replay_tests {
         let hold = OwnedRelation::new(RESTORE)?;
         let fields = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
         let (binding, archive, fingerprint) = ([1u8; 32], [2u8; 32], [3u8; 32]);
-        let body = serde_json::json!({"binding": binding, "archive": archive, "through": 4000,
+        let receipt = serde_json::json!({"binding": binding, "archive": archive, "through": 4000,
+            "original_authority": ([4u8; 16]), "captured": {"tx_id": 3, "system_time": 4},
+            "handoff": {"handoff": ([5u8; 32]), "fence": {"tx_id": 1, "system_time": 2},
+                "through": {"tx_id": 2, "system_time": 3}},
             "previous": null, "source": {"tx_id": 3, "system_time": 4}, "logical_at": 3000,
-            "fingerprint": fingerprint}).to_string().into_bytes();
+            "fingerprint": fingerprint});
+        let body = receipt.to_string().into_bytes();
         let replace = |id: &str, expected, body: &[u8]| {
             let mut document = fields(id);
             document.insert("binding".into(), Value::Binary(body.to_vec()));
@@ -558,6 +593,21 @@ mod replay_tests {
         assert_eq!(replay.source_time(), Timestamp(4));
         assert!(replay.check_order(Timestamp(4)).is_err());
         assert!(replay.check_order(Timestamp(5)).is_ok());
+        for (field, value) in [
+            ("captured", serde_json::json!({"tx_id": 4, "system_time": 4})),
+            ("original_authority", serde_json::json!(([0u8; 16]))),
+            ("handoff", serde_json::json!({"handoff": ([5u8; 32]),
+                "fence": {"tx_id": 3, "system_time": 4}, "through": {"tx_id": 2, "system_time": 3}})),
+        ] {
+            let mut invalid = receipt.clone();
+            invalid[field] = value;
+            let invalid = invalid.to_string().into_bytes();
+            controls[3] = replace(NATIVE_FRONTIER, None, &invalid)?;
+            controls[4] = replace("native-transaction/3", None, &invalid)?;
+            assert!(hosted_replay_controls(controls.iter()).is_err());
+        }
+        controls[3] = replace(NATIVE_FRONTIER, None, &body)?;
+        controls[4] = replace("native-transaction/3", None, &body)?;
         controls[4] = replace("native-transaction/3", Some(Timestamp(9)), &body)?;
         assert!(hosted_replay_controls(controls.iter()).is_err());
         controls[4] = replace("native-transaction/3", None, &body)?;
