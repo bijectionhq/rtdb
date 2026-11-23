@@ -2199,7 +2199,7 @@ impl<'a> OpenTransaction<'a> {
                     || self.decision_time() >= *until || *frontier < 0 || basis.tx_id.0 < 0
                     || relation.world().is_some() || relation.is_world_catalog()
                     || base.tx_basis().is_none_or(|head| basis.tx_id > head.tx_id || basis.system_time > head.system_time
-                        || ((basis.tx_id == head.tx_id) != (basis.system_time == head.system_time)))
+                        || (basis.tx_id == head.tx_id && basis.system_time != head.system_time))
                 {
                     return Err(unavailable());
                 }
@@ -2222,7 +2222,7 @@ impl<'a> OpenTransaction<'a> {
             let Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) = operation else { continue; };
             let observed = if self.buffer.base_snapshot().contains_table(&relation.lifetime_table(owner)) {
                 let accepted = self.decision_time();
-                if *valid_at >= accepted {
+                if *valid_at > accepted {
                     return Err(lifetime_uncovered());
                 }
                 // Expiration does not publish a new row revision. Certify

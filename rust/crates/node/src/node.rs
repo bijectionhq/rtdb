@@ -615,7 +615,7 @@ impl Node {
         let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
         let context = if audience { context } else { context.with_accelerators(Arc::clone(&self.factory.accelerators)) };
         context
-            .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
+            .with_read_options(&basis.snapshot, basis.snapshot_time, basis.current_time)
             .map(|context| context.with_query_cpu(query_cpu))
     }
 
@@ -3790,6 +3790,13 @@ impl SessionService for NativeSessionService {
         let time = database.partition.value().live().latest_completed_tx().map(|key| key.system_time.into());
         Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
+    async fn fresh_query_instant(&self) -> Result<rtdb_types::Instant> {
+        match &self.node.factory.decision_clock {
+            Some(_) => Ok(self.node.receiver_time().await?.into()),
+            None => Ok(self.node.query_instant()),
+        }
+    }
+
     async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken)
         -> Result<(TimeBasis, Option<crate::ReplicaQueryCapture>)>
     {

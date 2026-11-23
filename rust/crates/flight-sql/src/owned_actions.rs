@@ -4045,7 +4045,7 @@ impl Service {
         if publish_root {
             held.snapshot.check().map_err(status)?;
             deadline = deadline.min(held.snapshot.evidence_until());
-            if held.snapshot.present().system_time >= deadline {
+            if held.snapshot.query_time().map_err(status)? >= deadline {
                 return Err(Status::failed_precondition("Root hold is outside the fork deadline"));
             }
         }
@@ -4367,7 +4367,7 @@ impl Service {
         }
         if let Some(read) = &root_read {
             read.snapshot.check().map_err(status)?;
-            if read.snapshot.present().system_time >= deadline
+            if read.snapshot.query_time().map_err(status)? >= deadline
                 || ((delete_root || proposal_overlay || proposal_land || proposal_close) && (deadline > read.snapshot.evidence_until()
                     || read.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none()))
             {
