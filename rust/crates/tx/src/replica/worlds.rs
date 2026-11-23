@@ -11,17 +11,17 @@ use super::invalid;
 pub(crate) const WORLD_EFFECTS: &str = "owned_world_effects";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { Root, Overlay, ProposalOverlay, ProposalSettlement, ProposalLanding, ProposalClose, Clock, Fork, RootRetainedFork, RootRetainedAdvance, RootRetainedRenewal, RootRetainedSibling, ControlsRetainedFork, ProposalControlsFork, ProposalRootFork, ProposalRootHold, ProposalRootShorten, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
+enum Kind { Root, Overlay, ProposalOverlay, ProposalSettlement, ProposalLanding, ProposalClose, Clock, Fork, RootHeldFork, ControlsHeldFork, RootRetainedFork, RootRetainedAdvance, RootRetainedRenewal, RootRetainedSibling, ControlsRetainedFork, ProposalControlsFork, ProposalRootFork, ProposalRootHold, ProposalRootShorten, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
 
 const ROOT: Iid = Iid([0; 16]);
 
 impl Kind {
     fn writes_data(self) -> bool {
-        matches!(self, Self::Root | Self::Overlay | Self::ProposalOverlay | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalRootShorten | Self::ProposalLanding | Self::ProposalClose)
+        matches!(self, Self::Root | Self::Overlay | Self::ProposalOverlay | Self::RootHeldFork | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalRootShorten | Self::ProposalLanding | Self::ProposalClose)
     }
 
     fn relation_world(self, registered_world: Iid) -> Iid {
-        if matches!(self, Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalRootShorten | Self::ProposalLanding | Self::ProposalClose) { ROOT } else { registered_world }
+        if matches!(self, Self::RootHeldFork | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalRootShorten | Self::ProposalLanding | Self::ProposalClose) { ROOT } else { registered_world }
     }
 
     fn name(self) -> &'static str {
@@ -34,6 +34,8 @@ impl Kind {
             Self::ProposalLanding => "proposal-landing",
             Self::Clock => "clock",
             Self::Fork => "fork",
+            Self::RootHeldFork => "root-held-fork",
+            Self::ControlsHeldFork => "controls-held-fork",
             Self::RootRetainedFork => "root-retained-fork",
             Self::RootRetainedAdvance => "root-retained-advance",
             Self::RootRetainedRenewal => "root-retained-renewal",
@@ -60,6 +62,8 @@ impl Kind {
             "proposal-landing" => Ok(Self::ProposalLanding),
             "clock" => Ok(Self::Clock),
             "fork" => Ok(Self::Fork),
+            "root-held-fork" => Ok(Self::RootHeldFork),
+            "controls-held-fork" => Ok(Self::ControlsHeldFork),
             "root-retained-fork" => Ok(Self::RootRetainedFork),
             "root-retained-advance" => Ok(Self::RootRetainedAdvance),
             "root-retained-renewal" => Ok(Self::RootRetainedRenewal),
@@ -101,7 +105,10 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         Operation::Public(TxOp::OwnedForkWorld { record, previous, attempt, fingerprint, root, .. }) => Some(
             match record.get("_id") {
                 Some(Value::Uuid(world)) => {
+                    let held = matches!(record.get("mode"), Some(Value::Utf8(mode)) if mode == "held");
                     let kind = match root {
+                        crate::OwnedForkRoot::Writes if held => Kind::RootHeldFork,
+                        crate::OwnedForkRoot::Controls if held => Kind::ControlsHeldFork,
                         crate::OwnedForkRoot::Writes => Kind::RootRetainedFork,
                         crate::OwnedForkRoot::WritesAdvance => Kind::RootRetainedAdvance,
                         crate::OwnedForkRoot::WritesRenewal => Kind::RootRetainedRenewal,
@@ -171,7 +178,7 @@ pub(super) fn verify(
         if fields.len() != 5 || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose))
+            || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootHeldFork | Kind::ControlsHeldFork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose))
             || (matches!(kind, Kind::RootRetainedDrop | Kind::ProposalClose | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ProposalRootHold | Kind::ProposalRootShorten) && relations.len() != 1)
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
@@ -190,10 +197,10 @@ pub(super) fn verify(
             root_retained_fork = true;
             root_holder_replace = kind == Kind::ProposalRootHold;
             hosted = HostedEffects::ProposalHold;
-        } else if kind == Kind::ProposalRootFork {
+        } else if matches!(kind, Kind::RootHeldFork | Kind::ProposalRootFork) {
             root_retained_fork = true;
             hosted = HostedEffects::RequiredReplacements;
-        } else if matches!(kind, Kind::ControlsRetainedFork | Kind::ProposalControlsFork) {
+        } else if matches!(kind, Kind::ControlsHeldFork | Kind::ControlsRetainedFork | Kind::ProposalControlsFork) {
             hosted = HostedEffects::RequiredReplacements;
         } else if matches!(kind, Kind::ProposalOverlay | Kind::ProposalSettlement) {
             hosted = HostedEffects::ProposalOverlay;
@@ -273,6 +280,8 @@ pub(super) fn verify(
                     Some(Kind::ControlsRetainedDrop | Kind::RootRetainedDrop) => record.dropped
                         && record.mode == rtdb_types::WorldClockMode::Retained,
                     Some(Kind::Fork) => !record.dropped && record.id == record.pin,
+                    Some(Kind::RootHeldFork | Kind::ControlsHeldFork) => !record.dropped
+                        && record.id == record.pin && record.is_held_root_fork(),
                     Some(Kind::RootRetainedFork | Kind::ControlsRetainedFork) => !record.dropped && record.id == record.pin
                         && record.mode == rtdb_types::WorldClockMode::Retained,
                     Some(Kind::ProposalRootHold | Kind::ProposalRootShorten) => !record.dropped && record.id != record.pin
@@ -375,7 +384,7 @@ pub(super) fn verify(
             Kind::Root | Kind::ProposalSettlement => false,
             Kind::Overlay | Kind::ProposalOverlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),
-            Kind::ProposalLanding | Kind::ProposalClose | Kind::Fork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
+            Kind::ProposalLanding | Kind::ProposalClose | Kind::Fork | Kind::RootHeldFork | Kind::ControlsHeldFork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
         })
     {
         return Err(mismatch());
@@ -433,4 +442,28 @@ fn records_with_limit(
 
 fn mismatch() -> rtdb_types::Anomaly {
     invalid("Resolved world effects disagree with their ordered placed inventory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_types::{TxId, WorldClockMode, WorldSchemas};
+
+    #[test]
+    fn held_birth_has_its_own_control_and_registration_inventory() -> Result<()> {
+        let child = OwnedWorld {
+            id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([2; 16]), suffix: None,
+            ancestor: None, manifest: "a".repeat(43),
+            basis: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
+            parent_publication: Some(Timestamp(100)), mode: WorldClockMode::Held { start: Timestamp(100) },
+            until: Timestamp(300), schemas: WorldSchemas::new(BTreeMap::new())?, dropped: false,
+        };
+        let inventory = source_inventory(&[Operation::Public(TxOp::OwnedForkWorld {
+            record: child.record(), previous: None, sibling: None, overlay_source: None,
+            attempt: "1".repeat(22), fingerprint: [2; 32], root: crate::OwnedForkRoot::Controls,
+        })])?;
+        let [Value::Struct(effect)] = inventory.as_slice() else { panic!("Expected one world effect"); };
+        assert!(matches!(effect.get("kind"), Some(Value::Utf8(kind)) if kind == "controls-held-fork"));
+        Ok(())
+    }
 }
