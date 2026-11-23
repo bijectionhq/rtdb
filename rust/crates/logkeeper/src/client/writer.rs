@@ -540,7 +540,7 @@ impl Writer {
             }).count();
             if pipeline.commit != lsn - 1 || ready < self.ensemble.config.write_quorum {
                 self.repair_down(pipeline);
-                return Err(Error::Remote { key: self.ensemble.stream(), message: "guarded append requires an idle prefix on a live write quorum".into() });
+                return Err(Error::GuardedAppendUnavailable);
             }
             Some(GuardedFlight { lsn, marks: pipeline.replicas.iter().map(|replica| {
                 if matches!(replica.link, Link::Live) { Mark::Pending } else { Mark::Failed }

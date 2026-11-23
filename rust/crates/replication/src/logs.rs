@@ -9,6 +9,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, 
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
 pub(crate) const STRICT_DISPATCH_CUTOFF: &str = "rtdb.replication/strict-dispatch-cutoff";
+pub(crate) const STRICT_DISPATCH_UNAVAILABLE: &str = "rtdb.replication/strict-dispatch-unavailable";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicaMetadata { pub position: ReplicaPosition, pub timestamp: Timestamp }
@@ -153,6 +154,7 @@ impl PartitionLogs {
             let guard = GuardedAppend::new(&clock, stage.clock_upper, stage.cutoff);
             let receipt = self.replica.enqueue_guarded(payload, guard).await.map_err(|error| match error {
                 error @ StorageError::GuardedAppendCutoff => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_CUTOFF, error.to_string()),
+                error @ StorageError::GuardedAppendUnavailable => Anomaly::new(AnomalyCategory::Unavailable, STRICT_DISPATCH_UNAVAILABLE, error.to_string()),
                 error => error.into(),
             })?;
             return Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch });

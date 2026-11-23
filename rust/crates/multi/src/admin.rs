@@ -1974,9 +1974,10 @@ pub async fn audit_acceptance_quorum(
 
     let mut entries = rtdb_logkeeper::copy_certified_range(&stream, &proof, maximum_message_bytes.saturating_add(64), 1).await?;
     let entry = entries.pop().filter(|entry| entry.lsn == offset).ok_or_else(unavailable)?;
+    let not_strict = || Anomaly::incorrect("rtdb.multi/acceptance-audit-record", "The certified record is not a strict placed acceptance");
+    if !entry.guarded { return Err(not_strict()); }
     let cipher = crate::cipher::Cipher::new(&keys.existing(&current.key_id()).await?)?;
     let payload = cipher.open(&current.replica_seal_scope(), &entry.payload)?;
-    let not_strict = || Anomaly::incorrect("rtdb.multi/acceptance-audit-record", "The certified record is not a strict placed acceptance");
     let Some(ReplicaEnvelope { term, message: ReplicaBody::ResolvedTx(tx), .. }) = ReplicaEnvelope::decode(&payload)? else {
         return Err(not_strict());
     };

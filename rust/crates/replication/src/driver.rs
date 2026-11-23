@@ -19,7 +19,7 @@ use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, Pro
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
-use crate::logs::{DecodedReplica, STRICT_DISPATCH_CUTOFF, replica_decode_bound};
+use crate::logs::{DecodedReplica, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::matching_present_integer;
 use crate::state::fail_pending;
@@ -514,7 +514,7 @@ impl ReplicationDriver {
                 Event::Appender(result) => {
                     if let Some(leader) = &mut self.leader { leader.job = None; }
                     match result {
-                        Err(error) if error.code == STRICT_DISPATCH_CUTOFF => {
+                        Err(error) if matches!(error.code.as_str(), STRICT_DISPATCH_CUTOFF | STRICT_DISPATCH_UNAVAILABLE) => {
                             // Drop the speculative suffix before the source can be resolved again.
                             for held in self.demote().await? { self.apply_admitted(held).await?; }
                             self.start_claim()?;

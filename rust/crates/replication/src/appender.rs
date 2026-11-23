@@ -176,11 +176,30 @@ impl ReplicaAppender {
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
+                    let guarded = matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
                     let observation = self.durable_commit_observation(&request.write.body);
                     let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, || (self.clock)(), allow_offload,
                         |frame| request.write.stamp_append(sequence, frame));
-                    match observe_enqueue(enqueue, &self.cancellation, &mut receipts).await {
-                        Ok(Some(receipt)) => { receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation)); timer.reset(); }
+                    let enqueued = observe_enqueue(enqueue, &self.cancellation, &mut receipts).await;
+                    drop(envelope);
+                    drop(_copy_reservation);
+                    match enqueued {
+                        Ok(Some(receipt)) => {
+                            let receipt = track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation);
+                            if guarded {
+                                // A guarded provider owns the tail until its exact quorum settles.
+                                // Keep heartbeats and later requests out of that flight.
+                                let result = tokio::select! {
+                                    biased;
+                                    _ = self.cancellation.cancelled() => break Ok(()),
+                                    result = receipt => result,
+                                };
+                                if let Err(error) = result { break Err(error); }
+                            } else {
+                                receipts.push(receipt);
+                            }
+                            timer.reset();
+                        }
                         Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
                         Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
                     }
