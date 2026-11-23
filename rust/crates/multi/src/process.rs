@@ -142,7 +142,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         storage_namespaces,
         scoped_writes: scoped_writes.clone(),
         hosted_task: settings.hosted_task,
-        audience_source: audience.map(|profile| profile.source()),
+        audience_source: audience.map(|(_, profile)| profile.source()),
         storage_regions: storage_regions.clone(),
         local_witnesses,
     });
