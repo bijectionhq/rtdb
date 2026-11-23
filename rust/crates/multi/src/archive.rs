@@ -874,8 +874,8 @@ async fn plan_checkpoint_copy(
     Ok(sources)
 }
 
-/// Generic deployment forks have no authority over this deployment-scoped
-/// policy. The terminal transfer and hosted world owners retain exact custody.
+/// Generic deployment forks cannot adopt governed custody. The exact hosted
+/// world and terminal transfer owners carry the required source admissions.
 pub(crate) async fn require_plain_fork_cut(
     bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, source_key: &[u8], selected: i64,
 ) -> Result<()> {
@@ -893,8 +893,8 @@ pub(crate) async fn require_plain_fork_cut(
     if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
         verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
     }
-    if catalog.table_entries()?.iter().any(|entry| entry.table.owned_lifetime_relation().is_some()) {
-        return Err(unavailable("Generic deployment forks cannot carry placed lifetime replay authority"));
+    if catalog.table_entries()?.iter().any(|entry| rtdb_types::TableRef::owned_schema(&entry.table.schema)) {
+        return Err(unavailable("Generic deployment forks cannot copy governed relation custody"));
     }
     Ok(())
 }
