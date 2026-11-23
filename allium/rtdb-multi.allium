@@ -508,6 +508,7 @@ contract LogService {
         -- The owner first attests an exact quorum of original appends, then durably records its decision on a write quorum before release.
         -- Copies preserve the admission kind but supply no original reply or observation.
         -- A sealed tip can be recovered from a durable commit witness or original observations for the exact record on a write quorum.
+        -- Before transferring a retained guarded tip, recovery durably records its commit on a quorum of the predecessor journals.
         -- Recovery drops the guarded tip only if surviving and unobserved holders combined could not have supplied a quorum.
         -- A journal proved to hold only an exact copy is excluded from that upper bound. An original with a missing sample is still possible.
         -- If neither decision follows from the evidence, the successor remains closed and the outcome stays unknown.

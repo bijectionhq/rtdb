@@ -56,6 +56,8 @@ Each journal records its own upper clock sample after syncing the original guard
 The sample is synced as local metadata before the reply and survives restart and compaction with the exact entry.
 Only a sample strictly below the record's journal cutoff supplies a vote, including after recovery.
 Recovery copies carry the entry without creating observations of the original append.
+Recovery of a retained guarded tip records its commit on the predecessor quorum before copying the tip to a new ensemble.
+An interrupted copy can therefore recover the predecessor's selected outcome while the directory still names that predecessor.
 The audit includes each matching journal's retained sample and the quorum order statistic when enough original samples survive.
 It also reports the audit process's rounded clock immediately after establishing quorum agreement.
 The audit time includes probe latency and requires bounded clock uncertainty when compared with the writer's sample.

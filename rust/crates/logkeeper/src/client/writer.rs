@@ -358,19 +358,33 @@ async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, his
 /// An unsettled guarded flight is exclusive at the tip. Unlike an ordinary
 /// suffix, recovery needs its original quorum or definite exclusion before
 /// transferring it. Availability can require journals beyond the seal quorum.
-async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usize, Sealed)>) -> Result<(usize, Holding)> {
+struct SealedHistory {
+    source: usize,
+    history: Holding,
+    guarded_commit: Option<i64>,
+}
+
+async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usize, Sealed)>) -> Result<SealedHistory> {
     let mut checked_remaining = false;
     loop {
         let (source, winning) = winning_seal(replies);
         let source = *source;
-        let mut history = Holding::from(winning);
-        if !winning.guarded_tail || winning.commit_lsn >= history.last { return Ok((source, history)); }
-        if !ensemble.supports_guarded() { return Err(Error::GuardedAppendUnsupported); }
-        match settle_guarded_tail(ensemble, epoch, source, &history, replies).await? {
-            TailDecision::Keep => return Ok((source, history)),
+        let mut sealed = SealedHistory { source, history: Holding::from(winning), guarded_commit: None };
+        if !winning.guarded_tail { return Ok(sealed); }
+        let resolution = if winning.commit_lsn >= sealed.history.last {
+            TailDecision::Keep
+        } else {
+            if !ensemble.supports_guarded() { return Err(Error::GuardedAppendUnsupported); }
+            settle_guarded_tail(ensemble, epoch, source, &sealed.history, replies).await?
+        };
+        match resolution {
+            TailDecision::Keep => {
+                sealed.guarded_commit = Some(sealed.history.last);
+                return Ok(sealed);
+            }
             TailDecision::Discard => {
-                history.discard_last();
-                return Ok((source, history));
+                sealed.history.discard_last();
+                return Ok(sealed);
             }
             TailDecision::Unknown if !checked_remaining && replies.len() < ensemble.len() => {
                 let mut pending: FuturesUnordered<_> = (0..ensemble.len())
@@ -385,7 +399,7 @@ async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usiz
                 checked_remaining = true;
             }
             TailDecision::Unknown => return Err(Error::Remote {
-                key: ensemble.stream(), message: format!("guarded tail at position {} has an unknown outcome", history.last),
+                key: ensemble.stream(), message: format!("guarded tail at position {} has an unknown outcome", sealed.history.last),
             }),
         }
     }
@@ -454,14 +468,14 @@ async fn bootstrap_replica_page(
 impl Writer {
     pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
         let mut replies = seal_quorum(&ensemble, epoch).await?;
-        let (source, history) = sealed_history(&ensemble, epoch, &mut replies).await?;
+        let SealedHistory { source, history, .. } = sealed_history(&ensemble, epoch, &mut replies).await?;
         let recovered = Recovered { source: (&ensemble, source), start: history.trim + 1, history };
         Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
     }
 
     pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<i64> {
         let mut replies = seal_quorum(ensemble, epoch).await?;
-        let (source, history) = sealed_history(ensemble, epoch, &mut replies).await?;
+        let SealedHistory { source, history, .. } = sealed_history(ensemble, epoch, &mut replies).await?;
         let last = history.last;
         let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history };
         sync_quorum(ensemble, epoch, &replies, &recovered, last).await?;
@@ -472,10 +486,14 @@ impl Writer {
     /// copy to a different physical stream.
     async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
         let mut previous_replies = seal_quorum(previous, epoch).await?;
-        let (source, history) = sealed_history(previous, epoch, &mut previous_replies).await?;
+        let SealedHistory { source, history, guarded_commit } =
+            sealed_history(previous, epoch, &mut previous_replies).await?;
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
         let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
-        sync_quorum(previous, epoch, &previous_replies, &in_place, start - 1).await?;
+        // A move can stop before the destination is durable or recorded. The
+        // predecessor quorum must already retain the guarded outcome.
+        let commit = guarded_commit.unwrap_or(start - 1);
+        sync_quorum(previous, epoch, &previous_replies, &in_place, commit).await?;
         Ok(Recovered { source: (previous, source), history, start })
     }
 
@@ -1009,6 +1027,7 @@ mod tests {
         for (stream, originals, copies, guarded_before, expected) in [
             ("minority", 1, 0, None, -1), ("quorum", 2, 0, Some(i64::MAX), 0),
             ("copied", 1, 1, None, -1), ("late", 3, 0, Some(1), -1),
+            ("move-recovered-tail", 2, 0, Some(i64::MAX), 0),
         ] {
             let ensemble = Ensemble::new(StreamConfig { servers: endpoints.clone(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
             let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true, guarded_before };
@@ -1032,7 +1051,18 @@ mod tests {
                     deposed_by(2, ensemble.overwrite(server, 2, 0, vec![entry.clone()], false).await.unwrap()).unwrap();
                 }
             }
-            assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), expected);
+            if stream == "move-recovered-tail" {
+                let ready_to_copy = Writer::recover_moved(&ensemble, 0, 3, CopyFrom::Retained).await.unwrap();
+                assert_eq!(ready_to_copy.history.last, expected);
+                let mut predecessor_witnesses = 0;
+                for server in 0..ensemble.len() {
+                    let sealed = ensemble.seal(server, 3).await.unwrap();
+                    predecessor_witnesses += usize::from(sealed.commit_lsn == expected);
+                }
+                assert!(predecessor_witnesses >= ensemble.config.write_quorum);
+            } else {
+                assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), expected);
+            }
         }
 
         cancellation.cancel();
