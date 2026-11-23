@@ -41,10 +41,10 @@ pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
-pub(crate) const COMMIT_HOSTED_DECIDING_V1: &str = "rtdb.owned.CommitHostedDeciding.v1";
-pub(crate) const COMMIT_HOSTED_STAGED_V1: &str = "rtdb.owned.CommitHostedStaged.v1";
+pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
+pub(crate) const COMMIT_HOSTED_STAGED_V2: &str = "rtdb.owned.CommitHostedStaged.v2";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
-pub(crate) const COMMIT_HOSTED_WORLD_READS_V2: &str = "rtdb.owned.CommitHostedWorldReads.v2";
+pub(crate) const COMMIT_HOSTED_WORLD_READS_V3: &str = "rtdb.owned.CommitHostedWorldReads.v3";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
@@ -230,7 +230,6 @@ pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V2: &str = "rtdb.owned.PublishHeld
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
-pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -464,6 +463,7 @@ impl OwnedWorldReadResource {
 struct HostedWorldRead {
     held: Arc<OwnedWorldReadResource>,
     witnesses: Vec<OwnedWorldWitness>,
+    clock: Option<rtdb_types::WorldClockLimit>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -723,6 +723,7 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
         let ([kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing hosted root commit kind"))?;
         let counted = match kind {
@@ -748,16 +749,21 @@ impl Service {
         let mut handles = BTreeSet::new();
         let mut worlds = Vec::with_capacity(count);
         for _ in 0..count {
-            let (handle, tail) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world handle"))?;
+            let (clock, tail) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world clock bound"))?;
+            let clock = Timestamp(i64::from_be_bytes(*clock));
+            let (handle, tail) = tail.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world handle"))?;
             let (count, tail) = tail.split_first_chunk::<2>().ok_or_else(|| invalid("Missing held world witness count"))?;
             let count = usize::from(u16::from_be_bytes(*count));
-            if !handles.insert(*handle) || !(1..=MAX_WORLD_WITNESSES).contains(&count) {
+            if !handles.insert(*handle) || count > MAX_WORLD_WITNESSES || (count == 0 && clock == Timestamp::MAX) {
                 return Err(invalid("Invalid or repeated hosted world read"));
             }
             let (nonces, tail) = tail.split_at_checked(count * 16).ok_or_else(|| invalid("Truncated held world witnesses"))?;
             let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
             let (witnesses, reservation) = held.conditions(call, held.world, nonces)?;
-            worlds.push(HostedWorldRead { held, witnesses, _reservation: reservation });
+            let clock = (clock != Timestamp::MAX).then(|| rtdb_types::WorldClockLimit {
+                world: rtdb_types::Iid(*held.world.as_bytes()), pin: held.snapshot.parent_pin(), before: clock,
+            });
+            worlds.push(HostedWorldRead { held, witnesses, clock, _reservation: reservation });
             body = tail;
         }
         Ok((worlds, body))
@@ -818,8 +824,9 @@ impl Service {
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
 
-        let world_checks = worlds.iter().map(|read| read.witnesses.len()).sum::<usize>();
-        let world_ops = world_checks * 2 + usize::from(world_checks != 0);
+        let world_ops = worlds.iter()
+            .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some()))
+            .sum::<usize>() + usize::from(!worlds.is_empty());
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len())
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging }];
@@ -1060,12 +1067,14 @@ impl Service {
         let mut holds = Vec::new();
         if !worlds.is_empty() {
             let mut checks = Vec::new();
+            let mut clocks = Vec::new();
             for read in worlds {
                 read.held.snapshot.check().map_err(status)?;
                 checks.extend(read.witnesses);
+                clocks.extend(read.clock.map(|clock| (clock, read.held.snapshot.evidence_until())));
                 holds.push((read.held, read._reservation));
             }
-            native.append_hosted_world_read_checks(&mut operations, checks).map_err(status)?;
+            native.append_hosted_world_read_checks(&mut operations, checks, clocks).map_err(status)?;
         }
         operations.extend(refusal.into_iter().flatten());
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
@@ -3319,54 +3328,6 @@ impl Service {
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             sections, root, *fingerprint, controls, deadline,
-        ).await.map_err(status)?;
-        self.owned_tx_reply(committed)
-    }
-
-    pub(crate) async fn validate_world_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let (world, groups) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world commit has no world UUID"))?;
-        let world = Uuid::from_bytes(*world);
-        let (deadline, groups) = groups.split_first_chunk::<8>()
-            .ok_or_else(|| invalid("Owned world validation has no deadline"))?;
-        let deadline = Timestamp(i64::from_be_bytes(*deadline));
-        let (clock, groups) = groups.split_first_chunk::<8>()
-            .ok_or_else(|| invalid("Owned world validation has no clock bound"))?;
-        let clock = Timestamp(i64::from_be_bytes(*clock));
-        let (handle, rest) = groups.split_first_chunk::<16>()
-            .ok_or_else(|| invalid("Owned world commit has no held handle"))?;
-        let (count, rest) = rest.split_first_chunk::<2>()
-            .ok_or_else(|| invalid("Owned world commit has no witness count"))?;
-        let count = usize::from(u16::from_be_bytes(*count));
-        if count > MAX_WORLD_WITNESSES || (count == 0 && clock == Timestamp::MAX) {
-            return Err(invalid("Owned world validation requires a clock bound or at least one point witness"));
-        }
-        let (nonces, groups) = rest.split_at_checked(count * 16)
-            .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
-        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-        let (checks, _condition_charge) = held.conditions(call, world, nonces)?;
-        let clock = (clock != Timestamp::MAX).then(|| rtdb_types::WorldClockLimit {
-            world: rtdb_types::Iid(*world.as_bytes()), pin: held.snapshot.parent_pin(), before: clock,
-        });
-        let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
-        let policy = self.hosted_control_policy(call)?;
-        let control_groups = owned_groups(groups, true, false)?;
-        hosted_control::admit_control_targets(policy, control_groups.iter().map(|(relation, _)| relation))?;
-        let scope = self.hosted_control_scope(call).await?;
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - (2 * checks.len() + 2);
-        let (control_checks, _control_charges) = self.decode_hosted_control_groups(
-            call, control_groups, scope, &mut rows_left, true,
-        )?;
-        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
-        let attachment = attachment.ok_or_else(unsupported)?;
-        let connection = self.connection(call, &call.database).await?;
-        let mut session = connection.borrow().await?;
-        require_idle(&session)?;
-        held.snapshot.check().map_err(status)?;
-        let committed = host.validate_world(
-            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            world, checks, control_checks, deadline, clock,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }

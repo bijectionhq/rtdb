@@ -8,7 +8,7 @@ use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestam
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, finish_checkpoint_replay_parents, validate_checkpoint_world, fork_checkpoint_world_selected, prepare_checkpoint_replay_parent, retain_replayed_checkpoint_world},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, finish_checkpoint_replay_parents, fork_checkpoint_world_selected, prepare_checkpoint_replay_parent, retain_replayed_checkpoint_world},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -141,13 +141,6 @@ impl OwnedWorldHost for PlacedWorldHost {
             fork_checkpoint_world_selected(Arc::clone(&self.directory), &self.archive,
                 self.capture_source.as_ref(), agent.as_deref(), self.keys.as_ref(),
                 self.hosted_task.as_ref(), call.session, deployment, capture, suffix, until, resources, fork).await
-        })
-    }
-
-    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>) -> BoxFuture<'a, Result<TransactionKey>> {
-        Box::pin(async move {
-            let deployment = self.deployment(&call)?;
-            validate_checkpoint_world(self.directory.as_ref(), &self.archive, call.session, deployment, world, checks, controls, deadline, clock).await
         })
     }
 

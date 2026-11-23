@@ -1226,17 +1226,18 @@ impl<'a> OpenTransaction<'a> {
         let retained_release = crate::hosted_control::retained_release_world(operations);
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
-        let mut clock_limits = operations.iter().filter_map(|operation| match operation {
+        let mut clock_worlds = BTreeSet::new();
+        for clock in operations.iter().filter_map(|operation| match operation {
             Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock),
             _ => None,
-        });
-        if let Some(clock) = clock_limits.next() {
-            if clock_limits.next().is_some() || !publications.is_empty()
-                || admitted.iter().any(|world| *world != clock.world)
-            {
+        }) {
+            if !publications.is_empty() || !hosted_world_reads || !clock_worlds.insert(clock.world) {
                 return Err(unavailable());
             }
             admitted.insert(clock.world);
+            if admitted.len() > 8 {
+                return Err(unavailable());
+            }
         }
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
