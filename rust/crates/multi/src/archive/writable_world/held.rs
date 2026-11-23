@@ -318,7 +318,11 @@ impl HeldCheckpointWorld {
     ) -> Result<rtdb_node::OwnedMergedChanges> {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(relations)?;
-        self.require_accepted_archive_scope(relations).await?;
+        if let Some((_, system)) = self.ancestor() {
+            self.preflight_accepted_scope(relations, system).await?;
+        } else {
+            self.require_accepted_archive_scope(relations).await?;
+        }
         let page = self.open.snapshot.world_merged_changes_ordered(self.open.record.id, relations, after, through, limit, descending).await?;
         guard()?;
         self.check()?;
