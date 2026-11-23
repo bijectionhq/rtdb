@@ -7,7 +7,7 @@ use arrow_schema::DataType;
 use rtdb_columnar::MemoryBudget;
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::{Catalog, Expr, QualifiedTable, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Timestamp, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
 use rtdb_sql::StaticMutationKind;
 
 use crate::{ArrowDocuments, Documents, SourceTransaction, SqlArguments, SubmitOptions, TxOp};
@@ -104,15 +104,24 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     let mut group_of: BTreeMap<(Option<Timestamp>, Option<Timestamp>), usize> = Default::default();
     let mut inventory = memory.reserve(4096)?;
     let columns = plan.input.schema().fields().iter().map(|field| field.name.as_str())
-        .filter(|name| matches!(&plan.kind, StaticMutationKind::Patch(_)) || !valid_time_column(name))
         .map(str::to_owned).collect::<Vec<_>>();
     let mut pending_bounds = (None, None);
     let mut pending = Vec::with_capacity(128);
     let mut pending_charge = memory.reserve(4096)?;
     let mut flush = |bounds, pending: &mut Vec<_>, pending_charge: &mut Arc<rtdb_columnar::MemoryReservation>| -> Result<()> {
         if pending.is_empty() { return Ok(()); }
-        let rows = std::mem::replace(pending, Vec::with_capacity(128));
-        let documents = Documents::with_column_order(rows, columns.clone(), memory)?;
+        let mut rows = std::mem::replace(pending, Vec::with_capacity(128));
+        let mut page_columns = columns.clone();
+        if matches!(&plan.kind, StaticMutationKind::Put) {
+            page_columns.retain(|name| {
+                if !valid_time_column(name) || rows.iter().any(|row| row.get(name).is_some_and(|value| !matches!(value, Value::Null))) {
+                    return true;
+                }
+                for row in &mut rows { row.remove(name); }
+                false
+            });
+        }
+        let documents = Documents::with_column_order(rows, page_columns, memory)?;
         Arc::get_mut(pending_charge).expect("Static document buffer owns its reservation").shrink_to(4096)?;
         let page = crate::source::owned_row_documents(&documents, memory)?;
         let lease = Arc::get_mut(&mut inventory).expect("Static mutation owns its document groups");
@@ -153,9 +162,14 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         materialize(&plan.input, &context, &mut |row| {
             let mut document: StructFields<_> = plan.input.schema().fields().iter().zip(row).map(|(field, value)| (field.name.clone(), value)).collect();
             let bounds = if matches!(&plan.kind, StaticMutationKind::Patch(_)) { temporal } else {
-                let from = insert_bound(&document.remove("_valid_from").unwrap_or(Value::Null), &options.default_tz)?;
-                let to = insert_bound(&document.remove("_valid_to").unwrap_or(Value::Null), &options.default_tz)?;
-                (from, to)
+                for name in ["_valid_from", "_valid_to"] {
+                    if let Some(bound) = document.get_mut(name) {
+                        *bound = insert_bound(bound, &options.default_tz)?.map_or(Value::Null, |time| Value::Timestamp {
+                            value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+                        });
+                    }
+                }
+                (None, None)
             };
             for value in document.values_mut() { infer_document_decimals(value)?; }
             if pending.len() == 128 || pending_bounds != bounds {
@@ -205,33 +219,33 @@ fn projected_timed_puts(
     let output_fields = input.schema().fields().iter().try_fold(4096usize, |bytes, field| {
         bytes.checked_add(field.name.len().checked_mul(4).and_then(|name| name.checked_add(2048)).ok_or_else(overflow)?).ok_or_else(overflow)
     })?;
-    let mut group_reservation = memory.reserve(row_count.checked_mul(512)
+    let _projection = memory.reserve(row_count.checked_mul(512)
         .and_then(|bytes| bytes.checked_add(input_fields))
         .and_then(|bytes| bytes.checked_add(output_fields)).ok_or_else(overflow)?)?;
-    let mut data = Vec::new();
+    let mut data = BTreeMap::new();
     let mut times = Vec::with_capacity(2);
     let mut required = BTreeSet::new();
-    for expression in expressions {
+    for (position, expression) in expressions.iter().enumerate() {
         let Expr::Column { id, .. } = expression.expr else { return Ok(None); };
         let Some(expr) = values.schema().position(id).and_then(|position| row.get(position)) else { return Ok(None); };
         let name = expression.field.name.as_str();
         if valid_time_column(name) {
-            times.push((usize::from(name == "_valid_to"), expr));
+            times.push((position, expr));
             expr.visit(&mut |expr| if let Expr::Parameter { index, .. } = expr { required.insert(*index); });
         } else {
             let Expr::Parameter { index, .. } = expr else { return Ok(None); };
             let Some(field) = schema.fields().get(*index).filter(|field| plain_scalar_field(field)) else { return Ok(None); };
-            data.push((*index, field.as_ref().clone().with_name(name)));
+            data.insert(position, (*index, field.as_ref().clone().with_name(name)));
         }
     }
-    let Some((id, _)) = data.iter().find(|(_, field)| field.name() == "_id") else { return Ok(None); };
+    let Some((id, _)) = data.values().find(|(_, field)| field.name() == "_id") else { return Ok(None); };
     if pages.iter().any(|page| page.column(*id).logical_null_count() != 0) { return Ok(None); }
     let readers = required.into_iter().map(|index| {
         Ok((index, rtdb_columnar::ColumnReader::new(schema.field(index))?))
     }).collect::<Result<Vec<_>>>()?;
 
-    let mut groups: Vec<(_, Vec<_>)> = Vec::new();
-    let mut group_of = BTreeMap::new();
+    let mut cells = Vec::with_capacity(row_count);
+    let mut bounds = times.iter().map(|(position, _)| (*position, Vec::with_capacity(row_count))).collect::<BTreeMap<_, _>>();
     for (page_index, page) in pages.iter().enumerate() {
         for row in 0..page.num_rows() {
             let row_scope = scope.scratch();
@@ -245,46 +259,41 @@ fn projected_timed_puts(
             }
             let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(),
                 timezone, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
-            let evaluate_bounds = || -> Result<_> {
-                let mut endpoints = [Value::Null, Value::Null];
-                for &(endpoint, expression) in &times {
-                    endpoints[endpoint] = evaluate(expression, &Schema::default(), &[], &context)?;
-                }
-                Ok((insert_bound(&endpoints[0], timezone)?, insert_bound(&endpoints[1], timezone)?))
-            };
-            // The row path orders evaluation errors against admission of earlier documents.
-            let Ok(bounds) = evaluate_bounds() else { return Ok(None); };
-            let group = *group_of.entry(bounds).or_insert_with(|| {
-                groups.push((bounds, Vec::new()));
-                groups.len() - 1
-            });
-            groups[group].1.push(Some((page_index, row)));
+            for &(position, expression) in &times {
+                let evaluated = evaluate(expression, &Schema::default(), &[], &context);
+                // The row path orders evaluation errors against admission of earlier documents.
+                let Ok(time) = evaluated.and_then(|value| insert_bound(&value, timezone)) else { return Ok(None); };
+                bounds.get_mut(&position).expect("each bound has a column").push(time.map(|time| time.0));
+            }
+            cells.push(Some((page_index, row)));
         }
     }
 
-    let table_bytes = table.schema.len().checked_add(table.table.len()).and_then(|bytes| bytes.checked_mul(groups.len())).ok_or_else(overflow)?;
-    let bound = group_reservation.bytes().checked_add(table_bytes).ok_or_else(overflow)?;
-    Arc::get_mut(&mut group_reservation).expect("timed INSERT owns its group reservation").grow_to(bound)?;
-    let schema = Arc::new(arrow_schema::Schema::new(data.iter().map(|(_, field)| field.clone()).collect::<Vec<_>>()));
-    let mut operations = Vec::with_capacity(groups.len());
-    for ((valid_from, valid_to), cells) in groups {
-        // The row codec can place an initial null before this scalar when a subsequent put adds another type.
-        let (page, row) = cells[0].expect("a valid-time group has a first selected cell");
-        if data.iter().any(|(index, _)| {
-            let array = pages[page].column(*index);
-            array.data_type() == &DataType::Null || array.is_null(row)
-        }) {
-            return Ok(None);
-        }
-        let columns = data.iter().map(|(index, field)| selected_argument_column(pages, *index, field, &cells, memory)).collect::<Result<Vec<_>>>()?;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
-        let Some(documents) = ArrowDocuments::from_record_batch(&batch, memory)? else { return Ok(None); };
-        let reader = documents.id_reader()?;
-        let iids = (0..batch.num_rows()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<Vec<_>>>();
-        let Ok(iids) = iids else { return Ok(None); };
-        operations.push(Operation::PutReplayArrow { table: table.clone(), documents, iids: Some(iids), valid_from, valid_to });
+    let Some((first_page, first_row)) = cells.first().copied().flatten() else { return Ok(None); };
+    if data.values().any(|(index, _)| pages[first_page].column(*index).is_null(first_row)) {
+        return Ok(None);
     }
-    Ok(Some(operations))
+    let mut fields = Vec::with_capacity(expressions.len());
+    let mut columns = Vec::with_capacity(expressions.len());
+    for (position, expression) in expressions.iter().enumerate() {
+        if let Some((index, field)) = data.remove(&position) {
+            columns.push(selected_argument_column(pages, index, &field, &cells, memory)?);
+            fields.push(field);
+        } else {
+            let times = bounds.remove(&position).expect("each bound has a column");
+            if times.iter().all(Option::is_none) { continue; }
+            let column = arrow_array::TimestampMicrosecondArray::from(times).with_timezone("UTC");
+            fields.push(arrow_schema::Field::new(&expression.field.name, column.data_type().clone(), true));
+            columns.push(Arc::new(column));
+        }
+    }
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
+    let Some(documents) = ArrowDocuments::from_record_batch(&batch, memory)? else { return Ok(None); };
+    let reader = documents.id_reader()?;
+    let iids = (0..batch.num_rows()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<Vec<_>>>();
+    let Ok(iids) = iids else { return Ok(None); };
+    Ok(Some(vec![Operation::PutReplayArrow { table: table.clone(), documents, iids: Some(iids), valid_from: None, valid_to: None }]))
 }
 
 fn selected_argument_column(
@@ -439,11 +448,19 @@ mod tests {
         let ordinary = submit(SqlArguments::new(arguments.types().to_vec(), rows, &memory).unwrap());
         let projected = submit(arguments);
 
-        let [Operation::PutReplayArrow { documents: bounded, valid_from: Some(_), valid_to: Some(_), .. },
-            Operation::PutReplayArrow { documents: defaulted, valid_from: None, valid_to: None, .. }] = projected.operations.as_slice()
-            else { panic!("Expected two Arrow writes in first-seen valid-time order"); };
-        assert_eq!((bounded.array().len(), defaulted.array().len()), (2, 2));
-        assert_eq!(projected.encode().unwrap().as_slice(), ordinary.encode().unwrap().as_slice());
+        for transaction in [ordinary, projected] {
+            let source = transaction.encode().unwrap();
+            let source = rtdb_format::envelope::SourceMessage::decode(source.as_slice()).unwrap().unwrap();
+            let replay = SourceTransaction::decode(&source, &memory).unwrap();
+            let [Operation::PutReplayArrow { documents, iids: Some(iids), valid_from: None, valid_to: None, .. }] = replay.operations.as_slice()
+                else { panic!("Expected one Arrow write with document validity"); };
+            assert_eq!(documents.array().len(), 4);
+            assert_eq!(*iids, (1..=4).map(|id| rtdb_types::EntityId::Integer(id).iid()).collect::<Vec<_>>());
+            for name in ["_valid_from", "_valid_to"] {
+                let column = documents.array().column_by_name(name).unwrap();
+                assert_eq!((0..4).map(|row| column.is_null(row)).collect::<Vec<_>>(), [false, true, false, true]);
+            }
+        }
 
         let null_first = submit(page(vec![5, 6], vec![None, Some("six")], vec![Some(start); 2], vec![Some(end); 2]));
         assert!(matches!(null_first.operations.as_slice(), [Operation::PutReplayArrow { .. }]));

@@ -24,6 +24,27 @@ fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp:
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
 #[tokio::test]
+async fn a_static_insert_preserves_interleaved_assertion_order_for_one_identity() {
+    use rtdb_format::envelope::SourceMessage;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let source = prepare_submission(vec![
+        sql("INSERT INTO docs (_id, v, _valid_from, _valid_to) VALUES
+            (1, 10, TIMESTAMP '2020-01-01Z', TIMESTAMP '2020-04-01Z'),
+            (1, 20, TIMESTAMP '2020-02-01Z', TIMESTAMP '2020-03-01Z'),
+            (1, 30, TIMESTAMP '2020-01-01Z', TIMESTAMP '2020-04-01Z')"),
+        sql("ASSERT (SELECT v FROM docs FOR VALID_TIME AS OF TIMESTAMP '2020-02-02Z' WHERE _id = 1) = 30"),
+    ], SubmitOptions::default(), "xtdb", &context.memory).unwrap();
+    let encoded = source.encode().unwrap();
+    let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+    assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+}
+
+#[tokio::test]
 async fn sql_source_replay_keeps_unreached_parameter_cells_in_arrow() {
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};

@@ -61,7 +61,7 @@ fn static_sql_submission_rejects_functions_absent_from_the_sql_registry() {
 }
 
 #[test]
-fn sql_to_static_ops_3484_retains_decimal_values_and_groups_valid_bounds() {
+fn sql_to_static_ops_3484_retains_decimal_values_and_document_valid_bounds() {
     let memory = MemoryBudget::new(1 << 27);
     let operation = TxOp::Sql { sql: "INSERT INTO foo (_id, v, _valid_from) VALUES (1, 12.34, TIMESTAMP '2024-01-01T00:00:00Z'), (2, 56.78, TIMESTAMP '2024-01-01T00:00:00Z')".into(), args: None };
     let request = prepare_submission(vec![operation], SubmitOptions::default(), "xtdb", &memory).unwrap();
