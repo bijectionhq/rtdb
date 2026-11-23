@@ -1796,23 +1796,37 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
     fixture.logs.append_source(&rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::FlushBlock(Default::default())), Timestamp(1)).await.unwrap();
     fixture.driver.consume(raw(0, 1, 0, resolved(1, 0))).await.unwrap();
+    fixture.driver.consume(raw(1, 1, 1, boundary(0, 0))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    let produced = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    let ReplicaBody::BlockUploaded(upload) = upload(0, 0) else { unreachable!(); };
+    fixture.driver.consume(raw(2, 1, 2, ReplicaBody::BlockUploaded(proto::BlockUploaded {
+        catalog_sha256: produced.catalog.publication_sha256().map(|digest| digest.to_vec()), ..upload
+    }))).await.unwrap();
+
     fixture.driver.promote().await.unwrap();
     let old_snapshot = fixture.driver.partition.snapshot();
-    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(0));
+    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(2));
     let value = fixture.driver.partition.value();
+    let reset = PrimaryReset::from_installed(
+        Arc::clone(&fixture.logs), &produced.catalog, old_snapshot.catalog_cut(),
+        value.trie_catalog().file_size_target(), &CancellationToken::new(),
+    ).await.unwrap();
+    let primary = reset.publish_files(
+        Arc::clone(value.trie_catalog()), value.live().block_index(), &CancellationToken::new(),
+    ).await.unwrap();
     let (completion, mut receipt) = tokio::sync::oneshot::channel();
     fixture.driver.command(super::Command::ResetCompactor {
-        term: Term(1), expected: Arc::clone(value.trie_catalog()), expected_block: value.live().block_index(),
-        replacement: super::Replacement::L0(BTreeMap::new()), reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
+        term: Term(1), primary, reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
     }).await.unwrap();
     assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
     assert!(fixture.driver.leader.as_ref().unwrap().compactor_reset.is_some());
     assert_eq!(fixture.driver.partition.open_snapshot(None).catalog_cut(), None);
-    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
+    fixture.driver.consume(raw(3, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     assert_eq!(receipt.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
     assert_eq!(fixture.driver.partition.snapshot().catalog_cut(), None);
-    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(0));
+    assert_eq!(old_snapshot.catalog_cut().unwrap().through, ReplicaPosition(2));
 }
 
 #[tokio::test]
