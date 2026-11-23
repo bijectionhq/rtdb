@@ -65,18 +65,18 @@ async fn scalar_subquery_in_select_and_where_preserves_empty_and_single_row_resu
 #[tokio::test]
 async fn array_query_collects_one_column_with_order_duplicates_and_nulls() {
     let source = "SELECT ARRAY(SELECT n FROM (VALUES (3),(1),(NULL),(3)) t(n) ORDER BY n NULLS LAST)";
-    let expected = Value::List(vec![Value::I64(1), Value::I64(3), Value::I64(3), Value::Null]);
+    let expected = Value::list(vec![Value::I64(1), Value::I64(3), Value::I64(3), Value::Null]);
     assert_eq!(query(source, vec![]).await.unwrap(), [vec![expected]]);
     assert_eq!(query("SELECT ARRAY(SELECT 1 WHERE FALSE), ARRAY(SELECT NULL)", vec![]).await.unwrap(),
-        [vec![Value::List(vec![]), Value::List(vec![Value::Null])]]);
+        [vec![Value::list(vec![]), Value::list(vec![Value::Null])]]);
     assert_eq!(query("SELECT ARRAY(SELECT ARRAY(SELECT 2)), ARRAY(VALUES (1),(2))", vec![]).await.unwrap(),
-        [vec![Value::List(vec![Value::List(vec![Value::I64(2)])]), Value::List(vec![Value::I64(1), Value::I64(2)])]]);
+        [vec![Value::list(vec![Value::list(vec![Value::I64(2)])]), Value::list(vec![Value::I64(1), Value::I64(2)])]]);
     assert_eq!(query("SELECT ARRAY(FROM (VALUES (3),(1)) t(n) SELECT n ORDER BY n)", vec![]).await.unwrap(),
-        [vec![Value::List(vec![Value::I64(1), Value::I64(3)])]]);
+        [vec![Value::list(vec![Value::I64(1), Value::I64(3)])]]);
     assert_eq!(query("SELECT ARRAY(WITH a AS (SELECT 3 AS n) SELECT n FROM a)", vec![]).await.unwrap(),
-        [vec![Value::List(vec![Value::I64(3)])]]);
+        [vec![Value::list(vec![Value::I64(3)])]]);
     assert_eq!(query("SELECT ARRAY(SELECT n FROM (VALUES (0)) t(n) ORDER BY 1 / n LIMIT 0)", vec![]).await.unwrap(),
-        [vec![Value::List(vec![])]]);
+        [vec![Value::list(vec![])]]);
 }
 
 #[tokio::test]
@@ -108,15 +108,15 @@ async fn optional_select_items_preserve_rows_columns_and_wildcard_positions() {
 async fn array_query_uses_lexical_correlations_and_join_condition_scope() {
     let source = "SELECT v.x, ARRAY(SELECT n FROM (VALUES (2),(1)) t(n) WHERE t.n = v.x) FROM (VALUES (1),(2),(3)) v(x)";
     assert_eq!(query(source, vec![]).await.unwrap(), [
-        vec![Value::I64(1), Value::List(vec![Value::I64(1)])],
-        vec![Value::I64(2), Value::List(vec![Value::I64(2)])],
-        vec![Value::I64(3), Value::List(vec![])],
+        vec![Value::I64(1), Value::list(vec![Value::I64(1)])],
+        vec![Value::I64(2), Value::list(vec![Value::I64(2)])],
+        vec![Value::I64(3), Value::list(vec![])],
     ]);
     let source = "SELECT a.n FROM (VALUES (ARRAY[1,2])) a(n) INNER JOIN (VALUES (2)) b(x) ON ARRAY(SELECT n FROM (VALUES (1),(2)) t(n)) = a.n";
-    assert_eq!(query(source, vec![]).await.unwrap(), [vec![Value::List(vec![Value::I64(1), Value::I64(2)])]]);
+    assert_eq!(query(source, vec![]).await.unwrap(), [vec![Value::list(vec![Value::I64(1), Value::I64(2)])]]);
     let source = "SELECT $1, ARRAY(SELECT n FROM (VALUES (1),(2)) t(n) WHERE n <= $2)";
     assert_eq!(query(source, vec![Value::I64(9), Value::I64(1)]).await.unwrap(),
-        [vec![Value::I64(9), Value::List(vec![Value::I64(1)])]]);
+        [vec![Value::I64(9), Value::list(vec![Value::I64(1)])]]);
 }
 
 #[tokio::test]

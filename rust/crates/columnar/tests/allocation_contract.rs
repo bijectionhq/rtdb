@@ -77,7 +77,7 @@ fn builder_bounds_include_fixed_children_hidden_under_null_parents() {
 
 #[test]
 fn builder_bounds_select_the_matching_nested_union_leg() {
-    let list = Value::List(vec![Value::I64(1), Value::Null]);
+    let list = Value::list(vec![Value::I64(1), Value::Null]);
     let map = Value::Map { entries: vec![(Value::Utf8("key".into()), Value::Binary(vec![1; 32769]))], sorted: false };
     let logical = list.logical_type().join(&map.logical_type());
     retains_within_bound(logical, vec![list, map]);
@@ -112,8 +112,8 @@ fn selected_cell_read_bound_ignores_unselected_variable_payloads_and_union_legs(
 fn selected_nested_and_run_end_cells_fit_the_read_bound() {
     use rtdb_columnar::{estimate_read_value_bytes, read_value};
     let values = vec![
-        Value::Struct(StructFields::from([("list".into(), Value::List(vec![Value::Utf8("abc".into()), Value::Null])), ("map".into(), Value::Map { entries: vec![(Value::Utf8("key".into()), Value::Binary(vec![1; 8192]))], sorted: false })])),
-        Value::Struct(StructFields::from([("list".into(), Value::List(vec![])), ("map".into(), Value::Map { entries: vec![], sorted: false })])),
+        Value::Struct(StructFields::from([("list".into(), Value::list(vec![Value::Utf8("abc".into()), Value::Null])), ("map".into(), Value::Map { entries: vec![(Value::Utf8("key".into()), Value::Binary(vec![1; 8192]))], sorted: false })])),
+        Value::Struct(StructFields::from([("list".into(), Value::list(vec![])), ("map".into(), Value::Map { entries: vec![], sorted: false })])),
     ];
     let ty = values[0].logical_type().join(&values[1].logical_type());
     for ty in [ty.clone(), LogicalType::RunEndEncoded { width: RunEndWidth::I16, value: Box::new(ty) }] {
@@ -133,7 +133,7 @@ fn selected_list_bound_uses_its_offsets_and_rejects_unknown_extensions() {
     use rtdb_columnar::estimate_read_value_bytes;
     let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Binary));
     let field = to_field("value", &ty).unwrap();
-    let array = build_array(&ty, &[Value::List(vec![Value::Binary(vec![1; 1 << 20])]), Value::List(vec![Value::Binary(vec![2])])]).unwrap();
+    let array = build_array(&ty, &[Value::list(vec![Value::Binary(vec![1; 1 << 20])]), Value::list(vec![Value::Binary(vec![2])])]).unwrap();
     assert!(estimate_read_value_bytes(&field, array.as_ref(), 1).unwrap() < 100_000);
     let slice = array.slice(1, 1);
     assert_eq!(estimate_read_value_bytes(&field, slice.as_ref(), 0).unwrap(), estimate_read_value_bytes(&field, array.as_ref(), 1).unwrap());
@@ -174,7 +174,7 @@ fn a_cell_estimate_charges_the_column_schema_once_not_per_nested_value() {
     use rtdb_columnar::{build_array, estimate_read_cell_bytes, estimate_read_value_bytes, to_field};
     use rtdb_types::{LogicalType, Value};
     let elements = (0..200).map(|i| if i % 2 == 0 { Value::I64(i) } else { Value::Utf8(format!("v{i}")) }).collect::<Vec<_>>();
-    let values = vec![Value::List(elements)];
+    let values = vec![Value::list(elements)];
     let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
     let field = to_field("v", &logical).unwrap();
     let array = build_array(&logical, &values).unwrap();
@@ -188,7 +188,7 @@ fn a_cell_estimate_charges_the_column_schema_once_not_per_nested_value() {
 fn a_builder_estimate_grows_linearly_with_value_nesting() {
     use rtdb_columnar::estimate_builder_bytes;
     use rtdb_types::Value;
-    let nested = |depth: usize| (0..depth).fold(Value::I64(1), |inner, _| Value::List(vec![inner]));
+    let nested = |depth: usize| (0..depth).fold(Value::I64(1), |inner, _| Value::list(vec![inner]));
     let estimate = |depth: usize| { let value = nested(depth); estimate_builder_bytes(&value.logical_type(), &[value]).unwrap() };
     let (shallow, deep) = (estimate(8), estimate(16));
     assert!(deep < shallow * 8, "doubling the depth grew the estimate from {shallow} to {deep}");

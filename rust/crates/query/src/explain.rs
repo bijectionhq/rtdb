@@ -92,7 +92,7 @@ impl ExplainWork {
             final_buffers = add(final_buffers, value.final_buffers)?;
             result.push(value.value);
         }
-        Ok(WorkValue { value: Value::List(result), final_buffers, work: self })
+        Ok(WorkValue { value: Value::list(result), final_buffers, work: self })
     }
     fn list_array<'work, const N: usize>(&'work self, values: [WorkValue<'work>; N]) -> Result<WorkValue<'work>> {
         let mut pending = ScratchVec::new(self);
@@ -782,7 +782,7 @@ fn render<'work>(first: RenderFrame<'_>, work: &'work ExplainWork) -> Result<Wor
                 }
                 LiteralKind::Map { entries, .. } => { sink.append(&[RenderPiece::Text("{")])?; frames.push(RenderFrame::ValuePairs { entries: entries.iter(), first: true })?; }
                 LiteralKind::Struct(fields) => { sink.append(&[RenderPiece::Text("{")])?; frames.push(RenderFrame::Fields { fields: fields.iter(), first: true })?; }
-                LiteralKind::Leaf(leaf) => render_leaf(leaf.value(), &mut sink)?,
+                LiteralKind::Leaf(leaf) => render_leaf(leaf.value().as_ref(), &mut sink)?,
             },
             RenderFrame::RawSequence { mut values, first, close } => match values.next() {
                 Some(value) => { if !first { sink.append(&[RenderPiece::Text(" ")])?; } frames.push(RenderFrame::RawSequence { values, first: false, close })?; frames.push(RenderFrame::Raw(value))?; }
@@ -943,9 +943,9 @@ mod rendering_tests {
             (Value::Uuid([0; 16]), r#"#uuid "00000000-0000-0000-0000-000000000000""#),
             (Value::Uri("https://example.test/é".into()), r#"#xt/uri "https://example.test/%C3%A9""#),
             (Value::Transit(vec![0, 255]), r#"#bytes "00ff""#), (Value::Oid(-1), "-1"), (Value::RegClass(2), "2"), (Value::RegProc(3), "3"),
-            (Value::List(vec![Value::I64(1)]), "[1]"), (Value::Set(vec![Value::Null]), "#{nil}"),
+            (Value::list(vec![Value::I64(1)]), "[1]"), (Value::Set(vec![Value::Null]), "#{nil}"),
             (Value::Map { entries: vec![(Value::Keyword(Keyword::from_name("k")), Value::Bool(true))], sorted: true }, "{:k true}"),
-            (Value::FixedSizeList(vec![Value::Bool(false)]), "[false]"),
+            (Value::FixedSizeList(vec![Value::Bool(false)].into()), "[false]"),
             (Value::TimestampTzRange { lower: 0, upper: 0 }, r#"#xt/tstz-range "[#time/zoned-date-time \"1970-01-01T00:00Z[UTC]\" #time/zoned-date-time \"1970-01-01T00:00Z[UTC]\"]""#),
             (Value::Struct(StructFields::from([("z".into(), Value::Bool(false)), ("a".into(), Value::I64(1))])), "{:z false, :a 1}"),
         ];
@@ -1080,7 +1080,7 @@ mod rendering_tests {
             let memory = MemoryBudget::new(1 << 20);
             {
                 let work = work(&memory);
-                let source = Value::List(values);
+                let source = Value::list(values);
                 assert_eq!(literal(RegexLiteralView::new(&source), &work).err().unwrap().code, expected);
             }
             assert_eq!(memory.used_bytes(), 0);
@@ -1155,8 +1155,8 @@ mod rendering_tests {
     #[test]
     fn raw_and_physical_map_keys_keep_container_shapes_order_and_duplicates() {
         let value = Value::Map { entries: vec![
-            (Value::List(vec![Value::Keyword(Keyword::from_name("x"))]), Value::Struct(StructFields::from([("nested".into(), Value::Set(vec![Value::I64(1), Value::I64(2)]))]))),
-            (Value::List(vec![Value::Keyword(Keyword::from_name("x"))]), Value::I64(3)),
+            (Value::list(vec![Value::Keyword(Keyword::from_name("x"))]), Value::Struct(StructFields::from([("nested".into(), Value::Set(vec![Value::I64(1), Value::I64(2)]))]))),
+            (Value::list(vec![Value::Keyword(Keyword::from_name("x"))]), Value::I64(3)),
         ], sorted: true };
         assert_eq!(output(&value), "{[:x] {:nested #{1 2}}, [:x] 3}");
         let raw = raw(|builder| {
@@ -1195,11 +1195,11 @@ mod rendering_tests {
         impl Drop for NestedLists {
             fn drop(&mut self) {
                 let mut value = self.0.take();
-                while let Some(Value::List(mut children)) = value { value = children.pop(); }
+                while let Some(Value::List(children)) = value { value = children.into_values().pop(); }
             }
         }
         let mut value = Value::I64(7);
-        for _ in 0..DEPTH { value = Value::List(vec![value]); }
+        for _ in 0..DEPTH { value = Value::list(vec![value]); }
         let source = NestedLists(Some(value));
         {
             let work = work(&memory);

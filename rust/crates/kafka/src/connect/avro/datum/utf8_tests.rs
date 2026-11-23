@@ -121,7 +121,7 @@ fn nested_record_array_union_maps_keep_raw_key_identity() {
     assert_eq!(schema.to_json_datum(datum, &mut context).unwrap(), json!({"maps":[{"map":{"�":1}}]}));
     let datum = schema.decode_datum(&bytes, &mut context).unwrap();
     let output = schema.connect_plan(None, None, &mut 0, &mut context).unwrap().convert(datum, &mut 0, &mut context).unwrap();
-    assert_eq!(output.value, Value::Struct(StructFields::from([("maps".into(), Value::List(vec![Value::Map { entries: vec![(Value::Utf8("�".into()), Value::I64(1))], sorted: false }]))])));
+    assert_eq!(output.value, Value::Struct(StructFields::from([("maps".into(), Value::list(vec![Value::Map { entries: vec![(Value::Utf8("�".into()), Value::I64(1))], sorted: false }]))])));
 }
 
 #[test]

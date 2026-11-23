@@ -20,11 +20,11 @@ fn unqualified_decimal_preserves_each_declared_union_leg_and_runtime_value() {
 #[test]
 fn decimal_cast_options_apply_recursively_even_when_declared_target_matches_input() {
     let inner = CastTarget::List(Box::new(CastTarget::DecimalDefault));
-    let first = cast_target(&V::List(vec![V::F64(1.5), V::Null]), &inner, "UTC").unwrap();
+    let first = cast_target(&V::list(vec![V::F64(1.5), V::Null]), &inner, "UTC").unwrap();
     let target = CastTarget::List(Box::new(CastTarget::decimal(Some(10), Some(2)).unwrap()));
-    assert_eq!(cast_target(&first, &target, "UTC").unwrap(), V::List(vec![decimal(150, 10, 2), V::Null]));
+    assert_eq!(cast_target(&first, &target, "UTC").unwrap(), V::list(vec![decimal(150, 10, 2), V::Null]));
     let nested = CastTarget::List(Box::new(target));
-    assert_eq!(cast_target(&V::List(vec![first, V::List(vec![])]), &nested, "UTC").unwrap(), V::List(vec![V::List(vec![decimal(150, 10, 2), V::Null]), V::List(vec![])]));
+    assert_eq!(cast_target(&V::list(vec![first, V::list(vec![])]), &nested, "UTC").unwrap(), V::list(vec![V::list(vec![decimal(150, 10, 2), V::Null]), V::list(vec![])]));
     assert_eq!(nested.result_type(&T::list(T::list(T::Scalar(S::F64).maybe()))), T::list(T::list(T::Scalar(S::Decimal { precision: 10, scale: 2, bit_width: 128 }).maybe())));
 }
 
@@ -41,11 +41,11 @@ fn scale_without_precision_is_ignored_and_negative_explicit_scale_rounds_half_ev
 fn pg_array_text_cast_retains_nullable_elements_and_quoted_commas() {
     let integers = CastTarget::fixed(T::list(T::Scalar(S::I64)));
     for (input, expected) in [("{1,2,3}", vec![V::I64(1), V::I64(2), V::I64(3)]), ("{1,NULL}", vec![V::I64(1), V::Null]), ("{}", vec![])] {
-        assert_eq!(cast_target(&V::Utf8(input.into()), &integers, "UTC").unwrap(), V::List(expected));
+        assert_eq!(cast_target(&V::Utf8(input.into()), &integers, "UTC").unwrap(), V::list(expected));
     }
     assert_eq!(integers.result_type(&T::Scalar(S::Utf8)), T::list(T::Scalar(S::I64).maybe()));
     let text = CastTarget::fixed(T::list(T::Scalar(S::Utf8)));
-    assert_eq!(cast_target(&V::Utf8("{\"a,b\",c,\"NULL\",null}".into()), &text, "UTC").unwrap(), V::List(vec![V::Utf8("a,b".into()), V::Utf8("c".into()), V::Utf8("NULL".into()), V::Null]));
+    assert_eq!(cast_target(&V::Utf8("{\"a,b\",c,\"NULL\",null}".into()), &text, "UTC").unwrap(), V::list(vec![V::Utf8("a,b".into()), V::Utf8("c".into()), V::Utf8("NULL".into()), V::Null]));
     assert_eq!(cast_target(&V::Utf8("abc".into()), &text, "UTC").unwrap_err().code, "xtdb.expression/malformed-array-literal");
     assert_eq!(cast_target(&V::Utf8("{{1,2},{3,4}}".into()), &integers, "UTC").unwrap_err().code, "xtdb.expression/multi-dimensional-array-literal");
 }
@@ -54,8 +54,8 @@ fn pg_array_text_cast_retains_nullable_elements_and_quoted_commas() {
 fn list_union_targets_widen_metadata_without_converting_existing_values() {
     let target_type = T::list(T::Scalar(S::I64).join(&T::Scalar(S::Utf8)).maybe());
     let target = CastTarget::fixed(target_type.clone());
-    let value = V::List(vec![V::I64(1), V::Null]);
+    let value = V::list(vec![V::I64(1), V::Null]);
     assert_eq!(target.result_type(&value.logical_type()), target_type);
     assert_eq!(cast_target(&value, &target, "UTC").unwrap(), value);
-    assert!(cast_target(&V::List(vec![V::F64(1.0)]), &target, "UTC").is_err());
+    assert!(cast_target(&V::list(vec![V::F64(1.0)]), &target, "UTC").is_err());
 }

@@ -364,7 +364,7 @@ macro_rules! expression_body {
             context.reserve(items.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
             let mut values = Vec::with_capacity(items.len());
             for item in items { values.push($eval!(item)?); }
-            Ok(Value::List(values))
+            Ok(Value::list(values))
         }
         Expr::Struct(fields) => {
             let mut values = StructFields::new();
@@ -460,7 +460,11 @@ pub async fn evaluate_projection_async(expr: &Expr, schema: &Schema, row: &[Valu
 pub fn validate_projection_value(value: &Value) -> Result<()> {
     match value {
         Value::Decimal(value) => crate::decimal::validate_write(value),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_for_each(validate_projection_value),
+        Value::Set(values) => values.iter().try_for_each(validate_projection_value),
+        Value::List(values) | Value::FixedSizeList(values) => match values.view() {
+            rtdb_types::ListView::Values(values) => values.iter().try_for_each(validate_projection_value),
+            _ => Ok(()),
+        },
         Value::Struct(fields) => fields.values().try_for_each(validate_projection_value),
         Value::Map { entries, .. } => entries.iter().try_for_each(|(key, value)| { validate_projection_value(key)?; validate_projection_value(value) }),
         _ => Ok(()),

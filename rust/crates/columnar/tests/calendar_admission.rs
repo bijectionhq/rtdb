@@ -24,7 +24,7 @@ fn object_writers_narrow_wide_dates_while_stored_cell_copies_reject_them() {
 #[test]
 fn nested_calendar_values_follow_the_same_explicit_admission_boundary() {
     let wide = Value::Date(CalendarDate::new(CivilDate::MAX,DateUnit::Day));
-    let mut nested = Value::Struct(StructFields::from([("dates".into(),Value::List(vec![wide]))]));
+    let mut nested = Value::Struct(StructFields::from([("dates".into(),Value::list(vec![wide]))]));
     let logical = nested.logical_type();
     assert!(copy_array(&logical,&[nested.clone()]).is_err());
     let array = build_array(&logical,&[nested.clone()]).unwrap();

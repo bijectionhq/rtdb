@@ -70,11 +70,11 @@ pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, reque
                                 }
                                 schemas.entry(table.name.table.schema.clone()).or_default().push(object([
                                     ("table_name", Value::Utf8(table.name.table.table.clone())), ("table_type", Value::Utf8("TABLE".into())),
-                                    ("table_columns", if request.depth == 0 { Value::List(columns) } else { Value::Null }),
+                                    ("table_columns", if request.depth == 0 { Value::list(columns) } else { Value::Null }),
                                 ]));
                             }
                         }
-                        Value::List(schemas.into_iter().map(|(name, tables)| object([("db_schema_name", Value::Utf8(name)), ("db_schema_tables", if request.depth == 2 { Value::Null } else { Value::List(tables) })])).collect())
+                        Value::list(schemas.into_iter().map(|(name, tables)| object([("db_schema_name", Value::Utf8(name)), ("db_schema_tables", if request.depth == 2 { Value::Null } else { Value::list(tables) })])).collect())
                     };
                     output.push(vec![Value::Utf8(database.into()), schemas]);
                 }
@@ -141,7 +141,7 @@ fn exact_array(field: &Field, values: &[Value]) -> Result<ArrayRef> {
         }
         DataType::List(child) => {
             let mut offsets = vec![0i32]; let mut flattened = Vec::new();
-            for value in values { if let Value::List(children) = value { flattened.extend_from_slice(children); } offsets.push(i32::try_from(flattened.len()).map_err(|_| crate::invalid("Metadata list exceeds i32"))?); }
+            for value in values { if let Value::List(children) = value { flattened.extend(children.iter().map(std::borrow::Cow::into_owned)); } offsets.push(i32::try_from(flattened.len()).map_err(|_| crate::invalid("Metadata list exceeds i32"))?); }
             Ok(Arc::new(ListArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), exact_array(child, &flattened)?, validity(values)).map_err(arrow_error)?))
         }
         _ => build_array(&from_field(&field.clone().with_nullable(true))?, values),

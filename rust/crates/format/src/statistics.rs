@@ -52,10 +52,10 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     let mut statistics = Statistics::default();
     let with_bloom = calculate_blooms || (root && field.name() == "_iid");
     fold(field, array, mask, with_bloom, calculate_blooms, output, &mut statistics, depth)?;
-    let reader = rtdb_columnar::ColumnReader::new(field)?;
     let count = match present_cells(field, array, mask) {
         Some(count) => i64::try_from(count).map_err(invalid)?,
         None => {
+            let reader = rtdb_columnar::ColumnReader::new(field)?;
             let mut count = 0i64;
             for row in 0..array.len() {
                 if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
@@ -120,7 +120,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
             let children = fields.iter().enumerate().map(|(index, field)| {
                 write_column(field, values.column(index).as_ref(), false, calculate_blooms, &child_mask, output, depth + 1).and_then(|index| i32::try_from(index).map(Value::I32).map_err(invalid))
             }).collect::<Result<Vec<_>>>()?;
-            statistics.fields.insert("struct".into(), Value::List(children));
+            statistics.fields.insert("struct".into(), Value::list(children));
             return Ok(());
         }
         DataType::List(element) | DataType::FixedSizeList(element, _) => {
@@ -185,11 +185,13 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
     Ok(())
 }
 
-/// How many of a flat array's selected cells read as neither null nor undefined, counted from its validity.
+/// Counts selected cells whose logical presence depends only on the array's validity bitmap.
 fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize> {
     let data_type = array.data_type();
     let flat = data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_));
-    if !flat || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
+    let float_list = matches!(data_type, DataType::List(item) | DataType::FixedSizeList(item, _)
+        if item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64));
+    if !(flat || float_list) || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
     Some(match mask {
         Mask::All => array.len() - array.null_count(),
         Mask::Selected(rows) => (0..array.len()).filter(|row| rows[*row] && array.is_valid(*row)).count(),
@@ -276,5 +278,30 @@ mod tests {
         for (millis, day) in [(-86_400_001, -1), (-86_400_000, -1), (-1, 0), (0, 0), (86_400_001, 1)] {
             assert_eq!(numeric_value(&Value::DateMilli(millis)).unwrap(), numeric_value(&Value::DateDay(day)).unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod float_list_tests {
+    use super::*;
+    use arrow_array::{Float32Array, builder::{FixedSizeListBuilder, Float32Builder}};
+    use std::sync::Arc;
+
+    #[test]
+    fn float_list_presence_uses_parent_validity_and_selection() {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Arc::new(Float32Array::from(vec![Some(1.0), None, Some(2.0), Some(3.0)]));
+        let list = FixedSizeListArray::try_new(item, 2, values, Some(vec![true, false].into())).unwrap();
+        let field = Field::new("embedding", list.data_type().clone(), true);
+        assert_eq!(present_cells(&field, &list, &Mask::All), Some(1));
+        assert_eq!(present_cells(&field, &list, &Mask::Selected(vec![false, true])), Some(0));
+
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        builder.values().append_null();
+        builder.values().append_null();
+        builder.append(false);
+        let nulls = builder.finish();
+        let field = Field::new("embedding", nulls.data_type().clone(), true);
+        assert_eq!(present_cells(&field, &nulls, &Mask::All), Some(0));
     }
 }

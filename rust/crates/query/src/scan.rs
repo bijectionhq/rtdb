@@ -457,11 +457,15 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         scan.top_k = None;
         scan.ordered_top_k = None;
         scan.iids = Some(iids);
-        let iid_at = include_iid(&mut scan)?;
-        let position = |found: &dyn Fn(&rtdb_plan::Field) -> bool| scan.columns.iter().position(|field| found(field)).ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"));
-        let projected = columns.iter().map(|id| position(&|field| field.id == *id)).collect::<Result<Vec<_>>>()?;
-        let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().chain(residuals).cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
+        let mut needed = predicate.as_ref().map(Expr::referenced_columns).unwrap_or_default();
+        needed.extend(columns.iter().copied());
+        scan.columns.retain(|field| field.name == "_iid" || needed.contains(&field.id));
+        let iid_at = include_iid(&mut scan)?;
+        let schema = Schema::new(scan.columns.clone())?;
+        let projected = columns.iter().map(|id| schema.position(*id).ok_or_else(|| {
+            invalid("verifier-column", "Verified column is not projected by the scan")
+        })).collect::<Result<Vec<_>>>()?;
         let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false).await?;
         let metadata = self.execution.scope()?;
         let invocation = predicate.as_ref().map(|predicate| self.execution.prepare_expression(predicate, &schema, &metadata)).transpose()?;

@@ -32,17 +32,17 @@ async fn query(sql: &str, arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
 #[tokio::test]
 async fn group_by_test_vec_agg_keeps_empty_global_vector_and_null_elements() {
     for (source, expected) in [
-        ("(-> (rel [] [a]) (aggregate {:vec-out (vec-agg a)}))", vec![vec![V::List(vec![])]]),
+        ("(-> (rel [] [a]) (aggregate {:vec-out (vec-agg a)}))", vec![vec![V::list(vec![])]]),
         ("(-> (rel [] [a b]) (aggregate b {:vec-out (vec-agg a)}))", vec![]),
-        ("(-> (rel [{:a nil}] [a]) (aggregate {:vec-out (vec-agg a)}))", vec![vec![V::List(vec![V::Null])]]),
-        ("(-> (rel [{:a 42 :b nil}] [a b]) (aggregate a {:vec-out (vec-agg b)}))", vec![vec![V::I64(42), V::List(vec![V::Null])]]),
+        ("(-> (rel [{:a nil}] [a]) (aggregate {:vec-out (vec-agg a)}))", vec![vec![V::list(vec![V::Null])]]),
+        ("(-> (rel [{:a 42 :b nil}] [a b]) (aggregate a {:vec-out (vec-agg b)}))", vec![vec![V::I64(42), V::list(vec![V::Null])]]),
         ("(-> (rel [{:a 42 :b nil} {:a 45 :b 1} {:a 45 :b nil}] [a b]) (aggregate a {:vec-out (vec-agg b)}) (order-by a))",
-            vec![vec![V::I64(42), V::List(vec![V::Null])], vec![V::I64(45), V::List(vec![V::I64(1), V::Null])]]),
+            vec![vec![V::I64(42), V::list(vec![V::Null])], vec![V::I64(45), V::list(vec![V::I64(1), V::Null])]]),
     ] {
         assert_eq!(query(&format!("XTQL $${source}$$"), vec![]).await.unwrap(), expected, "{source}");
     }
     assert_eq!(query("XTQL $$(-> (rel [] [a]) (aggregate {:array-out (array-agg a)} {:vec-out (vec-agg a)}))$$", vec![]).await.unwrap(),
-        [vec![V::Null, V::List(vec![])]]);
+        [vec![V::Null, V::list(vec![])]]);
 }
 
 #[test]

@@ -113,7 +113,10 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
 fn infer_document_decimals(value: &mut Value) -> Result<()> {
     match value {
         Value::Decimal(decimal) => *decimal = rtdb_expr::infer_decimal(decimal)?,
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => for value in values { infer_document_decimals(value)?; },
+        Value::Set(values) => for value in values { infer_document_decimals(value)?; },
+        Value::List(values) | Value::FixedSizeList(values) => if let Some(values) = values.values_mut() {
+            for value in values { infer_document_decimals(value)?; }
+        },
         Value::Struct(fields) => for value in fields.values_mut() { infer_document_decimals(value)?; },
         Value::Map { entries, .. } => for (key, value) in entries { infer_document_decimals(key)?; infer_document_decimals(value)?; },
         _ => {}
@@ -193,9 +196,9 @@ mod tests {
     fn static_document_inference_visits_every_nested_decimal_cell() {
         let memory = MemoryBudget::new(1 << 24);
         let nested = |value: Value| Value::Struct(StructFields::from([
-            ("list".into(), Value::List(vec![value.clone(), Value::Null])),
+            ("list".into(), Value::list(vec![value.clone(), Value::Null])),
             ("set".into(), Value::Set(vec![value.clone()])),
-            ("fixed".into(), Value::FixedSizeList(vec![value.clone()])),
+            ("fixed".into(), Value::FixedSizeList(vec![value.clone()].into())),
             ("map".into(), Value::Map { entries: vec![(value.clone(), value.clone())], sorted: false }),
             ("struct".into(), Value::Struct(StructFields::from([("child".into(), value)]))),
         ]));

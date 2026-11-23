@@ -19,8 +19,8 @@ async fn equality_keeps_scalar_composite_and_literal_coercion_results_on_both_en
         (V::F64(f64::NAN), V::F64(f64::NAN), V::Bool(false)),
         (V::Null, V::I64(7), V::Null),
         (V::DateDay(0), V::Utf8("1970-01-01".into()), V::Bool(true)),
-        (V::List(vec![V::I64(1),V::Null]), V::List(vec![V::I64(1),V::I64(2)]), V::Null),
-        (V::List(vec![V::I64(1)]), V::List(vec![V::I64(1),V::Null]), V::Bool(false)),
+        (V::list(vec![V::I64(1),V::Null]), V::list(vec![V::I64(1),V::I64(2)]), V::Null),
+        (V::list(vec![V::I64(1)]), V::list(vec![V::I64(1),V::Null]), V::Bool(false)),
     ] {
         let expression = eq(value(left), value(right));
         assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext::default()).unwrap(), expected);

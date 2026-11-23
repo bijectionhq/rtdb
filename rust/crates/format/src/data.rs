@@ -272,6 +272,21 @@ impl EventBatch {
             recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
     }
 
+    pub fn read_put_field(&self, row: usize, name: &str) -> Result<Value> {
+        if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
+        let (operation, array, offset) = self.operation(row)?;
+        if operation.name() != "put" { return Ok(Value::Null); }
+        let document = array.as_any().downcast_ref::<arrow_array::StructArray>()
+            .filter(|array| !array.is_null(offset))
+            .ok_or_else(|| invalid("A put operation must contain a document struct"))?;
+        let Some(index) = document.fields().iter().position(|field| field.name() == name) else {
+            return Ok(Value::Null);
+        };
+        let field = &document.fields()[index];
+        if field.data_type() == &DataType::Null { return Ok(Value::Null); }
+        rtdb_columnar::read_value(field, document.column(index).as_ref(), offset)
+    }
+
     fn timestamp(&self, index: usize, row: usize) -> Result<Timestamp> {
         self.batch.column(index).as_any().downcast_ref::<TimestampMicrosecondArray>()
             .map(|column| Timestamp(column.value(row))).ok_or_else(|| invalid("Event timestamp array type changed"))
@@ -428,7 +443,9 @@ fn gather_column<E: EncodedEvent>(documents: &[&E], field: &Field, builder: Opti
         },
         _ => None,
     };
-    if (!flat && vector_width.is_none()) || !field.metadata().is_empty() || documents.is_empty() { return Ok(None); }
+    let variable_float = matches!(field.data_type(), DataType::List(item)
+        if item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64));
+    if (!flat && vector_width.is_none() && !variable_float) || !field.metadata().is_empty() || documents.is_empty() { return Ok(None); }
     let mut sources = Vec::with_capacity(documents.len());
     for document in documents {
         match document.put_column(field.name()) {
@@ -515,6 +532,23 @@ fn gather(data_type: &DataType, sources: &[Option<(&dyn Array, usize)>]) -> Resu
                 }
             }
             Arc::new(builder.finish()) as ArrayRef
+        }
+        DataType::List(_) => {
+            let null = arrow_array::new_null_array(data_type, 1);
+            let mut arrays: Vec<&dyn Array> = vec![null.as_ref()];
+            let mut sources_by_address = std::collections::HashMap::new();
+            let picks = sources.iter().map(|source| match source {
+                Some((array, row)) => {
+                    let address = *array as *const dyn Array as *const ();
+                    let index = *sources_by_address.entry(address).or_insert_with(|| {
+                        arrays.push(*array);
+                        arrays.len() - 1
+                    });
+                    (index, *row)
+                }
+                None => (0, 0),
+            }).collect::<Vec<_>>();
+            arrow_select::interleave::interleave(&arrays, &picks).map_err(invalid)?
         }
         DataType::FixedSizeList(item, width) => {
             let lists = sources.iter().map(|source| source.map(|(array, row)| {
@@ -614,9 +648,9 @@ mod tests {
         let vector = LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(2), element: Box::new(element) }.maybe();
         let types = StructFields::from([("v".into(), vector.clone())]);
         let rows = [
-            Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null]),
+            Value::FixedSizeList(vec![Value::F32(-0.0), Value::Null].into()),
             Value::Null,
-            Value::FixedSizeList(vec![Value::F32(4.0), Value::F32(5.0)]),
+            Value::FixedSizeList(vec![Value::F32(4.0), Value::F32(5.0)].into()),
         ].into_iter().enumerate().map(|(id, value)| StoredEvent {
             iid: EntityId::Integer(id as i64).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None,

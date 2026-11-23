@@ -66,9 +66,9 @@ async fn explicit_decimal_cast_uses_half_even_rounding_and_preserves_nulls() {
 #[tokio::test]
 async fn array_decimal_casts_apply_options_and_preserve_element_nulls() {
     assert_eq!(query("SELECT ARRAY['1.245', NULL, '1.255']::DECIMAL(5,2)[]").await.unwrap(),
-        (LogicalType::list(LogicalType::Scalar(ScalarType::Decimal { precision: 5, scale: 2, bit_width: 128 }).maybe()), Value::List(vec![decimal(124, 5, 2, 128), Value::Null, decimal(126, 5, 2, 128)])));
+        (LogicalType::list(LogicalType::Scalar(ScalarType::Decimal { precision: 5, scale: 2, bit_width: 128 }).maybe()), Value::list(vec![decimal(124, 5, 2, 128), Value::Null, decimal(126, 5, 2, 128)])));
     assert_eq!(query("SELECT '{1.245,NULL,1.255}'::DECIMAL(5,2)[]").await.unwrap().1,
-        Value::List(vec![decimal(124, 5, 2, 128), Value::Null, decimal(126, 5, 2, 128)]));
+        Value::list(vec![decimal(124, 5, 2, 128), Value::Null, decimal(126, 5, 2, 128)]));
 }
 
 #[tokio::test]

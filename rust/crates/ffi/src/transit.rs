@@ -19,7 +19,7 @@ fn output(value: &Value, typed_structs: bool) -> Result<T> {
     Ok(match value {
         Value::I8(value) => tag("i8", T::Integer(i64::from(*value))), Value::I16(value) => tag("i16", T::Integer(i64::from(*value))), Value::I32(value) => tag("i32", T::Integer(i64::from(*value))),
         Value::F32(value) => tag("f32", T::Float(f64::from(*value))),
-        Value::List(values) | Value::FixedSizeList(values) => T::Array(values.iter().map(|value| output(value, typed_structs)).collect::<Result<_>>()?),
+        Value::List(_) | Value::FixedSizeList(_) => T::Array(value.list_view().unwrap().iter().map(|value| output(value.as_ref(), typed_structs)).collect::<Result<_>>()?),
         Value::Set(values) => tag("set", T::Array(values.iter().map(|value| output(value, typed_structs)).collect::<Result<_>>()?)),
         Value::Struct(fields) => {
             let fields = T::Map(fields.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)).map(|(key, value)| Ok((T::String(key.clone()), output(value, typed_structs)?))).collect::<Result<_>>()?);
@@ -121,7 +121,7 @@ fn operation_value(value: Value, memory: &Arc<MemoryBudget>) -> Result<Option<Tx
 }
 fn quoted(identifier: &str) -> String { format!("\"{}\"", identifier.replace('"', "\"\"")) }
 fn fields(value: Value) -> Result<StructFields<Value>> { match value { Value::Struct(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit map")) } }
-fn list(value: Value) -> Result<Vec<Value>> { match value { Value::List(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit array")) } }
+fn list(value: Value) -> Result<Vec<Value>> { match value { Value::List(value) => Ok(value.into_values()), _ => Err(crate::invalid("Expected a Transit array")) } }
 fn string(value: Value) -> Result<String> { match value { Value::Utf8(value) => Ok(value), _ => Err(crate::invalid("Expected a Transit string")) } }
 fn optional_string(value: Option<Value>) -> Result<Option<String>> { value.filter(|value| !matches!(value, Value::Null)).map(string).transpose() }
 fn optional_time(value: Option<Value>, timezone: &str) -> Result<Option<Timestamp>> {
@@ -136,7 +136,7 @@ fn transaction_input_releases_transit_scratch_before_submission() {
     let input = TransactionInput::decode(&payload, &memory).unwrap();
     assert_eq!(memory.used_bytes(), input.value.retained_bytes().unwrap() + 8192);
     assert!(memory.used_bytes() < memory.peak_bytes());
-    assert_eq!(input.value, Value::Struct(StructFields::from([("operations".into(), Value::List(vec![Value::Utf8("SELECT 1".into())]))])));
+    assert_eq!(input.value, Value::Struct(StructFields::from([("operations".into(), Value::list(vec![Value::Utf8("SELECT 1".into())]))])));
     drop(input);
     assert_eq!(memory.used_bytes(), 0);
 }
@@ -146,7 +146,7 @@ fn deletes_and_erases_are_submitted_as_sql_dml() {
     let memory = MemoryBudget::new(1 << 20);
     let time = Value::Timestamp { value: 1_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
     let op = |kind: &str, ids: Vec<Value>, bounds: bool| {
-        let mut fields = StructFields::from([("op".into(), Value::Utf8(kind.into())), ("table".into(), Value::Utf8("docs".into())), ("ids".into(), Value::List(ids))]);
+        let mut fields = StructFields::from([("op".into(), Value::Utf8(kind.into())), ("table".into(), Value::Utf8("docs".into())), ("ids".into(), Value::list(ids))]);
         if bounds { fields.insert("valid_from".into(), time.clone()); }
         operation_value(Value::Struct(fields), &memory).unwrap()
     };

@@ -349,7 +349,7 @@ async fn empty_global_aggregates_and_groups_excluded_by_filter_keep_their_rows()
 
 #[tokio::test]
 async fn group_ids_preserve_nonreflexive_keys_and_top_level_null_groups() {
-    let nested = Value::List(vec![Value::Null]);
+    let nested = Value::list(vec![Value::Null]);
     let ty = LogicalType::list(LogicalType::Null).maybe();
     let input = values(0, "key", ty.clone(), vec![Value::Null, Value::Null, nested.clone(), nested.clone()]);
     let group = NamedExpr { field: field(1, "key", ty), expr: input.schema().fields()[0].expression() };
@@ -364,7 +364,7 @@ async fn array_aggregate_orders_selected_rows_and_distinct_retains_null_argument
     let mut array = agg(1, AggregateFunction::ArrayAgg, Some(argument.clone()), LogicalType::list(scalar(ScalarType::I64).maybe()).maybe());
     array.distinct = true;
     array.order_by.push(SortExpr { expr: argument, descending: false, nulls_first: true });
-    assert_eq!(collect(aggregate(input, vec![], vec![array]), query_context(QueryOptions { sort_memory_bytes: 1, ..QueryOptions::default() })).await.unwrap(), vec![vec![Value::List(vec![Value::Null, Value::Null, Value::I64(1), Value::I64(2)])]]);
+    assert_eq!(collect(aggregate(input, vec![], vec![array]), query_context(QueryOptions { sort_memory_bytes: 1, ..QueryOptions::default() })).await.unwrap(), vec![vec![Value::list(vec![Value::Null, Value::Null, Value::I64(1), Value::I64(2)])]]);
 }
 
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn decimal_sum_accepts_wide_and_wrapped_precision_and_rejects_physical_ove
 #[tokio::test]
 async fn unnest_keeps_list_order_and_outer_ordinality_is_null() {
     let ty = LogicalType::list(scalar(ScalarType::I64));
-    let input = values(0, "xs", ty, vec![Value::List(vec![Value::I64(4), Value::I64(5)]), Value::List(vec![])]);
+    let input = values(0, "xs", ty, vec![Value::list(vec![Value::I64(4), Value::I64(5)]), Value::list(vec![])]);
     let expr = input.schema().fields()[0].expression();
     let element = field(1, "x", scalar(ScalarType::I64).maybe());
     let ordinal = field(2, "n", scalar(ScalarType::I32).maybe());
@@ -544,7 +544,7 @@ async fn scalar_apply_rejects_multiple_rows_and_pull_many_distinguishes_empty_do
     let output = field(2, "answer", scalar(ScalarType::I64).maybe());
     let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::Scalar, output: Some(output) }).unwrap());
     assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap_err().code, "xtdb.single-join/cardinality-violation");
-    for (dependent, expected) in [(Arc::new(Relation::empty(Schema::default())), Value::Null), (Arc::new(Relation::unit()), Value::List(vec![Value::Struct(StructFields::new())]))] {
+    for (dependent, expected) in [(Arc::new(Relation::empty(Schema::default())), Value::Null), (Arc::new(Relation::unit()), Value::list(vec![Value::Struct(StructFields::new())]))] {
         let output = field(2, "answer", LogicalType::list(LogicalType::Struct(StructFields::new())).maybe());
         let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::PullMany, output: Some(output) }).unwrap());
         assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap(), vec![vec![expected]]);
@@ -628,7 +628,7 @@ fn spill_payload_columns() -> Vec<(&'static str, Vec<Value>)> {
     vec![
         ("uuid", vec![uuid(1), Value::Null, uuid(2), Value::Uuid([0; 16]), Value::Uuid([0xff; 16]), uuid(3), Value::Null, uuid(4)]),
         ("fsb", vec![Value::FixedSizeBinary(vec![1, 2, 3, 4]), Value::Null, Value::FixedSizeBinary(vec![0; 4]), Value::FixedSizeBinary(vec![0xff; 4]), Value::FixedSizeBinary(vec![9, 8, 7, 6]), Value::Null, Value::FixedSizeBinary(vec![0, 1, 0, 1]), Value::FixedSizeBinary(vec![5; 4])]),
-        ("mixed", vec![Value::I64(1), Value::Utf8("x".into()), Value::F64(2.5), Value::Bool(true), Value::Null, Value::Keyword(Keyword::parse("a/b").unwrap()), uuid(5), Value::List(vec![Value::I64(1), Value::Null])]),
+        ("mixed", vec![Value::I64(1), Value::Utf8("x".into()), Value::F64(2.5), Value::Bool(true), Value::Null, Value::Keyword(Keyword::parse("a/b").unwrap()), uuid(5), Value::list(vec![Value::I64(1), Value::Null])]),
         ("f64", vec![Value::F64(f64::NAN), Value::F64(f64::INFINITY), Value::F64(f64::NEG_INFINITY), Value::F64(-0.0), Value::F64(0.0), Value::F64(f64::MIN_POSITIVE), Value::Null, Value::F64(-1.5)]),
         ("f32", vec![Value::F32(f32::NAN), Value::F32(f32::INFINITY), Value::F32(f32::NEG_INFINITY), Value::F32(-0.0), Value::Null, Value::F32(f32::MAX), Value::F32(f32::MIN_POSITIVE), Value::F32(0.25)]),
         ("decimal", vec![decimal_cell(12_345, 32, 2, 128), decimal_cell(-1, 32, 2, 128), Value::Null, decimal_cell(0, 32, 2, 128), decimal_cell(99_999_999, 32, 2, 128), decimal_cell(-99_999_999, 32, 2, 128), decimal_cell(1, 32, 2, 128), Value::Null]),
@@ -643,13 +643,13 @@ fn spill_payload_columns() -> Vec<(&'static str, Vec<Value>)> {
             Value::Timestamp { value: 5, unit: TimeUnit::Microsecond, timezone: Some("Europe/London".into()) },
         ]),
         ("nested", vec![
-            Value::List(vec![structure(vec![("a", Value::I64(1)), ("b", Value::List(vec![Value::Utf8("x".into())]))])]),
+            Value::list(vec![structure(vec![("a", Value::I64(1)), ("b", Value::list(vec![Value::Utf8("x".into())]))])]),
             Value::Set(vec![Value::I64(3), Value::I64(1)]),
-            Value::Map { entries: vec![(Value::Utf8("k".into()), Value::List(vec![Value::F64(-0.0)]))], sorted: false },
+            Value::Map { entries: vec![(Value::Utf8("k".into()), Value::list(vec![Value::F64(-0.0)]))], sorted: false },
             structure(vec![("a", Value::Null), ("c", structure(vec![("d", uuid(6))]))]),
             Value::Null,
-            Value::List(vec![]),
-            Value::List(vec![Value::Null, Value::Set(vec![])]),
+            Value::list(vec![]),
+            Value::list(vec![Value::Null, Value::Set(vec![])]),
             structure(vec![]),
         ]),
         ("scalars", vec![Value::I8(-8), Value::I16(-16), Value::I32(i32::MIN), Value::Binary(vec![0, 0xff]), Value::Utf8(String::new()), Value::Uri("https://example.com/a?b".into()), Value::Bool(false), Value::Null]),

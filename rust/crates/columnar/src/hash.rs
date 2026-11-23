@@ -104,7 +104,8 @@ fn hash_value_with(value: &Value, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) 
             bytes[8..].copy_from_slice(&nanoseconds.to_le_bytes());
             hash_bytes(&bytes, seed) as i32
         }
-        Value::List(values) | Value::FixedSizeList(values) => values.iter().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value, seed)?)))?,
+        Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap().iter()
+            .try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value.as_ref(), seed)?)))?,
         Value::Set(values) => values.iter().try_fold(0i32, |hash, value| Ok::<i32, Anomaly>(hash.wrapping_add(nested(value, seed)?)))?,
         Value::Struct(fields) => fields.values().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value, seed)?)))?,
         Value::Map { entries, .. } => entries.iter().try_fold(0, |hash, (key, value)| {

@@ -45,8 +45,7 @@ pub fn ordered_compare_in_timezone(left: &Value, right: &Value, nulls_first: boo
     if matches!(left, Value::F16(_)) || matches!(right, Value::F16(_)) { return Err(mismatch()); }
     let number = |value: &Value| integer(value).map(|value| value as f64).or_else(|| crate::number(value));
     if let (Some(left), Some(right)) = (number(left), number(right)) {
-        return Ok(if left.is_nan() { if right.is_nan() { Ordering::Equal } else { Ordering::Greater } }
-            else if right.is_nan() { Ordering::Less } else { left.total_cmp(&right) });
+        return Ok(compare_ordered_floats(left, right));
     }
     match (left, right) {
         (Value::Binary(left) | Value::FixedSizeBinary(left), Value::Binary(right) | Value::FixedSizeBinary(right)) => Ok(left.cmp(right)),
@@ -60,3 +59,12 @@ pub fn ordered_compare_in_timezone(left: &Value, right: &Value, nulls_first: boo
 }
 
 fn mismatch() -> Anomaly { Anomaly::incorrect("xtdb.expression/function-type-mismatch", "compare is not applicable to these vector types") }
+
+pub fn compare_ordered_floats(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.total_cmp(&right),
+    }
+}

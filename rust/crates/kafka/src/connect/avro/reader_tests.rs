@@ -59,7 +59,7 @@ fn specific_anonymous_containers_skip_root_class_construction() {
         assert!(plan(schema, &[("specific.avro.reader", "true"), ("schema.reflection", "true")]).validate_reader(None).is_err());
     }
     let array = AvroPlan::parse_version(r#"{"type":"array","items":"int"}"#, &[], &options(&[("specific.avro.reader", "true")]), None).unwrap();
-    assert_eq!(array.decode(&[4, 2, 4, 0], &mut context()).unwrap().value, Value::List(vec![Value::I32(1), Value::I32(2)]));
+    assert_eq!(array.decode(&[4, 2, 4, 0], &mut context()).unwrap().value, Value::list(vec![Value::I32(1), Value::I32(2)]));
     let map = AvroPlan::parse_version(r#"{"type":"map","values":"long"}"#, &[], &options(&[("specific.avro.reader", "true")]), None).unwrap();
     assert_eq!(map.decode(&[2, 2, b'k', 14, 0], &mut context()).unwrap().value, Value::Map { entries: vec![(Value::Utf8("k".into()), Value::I64(7))], sorted: false });
     let union = AvroPlan::parse_version(r#"["null","int"]"#, &[], &options(&[("specific.avro.reader", "true")]), None).unwrap();

@@ -185,8 +185,8 @@ async fn aggregate_output_is_complete_and_retains_distinct_state_across_pages() 
         let (mut cursor,_) = cursor(&execution,schema,vec![vec![row(1,2),row(2,5)],vec![],vec![row(1,1),row(1,2),row(2,0)]],groups,vec![array,sum],None);
         let mut page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),2);
         assert!(cursor.next_page().await.unwrap().is_none());drop(cursor);assert_eq!(execution.context.spill_bytes(),0);
-        assert_eq!(page.next().unwrap().values,[Value::I64(1),Value::List(vec![Value::I64(2),Value::I64(1)]),Value::I64(3)]);
-        assert_eq!(page.next().unwrap().values,[Value::I64(2),Value::List(vec![Value::I64(5)]),Value::I64(5)]);
+        assert_eq!(page.next().unwrap().values,[Value::I64(1),Value::list(vec![Value::I64(2),Value::I64(1)]),Value::I64(3)]);
+        assert_eq!(page.next().unwrap().values,[Value::I64(2),Value::list(vec![Value::I64(5)]),Value::I64(5)]);
         drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);
     }
 }

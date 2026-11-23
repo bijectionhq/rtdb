@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn nonfinite_float_payloads_and_signed_zero_keep_exact_nested_wire_bits() {
-        let value = V::List(vec![V::F32(f32::from_bits(0x7fc00001)), V::F32(f32::INFINITY), V::F32(f32::NEG_INFINITY), V::F32(-0.0),
+        let value = V::list(vec![V::F32(f32::from_bits(0x7fc00001)), V::F32(f32::INFINITY), V::F32(f32::NEG_INFINITY), V::F32(-0.0),
             V::F64(f64::from_bits(0x7ff8000000000001)), V::F64(f64::INFINITY), V::F64(f64::NEG_INFINITY), V::F64(-0.0)]);
         let source = recipe_form(raw_literal(value), 0);
         let restored = assert_projection(&source);
@@ -556,7 +556,7 @@ mod tests {
         let RegexLiteralKind::List(values) = value.kind() else { panic!() };
         let bits = values.iter().map(|value| {
             let RegexLiteralKind::Leaf(leaf) = value.kind() else { panic!() };
-            match leaf.value() { V::F32(value) => u64::from(value.to_bits()), V::F64(value) => value.to_bits(), _ => panic!() }
+            match leaf.value().as_ref() { V::F32(value) => u64::from(value.to_bits()), V::F64(value) => value.to_bits(), _ => panic!() }
         }).collect::<Vec<_>>();
         assert_eq!(bits, [0x7fc00001, 0x7f800000, 0xff800000, 0x80000000, 0x7ff8000000000001, 0x7ff0000000000000, 0xfff0000000000000, 0x8000000000000000]);
         assert_eq!(serde_json::to_string(&recipe(&restored).pattern).unwrap(), r#"{"Literal":{"List":[{"F32":2143289345},{"F32":2139095040},{"F32":4286578688},{"F32":2147483648},{"F64":9221120237041090561},{"F64":9218868437227405312},{"F64":18442240474082181120},{"F64":9223372036854775808}]}}"#);
@@ -584,7 +584,8 @@ mod tests {
             assert_eq!(serde_json::to_string(&recipe(&restored).pattern).unwrap(), expected);
             let RegexFormKind::Literal(literal) = recipe(&restored).pattern.view().kind() else { panic!() };
             let RegexLiteralKind::Leaf(leaf) = literal.kind() else { panic!() };
-            let V::Date(value) = leaf.value() else { panic!() };
+            let cell = leaf.value();
+            let V::Date(value) = cell.as_ref() else { panic!() };
             assert_eq!(value.date(), date); assert_eq!(value.unit(), unit);
         }
         let input = scan("a", 0);
@@ -708,9 +709,9 @@ mod tests {
             (V::Keyword(Keyword::from_name(":raw/name")), r#"{"Keyword":":raw/name"}"#), (V::Uuid([0; 16]), r#"{"Uuid":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#),
             (V::Uri("https://example.test/é".into()), r#"{"Uri":"https://example.test/é"}"#), (V::Transit(vec![0, 255]), r#"{"Transit":[0,255]}"#),
             (V::Oid(-1), r#"{"Oid":-1}"#), (V::RegClass(2), r#"{"RegClass":2}"#), (V::RegProc(3), r#"{"RegProc":3}"#),
-            (V::List(vec![V::I64(1)]), r#"{"List":[{"I64":1}]}"#), (V::Set(vec![V::Null, V::Null]), r#"{"Set":["Null","Null"]}"#),
+            (V::list(vec![V::I64(1)]), r#"{"List":[{"I64":1}]}"#), (V::Set(vec![V::Null, V::Null]), r#"{"Set":["Null","Null"]}"#),
             (V::Map { entries: vec![(V::Null, V::Bool(true)), (V::Null, V::Bool(false))], sorted: true }, r#"{"Map":{"entries":[["Null",{"Bool":true}],["Null",{"Bool":false}]],"sorted":true}}"#),
-            (V::FixedSizeList(vec![V::Bool(false)]), r#"{"FixedSizeList":[{"Bool":false}]}"#), (V::TimestampTzRange { lower: -1, upper: 2 }, r#"{"TimestampTzRange":{"lower":-1,"upper":2}}"#),
+            (V::FixedSizeList(vec![V::Bool(false)].into()), r#"{"FixedSizeList":[{"Bool":false}]}"#), (V::TimestampTzRange { lower: -1, upper: 2 }, r#"{"TimestampTzRange":{"lower":-1,"upper":2}}"#),
             (V::Struct(StructFields::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), r#"{"Struct":{"a":{"Bool":true},"z":"Null"}}"#),
         ];
         assert_eq!(physical.len(), 41);

@@ -23,6 +23,7 @@ enum EvalValue<'a> {
 enum ListReader<'a> {
     Expressions(&'a [Expr]),
     Values(Vec<Value>),
+    Stored(rtdb_types::ListValue),
     Cast { input: EvalValue<'a>, element: Target<'a> },
     Trim { input: EvalValue<'a>, size: i64 },
     IntegerSeries(crate::series::IntegerSeries),
@@ -50,7 +51,10 @@ fn value_type_bound(value: &Value) -> Result<usize> {
     let mut bytes = 512usize;
     let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?; Ok(()) };
     match value {
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => for value in values { add(value_type_bound(value)?)?; },
+        Value::Set(values) => for value in values { add(value_type_bound(value)?)?; },
+        Value::List(values) | Value::FixedSizeList(values) => if let rtdb_types::ListView::Values(values) = values.view() {
+            for value in values { add(value_type_bound(value)?)?; }
+        },
         Value::Struct(fields) => for (name, value) in fields { add(name.len())?; add(value_type_bound(value)?)?; },
         Value::Map { entries, .. } => for (key, value) in entries { add(value_type_bound(key)?)?; add(value_type_bound(value)?)?; },
         Value::Timestamp { timezone: Some(zone), .. } => add(zone.len())?,
@@ -119,6 +123,15 @@ fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<Logic
                 ListReader::Values(items) => {
                     frame.context.reserve(items.iter().try_fold(0usize,|bytes,item|bytes.checked_add(item.retained_bytes()?).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
                     LogicalType::join_all(&items.iter().map(Value::logical_type).collect::<Vec<_>>())
+                }
+                ListReader::Stored(items) => {
+                    if let rtdb_types::ListView::Values(values) = items.view() {
+                        let bound = values.iter().try_fold(0usize, |bytes, item| {
+                            bytes.checked_add(item.retained_bytes()?).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)
+                        })?;
+                        frame.context.reserve(bound.checked_mul(8).ok_or_else(overflow)?)?;
+                    }
+                    items.element_type()
                 }
                 ListReader::Cast { input,element } => {
                     if let Some(target) = union_target(*element) {
@@ -271,7 +284,14 @@ pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: &[Valu
     let mut value = materialize(value, &frame)?.await?;
     value.admit_expression_dates()?;
     if !matches!(expr, Expr::Column { .. } | Expr::RowCopy(_)) { super::validate_projection_value(&value)?; }
-    let values = match value { Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values, _ => Vec::new() };
+    let values = match value {
+        Value::Set(values) => values,
+        Value::List(values) | Value::FixedSizeList(values) => {
+            frame.context.reserve(values.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+            values.into_values()
+        }
+        _ => Vec::new(),
+    };
     Ok(super::EvaluatedList { storage: super::ListStorage::Values(values) })
 }
 
@@ -292,9 +312,9 @@ fn make_list<'a>(kind: Kind,reader: ListReader<'a>,frame: &EvaluationFrame<'_>) 
 }
 fn from_value<'a>(value: Value,frame: &EvaluationFrame<'_>) -> Result<EvalValue<'a>> {
     match value {
-        Value::List(values) => make_list(Kind::List,ListReader::Values(values),frame),
+        Value::List(values) => make_list(Kind::List,ListReader::Stored(values),frame),
         Value::Set(values) => make_list(Kind::Set,ListReader::Values(values),frame),
-        Value::FixedSizeList(values) => make_list(Kind::Fixed,ListReader::Values(values),frame),
+        Value::FixedSizeList(values) => make_list(Kind::Fixed,ListReader::Stored(values),frame),
         Value::Struct(fields) => {
             let mut cells = StructFields::new();
             for (name,value) in fields { frame.context.reserve(4096)?;cells.insert(name,box_cell(from_value(value,frame)?)?); }
@@ -318,6 +338,7 @@ fn len(value: &EvalValue<'_>) -> Result<usize> {
     let EvalValue::List(_,reader) = value else { return Err(invalid("list length")); };
     match reader.as_ref() {
         ListReader::Expressions(items) => Ok(items.len()), ListReader::Values(items) => Ok(items.len()),
+        ListReader::Stored(items) => Ok(items.len()),
         ListReader::Cast { input, .. } => len(input),
         ListReader::Trim { size,.. } => crate::collection::view_size(*size),
         ListReader::IntegerSeries(series) => Ok(series.len()),
@@ -330,6 +351,10 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
         let value = match reader.as_ref() {
             ListReader::Expressions(items) => evaluate((*items).get(index).ok_or_else(|| invalid("nth"))?,frame)?.await?,
             ListReader::Values(items) => from_value(super::retained_clone(items.get(index).ok_or_else(|| invalid("nth"))?,frame.context)?,frame)?,
+            ListReader::Stored(items) => {
+                let value = items.view().get(index).ok_or_else(|| invalid("nth"))?;
+                from_value(super::retained_clone(value.as_ref(), frame.context)?, frame)?
+            },
             ListReader::Cast { input,element } => {
                 let value = nth(clone_value(input,frame)?,index,frame)?.await?;
                 if let Some(target) = union_target(*element) {
@@ -359,6 +384,16 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                 Ok(Value::Struct(result))
             }
             value @ EvalValue::List(kind,_) => {
+                if let EvalValue::List(_, reader) = &value
+                    && let ListReader::Stored(items) = reader.as_ref()
+                    && items.array().is_some()
+                {
+                    return Ok(match kind {
+                        Kind::List => Value::List(items.clone()),
+                        Kind::Fixed => Value::FixedSizeList(items.clone()),
+                        Kind::Set => unreachable!("set storage is not a list"),
+                    });
+                }
                 let size = len(&value)?;
                 frame.context.reserve(size.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
                 let mut values = Vec::with_capacity(size);
@@ -366,7 +401,7 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                     values.push(materialize(nth(clone_value(&value,frame)?,index,frame)?.await?,frame)?.await?);
                     if frame.asynchronous && index % 1024 == 1023 { tokio::task::yield_now().await; }
                 }
-                Ok(match kind { Kind::List => Value::List(values),Kind::Set => Value::Set(values),Kind::Fixed => Value::FixedSizeList(values) })
+                Ok(match kind { Kind::List => Value::list(values),Kind::Set => Value::Set(values),Kind::Fixed => Value::FixedSizeList(values.into()) })
             }
         }
     },frame)
@@ -409,7 +444,7 @@ fn cast_value<'a>(value: EvalValue<'a>,target: Target<'a>,frame: &'a EvaluationF
                 value @ EvalValue::List(Kind::List | Kind::Fixed,_) => value,
                 EvalValue::Scalar(Value::Utf8(text)) => {
                     frame.context.reserve(text.len().checked_mul(128).and_then(|n|n.checked_add(4096)).ok_or_else(overflow)?)?;
-                    from_value(Value::List(crate::cast::pg_array_text(&text)?),frame)?
+                    from_value(Value::list(crate::cast::pg_array_text(&text)?),frame)?
                 }
                 _ => return Err(invalid("list cast")),
             };

@@ -175,11 +175,18 @@ pub(crate) fn encode_batch(batch: &ColumnBatch, out: &mut Vec<u8>) -> Result<()>
             column => {
                 let values = (0..batch.len).map(|row| column.value(row)).collect::<Result<Vec<_>>>()?;
                 let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
-                let mut field = to_field(wire_name, &logical)?;
+                let mut field = to_field(&wire_name, &logical)?;
                 let mut metadata = field.metadata().clone();
-                metadata.insert(COLUMN_KEY.into(), "values".into());
+                let array = build_array(&logical, &values)?;
+                if crate::columnar::has_float_vector(&logical) && crate::columnar::dense_float_list(array.as_ref()) {
+                    metadata.insert(COLUMN_KEY.into(), "arrow".into());
+                    metadata.insert(NAME_KEY.into(), wire_name);
+                    metadata.insert(LOGICAL_KEY.into(), serde_json::to_string(&logical).map_err(|error| invalid("fragment-encode", error))?);
+                } else {
+                    metadata.insert(COLUMN_KEY.into(), "values".into());
+                }
                 field = field.with_metadata(metadata);
-                arrays.push(build_array(&logical, &values)?);
+                arrays.push(array);
                 fields.push(field);
             }
         }
@@ -255,7 +262,7 @@ mod tests {
         let ints: arrow_array::ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![Some(1), None, Some(3)]));
         let nested = vec![
             Value::Struct(rtdb_types::StructFields::from([("a".to_owned(), Value::I64(1)), ("b".to_owned(), Value::Utf8("x".into()))])),
-            Value::List(vec![Value::F64(f64::NAN), Value::Null]),
+            Value::list(vec![Value::F64(f64::NAN), Value::Null]),
             Value::Timestamp { value: 7, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) },
         ];
         let columns = vec![

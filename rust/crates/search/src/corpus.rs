@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rtdb_format::data::StoredOperation;
 use rtdb_index::LiveTable;
 use rtdb_text::{Corpus, Query};
 use rtdb_types::{EventHeader, Iid, Interval, Result, Timestamp, Value};
@@ -159,13 +158,10 @@ impl SnapshotCorpus {
         let counted = match winner {
             None => None,
             Some(Origin::File(index, row)) => self.members[index].trie.file.run_of(&self.column, row).flatten().map(|doc| Counted::Run(index, doc)),
-            Some(Origin::Live(index, row)) => match segments[index].row(row)?.event()?.operation {
-                StoredOperation::Put(document) => match document.get(&self.column) {
-                    None | Some(Value::Null | Value::Undefined) => None,
-                    Some(Value::Utf8(text)) => Some(Counted::Live(rtdb_text::tokens(text))),
-                    Some(_) => Some(Counted::Live(Vec::new())),
-                },
-                _ => None,
+            Some(Origin::Live(index, row)) => match segments[index].row(row)?.read_put_field(&self.column)? {
+                Value::Null | Value::Undefined => None,
+                Value::Utf8(text) => Some(Counted::Live(rtdb_text::tokens(&text))),
+                _ => Some(Counted::Live(Vec::new())),
             },
         };
         if let Some(counted) = counted {

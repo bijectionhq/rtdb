@@ -23,9 +23,9 @@ async fn project(expression: &str) -> (LogicalType, Value) {
 #[tokio::test]
 async fn xtql_series_uses_explicit_end_inclusion_and_lazy_integer_reads() {
     for (source,expected) in [
-        ("(generate-series 1 4 1)",Value::List(vec![Value::I64(1),Value::I64(2),Value::I64(3)])),
-        ("(generate_series 1 4 1 true)",Value::List(vec![Value::I64(1),Value::I64(2),Value::I64(3),Value::I64(4)])),
-        ("(generate-series 3 0 -1)",Value::List(vec![Value::I64(3),Value::I64(2),Value::I64(1)])),
+        ("(generate-series 1 4 1)",Value::list(vec![Value::I64(1),Value::I64(2),Value::I64(3)])),
+        ("(generate_series 1 4 1 true)",Value::list(vec![Value::I64(1),Value::I64(2),Value::I64(3),Value::I64(4)])),
+        ("(generate-series 3 0 -1)",Value::list(vec![Value::I64(3),Value::I64(2),Value::I64(1)])),
         ("(cardinality (generate-series 0 2147483647 1))",Value::I32(i32::MAX)),
         ("(nth (generate-series 0 2147483647 1) 2147483646)",Value::I64(2147483646)),
         ("(generate-series nil 4 0)",Value::Null),

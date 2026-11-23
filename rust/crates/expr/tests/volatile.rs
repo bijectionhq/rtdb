@@ -70,11 +70,11 @@ async fn ordinary_async_evaluation_uses_the_same_allocation_scope_as_sync_evalua
     {
         let scope = EvaluationScope::new(&memory).unwrap();
         let context = EvalContext { allocation: Some(&scope), ..Default::default() };
-        assert_eq!(evaluate(&expression, &Schema::default(), &[], &context).unwrap(), Value::List(vec![Value::Utf8("kept".into())]));
+        assert_eq!(evaluate(&expression, &Schema::default(), &[], &context).unwrap(), Value::list(vec![Value::Utf8("kept".into())]));
         charged = memory.used_bytes();
     }
     let scope = EvaluationScope::new(&memory).unwrap();
     let context = EvalContext { allocation: Some(&scope), ..Default::default() };
-    assert_eq!(evaluate_async(&expression, &Schema::default(), &[], &context).await.unwrap(), Value::List(vec![Value::Utf8("kept".into())]));
+    assert_eq!(evaluate_async(&expression, &Schema::default(), &[], &context).await.unwrap(), Value::list(vec![Value::Utf8("kept".into())]));
     assert_eq!(memory.used_bytes(), charged);
 }

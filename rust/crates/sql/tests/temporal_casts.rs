@@ -197,6 +197,6 @@ async fn unqualified_interval_literals_keep_their_prepared_and_vector_types() {
 async fn range_accepts_the_original_unqualified_interval_stride() {
     let timestamps = [1_577_836_800_000_000,1_577_923_200_000_000,1_578_009_600_000_000].into_iter()
         .map(|value| V::Timestamp { value,unit: U::Microsecond,timezone: None }).collect();
-    let expected = V::List(timestamps);
+    let expected = V::list(timestamps);
     assert_eq!(query("SELECT RANGE(DATE '2020-01-01',DATE '2020-01-04',INTERVAL 'P1D')","UTC").await.unwrap(),(expected.logical_type(),expected));
 }

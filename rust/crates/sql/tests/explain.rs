@@ -143,8 +143,8 @@ async fn api_test_explain_projection_rename_and_scan_predicate_describe_executed
     assert_eq!(project["project"], Value::Utf8("[{v foo.1/v}]".into()));
     let Value::Struct(scan) = &rows[2]["explain"] else { panic!("Expected scan metadata") };
     assert_eq!(scan["table"], Value::Utf8("xtdb.public.foo".into()));
-    assert_eq!(scan["columns"], Value::List(vec![Value::Utf8("v".into()), Value::Utf8("_id".into())]));
-    assert_eq!(scan["predicates"], Value::List(vec![Value::Utf8("(== _id 1)".into())]));
+    assert_eq!(scan["columns"], Value::list(vec![Value::Utf8("v".into()), Value::Utf8("_id".into())]));
+    assert_eq!(scan["predicates"], Value::list(vec![Value::Utf8("(== _id 1)".into())]));
     let present = |explain: &StructFields<Value>| explain.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)).map(|(name, _)| name.clone()).collect::<Vec<_>>();
     assert_eq!(present(project), ["project", "append?"], "keys follow each operator's reference map literal");
     assert_eq!(present(scan), ["columns", "table", "predicates"], "a key every rename declares precedes the scan's own");

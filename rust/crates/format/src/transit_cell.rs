@@ -52,7 +52,7 @@ fn cell(value: &Value, depth: usize) -> Result<T> {
             let (months, days, nanos) = interval_parts(value).expect("matched interval cell");
             tagged_text("xtdb/interval", interval_text(months, days, nanos))
         }
-        Value::List(values) | Value::FixedSizeList(values) => T::Array(values.iter().map(next).collect::<Result<_>>()?),
+        Value::List(values) | Value::FixedSizeList(values) => T::Array(values.iter().map(|value| cell(value.as_ref(), depth + 1)).collect::<Result<_>>()?),
         Value::Set(values) => tagged("set", T::Array(values.iter().map(next).collect::<Result<_>>()?)),
         Value::Struct(values) => document(values, depth)?,
         Value::Map { entries, .. } => T::Map(entries.iter().map(|(key, value)| Ok((next(key)?, next(value)?))).collect::<Result<_>>()?),

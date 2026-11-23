@@ -40,7 +40,7 @@ fn cursor(execution: &Execution, pages: Vec<Vec<Value>>, key: Expr, limit: u64, 
 async fn comparator_factory_waits_for_the_complete_initial_accumulation() {
     let execution = execution();
     let baseline = execution.context.memory.used_bytes();
-    let key = Expr::Literal(Value::List(vec![]));
+    let key = Expr::Literal(Value::list(vec![]));
     let (mut cursor, calls) = cursor(&execution, vec![vec![Value::I64(1)]], key, i64::MAX as u64, true);
     assert_eq!(cursor.next_page().await.err().unwrap().code, "test/input");
     assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
@@ -54,7 +54,7 @@ async fn comparator_factory_waits_for_the_complete_initial_accumulation() {
 async fn a_threshold_crossing_top_k_reduction_precedes_the_next_input_pull() {
     let execution = execution();
     let baseline = execution.context.memory.used_bytes();
-    let key = Expr::Literal(Value::List(vec![]));
+    let key = Expr::Literal(Value::list(vec![]));
     let (mut cursor, calls) = cursor(&execution, vec![vec![Value::I64(1); 102_401]], key, 1, true);
     assert_eq!(cursor.next_page().await.err().unwrap().code, "xtdb.expression/function-type-mismatch");
     assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);

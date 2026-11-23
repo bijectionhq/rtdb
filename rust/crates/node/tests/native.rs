@@ -1856,8 +1856,8 @@ async fn a_table_of_wide_heterogeneous_documents_stays_queryable_within_its_budg
         _ => Value::Keyword(rtdb_types::Keyword::from_name(&format!("k{i}"))),
     };
     for i in 0..60 {
-        let nested = Value::Struct(StructFields::from([(format!("f{}", i % 7), leaf(i)), ("l".into(), Value::List((0..(i % 5)).map(|j| leaf(i + j)).collect()))]));
-        let document = BTreeMap::from([("_id".into(), Value::I64(1)), (format!("c{}", i % 9), Value::List(vec![nested, leaf(i + 1)]))]);
+        let nested = Value::Struct(StructFields::from([(format!("f{}", i % 7), leaf(i)), ("l".into(), Value::list((0..(i % 5)).map(|j| leaf(i + j)).collect()))]));
+        let document = BTreeMap::from([("_id".into(), Value::I64(1)), (format!("c{}", i % 9), Value::list(vec![nested, leaf(i + 1)]))]);
         let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![document.into()], node.memory()).unwrap(), valid_from: None, valid_to: None };
         assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
     }
@@ -1915,10 +1915,10 @@ async fn wide_heterogeneous_documents_flush_and_delete_across_blocks() {
         0 => Value::I64(i), 1 => Value::Utf8(format!("s{i}")), 2 => Value::F64(i as f64 / 3.0), 3 => Value::Bool(i % 4 == 0),
         _ => Value::Timestamp { value: i * 1_000_000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some(format!("+{:02}:00", i % 12)) },
     };
-    let nested = |i: i64| (0..3).fold(leaf(i), |inner, depth| Value::Struct(StructFields::from([(format!("f{i}_{depth}"), inner), (format!("g{i}_{depth}"), Value::List(vec![leaf(i + depth), leaf(i + depth + 1)]))])));
+    let nested = |i: i64| (0..3).fold(leaf(i), |inner, depth| Value::Struct(StructFields::from([(format!("f{i}_{depth}"), inner), (format!("g{i}_{depth}"), Value::list(vec![leaf(i + depth), leaf(i + depth + 1)]))])));
     let documents = (0..80).map(|i| StructFields::from([
         ("_id".into(), Value::I64(i)),
-        (format!("c{i}"), Value::List(vec![nested(i), leaf(i + 1)])),
+        (format!("c{i}"), Value::list(vec![nested(i), leaf(i + 1)])),
     ])).collect::<Vec<_>>();
     let flush = || async { node.catalog().database("xtdb").unwrap().flush().await.unwrap(); node.sync_all(Duration::from_secs(30), &CancellationToken::new()).await.unwrap(); };
     let put = TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(documents, node.memory()).unwrap(), valid_from: None, valid_to: None };
@@ -2661,7 +2661,7 @@ async fn ordered_coverage_uses_only_adopted_l0_files() {
 async fn cosine_distance_ranks_the_versions_that_pass_the_filter_at_each_valid_point() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
-    let embedding = |x, y| Value::FixedSizeList(vec![Value::F32(x), Value::F32(y)]);
+    let embedding = |x, y| Value::FixedSizeList(vec![Value::F32(x), Value::F32(y)].into());
     let document = |id, status: &str, vector| StructFields::from([
         ("_id".into(), Value::I64(id)),
         ("status".into(), Value::Utf8(status.into())),

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rtdb_format::{data::StoredOperation, keys::ArtefactOwner};
+use rtdb_format::keys::ArtefactOwner;
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Expr};
 use rtdb_query::{MatchAnswers, ScanAccelerator, ScanRequest};
@@ -345,10 +345,8 @@ impl SearchAccelerator {
                 let header = source.header()?;
                 if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
                 if !query.phrases().is_empty() {
-                    let event = source.event()?;
-                    let StoredOperation::Put(document) = &event.operation else { continue };
-                    let Some(Value::Utf8(text)) = document.get(column) else { continue };
-                    if !query.matches(&rtdb_text::tokens(text)) { continue; }
+                    let Value::Utf8(text) = source.read_put_field(column)? else { continue };
+                    if !query.matches(&rtdb_text::tokens(&text)) { continue; }
                 }
                 candidates.insert(header.iid);
             }
@@ -499,15 +497,15 @@ impl SearchAccelerator {
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             for row in self.runtime.live_rows(request.database, segment, column, matching)? {
                 if cfg!(feature = "experiments") { work.postings_visited += 1; }
-                let event = segment.row(row)?.event()?;
-                if options.scope.is_some_and(|scope| !scope.contains(&event.iid)) { continue; }
-                if !may_be_visible(event.valid_time.lower().0, event.valid_time.upper().0, event.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
-                let StoredOperation::Put(document) = &event.operation else { continue };
-                let Some(Value::Utf8(value)) = document.get(column) else { continue };
-                let tokens = rtdb_text::tokens(value);
+                let source = segment.row(row)?;
+                let header = source.header()?;
+                if options.scope.is_some_and(|scope| !scope.contains(&header.iid)) { continue; }
+                if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
+                let Value::Utf8(value) = source.read_put_field(column)? else { continue };
+                let tokens = rtdb_text::tokens(&value);
                 if matching.matches(&tokens) {
                     if cfg!(feature = "experiments") { work.score_evaluations += 1; }
-                    candidates.push(event.iid, scoring.bm25(&tokens), false);
+                    candidates.push(header.iid, scoring.bm25(&tokens), false);
                 }
             }
         }

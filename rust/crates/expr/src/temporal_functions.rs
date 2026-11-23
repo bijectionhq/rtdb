@@ -217,11 +217,11 @@ impl RangeBins {
         let mut out = Vec::new();out.try_reserve_exact(length).map_err(|_|overflow())?;Ok(out)
     }
     pub(crate) fn materialize(self,context: &EvalContext<'_>) -> Result<Value> {
-        let mut out = self.reserve(context)?;out.extend((0..self.len()?).map(|index|self.nth(index)));Ok(Value::List(out))
+        let mut out = self.reserve(context)?;out.extend((0..self.len()?).map(|index|self.nth(index)));Ok(Value::list(out))
     }
     pub(crate) async fn materialize_async(self,context: &EvalContext<'_>) -> Result<Value> {
         let mut out = self.reserve(context)?;
         for index in 0..self.len()? { out.push(self.nth(index));if index % 1024 == 1023 { tokio::task::yield_now().await; } }
-        Ok(Value::List(out))
+        Ok(Value::list(out))
     }
 }

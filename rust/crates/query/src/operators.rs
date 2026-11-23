@@ -275,17 +275,17 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::SortLimit { order_by,offset,fetch,.. } => {
+        RelationNode::SortLimit { input: relation_input,order_by,offset,fetch } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
-            let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
-            let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
-            if !order_by.is_empty() && fetch.is_some()
-                && let Ok(limit) = usize::try_from(row_limit)
+            let bounds = if !order_by.is_empty() && fetch.is_some() && has_ordered_scan(relation_input) {
+                Some(sort_limit_bounds(offset.as_ref(), fetch.as_ref(), &execution).await)
+            } else { None };
+            if let Some(Ok((offset, remaining, row_limit))) = &bounds
+                && let Ok(limit) = usize::try_from(*row_limit)
                 && let Some(input) = ordered_input(runtime.child(0)?, execution.child(0), limit).await?
             {
-                let pages = Box::new(Limit { input: Some(input), offset: offset_value, remaining, execution });
+                let pages = Box::new(Limit { input: Some(input), offset: *offset, remaining: *remaining, execution });
                 let pages = crate::pages::retain_page_state(pages, state_reservation);
                 return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
             }
@@ -296,6 +296,10 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let input = match batches {
                 Some(batches) => Ok(batches),
                 None => Err(build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?),
+            };
+            let (offset_value, remaining, row_limit) = match bounds {
+                Some(bounds) => bounds?,
+                None => sort_limit_bounds(offset.as_ref(), fetch.as_ref(), &execution).await?,
             };
             let mut pages: BoxPageCursor = match input {
                 Ok((batches,projected)) if crate::sort::SortCursor::batch_eligible(&schema,order_by,row_limit) =>
@@ -446,6 +450,24 @@ impl PageCursor for LiteralPageCursor {
         Ok(Some(page))
     }
 }
+async fn sort_limit_bounds(offset: Option<&Expr>, fetch: Option<&Expr>, execution: &Execution) -> Result<(u64, Option<u64>, u64)> {
+    let offset = row_limit(offset, execution).await?.unwrap_or(0);
+    let remaining = row_limit(fetch, execution).await?;
+    let limit = offset.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
+    Ok((offset, remaining, limit))
+}
+
+fn has_ordered_scan(mut relation: &Relation) -> bool {
+    loop {
+        match relation.node() {
+            RelationNode::Scan(scan) => return scan.ordered_top_k.is_some() && scan.iids.is_none() && scan.matches.is_empty(),
+            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Extend { input, .. }
+            | RelationNode::Filter { input, .. } | RelationNode::Distinct { input, .. } => relation = input,
+            _ => return false,
+        }
+    }
+}
+
 fn ordered_input(runtime: Arc<EmittedRelation>, execution: Execution, limit: usize)
     -> futures::future::BoxFuture<'static, Result<Option<BoxPageCursor>>>
 {
@@ -579,7 +601,8 @@ pub(crate) fn uri_hashes_match(left: &[Value], right: &[Value], memory: &Arc<rtd
     fn has_uri(value: &Value) -> bool {
         match value {
             Value::Uri(_) => true,
-            Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => values.iter().any(has_uri),
+            Value::Set(values) => values.iter().any(has_uri),
+            Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(has_uri)),
             Value::Struct(fields) => fields.values().any(has_uri),
             Value::Map { entries, .. } => entries.iter().any(|(key,value)| has_uri(key) || has_uri(value)),
             _ => false,
@@ -613,7 +636,8 @@ fn equality_hash(values: &[Value], timezone: &str) -> u32 {
     fn temporal(value: &Value) -> bool {
         match value {
             Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
-            Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => values.iter().any(temporal),
+            Value::Set(values) => values.iter().any(temporal),
+            Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(temporal)),
             Value::Struct(fields) => fields.values().any(temporal),
             Value::Map { entries, .. } => entries.iter().any(|(key, value)| temporal(key) || temporal(value)),
             _ => false,
@@ -845,7 +869,7 @@ impl PageCursor for Apply {
                         output_scope.reserve(self.document_bound(&row)?)?;
                         documents.push(self.document(&row));
                     }
-                    if documents.is_empty() { Value::Null } else { Value::List(documents) }
+                    if documents.is_empty() { Value::Null } else { Value::list(documents) }
                 }
                 _ => unreachable!(),
             };

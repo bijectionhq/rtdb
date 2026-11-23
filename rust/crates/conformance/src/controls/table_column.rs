@@ -19,7 +19,7 @@ pub(super) struct Input {
 
 fn validate_input(value: &Value) -> Result<(), Error> {
     let scalar = |value: &Value| matches!(value, Value::Null | Value::I64(_) | Value::F64(_));
-    if scalar(value) || matches!(value, Value::List(elements) if elements.iter().all(scalar)) {
+    if scalar(value) || matches!(value, Value::List(elements) if elements.iter().all(|value| scalar(value.as_ref()))) {
         Ok(())
     } else {
         Err(Anomaly::unsupported(

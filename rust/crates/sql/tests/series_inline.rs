@@ -28,7 +28,7 @@ async fn query(end_exclusive: bool) -> Result<Vec<Vec<V>>> {
     Ok(rows)
 }
 
-fn integers(values: &[i64]) -> V { V::List(values.iter().copied().map(V::I64).collect()) }
+fn integers(values: &[i64]) -> V { V::list(values.iter().copied().map(V::I64).collect()) }
 
 #[tokio::test]
 async fn sql_series_endpoint_policy_preserves_embedded_xtql_explicit_endpoints() {

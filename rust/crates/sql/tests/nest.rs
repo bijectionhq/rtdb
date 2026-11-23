@@ -59,12 +59,12 @@ async fn nest_many_returns_the_correlated_rows_as_a_list_of_structs() {
         FROM customers c")).await.unwrap();
     rows.sort_by_key(|row| format!("{:?}", row[0]));
     for row in &mut rows {
-        if let V::List(documents) = &mut row[2] { documents.sort_by_key(|document| format!("{document:?}")); }
+        if let V::List(documents) = &mut row[2] { documents.values_mut().unwrap().sort_by_key(|document| format!("{document:?}")); }
     }
     let order = |id, value| doc(&[("order_id", V::I64(id)), ("value", V::F64(value))]);
     assert_eq!(rows, [
-        vec![V::I64(0), V::Utf8("bob".into()), V::List(vec![order(0, 26.20), order(1, 8.99)])],
-        vec![V::I64(1), V::Utf8("alice".into()), V::List(vec![order(2, 12.34)])],
+        vec![V::I64(0), V::Utf8("bob".into()), V::list(vec![order(0, 26.20), order(1, 8.99)])],
+        vec![V::I64(1), V::Utf8("alice".into()), V::list(vec![order(2, 12.34)])],
     ]);
     assert_eq!(query("SELECT NEST_MANY(SELECT 1 AS x WHERE FALSE) AS n").await.unwrap(), [vec![V::Null]]);
 }

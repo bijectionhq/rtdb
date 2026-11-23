@@ -41,15 +41,15 @@ fn replace_first_put_iids(message: &mut SourceMessage, iids: &[[u8; 16]]) -> Res
     let Some(Value::List(previous)) = fields.get("iids") else { return Err("Source put did not supply IIDs".into()); };
     if previous.len() != iids.len() { return Err("Fixture IID count differs from the source put".into()); }
     let mut canonical_bytes = Vec::new();
-    for value in previous {
-        let Value::FixedSizeBinary(bytes) = value else { return Err("Expected a fixed-width source IID".into()); };
+    for value in previous.iter() {
+        let Value::FixedSizeBinary(bytes) = value.as_ref() else { return Err("Expected a fixed-width source IID".into()); };
         canonical_bytes.extend_from_slice(bytes);
     }
     let replacement = iids.concat();
     if canonical_bytes.is_empty() || canonical_bytes == replacement {
         return Err("Fixture must replace an IID with a different value".into());
     }
-    fields.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.to_vec())).collect()));
+    fields.insert("iids".into(), Value::list(iids.iter().map(|iid| Value::FixedSizeBinary(iid.to_vec())).collect()));
 
     let mut selected = None;
     for (offset, bytes) in stream.windows(canonical_bytes.len()).enumerate() {

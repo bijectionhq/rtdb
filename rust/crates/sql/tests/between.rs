@@ -49,7 +49,7 @@ fn between_modes_keep_the_common_value_grammar_boundary() {
 async fn runtime_between_specializations_are_admitted_before_payload_selection() {
     let sql = "SELECT (COALESCE($1,$1) BETWEEN $2 AND $2) IS NULL";
     assert_eq!(query(sql,vec![V::IntervalYearMonth(1),V::IntervalMonthDayNano { months: 0,days: 1,nanoseconds: 0 }]).await.unwrap_err().code,"xtdb.expression/cannot-compare-different-unit-intervals");
-    assert_eq!(query(sql,vec![V::FixedSizeList(vec![V::I64(1)]),V::FixedSizeList(vec![V::I64(2)])]).await.unwrap_err().code,"xtdb.expression/function-type-mismatch");
+    assert_eq!(query(sql,vec![V::FixedSizeList(vec![V::I64(1)].into()),V::FixedSizeList(vec![V::I64(2)].into())]).await.unwrap_err().code,"xtdb.expression/function-type-mismatch");
     assert_eq!(query("SELECT (COALESCE(1,2) BETWEEN 'a' AND 'z') IS NULL",vec![]).await.unwrap(),[vec![V::Bool(false)]]);
 }
 

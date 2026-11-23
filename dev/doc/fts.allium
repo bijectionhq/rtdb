@@ -188,6 +188,7 @@ rule RepairUnreadableSearchFile {
 -- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
 -- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
 -- SEARCH_SCORE(column, query) is the BM25 of that value for the query's terms.
+-- Search file construction and live postings derive tokens from the indexed fields of each put event.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
 --

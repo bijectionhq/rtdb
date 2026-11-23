@@ -10,8 +10,8 @@ fn set_type() -> L { L::List { kind: ListKind::Set,element: Box::new(L::Scalar(S
 fn direct_sql_equality_rejects_sets_and_union_child_pairs_before_length_or_value_checks() {
     for (left,right) in [
         (set(),set()),
-        (V::List(vec![set()]),V::List(vec![set(),V::I64(1)])),
-        (V::List(vec![V::I64(1),set()]),V::List(vec![set(),V::I64(2)])),
+        (V::list(vec![set()]),V::list(vec![set(),V::I64(1)])),
+        (V::list(vec![V::I64(1),set()]),V::list(vec![set(),V::I64(2)])),
         (V::Struct(StructFields::from([("a".into(),set())])),V::Struct(StructFields::from([("a".into(),set())]))),
     ] {
         assert_eq!(sql_eq(&left,&right, &equality_scope()).unwrap_err().code,"xtdb.expression/set-equality");
@@ -28,7 +28,7 @@ fn direct_sql_equality_rejects_sets_and_union_child_pairs_before_length_or_value
 async fn declared_set_pairs_reject_empty_lists_and_unselected_branches() {
     let empty = Expr::Parameter { index: 0,data_type: L::list(set_type()) };
     let expression = Expr::binary(B::Eq,empty.clone(),empty);
-    let arguments = [V::List(vec![])];
+    let arguments = [V::list(vec![])];
     let context = EvalContext { parameters: &arguments,..Default::default() };
     assert!(CompiledExpr::compile(&expression,&Schema::default()).is_err());
     assert_eq!(evaluate(&expression,&Schema::default(),&[],&context).unwrap_err().code,"xtdb.expression/set-equality");

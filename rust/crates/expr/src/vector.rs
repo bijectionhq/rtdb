@@ -1,4 +1,4 @@
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Anomaly, ListView, Result, Value};
 
 use crate::{compare::nullish, numeric::number};
 
@@ -18,9 +18,9 @@ pub(crate) fn cosine_distance(left: &Value, right: &Value) -> Result<Value> {
     let mut dot = 0.0;
     let mut left_squared = 0.0;
     let mut right_squared = 0.0;
-    for (left, right) in left.iter().zip(right) {
-        let left = component(left)? / left_scale;
-        let right = component(right)? / right_scale;
+    for index in 0..left.len() {
+        let left = component_at(left, index)? / left_scale;
+        let right = component_at(right, index)? / right_scale;
         dot += left * right;
         left_squared += left * left;
         right_squared += right * right;
@@ -41,6 +41,11 @@ pub struct CosineVector {
 impl CosineVector {
     pub fn prepare<'a>(values: impl Iterator<Item = &'a Value> + Clone, dimensions: usize) -> Result<Self> {
         Self::prepare_components(values.map(component), dimensions)
+    }
+
+    pub fn prepare_value(value: &Value) -> Result<Self> {
+        let values = components(value)?;
+        Self::prepare_components((0..values.len()).map(|index| component_at(values, index)), values.len())
     }
 
     pub fn prepare_components(values: impl Iterator<Item = Result<f64>>, dimensions: usize) -> Result<Self> {
@@ -82,22 +87,29 @@ impl CosineVector {
     }
 }
 
-fn components(vector: &Value) -> Result<&[Value]> {
+fn components(vector: &Value) -> Result<ListView<'_>> {
     match vector {
-        Value::List(values) | Value::FixedSizeList(values) => Ok(values),
+        Value::List(_) | Value::FixedSizeList(_) => Ok(vector.list_view().unwrap()),
         _ => Err(Anomaly::incorrect("rtdb.vector/type", "Cosine distance requires numeric lists")),
     }
 }
 
-fn scale(values: &[Value]) -> Result<f64> {
+fn scale(values: ListView<'_>) -> Result<f64> {
     let mut scale = 0.0_f64;
-    for value in values {
-        scale = scale.max(component(value)?.abs());
+    for index in 0..values.len() {
+        scale = scale.max(component_at(values, index)?.abs());
     }
     if scale == 0.0 {
         return Err(Anomaly::incorrect("rtdb.vector/zero-norm", "Cosine distance requires a nonzero vector"));
     }
     Ok(scale)
+}
+
+fn component_at(values: ListView<'_>, index: usize) -> Result<f64> {
+    if let ListView::Values(values) = values { return component(&values[index]); }
+    let value = values.float_component(index);
+    value.filter(|value| value.is_finite())
+        .ok_or_else(|| Anomaly::incorrect("rtdb.vector/component", "Vector components must be finite numbers"))
 }
 
 fn component(value: &Value) -> Result<f64> {
@@ -116,7 +128,7 @@ mod tests {
         let query = [1e290, -1e-210, 0.0, 1e290].map(Value::F64);
         let prepared = CosineVector::prepare(query.iter(), query.len()).unwrap();
         for row in [[1e-290, 1e-290, 0.0, 1e-290], [1.0, -2.0, -0.0, 3.0], [-10.0, -100.0, 5.0, 0.01]] {
-            let Value::F64(expected) = cosine_distance(&Value::List(row.map(Value::F64).to_vec()), &Value::List(query.to_vec())).unwrap() else { unreachable!() };
+            let Value::F64(expected) = cosine_distance(&Value::list(row.map(Value::F64).to_vec()), &Value::list(query.to_vec())).unwrap() else { unreachable!() };
             assert_eq!(prepared.score(row.into_iter()).unwrap().to_bits(), expected.to_bits());
         }
         assert_eq!(prepared.score([0.0; 4].into_iter()), None);

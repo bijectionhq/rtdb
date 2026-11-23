@@ -65,7 +65,7 @@ fn default_objects_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::F32(left), Value::F32(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
         (Value::F64(left), Value::F64(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
-        (Value::List(left), Value::List(right)) => left.len() == right.len() && left.iter().zip(right).all(|(left, right)| default_objects_equal(left, right)),
+        (Value::List(left), Value::List(right)) => left.len() == right.len() && left.iter().zip(right.iter()).all(|(left, right)| default_objects_equal(left.as_ref(), right.as_ref())),
         (Value::Struct(left), Value::Struct(right)) => left.len() == right.len() && left.iter().zip(right).all(|((left_key, left), (right_key, right))| left_key == right_key && default_objects_equal(left, right)),
         (Value::Map { entries: left, .. }, Value::Map { entries: right, .. }) => left.len() == right.len() && left.iter().all(|(left_key, left)| right.iter().find(|(right_key, _)| default_objects_equal(left_key, right_key)).is_some_and(|(_, right)| default_objects_equal(left, right))),
         _ => left == right,
@@ -122,7 +122,7 @@ pub(crate) fn validate_value(schema: &ConnectSchema, value: &Value, depth: usize
     if let Some(valid) = logical { return if valid { Ok(()) } else { Err(invalid()) }; }
     match (&schema.kind, value) {
         (SchemaKind::Bool, Value::Bool(_)) | (SchemaKind::I8, Value::I8(_)) | (SchemaKind::I16, Value::I16(_)) | (SchemaKind::I32, Value::I32(_)) | (SchemaKind::I64, Value::I64(_)) | (SchemaKind::F32, Value::F32(_)) | (SchemaKind::F64, Value::F64(_)) | (SchemaKind::String, Value::Utf8(_)) | (SchemaKind::Bytes, Value::Binary(_)) => Ok(()),
-        (SchemaKind::Array(element), Value::List(values)) => values.iter().try_for_each(|value| validate_value(element, value, depth + 1)),
+        (SchemaKind::Array(element), Value::List(values)) => values.iter().try_for_each(|value| validate_value(element, value.as_ref(), depth + 1)),
         (SchemaKind::Map(key, element), Value::Map { entries, .. }) => entries.iter().try_for_each(|(k, v)| { validate_value(key, k, depth + 1)?; validate_value(element, v, depth + 1) }),
         (SchemaKind::Struct(fields), Value::Struct(values)) => fields.iter().try_for_each(|field| {
             let value = values.get(&field.name).unwrap_or(&Value::Null);

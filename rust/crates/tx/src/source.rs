@@ -190,13 +190,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             let iids = documents.rows().iter().map(|document| {
                 document_id(document, memory).map(|id| Value::FixedSizeBinary(id.iid().0.to_vec()))
             }).collect::<Result<_>>()?;
-            body.insert("iids".into(), Value::List(iids));
+            body.insert("iids".into(), Value::list(iids));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Row(documents)));
             if matches!(operation, Operation::Public(TxOp::PatchDocs { .. })) { "patch-docs" } else { "put-docs" }
         }
         Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
-            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            body.insert("iids".into(), Value::list(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Row(documents)));
             if matches!(operation, Operation::PatchIids { .. }) { "patch-docs" } else { "put-docs" }
@@ -204,26 +204,26 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         Operation::Public(TxOp::PutArrowDocs { table, documents, valid_from, valid_to }) => {
             let iids = (0..documents.row_count()).map(|row| documents.iid(row)
                 .map(|iid| Value::FixedSizeBinary(iid.0.to_vec()))).collect::<Result<_>>()?;
-            body.insert("iids".into(), Value::List(iids));
+            body.insert("iids".into(), Value::list(iids));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
             "put-docs"
         }
         Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => {
-            body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
+            body.insert("iids".into(), Value::list(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
             "put-docs"
         }
         Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
             body.insert("table".into(), Value::Utf8(table_name(table)));
-            body.insert("iids".into(), Value::List(ids.ids().iter().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec())).collect()));
+            body.insert("iids".into(), Value::list(ids.ids().iter().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
             "delete-docs"
         }
         Operation::Public(TxOp::EraseDocs { table, ids }) => {
             body.insert("table".into(), Value::Utf8(table_name(table)));
-            body.insert("iids".into(), Value::List(ids.ids().iter().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec())).collect()));
+            body.insert("iids".into(), Value::list(ids.ids().iter().map(|id| Value::FixedSizeBinary(id.iid().0.to_vec())).collect()));
             "erase-docs"
         }
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
@@ -586,7 +586,7 @@ fn optional_timestamp(value: Value) -> Result<Option<Timestamp>> {
 fn optional_string(value: Value) -> Result<Option<String>> { match value { Value::Null | Value::Undefined => Ok(None), Value::Utf8(value) => Ok(Some(value)), _ => Err(invalid("Expected optional string")) } }
 fn iids(value: Value) -> Result<Vec<Iid>> {
     let Value::List(values) = value else { return Err(invalid("IIDs must be a list")); };
-    values.into_iter().map(|value| match value { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid("IID must be fixed-size binary")) }).collect()
+    values.into_values().into_iter().map(|value| match value { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes), _ => Err(invalid("IID must be fixed-size binary")) }).collect()
 }
 fn time_fields(body: &mut StructFields<Value>, from: Option<Timestamp>, to: Option<Timestamp>) {
     let time = |time: Option<Timestamp>| time.map(|time| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).unwrap_or(Value::Null);

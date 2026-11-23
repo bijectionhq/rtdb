@@ -217,7 +217,7 @@ fn joined_float_lists(children: &[Option<(ArrayRef, Arc<ArrowField>, Option<Logi
         _ => &LogicalType::Null,
     }));
     let field = rtdb_columnar::to_field(name, &logical)?;
-    if !matches!(field.data_type(), DataType::FixedSizeList(..)) { return Ok(None); }
+    if !matches!(field.data_type(), DataType::List(_) | DataType::FixedSizeList(..)) { return Ok(None); }
     let null = arrow_array::new_null_array(field.data_type(), 1);
     let mut missing = Vec::with_capacity(children.len());
     let mut arrays = Vec::with_capacity(children.len());
@@ -332,13 +332,35 @@ pub(crate) fn interleave(arrays: &[&dyn Array], cells: &[(usize, usize)]) -> Res
     Ok(Arc::new(UnionArray::try_new(fields.clone(), datafusion_common::arrow::buffer::ScalarBuffer::from(ids), Some(datafusion_common::arrow::buffer::ScalarBuffer::from(offsets)), children).map_err(|error| invalid("column-gather", error))?))
 }
 
-fn dense_float_list(array: &dyn Array) -> bool {
-    let DataType::FixedSizeList(item, width) = array.data_type() else { return false };
-    *width > 0 && item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64)
-        && array.as_any().downcast_ref::<arrow_array::FixedSizeListArray>()
-            .is_some_and(|list| item.is_nullable() || list.values().nulls().is_none_or(|items| {
-                items.iter().enumerate().all(|(index, valid)| valid || list.is_null(index / *width as usize))
-            }))
+pub(crate) fn has_float_vector(logical: &LogicalType) -> bool {
+    use rtdb_types::{ListKind, ScalarType};
+    match logical {
+        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => has_float_vector(inner),
+        LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => {
+            match element.as_ref() {
+                LogicalType::Union(legs) => legs.iter().all(|ty| matches!(ty, LogicalType::Null | LogicalType::Scalar(ScalarType::F32 | ScalarType::F64))),
+                element => matches!(plain_scalar(element), Some(ScalarType::F32 | ScalarType::F64)),
+            }
+        }
+        LogicalType::Union(legs) => legs.iter().any(has_float_vector),
+        LogicalType::Struct(fields) => fields.values().any(has_float_vector),
+        _ => false,
+    }
+}
+
+pub(crate) fn dense_float_list(array: &dyn Array) -> bool {
+    let plain_float = |item: &ArrowField| item.metadata().is_empty()
+        && (matches!(item.data_type(), DataType::Float32 | DataType::Float64)
+            || rtdb_types::ListValue::supports_float_union(item.data_type()));
+    match array.data_type() {
+        DataType::List(item) => plain_float(item) && array.as_any().is::<arrow_array::ListArray>(),
+        DataType::FixedSizeList(item, width) => *width > 0 && plain_float(item)
+            && array.as_any().downcast_ref::<arrow_array::FixedSizeListArray>()
+                .is_some_and(|list| item.is_nullable() || list.values().nulls().is_none_or(|items| {
+                    items.iter().enumerate().all(|(index, valid)| valid || list.is_null(index / *width as usize))
+                })),
+        _ => false,
+    }
 }
 
 pub(crate) fn flat(data_type: &DataType) -> bool {
@@ -383,14 +405,14 @@ fn conform_array(array: &ArrayRef, logical: &LogicalType, target: &LogicalType, 
             let kept = copyable(&scalar) || scalar == rtdb_types::ScalarType::DateDay;
             (scalar == expected && kept && array.data_type() == field.data_type()).then(|| Arc::clone(array))
         }
-        (LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(width), element },
-            LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(expected_width), element: expected }) => {
-            if width != expected_width || strip(&element) != strip(&expected) || !dense_float_list(array.as_ref()) { return None; }
-            let DataType::FixedSizeList(item, width) = field.data_type() else { return None };
-            let list = array.as_any().downcast_ref::<arrow_array::FixedSizeListArray>()?;
-            if list.data_type() == field.data_type() { return Some(Arc::clone(array)); }
-            arrow_array::FixedSizeListArray::try_new(Arc::clone(item), *width, Arc::clone(list.values()), list.nulls().cloned())
-                .ok().map(|array| Arc::new(array) as ArrayRef)
+        (LogicalType::List { kind, element }, LogicalType::List { kind: expected_kind, element: expected })
+            if kind == expected_kind && (strip(&element) == strip(&expected)
+                || matches!(expected.as_ref(), LogicalType::Union(legs) if legs.iter().any(|leg| *leg == strip(&element))))
+                && dense_float_list(array.as_ref()) =>
+        {
+            let source = rtdb_columnar::to_field(field.name(), logical).ok()?
+                .with_data_type(array.data_type().clone());
+            rtdb_columnar::conform_float_list(array, &source, field)
         }
         // A copied record's fields take the order of the result's, whatever order the cells came in.
         (LogicalType::Struct(children), LogicalType::Struct(expected)) => {
@@ -1377,6 +1399,11 @@ pub(crate) mod projection {
                     let Some(column) = column(field, schema, batch, parameters)? else { return Ok(None) };
                     columns.push(column);
                 }
+                if columns.iter().any(|column| matches!(column, Column::Arrow { array, .. } if super::dense_float_list(array.as_ref())))
+                    && let Some(structure) = vector_struct(fields.iter().map(|(name, _)| name.as_str()).zip(&columns))
+                {
+                    return Ok(Some(structure));
+                }
                 let mut values = Vec::with_capacity(batch.len);
                 for row in 0..batch.len {
                     let mut document = StructFields::new();
@@ -1408,6 +1435,23 @@ pub(crate) mod projection {
         }
     }
 
+    fn vector_struct<'a>(fields: impl Iterator<Item = (&'a str, &'a Column)>) -> Option<Column> {
+        let mut children = Vec::new();
+        let mut arrays = Vec::new();
+        let mut types = StructFields::new();
+        for (name, column) in fields {
+            let Column::Arrow { array, logical: Some(logical), field } = column else { return None; };
+            let supported = super::dense_float_list(array.as_ref())
+                || super::plain_scalar(logical).is_some_and(super::copyable);
+            if !supported || types.insert(name.to_owned(), logical.clone()).is_some() { return None; }
+            children.push(Arc::new(field.as_ref().clone().with_name(name)));
+            arrays.push(Arc::clone(array));
+        }
+        let array = StructArray::try_new(children.into(), arrays, None).ok()?;
+        let field = Arc::new(ArrowField::new("value", array.data_type().clone(), false));
+        Some(Column::Arrow { array: Arc::new(array), field, logical: Some(LogicalType::Struct(types)) })
+    }
+
     /// The first non-null argument per row. An argument the kernels can't compute, or one that raises an error the
     /// evaluator might never reach, leaves the whole call to the evaluator.
     fn coalesce(args: &[Expr], schema: &Schema, batch: &ColumnBatch, parameters: &[Value]) -> Result<Option<Column>> {
@@ -1421,15 +1465,24 @@ pub(crate) mod projection {
             }
         }
         let Some(last) = computed.iter().rposition(|arg| matches!(arg, Arg::Cells(_))) else { return Ok(None) };
-        // Arguments of one plain scalar layout are interleaved in bulk, a constant as a one-cell array of that layout.
-        let layout = computed.iter().find_map(|arg| match arg { Arg::Cells(Column::Arrow { array, logical: Some(logical), .. }) => Some((array.data_type().clone(), super::plain_scalar(logical)?.clone())), _ => None });
-        if let Some((data_type, scalar)) = layout.filter(|(data_type, scalar)| super::copyable(scalar) && super::scalar_layout(data_type) && *data_type != DataType::Null) {
-            let logical = LogicalType::Scalar(scalar);
+        let layout = computed.iter().find_map(|arg| match arg {
+            Arg::Cells(Column::Arrow { array, logical: Some(logical), .. }) if super::dense_float_list(array.as_ref()) => {
+                Some(match logical { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical }.clone())
+            }
+            Arg::Cells(Column::Arrow { array, logical: Some(logical), .. })
+                if super::scalar_layout(array.data_type()) && array.data_type() != &DataType::Null => {
+                super::plain_scalar(logical).filter(|scalar| super::copyable(scalar)).cloned().map(LogicalType::Scalar)
+            }
+            _ => None,
+        });
+        if let Some(logical) = layout {
+            let field = Arc::new(rtdb_columnar::to_field("value", &logical.clone().maybe())?);
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(computed.len());
             for arg in &computed {
                 let array = match arg {
-                    Arg::Cells(Column::Arrow { array, logical: Some(other), .. }) if array.data_type() == &data_type && super::plain_scalar(other) == super::plain_scalar(&logical) => Some(Arc::clone(array)),
-                    Arg::Constant(value) if value.logical_type() == logical => rtdb_columnar::copy_array(&logical, std::slice::from_ref(value)).ok().filter(|array| array.data_type() == &data_type),
+                    Arg::Cells(column) => super::conform(column, &logical, &field),
+                    Arg::Constant(value) if value.logical_type() == logical => rtdb_columnar::copy_array(&logical, std::slice::from_ref(value))
+                        .ok().filter(|array| array.data_type() == field.data_type()),
                     _ => None,
                 };
                 match array { Some(array) => arrays.push(array), None => break }
@@ -1442,7 +1495,6 @@ pub(crate) mod projection {
                 }).collect::<Vec<_>>();
                 let sources: Vec<&dyn Array> = arrays.iter().map(|array| array.as_ref()).collect();
                 let array = arrow_select::interleave::interleave(&sources, &picks).map_err(|error| crate::invalid("column-coalesce", error))?;
-                let field = Arc::new(ArrowField::new("value", data_type, true));
                 return Ok(Some(Column::Arrow { array, field, logical: Some(logical) }));
             }
         }
@@ -1459,8 +1511,6 @@ pub(crate) mod projection {
         Ok(Some(Column::Values(values)))
     }
 
-    /// A record of input columns copied cell for cell: one struct array where every field is a plain scalar column,
-    /// otherwise one record per row, admitted as the evaluator's output is.
     fn row_copy(fields: &[rtdb_plan::Field], schema: &Schema, batch: &ColumnBatch) -> Result<Option<Column>> {
         let Some(columns) = fields.iter().map(|field| schema.position(field.id).map(|position| &batch.columns[position])).collect::<Option<Vec<_>>>() else { return Ok(None) };
         let unique = fields.iter().enumerate().all(|(index, field)| fields[..index].iter().all(|other| other.name != field.name));
@@ -1468,7 +1518,8 @@ pub(crate) mod projection {
         let mut types = StructFields::new();
         for (field, column) in fields.iter().zip(&columns) {
             let Column::Arrow { array, field: source, logical: Some(logical) } = column else { break };
-            if !unique || super::plain_scalar(logical).is_none() || !super::scalar_layout(array.data_type()) || array.data_type() == &DataType::Null { break; }
+            let flat = super::plain_scalar(logical).is_some() && super::scalar_layout(array.data_type());
+            if !unique || array.data_type() == &DataType::Null || !(flat || super::dense_float_list(array.as_ref())) { break; }
             let child = ArrowField::new(field.name.clone(), array.data_type().clone(), source.is_nullable() || array.null_count() != 0).with_metadata(source.metadata().clone());
             children.push((Arc::new(child), Arc::clone(array)));
             types.insert(field.name.clone(), logical.clone());
@@ -1498,6 +1549,31 @@ mod ranked_arrow_tests {
     use arrow_array::{FixedSizeListArray, Float32Array};
     use rtdb_plan::{Binder, Schema};
     use rtdb_types::{ListKind, ScalarType};
+
+    #[test]
+    fn scan_gathers_different_float_widths_into_one_arrow_embedding_column() {
+        let layout = |scalar| LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(LogicalType::Scalar(scalar)) };
+        let vector = |components: ArrayRef, scalar| {
+            let logical = layout(scalar);
+            let field = Arc::new(rtdb_columnar::to_field("embedding", &logical).unwrap());
+            let DataType::FixedSizeList(item, width) = field.data_type() else { unreachable!() };
+            let list = FixedSizeListArray::try_new(Arc::clone(item), *width, components, None).unwrap();
+            Some((Arc::new(list) as ArrayRef, field, Some(logical)))
+        };
+        let children = [
+            vector(Arc::new(Float32Array::from(vec![1.0, 2.0])), ScalarType::F32),
+            vector(Arc::new(arrow_array::Float64Array::from(vec![3.0, 4.0])), ScalarType::F64),
+            None,
+        ];
+        let column = joined_float_lists(&children, &[(1, 0), (2, 0), (0, 0)], "embedding").unwrap().unwrap();
+        let Column::Arrow { array, .. } = &column else { panic!("expected an Arrow vector column"); };
+        assert!(array.is_null(1));
+        let second = column.value(0).unwrap();
+        let first = column.value(2).unwrap();
+        assert!(matches!(second.list_view(), Some(rtdb_types::ListView::Union(_))));
+        assert_eq!(first.list_view().unwrap().get(1).as_deref(), Some(&Value::F32(2.0)));
+        assert_eq!(second.list_view().unwrap().get(1).as_deref(), Some(&Value::F64(4.0)));
+    }
 
     #[test]
     fn ranked_payloads_stay_in_arrow_across_input_batches() {

@@ -88,7 +88,7 @@ fn metadata_counts_masked_struct_children_and_keeps_numeric_bounds() {
     assert_eq!(columns[0].field("root-col?"), Some(&Value::Bool(false)));
     assert_eq!(columns[0].field("numbers").unwrap().field("min"), Some(&Value::F64(-4.0)));
     assert_eq!(columns[0].field("numbers").unwrap().field("max"), Some(&Value::F64(7.0)));
-    assert_eq!(columns[root].field("struct"), Some(&Value::List(vec![Value::I32(0)])));
+    assert_eq!(columns[root].field("struct"), Some(&Value::list(vec![Value::I32(0)])));
     assert_eq!(columns[root].field("count"), Some(&Value::I64(2)));
 }
 
@@ -152,8 +152,8 @@ fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
     let MetadataNode::Leaf { columns: first_columns, .. } = &file.nodes()[first] else { panic!("First node must be a leaf") };
     let MetadataNode::Leaf { columns: second_columns, .. } = &file.nodes()[second] else { panic!("Second node must be a leaf") };
     let nested = |columns: &[Value]| columns.iter().find(|column| column.field("col-name") == Some(&Value::Utf8("nested".into()))).unwrap().field("struct").unwrap().clone();
-    assert_eq!(nested(&first_columns.values().unwrap()), Value::List(vec![Value::I32(4)]));
-    assert_eq!(nested(&second_columns.values().unwrap()), Value::List(vec![Value::I32(4 + first_columns.values().unwrap().len() as i32)]));
+    assert_eq!(nested(&first_columns.values().unwrap()), Value::list(vec![Value::I32(4)]));
+    assert_eq!(nested(&second_columns.values().unwrap()), Value::list(vec![Value::I32(4 + first_columns.values().unwrap().len() as i32)]));
     assert_eq!(summary.row_count, Some(2));
     let temporal = summary.temporal_metadata.unwrap();
     assert_eq!(temporal.min_valid_from, Some(0));

@@ -33,7 +33,7 @@ fn array_read(ty: PgType, input: &mut Input<'_>) -> Result<Value> {
     let dimensions = input.i32()?;
     let flags = input.i32()?;
     let oid = input.i32()?;
-    if dimensions == 0 { return Ok(Value::List(Vec::new())); }
+    if dimensions == 0 { return Ok(Value::list(Vec::new())); }
     if dimensions != 1 || flags != 0 { return Err(invalid("Binary array requires one dimension and non-null elements")); }
     let count = usize::try_from(input.i32()?).map_err(invalid)?;
     let _lower = input.i32()?;
@@ -45,7 +45,7 @@ fn array_read(ty: PgType, input: &mut Input<'_>) -> Result<Value> {
         let value = read(element, input.take(length)?)?;
         values.push(match (ty, value) { (PgType::Int4s, Value::I64(value)) => Value::I32(value as i32), (PgType::Int8s, Value::I32(value)) => Value::I64(i64::from(value)), (_, value) => value });
     }
-    Ok(Value::List(values))
+    Ok(Value::list(values))
 }
 
 fn numeric_read(input: &mut Input<'_>) -> Result<Value> {

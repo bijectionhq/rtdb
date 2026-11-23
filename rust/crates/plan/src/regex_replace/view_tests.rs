@@ -81,9 +81,9 @@ fn all_forty_one_physical_kinds_have_exactly_thirty_four_borrowed_leaves() {
         (Value::Keyword(Keyword::from_name("plain/name")), "keyword"), (Value::Uuid([0; 16]), "leaf"),
         (Value::Uri("https://example.test/é".into()), "leaf"), (Value::Transit(vec![0, 255]), "leaf"),
         (Value::Oid(-1), "leaf"), (Value::RegClass(2), "leaf"), (Value::RegProc(3), "leaf"),
-        (Value::List(vec![Value::I64(1)]), "list"), (Value::Set(vec![Value::Null]), "set"),
+        (Value::list(vec![Value::I64(1)]), "list"), (Value::Set(vec![Value::Null]), "set"),
         (Value::Map { entries: vec![(Value::Null, Value::Bool(true))], sorted: true }, "map"),
-        (Value::FixedSizeList(vec![Value::Bool(false)]), "fixed-size-list"),
+        (Value::FixedSizeList(vec![Value::Bool(false)].into()), "fixed-size-list"),
         (Value::TimestampTzRange { lower: -1, upper: 2 }, "leaf"), (Value::Struct(StructFields::new()), "struct"),
     ];
     assert_eq!(cases.len(), 41);
@@ -91,11 +91,11 @@ fn all_forty_one_physical_kinds_have_exactly_thirty_four_borrowed_leaves() {
     for (source, label) in &cases {
         let view = RegexLiteralView::new(source);
         assert_eq!(literal_label(view), *label);
-        if let RegexLiteralKind::Leaf(leaf) = view.kind() { assert!(std::ptr::eq(leaf.value(), source)); leaves += 1; }
+        if let RegexLiteralKind::Leaf(leaf) = view.kind() { assert!(std::ptr::eq(leaf.value().as_ref(), source)); leaves += 1; }
     }
     assert_eq!(leaves, 34);
-    assert!(matches!(RegexLiteralView::new(&cases[12].0).kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::F32(value) if value.to_bits() == 0x7fc00001)));
-    assert!(matches!(RegexLiteralView::new(&cases[13].0).kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::F64(value) if value.to_bits() == 0x7ff8000000000001)));
+    assert!(matches!(RegexLiteralView::new(&cases[12].0).kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(), Value::F32(value) if value.to_bits() == 0x7fc00001)));
+    assert!(matches!(RegexLiteralView::new(&cases[13].0).kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(), Value::F64(value) if value.to_bits() == 0x7ff8000000000001)));
     assert!(matches!(RegexLiteralView::new(&cases[28].0).kind(), RegexLiteralKind::Keyword("plain/name")));
 }
 
@@ -112,17 +112,18 @@ fn child_and_text_borrows_outlive_temporary_views_and_cursors() {
     let super::super::storage::RawKind::Symbol(text_id) = &storage.forms[child_id.0].kind else { panic!("expected symbol") };
     let source = &storage.texts[text_id.0];
     assert_eq!(symbol(child).as_ptr(), source.as_ptr());
-    let values = Value::List(vec![Value::Utf8("physical".into())]);
+    let values = Value::list(vec![Value::Utf8("physical".into())]);
     let value = first_literal(&values).unwrap();
     let Value::List(children) = &values else { panic!("expected list") };
-    let Value::Utf8(source) = &children[0] else { panic!("expected text") };
+    let child = children.get(0).unwrap();
+    let Value::Utf8(source) = child.as_ref() else { panic!("expected text") };
     assert_eq!(text(value).as_ptr(), source.as_ptr());
     let fields = Value::Struct(StructFields::from([("field".into(), Value::I64(1))]));
     let (name, value) = first_field(&fields).unwrap();
     let Value::Struct(source) = &fields else { panic!("expected struct") };
     let (source_name, source_value) = source.first_key_value().unwrap();
     assert_eq!(name.as_ptr(), source_name.as_ptr());
-    assert!(matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if std::ptr::eq(leaf.value(), source_value)));
+    assert!(matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if std::ptr::eq(leaf.value().as_ref(), source_value)));
 }
 
 #[test]
@@ -231,7 +232,7 @@ fn raw_pairs_preserve_entry_order_and_source_lifetimes() {
 
 #[test]
 fn physical_sequence_and_pair_cursors_borrow_exact_children() {
-    for source in [Value::List(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]), Value::Set(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]), Value::FixedSizeList(vec![Value::Utf8("a".into()), Value::Utf8("b".into())])] {
+    for source in [Value::list(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]), Value::Set(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]), Value::FixedSizeList(vec![Value::Utf8("a".into()), Value::Utf8("b".into())].into())] {
         let values = match RegexLiteralView::new(&source).kind() { RegexLiteralKind::List(values) | RegexLiteralKind::Set(values) | RegexLiteralKind::FixedSizeList(values) => values, _ => panic!("expected sequence") };
         assert_eq!(values.len(), 2);
         assert!(!values.is_empty());
@@ -285,7 +286,7 @@ fn field_cursors_preserve_insertion_order_and_borrow_names_and_values() {
 
 #[test]
 fn empty_physical_containers_have_exact_exhausted_cursors() {
-    let sequence = Value::List(vec![]);
+    let sequence = Value::list(vec![]);
     let RegexLiteralKind::List(values) = RegexLiteralView::new(&sequence).kind() else { panic!("expected list") };
     assert!(values.is_empty());
     assert_eq!(values.len(), 0);

@@ -474,7 +474,7 @@ fn nested_decimal_c_data_restores_each_union_child_scale() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let decimal = |scale| LogicalType::Scalar(ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
     let ty = LogicalType::list(LogicalType::from_legs([decimal(i32::MIN), decimal(i32::MAX)])).maybe();
-    let value = Value::List([i32::MIN, i32::MAX].into_iter().map(|scale| Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap())).collect());
+    let value = Value::list([i32::MIN, i32::MAX].into_iter().map(|scale| Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap())).collect());
     let page = RecordBatch::try_new(Arc::new(Schema::new(vec![rtdb_columnar::to_field("values", &ty).unwrap()])), vec![rtdb_columnar::build_array(&ty, &[Value::Null, value.clone()]).unwrap()]).unwrap();
     let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
     let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();

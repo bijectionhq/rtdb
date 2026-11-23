@@ -116,12 +116,12 @@ impl GeneratedSeries {
                 let mut out = Vec::new();
                 out.try_reserve_exact(series.len()).map_err(|_|Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate integer series"))?;
                 out.extend((0..series.len()).map(|index|series.nth(index)));
-                Ok(Value::List(out))
+                Ok(Value::list(out))
             }
             Self::Temporal(mut series) => {
                 let mut out = Vec::new();
                 while let Some(value) = series.next(context)? { push(&mut out,value,context)?; }
-                Ok(Value::List(out))
+                Ok(Value::list(out))
             }
         }
     }
@@ -132,6 +132,6 @@ impl GeneratedSeries {
             push(&mut out,value,context)?;
             if out.len() % 1024 == 0 { tokio::task::yield_now().await; }
         }
-        Ok(Value::List(out))
+        Ok(Value::list(out))
     }
 }

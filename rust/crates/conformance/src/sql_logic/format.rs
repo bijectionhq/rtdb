@@ -139,7 +139,7 @@ fn text(value: &Value, nested: bool) -> Result<String> {
                 _ => text,
             }
         }
-        Value::List(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| text(value, true)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::List(_) | Value::FixedSizeList(_) => format!("[{}]", value.list_view().unwrap().iter().map(|value| text(value.as_ref(), true)).collect::<Result<Vec<_>>>()?.join(" ")),
         Value::Set(values) => format!("#{{{}}}", values.iter().map(|value| text(value, true)).collect::<Result<Vec<_>>>()?.join(" ")),
         Value::Struct(values) => format!("{{{}}}", values.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)).map(|(key, value)| Ok(format!("{} {}", quoted(key), text(value, true)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", text(key, true)?, text(value, true)?))).collect::<Result<Vec<_>>>()?.join(", ")),
@@ -243,6 +243,6 @@ mod tests {
         assert_eq!(cell(b'T',&Value::DateDay(i32::MAX)).unwrap(),rtdb_types::CivilDate::from_epoch_day(i64::from(i32::MAX)).unwrap().to_string());
         let timestamp = Value::Timestamp { value: day * 86_400 - 7200,unit: TimeUnit::Second,timezone: Some("Europe/Paris".into()) };
         assert_eq!(cell(b'T',&timestamp).unwrap(),"+300000-07-01T00:00+02:00[Europe/Paris]");
-        assert!(cell(b'T',&Value::List(vec![timestamp])).is_err());
+        assert!(cell(b'T',&Value::list(vec![timestamp])).is_err());
     }
 }

@@ -91,7 +91,7 @@ async fn search_index_definitions_are_documents_as_of_their_transaction() {
     let definitions = "SELECT _id, schema_name, table_name, columns, analyzer FROM xt.search_indexes";
     assert_eq!(rows(session.query_sql(definitions, vec![]).await.unwrap()).await, [vec![
         Value::Utf8("docs_text".into()), Value::Utf8("public".into()), Value::Utf8("docs".into()),
-        Value::List(vec![Value::Utf8("title".into()), Value::Utf8("body".into())]), Value::Utf8("simple".into()),
+        Value::list(vec![Value::Utf8("title".into()), Value::Utf8("body".into())]), Value::Utf8("simple".into()),
     ]]);
     let version = rows(session.query_sql("SELECT version FROM xt.search_indexes", vec![]).await.unwrap()).await;
     assert_eq!(version, [vec![Value::I64(created.tx_key().tx_id.0)]], "the version is the defining transaction");

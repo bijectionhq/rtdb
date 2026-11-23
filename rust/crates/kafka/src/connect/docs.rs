@@ -74,7 +74,7 @@ fn convert_document(value: Value) -> Result<Value> {
             for (key, value) in entries { fields.insert(map_key(key)?, convert_document(value)?); }
             Value::Struct(fields)
         }
-        Value::List(values) => Value::List(values.into_iter().map(convert_document).collect::<Result<_>>()?),
+        Value::List(values) => Value::list(values.into_values().into_iter().map(convert_document).collect::<Result<_>>()?),
         Value::Timestamp { value, unit: rtdb_types::TimeUnit::Millisecond, timezone } => Value::Timestamp {
             value: value.checked_mul(1000).ok_or_else(|| error("conversion-error", "Timestamp exceeds the document writer's microsecond range"))?, unit: rtdb_types::TimeUnit::Microsecond, timezone,
         },
@@ -109,7 +109,7 @@ fn convert_schema_value(value: Value, schema: Option<&super::ConnectSchema>, dep
             }
             Ok(Value::Struct(result))
         }
-        (Value::List(values), Some(SchemaKind::Array(element))) => Ok(Value::List(values.into_iter().map(|value| convert_schema_value(value, Some(element), depth + 1)).collect::<Result<_>>()?)),
+        (Value::List(values), Some(SchemaKind::Array(element))) => Ok(Value::list(values.into_values().into_iter().map(|value| convert_schema_value(value, Some(element), depth + 1)).collect::<Result<_>>()?)),
         (Value::Map { entries, .. }, Some(SchemaKind::Map(_, value_schema))) => {
             let mut result = StructFields::new();
             for (key, value) in entries { result.insert(map_key(key)?, convert_schema_value(value, Some(value_schema), depth + 1)?); }
@@ -186,7 +186,7 @@ fn document_growth(value: &Value) -> Result<usize> {
     match value {
         Value::Struct(fields) => fields.values().try_fold(4096usize, add),
         Value::Map { entries, .. } => entries.iter().map(|(_, value)| value).try_fold(4096usize, add),
-        Value::List(values) => values.iter().try_fold(4096usize, add),
+        Value::List(values) => values.iter().try_fold(4096usize, |bytes, value| add(bytes, value.as_ref())),
         _ => Ok(4096),
     }
 }

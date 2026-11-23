@@ -145,8 +145,8 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
             if !json.is_object() { return Err(error("conversion-error", "Struct payload must be an object")); }
             Value::Struct(fields.iter().map(|field| Ok((field.name.clone(), convert_budget(&Some(Arc::clone(&field.schema)), json.get(&field.name).unwrap_or(&Json::Null), replace, depth + 1, budget)?))).collect::<Result<_>>()?)
         }
-        Some(SchemaKind::Array(element)) => Value::List(json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?.iter().map(|value| convert_budget(&Some(Arc::clone(element)), value, replace, depth + 1, budget)).collect::<Result<_>>()?),
-        Some(SchemaKind::ArrayOfNull) => Value::List(json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)).collect::<Result<_>>()?),
+        Some(SchemaKind::Array(element)) => Value::list(json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?.iter().map(|value| convert_budget(&Some(Arc::clone(element)), value, replace, depth + 1, budget)).collect::<Result<_>>()?),
+        Some(SchemaKind::ArrayOfNull) => Value::list(json.as_array().ok_or_else(|| error("conversion-error", "Array payload must be an array"))?.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)).collect::<Result<_>>()?),
         Some(SchemaKind::MapOfNull | SchemaKind::MapWithNullValues(_)) => {
             let entries = json.as_array().ok_or_else(|| error("conversion-error", "Map must be a tuple array"))?.iter().map(|entry| {
                 let pair = entry.as_array().filter(|pair| pair.len() == 2).ok_or_else(|| error("conversion-error", "Map entry must be a pair"))?;
@@ -170,7 +170,7 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
         None => match json {
             Json::Null => Value::Null, Json::Boolean(value) => Value::Bool(*value), Json::String(value) => Value::Utf8(value.clone()),
             Json::Number(_) | Json::Decimal(_) => if json.is_integral() { Value::I64(integral()) } else { Value::F64(json.double_value().ok_or_else(|| error("conversion-error", "Invalid number"))?) },
-            Json::Array(values) => Value::List(values.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)).collect::<Result<_>>()?),
+            Json::Array(values) => Value::list(values.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)).collect::<Result<_>>()?),
             Json::Object(values) => Value::Map { entries: values.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), convert_budget(&None, value, replace, depth + 1, budget)?))).collect::<Result<_>>()?, sorted: false },
         },
     })
@@ -240,7 +240,7 @@ fn registry_value(schema: &Arc<ConnectSchema>, json: Option<&Json>, depth: usize
             budget.claim(fields.len().saturating_mul(4096))?;
             Ok(Value::Struct(fields.iter().map(|field| Ok((field.name.clone(), registry_value(&field.schema, json.get(&field.name), depth + 1, budget)?))).collect::<Result<_>>()?))
         }
-        SchemaKind::Array(element) => Ok(Value::List(json.as_array().ok_or_else(|| error("conversion-error", "Connect array payload must be an array"))?.iter().map(|value| registry_value(element, Some(value), depth + 1, budget)).collect::<Result<_>>()?)),
+        SchemaKind::Array(element) => Ok(Value::list(json.as_array().ok_or_else(|| error("conversion-error", "Connect array payload must be an array"))?.iter().map(|value| registry_value(element, Some(value), depth + 1, budget)).collect::<Result<_>>()?)),
         SchemaKind::Map(key, value) => {
             let entries = if matches!(key.resolved().kind, SchemaKind::String) {
                 json.as_object().ok_or_else(|| error("conversion-error", "Connect map payload must be an object"))?.iter().map(|(name, json)| { budget.claim(name.len().saturating_add(512))?; Ok((Value::Utf8(name.clone()), registry_value(value, Some(json), depth + 1, budget)?)) }).collect::<Result<_>>()?

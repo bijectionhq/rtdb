@@ -53,13 +53,27 @@ pub fn estimate_read_cell_bytes(field: &Field, array: &dyn Array, row: usize) ->
             let values = cast::<ListArray>(array)?;
             let start = usize::try_from(values.value_offsets()[row]).map_err(|_| layout())?;
             let end = usize::try_from(values.value_offsets()[row + 1]).map_err(|_| layout())?;
-            range(child, values.values().as_ref(), start, end)?
+            if field.metadata().is_empty() && child.metadata().is_empty()
+                && matches!(child.data_type(), DataType::Float32 | DataType::Float64) {
+                if start > end || end > values.values().len() { return Err(layout()); }
+                add(256, mul(end - start, 16)?)?
+            } else {
+                range(child, values.values().as_ref(), start, end)?
+            }
         }
         DataType::FixedSizeList(child, length) => {
             let values = cast::<FixedSizeListArray>(array)?;
             let length = usize::try_from(*length).map_err(|_| layout())?;
             let start = mul(row, length)?;
-            range(child, values.values().as_ref(), start, add(start, length)?)?
+            let end = add(start, length)?;
+            if field.metadata().is_empty() && child.metadata().is_empty()
+                && matches!(child.data_type(), DataType::Float32 | DataType::Float64)
+            {
+                if end > values.values().len() { return Err(layout()); }
+                add(256, mul(length, 16)?)?
+            } else {
+                range(child, values.values().as_ref(), start, end)?
+            }
         }
         DataType::Map(child, _) => {
             let values = cast::<MapArray>(array)?;

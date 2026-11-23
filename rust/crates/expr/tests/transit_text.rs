@@ -46,7 +46,7 @@ fn varchar_casts_and_str_print_stored_values_with_pr_str() {
 
 #[test]
 fn varchar_casts_of_lists_print_nested_stored_strings_quoted() {
-    let list = V::List(vec![stored(&T::String("a".into())),stored(&big("2"))]);
+    let list = V::list(vec![stored(&T::String("a".into())),stored(&big("2"))]);
     assert_eq!(cast(&list,&LogicalType::Scalar(ScalarType::Utf8),"UTC").unwrap(),V::Utf8(r#"["a" 2N]"#.into()));
 }
 

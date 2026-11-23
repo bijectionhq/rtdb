@@ -56,7 +56,7 @@ fn set_hash_is_order_independent_and_list_hash_preserves_order() {
     let a = Value::I64(1);
     let b = Value::I64(2);
     assert_eq!(hash_value(&Value::Set(vec![a.clone(), b.clone()]), 0).unwrap(), hash_value(&Value::Set(vec![b.clone(), a.clone()]), 0).unwrap());
-    assert_ne!(hash_value(&Value::List(vec![a.clone(), b.clone()]), 0).unwrap(), hash_value(&Value::List(vec![b, a]), 0).unwrap());
+    assert_ne!(hash_value(&Value::list(vec![a.clone(), b.clone()]), 0).unwrap(), hash_value(&Value::list(vec![b, a]), 0).unwrap());
 }
 #[test]
 fn murmur3_x86_vectors_include_nonempty_tails() {
@@ -76,7 +76,7 @@ fn murmur_vector_hash_uses_signed_widths_ieee_bytes_and_null_zero() {
     for value in [Value::U8(255), Value::U16(65535), Value::U32(u32::MAX), Value::U64(u64::MAX), Value::I64(-1), Value::F64(-1.0)] {
         assert_eq!(hash_value_murmur3(&value, 7).unwrap(), minus_one);
     }
-    assert_eq!(hash_value_murmur3(&Value::List(vec![Value::Bool(true), Value::Bool(false)]), 0).unwrap(), 17 * 31 + 19);
+    assert_eq!(hash_value_murmur3(&Value::list(vec![Value::Bool(true), Value::Bool(false)]), 0).unwrap(), 17 * 31 + 19);
     assert_eq!(hash_value_murmur3(&Value::Time { value: 1234, unit: TimeUnit::Microsecond, bit_width: 64 }, 0).unwrap(), murmur3_32(&1234i64.to_le_bytes(), 0) as i32);
     assert_ne!(hash_value_murmur3(&Value::F64(-0.0), 0).unwrap(), hash_value_murmur3(&Value::F64(0.0), 0).unwrap());
 }

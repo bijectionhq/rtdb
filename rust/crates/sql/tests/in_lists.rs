@@ -83,8 +83,8 @@ async fn uncorrelated_build_precedes_needle_and_correlated_build_follows_it() {
 
 #[tokio::test]
 async fn uncorrelated_marks_stop_comparison_but_correlated_values_project_the_whole_batch() {
-    let needle = V::List(vec![V::Timestamp { value: i64::MAX, unit: TimeUnit::Second, timezone: Some("UTC".into()) }]);
-    let later = V::List(vec![V::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }]);
+    let needle = V::list(vec![V::Timestamp { value: i64::MAX, unit: TimeUnit::Second, timezone: Some("UTC".into()) }]);
+    let later = V::list(vec![V::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }]);
     assert_eq!(query("SELECT $1 IN ($1,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL)", vec![needle.clone(),later.clone()]).await.unwrap(), [vec![V::Bool(true)]]);
     assert_eq!(query("SELECT x IN (x,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL) FROM (VALUES ($1)) t(x)", vec![needle,later]).await.unwrap_err().code, "xtdb/numeric-value-out-of-range");
 }
@@ -106,7 +106,7 @@ async fn scalar_shared_marks_keep_raw_uri_hash_selection_and_nested_object_equal
     assert_eq!(query("SELECT $1 IN ($2)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Bool(true)]]);
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Bool(false)]]);
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,NULL)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Null]]);
-    assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![V::List(vec![needle]),V::List(vec![candidate])]).await.unwrap(), [vec![V::Bool(true)]]);
+    assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![V::list(vec![needle]),V::list(vec![candidate])]).await.unwrap(), [vec![V::Bool(true)]]);
 }
 
 #[test]

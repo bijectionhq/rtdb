@@ -182,7 +182,7 @@ async fn spilled_scalar_mark_retains_null_facts_from_other_partitions() {
 #[tokio::test]
 async fn spilled_nested_mark_keeps_probe_pages_and_compares_all_build_partitions() {
     let execution = execution_threshold(1,0);let baseline = execution.context.memory.used_bytes();
-    let nested = |left,right|Value::List(vec![Value::I64(left),right]);
+    let nested = |left,right|Value::list(vec![Value::I64(left),right]);
     let ty = nested(1,Value::Null).logical_type().join(&nested(2,Value::I64(3)).logical_type()).maybe();
     let dependent = union(typed_table(1,&[nested(1,Value::Null)],ty.clone()),typed_table(1,&[nested(2,Value::I64(3))],ty.clone()));
     let input = union(typed_table(0,&[nested(1,Value::I64(2)),nested(2,Value::I64(3))],ty.clone()),typed_table(0,&[Value::Null],ty));

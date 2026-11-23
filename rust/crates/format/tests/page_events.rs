@@ -12,7 +12,7 @@ fn page_events_encode_to_the_bytes_their_decoded_events_encode_to() {
     let events = (0..12i64).map(|id| StoredEvent {
         iid: EntityId::Integer(id).iid(), system_from: Timestamp(10 + id), valid_time: Interval::new(Timestamp(id), Timestamp::MAX).unwrap(),
         operation: match id % 4 {
-            0 => doc(id, Some(Value::List(vec![Value::Utf8("a".into()), Value::Utf8(format!("t{id}"))]))),
+            0 => doc(id, Some(Value::list(vec![Value::Utf8("a".into()), Value::Utf8(format!("t{id}"))]))),
             1 => doc(id, None),
             2 => if id == 2 { StoredOperation::Delete } else { StoredOperation::Erase },
             _ => doc(id, Some(Value::Null)),

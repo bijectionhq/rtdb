@@ -62,7 +62,7 @@ fn transit_children_use_decoded_equality_inside_native_lists_and_structs() {
     let left = stored(&tag("i8", T::Integer(7)), false);
     let right = stored(&T::Integer(7), true);
     for (left, right) in [
-        (V::List(vec![left.clone()]), V::List(vec![right.clone()])),
+        (V::list(vec![left.clone()]), V::list(vec![right.clone()])),
         (V::Struct(StructFields::from([("value".into(), left)])), V::Struct(StructFields::from([("value".into(), right)]))),
     ] {
         assert_eq!(equality_allocation_bound(&left, &right).unwrap(), 0);

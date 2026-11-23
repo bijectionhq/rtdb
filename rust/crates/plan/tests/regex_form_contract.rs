@@ -202,10 +202,10 @@ fn all_forty_one_literal_variants_keep_generic_serde_shapes_widths_and_bit_paylo
         (V::Oid(-1), vec![NewtypeVariant("Value", 32, "Oid"), I32(-1)]),
         (V::RegClass(2), vec![NewtypeVariant("Value", 33, "RegClass"), I32(2)]),
         (V::RegProc(3), vec![NewtypeVariant("Value", 34, "RegProc"), I32(3)]),
-        (V::List(vec![V::I64(1)]), vec![NewtypeVariant("Value", 35, "List"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("Value", 6, "I64"), I64(1), SeqEnd]),
+        (V::list(vec![V::I64(1)]), vec![NewtypeVariant("Value", 35, "List"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("Value", 6, "I64"), I64(1), SeqEnd]),
         (V::Set(vec![V::Null, V::Null]), vec![NewtypeVariant("Value", 36, "Set"), CollectSeq, Seq(Some(2)), SeqElement, UnitVariant("Value", 1, "Null"), SeqElement, UnitVariant("Value", 1, "Null"), SeqEnd]),
         (V::Map { entries: vec![(V::Null, V::Bool(true))], sorted: true }, vec![StructVariant("Value", 37, "Map", 2), VariantField("entries"), CollectSeq, Seq(Some(1)), SeqElement, Tuple(2), TupleElement, UnitVariant("Value", 1, "Null"), TupleElement, NewtypeVariant("Value", 2, "Bool"), Bool(true), TupleEnd, SeqEnd, VariantField("sorted"), Bool(true), StructVariantEnd]),
-        (V::FixedSizeList(vec![V::Bool(false)]), vec![NewtypeVariant("Value", 38, "FixedSizeList"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("Value", 2, "Bool"), Bool(false), SeqEnd]),
+        (V::FixedSizeList(vec![V::Bool(false)].into()), vec![NewtypeVariant("Value", 38, "FixedSizeList"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("Value", 2, "Bool"), Bool(false), SeqEnd]),
         (V::TimestampTzRange { lower: -1, upper: 2 }, vec![StructVariant("Value", 39, "TimestampTzRange", 2), VariantField("lower"), I64(-1), VariantField("upper"), I64(2), StructVariantEnd]),
         (V::Struct(StructFields::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), vec![NewtypeVariant("Value", 40, "Struct"), CollectMap, Map(Some(2)), MapEntry, s("a"), NewtypeVariant("Value", 2, "Bool"), Bool(true), MapEntry, s("z"), UnitVariant("Value", 1, "Null"), MapEnd]),
     ];
@@ -257,7 +257,8 @@ fn float_wire_bits_preserve_nan_payloads_infinities_and_signed_zero() {
         let decoded_form = serde_json::from_str::<F>(&json).unwrap();
         let rtdb_plan::RegexFormKind::Literal(literal) = decoded_form.view().kind() else { panic!("expected F32") };
         let rtdb_plan::RegexLiteralKind::Leaf(leaf) = literal.kind() else { panic!("expected F32") };
-        let V::F32(decoded) = leaf.value() else { panic!("expected F32") };
+        let cell = leaf.value();
+        let V::F32(decoded) = cell.as_ref() else { panic!("expected F32") };
         assert_eq!(decoded.to_bits(), bits);
     }
     for bits in [0u64, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000001, 0x7ff0000000000002] {
@@ -269,7 +270,8 @@ fn float_wire_bits_preserve_nan_payloads_infinities_and_signed_zero() {
         let decoded_form = serde_json::from_str::<F>(&json).unwrap();
         let rtdb_plan::RegexFormKind::Literal(literal) = decoded_form.view().kind() else { panic!("expected F64") };
         let rtdb_plan::RegexLiteralKind::Leaf(leaf) = literal.kind() else { panic!("expected F64") };
-        let V::F64(decoded) = leaf.value() else { panic!("expected F64") };
+        let cell = leaf.value();
+        let V::F64(decoded) = cell.as_ref() else { panic!("expected F64") };
         assert_eq!(decoded.to_bits(), bits);
     }
 }

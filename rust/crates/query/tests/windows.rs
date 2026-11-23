@@ -27,7 +27,7 @@ fn relation(rows: Vec<Vec<V>>, partitioned: bool) -> Arc<Relation> {
 
 #[tokio::test]
 async fn multiple_window_outputs_share_sorted_input_with_nonreflexive_group_keys() {
-    let null_list = V::List(vec![V::Null]);
+    let null_list = V::list(vec![V::Null]);
     let rows = vec![vec![V::Null,V::I64(3)],vec![null_list.clone(),V::I64(5)],vec![V::Null,V::I64(1)],vec![null_list.clone(),V::I64(2)]];
     let context = context(1 << 24);
     let mut cursor = PreparedQuery::new(relation(rows,true)).unwrap().execute(Arc::clone(&context),vec![]).await.unwrap();

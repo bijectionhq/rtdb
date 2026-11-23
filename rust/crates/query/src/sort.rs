@@ -1,9 +1,12 @@
 use std::{cmp::Ordering, sync::Arc};
+use arrow_array::{Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
 use rtdb_expr::{ordered_compare_in_timezone, validate_order_type};
 use rtdb_plan::{Schema, SortExpr};
-use rtdb_types::{LogicalType, Result, Value};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use crate::columnar::{Column, ColumnBatch};
 use crate::{context::Execution, cursor::{OwnedRow, RowCursor}, invalid, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, spill::{SpillFile, SpillReader}};
 
 mod records;
@@ -115,24 +118,31 @@ impl crate::columnar::BatchCursor for ColumnTop {
         }).collect::<Option<_>>().ok_or_else(|| invalid("sort-state", "A batch top-k sorts by input columns"))?;
         let mut types = KeyTypes::declared(plan)?;
         let _scratch = memory.reserve(limit.saturating_add(1).saturating_mul(128))?;
-        let mut kept: Vec<(OwnedRow, (usize, usize))> = Vec::with_capacity(limit + 1);
+        let mut kept: Vec<(usize, usize)> = Vec::with_capacity(limit + 1);
         let mut winners = None;
         let mut accumulated = 0usize;
         let mut deferred = None;
         while let Some(batch) = input.next_batch().await? {
             accumulated = accumulated.saturating_add(batch.len);
+            let packed_types = positions.iter().map(|&position| packed_type(&batch.columns[position])).collect::<Option<Vec<_>>>();
+            if let Some(types_in_batch) = &packed_types && batch.len != 0 {
+                types.observe_types(types_in_batch.clone(), plan)?;
+            }
+            let sources = [winners.as_ref().unwrap_or(&batch), &batch];
             for row in 0..batch.len {
                 plan.execution.context.check_cancelled()?;
-                let key = positions.iter().map(|&position| {
-                    let mut value = batch.columns[position].value(row)?;
-                    if self.projected { value.admit_expression_dates()?; }
-                    Ok(value)
-                }).collect::<Result<Vec<_>>>()?;
-                types.observe(&key, plan)?;
+                if packed_types.is_none() {
+                    let key = positions.iter().map(|&position| key_value(&batch.columns[position], row, self.projected)).collect::<Result<Vec<_>>>()?;
+                    types.observe(&key, plan)?;
+                }
                 if deferred.is_some() { continue; }
-                match plan.top_position_by(kept.len(), limit, &key, |index| &kept[index].0.values) {
+                let compare = |index| {
+                    let (source, other) = kept[index];
+                    compare_batch_keys(plan, &positions, &batch, row, sources[source], other, self.projected)
+                };
+                match find_top_position(kept.len(), limit, compare) {
                     Ok(Some(index)) => {
-                        kept.insert(index, (OwnedRow::new(key, memory)?, (1, row)));
+                        kept.insert(index, (1, row));
                         kept.truncate(limit);
                     }
                     Ok(None) => (),
@@ -144,10 +154,9 @@ impl crate::columnar::BatchCursor for ColumnTop {
                 if let Some(error) = deferred.take() { return Err(error); }
                 accumulated = kept.len();
             }
-            if kept.iter().any(|(_, (source, _))| *source == 1) {
-                let picks = kept.iter().map(|(_, position)| *position).collect::<Vec<_>>();
-                winners = Some(crate::columnar::ColumnBatch::gather_ranked(winners.as_ref(), &batch, &picks, &plan.schema, self.projected, memory)?);
-                for (row, (_, position)) in kept.iter_mut().enumerate() { *position = (0, row); }
+            if kept.iter().any(|(source, _)| *source == 1) {
+                winners = Some(ColumnBatch::gather_ranked(winners.as_ref(), &batch, &kept, &plan.schema, self.projected, memory)?);
+                for (row, position) in kept.iter_mut().enumerate() { *position = (0, row); }
             }
         }
         if accumulated == 0 { return Ok(None); }
@@ -159,6 +168,96 @@ impl crate::columnar::BatchCursor for ColumnTop {
         let picks = (self.offset..winners.len).map(|row| (1, row)).collect::<Vec<_>>();
         crate::columnar::ColumnBatch::gather_ranked(None, &winners, &picks, &plan.schema, self.projected, memory).map(Some)
     }
+}
+
+fn find_top_position(len: usize, limit: usize, compare: impl Fn(usize) -> Result<Ordering>) -> Result<Option<usize>> {
+    if len == limit && len > 0 && compare(len - 1)? != Ordering::Less { return Ok(None); }
+    let mut low = 0;
+    let mut high = len;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if compare(middle)? == Ordering::Less { high = middle; } else { low = middle + 1; }
+    }
+    Ok((low < limit).then_some(low))
+}
+
+fn packed_key(column: &Column) -> Option<(&dyn Array, ScalarType)> {
+    let Column::Arrow { array, field, logical: Some(logical) } = column else { return None; };
+    if !field.metadata().is_empty() { return None; }
+    let logical = match logical { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
+    let scalar = match (array.data_type(), logical) {
+        (DataType::Float32, LogicalType::Scalar(ScalarType::F32)) => ScalarType::F32,
+        (DataType::Float64, LogicalType::Scalar(ScalarType::F64)) => ScalarType::F64,
+        (DataType::Int8, LogicalType::Scalar(ScalarType::I8)) => ScalarType::I8,
+        (DataType::Int16, LogicalType::Scalar(ScalarType::I16)) => ScalarType::I16,
+        (DataType::Int32, LogicalType::Scalar(ScalarType::I32)) => ScalarType::I32,
+        (DataType::Int64, LogicalType::Scalar(ScalarType::I64)) => ScalarType::I64,
+        (DataType::Utf8, LogicalType::Scalar(ScalarType::Utf8)) => ScalarType::Utf8,
+        _ => return None,
+    };
+    Some((array.as_ref(), scalar))
+}
+
+fn packed_type(column: &Column) -> Option<LogicalType> {
+    let (array, scalar) = packed_key(column)?;
+    Some(match array.null_count() {
+        count if count == array.len() => LogicalType::Null,
+        0 => LogicalType::Scalar(scalar),
+        _ => LogicalType::Scalar(scalar).maybe(),
+    })
+}
+
+fn compare_packed(left: &Column, row: usize, right: &Column, other: usize, order: &SortExpr) -> Option<Ordering> {
+    let (left, scalar) = packed_key(left)?;
+    let (right, other_scalar) = packed_key(right)?;
+    if scalar != other_scalar { return None; }
+    match (left.is_null(row), right.is_null(other)) {
+        (true, true) => return Some(Ordering::Equal),
+        (true, false) => return Some(if order.nulls_first { Ordering::Less } else { Ordering::Greater }),
+        (false, true) => return Some(if order.nulls_first { Ordering::Greater } else { Ordering::Less }),
+        (false, false) => (),
+    }
+    macro_rules! values {
+        ($array:ty) => {
+            (left.as_any().downcast_ref::<$array>()?.value(row), right.as_any().downcast_ref::<$array>()?.value(other))
+        };
+    }
+    macro_rules! ordered {
+        ($array:ty) => {{ let (left, right) = values!($array); left.cmp(&right) }};
+    }
+    let comparison = match scalar {
+        ScalarType::F32 => { let (left, right) = values!(Float32Array); rtdb_expr::compare_ordered_floats(f64::from(left), f64::from(right)) }
+        ScalarType::F64 => { let (left, right) = values!(Float64Array); rtdb_expr::compare_ordered_floats(left, right) }
+        ScalarType::I8 => ordered!(Int8Array),
+        ScalarType::I16 => ordered!(Int16Array),
+        ScalarType::I32 => ordered!(Int32Array),
+        ScalarType::I64 => ordered!(Int64Array),
+        ScalarType::Utf8 => { let (left, right) = values!(StringArray); left.as_bytes().cmp(right.as_bytes()) }
+        _ => return None,
+    };
+    Some(if order.descending { comparison.reverse() } else { comparison })
+}
+
+fn key_value(column: &Column, row: usize, projected: bool) -> Result<Value> {
+    let mut value = column.value(row)?;
+    if projected { value.admit_expression_dates()?; }
+    Ok(value)
+}
+
+fn compare_batch_keys(plan: &SortPlan, positions: &[usize], left: &ColumnBatch, row: usize, right: &ColumnBatch, other: usize, projected: bool) -> Result<Ordering> {
+    for (&position, order) in positions.iter().zip(&plan.order) {
+        let (left, right) = (&left.columns[position], &right.columns[position]);
+        let comparison = match compare_packed(left, row, right, other, order) {
+            Some(comparison) => comparison,
+            None => {
+                let left = key_value(left, row, projected)?;
+                let right = key_value(right, other, projected)?;
+                plan.compare_key(&left, &right, order)?
+            }
+        };
+        if comparison != Ordering::Equal { return Ok(comparison); }
+    }
+    Ok(Ordering::Equal)
 }
 
 struct Accumulator { records: RecordBuffer, keys: KeyTypes }
@@ -186,11 +285,16 @@ impl SortPlan {
         for (index, order) in self.order.iter().enumerate() {
             let left = left.get(index).ok_or_else(|| invalid("invalid-spill", "Sort key is absent"))?;
             let right = right.get(index).ok_or_else(|| invalid("invalid-spill", "Sort key is absent"))?;
-            let mut comparison = ordered_compare_in_timezone(left, right, order.nulls_first, &self.execution.context.timezone)?;
-            if order.descending && !matches!(left, Value::Null | Value::Undefined) && !matches!(right, Value::Null | Value::Undefined) { comparison = comparison.reverse(); }
+            let comparison = self.compare_key(left, right, order)?;
             if comparison != Ordering::Equal { return Ok(comparison); }
         }
         Ok(Ordering::Equal)
+    }
+    fn compare_key(&self, left: &Value, right: &Value, order: &SortExpr) -> Result<Ordering> {
+        let comparison = ordered_compare_in_timezone(left, right, order.nulls_first, &self.execution.context.timezone)?;
+        if order.descending && !matches!(left, Value::Null | Value::Undefined) && !matches!(right, Value::Null | Value::Undefined) {
+            Ok(comparison.reverse())
+        } else { Ok(comparison) }
     }
     fn reduce(&self, accumulator: Accumulator) -> Result<Accumulator> {
         let Accumulator { records, keys } = accumulator;
@@ -265,14 +369,7 @@ impl SortPlan {
     }
 
     fn top_position_by<'a>(&self, len: usize, limit: usize, key: &[Value], kept: impl Fn(usize) -> &'a [Value]) -> Result<Option<usize>> {
-        if len == limit && len > 0 && self.compare(key, kept(len - 1))? != Ordering::Less { return Ok(None); }
-        let mut low = 0;
-        let mut high = len;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.compare(key, kept(middle))? == Ordering::Less { high = middle; } else { low = middle + 1; }
-        }
-        Ok((low < limit).then_some(low))
+        find_top_position(len, limit, |index| self.compare(key, kept(index)))
     }
 
     async fn top_batches(&self, mut batches: crate::columnar::BoxBatchCursor, projected: bool) -> Result<Option<SortOutput>> {
@@ -396,9 +493,11 @@ impl KeyTypes {
     }
     fn observe(&mut self, values: &[Value], plan: &SortPlan) -> Result<()> {
         if values.len() != self.values.len() { return Err(invalid("sort-state", "Sort key metadata width changed")); }
-        let types: Vec<LogicalType> = values.iter().map(Value::logical_type).collect();
+        self.observe_types(values.iter().map(Value::logical_type).collect(), plan)
+    }
+    fn observe_types(&mut self, types: Vec<LogicalType>, plan: &SortPlan) -> Result<()> {
         if self.seen.contains(&types) { return Ok(()); }
-        let bound = values.iter().try_fold(type_bytes(&self.values)?, |sum, value| sum.checked_add(value.retained_bytes()?).ok_or_else(size_error))?;
+        let bound = type_bytes(&self.values)?.checked_add(type_bytes(&types)?).ok_or_else(size_error)?;
         let _temporary = plan.execution.context.memory.reserve(bound.checked_mul(16).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?)?;
         let values = self.values.iter().zip(&types).map(|(ty, value)| ty.join(value)).collect();
         let mut seen = std::mem::take(&mut self.seen);

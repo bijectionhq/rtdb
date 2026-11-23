@@ -121,9 +121,9 @@ pub(super) fn coerce(value: Value, schema: &ConnectSchema) -> Result<Value> {
     Ok(match (value, &schema.kind) {
         (Value::I32(value), SchemaKind::I8) => Value::I8(value as i8), (Value::I32(value), SchemaKind::I16) => Value::I16(value as i16),
         (Value::Struct(mut values), SchemaKind::Struct(fields)) => { for field in fields { if let Some(value) = values.remove(&field.name) { values.insert(field.name.clone(), coerce(value, &field.schema)?); } } Value::Struct(values) }
-        (Value::List(values), SchemaKind::Array(element)) => Value::List(values.into_iter().map(|value| coerce(value, element)).collect::<Result<_>>()?),
+        (Value::List(values), SchemaKind::Array(element)) => Value::list(values.into_values().into_iter().map(|value| coerce(value, element)).collect::<Result<_>>()?),
         (Value::Map { entries, sorted }, SchemaKind::Map(key, value)) => Value::Map { entries: entries.into_iter().map(|(k, v)| Ok((coerce(k, key)?, coerce(v, value)?))).collect::<Result<_>>()?, sorted },
-        (Value::List(values), SchemaKind::Map(key, value)) => Value::Map { entries: values.into_iter().map(|entry| {
+        (Value::List(values), SchemaKind::Map(key, value)) => Value::Map { entries: values.into_values().into_iter().map(|entry| {
             let Value::Struct(mut fields) = entry else { return Err(error("avro-decode", "MapEntry value is not a record")); };
             Ok((coerce(fields.remove("key").ok_or_else(|| error("avro-decode", "MapEntry key is absent"))?, key)?, coerce(fields.remove("value").ok_or_else(|| error("avro-decode", "MapEntry value is absent"))?, value)?))
         }).collect::<Result<_>>()?, sorted: false },
@@ -159,7 +159,7 @@ fn default_value(value: &Json, schema: &ConnectSchema, field_default: bool) -> R
     Ok(match &schema.kind {
         SchemaKind::Bool => Value::Bool(value.as_bool().unwrap_or(false)), SchemaKind::I8 => Value::I8(integer() as i8), SchemaKind::I16 => Value::I16(integer() as i16), SchemaKind::I32 => Value::I32(integer() as i32), SchemaKind::I64 => Value::I64(integer()), SchemaKind::F32 => Value::F32(value.as_f64().unwrap_or(0.0) as f32), SchemaKind::F64 => Value::F64(value.as_f64().unwrap_or(0.0)),
         SchemaKind::String => Value::Utf8(value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())), SchemaKind::Bytes => Value::Binary(bytes()?),
-        SchemaKind::Array(element) => Value::List(value.as_array().ok_or_else(|| error("avro-schema", "Array default is not an array"))?.iter().map(|value| default_value(value, element, field_default)).collect::<Result<_>>()?),
+        SchemaKind::Array(element) => Value::list(value.as_array().ok_or_else(|| error("avro-schema", "Array default is not an array"))?.iter().map(|value| default_value(value, element, field_default)).collect::<Result<_>>()?),
         SchemaKind::Map(_, element) => Value::Map { entries: value.as_object().ok_or_else(|| error("avro-schema", "Map default is not an object"))?.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), default_value(value, element, field_default)?))).collect::<Result<_>>()?, sorted: false },
         SchemaKind::Struct(fields) => {
             let object = value.as_object().ok_or_else(|| error("avro-schema", "Record default is not an object"))?;
@@ -193,7 +193,7 @@ pub(super) fn raw_default_value(value: &super::default_json::DefaultJson, schema
         SchemaKind::I8 => Value::I8(value.int_value().unwrap_or(0) as i8), SchemaKind::I16 => Value::I16(value.int_value().unwrap_or(0) as i16), SchemaKind::I32 => Value::I32(value.int_value().unwrap_or(0)), SchemaKind::I64 => Value::I64(integer()),
         SchemaKind::F32 => Value::F32(value.double_value().unwrap_or(0.0) as f32), SchemaKind::F64 => Value::F64(value.double_value().unwrap_or(0.0)),
         SchemaKind::String => Value::Utf8(value.as_str().map(str::to_owned).ok_or_else(|| error("avro-schema", "String default is not textual"))?), SchemaKind::Bytes => Value::Binary(bytes()?),
-        SchemaKind::Array(element) => Value::List(value.as_array().ok_or_else(|| error("avro-schema", "Array default is not an array"))?.iter().map(|value| raw_default_value(value, element, field_default)).collect::<Result<_>>()?),
+        SchemaKind::Array(element) => Value::list(value.as_array().ok_or_else(|| error("avro-schema", "Array default is not an array"))?.iter().map(|value| raw_default_value(value, element, field_default)).collect::<Result<_>>()?),
         SchemaKind::Map(_, element) => Value::Map { entries: value.as_object().ok_or_else(|| error("avro-schema", "Map default is not an object"))?.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), raw_default_value(value, element, field_default)?))).collect::<Result<_>>()?, sorted: false },
         SchemaKind::Struct(fields) => {
             value.as_object().ok_or_else(|| error("avro-schema", "Record default is not an object"))?;
@@ -253,7 +253,8 @@ mod tests {
             assert_eq!(value.to_bits(),bits);
             let array=plan.connect.field("array").unwrap().schema;
             let Value::List(values)=array.default.as_ref().unwrap() else { panic!("expected Array default") };
-            let Value::F32(value)=&values[0] else { panic!("expected Float element") };
+            let item=values.get(0).unwrap();
+            let Value::F32(value)=item.as_ref() else { panic!("expected Float element") };
             assert_eq!(value.to_bits(),bits);
             let map=plan.connect.field("map").unwrap().schema;
             let Value::Map {entries,..}=map.default.as_ref().unwrap() else { panic!("expected Map default") };

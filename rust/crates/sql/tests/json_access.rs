@@ -28,7 +28,7 @@ fn object() -> V {
     V::Struct(StructFields::from([
         ("age".into(),V::I64(25)),("name".into(),V::Utf8("Alice".into())),("Camel".into(),V::I64(7)),
         ("nested".into(),V::Struct(StructFields::from([("inner".into(),V::I64(42))]))),
-        ("items".into(),V::List(vec![V::I64(10),V::Struct(StructFields::from([("answer".into(),V::I64(42))]))])),
+        ("items".into(),V::list(vec![V::I64(10),V::Struct(StructFields::from([("answer".into(),V::I64(42))]))])),
     ]))
 }
 

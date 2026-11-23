@@ -275,7 +275,10 @@ pub(crate) fn int_cells(array: &dyn Array) -> Option<Vec<Option<i64>>> {
 fn gathered(batches: &[ColumnBatch], position: usize, pairs: &[(usize, usize)]) -> Result<Column> {
     let arrow = batches.iter().map(|batch| match &batch.columns[position] { Column::Arrow { array, field, logical } => Some((array, field, logical)), Column::Values(_) => None }).collect::<Option<Vec<_>>>();
     if let Some(arrow) = arrow && let Some((_, field, logical)) = arrow.first()
-        && crate::columnar::flat(field.data_type()) && arrow.iter().all(|(_, other, other_logical)| other == field && other_logical == logical) {
+        && arrow.iter().all(|(array, other, other_logical)| {
+            other == field && other_logical == logical
+                && (crate::columnar::flat(other.data_type()) || crate::columnar::dense_float_list(array.as_ref()))
+        }) {
         let arrays: Vec<&dyn Array> = arrow.iter().map(|(array, ..)| array.as_ref()).collect();
         let array = crate::columnar::interleave(&arrays, pairs)?;
         return Ok(Column::Arrow { array, field: Arc::clone(field), logical: (*logical).clone() });
@@ -286,7 +289,8 @@ fn gathered(batches: &[ColumnBatch], position: usize, pairs: &[(usize, usize)]) 
 /// A probe column at the probe rows that matched, in match order.
 fn taken(column: &Column, indices: &UInt32Array) -> Result<Column> {
     match column {
-        Column::Arrow { array, field, logical } if crate::columnar::flat(field.data_type()) =>
+        Column::Arrow { array, field, logical }
+            if crate::columnar::flat(field.data_type()) || crate::columnar::dense_float_list(array.as_ref()) =>
             Ok(Column::Arrow { array: arrow_select::take::take(array.as_ref(), indices, None).map_err(|error| invalid("join-gather", error))?, field: Arc::clone(field), logical: logical.clone() }),
         column => indices.values().iter().map(|row| column.value(*row as usize)).collect::<Result<Vec<_>>>().map(Column::Values),
     }

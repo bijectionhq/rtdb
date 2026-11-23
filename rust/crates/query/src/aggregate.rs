@@ -510,7 +510,7 @@ impl AggregateColumn {
                             scope.reserve(value.retained_bytes()?)?;
                             values.push(if matches!(value,Value::Undefined) { Value::Null } else { value.clone() });
                         }
-                        if values.is_empty() && (aggregate.function == AggregateFunction::ArrayAgg || present) { Value::Null } else { Value::List(values) }
+                        if values.is_empty() && (aggregate.function == AggregateFunction::ArrayAgg || present) { Value::Null } else { Value::list(values) }
                     };
                     row.replace_value(column,value,&execution.context.memory)?;
                 }

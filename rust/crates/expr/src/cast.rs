@@ -308,11 +308,11 @@ pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str
             }
             let parsed;
             let values = match value {
-                Value::List(values) | Value::FixedSizeList(values) => values,
-                Value::Utf8(text) => { parsed = pg_array_text(text)?; &parsed }
+                Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(),
+                Value::Utf8(text) => { parsed = pg_array_text(text)?; rtdb_types::ListView::Values(&parsed) }
                 _ => return Err(inapplicable("list", &[value])),
             };
-            Ok(Value::List(values.iter().map(|value| cast_target(value, element, timezone)).collect::<Result<_>>()?))
+            Ok(Value::list(values.iter().map(|value| cast_target(value.as_ref(), element, timezone)).collect::<Result<_>>()?))
         }
     }
 }

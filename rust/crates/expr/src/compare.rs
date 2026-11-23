@@ -9,7 +9,7 @@ pub(crate) fn nullish(value: &Value) -> bool { matches!(value, Value::Null | Val
 fn contains_set(value: &Value) -> bool {
     match value {
         Value::Set(_) => true,
-        Value::List(values) => values.iter().any(contains_set),
+        Value::List(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(contains_set)),
         Value::Struct(fields) => fields.values().any(contains_set),
         _ => false,
     }
@@ -33,7 +33,13 @@ fn validate_equality_values(left: &Value, right: &Value) -> Result<()> {
         use rtdb_types::{ListKind, LogicalType as T};
         match value {
             Value::Set(_) => T::List { kind: ListKind::Set, element: Box::new(T::Nothing) },
-            Value::List(values) => T::list(match values.as_slice() { [] => T::Nothing,[value] => shape(value),_ => T::join_all(&values.iter().map(shape).collect::<Vec<_>>()) }),
+            Value::List(values) => T::list(match values.view() {
+                rtdb_types::ListView::Values([]) => T::Nothing,
+                rtdb_types::ListView::Values([value]) => shape(value),
+                rtdb_types::ListView::Values(values) => T::join_all(&values.iter().map(shape).collect::<Vec<_>>()),
+                view if view.is_empty() => T::Nothing,
+                _ => T::Null,
+            }),
             Value::Struct(fields) => T::Struct(fields.iter().map(|(name, value)| (name.clone(), shape(value))).collect()),
             _ => T::Null,
         }
@@ -71,10 +77,11 @@ pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str, allocati
     }
     if let (Some(left), Some(right)) = (number(left), number(right)) { return Ok(Some(left == right)); }
     match (left, right) {
-        (Value::List(left), Value::List(right)) | (Value::FixedSizeList(left), Value::FixedSizeList(right)) => {
+        (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) => {
+            let (left, right) = (left.list_view().unwrap(), right.list_view().unwrap());
             if left.len() != right.len() { return Ok(Some(false)); }
             let mut unknown = false;
-            for (a, b) in left.iter().zip(right) { match sql_eq_value(a, b, timezone, allocation)? { Some(false) => return Ok(Some(false)), None => unknown = true, _ => () } }
+            for (a, b) in left.iter().zip(right.iter()) { match sql_eq_value(a.as_ref(), b.as_ref(), timezone, allocation)? { Some(false) => return Ok(Some(false)), None => unknown = true, _ => () } }
             Ok(if unknown { None } else { Some(true) })
         }
         (Value::Struct(left), Value::Struct(right)) => {
@@ -194,9 +201,10 @@ pub(crate) fn strict_eq_scoped(left: &Value, right: &Value, allocation: Option<&
         return Ok(category(left) == category(right) && sql_eq_scoped(left, right, "UTC", allocation)? == Some(true));
     }
     match (left, right) {
-        (Value::List(a), Value::List(b)) | (Value::FixedSizeList(a), Value::FixedSizeList(b)) => {
+        (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) => {
+            let (a, b) = (left.list_view().unwrap(), right.list_view().unwrap());
             if a.len() != b.len() { return Ok(false); }
-            for (a, b) in a.iter().zip(b) { if !strict_eq_scoped(a, b, allocation)? { return Ok(false); } }
+            for (a, b) in a.iter().zip(b.iter()) { if !strict_eq_scoped(a.as_ref(), b.as_ref(), allocation)? { return Ok(false); } }
             Ok(true)
         }
         (Value::Struct(a), Value::Struct(b)) => {
@@ -290,8 +298,9 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
         _ if date_time(left) && date_time(right) => temporal_order(left, right, timezone),
         (Value::Duration { .. }, Value::Duration { .. }) | (Value::Time { .. }, Value::Time { .. }) => temporal_order(left, right, timezone),
-        (Value::List(a), Value::List(b)) | (Value::FixedSizeList(a), Value::FixedSizeList(b)) => {
-            for (a, b) in a.iter().zip(b) { let order = compare_in_timezone(a, b, nulls_first, timezone)?; if order != Ordering::Equal { return Ok(order); } }
+        (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) => {
+            let (a, b) = (left.list_view().unwrap(), right.list_view().unwrap());
+            for (a, b) in a.iter().zip(b.iter()) { let order = compare_in_timezone(a.as_ref(), b.as_ref(), nulls_first, timezone)?; if order != Ordering::Equal { return Ok(order); } }
             Ok(a.len().cmp(&b.len()))
         }
         _ => match (IntervalParts::of(left), IntervalParts::of(right)) {

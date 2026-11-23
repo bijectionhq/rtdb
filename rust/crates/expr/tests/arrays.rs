@@ -32,20 +32,20 @@ fn array_bounds_use_one_dimension_and_empty_arrays_keep_lower_bound_one() {
 #[test]
 fn trim_preserves_elements_and_reports_overtrimmed_length() {
     for (amount, expected) in [(0, vec![V::I64(42), V::I64(43)]), (1, vec![V::I64(42)]), (2, vec![])] {
-        assert_eq!(run(&trim(list(), amount)).unwrap(), V::List(expected.clone()));
-        assert_eq!(scalar_call("trim_array", &[V::List(vec![V::I64(42), V::I64(43)]), V::I64(amount)], &EvalContext::default()).unwrap(), V::List(expected));
+        assert_eq!(run(&trim(list(), amount)).unwrap(), V::list(expected.clone()));
+        assert_eq!(scalar_call("trim_array", &[V::list(vec![V::I64(42), V::I64(43)]), V::I64(amount)], &EvalContext::default()).unwrap(), V::list(expected));
     }
     let error = run(&trim(list(), 3)).unwrap_err();
     assert_eq!(error.code, "xtdb.expression/array-element-error");
     assert_eq!(error.message.as_deref(), Some("Data exception - array element error."));
     assert_eq!(error.context["nlen"], serde_json::json!(-1));
-    assert_eq!(run(&trim(Expr::List(vec![]), 0)).unwrap(), V::List(vec![]));
+    assert_eq!(run(&trim(Expr::List(vec![]), 0)).unwrap(), V::list(vec![]));
 }
 
 #[test]
 fn trim_and_bounds_keep_unread_cells_and_null_arguments_lazy() {
     let input = Expr::List(vec![count(7), Expr::Literal(V::calendar_date(CivilDate::MAX, DateUnit::Day)), sleep(-1)]);
-    assert_eq!(run(&trim(input.clone(), 2)).unwrap(), V::List(vec![V::I64(7)]));
+    assert_eq!(run(&trim(input.clone(), 2)).unwrap(), V::list(vec![V::I64(7)]));
     for name in ["array_upper", "array_length"] {
         assert_eq!(run(&call(name, vec![input.clone(), count(1)])).unwrap(), V::I32(3));
     }
@@ -55,7 +55,7 @@ fn trim_and_bounds_keep_unread_cells_and_null_arguments_lazy() {
         assert_eq!(run(&call(name, vec![list(), Expr::Literal(V::Null)])).unwrap(), V::Null);
     }
     let input = Expr::Cast { expr: Box::new(Expr::List(vec![Expr::Literal(V::Utf8("8".into())), Expr::Literal(V::Utf8("invalid".into()))])), target: CastTarget::List(Box::new(CastTarget::Fixed(L::Scalar(S::I64)))) };
-    assert_eq!(run(&trim(input, 1)).unwrap(), V::List(vec![V::I64(8)]));
+    assert_eq!(run(&trim(input, 1)).unwrap(), V::list(vec![V::I64(8)]));
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn array_dispatch_preserves_the_pinned_signed_integer_and_list_matrix() {
 #[tokio::test(start_paused = true)]
 async fn trimmed_sleep_is_unstarted_and_selected_sleep_cancellation_releases_memory() {
     let start = tokio::time::Instant::now();
-    assert_eq!(evaluate_async(&trim(Expr::List(vec![count(7), sleep(i64::MAX)]), 1), &Schema::default(), &[], &EvalContext::default()).await.unwrap(), V::List(vec![V::I64(7)]));
+    assert_eq!(evaluate_async(&trim(Expr::List(vec![count(7), sleep(i64::MAX)]), 1), &Schema::default(), &[], &EvalContext::default()).await.unwrap(), V::list(vec![V::I64(7)]));
     assert_eq!(tokio::time::Instant::now(), start);
     let memory = MemoryBudget::new(1 << 20);
     {

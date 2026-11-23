@@ -134,7 +134,7 @@ fn replacing_outer_run_end_width_retains_nested_layouts_and_nullability() {
 fn absent_contribution_depends_on_whether_a_segment_contains_puts() {
     assert_eq!(T::absent_contribution(false), T::Nothing);
     assert_eq!(T::absent_contribution(true), T::Null);
-    assert_eq!(Value::List(vec![]).logical_type(), T::list(T::Nothing));
+    assert_eq!(Value::list(vec![]).logical_type(), T::list(T::Nothing));
 }
 
 #[test]

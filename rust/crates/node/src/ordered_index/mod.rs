@@ -109,7 +109,7 @@ async fn definitions(
             definitions.push(Definition {
                 name: text(cell(0)?)?,
                 table: TableRef::new(text(cell(1)?)?, text(cell(2)?)?),
-                columns: columns.into_iter().map(text).collect::<Result<_>>()?,
+                columns: columns.into_values().into_iter().map(text).collect::<Result<_>>()?,
                 version,
             });
         }

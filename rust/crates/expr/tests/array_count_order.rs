@@ -28,7 +28,7 @@ fn trim_observes_input_size_before_inline_arithmetic_and_cast_payloads() {
     }
     assert_eq!(run(&trim(Expr::List(vec![]),divide())).unwrap_err().code,"xtdb.expression/division-by-zero");
     let cast = Expr::Cast { expr: Box::new(Expr::Literal(V::Utf8("bad-array".into()))),target: CastTarget::List(Box::new(CastTarget::Fixed(L::Scalar(S::I64)))) };
-    assert_eq!(run(&trim(Expr::List(vec![literal(7)]),call("array_lower",vec![cast,literal(1)]))).unwrap(),V::List(vec![]));
+    assert_eq!(run(&trim(Expr::List(vec![literal(7)]),call("array_lower",vec![cast,literal(1)]))).unwrap(),V::list(vec![]));
 }
 
 #[test]
@@ -101,7 +101,7 @@ async fn cancellation_releases_prepared_count_payloads_and_allocation_failure_is
 fn unregistered_type_predicates_shortcut_null_before_count_control() {
     for name in ["boolean?","number?","integer?","float?","string?","keyword?","uuid?","list?","set?","map?"] {
         let condition = Expr::Coalesce(vec![call(name,vec![nil()]),yes()]);
-        assert_eq!(run(&trim(Expr::List(vec![literal(7)]),choose(condition,literal(0),literal(1)))).unwrap(),V::List(vec![V::I64(7)]),"{name}");
+        assert_eq!(run(&trim(Expr::List(vec![literal(7)]),choose(condition,literal(0),literal(1)))).unwrap(),V::list(vec![V::I64(7)]),"{name}");
         assert_eq!(rtdb_plan::function_type_with_args(name,&[divide()]).unwrap_err().code,"xtdb.expression/function-type-mismatch","{name}");
     }
 }

@@ -31,7 +31,7 @@ async fn untyped_sort_parameters_validate_populated_values_even_for_singletons()
     for count in [0, 1] {
         let input = integers(count);
         let relation = Arc::new(Relation::new(input.schema().clone(), RelationNode::Sort { input, order_by: vec![SortExpr { expr: Expr::Parameter { index: 0, data_type: LogicalType::Nothing }, descending: false, nulls_first: false }] }).unwrap());
-        let mut cursor = PreparedQuery::new(relation).unwrap().execute(context(1 << 20), vec![Value::List(vec![Value::I64(1)])]).await.unwrap();
+        let mut cursor = PreparedQuery::new(relation).unwrap().execute(context(1 << 20), vec![Value::list(vec![Value::I64(1)])]).await.unwrap();
         if count == 0 { assert!(cursor.next_batch().await.unwrap().is_none()); }
         else { assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/function-type-mismatch"); }
     }

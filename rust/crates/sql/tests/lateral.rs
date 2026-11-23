@@ -17,17 +17,17 @@ fn context() -> Arc<QueryContext> {
         ("x", vec![vec![("_id", Value::I64(1)), ("x", Value::I64(1)), ("y", Value::I64(1))]]),
         ("z", vec![vec![("_id", Value::I64(1)), ("x", Value::I64(1)), ("z", Value::I64(1))]]),
         ("y", vec![vec![("_id", Value::I64(1)), ("b", Value::Utf8("one".into()))]]),
-        ("nested_table", vec![vec![("_id", Value::I64(1)), ("nest", Value::List(vec![Value::I64(1), Value::I64(2), Value::I64(3)]))]]),
+        ("nested_table", vec![vec![("_id", Value::I64(1)), ("nest", Value::list(vec![Value::I64(1), Value::I64(2), Value::I64(3)]))]]),
         ("other_table", (1..=3).map(|id| vec![("_id", Value::I64(id))]).collect()),
         ("actors", [
             ("bob", "Bob", vec!["The Great Escape", "Bob the Builder", "Bob the Builder Electric Boogaloo"]),
             ("steve", "Steve", vec!["Hot Fuzz", "Shaun of the Dead"]),
         ].into_iter().map(|(id, name, films)| vec![
             ("_id", Value::Utf8(id.into())), ("name", Value::Utf8(name.into())),
-            ("films", Value::List(films.into_iter().map(|film| Value::Utf8(film.into())).collect())),
+            ("films", Value::list(films.into_iter().map(|film| Value::Utf8(film.into())).collect())),
         ]).collect()),
-        ("docs", vec![vec![("_id", Value::I64(1)), ("xs", Value::List(vec![Value::I64(2)])), ("ys", Value::List(vec![Value::I64(3)]))]]),
-        ("foo", vec![vec![("_id", Value::I64(1)), ("vs", Value::List((1..=2).map(|i| Value::Struct(StructFields::from([
+        ("docs", vec![vec![("_id", Value::I64(1)), ("xs", Value::list(vec![Value::I64(2)])), ("ys", Value::list(vec![Value::I64(3)]))]]),
+        ("foo", vec![vec![("_id", Value::I64(1)), ("vs", Value::list((1..=2).map(|i| Value::Struct(StructFields::from([
             ("t".into(), Value::I64(i)), ("v".into(), Value::I64(i)),
         ]))).collect()))]]),
     ] {
@@ -71,7 +71,7 @@ async fn select_star_lateral_join_and_lateral_with_unnest_4009_keep_aliases_and_
     assert_eq!(query("FROM UNNEST(ARRAY[1,2]) AS u(v)", vec![]).await.unwrap(), vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
     assert_eq!(query("SELECT FROM (VALUES (1),(2)) AS t(v)", vec![]).await.unwrap(), vec![vec![],vec![]]);
     assert_eq!(query("SELECT * FROM (SELECT y.b FROM y) AS x (x_b), LATERAL (SELECT y.b AS z_b, x_b FROM y) AS z (z_b, outer_b)", vec![]).await.unwrap(), vec![vec![Value::Utf8("one".into()), Value::Utf8("one".into()), Value::Utf8("one".into())]]);
-    let array = Value::List(vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
+    let array = Value::list(vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
     assert_eq!(query("SELECT * FROM nested_table nt, LATERAL (SELECT nt.nest) t(a)", vec![]).await.unwrap(), vec![vec![Value::I64(1), array.clone(), array.clone()]]);
     assert_eq!(query("SELECT * FROM nested_table nt, LATERAL (FROM UNNEST(nt.nest) AS foo(id)) t(a)", vec![]).await.unwrap(), (1..=3).map(|id| vec![Value::I64(1), array.clone(), Value::I64(id)]).collect::<Vec<_>>());
     assert_eq!(query("SELECT nt._id, value, ordinal FROM nested_table nt, UNNEST(nt.nest) WITH ORDINALITY AS items(value, ordinal)", vec![]).await.unwrap(), (1..=3).map(|id| vec![Value::I64(1), Value::I64(id), Value::I32(id as i32)]).collect::<Vec<_>>());

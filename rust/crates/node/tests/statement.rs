@@ -238,7 +238,7 @@ async fn typed_unsigned_nulls_and_empty_lists_keep_opened_vector_fields() {
     let statement = PreparedSql::prepare("SELECT $1 AS value", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
     for (ty, value, expected) in [
         (LogicalType::Scalar(ScalarType::U64).maybe(), Value::Null, LogicalType::Scalar(ScalarType::I64).maybe()),
-        (LogicalType::list(LogicalType::Scalar(ScalarType::U8)), Value::List(vec![]), LogicalType::list(LogicalType::Scalar(ScalarType::I8))),
+        (LogicalType::list(LogicalType::Scalar(ScalarType::U8)), Value::list(vec![]), LogicalType::list(LogicalType::Scalar(ScalarType::I8))),
     ] {
         assert_eq!(statement.result_schema(&context, std::slice::from_ref(&ty)).unwrap().schema().fields()[0].data_type, ty);
         let mut cursor = statement.open_query_typed(Arc::clone(&context), vec![value.clone()], &[ty]).await.unwrap();
@@ -440,7 +440,7 @@ async fn postgres_value_dependent_parameter_publishes_default_then_rebinds_unnes
     let context = context(None, &memory);
     let statement = PreparedSql::prepare_postgres("SELECT * FROM UNNEST($1) AS items(value)", &context, vec!["public".into()], &[114]).unwrap();
     assert_eq!(statement.postgres_types().unwrap(), &[PgType::Default]);
-    let mut cursor = statement.open_query(context, vec![Value::List(vec![Value::I64(1)])]).await.unwrap();
+    let mut cursor = statement.open_query(context, vec![Value::list(vec![Value::I64(1)])]).await.unwrap();
     assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
 }
 
@@ -456,7 +456,7 @@ async fn prepared_series_uses_the_nodes_captured_endpoint_policy() {
         let mut cursor = statement.open_query(context,vec![]).await.unwrap();
         let page = cursor.next_batch().await.unwrap().unwrap();
         let value = read_value(page.batch().schema().field(0),page.batch().column(0).as_ref(),0).unwrap();
-        assert_eq!(value,Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
+        assert_eq!(value,Value::list((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
 }
 
@@ -816,13 +816,13 @@ fn a_thousand_unpushable_conjuncts_plan_and_run_on_a_worker_stack() {
 async fn a_list_holding_a_null_among_mixed_types_reads_back_through_every_valid_time() {
     let memory = MemoryBudget::new(1 << 26);
     let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
-    write(&state, 1, Value::List(vec![Value::Bool(false), Value::Null, Value::I64(0)]), &memory);
+    write(&state, 1, Value::list(vec![Value::Bool(false), Value::Null, Value::I64(0)]), &memory);
     let context = context(Some(&state), &memory);
     let statement = PreparedSql::prepare("SELECT v FROM docs FOR VALID_TIME ALL", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
     let mut cursor = statement.open_query(Arc::clone(&context), vec![]).await.unwrap();
     let batch = cursor.next_batch().await.unwrap().unwrap();
     let field = batch.batch().schema().field(0).clone();
-    assert_eq!(read_value(&field, batch.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![Value::Bool(false), Value::Null, Value::I64(0)]));
+    assert_eq!(read_value(&field, batch.batch().column(0).as_ref(), 0).unwrap(), Value::list(vec![Value::Bool(false), Value::Null, Value::I64(0)]));
 }
 
 #[tokio::test]

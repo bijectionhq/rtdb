@@ -31,10 +31,12 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             return Ok(Value::I32(if name == "array_lower" { 1 } else { i32::try_from(items.len()).map_err(|_| overflow())? }));
         }
         let size = view_size(trim_size(items.len(), count)?)?;
-        let items = items.get(..size).ok_or_else(|| Anomaly::incorrect("xtdb/invalid-argument-types", "nth is not applicable to these collection values"))?;
-        context.reserve(items.iter().try_fold(size.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?, |bytes, item| bytes.checked_add(item.retained_bytes()?).ok_or_else(overflow))?)?;
+        if size > items.len() { return Err(Anomaly::incorrect("xtdb/invalid-argument-types", "nth is not applicable to these collection values")); }
+        if let Some(list) = items.slice_packed(0, size) { return Ok(Value::List(list)); }
+        let items = items.iter().take(size);
+        context.reserve(items.clone().try_fold(size.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?, |bytes, item| bytes.checked_add(item.retained_bytes()?).ok_or_else(overflow))?)?;
         let mut result = Vec::with_capacity(size);
-        for item in items { let mut item = item.clone();item.admit_box_date()?;result.push(item); }
-        Ok(Value::List(result))
+        for item in items { let mut item = item.into_owned();item.admit_box_date()?;result.push(item); }
+        Ok(Value::list(result))
     })())
 }

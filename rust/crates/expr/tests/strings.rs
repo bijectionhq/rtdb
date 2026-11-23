@@ -5,7 +5,7 @@ use rtdb_types::{LogicalType as L, ScalarType as S, Value as V};
 
 fn text(value: &str) -> V { V::Utf8(value.into()) }
 fn call(name: &str, values: &[V]) -> V { scalar_call(name, values, &EvalContext::default()).unwrap() }
-fn list(values: &[&str]) -> V { V::List(values.iter().map(|value| text(value)).collect()) }
+fn list(values: &[&str]) -> V { V::list(values.iter().map(|value| text(value)).collect()) }
 
 #[test]
 fn batch_execution_compiles_opened_fields_and_admits_unsigned_cells_and_parameters() {
@@ -60,11 +60,11 @@ fn test_cast_any_to_text_retains_original_collections_binary_and_uri_assertions(
     let object = |fields: &[(&str, V)]| V::Struct(fields.iter().map(|(key, value)| ((*key).into(), value.clone())).collect());
     for (value, expected) in [
         (V::I64(42), "42"), (V::F64(3.14), "3.14"), (V::Bool(true), "true"), (text("hello"), "hello"),
-        (V::List(vec![V::I64(1), V::I64(2), V::I64(3)]), "[1 2 3]"),
+        (V::list(vec![V::I64(1), V::I64(2), V::I64(3)]), "[1 2 3]"),
         (list(&["a", "b"]), "[\"a\" \"b\"]"),
         (object(&[("a", V::I64(1))]), "{\"a\" 1}"),
         (object(&[("x", text("hello")), ("y", V::I64(42))]), "{\"x\" \"hello\", \"y\" 42}"),
-        (object(&[("arr", V::List(vec![V::I64(1), V::I64(2)])), ("obj", object(&[("z", V::I64(3))]))]), "{\"arr\" [1 2], \"obj\" {\"z\" 3}}"),
+        (object(&[("arr", V::list(vec![V::I64(1), V::I64(2)])), ("obj", object(&[("z", V::I64(3))]))]), "{\"arr\" [1 2], \"obj\" {\"z\" 3}}"),
         (V::Set(vec![V::I64(1), V::I64(2), V::I64(3)]), "[1 2 3]"),
         (V::Uri("https://example.org/".into()), "https://example.org/"),
         (V::Binary(vec![0xde, 0xad, 0xbe, 0xef]), "\\xdeadbeef"),
@@ -78,7 +78,7 @@ fn test_cast_any_to_text_retains_original_collections_binary_and_uri_assertions(
 fn reader_text_keeps_nested_extension_and_transit_forms() {
     let decimal = V::Decimal(rtdb_types::DecimalValue::new(123i128.to_be_bytes().to_vec(), 3, 2, 128).unwrap());
     assert_eq!(call("str", &[decimal.clone()]), text("1.23"));
-    assert_eq!(call("str", &[V::List(vec![decimal, V::Keyword(rtdb_types::Keyword::from_name("foo/bar")), V::Uuid([0; 16]), V::Uri("https://example.org/é".into())])]),
+    assert_eq!(call("str", &[V::list(vec![decimal, V::Keyword(rtdb_types::Keyword::from_name("foo/bar")), V::Uuid([0; 16]), V::Uri("https://example.org/é".into())])]),
         text("[1.23M \"foo/bar\" #bytes \"00000000000000000000000000000000\" #xt/uri \"https://example.org/%C3%A9\"]"));
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     let value = V::Transit(encode_msgpack(&T::Array(vec![T::Keyword("x".into()), T::String("hello".into())])).unwrap());
@@ -92,7 +92,7 @@ fn temporal_text_casts_keep_java_spelling_and_format_reads_primitive_units() {
     use rtdb_types::TimeUnit as U;
     assert_eq!(call("str", &[V::DateMilli(-1)]), text("1970-01-01"));
     assert_eq!(call("str", &[V::DateMilli(-86_400_001)]), text("1969-12-31"));
-    assert_eq!(call("str", &[V::List(vec![V::DateMilli(-1)])]), text("[#time/date \"1970-01-01\"]"));
+    assert_eq!(call("str", &[V::list(vec![V::DateMilli(-1)])]), text("[#time/date \"1970-01-01\"]"));
     assert_eq!(call("str", &[V::Timestamp { value: 1, unit: U::Nanosecond, timezone: None }]), text("1970-01-01T00:00:00.000000001"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("UTC".into()) }]), text("1970-01-01T00:00Z[UTC]"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("+02:30".into()) }]), text("1970-01-01T02:30+02:30"));

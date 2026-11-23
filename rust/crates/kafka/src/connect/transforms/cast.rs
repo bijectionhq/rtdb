@@ -184,7 +184,7 @@ pub(super) fn mask(value: Value, replacement: Option<&str>) -> Result<Value> {
         Value::Bool(_) => Value::Bool(false), Value::I8(_) => Value::I8(0), Value::I16(_) => Value::I16(0), Value::I32(_) => Value::I32(0), Value::I64(_) => Value::I64(0), Value::F32(_) => Value::F32(0.0), Value::F64(_) => Value::F64(0.0), Value::Utf8(_) => Value::Utf8(String::new()),
         Value::DateDay(_) => Value::DateDay(0), Value::Time { unit, bit_width, .. } => Value::Time { value: 0, unit, bit_width }, Value::Timestamp { unit, timezone, .. } => Value::Timestamp { value: 0, unit, timezone },
         Value::Decimal(_) => Value::Decimal(rtdb_types::DecimalValue::new(vec![0;16], 32, 0, 128)?),
-        Value::List(_) => Value::List(Vec::new()), Value::Map { .. } => Value::Map { entries: Vec::new(), sorted: false },
+        Value::List(_) => Value::list(Vec::new()), Value::Map { .. } => Value::Map { entries: Vec::new(), sorted: false },
         _ => return Err(error("transform-error", "Input type has no Connect null mask")),
     })
 }

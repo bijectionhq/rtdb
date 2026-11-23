@@ -178,11 +178,11 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             Ok(if name == "namespace" { parts.map(|(namespace, _)| Value::Utf8(namespace.into())).unwrap_or(Value::Null) }
                 else { Value::Utf8(parts.map_or(keyword.as_str(), |(_, local)| local).into()) })
         }
-        "cardinality" => match &args[0] { Value::List(items) | Value::Set(items) | Value::FixedSizeList(items) => count(items.len()), _ => Err(inapplicable(&name, &[&args[0]])) },
+        "cardinality" => match &args[0] { Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => count(args[0].list_view().unwrap().len()), _ => Err(inapplicable(&name, &[&args[0]])) },
         "nth" => {
             let index = integer(&args[1]).ok_or_else(|| inapplicable(&name, &[&args[1]]))?;
-            let items = match &args[0] { Value::List(items) | Value::FixedSizeList(items) => items, _ => return Ok(Value::Null) };
-            let mut value = usize::try_from(index).ok().and_then(|index| items.get(index)).cloned().unwrap_or(Value::Null);
+            let items = match &args[0] { Value::List(_) | Value::FixedSizeList(_) => args[0].list_view().unwrap(), _ => return Ok(Value::Null) };
+            let mut value = usize::try_from(index).ok().and_then(|index| items.get(index)).map(std::borrow::Cow::into_owned).unwrap_or(Value::Null);
             value.admit_box_date()?;
             Ok(value)
         }

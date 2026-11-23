@@ -58,7 +58,7 @@ fn nested_union_list_and_struct_decimals_retain_independent_scales() {
     let (first_type, first) = decimal(128, i32::MIN); let (second_type, second) = decimal(128, i32::MAX);
     let union = LogicalType::from_legs([first_type, second_type, LogicalType::Null]);
     let ty = LogicalType::Struct(StructFields::from([("items".into(), LogicalType::List { kind: ListKind::List, element: Box::new(union) })]));
-    let values = vec![Value::Struct(StructFields::from([("items".into(), Value::List(vec![first, Value::Null, second]))]))];
+    let values = vec![Value::Struct(StructFields::from([("items".into(), Value::list(vec![first, Value::Null, second]))]))];
     let page = batch(&ty, &values);
     let bytes = ipc::write_stream(&page.schema(), &[page]).unwrap();
     check(&ipc::ArrowStream::open(bytes.into(), None).unwrap().next().unwrap().unwrap(), &ty, &values);

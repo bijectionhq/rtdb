@@ -77,7 +77,7 @@ fn into_destination(value: Value, source: &ConnectSchema, destination: &ConnectS
     }
     Ok(match (value, &source.kind, &destination.kind) {
         (value @ Value::Bool(_), _, SchemaKind::Bool) | (value @ Value::I8(_), _, SchemaKind::I8) | (value @ Value::I16(_), _, SchemaKind::I16) | (value @ Value::I32(_), _, SchemaKind::I32) | (value @ Value::I64(_), _, SchemaKind::I64) | (value @ Value::F32(_), _, SchemaKind::F32) | (value @ Value::F64(_), _, SchemaKind::F64) | (value @ Value::Utf8(_), _, SchemaKind::String) | (value @ Value::Binary(_), _, SchemaKind::Bytes) => value,
-        (Value::List(values), SchemaKind::Array(source), SchemaKind::Array(destination)) => Value::List(values.into_iter().map(|value| into_destination(value, source, destination, depth + 1)).collect::<Result<_>>()?),
+        (Value::List(values), SchemaKind::Array(source), SchemaKind::Array(destination)) => Value::list(values.into_values().into_iter().map(|value| into_destination(value, source, destination, depth + 1)).collect::<Result<_>>()?),
         (Value::Map { entries, sorted }, SchemaKind::Map(source_key, source_value), SchemaKind::Map(destination_key, destination_value)) => Value::Map { entries: entries.into_iter().map(|(key, value)| Ok((into_destination(key, source_key, destination_key, depth + 1)?, into_destination(value, source_value, destination_value, depth + 1)?))).collect::<Result<_>>()?, sorted },
         (value @ Value::Struct(_), SchemaKind::Struct(_), SchemaKind::Struct(_)) if same_schema(&source, &destination, &mut Default::default(), depth)? => value,
         _ => return Err(error("avro-decode", "Converted union value does not match its destination field")),

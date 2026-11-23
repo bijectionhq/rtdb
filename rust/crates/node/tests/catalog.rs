@@ -65,7 +65,7 @@ async fn information_schema_test_pg_namespace_has_reference_oids() {
 
 #[tokio::test]
 async fn information_schema_npgsql_get_schema_columns_query_joins_type_descriptors() {
-    let context = context(false, Some(StructFields::from([("_id".into(), Value::I64(1)), ("s".into(), Value::Utf8("a".into())), ("ints".into(), Value::List(vec![Value::I64(1), Value::I64(2)]))])));
+    let context = context(false, Some(StructFields::from([("_id".into(), Value::I64(1)), ("s".into(), Value::Utf8("a".into())), ("ints".into(), Value::list(vec![Value::I64(1), Value::I64(2)]))])));
     assert_eq!(query(&context, "SELECT column_name, format_type(typ.oid, NULL) AS data_type FROM information_schema.columns JOIN pg_namespace AS ns ON ns.nspname = udt_schema JOIN pg_type AS typ ON typ.typnamespace = ns.oid AND typname = udt_name WHERE table_name = 'docs' AND column_name NOT IN ('_system_from', '_system_to', '_valid_from', '_valid_to') ORDER BY column_name").await,
         vec![vec![Value::Utf8("_id".into()), Value::Utf8("bigint".into())], vec![Value::Utf8("ints".into()), Value::Utf8("bigint[]".into())], vec![Value::Utf8("s".into()), Value::Utf8("text".into())]]);
     assert_eq!(query(&context, "SELECT character_set_catalog, character_set_schema, collation_catalog FROM information_schema.columns WHERE table_name = 'docs' AND column_name = 's'").await, vec![vec![Value::Null, Value::Null, Value::Null]]);

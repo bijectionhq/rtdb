@@ -172,7 +172,7 @@ fn missing_members_and_nulls_do_not_become_boolean_false() {
     assert_eq!(sql_eq(&a, &b, &equality_scope()).unwrap(), Some(false));
     assert_eq!(sql_eq(&b, &b, &equality_scope()).unwrap(), None);
     assert!(!is_true(&V::Null).unwrap());
-    assert_eq!(sql_eq(&V::List(vec![V::I64(1), V::Null]), &V::List(vec![V::I64(1), V::Null]), &equality_scope()).unwrap(), None);
+    assert_eq!(sql_eq(&V::list(vec![V::I64(1), V::Null]), &V::list(vec![V::I64(1), V::Null]), &equality_scope()).unwrap(), None);
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn distinct_from_handles_outer_nulls_and_retains_compound_unknown_comparisons() 
 
 #[test]
 fn null_eq_keeps_reference_nonreflexive_nested_null_comparison() {
-    let value = V::Struct(StructFields::from([("nested".into(), V::List(vec![V::Null, V::I64(4)]))]));
+    let value = V::Struct(StructFields::from([("nested".into(), V::list(vec![V::Null, V::I64(4)]))]));
     assert_eq!(sql_eq(&value, &value, &equality_scope()).unwrap(), None);
     assert!(!null_eq(&value, &value, &equality_scope()).unwrap());
 }
@@ -247,7 +247,7 @@ fn scalar_comparisons_and_not_preserve_nonnullable_boolean_schemas() {
     assert_eq!(expr(B::And, V::Bool(true), V::Bool(false)).data_type(), boolean);
     assert_eq!(Expr::unary(rtdb_plan::UnaryOp::Not, Expr::Literal(V::Bool(true))).data_type(), boolean);
     assert_eq!(expr(B::Eq, V::Null, V::I64(2)).data_type(), boolean.clone().maybe());
-    assert_eq!(expr(B::Eq, V::List(vec![V::I64(1)]), V::List(vec![V::I64(1)])).data_type(), boolean.maybe());
+    assert_eq!(expr(B::Eq, V::list(vec![V::I64(1)]), V::list(vec![V::I64(1)])).data_type(), boolean.maybe());
 }
 
 #[test]

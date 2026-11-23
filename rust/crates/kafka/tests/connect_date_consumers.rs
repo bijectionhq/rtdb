@@ -345,13 +345,13 @@ impl Converter for NanDefaultsConverter {
             ConnectField { name: "when".into(), schema: scalar(SchemaKind::String, None) },
             ConnectField { name: "single".into(), schema: scalar(SchemaKind::F32, Some(single.clone())) },
             ConnectField { name: "double".into(), schema: scalar(SchemaKind::F64, Some(double.clone())) },
-            ConnectField { name: "array".into(), schema: scalar(SchemaKind::Array(Arc::clone(&f64_schema)), Some(Value::List(vec![double.clone()]))) },
+            ConnectField { name: "array".into(), schema: scalar(SchemaKind::Array(Arc::clone(&f64_schema)), Some(Value::list(vec![double.clone()]))) },
             ConnectField { name: "map".into(), schema: scalar(SchemaKind::Map(f64_schema, f32_schema), Some(Value::Map { entries, sorted: false })) },
             ConnectField { name: "nested".into(), schema: nested },
         ]));
         Ok(ConnectData { schema: Some(Arc::new(schema)), value: Value::Struct(StructFields::from([
             ("when".into(), Value::Utf8("1970".into())), ("single".into(), Value::F32(1.0)), ("double".into(), Value::F64(1.0)),
-            ("array".into(), Value::List(vec![Value::F64(1.0)])), ("map".into(), Value::Map { entries: vec![(Value::F64(1.0), Value::F32(1.0))], sorted: false }),
+            ("array".into(), Value::list(vec![Value::F64(1.0)])), ("map".into(), Value::Map { entries: vec![(Value::F64(1.0), Value::F32(1.0))], sorted: false }),
             ("nested".into(), Value::Struct(StructFields::from([("n".into(), Value::F64(1.0))]))),
         ])) })
     }

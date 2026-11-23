@@ -8,7 +8,7 @@ pub fn allocation_bound(value: &Value) -> Result<usize> {
     let extra = match value {
         Value::Uri(text) => rtdb_types::UriParts::parse(text)?.ascii_allocation_bound()?,
         Value::Transit(bytes) => bytes.len().checked_mul(bytes.len()).and_then(|bytes| bytes.checked_mul(16)).ok_or_else(overflow)?,
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
+        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => value.list_view().unwrap().iter().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value.as_ref())?).ok_or_else(overflow))?,
         Value::Struct(fields) => fields.values().try_fold(0usize, |bytes, value| bytes.checked_add(allocation_bound(value)?).ok_or_else(overflow))?,
         Value::Map { entries, .. } => entries.iter().try_fold(0usize, |bytes, (key, value)| bytes.checked_add(allocation_bound(key)?).and_then(|bytes| bytes.checked_add(allocation_bound(value).ok()?)).ok_or_else(overflow))?,
         _ => 0,
@@ -62,7 +62,7 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
         Value::Duration { value, unit } => tagged("time/duration", &crate::temporal_text::duration_text(nanos(*value, *unit))),
         value if IntervalParts::of(value).is_some() => tagged("xt/interval", &crate::temporal_text::interval_text(IntervalParts::of(value).ok_or_else(overflow)?)),
         Value::TimestampTzRange { lower, upper } => format!("[{} {}]", tagged("time/zoned-date-time", &timestamp(nanos(*lower, TimeUnit::Microsecond), Some("UTC"))?), tagged("time/zoned-date-time", &timestamp(nanos(*upper, TimeUnit::Microsecond), Some("UTC"))?)),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| reader(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) => format!("[{}]", value.list_view().unwrap().iter().map(|value| reader(value.as_ref(), depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
         Value::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, value)| Ok(format!("{} {}", quoted(name), reader(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", object(key, depth + 1)?, object(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Transit(bytes) => crate::transit_object::printed_text(bytes, Admission::Standalone)?,
@@ -75,7 +75,7 @@ fn object(value: &Value, depth: usize) -> Result<String> {
     Ok(match value {
         Value::Keyword(value) => value.to_string(), Value::Uuid(value) => tagged("uuid", &uuid::Uuid::from_bytes(*value).to_string()),
         Value::Set(values) => format!("#{{{}}}", values.iter().map(|value| object(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::List(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| object(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
+        Value::List(_) | Value::FixedSizeList(_) => format!("[{}]", value.list_view().unwrap().iter().map(|value| object(value.as_ref(), depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
         value => reader(value, depth)?,
     })
 }

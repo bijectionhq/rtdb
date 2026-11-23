@@ -256,7 +256,7 @@ fn literal(expression: &ast::Expr) -> Result<Value> {
             }
             match literal(expr)? { Value::I64(value) => value.checked_neg().map(Value::I64).ok_or_else(|| gap("Synthetic negation overflow")), Value::F64(value) => Ok(Value::F64(-value)), _ => Err(expression_data_error()) }
         }
-        ast::Expr::Array(array) => array.elem.iter().map(literal).collect::<Result<Vec<_>>>().map(Value::List),
+        ast::Expr::Array(array) => array.elem.iter().map(literal).collect::<Result<Vec<_>>>().map(Value::list),
         ast::Expr::Dictionary(fields) => fields.iter().map(|field| Ok((Identifier { text: field.key.value.clone(), quoted: field.key.quote_style.is_some() }.normalized(), literal(&field.value)?))).collect::<Result<StructFields<_>>>().map(Value::Struct),
         ast::Expr::TypedString(value) => {
             let data_type = match value.data_type.to_string().to_uppercase().as_str() {

@@ -210,7 +210,7 @@ impl PreparedQuery {
             *parameter = rtdb_expr::cast(parameter, &rtdb_columnar::execution_type(ty), &context.timezone)?;
         }
         let arrow = mask.iter().any(|keep| *keep).then_some(crate::parameters::PackedVectors { batch, mask });
-        rtdb_storage::IoRegion::retaining(context.clone(), self.open_retained(context, parameters, text, Batching::Rows, arrow)).await
+        rtdb_storage::IoRegion::retaining(context.clone(), self.open_retained(context, parameters, text, Batching::Columns, arrow)).await
     }
 
     async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
@@ -265,7 +265,8 @@ impl PreparedQuery {
         let cancellation = context.cancellation.clone();
         let owner = context.owner_cancellation.clone();
         let operators = Arc::clone(&runtime_schema);
-        let vector_projection = crate::cosine::in_projection(&self.relation);
+        let vector_projection = crate::cosine::in_projection(&self.relation)
+            || runtime_schema.schema().fields().iter().any(|field| crate::columnar::has_float_vector(&field.data_type));
         let input = owner.run_until_cancelled(cancellation.run_until_cancelled(async {
             match batching {
                 Batching::Pages if analysis.is_none() => crate::operators::build_pages(operators, execution).await.map(QueryInput::Pages),
@@ -459,7 +460,7 @@ mod vector_path_tests {
         let mut tx = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
         for (id, values) in [(1, [0.0, 1.0]), (2, [1.0, 0.0])] {
             let doc = StructFields::from([("_id".into(), Value::I64(id)),
-                ("embedding".into(), Value::FixedSizeList(values.map(Value::F32).to_vec()))]);
+                ("embedding".into(), Value::FixedSizeList(values.map(Value::F32).to_vec().into()))]);
             tx.put(table.clone(), doc, Interval::ALL).unwrap();
         }
         state.apply(&tx.stage().unwrap()).unwrap();

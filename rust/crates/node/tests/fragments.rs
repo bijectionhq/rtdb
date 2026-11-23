@@ -82,7 +82,7 @@ fn order(id: i64) -> StructFields<Value> {
     let mut document = StructFields::from([("_id".to_owned(), Value::I64(id)), ("note".to_owned(), Value::Utf8(format!("order {id}")))]);
     if id % 11 != 0 { document.insert("total".to_owned(), Value::I64(id)); }
     if id % 5 == 0 {
-        document.insert("meta".to_owned(), Value::Struct(StructFields::from([("rank".to_owned(), Value::I64(id % 3)), ("tags".to_owned(), Value::List(vec![Value::Utf8("a".into()), Value::Utf8(format!("t{id}"))]))])));
+        document.insert("meta".to_owned(), Value::Struct(StructFields::from([("rank".to_owned(), Value::I64(id % 3)), ("tags".to_owned(), Value::list(vec![Value::Utf8("a".into()), Value::Utf8(format!("t{id}"))]))])));
     }
     document
 }

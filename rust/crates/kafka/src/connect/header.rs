@@ -74,7 +74,7 @@ impl Parser<'_> {
         loop {
             if self.can("]") {
                 let kind = match schema.common { Some(element) => { for value in &mut values { *value = align(std::mem::replace(value, Value::Null), &element)?; } SchemaKind::Array(element) }, None => SchemaKind::ArrayOfNull };
-                return Ok(typed(kind, Value::List(values)));
+                return Ok(typed(kind, Value::list(values)));
             }
             if self.next == self.tokens.len() || self.can(",") { return Err(error("header-parse", "Missing array element or closing bracket")); }
             let value = self.value(true, depth)?; schema.merge(value.schema); values.push(value.value);
@@ -230,7 +230,7 @@ mod tests {
     }
     #[test]
     fn header_collections_align_numbers_and_preserve_mixed_schema_absence() {
-        assert_eq!(literal("[1,128]").unwrap().value, Value::List(vec![Value::I16(1), Value::I16(128)]));
+        assert_eq!(literal("[1,128]").unwrap().value, Value::list(vec![Value::I16(1), Value::I16(128)]));
         assert!(matches!(literal("[1,\"a\"]").unwrap().schema.unwrap().kind, SchemaKind::ArrayOfNull));
         assert!(matches!(literal("{1:null}").unwrap().schema.unwrap().kind, SchemaKind::MapWithNullValues(_)));
         assert_eq!(literal("[unquoted]").unwrap().value, Value::Utf8("[unquoted]".into()));

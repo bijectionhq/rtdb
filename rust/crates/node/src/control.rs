@@ -385,7 +385,8 @@ fn string(value: Value, option: &str) -> Result<Option<String>> {
 fn control_requires_catalog(expression: &Expr, arguments: &[Value]) -> bool {
     fn regclass(value: &Value) -> bool { match value {
         Value::RegClass(_) => true,
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().any(regclass),
+        Value::Set(values) => values.iter().any(regclass),
+        Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(regclass)),
         Value::Struct(fields) => fields.values().any(regclass),
         Value::Map { entries, .. } => entries.iter().any(|(key, value)| regclass(key) || regclass(value)),
         _ => false,

@@ -24,7 +24,7 @@ async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_
     let budget = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
     let mut transaction = tx(&state, &budget, 0, 0);
-    transaction.put(table(), document(1, Value::Struct(StructFields::from([("scalar".into(), Value::U64(u64::MAX)), ("list".into(), Value::List(vec![Value::U8(255)]))]))), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
+    transaction.put(table(), document(1, Value::Struct(StructFields::from([("scalar".into(), Value::U64(u64::MAX)), ("list".into(), Value::list(vec![Value::U8(255)]))]))), Interval::from_micros(0, i64::MAX).unwrap()).unwrap();
     state.apply(&transaction.stage().unwrap()).unwrap();
     let physical = state.value().snapshot().column_types(&table())["v"].clone();
     let store = Arc::new(MemoryStore::default());
@@ -40,7 +40,7 @@ async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_
         assert_eq!(cursor.schema().fields()[0].data_type, physical);
         assert_eq!(cursor.runtime_schema().fields()[0].data_type, rtdb_columnar::execution_type(&physical));
         let page = cursor.next_batch().await.unwrap().unwrap();
-        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::Struct(StructFields::from([("scalar".into(), Value::I64(-1)), ("list".into(), Value::List(vec![Value::I8(-1)]))])));
+        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::Struct(StructFields::from([("scalar".into(), Value::I64(-1)), ("list".into(), Value::list(vec![Value::I8(-1)]))])));
     }
     assert_eq!(state.value().snapshot().column_types(&table())["v"], physical);
 }

@@ -42,8 +42,9 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         let position = (*position)?;
         let field = source.field(position);
         let array = batch.batch().column(position);
-        if !fixed_floats(field, target) { return None; }
-        physical::relayout(Arc::clone(array), field, target).ok()
+        let direct = conform_float_list(array, field, target)?;
+        let physical = target.as_ref().clone().with_nullable(target.is_nullable() || field.is_nullable());
+        Some((physical, direct))
     }).collect::<Vec<_>>();
     let mut decoded_bound = multiply(batch.batch().num_rows(), multiply(declared.fields().len(), std::mem::size_of::<Value>())?)?;
     for (position, direct) in positions.iter().zip(&direct) {
@@ -93,12 +94,30 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
     Ok(DeclaredBatch { batch, declared, _reservation: reservation })
 }
 
-fn fixed_floats(source: &Field, target: &Field) -> bool {
-    if !source.metadata().is_empty() || !target.metadata().is_empty() { return false; }
-    matches!((source.data_type(), target.data_type()),
-        (DataType::FixedSizeList(left, width), DataType::FixedSizeList(right, expected))
-        if *width > 0 && width == expected && left.metadata().is_empty() && right.metadata().is_empty()
-            && left.data_type() == right.data_type() && matches!(left.data_type(), DataType::Float32 | DataType::Float64))
+pub fn conform_float_list(array: &ArrayRef, source: &Field, target: &Field) -> Option<ArrayRef> {
+    let list_items = match (source.data_type(), target.data_type()) {
+        (DataType::List(left), DataType::List(right)) => (left, right),
+        (DataType::FixedSizeList(left, width), DataType::FixedSizeList(right, target_width)) if width == target_width => (left, right),
+        _ => return None,
+    };
+    let supported = |field: &Field| field.metadata().is_empty() && (matches!(field.data_type(), DataType::Float32 | DataType::Float64)
+        || rtdb_types::ListValue::supports_float_union(field.data_type()));
+    if !source.metadata().is_empty() || !target.metadata().is_empty()
+        || !supported(list_items.0) || !supported(list_items.1)
+        || (!target.is_nullable() && array.null_count() != 0)
+    {
+        return None;
+    }
+    if array.data_type() == target.data_type() { return Some(Arc::clone(array)); }
+    physical::relayout(Arc::clone(array), source, target).ok()
+        .and_then(|(_, array)| (array.data_type() == target.data_type()).then_some(array))
+}
+
+pub(crate) fn conform_float_components(array: ArrayRef, target: &Field) -> Option<ArrayRef> {
+    if array.data_type() == target.data_type() { return Some(array); }
+    let source = Field::new(target.name(), array.data_type().clone(), false);
+    physical::relayout(array, &source, target).ok()
+        .and_then(|(_, array)| (array.data_type() == target.data_type()).then_some(array))
 }
 
 fn layout(target: &L, source: &L) -> Result<L> {

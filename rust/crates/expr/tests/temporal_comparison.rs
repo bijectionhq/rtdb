@@ -50,7 +50,7 @@ fn temporal_inequality_retains_raw_read_value_dispatch() {
     assert_eq!(binary(B::IsDistinctFrom, second.clone(), microsecond.clone(), "UTC"), V::Bool(false));
     assert_eq!(binary(B::IsNotDistinctFrom, second.clone(), microsecond.clone(), "UTC"), V::Bool(true));
     assert_eq!(binary(B::NotEq, second.clone(), timestamp(1_000_000, U::Microsecond, Some("UTC")), "UTC"), V::Bool(true));
-    assert_eq!(binary(B::NotEq, V::List(vec![second]), V::List(vec![microsecond]), "UTC"), V::Bool(true));
+    assert_eq!(binary(B::NotEq, V::list(vec![second]), V::list(vec![microsecond]), "UTC"), V::Bool(true));
     assert_eq!(binary(B::NotEq, V::Null, V::DateDay(0), "UTC"), V::Null);
     assert_eq!(binary(B::IsDistinctFrom, V::Null, V::DateDay(0), "UTC"), V::Bool(true));
 }
@@ -62,7 +62,7 @@ fn strict_equality_preserves_temporal_categories_zone_labels_and_interval_units(
     assert!(!strict_eq(&timestamp(0, U::Second, Some("UTC")), &timestamp(0, U::Microsecond, Some("Z")), &equality_scope()).unwrap());
     assert!(strict_eq(&timestamp(1, U::Second, Some("UTC")), &timestamp(1_000_000, U::Microsecond, Some("UTC")), &equality_scope()).unwrap());
     assert!(!strict_eq(&V::IntervalYearMonth(12), &V::IntervalMonthDayMicro { months: 12, days: 0, nanoseconds: 0 }, &equality_scope()).unwrap());
-    assert!(strict_eq(&V::List(vec![V::Null, V::I32(1)]), &V::List(vec![V::Null, V::I64(1)]), &equality_scope()).unwrap());
+    assert!(strict_eq(&V::list(vec![V::Null, V::I32(1)]), &V::list(vec![V::Null, V::I64(1)]), &equality_scope()).unwrap());
     assert!(!strict_eq(&V::I64(1), &V::F64(1.0), &equality_scope()).unwrap());
     assert_eq!(scalar_call("===", &[V::Null, V::Null], &EvalContext::default()).unwrap(), V::Bool(true));
     let period = Expr::Literal(V::TimestampTzRange { lower: 0, upper: i64::MAX });

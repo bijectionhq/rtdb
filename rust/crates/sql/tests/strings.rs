@@ -272,7 +272,7 @@ async fn string_null_policy_is_preserved_when_virtual_columns_narrow_at_executio
     assert!(cursor.runtime_schema().fields().iter().all(|field| field.data_type != LogicalType::Null));
     let batch = cursor.next_batch().await.unwrap().unwrap();
     let row = batch.batch().schema().fields().iter().zip(batch.batch().columns()).map(|(field, array)| read_value(field, array.as_ref(), 0).unwrap()).collect::<Vec<_>>();
-    assert_eq!(row, [text(""), V::List(vec![text("a"), text("b")]), text("")]);
+    assert_eq!(row, [text(""), V::list(vec![text("a"), text("b")]), text("")]);
 }
 
 #[tokio::test]
@@ -345,6 +345,6 @@ async fn struct_literal_keys_named_like_odbc_escapes_stay_struct_keys() {
     let rows = query("SELECT {d: 1} AS a, [{t: 1, v: 2}] AS b, {ts: TIMESTAMP '2020-01-01Z'} AS c").await.unwrap();
     let [a, b, c] = rows[0].as_slice() else { panic!("{rows:?}") };
     assert_eq!(a, &V::Struct(StructFields::from([("d".into(), V::I64(1))])));
-    assert_eq!(b, &V::List(vec![V::Struct(StructFields::from([("t".into(), V::I64(1)), ("v".into(), V::I64(2))]))]));
+    assert_eq!(b, &V::list(vec![V::Struct(StructFields::from([("t".into(), V::I64(1)), ("v".into(), V::I64(2))]))]));
     assert!(matches!(c, V::Struct(fields) if matches!(fields.get("ts"), Some(V::Timestamp { .. }))), "{c:?}");
 }

@@ -549,6 +549,39 @@ async fn arrow_copy_unsigned_ids_and_values_enter_signed_execution() {
 }
 
 #[tokio::test]
+async fn arrow_copy_vectors_rank_after_flush_for_both_ipc_formats() {
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field};
+
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let embedding = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.0, 1.0, 1.0, 0.0])), None).unwrap();
+    let batch = RecordBatch::try_from_iter([
+        ("_id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+        ("embedding", Arc::new(embedding) as ArrayRef),
+    ]).unwrap();
+    for (table, file) in [("stream_vectors", false), ("file_vectors", true)] {
+        let bytes = if file { rtdb_format::ipc::write_file(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() }
+            else { rtdb_format::ipc::write_stream(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() };
+        let format = if file { "arrow-file" } else { "arrow-stream" };
+        client.send(b'Q', &cstring(&format!("COPY {table} FROM STDIN WITH (FORMAT '{format}')"))).await;
+        assert_eq!(client.receive().await.0, b'G');
+        client.send(b'd', &bytes).await;
+        client.send(b'c', &[]).await;
+        assert_eq!(tags(&client.through(b'Z').await), b"CZ");
+        running.node.flush_all(std::time::Duration::from_secs(10)).await.unwrap();
+
+        let results = client.query(&format!(
+            "SELECT _id FROM {table} ORDER BY COSINE_DISTANCE(embedding, ARRAY[1,0]), _id LIMIT 2"
+        )).await;
+        assert_eq!(rows(&results), vec![vec![Some(b"2".to_vec())], vec![Some(b"1".to_vec())]]);
+    }
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn arrow_copy_batches_autocommit_separately_and_explicit_rollback_discards_all_batches() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

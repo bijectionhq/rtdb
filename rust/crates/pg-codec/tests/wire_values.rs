@@ -221,12 +221,12 @@ fn interval_and_oid_binary_output_follow_the_pinned_textual_writers() {
 
 #[test]
 fn text_arrays_keep_quoted_null_distinct_and_binary_null_read_is_unsupported() {
-    let value = Value::List(vec![Value::Utf8("NULL".into()), Value::Null, Value::Utf8("a,\"b\\c".into())]);
+    let value = Value::list(vec![Value::Utf8("NULL".into()), Value::Null, Value::Utf8("a,\"b\\c".into())]);
     let text = output(PgType::Texts, Format::Text, &value);
     assert_eq!(read_text(1009, std::str::from_utf8(&text).unwrap()).unwrap(), value);
     let binary = output(PgType::Texts, Format::Binary, &value);
     assert!(decode(PgType::Texts, Format::Binary, &binary, &MemoryBudget::new(1 << 20)).is_err());
-    assert!(encode_value(PgType::Int8s, Format::Binary, &Value::List(vec![Value::Null]), &SessionEnvironment::default()).is_err());
+    assert!(encode_value(PgType::Int8s, Format::Binary, &Value::list(vec![Value::Null]), &SessionEnvironment::default()).is_err());
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn equality_scope() -> rtdb_expr::EvaluationScope {
 #[test]
 fn transit_preserves_postgres_reference_types_through_nested_values() {
     use rtdb_format::transit::{TransitValue as T, decode_json, encode_json};
-    let value = Value::List(vec![Value::Oid(-12), Value::RegClass(123), Value::RegProc(i32::MIN)]);
+    let value = Value::list(vec![Value::Oid(-12), Value::RegClass(123), Value::RegProc(i32::MIN)]);
     let bytes = encode_json(&rtdb_pg_codec::to_transit(&value).unwrap()).unwrap();
     assert_eq!(rtdb_pg_codec::from_transit(decode_json(&bytes).unwrap()).unwrap(), value);
     let data = T::Tagged { tag: "xt/regclass".into(), representation: Box::new(T::Integer(i64::MAX)) };
@@ -300,7 +300,7 @@ fn jvm_transit_preserves_nested_lists_and_uuid_words() {
     use rtdb_pg_codec::from_transit;
     let lists = b"\x92\xa6~#list\x92\x92\xa2^0\x91\x01\x92\xa2^0\x90";
     assert_eq!(from_transit(decode_msgpack(lists).unwrap()).unwrap(),
-        Value::List(vec![Value::List(vec![Value::I64(1)]), Value::List(vec![])]));
+        Value::list(vec![Value::list(vec![Value::I64(1)]), Value::list(vec![])]));
     let uuid = b"\x92\xa3~#'\x92\xa3~#u\x92\xff\xd3\x87\x65\x43\x21\xab\xcd\xef\x09";
     let text = "ffffffff-ffff-ffff-8765-4321abcdef09";
     assert_eq!(from_transit(decode_msgpack(uuid).unwrap()).unwrap(), read_text(2950, text).unwrap());
@@ -349,7 +349,7 @@ fn fixed_size_binary_columns_are_bytea_with_lowercase_hex_text_and_raw_binary() 
 
 #[test]
 fn rendered_structs_omit_their_null_fields_as_the_reference_reads_them() {
-    let value = Value::Struct(StructFields::from([("a".into(), Value::I64(1)), ("b".into(), Value::Null), ("c".into(), Value::List(vec![Value::Struct(StructFields::from([("d".into(), Value::Null)]))]))]));
+    let value = Value::Struct(StructFields::from([("a".into(), Value::I64(1)), ("b".into(), Value::Null), ("c".into(), Value::list(vec![Value::Struct(StructFields::from([("d".into(), Value::Null)]))]))]));
     for format in [Format::Text, Format::Binary] {
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&output(PgType::Json, format, &value)).unwrap(), serde_json::json!({"a": 1, "c": [{}]}));
     }

@@ -142,6 +142,7 @@ pub struct RowSource { pub batch: Arc<IndexBatch>, pub row: usize }
 impl RowSource {
     pub fn header(&self) -> Result<EventHeader> { self.batch.header(self.row) }
     pub fn event(&self) -> Result<StoredEvent> { self.batch.view().read_event(self.row) }
+    pub fn read_put_field(&self, name: &str) -> Result<Value> { self.batch.view().read_put_field(self.row, name) }
 }
 
 #[derive(Clone, Debug)]
@@ -632,7 +633,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
         operation: StoredOperation::Put(StructFields::from([
             ("_id".into(), Value::I64(id)),
             ("value".into(), if text { Value::Utf8(id.to_string()) } else { Value::I64(id) }),
-            ("embedding".into(), Value::FixedSizeList(vec![Value::F32(id as f32), Value::F32(0.25)])),
+            ("embedding".into(), Value::FixedSizeList(vec![Value::F32(id as f32), Value::F32(0.25)].into())),
         ])),
         recency: None,
     }).collect::<Vec<_>>();

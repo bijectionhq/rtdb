@@ -10,8 +10,8 @@ fn session_information_uses_reference_constants_and_actual_artifact_version() {
     for (name, expected) in [("current_user", "xtdb"), ("current_database", "xtdb"), ("current_schema", "public")] {
         assert_eq!(scalar_call(name, &[], &context).unwrap(), text(expected));
     }
-    assert_eq!(scalar_call("current_schemas", &[V::Bool(false)], &context).unwrap(), V::List(vec![text("public")]));
-    assert_eq!(scalar_call("current_schemas", &[V::Bool(true)], &context).unwrap(), V::List(vec![text("pg_catalog"), text("public")]));
+    assert_eq!(scalar_call("current_schemas", &[V::Bool(false)], &context).unwrap(), V::list(vec![text("public")]));
+    assert_eq!(scalar_call("current_schemas", &[V::Bool(true)], &context).unwrap(), V::list(vec![text("pg_catalog"), text("public")]));
     for (setting, expected) in [("server_version_num", "160000"), ("search_path", "public"), ("xtdb.version", runtime_version())] {
         assert_eq!(scalar_call("current_setting", &[text(setting)], &context).unwrap(), text(expected));
     }

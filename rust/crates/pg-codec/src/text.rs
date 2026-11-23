@@ -20,7 +20,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         1184 => timestamp(text)?,
         1186 => { let (months, days, nanoseconds) = interval(text)?; if nanoseconds % 1000 != 0 { Value::IntervalMonthDayNano { months, days, nanoseconds } } else if nanoseconds != 0 || days != 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } } else { Value::IntervalYearMonth(months) } },
         11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
-        1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; Value::List(array(text)?.into_iter().map(|value| value.map_or(Ok(Value::Null), |text| read_text(element, &text))).collect::<Result<_>>()?) },
+        1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; Value::list(array(text)?.into_iter().map(|value| value.map_or(Ok(Value::Null), |text| read_text(element, &text))).collect::<Result<_>>()?) },
         114 | 3802 => read_json(text)?,
         3910 => {
             let Some(inner) = text.strip_prefix('[').and_then(|text| text.strip_suffix(')')) else { return Ok(Value::Null); };
@@ -72,7 +72,7 @@ fn read_json(text: &str) -> Result<Value> {
         Some(b't') if text == "true" => Value::Bool(true),
         Some(b'f') if text == "false" => Value::Bool(false),
         Some(b'"') => Value::Utf8(serde_json::from_str(text).map_err(invalid)?),
-        Some(b'[') => { let values: Vec<Box<RawValue>> = serde_json::from_str(text).map_err(invalid)?; Value::List(values.into_iter().map(|value| read_json(value.get())).collect::<Result<_>>()?) },
+        Some(b'[') => { let values: Vec<Box<RawValue>> = serde_json::from_str(text).map_err(invalid)?; Value::list(values.into_iter().map(|value| read_json(value.get())).collect::<Result<_>>()?) },
         Some(b'{') => {
             let mut fields: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).map_err(invalid)?;
             let kind = fields.get("@type").and_then(|kind| serde_json::from_str::<String>(kind.get()).ok());
@@ -88,7 +88,7 @@ fn read_json(text: &str) -> Result<Value> {
                     "xt:timestamp" => read_text(1114, &string()?)?, "xt:date" => read_text(1082, &string()?)?, "xt:time" => read_text(1083, &string()?)?,
                     "xt:duration" => read_text(11112, &string()?)?, "xt:interval" => read_text(1186, &string()?)?,
                     "xt:keyword" => Value::Keyword(rtdb_types::Keyword::from_name(string()?)), "xt:uuid" => read_text(2950, &string()?)?,
-                    "xt:set" => { let Value::List(values) = read_json(value.get())? else { return Err(invalid("JSON-LD set requires an array")); }; Value::Set(unique(values)) },
+                    "xt:set" => { let Value::List(values) = read_json(value.get())? else { return Err(invalid("JSON-LD set requires an array")); }; Value::Set(unique(values.into_values())) },
                     "xt:incorrect" | "xt:unsupported" | "xt:conflict" | "xt:fault" | "xt:interrupted" | "xt:not-found" | "xt:forbidden" | "xt:busy" | "xt:unavailable" | "xt:error" => json_error(&kind, value.get())?,
                     _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-json-ld-value", format!("JSON-LD {kind} cannot be imported as a native document value"))),
                 }
@@ -111,7 +111,7 @@ pub fn from_transit(value: rtdb_format::transit::TransitValue) -> Result<Value> 
 fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     Ok(match value {
-        T::Null => Value::Null, T::Bool(value) => Value::Bool(value), T::Integer(value) => Value::I64(value), T::Float(value) => Value::F64(value), T::String(value) => Value::Utf8(value), T::Keyword(value) => Value::Keyword(rtdb_types::Keyword::from_name(&value)), T::Bytes(value) => Value::Binary(value), T::Array(values) => Value::List(values.into_iter().map(transit).collect::<Result<_>>()?),
+        T::Null => Value::Null, T::Bool(value) => Value::Bool(value), T::Integer(value) => Value::I64(value), T::Float(value) => Value::F64(value), T::String(value) => Value::Utf8(value), T::Keyword(value) => Value::Keyword(rtdb_types::Keyword::from_name(&value)), T::Bytes(value) => Value::Binary(value), T::Array(values) => Value::list(values.into_iter().map(transit).collect::<Result<_>>()?),
         T::Float32(value) => Value::F64(f64::from(value)),
         T::Map(entries) => {
             let mut fields = StructFields::new();
@@ -166,7 +166,7 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                 "set" => { let T::Array(values) = *representation else { return Err(invalid("Transit set requires an array")); }; Value::Set(unique(values.into_iter().map(transit).collect::<Result<_>>()?)) },
                 "list" => {
                     let T::Array(values) = *representation else { return Err(invalid("Transit list requires an array")); };
-                    Value::List(values.into_iter().map(transit).collect::<Result<_>>()?)
+                    Value::list(values.into_iter().map(transit).collect::<Result<_>>()?)
                 }
                 "xtdb/byte-array" => read_text(17, &format!("\\x{}", string()?.get(2..).ok_or_else(|| invalid("Transit byte-array requires a hexadecimal prefix"))?))?,
                 "xtdb/tstz-range" => {

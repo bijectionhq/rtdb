@@ -14,6 +14,7 @@
 --   The transient appends only, and what it appends the value it came from cannot see; committing it yields the table's next value, and applying a transaction installs those values.
 --   One coroutine writes a transient, and it is never published mid-flight.
 --   Columnar puts retain their Arrow values alongside resolved IIDs and valid-time intervals until the events are encoded.
+--   Row-based operations carry homogeneous floating-point lists as typed Arrow component buffers.
 --   Staged rows ARE read, by the transactions resolving behind them (read-your-writes), and that stays within the discipline only because the reader is the same owner — the term's own coroutine.
 --   Nothing else may read staged rows.
 --

@@ -109,7 +109,7 @@ async fn list_nth_repeats_suspension_after_comparison_without_memoizing_cells() 
     let other = Expr::List(vec![literal(Value::Null),literal(Value::I64(2))]);
     let expression = call("nullif",vec![list,other]);
     let start = tokio::time::Instant::now();
-    assert_eq!(evaluate_async(&expression,&Schema::default(),&[],&EvalContext::default()).await.unwrap(),Value::List(vec![Value::Null,Value::I64(1)]));
+    assert_eq!(evaluate_async(&expression,&Schema::default(),&[],&EvalContext::default()).await.unwrap(),Value::list(vec![Value::Null,Value::I64(1)]));
     assert_eq!(tokio::time::Instant::now() - start,Duration::from_millis(10));
 }
 

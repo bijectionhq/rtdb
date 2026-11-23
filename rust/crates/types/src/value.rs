@@ -1,5 +1,5 @@
 use crate::StructFields;
-use crate::{Anomaly, CalendarDate, CivilDate, DateUnit, EntityId, IntervalUnit, Keyword, ListKind, LogicalType, Result, ScalarType, TimeUnit};
+use crate::{Anomaly, CalendarDate, CivilDate, DateUnit, EntityId, ListValue, IntervalUnit, Keyword, ListKind, ListView, LogicalType, Result, ScalarType, TimeUnit};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,8 +38,8 @@ pub enum Value {
     IntervalMonthDayNano { months: i32, days: i32, nanoseconds: i64 },
     IntervalMonthDayMicro { months: i32, days: i32, nanoseconds: i64 },
     Keyword(Keyword), Uuid([u8; 16]), Uri(String), Transit(Vec<u8>), Oid(i32), RegClass(i32), RegProc(i32),
-    List(Vec<Value>), Set(Vec<Value>), Map { entries: Vec<(Value, Value)>, sorted: bool },
-    FixedSizeList(Vec<Value>), TimestampTzRange { lower: i64, upper: i64 },
+    List(ListValue), Set(Vec<Value>), Map { entries: Vec<(Value, Value)>, sorted: bool },
+    FixedSizeList(ListValue), TimestampTzRange { lower: i64, upper: i64 },
     Struct(StructFields<Value>),
 }
 
@@ -84,7 +84,10 @@ impl Value {
     pub fn admit_expression_dates(&mut self) -> Result<()> {
         match self {
             Self::Date(value) => *self = value.expression_value()?,
-            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => for value in values { value.admit_expression_dates()?; },
+            Self::List(values) | Self::FixedSizeList(values) => if let Some(values) = values.values_mut() {
+                for value in values { value.admit_expression_dates()?; }
+            },
+            Self::Set(values) => for value in values { value.admit_expression_dates()?; },
             Self::Struct(fields) => for value in fields.values_mut() { value.admit_expression_dates()?; },
             Self::Map { entries, .. } => for (key, value) in entries { key.admit_expression_dates()?; value.admit_expression_dates()?; },
             _ => (),
@@ -97,7 +100,8 @@ impl Value {
     pub fn admit_object_dates(&mut self) {
         match self {
             Self::Date(value) => *self = value.object_value(),
-            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => values.iter_mut().for_each(Self::admit_object_dates),
+            Self::List(values) | Self::FixedSizeList(values) => if let Some(values) = values.values_mut() { values.iter_mut().for_each(Self::admit_object_dates); },
+            Self::Set(values) => values.iter_mut().for_each(Self::admit_object_dates),
             Self::Struct(fields) => fields.values_mut().for_each(Self::admit_object_dates),
             Self::Map { entries, .. } => for (key, value) in entries { key.admit_object_dates(); value.admit_object_dates(); },
             _ => (),
@@ -121,7 +125,8 @@ impl Value {
     pub fn has_calendar_object(&self) -> bool {
         match self {
             Self::Date(_) => true,
-            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => values.iter().any(Self::has_calendar_object),
+            Self::List(values) | Self::FixedSizeList(values) => matches!(values.view(), ListView::Values(values) if values.iter().any(Self::has_calendar_object)),
+            Self::Set(values) => values.iter().any(Self::has_calendar_object),
             Self::Struct(fields) => fields.values().any(Self::has_calendar_object),
             Self::Map { entries, .. } => entries.iter().any(|(key,value)| key.has_calendar_object() || value.has_calendar_object()),
             _ => false,
@@ -134,14 +139,15 @@ impl Value {
         self.heap_bytes()?.checked_add(std::mem::size_of::<Self>()).ok_or_else(size_overflow)
     }
 
-    fn heap_bytes(&self) -> Result<usize> {
+    pub(crate) fn heap_bytes(&self) -> Result<usize> {
         let total = match self {
             Self::Utf8(value) | Self::Uri(value) => value.capacity(),
             Self::Keyword(value) => value.retained_bytes(),
             Self::Binary(value) | Self::FixedSizeBinary(value) | Self::Transit(value) => value.capacity(),
             Self::Decimal(value) => value.unscaled.capacity(),
             Self::Timestamp { timezone, .. } => timezone.as_ref().map_or(0, String::capacity),
-            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => {
+            Self::List(values) | Self::FixedSizeList(values) => values.retained_payload_bytes()?,
+            Self::Set(values) => {
                 let inline = values.capacity().checked_mul(std::mem::size_of::<Self>()).ok_or_else(size_overflow)?;
                 values.iter().try_fold(inline, |bytes, value| bytes.checked_add(value.heap_bytes()?).ok_or_else(size_overflow))?
             }
@@ -205,14 +211,16 @@ impl Value {
             Self::IntervalMonthDayMicro { .. } => S::IntervalMonthDayMicro,
             Self::Keyword(_) => S::Keyword, Self::Uuid(_) => S::Uuid, Self::Uri(_) => S::Uri,
             Self::Transit(_) => S::Transit, Self::Oid(_) => S::Oid, Self::RegClass(_) => S::RegClass, Self::RegProc(_) => S::RegProc,
-            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => {
-                let types: Vec<_> = values.iter().map(Self::logical_type).collect();
-                let kind = match self {
-                    Self::Set(_) => ListKind::Set,
+            Self::List(values) | Self::FixedSizeList(values) => return LogicalType::List {
+                kind: match self {
                     Self::FixedSizeList(_) => ListKind::FixedSizeList(i32::try_from(values.len()).unwrap_or(i32::MAX)),
                     _ => ListKind::List,
-                };
-                return LogicalType::List { kind, element: Box::new(LogicalType::join_all(&types)) };
+                },
+                element: Box::new(values.element_type()),
+            },
+            Self::Set(values) => {
+                let types: Vec<_> = values.iter().map(Self::logical_type).collect();
+                return LogicalType::List { kind: ListKind::Set, element: Box::new(LogicalType::join_all(&types)) };
             }
             Self::Map { entries, sorted } => {
                 let keys: Vec<_> = entries.iter().map(|(key, _)| key.logical_type()).collect();
@@ -230,6 +238,16 @@ impl Value {
             Self::Struct(fields) => return LogicalType::Struct(fields.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect()),
         };
         LogicalType::Scalar(scalar)
+    }
+
+    pub fn list(values: Vec<Value>) -> Self { Self::List(values.into()) }
+
+    pub fn list_view(&self) -> Option<ListView<'_>> {
+        match self {
+            Self::Set(values) => Some(ListView::Values(values)),
+            Self::List(values) | Self::FixedSizeList(values) => Some(values.view()),
+            _ => None,
+        }
     }
 
     pub fn field(&self, name: &str) -> Option<&Self> {

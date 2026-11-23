@@ -10,7 +10,7 @@ pub(crate) fn call(name: &str, arguments: &[Value], context: &EvalContext<'_>) -
             Value::Bool(implicit) => {
                 let names: &[&str] = if *implicit { &["pg_catalog", "public"] } else { &["public"] };
                 context.reserve(names.len() * std::mem::size_of::<Value>() + names.iter().map(|name| name.len()).sum::<usize>()).map(|()|
-                    Value::List(names.iter().map(|name| Value::Utf8((*name).into())).collect()))
+                    Value::list(names.iter().map(|name| Value::Utf8((*name).into())).collect()))
             }
             _ => Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "current_schemas requires a boolean")),
         },

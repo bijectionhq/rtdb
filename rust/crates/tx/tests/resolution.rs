@@ -377,6 +377,6 @@ async fn resolved_series_dml_uses_the_resolving_nodes_endpoint_policy() {
         assert!(resolved.result().committed(),"{:?}",resolved.result());
         let batch = resolved.writes().tables()[&table()].batch().unwrap();
         let StoredOperation::Put(document) = batch.view().read_event(0).unwrap().operation else { panic!("put") };
-        assert_eq!(document["v"],Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
+        assert_eq!(document["v"],Value::list((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
 }

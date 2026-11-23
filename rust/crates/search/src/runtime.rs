@@ -51,11 +51,9 @@ impl LivePostings {
     }
     fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str) -> Result<()> {
         for row in self.rows..segment.row_count() {
-            let event = segment.row(row)?.event()?;
-            let rtdb_format::data::StoredOperation::Put(document) = &event.operation else { continue };
-            let Some(rtdb_types::Value::Utf8(text)) = document.get(column) else { continue };
+            let rtdb_types::Value::Utf8(text) = segment.row(row)?.read_put_field(column)? else { continue };
             let mut seen = std::collections::BTreeSet::new();
-            for token in rtdb_text::tokens(text) {
+            for token in rtdb_text::tokens(&text) {
                 if seen.insert(token.clone()) { self.bytes += token.len() + 4; self.postings.entry(token).or_default().push(row); }
             }
         }

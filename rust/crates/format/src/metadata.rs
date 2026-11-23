@@ -30,7 +30,7 @@ impl LeafColumns {
         match self.0.as_ref() {
             LeafSource::Decoded(columns) => Ok(std::borrow::Cow::Borrowed(columns)),
             LeafSource::Stored { field, columns, offset } => match rtdb_columnar::read_value(field, columns.as_ref(), *offset)? {
-                Value::List(values) => Ok(std::borrow::Cow::Owned(values)),
+                Value::List(values) => Ok(std::borrow::Cow::Owned(values.into_values())),
                 _ => Err(invalid("Metadata leaf has no columns")),
             },
         }
@@ -140,7 +140,7 @@ impl MetadataBuilder {
             for (name, value) in fields {
                 match (name.as_str(), value) {
                     ("list" | "set", Value::I32(index)) => *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?,
-                    ("struct", Value::List(children)) => for child in children {
+                    ("struct", Value::List(children)) => for child in children.values_mut().ok_or_else(|| invalid("Struct metadata children must be integers"))? {
                         let Value::I32(index) = child else { return Err(invalid("Struct metadata child must be an integer")); };
                         *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?;
                     },
@@ -216,7 +216,7 @@ impl MetadataFile {
                 "branch-iid" => {
                     let Value::List(children) = value else { return Err(invalid("IID branch is not a list")); };
                     if children.len() != 4 { return Err(invalid("IID branch must have four buckets")); }
-                    MetadataNode::IidBranch(children.iter().map(|child| match child {
+                    MetadataNode::IidBranch(children.iter().map(|child| match child.as_ref() {
                         Value::Null => Ok(None),
                         Value::I32(child) => Ok(Some(child_index(*child, row)?)),
                         _ => Err(invalid("IID child reference is not an integer")),
@@ -225,7 +225,7 @@ impl MetadataFile {
                 "branch-recency" => {
                     let Value::List(children) = value else { return Err(invalid("Recency branch is not a list")); };
                     let mut buckets = Vec::with_capacity(children.len());
-                    for child in children {
+                    for child in children.into_values() {
                         let Value::Struct(fields) = child else { return Err(invalid("Recency bucket is not a struct")); };
                         let Value::I32(index) = required(&fields, "idx")? else { return Err(invalid("Recency bucket has no child index")); };
                         let Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } = required(&fields, "max-recency")? else { return Err(invalid("Recency bucket has no microsecond ceiling")); };
@@ -355,14 +355,14 @@ fn column_stat_field(name: &str, ty: &LogicalType) -> Result<Field> {
 fn node_value(node: &MetadataNode) -> Result<(&'static str, Value)> {
     Ok(match node {
         MetadataNode::Nil => ("nil", Value::Null),
-        MetadataNode::IidBranch(children) => ("branch-iid", Value::List(children.iter().map(|child| child.map(|child| i32::try_from(child).map(Value::I32).map_err(invalid)).unwrap_or(Ok(Value::Null))).collect::<Result<_>>()?)),
-        MetadataNode::RecencyBranch(children) => ("branch-recency", Value::List(children.iter().map(|(upper, child)| Ok(Value::Struct(StructFields::from([
+        MetadataNode::IidBranch(children) => ("branch-iid", Value::list(children.iter().map(|child| child.map(|child| i32::try_from(child).map(Value::I32).map_err(invalid)).unwrap_or(Ok(Value::Null))).collect::<Result<_>>()?)),
+        MetadataNode::RecencyBranch(children) => ("branch-recency", Value::list(children.iter().map(|(upper, child)| Ok(Value::Struct(StructFields::from([
             ("max-recency".into(), Value::Timestamp { value: upper.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }),
             ("idx".into(), Value::I32(i32::try_from(*child).map_err(invalid)?)),
         ])))).collect::<Result<_>>()?)),
         MetadataNode::Leaf { data_page_index, columns } => ("leaf", Value::Struct(StructFields::from([
             ("data-page-idx".into(), Value::I32(i32::try_from(*data_page_index).map_err(invalid)?)),
-            ("columns".into(), Value::List(columns.values()?.into_owned())),
+            ("columns".into(), Value::list(columns.values()?.into_owned())),
         ]))),
     })
 }
@@ -383,7 +383,7 @@ fn build_field_values(field: &Field, values: &[Value]) -> Result<ArrayRef> {
             let mut offsets = vec![0i32];
             for value in values {
                 match value {
-                    Value::List(values) => elements.extend(values.iter().cloned()),
+                    Value::List(values) => elements.extend(values.iter().map(std::borrow::Cow::into_owned)),
                     Value::Null | Value::Undefined => {}
                     _ => return Err(invalid("Metadata list field contains a non-list value")),
                 }

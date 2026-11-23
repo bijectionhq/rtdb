@@ -85,7 +85,7 @@ async fn virtual_endpoints_keep_advertised_types_and_runtime_null_vectors() {
 #[tokio::test]
 async fn virtual_runtime_types_propagate_through_correlated_nested_and_outer_projections() {
     assert_eq!(query("SELECT s._valid_from AS direct,(SELECT s._valid_from) AS correlated,ARRAY[s._valid_from] AS nested FROM pg_catalog.pg_namespace s LIMIT 1").await.unwrap().1,
-        [vec![V::Null, V::Null, V::List(vec![V::Null])]]);
+        [vec![V::Null, V::Null, V::list(vec![V::Null])]]);
     assert_eq!(query("SELECT s._valid_time,s._valid_from FROM foo LEFT JOIN pg_catalog.pg_namespace s ON FALSE").await.unwrap().1, [vec![V::Null, V::Null]]);
     assert_eq!(query("SELECT MIN(_valid_from),COUNT(_valid_from) FROM pg_catalog.pg_namespace").await.unwrap().1, [vec![V::Null, V::I64(0)]]);
     assert_eq!(query("SELECT COUNT(*) FROM pg_catalog.pg_namespace GROUP BY _valid_from").await.unwrap().1.len(), 1);
@@ -114,14 +114,14 @@ async fn virtual_null_vectors_preserve_aggregate_factories_and_promote_array_ele
     assert_eq!(runtime.fields()[5].data_type, instant.maybe());
     let page = cursor.next_batch().await.unwrap().unwrap();
     let row = page.batch().schema().fields().iter().zip(page.batch().columns()).map(|(field, array)| read_value(field, array.as_ref(), 0).unwrap()).collect::<Vec<_>>();
-    assert_eq!(row, [V::List(vec![V::Null]), V::List(vec![V::List(vec![V::Null])]), V::Null, V::Null, V::Null, V::Null]);
+    assert_eq!(row, [V::list(vec![V::Null]), V::list(vec![V::list(vec![V::Null])]), V::Null, V::Null, V::Null, V::Null]);
     assert!(cursor.next_batch().await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn correlated_aggregate_uses_the_same_runtime_null_dispatch() {
     let sql = "SELECT (SELECT SUM(CAST(s._valid_from AS DECIMAL)) FROM (VALUES (1)) v(n)),(SELECT ARRAY_AGG(s._valid_from) FROM (VALUES (1)) v(n)) FROM pg_catalog.pg_namespace s LIMIT 1";
-    assert_eq!(query(sql).await.unwrap().1, [vec![V::Null, V::List(vec![V::Null])]]);
+    assert_eq!(query(sql).await.unwrap().1, [vec![V::Null, V::list(vec![V::Null])]]);
 }
 
 #[tokio::test]

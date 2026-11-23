@@ -7,7 +7,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes};
 use rtdb_node::{AccessSettings, CommitResult, NativeSession, Node, TransactionSettings, TransactionStatus};
 use rtdb_pg_codec::Format;
 use rtdb_plan::{CopyFormat, Identifier};
-use rtdb_tx::{Documents, TxOp};
+use rtdb_tx::{ArrowDocuments, Documents, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,10 @@ impl CopyInput {
                 self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; let mut bytes = Vec::with_capacity(size); self.file.read_to_end(&mut bytes).map_err(io_error)?;
                 let values = if self.format == CopyFormat::TransitJson { rtdb_format::transit::decode_json_sequence(&bytes)? } else { rtdb_format::transit::decode_msgpack_sequence(&bytes)? };
                 let rows = values.into_iter().map(|value| match rtdb_pg_codec::from_transit(value)? { Value::Struct(fields) => Ok(fields), _ => Err(protocol("COPY Transit values must be documents")) }).collect::<Result<Vec<_>>>()?;
-                let count = rows.len() as u64; self.submit(rows, session, node, cancellation).await?; Ok(count)
+                let count = rows.len() as u64;
+                let operation = self.row_operation(rows, node.memory())?;
+                self.submit(operation, session, node, cancellation).await?;
+                Ok(count)
             }
             CopyFormat::ArrowFile | CopyFormat::ArrowStream => {
                 let mut file = self.file.reopen().map_err(io_error)?;
@@ -49,23 +52,33 @@ impl CopyInput {
                 let mut count = 0u64;
                 for batch in reader {
                     if cancellation.is_cancelled() { return Err(cancelled()); }
-                    let batch = batch?; let schema = batch.schema();
+                    let batch = batch?;
+                    count = count.checked_add(batch.num_rows() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
+                    if let Some(documents) = ArrowDocuments::try_new(&batch, node.memory())? {
+                        let operation = TxOp::PutArrowDocs { table: self.table.clone(), documents, valid_from: None, valid_to: None };
+                        self.submit(operation, session, node, cancellation).await?;
+                        continue;
+                    }
+                    let schema = batch.schema();
                     let mut bound = 8192usize;
                     for row in 0..batch.num_rows() { for column in 0..batch.num_columns() { bound = bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.column(column).as_ref(), row)?).ok_or_else(|| protocol("COPY row allocation overflow"))?; } }
                     let _values = node.memory().reserve(bound)?;
                     let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<StructFields<_>>>()).collect::<Result<Vec<_>>>()?;
-                    count = count.checked_add(rows.len() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
-                    self.submit(rows, session, node, cancellation).await?;
+                    let operation = self.row_operation(rows, node.memory())?;
+                    self.submit(operation, session, node, cancellation).await?;
                 }
                 Ok(count)
             }
         }
     }
-    async fn submit(&self, rows: Vec<StructFields<Value>>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
+    fn row_operation(&self, rows: Vec<StructFields<Value>>, memory: &Arc<MemoryBudget>) -> Result<TxOp> {
+        Ok(TxOp::PutDocs { table: self.table.clone(), documents: Documents::new(rows, memory)?, valid_from: None, valid_to: None })
+    }
+
+    async fn submit(&self, operation: TxOp, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
         let owns_transaction = session.state().status() == TransactionStatus::Idle;
         if owns_transaction { session.state_mut().begin_with(TransactionSettings { access: Some(AccessSettings::ReadWrite(Default::default())), ..Default::default() })?; }
         let work = async {
-            let operation = TxOp::PutDocs { table: self.table.clone(), documents: Documents::new(rows, node.memory())?, valid_from: None, valid_to: None };
             session.state_mut().execute_operation(operation).await?;
             if owns_transaction { let _sample = rtdb_plan::ExecutionSample::new(node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction); if let CommitResult::Executed(tx) = session.state_mut().commit_tx(None).await? { if let Some(error) = tx.error() { return Err(error.clone()); } } }
             Ok(())

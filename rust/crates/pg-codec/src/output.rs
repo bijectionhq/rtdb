@@ -98,22 +98,22 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
 }
 
 fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironment) -> Result<Vec<u8>> {
-    let values = match value { Value::List(values) | Value::FixedSizeList(values) => values, _ => return Err(incompatible(ty, value)) };
+    let values = match value { Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(), _ => return Err(incompatible(ty, value)) };
     let element = match ty { PgType::Int4s => PgType::Int4, PgType::Int8s => PgType::Int8, _ => PgType::Text };
     if format == Format::Binary {
         let mut result = Vec::new();
         for value in [1, 0, element.descriptor().oid, i32::try_from(values.len()).map_err(invalid)?, 1] { result.extend_from_slice(&value.to_be_bytes()); }
-        for value in values {
-            if matches!(value, Value::Null | Value::Undefined) { if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); } result.extend_from_slice(&(-1i32).to_be_bytes()); }
-            else { let bytes = encode_value(element, format, value, env)?; result.extend_from_slice(&i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes()); result.extend_from_slice(&bytes); }
+        for value in values.iter() {
+            if matches!(value.as_ref(), Value::Null | Value::Undefined) { if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); } result.extend_from_slice(&(-1i32).to_be_bytes()); }
+            else { let bytes = encode_value(element, format, value.as_ref(), env)?; result.extend_from_slice(&i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes()); result.extend_from_slice(&bytes); }
         }
         Ok(result)
     } else {
         let mut output = String::from("{");
         for (index, value) in values.iter().enumerate() {
             if index != 0 { output.push(','); }
-            if matches!(value, Value::Null | Value::Undefined) { output.push_str("NULL"); }
-            else { let bytes = encode_value(element, format, value, env)?; let text = std::str::from_utf8(&bytes).map_err(invalid)?; if ty == PgType::Texts { output.push('"'); for ch in text.chars() { if matches!(ch, '\\' | '"') { output.push('\\'); } output.push(ch); } output.push('"'); } else { output.push_str(text); } }
+            if matches!(value.as_ref(), Value::Null | Value::Undefined) { output.push_str("NULL"); }
+            else { let bytes = encode_value(element, format, value.as_ref(), env)?; let text = std::str::from_utf8(&bytes).map_err(invalid)?; if ty == PgType::Texts { output.push('"'); for ch in text.chars() { if matches!(ch, '\\' | '"') { output.push('\\'); } output.push(ch); } output.push('"'); } else { output.push_str(text); } }
         }
         output.push('}'); Ok(output.into_bytes())
     }
@@ -145,7 +145,7 @@ fn json(value: &Value, ld: bool, output: &mut String, depth: usize) -> Result<()
             output.push('}');
         },
         Value::Map { entries, .. } => { output.push('{'); for (index, (key, value)) in entries.iter().enumerate() { if index != 0 { output.push(','); } json_string(&display_key(key)?, output)?; output.push(':'); json(value, ld, output, depth + 1)?; } output.push('}'); },
-        Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => { let set = ld && matches!(value, Value::Set(_)); if set { output.push_str("{\"@type\":\"xt:set\",\"@value\":"); } output.push('['); for (index, value) in values.iter().enumerate() { if index != 0 { output.push(','); } json(value, ld, output, depth + 1)?; } output.push(']'); if set { output.push('}'); } },
+        Value::List(_) | Value::FixedSizeList(_) | Value::Set(_) => { let values = value.list_view().unwrap(); let set = ld && matches!(value, Value::Set(_)); if set { output.push_str("{\"@type\":\"xt:set\",\"@value\":"); } output.push('['); for (index, value) in values.iter().enumerate() { if index != 0 { output.push(','); } json(value.as_ref(), ld, output, depth + 1)?; } output.push(']'); if set { output.push('}'); } },
         Value::Transit(bytes) => { let error = rtdb_format::transit::decode_anomaly(bytes)?; output.push_str(&String::from_utf8(encode_error(&error, if ld { PgType::JsonLd } else { PgType::Json })?).map_err(invalid)?); },
         value => { let (tag, text) = scalar_text(value)?; if ld { tagged_json(tag, &text, output)?; } else { let text = if matches!(value, Value::Timestamp { timezone: Some(_), .. }) { text.split('[').next().unwrap_or(&text) } else { &text }; json_string(text, output)?; } },
     }
@@ -179,9 +179,9 @@ fn without_absent_fields(value: &Value) -> std::borrow::Cow<'_, Value> {
     use std::borrow::Cow;
     match value {
         Value::Struct(fields) => Cow::Owned(Value::Struct(fields.iter().filter(|(_, value)| !is_absent(value)).map(|(key, value)| (key.clone(), without_absent_fields(value).into_owned())).collect())),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) if values.iter().any(contains_struct) => {
-            let values = values.iter().map(|value| without_absent_fields(value).into_owned()).collect();
-            Cow::Owned(match value { Value::List(_) => Value::List(values), Value::Set(_) => Value::Set(values), _ => Value::FixedSizeList(values) })
+        Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) if contains_struct(value) => {
+            let values: Vec<Value> = value.list_view().unwrap().iter().map(|value| without_absent_fields(value.as_ref()).into_owned()).collect();
+            Cow::Owned(match value { Value::List(_) => Value::list(values), Value::Set(_) => Value::Set(values), _ => Value::FixedSizeList(values.into()) })
         }
         Value::Map { entries, sorted } if entries.iter().any(|(_, value)| contains_struct(value)) =>
             Cow::Owned(Value::Map { entries: entries.iter().map(|(key, value)| (key.clone(), without_absent_fields(value).into_owned())).collect(), sorted: *sorted }),
@@ -192,7 +192,8 @@ fn without_absent_fields(value: &Value) -> std::borrow::Cow<'_, Value> {
 fn contains_struct(value: &Value) -> bool {
     match value {
         Value::Struct(_) => true,
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().any(contains_struct),
+        Value::Set(values) => values.iter().any(contains_struct),
+        Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(contains_struct)),
         Value::Map { entries, .. } => entries.iter().any(|(_, value)| contains_struct(value)),
         _ => false,
     }

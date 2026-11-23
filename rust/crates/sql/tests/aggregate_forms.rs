@@ -151,8 +151,9 @@ fn aggregate_forms(rows: &[Vec<Value>]) -> Vec<String> {
     rows.iter().filter_map(|row| row[2].field("aggregates").filter(|value| !matches!(value, Value::Null))).flat_map(|value| {
         let Value::List(aggregates) = value else { panic!("Expected aggregate forms") };
         aggregates.iter().map(|value| {
-            let Value::List(pair) = value else { panic!("Expected output/form pair") };
-            let Value::Utf8(form) = &pair[1] else { panic!("Expected printed form") }; form.clone()
+            let Value::List(pair) = value.as_ref() else { panic!("Expected output/form pair") };
+            let cell = pair.get(1).unwrap();
+            let Value::Utf8(form) = cell.as_ref() else { panic!("Expected printed form") }; form.clone()
         })
     }).collect()
 }
@@ -245,7 +246,7 @@ async fn xtql_factory_spelling_and_explicit_all_quantifiers_survive_explanation(
         let mut prepared = rtdb_xtql::compile(&source, &context.catalog, &rtdb_xtql::CompileOptions::default()).unwrap();
         let expected = match normalized.as_str() {
             "sum_all" | "row_count" => Value::I64(2), "sum_distinct" => Value::I64(1),
-            "array_agg" => Value::List(vec![Value::I64(1), Value::I64(1)]), "array_agg_distinct" => Value::List(vec![Value::I64(1)]),
+            "array_agg" => Value::list(vec![Value::I64(1), Value::I64(1)]), "array_agg_distinct" => Value::list(vec![Value::I64(1)]),
             _ => unreachable!(),
         };
         assert_eq!(collect(&context, prepared.clone()).await.unwrap(), [vec![expected]], "{name}");

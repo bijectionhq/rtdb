@@ -53,7 +53,7 @@ fn legacy_inst_reader_keeps_partial_fields_millisecond_truncation_and_calendar_c
 fn temporal_and_qualified_interval_options_survive_recursive_xtql_targets() {
     use rtdb_types::TimeUnit as U;
     assert_eq!(project("(cast [\"05:34:56.123456789\" nil] #xt/type [:list [:time-local :nano]] {:precision 7})").1,
-        V::List(vec![V::Time { value: 20_096_123_456_700, unit: U::Nanosecond, bit_width: 64 },V::Null]));
+        V::list(vec![V::Time { value: 20_096_123_456_700, unit: U::Nanosecond, bit_width: 64 },V::Null]));
     assert_eq!(project("(cast \"1 10:10:10.111111111\" #xt/type [:ree [:interval :year-month]] {:start-field \"DAY\" :end-field \"SECOND\" :leading-precision 2 :fractional-precision 7})").1,
         V::IntervalMonthDayNano { months: 0, days: 1, nanoseconds: 36_610_111_111_100 });
     assert_eq!(project("(cast 3 #xt/type [:interval :year-month] {:start-field \"DAY\"})").1,
@@ -85,7 +85,7 @@ fn ignored_temporal_and_integer_interval_options_retain_malformed_values() {
             V::Timestamp { value: 123_456_789,unit: U::Nanosecond,timezone: Some("UTC".into()) });
         assert_eq!(project(&format!("(cast 3 #xt/type [:interval :year-month] {{:start-field \"DAY\" :leading-precision {option} :fractional-precision {option}}})")).1,
             V::IntervalMonthDayMicro { months: 0,days: 3,nanoseconds: 0 });
-        assert_eq!(project(&format!("(cast [nil] #xt/type [:list [:time-local :nano]] {{:precision {option}}})")).1,V::List(vec![V::Null]));
+        assert_eq!(project(&format!("(cast [nil] #xt/type [:list [:time-local :nano]] {{:precision {option}}})")).1,V::list(vec![V::Null]));
     }
     assert_eq!(project("(cast nil #xt/type [:interval :year-month] {:start-field [:invalid] :end-field :invalid :leading-precision :invalid})"),(T::Null,V::Null));
     assert_eq!(project("(cast \"3\" #xt/type [:interval :year-month] {:start-field \"DAY\" :leading-precision 2 :fractional-precision :unused})").1,
@@ -183,11 +183,11 @@ fn decimal(coefficient: i128, precision: i32, scale: i32) -> V {
 #[test]
 fn expression_test_cast_list_elementwise_and_pg_array_text() {
     for (expression, expected) in [
-        ("(cast [1 nil 3] #xt/type [:list :i64])", V::List(vec![V::I64(1), V::Null, V::I64(3)])),
-        ("(cast [1 2] #xt/type [:list :utf8])", V::List(vec![V::Utf8("1".into()), V::Utf8("2".into())])),
-        ("(cast [[1.0 2.0] [3.0]] #xt/type [:list [:list :i64]])", V::List(vec![V::List(vec![V::I64(1), V::I64(2)]), V::List(vec![V::I64(3)])])),
-        ("(cast \"{1,NULL}\" #xt/type [:list :i64])", V::List(vec![V::I64(1), V::Null])),
-        ("(cast [] #xt/type [:list :i64])", V::List(vec![])),
+        ("(cast [1 nil 3] #xt/type [:list :i64])", V::list(vec![V::I64(1), V::Null, V::I64(3)])),
+        ("(cast [1 2] #xt/type [:list :utf8])", V::list(vec![V::Utf8("1".into()), V::Utf8("2".into())])),
+        ("(cast [[1.0 2.0] [3.0]] #xt/type [:list [:list :i64]])", V::list(vec![V::list(vec![V::I64(1), V::I64(2)]), V::list(vec![V::I64(3)])])),
+        ("(cast \"{1,NULL}\" #xt/type [:list :i64])", V::list(vec![V::I64(1), V::Null])),
+        ("(cast [] #xt/type [:list :i64])", V::list(vec![])),
         ("(cast nil #xt/type [:list :i64])", V::Null),
     ] { assert_eq!(project(expression).1, expected, "{expression}"); }
 }
@@ -199,7 +199,7 @@ fn composite_type_casts_accept_nested_tags_and_preserve_identical_values() {
     assert_eq!(project("(cast #xt/tstz-range [nil nil] #xt/type :tstz-range)").1,
         V::TimestampTzRange { lower: i64::MIN, upper: i64::MAX });
     assert_eq!(project("(cast [1 2] #xt/type [:list #xt/type :i64])").1,
-        V::List(vec![V::I64(1), V::I64(2)]));
+        V::list(vec![V::I64(1), V::I64(2)]));
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn nullable_list_elements_remap_without_nullable_scalar_dispatch() {
         "(cast [1 nil] #xt/type [:list [:? :i64]])",
         "(cast [1 nil] #xt/type [:ree [:list [:ree-i16 [:? :i64]]]])",
     ] {
-        assert_eq!(project(expression), (T::list(T::Scalar(S::I64).maybe()), V::List(vec![V::I64(1), V::Null])), "{expression}");
+        assert_eq!(project(expression), (T::list(T::Scalar(S::I64).maybe()), V::list(vec![V::I64(1), V::Null])), "{expression}");
     }
 }
 
@@ -260,9 +260,9 @@ fn unchecked_parameter_types_validate_encoded_identity_targets_at_evaluation() {
 #[test]
 fn expression_test_cast_list_applies_element_cast_opts() {
     assert_eq!(project("(cast (cast [1.5] #xt/type [:list [:decimal 64 9 256]]) #xt/type [:list [:decimal 64 9 256]] {:precision 10 :scale 2})"),
-        (T::list(T::Scalar(S::Decimal { precision: 10, scale: 2, bit_width: 128 })), V::List(vec![decimal(150, 10, 2)])));
+        (T::list(T::Scalar(S::Decimal { precision: 10, scale: 2, bit_width: 128 })), V::list(vec![decimal(150, 10, 2)])));
     assert_eq!(project("(cast [[1.245M nil] []] #xt/type [:list [:list [:decimal 64 9 256]]] {:precision 5 :scale 2})").1,
-        V::List(vec![V::List(vec![decimal(124, 5, 2), V::Null]), V::List(vec![])]));
+        V::list(vec![V::list(vec![decimal(124, 5, 2), V::Null]), V::list(vec![])]));
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn decimal_literals_casts_and_round_keep_signed32_scale() {
         assert_eq!(project(expression), (T::Scalar(S::Decimal { precision: 32, scale, bit_width: 128 }), decimal(coefficient, 32, scale)), "{expression}");
     }
     assert_eq!(project("(cast [1E-1000M 2E-1000M] #xt/type [:list [:decimal 64 9 256]] {:precision 32 :scale 1000})").1,
-        V::List(vec![decimal(1, 32, 1000), decimal(2, 32, 1000)]));
+        V::list(vec![decimal(1, 32, 1000), decimal(2, 32, 1000)]));
 }
 
 #[test]

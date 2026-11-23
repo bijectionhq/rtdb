@@ -174,7 +174,7 @@ fn typed_decimal_copy_rejects_metadata_relabeling_and_invalid_width_at_every_dep
         scalar(ScalarType::Decimal { precision: 256, scale: 129, bit_width: 256 }),
     ] {
         assert!(rtdb_columnar::copy_array(&target, std::slice::from_ref(&value)).is_err());
-        assert!(rtdb_columnar::copy_array(&LogicalType::list(target), &[Value::List(vec![value.clone()])]).is_err());
+        assert!(rtdb_columnar::copy_array(&LogicalType::list(target), &[Value::list(vec![value.clone()])]).is_err());
     }
     let mut malformed = if let Value::Decimal(value) = value { value } else { unreachable!() };
     malformed.unscaled.pop();
@@ -218,11 +218,11 @@ fn timestamps_and_durations_preserve_unit_and_zone() {
 #[test]
 fn nested_lists_sets_maps_and_ranges_round_trip() {
     let union = LogicalType::from_legs([scalar(ScalarType::Utf8), scalar(ScalarType::I64), LogicalType::Null]);
-    round_trip(LogicalType::List { kind: ListKind::List, element: Box::new(union) }, vec![Value::List(vec![Value::I64(1), Value::Null, Value::Utf8("x".into())]), Value::List(vec![])]);
+    round_trip(LogicalType::List { kind: ListKind::List, element: Box::new(union) }, vec![Value::list(vec![Value::I64(1), Value::Null, Value::Utf8("x".into())]), Value::list(vec![])]);
     round_trip(LogicalType::List { kind: ListKind::Set, element: Box::new(scalar(ScalarType::I64)) }, vec![Value::Set(vec![Value::I64(1), Value::I64(2)])]);
     let entries = LogicalType::Struct(StructFields::from([("key".into(), scalar(ScalarType::Utf8)), ("value".into(), scalar(ScalarType::I64).maybe())]));
     round_trip(LogicalType::List { kind: ListKind::Map { sorted: false }, element: Box::new(entries) }, vec![Value::Map { entries: vec![(Value::Utf8("one".into()), Value::I64(1)), (Value::Utf8("null".into()), Value::Null)], sorted: false }]);
-    round_trip(LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(scalar(ScalarType::I64)) }.maybe(), vec![Value::Null, Value::FixedSizeList(vec![Value::I64(1), Value::I64(2)])]);
+    round_trip(LogicalType::List { kind: ListKind::FixedSizeList(2), element: Box::new(scalar(ScalarType::I64)) }.maybe(), vec![Value::Null, Value::FixedSizeList(vec![Value::I64(1), Value::I64(2)].into())]);
     round_trip(LogicalType::List { kind: ListKind::TimestampTzRange, element: Box::new(scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })) }, vec![Value::TimestampTzRange { lower: i64::MIN, upper: i64::MAX }]);
 }
 
@@ -354,7 +354,7 @@ fn deeply_nested_union_cells_round_trip_promptly() {
     for depth in 0..40 {
         let other = if depth % 2 == 0 { scalar(ScalarType::Utf8) } else { LogicalType::Struct(StructFields::from([("v".into(), scalar(ScalarType::Bool))])) };
         ty = LogicalType::list(LogicalType::from_legs([ty, other, LogicalType::Null]));
-        value = Value::List(vec![value, Value::Null]);
+        value = Value::list(vec![value, Value::Null]);
     }
     let started = std::time::Instant::now();
     round_trip(ty, vec![value]);
@@ -366,9 +366,9 @@ fn a_column_reader_reads_every_cell_as_read_value_does() {
     use rtdb_columnar::{ColumnReader, build_array, read_value, read_value_as, to_field};
     use rtdb_types::{LogicalType, Value};
     let values = vec![
-        Value::List(vec![Value::I64(1), Value::Utf8("a".into()), Value::Null]),
+        Value::list(vec![Value::I64(1), Value::Utf8("a".into()), Value::Null]),
         Value::Utf8("b".into()),
-        Value::List(vec![Value::Bool(true), Value::List(vec![Value::F64(1.5)])]),
+        Value::list(vec![Value::Bool(true), Value::list(vec![Value::F64(1.5)])]),
         Value::Null,
     ];
     let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());

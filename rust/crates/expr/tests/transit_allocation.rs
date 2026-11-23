@@ -28,8 +28,8 @@ async fn outer_null_and_unequal_prefixes_leave_invalid_transit_unread() {
     let memory = MemoryBudget::new(4096);
     let allocation = EvaluationScope::new(&memory).unwrap();
     assert_eq!(sql_eq(&invalid,&V::Null,&allocation).unwrap(),None);
-    let left = V::List(vec![V::I64(0),invalid.clone()]);
-    let right = V::List(vec![V::I64(1),invalid.clone()]);
+    let left = V::list(vec![V::I64(0),invalid.clone()]);
+    let right = V::list(vec![V::I64(1),invalid.clone()]);
     assert_eq!(sql_eq(&left,&right,&allocation).unwrap(),Some(false));
     assert!(!strict_eq(&left,&right,&allocation).unwrap());
     let expression = Expr::binary(BinaryOp::Eq,Expr::Literal(invalid),Expr::Literal(V::Null));
@@ -104,7 +104,7 @@ fn derived_table_text_and_canonical_output_keep_the_callers_reservations() {
 
 #[test]
 fn equality_shape_admission_uses_the_public_callers_scope() {
-    let value = V::List(vec![V::Set(vec![])]);
+    let value = V::list(vec![V::Set(vec![])]);
     let memory = MemoryBudget::new(4096);
     {
         let allocation = EvaluationScope::new(&memory).unwrap();

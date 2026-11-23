@@ -14,13 +14,13 @@ fn scalar_aliases_keep_null_and_nested_distinctness_and_temporal_metadata_units(
         ("is_true",vec![V::I64(1)],V::Bool(false)),("is_false",vec![V::Null],V::Bool(false)),
         ("distinct-from",vec![V::Null,V::Null],V::Bool(false)),("distinct_from",vec![V::Null,V::I64(1)],V::Bool(true)),
         ("distinct_from",vec![V::I64(1),V::I32(1)],V::Bool(false)),
-        ("distinct_from",vec![V::List(vec![V::Null]),V::List(vec![V::Null])],V::Null),
+        ("distinct_from",vec![V::list(vec![V::Null]),V::list(vec![V::Null])],V::Null),
         ("_meta_double",vec![V::I64(-3)],V::F64(-3.0)),("_meta-double",vec![V::DateDay(-1)],V::F64(-86_400.0)),
         ("_meta_double",vec![V::DateMilli(86_400_001)],V::F64(86_400.0)),
         ("_meta_double",vec![V::Timestamp { value: 1234,unit: U::Millisecond,timezone: Some("UTC".into()) }],V::F64(1.234)),
         ("_meta_double",vec![V::Time { value: 1234,unit: U::Microsecond,bit_width: 64 }],V::F64(0.001234)),
         ("_meta_double",vec![V::Duration { value: -500_000_000,unit: U::Nanosecond }],V::F64(-0.5)),
-        ("_meta_double",vec![V::Utf8("12".into())],V::Null),("_meta_double",vec![V::List(vec![V::I64(1)])],V::Null),
+        ("_meta_double",vec![V::Utf8("12".into())],V::Null),("_meta_double",vec![V::list(vec![V::I64(1)])],V::Null),
     ] { assert_eq!(scalar_call(name,&args,&context).unwrap(),expected,"{name}"); }
     let source = L::Scalar(S::I64).join(&L::Scalar(S::Utf8));
     assert_eq!(function_type("_meta_double",&[source]).unwrap(),L::Scalar(S::F64).maybe());

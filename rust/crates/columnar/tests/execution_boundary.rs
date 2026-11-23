@@ -41,12 +41,12 @@ fn execution_types_retain_nested_layouts_and_merge_collapsed_union_legs() {
     ]));
     assert_eq!(execution_type(&nested), expected);
     let mut value = V::Struct(StructFields::from([
-        ("values".into(), V::FixedSizeList(vec![V::U64(u64::MAX), V::Null])),
+        ("values".into(), V::FixedSizeList(vec![V::U64(u64::MAX), V::Null].into())),
         ("encoded".into(), V::U8(255)),
     ]));
     admit_execution_value(&mut value);
     assert_eq!(value, V::Struct(StructFields::from([
-        ("values".into(), V::FixedSizeList(vec![V::I64(-1), V::Null])),
+        ("values".into(), V::FixedSizeList(vec![V::I64(-1), V::Null].into())),
         ("encoded".into(), V::I8(-1)),
     ])));
     let mut map = V::Map { entries: vec![(V::U16(u16::MAX), V::Set(vec![V::U32(u32::MAX)]))], sorted: true };
@@ -58,12 +58,12 @@ fn execution_types_retain_nested_layouts_and_merge_collapsed_union_legs() {
 
 #[test]
 fn run_end_and_nested_cells_use_the_execution_view_without_rewriting_arrays() {
-    let raw = V::List(vec![V::U8(255), V::U8(128)]);
+    let raw = V::list(vec![V::U8(255), V::U8(128)]);
     let physical = T::list(T::Scalar(S::U8)).run_end_encoded(RunEndWidth::I32).unwrap();
     let field = to_field("v", &physical).unwrap();
     let array = copy_array(&physical, &[raw.clone(), raw.clone()]).unwrap();
     for row in 0..2 {
-        assert_eq!(read_execution_value(&field, array.as_ref(), row).unwrap(), V::List(vec![V::I8(-1), V::I8(-128)]));
+        assert_eq!(read_execution_value(&field, array.as_ref(), row).unwrap(), V::list(vec![V::I8(-1), V::I8(-128)]));
         assert_eq!(read_value(&field, array.as_ref(), row).unwrap(), raw);
     }
     assert_eq!(from_field(&field).unwrap(), physical);

@@ -362,7 +362,7 @@ impl<'a> OpenTransaction<'a> {
                 check_search_index_name(&name)?;
                 let document = rtdb_types::StructFields::from([
                     ("_id".into(), Value::Utf8(name)), ("schema_name".into(), Value::Utf8(table.table.schema.clone())), ("table_name".into(), Value::Utf8(table.table.table.clone())),
-                    ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
+                    ("columns".into(), Value::list(columns.into_iter().map(Value::Utf8).collect())), ("analyzer".into(), Value::Utf8(rtdb_text::SIMPLE_ANALYZER.into())),
                     ("version".into(), Value::I64(self.tx_key().tx_id.0)), ("history".into(), Value::Bool(history)),
                 ]);
                 return self.buffer.put(TableRef::new("xt", "search_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);
@@ -388,7 +388,7 @@ impl<'a> OpenTransaction<'a> {
                     ("_id".into(), Value::Utf8(name)),
                     ("schema_name".into(), Value::Utf8(table.table.schema)),
                     ("table_name".into(), Value::Utf8(table.table.table)),
-                    ("columns".into(), Value::List(columns.into_iter().map(Value::Utf8).collect())),
+                    ("columns".into(), Value::list(columns.into_iter().map(Value::Utf8).collect())),
                     ("version".into(), Value::I64(self.tx_key().tx_id.0)),
                 ]);
                 return self.buffer.put(TableRef::new("xt", "ordered_indexes"), document, interval(self.tx_key().system_time, Timestamp::MAX)?);

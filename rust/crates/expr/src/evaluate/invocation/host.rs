@@ -331,7 +331,7 @@ impl<'a> Expression<'a> {
     }
     fn emission(&self) -> Emission {
         match self {
-            Self::Constant(form) => match literal_leaf(*form) { Some(Value::I64(_)) => Emission::Number(Cast::Long), Some(Value::F64(_)) => Emission::Number(Cast::Double), _ => Emission::Reference },
+            Self::Constant(form) => match literal_leaf(*form).as_deref() { Some(Value::I64(_)) => Emission::Number(Cast::Long), Some(Value::F64(_)) => Emission::Number(Cast::Double), _ => Emission::Reference },
             Self::Local { emission,.. } => *emission,
             Self::Cast { kind,resolution,.. } => resolution.emission(|_|Emission::Number(*kind)),
             Self::Boolean { resolution,.. } => resolution.emission(|_|Emission::Boolean),
@@ -429,7 +429,7 @@ impl HostValue<'_> {
                 FormKind::Literal(value) => match value.kind() {
                     LiteralKind::Keyword(_) => Ok(()),
                     LiteralKind::Text(_) => Err(error("Host value is not callable")),
-                    LiteralKind::Leaf(leaf) => match leaf.value() {
+                    LiteralKind::Leaf(leaf) => match leaf.value().as_ref() {
                         Value::Null => Ok(()),
                         Value::Bool(_) | Value::I64(_) | Value::F64(_) => Err(error("Host value is not callable")),
                         _ => Err(unsupported("Host call admission requires an established host literal carrier")),
@@ -440,7 +440,7 @@ impl HostValue<'_> {
         }
     }
     fn truthy(&self) -> bool {
-        match self { Self::Nil | Self::Bool(false) => false, Self::Constant(form) => !matches!(literal_leaf(*form), Some(Value::Null | Value::Bool(false))), _ => true }
+        match self { Self::Nil | Self::Bool(false) => false, Self::Constant(form) => !matches!(literal_leaf(*form).as_deref(), Some(Value::Null | Value::Bool(false))), _ => true }
     }
     fn string(&self) -> Result<JavaText<'_>> {
         match self {
@@ -461,7 +461,7 @@ impl HostValue<'_> {
             Self::Constant(form) => match form.kind() {
                 FormKind::Literal(value) => match value.kind() {
                     LiteralKind::Text(_) | LiteralKind::Keyword(_) => false,
-                    LiteralKind::Leaf(leaf) => match leaf.value() {
+                    LiteralKind::Leaf(leaf) => match leaf.value().as_ref() {
                         Value::I64(value) => Number::Long(*value).classifies(classification),
                         Value::F64(value) => Number::Double(*value).classifies(classification),
                         Value::Null | Value::Bool(_) => false,
@@ -475,8 +475,8 @@ impl HostValue<'_> {
             Self::Nil | Self::Bool(_) | Self::Text(_) | Self::Function(_) | Self::Vector(_) => false,
         })
     }
-    fn nan(&self) -> bool { match self { Self::Number(value) => value.is_nan(),Self::Constant(form) => matches!(literal_leaf(*form), Some(Value::F64(value)) if value.is_nan()),_ => false } }
-    fn nil(&self) -> bool { matches!(self,Self::Nil) || matches!(self,Self::Constant(form) if matches!(literal_leaf(*form),Some(Value::Null))) }
+    fn nan(&self) -> bool { match self { Self::Number(value) => value.is_nan(),Self::Constant(form) => matches!(literal_leaf(*form).as_deref(), Some(Value::F64(value)) if value.is_nan()),_ => false } }
+    fn nil(&self) -> bool { matches!(self,Self::Nil) || matches!(self,Self::Constant(form) if matches!(literal_leaf(*form).as_deref(),Some(Value::Null))) }
     fn index(&self,context: &EvalContext<'_>) -> Result<i32> {
         drop(self.number(context)?);
         let value = numeric_cast(Cast::Int,self.clone(),false,context)?;
@@ -729,7 +729,7 @@ fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaStri
             FormKind::Literal(value) => match value.kind() {
                 LiteralKind::Text(value) => text_utf8(value,context),
                 LiteralKind::Keyword(value) => { reserve_text(value.len().checked_add(1).ok_or_else(limit)?,context)?;text_utf8(&format!(":{value}"),context) }
-                LiteralKind::Leaf(leaf) => match leaf.value() {
+                LiteralKind::Leaf(leaf) => match leaf.value().as_ref() {
                     Value::Null => text_utf8("",context),
                     Value::Bool(value) => text_utf8(if *value { "true" } else { "false" },context),
                     Value::I64(value) => { context.reserve(32)?;text_utf8(&value.to_string(),context) }
@@ -747,13 +747,13 @@ fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaStri
 fn printed_text(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaString> {
     match text::printed(value,context)? { HostValue::Text(value) => Ok(value),_ => unreachable!() }
 }
-fn literal_leaf<'a>(form: FormView<'a>) -> Option<&'a Value> {
+fn literal_leaf<'a>(form: FormView<'a>) -> Option<std::borrow::Cow<'a, Value>> {
     match form.kind() { FormKind::Literal(value) => match value.kind() { LiteralKind::Leaf(leaf) => Some(leaf.value()), _ => None }, _ => None }
 }
 fn literal_number(form: FormView<'_>,context: &EvalContext<'_>) -> Result<Number> {
     Ok(match form.kind() {
         FormKind::Literal(value) => match value.kind() {
-            LiteralKind::Leaf(leaf) => match leaf.value() { Value::I64(value) => Number::Long(*value), Value::F64(value) => Number::Double(*value), _ => return Err(error("Host value is not a Number")) },
+            LiteralKind::Leaf(leaf) => match leaf.value().as_ref() { Value::I64(value) => Number::Long(*value), Value::F64(value) => Number::Double(*value), _ => return Err(error("Host value is not a Number")) },
             _ => return Err(error("Host value is not a Number")),
         },
         FormKind::BigInteger(value) | FormKind::Decimal(value) => {

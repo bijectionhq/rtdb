@@ -428,7 +428,7 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
         Avro::Array(values) => {
             let Schema::Array(array) = schema else { return Err(error("avro-decode", "Array value lacks its schema")); };
             let element = match &connect.kind { SchemaKind::Array(element) => element.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(error("avro-decode", "Array Connect schema is absent")) };
-            Value::List(values.into_iter().map(|value| convert(&array.items, value, names, unions, element, depth + 1)).collect::<Result<_>>()?)
+            Value::list(values.into_iter().map(|value| convert(&array.items, value, names, unions, element, depth + 1)).collect::<Result<_>>()?)
         }
         Avro::Map(values) => {
             let Schema::Map(map) = schema else { return Err(error("avro-decode", "Map value lacks its schema")); };
@@ -615,7 +615,7 @@ mod tests {
         let array = AvroPlan::parse(r#"{"type":"array","items":"string","connect.default":[null]}"#, &[]).unwrap();
         assert!(array.connect.default.is_none());
         let optional = AvroPlan::parse(r#"{"type":"array","items":["null","string"],"connect.default":[null]}"#, &[]).unwrap();
-        assert_eq!(optional.connect.default, Some(Value::List(vec![Value::Null])));
+        assert_eq!(optional.connect.default, Some(Value::list(vec![Value::Null])));
         let record = AvroPlan::parse(r#"{"type":"record","name":"R","connect.default":{},"fields":[{"name":"required","type":"string","default":"x"}]}"#, &[]).unwrap();
         assert!(record.connect.default.is_none());
         let nested = AvroPlan::parse(r#"{"type":"record","name":"R","fields":[{"name":"nested","type":{"type":"record","name":"N","fields":[{"name":"required","type":"string","default":"x"}]},"default":{}}]}"#, &[]).unwrap();

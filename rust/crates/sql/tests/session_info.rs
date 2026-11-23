@@ -49,7 +49,7 @@ async fn user_resolves_visible_columns_before_using_the_session_value() {
 #[tokio::test]
 async fn session_information_keywords_aliases_and_scalar_calls_share_reference_values() {
     assert_eq!(query("SELECT CURRENT_USER,CURRENT_CATALOG,CURRENT_SCHEMA,CURRENT_SCHEMA() AS test_output_4,CURRENT_DATABASE(),pg_catalog.CURRENT_SCHEMA(),CURRENT_SCHEMAS(TRUE),CURRENT_SCHEMAS(FALSE) AS test_output_8,CURRENT_SETTING('search_path'),CURRENT_SETTING('server_version_num') AS test_output_10").await.unwrap(),
-        [vec![text("xtdb"),text("xtdb"),text("public"),text("public"),text("xtdb"),text("public"),V::List(vec![text("pg_catalog"),text("public")]),V::List(vec![text("public")]),text("public"),text("160000")]]);
+        [vec![text("xtdb"),text("xtdb"),text("public"),text("public"),text("xtdb"),text("public"),V::list(vec![text("pg_catalog"),text("public")]),V::list(vec![text("public")]),text("public"),text("160000")]]);
     assert_eq!(query("SELECT CURRENT_SCHEMAS(NULL),CURRENT_SETTING(NULL)").await.unwrap(), [vec![V::Null,V::Null]]);
     assert_eq!(query("SELECT CURRENT_SETTING('xtdb.version')").await.unwrap(), [vec![text(rtdb_types::runtime_version())]]);
     for source in ["SELECT VERSION()", "SELECT pg_catalog.VERSION()"] {

@@ -82,11 +82,11 @@ pub(crate) fn cast(value: &Value, target: &CastTarget, context: &EvalContext<'_>
         CastTarget::List(element) if element.union_target().is_none() => {
             let parsed;
             let values = match value {
-                Value::List(values) | Value::FixedSizeList(values) => values,
-                Value::Utf8(text) => { parsed = crate::cast::pg_array_text(text)?; &parsed },
+                Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(),
+                Value::Utf8(text) => { parsed = crate::cast::pg_array_text(text)?; rtdb_types::ListView::Values(&parsed) },
                 _ => return crate::cast::cast_target(value, target, context.timezone),
             };
-            return Ok(Value::List(values.iter().map(|value| cast(value, element, context)).collect::<Result<_>>()?));
+            return Ok(Value::list(values.iter().map(|value| cast(value.as_ref(), element, context)).collect::<Result<_>>()?));
         }
         _ => (),
     }

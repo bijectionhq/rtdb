@@ -18,13 +18,13 @@ fn signed_execution_buffers_retain_bits_in_unsigned_declared_fields() {
     ] {
         let source_type = LogicalType::list(LogicalType::Scalar(signed).maybe());
         let target_type = LogicalType::list(LogicalType::Scalar(unsigned).maybe());
-        let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &source_type).unwrap()])), vec![copy_array(&source_type, &[Value::List(vec![value.clone(), Value::Null])]).unwrap()]).unwrap();
+        let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &source_type).unwrap()])), vec![copy_array(&source_type, &[Value::list(vec![value.clone(), Value::Null])]).unwrap()]).unwrap();
         let target = Schema::new(vec![to_field("v", &target_type).unwrap()]);
         let page = conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
         assert_eq!(page.declared_schema().as_ref(), &target);
         assert_eq!(page.batch().schema().as_ref(), &target);
-        assert_eq!(read_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![physical, Value::Null]));
-        assert_eq!(rtdb_columnar::read_execution_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![value, Value::Null]));
+        assert_eq!(read_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::list(vec![physical, Value::Null]));
+        assert_eq!(rtdb_columnar::read_execution_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::list(vec![value, Value::Null]));
         drop(page);
         assert_eq!(memory.used_bytes(), 0);
     }
@@ -51,11 +51,11 @@ fn declared_layout_preserves_nested_nulls_and_reorders_columns() {
     let input_type = LogicalType::list(LogicalType::Null);
     let target_type = LogicalType::list(LogicalType::Scalar(ScalarType::I64));
     let source = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("absent", DataType::Null, true), to_field("items", &input_type).unwrap()])),
-        vec![Arc::new(NullArray::new(1)), copy_array(&input_type, &[Value::List(vec![Value::Null])]).unwrap()]).unwrap();
+        vec![Arc::new(NullArray::new(1)), copy_array(&input_type, &[Value::list(vec![Value::Null])]).unwrap()]).unwrap();
     let target = Schema::new(vec![to_field("items", &target_type).unwrap(), Field::new("absent", DataType::Int64, false)]);
     let page = conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
     assert_eq!(page.declared_schema().as_ref(), &target);
-    assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![Value::Null]));
+    assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::list(vec![Value::Null]));
     assert_eq!(page.batch().column(1).null_count(), 1);
 }
 
@@ -164,7 +164,7 @@ fn nullable_scalar_wrapping_selects_the_declared_null_leg() {
 #[test]
 fn nested_list_layout_keeps_child_names_metadata_and_retained_buffers() {
     let memory = MemoryBudget::new(1 << 23);
-    let value = Value::List(vec![Value::Struct(StructFields::from([("a".into(), Value::I64(5)), ("z".into(), Value::Utf8("nested".into()))]))]);
+    let value = Value::list(vec![Value::Struct(StructFields::from([("a".into(), Value::I64(5)), ("z".into(), Value::Utf8("nested".into()))]))]);
     let logical = value.logical_type();
     let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &logical).unwrap()])), vec![copy_array(&logical, &[value.clone()]).unwrap()]).unwrap();
     let child = Field::new("items", DataType::Struct(vec![Field::new("z", DataType::Utf8, false), Field::new("a", DataType::Int64, false)].into()), false)

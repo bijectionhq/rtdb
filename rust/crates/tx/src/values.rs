@@ -2,7 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Fields, Schema};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field, to_field};
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
@@ -167,26 +167,33 @@ impl ArrowDocuments {
     pub(crate) fn from_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>, owner: Option<&OwnedBatch>, canonical: bool) -> Result<Option<Self>> {
         let schema = batch.schema();
         let Ok(id) = schema.index_of("_id") else { return Ok(None); };
-        if !matches!(schema.field(id).data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Utf8) {
+        let id_type = schema.field(id);
+        let supported_extension = |field: &arrow_schema::Field| match field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str) {
+            Some("uuid") => field.data_type() == &DataType::FixedSizeBinary(16),
+            Some("xt/clj-keyword") => field.data_type() == &DataType::Utf8,
+            _ => false,
+        };
+        if !(id_type.metadata().is_empty()
+            && matches!(id_type.data_type(), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Utf8))
+            && !supported_extension(id_type)
+        {
             return Ok(None);
         }
         let mut vectors = false;
         if batch.num_rows() == 0 || batch.column(id).null_count() != 0 || !schema.fields().iter().zip(batch.columns()).all(|(field, array)| {
-            if !field.metadata().is_empty() ||
-                (field.name().starts_with('_') && field.name() != "_id") {
-                return false;
-            }
+            if field.name().starts_with('_') && field.name() != "_id" { return false; }
+            if !field.metadata().is_empty() { return supported_extension(field); }
             match field.data_type() {
                 DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
-                DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Null => true,
+                DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) | DataType::Null => true,
+                DataType::List(item) if item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64) => {
+                    vectors |= canonical || array.null_count() < array.len();
+                    array.as_any().is::<ListArray>()
+                }
                 DataType::FixedSizeList(item, size) if *size > 0 && item.metadata().is_empty() &&
                     matches!(item.data_type(), DataType::Float32 | DataType::Float64) => {
                     vectors |= canonical || array.null_count() < array.len();
-                    array.as_any().downcast_ref::<FixedSizeListArray>().is_some_and(|list| {
-                        list.values().nulls().is_none_or(|items| {
-                            items.iter().enumerate().all(|(index, valid)| valid || list.is_null(index / *size as usize))
-                        })
-                    })
+                    array.as_any().is::<FixedSizeListArray>()
                 }
                 _ => false,
             }
@@ -207,22 +214,42 @@ impl ArrowDocuments {
                 continue;
             }
             let nullable = if canonical { field.is_nullable() } else { column.null_count() != 0 };
-            let (logical, list) = match field.data_type() {
+            let source = column;
+            let invalid_embedding = |reason: &str| Anomaly::incorrect("rtdb.tx/document-schema", reason);
+            let logical = match field.data_type() {
+                DataType::List(item) => {
+                    let list = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid_embedding("Invalid embedding column"))?;
+                    let child_nullable = if canonical { item.is_nullable() } else { list.values().null_count() != 0 };
+                    let element = from_field(&item.as_ref().clone().with_nullable(child_nullable))?;
+                    LogicalType::list(element)
+                }
                 DataType::FixedSizeList(item, size) => {
                     let list = column.as_any().downcast_ref::<FixedSizeListArray>()
                         .ok_or_else(|| Anomaly::incorrect("rtdb.tx/document-schema", "Invalid embedding column"))?;
-                    let element = from_field(&item.as_ref().clone().with_nullable(canonical && item.is_nullable()))?;
-                    (LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(*size), element: Box::new(element) }, Some(list))
+                    let nullable = if canonical { item.is_nullable() } else {
+                        list.values().nulls().is_some_and(|items| items.iter().enumerate().any(|(index, valid)| {
+                            !valid && list.is_valid(index / *size as usize)
+                        }))
+                    };
+                    let element = from_field(&item.as_ref().clone().with_nullable(nullable))?;
+                    LogicalType::List { kind: rtdb_types::ListKind::FixedSizeList(*size), element: Box::new(element) }
                 }
-                _ => (from_field(&field.as_ref().clone().with_nullable(false))?, None),
+                _ => from_field(&field.as_ref().clone().with_nullable(false))?,
             };
             let logical = if nullable { logical.maybe() } else { logical };
             let field = to_field(field.name(), &logical)?;
-            let column = if let (Some(list), DataType::FixedSizeList(item, size)) = (list, field.data_type()) {
-                Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *size, Arc::clone(list.values()), list.nulls().cloned())
-                    .map_err(|error| Anomaly::incorrect("rtdb.tx/document-schema", error.to_string()))?) as ArrayRef
-            } else {
-                Arc::clone(column)
+            let column: ArrayRef = match field.data_type() {
+                DataType::FixedSizeList(item, size) => {
+                    let list = source.as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| invalid_embedding("Invalid fixed-width embedding column"))?;
+                    Arc::new(FixedSizeListArray::try_new(Arc::clone(item), *size, Arc::clone(list.values()), list.nulls().cloned())
+                        .map_err(|error| invalid_embedding(&error.to_string()))?)
+                }
+                DataType::List(item) => {
+                    let list = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid_embedding("Invalid variable-width embedding column"))?;
+                    Arc::new(ListArray::try_new(Arc::clone(item), list.offsets().clone(), Arc::clone(list.values()), list.nulls().cloned())
+                        .map_err(|error| invalid_embedding(&error.to_string()))?)
+                }
+                _ => Arc::clone(source),
             };
             fields.push(Arc::new(field));
             columns.push(column);

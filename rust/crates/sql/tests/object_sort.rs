@@ -32,6 +32,6 @@ async fn configured_object_sort_reaches_order_window_array_and_percentile_consum
         assert_eq!(query(&format!("SELECT label,ROW_NUMBER() OVER (ORDER BY n) AS rn {source} ORDER BY rn"),object_sort).await,
             [vec![Value::Utf8("b".into()),Value::I64(1)],vec![Value::Utf8("a".into()),Value::I64(2)],vec![Value::Utf8("d".into()),Value::I64(3)],vec![Value::Utf8("c".into()),Value::I64(4)]]);
         assert_eq!(query(&format!("SELECT ARRAY_AGG(label ORDER BY n),PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY n),PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY n DESC) {source}"),object_sort).await,
-            [vec![Value::List(["b","a","d","c"].into_iter().map(|value|Value::Utf8(value.into())).collect()),Value::F64(1.5),Value::I64(2)]]);
+            [vec![Value::list(["b","a","d","c"].into_iter().map(|value|Value::Utf8(value.into())).collect()),Value::F64(1.5),Value::I64(2)]]);
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{data::{EventBatch, StoredOperation}, ipc::ArrowFile, keys::ArtefactOwner, log::proto::ArtefactRecord};
+use rtdb_format::{data::EventBatch, ipc::ArrowFile, keys::ArtefactOwner, log::proto::ArtefactRecord};
 use rtdb_index::PartitionValue;
 use rtdb_maintenance::{ArtefactBuilder, ArtefactDefinition, ArtefactJob};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
@@ -172,17 +172,15 @@ pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
-fn search_row(event: &rtdb_format::data::StoredEvent, columns: &[String]) -> SearchRow {
-    let values = columns.iter().map(|column| match &event.operation {
-        StoredOperation::Put(document) => match document.get(column) {
-            None | Some(Value::Null | Value::Undefined) => None,
-            Some(Value::Utf8(text)) => Some(rtdb_text::tokens(text)),
-            Some(_) => Some(Vec::new()),
-        },
-        _ => None,
-    }).collect();
-    let op = match &event.operation { StoredOperation::Put(_) => rtdb_types::EventOp::Put, StoredOperation::Delete => rtdb_types::EventOp::Delete, StoredOperation::Erase => rtdb_types::EventOp::Erase };
-    SearchRow { iid: event.iid.0, system_from: event.system_from.0, valid_from: event.valid_time.lower().0, valid_to: event.valid_time.upper().0, op, values }
+fn search_row(batch: &EventBatch, row: usize, columns: &[String]) -> Result<SearchRow> {
+    let header = batch.header(row)?;
+    let values = columns.iter().map(|column| Ok(match batch.read_put_field(row, column)? {
+        Value::Null | Value::Undefined => None,
+        Value::Utf8(text) => Some(rtdb_text::tokens(&text)),
+        _ => Some(Vec::new()),
+    })).collect::<Result<_>>()?;
+    Ok(SearchRow { iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
+        valid_to: header.valid_time.upper().0, op: header.op, values })
 }
 
 /// A data file's pages of rows in order, each read under its memory reservation.
@@ -203,7 +201,7 @@ impl Iterator for PageRows<'_> {
         self.page += 1;
         Some(read_page(&mut self.reader, page, self.memory).and_then(|owned| {
             let batch = EventBatch::new(owned.batch().clone())?;
-            (0..batch.len()).map(|row| Ok(search_row(&batch.read_event(row)?, self.columns))).collect()
+            (0..batch.len()).map(|row| search_row(&batch, row, self.columns)).collect()
         }))
     }
 }
@@ -218,7 +216,7 @@ pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &'a Ca
         page += 1;
         Some(file.read_page(page - 1).and_then(|batch| {
             let batch = EventBatch::new(batch)?;
-            (0..batch.len()).map(|row| Ok(search_row(&batch.read_event(row)?, columns))).collect()
+            (0..batch.len()).map(|row| search_row(&batch, row, columns)).collect()
         }))
     }))
 }

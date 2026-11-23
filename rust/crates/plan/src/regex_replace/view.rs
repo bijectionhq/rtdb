@@ -68,7 +68,7 @@ impl<'a> RegexFormPairs<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum LiteralSource<'a> { Legacy(&'a Value), Stored(&'a FormStorage, LiteralId) }
+enum LiteralSource<'a> { Legacy(&'a Value), Packed(rtdb_types::ListView<'a>, usize), Stored(&'a FormStorage, LiteralId) }
 /// An immutable physical literal borrow from an external Value or canonical raw root.
 #[derive(Clone, Copy)]
 pub struct RegexLiteralView<'a>(LiteralSource<'a>);
@@ -84,9 +84,9 @@ impl<'a> RegexLiteralView<'a> {
         match self.0 {
             LiteralSource::Legacy(value) => match value {
                 Value::Utf8(value) => RegexLiteralKind::Text(value), Value::Keyword(value) => RegexLiteralKind::Keyword(value.as_str()),
-                Value::List(values) => RegexLiteralKind::List(RegexLiterals(LiteralSequence::Legacy(values))),
+                Value::List(values) => RegexLiteralKind::List(RegexLiterals(LiteralSequence::Fixed(values.view()))),
                 Value::Set(values) => RegexLiteralKind::Set(RegexLiterals(LiteralSequence::Legacy(values))),
-                Value::FixedSizeList(values) => RegexLiteralKind::FixedSizeList(RegexLiterals(LiteralSequence::Legacy(values))),
+                Value::FixedSizeList(values) => RegexLiteralKind::FixedSizeList(RegexLiterals(LiteralSequence::Fixed(values.view()))),
                 Value::Map { entries, sorted } => RegexLiteralKind::Map { entries: RegexLiteralPairs(LiteralPairs::Legacy(entries)), sorted: *sorted },
                 Value::Struct(fields) => RegexLiteralKind::Struct(RegexFields(FieldSource::Legacy(fields))),
                 value @ (Value::Undefined | Value::Null | Value::Bool(_) | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_)
@@ -94,11 +94,12 @@ impl<'a> RegexLiteralView<'a> {
                     | Value::Binary(_) | Value::FixedSizeBinary(_) | Value::Decimal(_) | Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_)
                     | Value::Time { .. } | Value::Timestamp { .. } | Value::Duration { .. } | Value::IntervalYearMonth(_) | Value::IntervalDayTime { .. }
                     | Value::IntervalMonthDayNano { .. } | Value::IntervalMonthDayMicro { .. } | Value::Uuid(_) | Value::Uri(_) | Value::Transit(_)
-                    | Value::Oid(_) | Value::RegClass(_) | Value::RegProc(_) | Value::TimestampTzRange { .. }) => RegexLiteralKind::Leaf(RegexLeaf(value)),
+                    | Value::Oid(_) | Value::RegClass(_) | Value::RegProc(_) | Value::TimestampTzRange { .. }) => RegexLiteralKind::Leaf(RegexLeaf(LeafSource::Borrowed(value))),
             },
+            LiteralSource::Packed(values, index) => RegexLiteralKind::Leaf(RegexLeaf(LeafSource::Packed(values, index))),
             LiteralSource::Stored(storage, id) => match storage.literals[id.0].kind {
                 LiteralKind::Text(text) => RegexLiteralKind::Text(&storage.texts[text.0]), LiteralKind::Keyword(text) => RegexLiteralKind::Keyword(&storage.texts[text.0]),
-                LiteralKind::Leaf(leaf) => RegexLiteralKind::Leaf(RegexLeaf(storage.leaves[leaf.0].value())),
+                LiteralKind::Leaf(leaf) => RegexLiteralKind::Leaf(RegexLeaf(LeafSource::Borrowed(storage.leaves[leaf.0].value()))),
                 LiteralKind::List(span) => RegexLiteralKind::List(RegexLiterals(LiteralSequence::Stored(storage, &storage.literal_children[span.range()]))),
                 LiteralKind::Set(span) => RegexLiteralKind::Set(RegexLiterals(LiteralSequence::Stored(storage, &storage.literal_children[span.range()]))),
                 LiteralKind::FixedSizeList(span) => RegexLiteralKind::FixedSizeList(RegexLiterals(LiteralSequence::Stored(storage, &storage.literal_children[span.range()]))),
@@ -109,20 +110,36 @@ impl<'a> RegexLiteralView<'a> {
         }
     }
 }
-/// A sealed source borrow of exactly 34 bounded nonrecursive Value variants.
 #[derive(Clone, Copy)]
-pub struct RegexLeaf<'a>(&'a Value);
-impl<'a> RegexLeaf<'a> { pub fn value(self) -> &'a Value { self.0 } }
+enum LeafSource<'a> { Borrowed(&'a Value), Packed(rtdb_types::ListView<'a>, usize) }
 
 #[derive(Clone, Copy)]
-enum LiteralSequence<'a> { Legacy(&'a [Value]), Stored(&'a FormStorage, &'a [LiteralId]) }
+pub struct RegexLeaf<'a>(LeafSource<'a>);
+
+impl<'a> RegexLeaf<'a> {
+    pub fn value(self) -> std::borrow::Cow<'a, Value> {
+        match self.0 {
+            LeafSource::Borrowed(value) => std::borrow::Cow::Borrowed(value),
+            LeafSource::Packed(values, index) => values.get(index).expect("index in packed literal"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LiteralSequence<'a> { Legacy(&'a [Value]), Fixed(rtdb_types::ListView<'a>), Stored(&'a FormStorage, &'a [LiteralId]) }
 /// A borrowed ordered physical sequence; no child Value is reconstructed.
 #[derive(Clone, Copy)]
 pub struct RegexLiterals<'a>(LiteralSequence<'a>);
 impl<'a> RegexLiterals<'a> {
-    pub fn len(self) -> usize { match self.0 { LiteralSequence::Legacy(values) => values.len(), LiteralSequence::Stored(_, values) => values.len() } }
+    pub fn len(self) -> usize { match self.0 { LiteralSequence::Legacy(values) => values.len(), LiteralSequence::Fixed(values) => values.len(), LiteralSequence::Stored(_, values) => values.len() } }
     pub fn is_empty(self) -> bool { self.len() == 0 }
-    pub fn get(self, index: usize) -> Option<RegexLiteralView<'a>> { match self.0 { LiteralSequence::Legacy(values) => values.get(index).map(RegexLiteralView::new), LiteralSequence::Stored(storage, values) => values.get(index).map(|id| RegexLiteralView(LiteralSource::Stored(storage, *id))) } }
+    pub fn get(self, index: usize) -> Option<RegexLiteralView<'a>> {
+        match self.0 {
+            LiteralSequence::Legacy(values) | LiteralSequence::Fixed(rtdb_types::ListView::Values(values)) => values.get(index).map(RegexLiteralView::new),
+            LiteralSequence::Fixed(values) => (index < values.len()).then_some(RegexLiteralView(LiteralSource::Packed(values, index))),
+            LiteralSequence::Stored(storage, values) => values.get(index).map(|id| RegexLiteralView(LiteralSource::Stored(storage, *id))),
+        }
+    }
     pub fn iter(self) -> RegexLiteralIter<'a> { RegexLiteralIter { values: self, front: 0, back: self.len() } }
 }
 #[derive(Clone, Copy)]

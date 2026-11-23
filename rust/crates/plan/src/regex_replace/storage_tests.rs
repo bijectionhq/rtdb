@@ -77,7 +77,7 @@ fn invalid_events_poison_and_destroy_partial_buffers_before_returning() {
     assert_eq!(memory.used_bytes(), 0);
     let mut builder = RegexFormBuilder::new_untracked();
     builder.begin_literal().unwrap();
-    assert_eq!(builder.value_leaf(&Value::List(vec![])).unwrap_err().code, "rtdb.plan/regex-form-build");
+    assert_eq!(builder.value_leaf(&Value::list(vec![])).unwrap_err().code, "rtdb.plan/regex-form-build");
 }
 
 #[test]
@@ -136,8 +136,8 @@ fn physical_values() -> Vec<Value> {
         Value::Duration { value: 5, unit: TimeUnit::Microsecond }, Value::IntervalYearMonth(6), Value::IntervalDayTime { days: 7, milliseconds: 8 },
         Value::IntervalMonthDayNano { months: 1, days: 2, nanoseconds: 3 }, Value::IntervalMonthDayMicro { months: 4, days: 5, nanoseconds: 6 },
         Value::Keyword(Keyword::from_name(":x")), Value::Uuid([17;16]), Value::Uri("unvalidated:%%".into()), Value::Transit(vec![0,128,255]),
-        Value::Oid(1), Value::RegClass(2), Value::RegProc(3), Value::List(vec![Value::I64(1)]), Value::Set(vec![Value::Null,Value::Null]),
-        Value::Map { entries: vec![(Value::I64(1),Value::Bool(true))], sorted: false }, Value::FixedSizeList(vec![Value::Bool(false)]),
+        Value::Oid(1), Value::RegClass(2), Value::RegProc(3), Value::list(vec![Value::I64(1)]), Value::Set(vec![Value::Null,Value::Null]),
+        Value::Map { entries: vec![(Value::I64(1),Value::Bool(true))], sorted: false }, Value::FixedSizeList(vec![Value::Bool(false)].into()),
         Value::TimestampTzRange { lower: -1, upper: 2 }, Value::Struct(StructFields::from([("a".into(), Value::I64(1))]))]
 }
 struct LegacyLiteral<'a>(&'a Value);

@@ -60,7 +60,7 @@ fn nested_unions_and_run_ends_preserve_independent_precision_carriers() {
     let union = LogicalType::from_legs([first_type, second_type, LogicalType::Null]);
     let structure = LogicalType::Struct(StructFields::from([("items".into(), LogicalType::list(union))]));
     let logical = LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(structure) };
-    let value = Value::Struct(StructFields::from([("items".into(), Value::List(vec![first, Value::Null, second]))]));
+    let value = Value::Struct(StructFields::from([("items".into(), Value::list(vec![first, Value::Null, second]))]));
     let values = [value.clone(), value]; let page = batch(&logical, &values);
     let bytes = ipc::write_stream(&page.schema(), &[page]).unwrap();
     check(&ipc::ArrowStream::open(bytes.into(), None).unwrap().next().unwrap().unwrap(), &logical, &values);

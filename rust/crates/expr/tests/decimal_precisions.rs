@@ -163,7 +163,7 @@ fn projection_rejects_nonpositive_precision_and_checks_nested_cells_only_when_wr
         let cast = Expr::Cast { expr: Box::new(parameter), target: CastTarget::fixed(ty.clone()) };
         assert!(evaluate_projection(&cast, &Schema::default(), &[], &EvalContext { parameters: &[value.clone()], ..Default::default() }).is_err());
         assert_eq!(evaluate_projection(&cast, &Schema::default(), &[], &EvalContext { parameters: &[Value::Null], ..Default::default() }).unwrap(), Value::Null);
-        let nested = Value::List(vec![Value::Struct(StructFields::from([("v".into(), value)]))]);
+        let nested = Value::list(vec![Value::Struct(StructFields::from([("v".into(), value)]))]);
         let schema = Schema::new(vec![Field { id: ColumnId(0), name: "nested".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: nested.logical_type() }]).unwrap();
         let column = schema.fields()[0].expression();
         assert_eq!(evaluate_projection(&column, &schema, &[nested.clone()], &EvalContext::default()).unwrap(), nested);

@@ -103,7 +103,7 @@ fn date_bin_keeps_macro_truncation_and_evaluates_bound_origin_before_source() {
 fn range_bins_keep_weighted_intersections_lazy_size_and_signed_reader_size() {
     let V::List(values) = run(&bins(13*60_000_000,38*60_000_000,15*60_000_000)).unwrap() else { panic!() };
     for (value,(from,to,weight)) in values.iter().zip([(0,15,0.08),(15,30,0.6),(30,45,0.32)]) {
-        let V::Struct(fields) = value else { panic!() };
+        let V::Struct(fields) = value.as_ref() else { panic!() };
         assert_eq!(fields["_from"],ts(from*60_000_000,U::Microsecond,Some("UTC")));
         assert_eq!(fields["_to"],ts(to*60_000_000,U::Microsecond,Some("UTC")));
         assert_eq!(fields["_weight"],V::F64(weight));

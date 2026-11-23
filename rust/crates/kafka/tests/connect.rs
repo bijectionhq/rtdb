@@ -265,7 +265,7 @@ async fn flatten_propagates_ancestor_optional_defaults_and_preserves_arrays() {
     let value = converter.decode("events", Some(br#"{"schema":{"type":"struct","fields":[{"field":"nested","type":"struct","optional":true,"fields":[{"field":"n","type":"int64","default":9},{"field":"xs","type":"array","items":{"type":"string"}}]}]},"payload":{"nested":{"n":null,"xs":["a","b"]}}}"#), &mut context).await.unwrap();
     let mut chain = PluginRegistry::default().chain_with_environment(&config,environment()).unwrap();
     let record = chain.apply(SinkRecord::new("events".into(), 0, 1, ConnectData::null(), value)).unwrap().unwrap();
-    assert_eq!(record.value.value, Value::Struct(StructFields::from([("nested.n".into(), Value::I64(9)), ("nested.xs".into(), Value::List(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]))])));
+    assert_eq!(record.value.value, Value::Struct(StructFields::from([("nested.n".into(), Value::I64(9)), ("nested.xs".into(), Value::list(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]))])));
     let schema = record.value.schema.unwrap(); assert!(schema.field("nested.n").unwrap().schema.optional); assert_eq!(schema.field("nested.n").unwrap().schema.default, Some(Value::I64(9)));
 }
 

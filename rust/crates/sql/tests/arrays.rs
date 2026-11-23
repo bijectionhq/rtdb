@@ -28,7 +28,7 @@ async fn query(source: &str) -> Result<Vec<Vec<V>>> {
 #[tokio::test]
 async fn sql_array_bounds_and_trim_preserve_reference_results() {
     assert_eq!(query("SELECT ARRAY_UPPER(ARRAY[1,2],1),ARRAY_LOWER(ARRAY[],1),ARRAY_LENGTH(ARRAY[],1),TRIM_ARRAY(ARRAY[42,43],1)").await.unwrap(),
-        [vec![V::I32(2), V::I32(1), V::I32(0), V::List(vec![V::I64(42)])]]);
+        [vec![V::I32(2), V::I32(1), V::I32(0), V::list(vec![V::I64(42)])]]);
     assert_eq!(query("SELECT ARRAY_LENGTH(TRIM_ARRAY(ARRAY[1,2],-1),1),ARRAY_LOWER(TRIM_ARRAY(ARRAY[],-2147483648),1),TRIM_ARRAY(NULL,1),TRIM_ARRAY(ARRAY[1],NULL) AS test_output_4").await.unwrap(),
         [vec![V::I32(3), V::I32(1), V::Null, V::Null]]);
     for sql in ["SELECT ARRAY_UPPER(ARRAY[1],2)", "SELECT ARRAY_LENGTH(ARRAY[1],0)", "SELECT ARRAY_LOWER(ARRAY[],2)"] {
@@ -36,14 +36,14 @@ async fn sql_array_bounds_and_trim_preserve_reference_results() {
     }
     assert_eq!(query("SELECT TRIM_ARRAY(ARRAY[1,2,3],4)").await.unwrap_err().code, "xtdb.expression/array-element-error");
     assert!(query("SELECT ARRAY_LENGTH(ARRAY[1],CAST(1 AS INT))").await.is_err());
-    assert_eq!(query("SELECT TRIM_ARRAY(ARRAY[1,2],CAST(1 AS INT))").await.unwrap(), [vec![V::List(vec![V::I64(1)])]]);
+    assert_eq!(query("SELECT TRIM_ARRAY(ARRAY[1,2],CAST(1 AS INT))").await.unwrap(), [vec![V::list(vec![V::I64(1)])]]);
 }
 
 #[tokio::test]
 async fn array_views_accept_relational_columns_and_keep_casts_deferred() {
     assert_eq!(query("SELECT TRIM_ARRAY(v,1),ARRAY_LENGTH(v,1) FROM (VALUES (ARRAY[1,2]),(ARRAY[3,4,5])) AS t(v)").await.unwrap(),
-        [vec![V::List(vec![V::I64(1)]), V::I32(2)], vec![V::List(vec![V::I64(3), V::I64(4)]), V::I32(3)]]);
-    assert_eq!(query("SELECT TRIM_ARRAY(CAST(ARRAY['7','bad'] AS BIGINT ARRAY),1)").await.unwrap(), [vec![V::List(vec![V::I64(7)])]]);
+        [vec![V::list(vec![V::I64(1)]), V::I32(2)], vec![V::list(vec![V::I64(3), V::I64(4)]), V::I32(3)]]);
+    assert_eq!(query("SELECT TRIM_ARRAY(CAST(ARRAY['7','bad'] AS BIGINT ARRAY),1)").await.unwrap(), [vec![V::list(vec![V::I64(7)])]]);
     assert_eq!(query("SELECT ARRAY_LENGTH(ARRAY[PG_SLEEP(-0.1)],1)").await.unwrap(), [vec![V::I32(1)]]);
 }
 

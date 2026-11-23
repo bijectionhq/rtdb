@@ -53,7 +53,7 @@ fn uri_expression_equality_uses_objects_and_ordering_reaches_the_byte_buffer_err
     assert_eq!(sql_eq(&left,&right, &equality_scope()).unwrap(),Some(true));
     assert_eq!(sql_not_eq_in_timezone(&left,&right,"UTC", &equality_scope()).unwrap(),Some(false));
     assert!(strict_eq(&left,&right, &equality_scope()).unwrap());
-    assert_eq!(sql_eq(&V::List(vec![left.clone()]),&V::List(vec![right.clone()]), &equality_scope()).unwrap(),Some(true));
+    assert_eq!(sql_eq(&V::list(vec![left.clone()]),&V::list(vec![right.clone()]), &equality_scope()).unwrap(),Some(true));
     assert_eq!(sql_eq(&left,&text("HTTP://EXAMPLE.com/%ab"), &equality_scope()).unwrap(),Some(false));
     assert!(compare(&left,&right,false).is_err());
     assert!(ordered_compare_in_timezone(&left,&right,false,"UTC").is_err());
@@ -76,7 +76,7 @@ fn nested_uri_ascii_rendering_uses_nfc_and_keeps_direct_text_and_escape_spelling
         let uri = V::Uri(original.into());
         assert_eq!(scalar_call("str",std::slice::from_ref(&uri),&EvalContext::default()).unwrap(),text(original));
         let expected = text(&format!("[#xt/uri {ascii:?}]"));
-        assert_eq!(scalar_call("str",&[V::List(vec![uri])],&EvalContext::default()).unwrap(),expected);
+        assert_eq!(scalar_call("str",&[V::list(vec![uri])],&EvalContext::default()).unwrap(),expected);
         let transit = V::Transit(encode_msgpack(&T::Array(vec![T::Tagged { tag: "r".into(),representation: Box::new(T::String(original.into())) }])).unwrap());
         assert_eq!(scalar_call("str",&[transit],&EvalContext::default()).unwrap(),expected);
     }
@@ -85,7 +85,7 @@ fn nested_uri_ascii_rendering_uses_nfc_and_keeps_direct_text_and_escape_spelling
 #[test]
 fn uri_nfc_scratch_is_admitted_before_nested_rendering() {
     let uri = V::Uri(format!("/a{}","\u{301}".repeat(8192)));
-    let value = V::List(vec![uri]);
+    let value = V::list(vec![uri]);
     let memory = MemoryBudget::new(1 << 20);
     let scope = EvaluationScope::new(&memory).unwrap();
     let context = EvalContext { allocation: Some(&scope),..Default::default() };

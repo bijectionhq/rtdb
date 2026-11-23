@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float64Array, PrimitiveArray, builder::Float64Builder, types::{Float32Type, Float64Type}};
+use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float64Array, ListArray, PrimitiveArray, UnionArray, builder::Float64Builder, types::{Float32Type, Float64Type}};
 use arrow_schema::{DataType, Field};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_expr::CosineVector;
@@ -73,13 +73,6 @@ pub(crate) fn fixed_float(array: &dyn Array) -> bool {
         if *width > 0 && item.metadata().is_empty() && matches!(item.data_type(), DataType::Float32 | DataType::Float64))
 }
 
-fn components(value: &Value) -> Option<&[Value]> {
-    match value {
-        Value::List(values) | Value::FixedSizeList(values) => Some(values.as_slice()),
-        _ => None,
-    }
-}
-
 pub(crate) struct Projection {
     position: usize,
     query: CosineVector,
@@ -91,15 +84,23 @@ impl Projection {
         let Some((id, other)) = inputs(expr) else { return Ok(None) };
         let Some(position) = schema.position(id) else { return Ok(None) };
         let prepared = match other {
-            Expr::Literal(value) => Self::prepare(components(value).into_iter().flatten(), memory),
+            Expr::Literal(value) => Self::prepare_value(value, memory),
             Expr::Parameter { index, .. } => match parameters.vector(*index) {
                 Some(array) => Self::prepare_arrow(array, memory),
-                None => Self::prepare(parameters.values().get(*index).and_then(components).into_iter().flatten(), memory),
+                None => match parameters.values().get(*index) { Some(value) => Self::prepare_value(value, memory), None => Ok(None) },
             },
             Expr::List(items) => Self::prepare(items.iter().filter_map(|item| match item { Expr::Literal(value) => Some(value), _ => None }), memory),
             _ => return Ok(None),
         }?;
         Ok(prepared.map(|(query, _memory)| Self { position, query, _memory }))
+    }
+
+    fn prepare_value(value: &Value, memory: &Arc<MemoryBudget>) -> Result<Option<(CosineVector, Arc<MemoryReservation>)>> {
+        let Some(values) = value.list_view() else { return Ok(None); };
+        let bytes = values.len().checked_mul(8).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| crate::invalid("vector-size", "Prepared vector exceeds addressable memory"))?;
+        let Ok(reservation) = memory.reserve(bytes) else { return Ok(None); };
+        Ok(CosineVector::prepare_value(value).ok().map(|query| (query, reservation)))
     }
 
     fn prepare<'a>(values: impl Iterator<Item = &'a Value> + Clone, memory: &Arc<MemoryBudget>) -> Result<Option<(CosineVector, Arc<MemoryReservation>)>> {
@@ -128,14 +129,41 @@ impl Projection {
     }
 
     pub(crate) fn column(&self, batch: &ColumnBatch) -> Option<Column> {
-        let Column::Arrow { array, .. } = batch.columns.get(self.position)? else { return None };
-        let list = array.as_any().downcast_ref::<FixedSizeListArray>()?;
-        let width = usize::try_from(list.value_length()).ok()?;
-        if self.query.dimensions() != width { return None; }
-        let children = list.values();
+        let Column::Arrow { array, logical: Some(logical), .. } = batch.columns.get(self.position)? else { return None };
+        if !crate::columnar::has_float_vector(logical) { return None; }
+        let width = self.query.dimensions();
+        let (children, rows): (&dyn Array, _) = if let Some(list) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+            if usize::try_from(list.value_length()).ok()? != width { return None; }
+            (list.values().as_ref(), None)
+        } else if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+            (list.values().as_ref(), Some(list.value_offsets()))
+        } else {
+            return None;
+        };
+        let bounds = |row| match rows {
+            None => Some((row * width, row * width + width)),
+            Some(offsets) => Some((usize::try_from(offsets[row]).ok()?, usize::try_from(offsets[row + 1]).ok()?)),
+        };
+        let list = array.as_ref();
         let output = match children.data_type() {
-            DataType::Float32 => score_rows::<Float32Type>(list, &self.query, width)?,
-            DataType::Float64 => score_rows::<Float64Type>(list, &self.query, width)?,
+            DataType::Float32 => score_rows::<Float32Type>(list, children, &self.query, bounds)?,
+            DataType::Float64 => score_rows::<Float64Type>(list, children, &self.query, bounds)?,
+            DataType::Union(..) if rtdb_types::ListValue::supports_float_union(children.data_type()) => {
+                let view = rtdb_types::ListView::Union(children.as_any().downcast_ref::<UnionArray>()?);
+                let mut scores = Float64Builder::with_capacity(list.len());
+                for row in 0..list.len() {
+                    if list.is_null(row) {
+                        scores.append_null();
+                        continue;
+                    }
+                    let (start, end) = bounds(row)?;
+                    if (start..end).any(|component| view.float_component(component).is_none()) { return None; }
+                    scores.append_value(self.query.score((start..end).map(|component| {
+                        view.float_component(component).expect("validated components")
+                    }))?);
+                }
+                scores.finish()
+            }
             _ => return None,
         };
         Some(Column::Arrow { array: Arc::new(output), field: Arc::new(Field::new("cosine_distance", DataType::Float64, true)),
@@ -143,10 +171,11 @@ impl Projection {
     }
 }
 
-fn score_rows<T: ArrowPrimitiveType>(list: &FixedSizeListArray, query: &CosineVector, width: usize) -> Option<Float64Array>
+fn score_rows<T: ArrowPrimitiveType>(list: &dyn Array, children: &dyn Array, query: &CosineVector,
+    bounds: impl Fn(usize) -> Option<(usize, usize)>) -> Option<Float64Array>
 where T::Native: Into<f64>,
 {
-    let values = list.values().as_any().downcast_ref::<PrimitiveArray<T>>()?;
+    let values = children.as_any().downcast_ref::<PrimitiveArray<T>>()?;
     let mut builder = Float64Builder::with_capacity(list.len());
     let nulls = values.nulls();
     for row in 0..list.len() {
@@ -154,8 +183,7 @@ where T::Native: Into<f64>,
             builder.append_null();
             continue;
         }
-        let start = row * width;
-        let end = start + width;
+        let (start, end) = bounds(row)?;
         if nulls.is_some_and(|nulls| (start..end).any(|component| nulls.is_null(component))) {
             return None;
         }

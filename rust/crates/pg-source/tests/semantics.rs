@@ -46,7 +46,7 @@ fn postgres_text_types_preserve_numeric_array_and_temporal_values() {
     assert_eq!(read_text(21, "-32768").unwrap(), Value::I16(i16::MIN));
     assert_eq!(read_text(23, "2147483647").unwrap(), Value::I32(i32::MAX));
     assert_eq!(read_text(20, "9223372036854775807").unwrap(), Value::I64(i64::MAX));
-    assert_eq!(read_text(1009, r#"{"NULL",NULL,"a,b","a\"b","a\\b"}"#).unwrap(), Value::List(vec![Value::Utf8("NULL".into()), Value::Null, Value::Utf8("a,b".into()), Value::Utf8("a\"b".into()), Value::Utf8("a\\b".into())]));
+    assert_eq!(read_text(1009, r#"{"NULL",NULL,"a,b","a\"b","a\\b"}"#).unwrap(), Value::list(vec![Value::Utf8("NULL".into()), Value::Null, Value::Utf8("a,b".into()), Value::Utf8("a\"b".into()), Value::Utf8("a\\b".into())]));
     assert_eq!(read_text(1184, "2000-01-01 00:00:00+00").unwrap(), Value::Timestamp { value: 946_684_800_000_000, unit: TimeUnit::Microsecond, timezone: Some("Z".into()) });
     assert_eq!(read_text(1186, "P1Y-2M3DT4H5M6.000001S").unwrap(), Value::IntervalMonthDayMicro { months: 10, days: 3, nanoseconds: 14_706_000_001_000 });
     let Value::Decimal(decimal) = read_text(1700, "0.000000001").unwrap() else { panic!("expected decimal") };

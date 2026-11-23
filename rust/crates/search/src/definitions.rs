@@ -35,7 +35,7 @@ pub async fn definitions_in(database: &str, partitions: Vec<Snapshot>, storage: 
         for row in 0..batch.num_rows() {
             let cell = |column: usize| read_value(schema.field(column), batch.column(column).as_ref(), row);
             let text = |value: Value| match value { Value::Utf8(text) => Ok(text), other => Err(malformed(&other)) };
-            let columns = match cell(3)? { Value::List(values) => values.into_iter().map(text).collect::<Result<Vec<_>>>()?, other => return Err(malformed(&other)) };
+            let columns = match cell(3)? { Value::List(values) => values.into_values().into_iter().map(text).collect::<Result<Vec<_>>>()?, other => return Err(malformed(&other)) };
             let version = match cell(4)? { Value::I64(version) => version, other => return Err(malformed(&other)) };
             // A definition written before the option existed covers history.
             let history = match cell(5)? { Value::Bool(history) => history, Value::Null => true, other => return Err(malformed(&other)) };

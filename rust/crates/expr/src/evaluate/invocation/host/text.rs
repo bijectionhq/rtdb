@@ -113,7 +113,7 @@ fn format(args: &[HostValue<'_>],output: &mut Units<'_,'_>,context: &EvalContext
                         Number::Byte(value) => i64::from(*value),Number::Short(value) => i64::from(*value),Number::Int(value) => i64::from(*value),Number::Long(value) => *value,
                         _ => return Err(error("Host format %d requires an integral argument")),
                     },
-                    HostValue::Constant(form) => match super::literal_leaf(*form) { Some(Value::I64(value)) => *value,_ => return Err(error("Host format %d requires an integral argument")) },
+                    HostValue::Constant(form) => match super::literal_leaf(*form).as_deref() { Some(Value::I64(value)) => *value,_ => return Err(error("Host format %d requires an integral argument")) },
                     _ => return Err(error("Host format %d requires an integral argument")),
                 };
                 output.push_str(&integer.to_string())?;
@@ -135,7 +135,7 @@ fn spread<'a>(value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<Vec<Hos
             FormKind::Set(values) if values.is_empty() => return Ok(Vec::new()),
             FormKind::Map(_) | FormKind::Set(_) => return Err(unsupported("Host sequences of maps and sets are not implemented")),
             FormKind::Literal(literal) => match literal.kind() {
-                LiteralKind::Leaf(leaf) if matches!(leaf.value(),Value::Null) => return Ok(Vec::new()),
+                LiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(),Value::Null) => return Ok(Vec::new()),
                 LiteralKind::Text(_) => return Err(unsupported("Host sequences of String characters are not implemented")),
                 _ => return Err(error("Host value is not a sequence")),
             },
@@ -241,7 +241,7 @@ fn write_form(form: FormView<'_>,output: &mut Units<'_,'_>,context: &EvalContext
         FormKind::Literal(literal) => match literal.kind() {
             LiteralKind::Text(value) => quoted(value.encode_utf16(),output),
             LiteralKind::Keyword(value) => { output.push(u16::from(b':'))?;output.push_str(value) }
-            LiteralKind::Leaf(leaf) => match leaf.value() {
+            LiteralKind::Leaf(leaf) => match leaf.value().as_ref() {
                 Value::Null => output.push_str("nil"),
                 Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
                 Value::I64(value) => output.push_str(&value.to_string()),

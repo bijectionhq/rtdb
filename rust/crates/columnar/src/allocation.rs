@@ -75,9 +75,22 @@ fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
             bytes = add(bytes, cell_cost(leg, value)?)?;
         }
         LogicalType::List { kind, element } => match value {
-            Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => {
+            Value::Set(values) => {
                 for value in values { bytes = add(bytes, cell_cost(element, value)?)?; }
             }
+            Value::List(values) | Value::FixedSizeList(values) => match values.view() {
+                rtdb_types::ListView::Values(values) => {
+                    for value in values { bytes = add(bytes, cell_cost(element, value)?)?; }
+                }
+                _ => {
+                    let plain = match element.as_ref() { LogicalType::Maybe(inner) => inner.as_ref(), element => element };
+                    if matches!(plain, LogicalType::Scalar(ScalarType::F32 | ScalarType::F64)) {
+                        bytes = add(bytes, multiply(values.len(), 8)?)?;
+                    } else {
+                        for value in values.iter() { bytes = add(bytes, cell_cost(element, value.as_ref())?)?; }
+                    }
+                }
+            },
             Value::Map { entries, .. } => {
                 let LogicalType::Struct(fields) = element.as_ref() else { return Err(overflow()); };
                 let key_type = fields.get("key").ok_or_else(overflow)?;
@@ -120,7 +133,11 @@ fn absent_cost(logical: &LogicalType) -> Result<usize> {
 fn value_depth(value: &Value) -> usize {
     1 + match value {
         Value::Struct(fields) => fields.values().map(value_depth).max().unwrap_or(0),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().map(value_depth).max().unwrap_or(0),
+        Value::Set(values) => values.iter().map(value_depth).max().unwrap_or(0),
+        Value::List(values) | Value::FixedSizeList(values) => match values.view() {
+            rtdb_types::ListView::Values(values) => values.iter().map(value_depth).max().unwrap_or(0),
+            _ => usize::from(!values.is_empty()),
+        },
         Value::Map { entries, .. } => entries.iter().map(|(key, value)| value_depth(key).max(value_depth(value))).max().unwrap_or(0) + 1,
         _ => 0,
     }
@@ -134,9 +151,12 @@ fn clone_cost(value: &Value) -> Result<usize> {
         Value::Binary(value) | Value::Transit(value) | Value::FixedSizeBinary(value) => bytes = add(bytes, value.len())?,
         Value::Decimal(value) => bytes = add(bytes, value.unscaled.len())?,
         Value::Timestamp { timezone: Some(timezone), .. } => bytes = add(bytes, timezone.len())?,
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => {
+        Value::Set(values) => {
             for value in values { bytes = add(bytes, clone_cost(value)?)?; }
         }
+        Value::List(values) | Value::FixedSizeList(values) => if let rtdb_types::ListView::Values(values) = values.view() {
+            for value in values { bytes = add(bytes, clone_cost(value)?)?; }
+        },
         Value::Map { entries, .. } => for (key, value) in entries {
             bytes = add(bytes, map_node_cost()?)?;
             bytes = add(bytes, add(clone_cost(key)?, clone_cost(value)?)?)?;

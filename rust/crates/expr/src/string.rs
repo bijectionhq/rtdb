@@ -26,7 +26,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             let parts = if source.is_empty() { Vec::new() }
                 else if nullish(&args[1]) { source.encode_utf16().map(|unit| Value::Utf8(java_utf16([unit]))).collect() }
                 else { let delimiter = text(&args[1])?; if delimiter.is_empty() { vec![Value::Utf8(source.into())] } else { source.split(delimiter).map(|part| Value::Utf8(part.into())).collect() } };
-            return Ok(Value::List(parts));
+            return Ok(Value::list(parts));
         }
         if args.iter().any(nullish) { return Ok(Value::Null); }
         let binary = matches!(args[0], Value::Binary(_));
@@ -109,7 +109,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             "parse_ident" => {
                 let source = text(&args[0])?;
                 context.reserve(source.len().checked_mul(std::mem::size_of::<Value>() * 2 + 64).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
-                Value::List(parse_ident(source)?.into_iter().map(Value::Utf8).collect())
+                Value::list(parse_ident(source)?.into_iter().map(Value::Utf8).collect())
             }
             "quote_ident" => Value::Utf8(quote_ident(text(&args[0])?)),
             _ => unreachable!(),

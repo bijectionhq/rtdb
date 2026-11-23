@@ -265,7 +265,7 @@ impl<'a> RegexFormBuilder<'a> {
     /// Copies a borrowed raw subtree into this root; no source backing or owning child handle is retained.
     pub fn append_view(&mut self, source: RegexFormView<'_>) -> Result<()> {
         self.event(|this| {
-            if matches!(source.kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::Null))) { return this.literal(&Value::Null); }
+            if matches!(source.kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(), Value::Null))) { return this.literal(&Value::Null); }
             this.raw_slot()?;
             this.import(Action::Raw(source))
         })
@@ -290,7 +290,7 @@ impl<'a> RegexFormBuilder<'a> {
                 },
                 Action::Value(value) => match value.kind() {
                     RegexLiteralKind::Text(value) => self.value_text(value)?, RegexLiteralKind::Keyword(value) => self.value_keyword(value)?,
-                    RegexLiteralKind::Leaf(value) => self.value_leaf(value.value())?,
+                    RegexLiteralKind::Leaf(value) => self.value_leaf(value.value().as_ref())?,
                     RegexLiteralKind::List(values) => { self.begin_value_list()?; work.push(Action::End)?; work.push(Action::Sequence(values, 0))?; }
                     RegexLiteralKind::Set(values) => { self.begin_value_set()?; work.push(Action::End)?; work.push(Action::Sequence(values, 0))?; }
                     RegexLiteralKind::FixedSizeList(values) => { self.begin_value_fixed_size_list()?; work.push(Action::End)?; work.push(Action::Sequence(values, 0))?; }

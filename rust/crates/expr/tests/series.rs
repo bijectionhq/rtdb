@@ -11,7 +11,7 @@ fn call(name: &str,args: Vec<Expr>) -> Expr {
 }
 fn ints(start: i64,end: i64,step: i64,inclusive: bool) -> Expr { call("generate_series",vec![int(start),int(end),int(step),lit(V::Bool(inclusive))]) }
 fn run(expr: &Expr) -> rtdb_types::Result<V> { evaluate(expr,&Schema::default(),&[],&EvalContext::default()) }
-fn list(values: &[i64]) -> V { V::List(values.iter().map(|value|V::I64(*value)).collect()) }
+fn list(values: &[i64]) -> V { V::list(values.iter().map(|value|V::I64(*value)).collect()) }
 fn day(year: i32,month: u32,day: u32) -> V { V::calendar_date(CivilDate::from_ymd(year,month,day).unwrap(),DateUnit::Day) }
 fn timestamp(second: i64,unit: U,zone: Option<&str>) -> V { V::Timestamp { value: second * unit.units_per_second(),unit,timezone: zone.map(str::to_owned) } }
 
@@ -48,12 +48,12 @@ fn integer_series_size_and_nth_are_lazy_and_trim_extension_delegates_to_the_view
 #[test]
 fn calendar_series_clamp_each_month_and_preserve_temporal_output_units() {
     let values = [day(2024,1,31),day(2024,5,1),V::IntervalYearMonth(1)];
-    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::List(vec![day(2024,1,31),day(2024,2,29),day(2024,3,29),day(2024,4,29)]));
+    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::list(vec![day(2024,1,31),day(2024,2,29),day(2024,3,29),day(2024,4,29)]));
     let values = [day(1970,1,1),day(1970,1,3),V::IntervalMonthDayMicro { months: 0,days: 1,nanoseconds: 0 },V::Bool(true)];
-    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::List(vec![timestamp(0,U::Microsecond,None),timestamp(86_400,U::Microsecond,None),timestamp(172_800,U::Microsecond,None)]));
+    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::list(vec![timestamp(0,U::Microsecond,None),timestamp(86_400,U::Microsecond,None),timestamp(172_800,U::Microsecond,None)]));
     let values = [V::Timestamp { value: -1,unit: U::Microsecond,timezone: None },V::Timestamp { value: 1,unit: U::Microsecond,timezone: None },V::IntervalMonthDayNano { months: 0,days: 0,nanoseconds: 500 }];
     let expected = [-1000,-500,0,500].into_iter().map(|value|V::Timestamp { value,unit: U::Nanosecond,timezone: None }).collect();
-    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::List(expected));
+    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::list(expected));
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn date_series_cells_wrap_at_the_day_box_width_while_iteration_keeps_wide_calend
     let start = CivilDate::from_epoch_day(i64::from(i32::MAX)).unwrap();
     let end = start.plus_months(1).unwrap();
     let expression = call("generate_series",vec![lit(V::DateDay(i32::MAX)),lit(V::calendar_date(end,DateUnit::Day)),lit(V::IntervalYearMonth(1)),lit(V::Bool(true))]);
-    assert_eq!(run(&expression).unwrap(),V::List(vec![V::DateDay(i32::MAX),V::DateDay(end.epoch_day() as i32)]));
+    assert_eq!(run(&expression).unwrap(),V::list(vec![V::DateDay(i32::MAX),V::DateDay(end.epoch_day() as i32)]));
 }
 
 #[test]
@@ -70,9 +70,9 @@ fn zoned_calendar_days_cross_daylight_changes_and_differing_zones_select_utc() {
     let end = CivilDate::from_ymd(2024,4,1).unwrap().epoch_day()*86_400+10*3600;
     let stride = V::IntervalMonthDayMicro { months: 0,days: 1,nanoseconds: 0 };
     let values = [timestamp(noon,U::Second,Some("Europe/Paris")),timestamp(end,U::Second,Some("Europe/Paris")),stride.clone(),V::Bool(true)];
-    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::List(vec![timestamp(noon,U::Microsecond,Some("Europe/Paris")),timestamp(noon+23*3600,U::Microsecond,Some("Europe/Paris")),timestamp(end,U::Microsecond,Some("Europe/Paris"))]));
+    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::list(vec![timestamp(noon,U::Microsecond,Some("Europe/Paris")),timestamp(noon+23*3600,U::Microsecond,Some("Europe/Paris")),timestamp(end,U::Microsecond,Some("Europe/Paris"))]));
     let values = [timestamp(noon,U::Second,Some("Europe/Paris")),timestamp(end,U::Second,Some("UTC")),stride,V::Bool(true)];
-    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::List(vec![timestamp(noon,U::Microsecond,Some("UTC")),timestamp(noon+24*3600,U::Microsecond,Some("UTC"))]));
+    assert_eq!(scalar_call("generate_series",&values,&EvalContext::default()).unwrap(),V::list(vec![timestamp(noon,U::Microsecond,Some("UTC")),timestamp(noon+24*3600,U::Microsecond,Some("UTC"))]));
 }
 
 #[test]

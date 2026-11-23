@@ -14,7 +14,7 @@ fn box_date_admission_checks_days_and_retains_millisecond_calendar_days() {
 
 #[test]
 fn box_admission_is_shallow_and_physical_millisecond_dates_use_day_reads() {
-    let mut list = Value::List(vec![Value::calendar_date(CivilDate::MAX,DateUnit::Day)]);
+    let mut list = Value::list(vec![Value::calendar_date(CivilDate::MAX,DateUnit::Day)]);
     list.admit_box_date().unwrap();
     assert!(list.admit_expression_dates().is_err());
     for millis in [1,-1,86_400_001,-86_400_001,i64::MIN,i64::MAX] {

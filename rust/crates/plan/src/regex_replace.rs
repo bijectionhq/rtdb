@@ -33,7 +33,7 @@ impl PartialEq for RegexForm {
         match (self.storage(), other.storage()) {
             (Some(left), Some(right)) => left.structural_eq(right),
             (None, None) => true,
-            (None, Some(_)) => matches!(other.view().kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::Null))),
+            (None, Some(_)) => matches!(other.view().kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(), Value::Null))),
             (Some(_), None) => other == self,
         }
     }
@@ -55,7 +55,7 @@ impl RegexForm {
     pub fn copy_untracked(source: RegexFormView<'_>) -> Result<Self> { FormAllocation::Untracked.copy(source) }
 
     fn truthy(&self) -> bool {
-        !matches!(self.view().kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::Null | Value::Bool(false))))
+        !matches!(self.view().kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(), Value::Null | Value::Bool(false))))
     }
     /// Bounds the complete retained backing, including spare capacity and unreachable charged tombstones.
     /// Sharing a backing does not discount this conservative retained-copy bound.
@@ -133,7 +133,7 @@ impl RegexReplacement {
         match self.flags.view().kind() {
             RegexFormKind::Map(_) => (),
             RegexFormKind::Literal(value) => match value.kind() {
-                RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::Null) => (),
+                RegexLiteralKind::Leaf(leaf) if matches!(leaf.value().as_ref(), Value::Null) => (),
                 RegexLiteralKind::Text(text) => { for ch in text.chars() { flag(ch); } }
                 _ => return Err(metadata_error("REGEXP_REPLACE flags are not seqable")),
             },
