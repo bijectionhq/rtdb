@@ -465,7 +465,7 @@ pub async fn unquarantine(directory: &dyn Directory, name: &str) -> Result<Deplo
 
 async fn fork_source(directory: &dyn Directory, parent: &str) -> Result<DeploymentRecord> {
     let source = record(directory, parent).await?;
-    if !source.can_fork() {
+    if !source.can_fork() || source.serving_replay_capture.is_some() {
         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{parent} cannot be forked in its current state")));
     }
     Ok(source)
@@ -1248,6 +1248,7 @@ async fn prepare_cell_move(
         staged.catalog_readers.clear();
         staged.catalog_admission_floors.clear();
         staged.checkpoint_recovery = None;
+        staged.serving_replay_capture = None;
         staged.checkpoint_captures.clear();
         staged.checkpoint_worlds.clear();
         staged.checkpoint_suffix_pins.clear();
@@ -1370,7 +1371,7 @@ async fn stage_cell_storage(
         crate::reference::materialize(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
         ).await?;
-        crate::archive::materialize_completed_repair(
+        crate::archive::materialize_serving_archive(
             from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), hosted_task.as_ref(),
         ).await?;
         if let Some(checkpoint) = staged.checkpoint {

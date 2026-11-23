@@ -395,7 +395,7 @@ impl CellStoreFactory {
                 let checkpoint_replay_from = if config.snapshot_block.is_none() && record.compaction_replay_cutoff.is_none() {
                     checkpoint_startup_replay(record)?
                 } else { None };
-                let repair = crate::archive::completed_repair(record)?.map(|repair| repair.operation);
+                let repair = crate::archive::serving_archive_operation(record)?;
                 record.storage_regions.insert(id, if local {
                     StorageRegion::Local { archive: None, checkpoint_suffix: None, repair_archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
                 } else {

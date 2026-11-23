@@ -1,0 +1,55 @@
+{
+  "summary": "Serving replay source selection requires an exact parked checkpoint, unchanged selection, and a strictly advancing replacement.",
+  "flags": ["--no-external-by-default", "--verify-module", "handoff", "--verify-root"],
+  "min_verified_functions": 5,
+  "controls": {
+    "switch_on_a_running_holder": {
+      "defect": "A writer that opened the earlier physical source is still admitted during selection.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/replay_handoff.rs",
+          "find": "    parked && exact_checkpoint && same_selection && match prior",
+          "replace": "    exact_checkpoint && same_selection && match prior"
+        }
+      ],
+      "expect": [{"file": "rust/crates/multi/src/archive/replay_handoff.rs", "function": "may_install", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    },
+    "skip_exact_checkpoint": {
+      "defect": "Previously verified inventory can select another current checkpoint.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/replay_handoff.rs",
+          "find": "    parked && exact_checkpoint && same_selection && match prior",
+          "replace": "    parked && same_selection && match prior"
+        }
+      ],
+      "expect": [{"file": "rust/crates/multi/src/archive/replay_handoff.rs", "function": "may_install", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    },
+    "switch_after_competing_install": {
+      "defect": "A stale administration task can change the selection made after it started.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/replay_handoff.rs",
+          "find": "    parked && exact_checkpoint && same_selection && match prior",
+          "replace": "    parked && exact_checkpoint && match prior"
+        }
+      ],
+      "expect": [{"file": "rust/crates/multi/src/archive/replay_handoff.rs", "function": "may_install", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    },
+    "same_block_replaces_archive": {
+      "defect": "Two different captures at the same checkpoint can repeatedly replace each other.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/archive/replay_handoff.rs",
+          "find": "Some(prior) => prior < candidate",
+          "replace": "Some(prior) => prior <= candidate"
+        }
+      ],
+      "expect": [{"file": "rust/crates/multi/src/archive/replay_handoff.rs", "function": "may_install", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 4
+    }
+  }
+}

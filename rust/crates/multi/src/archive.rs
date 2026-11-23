@@ -77,6 +77,7 @@ pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod replica_artifact;
 mod replica_suffix;
+mod replay_handoff;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
 mod read_world;
 mod writable_world;
@@ -174,12 +175,49 @@ pub(crate) struct ArchivedCheckpoint {
 }
 
 /// Select the repair in the same directory observation that authorizes its I/O.
-pub(crate) fn completed_repair(record: &DeploymentRecord) -> Result<Option<&CheckpointRecovery>> {
+fn completed_repair(record: &DeploymentRecord) -> Result<Option<&CheckpointRecovery>> {
     let repair = record.checkpoint_recovery.as_deref().filter(|repair| repair.completed_at_ms.is_some());
     if let Some(repair) = repair {
         require_capture_open(record, repair.operation)?;
     }
     Ok(repair)
+}
+
+#[derive(PartialEq, Eq)]
+struct ServingArchive<'a> {
+    point: CapturePoint,
+    archive: &'a str,
+    manifest: &'a str,
+}
+
+fn serving_archive(record: &DeploymentRecord) -> Result<Option<ServingArchive<'_>>> {
+    if let Some(operation) = record.serving_replay_capture {
+        require_capture_open(record, operation)?;
+        let capture = record.checkpoint_captures.get(&operation)
+            .filter(|capture| capture.media_bound)
+            .ok_or_else(|| inconsistent("The serving replay source has no retained capture"))?;
+        let deployment = record.id.parse().map_err(|_| inconsistent("Invalid retained archive owner"))?;
+        let point = capture_point(record, deployment, operation, &capture.archive)?;
+        if !same_incarnation(record, &point) {
+            return Err(inconsistent("The serving replay source belongs to another incarnation"));
+        }
+        return Ok(Some(ServingArchive {
+            point,
+            archive: &capture.archive,
+            manifest: capture.manifest_sha256.as_deref().ok_or_else(|| inconsistent("The serving replay source has no accepted manifest"))?,
+        }));
+    }
+    let Some(recovery) = completed_repair(record)? else { return Ok(None); };
+    let deployment = record.id.parse().map_err(|_| inconsistent("Invalid retained archive owner"))?;
+    let point = capture_point(record, deployment, recovery.operation, &recovery.archive)?;
+    if !same_incarnation(record, &point) || point.checkpoint != recovery.checkpoint {
+        return Err(inconsistent("The recovery archive differs from its accepted checkpoint"));
+    }
+    Ok(Some(ServingArchive { point, archive: &recovery.archive, manifest: &recovery.manifest_sha256 }))
+}
+
+pub(crate) fn serving_archive_operation(record: &DeploymentRecord) -> Result<Option<Uuid>> {
+    Ok(serving_archive(record)?.map(|source| source.point.operation))
 }
 
 impl ArchivedCheckpoint {
@@ -189,24 +227,21 @@ impl ArchivedCheckpoint {
         owner: Uuid,
         region: Arc<IoRegion>,
     ) -> Result<Option<Self>> {
-        let Some(recovery) = completed_repair(record)? else { return Ok(None); };
-        if !record.storage_regions.get(&owner).is_some_and(|hold| hold.admits_archive_read(recovery.operation)) {
-            return Err(inconsistent("Opening a repair archive requires its own storage admission"));
+        let Some(source) = serving_archive(record)? else { return Ok(None); };
+        let operation = source.point.operation;
+        if !record.storage_regions.get(&owner).is_some_and(|hold| hold.admits_archive_read(operation)) {
+            return Err(inconsistent("Opening the serving archive requires its own storage admission"));
         }
-        let archive: CellStorage = serde_json::from_str(&recovery.archive)
+        let archive: CellStorage = serde_json::from_str(source.archive)
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
-        let deployment = record.id.parse::<Uuid>()
-            .map_err(|_| inconsistent("Invalid retained archive owner"))?;
-        let expected = capture_point(record, deployment, recovery.operation, &recovery.archive)?;
         let bucket = archive.bucket(region).await?;
-        let prefix = format!("checkpoint-captures/{}/{}", record.id, recovery.operation);
+        let prefix = format!("checkpoint-captures/{}/{operation}", record.id);
         let scope = PrefixedStore::new(bucket.clone(), prefix.clone());
         let capture = read::<Capture>(&scope, &key("capture.json")?)
             .await?
             .ok_or_else(|| unavailable("The recovery archive is unavailable"))?;
-        if capture.point != expected || !same_incarnation(record, &capture.point)
-            || capture.point.checkpoint != recovery.checkpoint
-            || digest(&encode(&capture)?) != recovery.manifest_sha256
+        if capture.point != source.point || capture.manifest_sha256()? != source.manifest
+            || (record.serving_replay_capture.is_some() && capture.format != CheckpointContents::Replay)
         {
             return Err(inconsistent(
                 "The recovery archive differs from its accepted manifest",
@@ -289,7 +324,7 @@ impl ArchivedCheckpoint {
 
 /// Transfer the repair overlay under a temporary admission in its original
 /// custody. The destination uses its separate publication region.
-pub(crate) async fn materialize_completed_repair(
+pub(crate) async fn materialize_serving_archive(
     directory: &dyn Directory,
     keys: &dyn KeyService,
     source: &DeploymentRecord,
@@ -297,18 +332,18 @@ pub(crate) async fn materialize_completed_repair(
     destination: Arc<dyn ObjectStore>,
     hosted_task: Option<&rtdb_directory::HostedTask>,
 ) -> Result<()> {
-    let Some(repair) = completed_repair(source)? else { return Ok(()); };
-    let archive: CellStorage = serde_json::from_str(&repair.archive)
+    let Some(selected) = serving_archive(source)? else { return Ok(()); };
+    let archive: CellStorage = serde_json::from_str(selected.archive)
         .map_err(|_| inconsistent("Invalid retained archive binding"))?;
     stage::with_region(
-        directory, keys, &source.id, &archive, hosted_task, Some((repair.operation, None)), None,
+        directory, keys, &source.id, &archive, hosted_task, Some((selected.point.operation, None)), None,
         |current| {
             if !matches!(current.lifecycle, Lifecycle::Moving)
                 || current.epoch != source.epoch
                 || current.incarnation != source.incarnation
                 || current.log_epoch != source.log_epoch
                 || current.storage_prefix() != source.storage_prefix()
-                || completed_repair(current)? != Some(repair)
+                || serving_archive(current)?.as_ref() != Some(&selected)
             {
                 return Err(inconsistent("The source no longer admits its repair for transfer"));
             }
@@ -717,6 +752,91 @@ async fn verified_archive(
     Ok((capture, material))
 }
 
+pub async fn retain_serving_replay(
+    directory: &dyn Directory,
+    storage: &CellStorage,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    installation: &DeploymentRecord,
+    operation: Uuid,
+    manifest: &str,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
+) -> Result<CapturePoint> {
+    if same_storage(storage, archive) || storage.overlaps(archive)? {
+        return Err(inconsistent("Serving replay requires an independent archive"));
+    }
+    let deployment = installation.id.parse().map_err(|_| inconsistent("Invalid retained archive owner"))?;
+    let (point, manifest) = capture_receipt(installation, archive, deployment, operation)?
+        .filter(|(_, retained)| retained == manifest)
+        .ok_or_else(|| inconsistent("The capture does not retain the supplied manifest"))?;
+    let admit = |record: &DeploymentRecord| {
+        require_capture_open(record, operation)?;
+        let exact_receipt = capture_receipt(record, archive, deployment, operation)?
+            .is_some_and(|(registered, digest)| registered == point && digest == manifest);
+        if !same_lifetime(record, &point)
+            || record.storage_prefix() != installation.storage_prefix()
+            || record.parent.is_some()
+            || !exact_receipt
+        {
+            return Err(inconsistent("The installation changed before archive handoff"));
+        }
+        if record.serving_replay_capture == Some(operation) {
+            return Ok(());
+        }
+        let previous = serving_archive(record)?.map(|source| source.point.checkpoint.block);
+        let parked = record.holder.is_none() && record.checkpoint_recovery.is_none() && record.move_from.is_none();
+        let exact_checkpoint = record.checkpoint == Some(point.checkpoint)
+            && point.checkpoint.root_sha256.is_some() && record.recovery_manifest_sha256.is_some();
+        let same_selection = record.epoch == installation.epoch
+            && record.serving_replay_capture == installation.serving_replay_capture;
+        if !replay_handoff::may_install(parked, exact_checkpoint, same_selection, previous, point.checkpoint.block) {
+            return Err(inconsistent("Archive handoff requires the exact parked checkpoint and a newer replay source"));
+        }
+        Ok(())
+    };
+    stage::with_region(
+        directory, keys, &installation.id, archive, hosted_task, Some((operation, None)), None,
+        |record| {
+            admit(record)?;
+            Ok(None)
+        },
+        |record, owner, region| {
+            let (point, manifest, admit) = (&point, manifest.as_str(), &admit);
+            async move {
+                if record.serving_replay_capture == Some(operation) {
+                    return Ok(());
+                }
+                let bucket = archive.bucket(region).await?;
+                if read::<CapturePoint>(bucket.as_ref(), &archive_witness(deployment, operation)?).await?.as_ref() != Some(point) {
+                    return Err(inconsistent("The archive belongs to another captured checkpoint"));
+                }
+                let (capture, material) = verified_archive(Arc::clone(&bucket), point, manifest, keys).await?;
+                if capture.format != CheckpointContents::Replay {
+                    return Err(inconsistent("Serving replay requires a complete replay archive"));
+                }
+                keys.existing_key(&record.key_id()).await?
+                    .ok_or_else(|| unavailable("The current installation key is unavailable"))?;
+                let files = PrefixedStore::new(bucket, format!("checkpoint-captures/{deployment}/{operation}/objects"));
+                let plaintext = EncryptingStore::new(Arc::new(files), &material)?;
+                let digest = recovery_manifest_sha256(&plaintext, point.checkpoint, StorageEpoch(point.log_epoch)).await?;
+                update_installation(directory, &installation.id, |current| {
+                    admit(current)?;
+                    if !current.storage_regions.get(&owner).is_some_and(|hold| hold.admits_archive_read(operation)) {
+                        return Err(inconsistent("The archive handoff lost its storage admission"));
+                    }
+                    if current.serving_replay_capture != Some(operation) {
+                        current.serving_replay_capture = Some(operation);
+                        current.recovery_manifest_sha256 = Some(digest);
+                    }
+                    Ok(())
+                }).await?;
+                Ok(())
+            }
+        },
+    ).await?;
+    Ok(point)
+}
+
 fn archive_key_id(point: &CapturePoint) -> String {
     format!("checkpoint-{}-{}-{}", point.deployment, point.incarnation, point.operation)
 }
@@ -930,7 +1050,7 @@ pub(crate) async fn copy_fork_checkpoint(
 ) -> Result<()> {
     let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
         .ok_or_else(|| unavailable("The source has no checkpoint to copy"))?;
-    if source.checkpoint_recovery.is_some() {
+    if source.checkpoint_recovery.is_some() || source.serving_replay_capture.is_some() {
         return Err(inconsistent("A fork requires serving history outside checkpoint repair"));
     }
     let version = checkpoint_storage_root()?;
@@ -1118,7 +1238,7 @@ async fn capture_checkpoint(
         }
         let checkpoint = record.checkpoint_captures[&operation].checkpoint;
         let checkpoint_metadata_from = capture_metadata_floor(record, checkpoint);
-        let repair_archive = completed_repair(record)?.map(|repair| repair.operation);
+        let repair_archive = serving_archive_operation(record)?;
         let admission = if local {
             rtdb_directory::StorageRegion::Local {
                 archive: Some(operation),
@@ -1671,6 +1791,7 @@ pub(crate) async fn restore_checkpoint(
         record.lifecycle = recovery.previous_lifecycle;
         record.compaction_replay_cutoff = Some(cutoff.0);
         record.recovery_manifest_sha256 = None;
+        record.serving_replay_capture = None;
         record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
     })

@@ -65,6 +65,7 @@ pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> b
             .checkpoint_recovery
             .as_ref()
             .is_some_and(|repair| repair.operation == capture)
+        && record.serving_replay_capture != Some(capture)
 }
 
 pub(crate) fn obsolete_world_suffix(
@@ -186,10 +187,10 @@ async fn retire_capture_inner(
                 return Err(inconsistent("A live world retains this checkpoint capture"));
             }
 
-            if record
+            if (record.serving_replay_capture == Some(capture) || record
                 .checkpoint_recovery
                 .as_ref()
-                .is_some_and(|repair| repair.operation == capture)
+                .is_some_and(|repair| repair.operation == capture))
                 && (record.lifecycle != Lifecycle::Deleted || record.disposal.is_none())
             {
                 return Err(inconsistent(
@@ -502,6 +503,27 @@ mod tests {
             store.get_fresh(&object(sibling)?).await?.as_ref(),
             b"retained"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_selected_serving_archive_cannot_be_discarded_while_parked() -> Result<()> {
+        let files = tempfile::tempdir().unwrap();
+        let archive = CellStorage::Local { root: files.path().join("archive") };
+        let storage = CellStorage::Local { root: files.path().join("serving") };
+        let keys = LocalKeyService::new(files.path().join("keys"))?;
+        let directory = MemoryDirectory::new();
+        let capture = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("tenant", "org", Vec::new(), now_ms());
+        record.serving_replay_capture = Some(capture);
+        let record = directory.create_deployment(record).await?;
+
+        let error = retire_capture(directory.as_ref(), &record, &storage, &archive, &keys, capture, None)
+            .await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("The serving history still depends on this capture"));
+        let retained = directory.deployment(&record.id).await?.unwrap();
+        assert_eq!(retained.serving_replay_capture, Some(capture));
+        assert!(require_capture_open(&retained, capture).is_ok());
         Ok(())
     }
 

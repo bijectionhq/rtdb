@@ -45,6 +45,9 @@ struct Request {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     CaptureCheckpoint,
+    RetainServingReplay {
+        manifest_sha256: String,
+    },
     CaptureCheckpointSuffix {
         lease: Uuid,
         basis: rtdb_types::TransactionKey,
@@ -121,6 +124,12 @@ enum Action {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum Reply {
     Captured {
+        name: String,
+        authority: Uuid,
+        point: CapturePoint,
+        manifest_sha256: String,
+    },
+    ServingReplayRetained {
         name: String,
         authority: Uuid,
         point: CapturePoint,
@@ -298,11 +307,10 @@ impl RecoveryService {
                     Some(receipt) => receipt,
                     None => {
                         archive::require_capture_open(&installation, request.capture)?;
-                        let flushed = if installation
-                            .checkpoint_captures
-                            .contains_key(&request.capture)
-                        {
+                        let flushed = if installation.checkpoint_captures.contains_key(&request.capture) {
                             None
+                        } else if installation.holder.is_none() && installation.checkpoint.is_some() {
+                            Some(installation.clone())
                         } else {
                             Some(
                                 flush_checkpoint(directory.as_ref(), &installation, &self.control)
@@ -325,6 +333,18 @@ impl RecoveryService {
                     }
                 };
                 Ok(Reply::Captured {
+                    name: installation.name,
+                    authority: request.authority,
+                    point,
+                    manifest_sha256,
+                })
+            }
+            Action::RetainServingReplay { manifest_sha256 } => {
+                let point = archive::retain_serving_replay(
+                    directory.as_ref(), &self.storage, &self.archive, self.keys.as_ref(),
+                    &installation, request.capture, &manifest_sha256, self.hosted_task.as_ref(),
+                ).await?;
+                Ok(Reply::ServingReplayRetained {
                     name: installation.name,
                     authority: request.authority,
                     point,

@@ -135,7 +135,12 @@ An already admitted reader or an outstanding startup block confirmation keeps th
 The model reaches a state with an admitted archive reader and both original sources removed.
 TLC checks 420 states and rejects publication before synchronization, a foreign replay cut, retirement during an original read or pending confirmation, and trimming before the copy drains.
 The model takes the exact-cut check and independent durable archive content as inputs.
-The runtime still needs an archive format and a custody admission that supply both.
+Hosted recovery can select an independently verified replay capture of the exact parked checkpoint.
+The directory publishes the capture and the recovery digest for its archive custody together, and each startup retains the selected capture before verifying that digest.
+[Verus](../verus/serving_replay_handoff/proof.rs) checks the production selection guard against a live holder, a changed checkpoint, a competing selection, and a replacement at the same block.
+The capture format preserves the existing encrypted replay closure, including the original ordered inputs by logical name.
+Later captures can read those inputs from an admitted archive after their original packs disappear.
+Automatic L0 release needs exact original-pack retirement authority, including the remaining older readers, descendants and pending block confirmations.
 
 ## Source retention through copy completion
 

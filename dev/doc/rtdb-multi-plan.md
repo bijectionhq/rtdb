@@ -177,14 +177,23 @@ witness and exact manifest, and verifies every object under the capture's
 media key. The receipt binds the supplied observation ID to the original
 capture point and digest.
 
+On a parked installation, `capture_checkpoint` uses the already published cut.
+The recovery listener accepts `retain_serving_replay` with the capture ID and `manifest_sha256` of that cut.
+Upgrade the serving and recovery processes that share the directory before selecting a serving replay archive.
+It verifies the original archive in independent custody and publishes its physical inventory receipt together with the selected capture.
+The next holder and later capture operations can read the selected archive while replaying the original installation's ordered tail.
+A parked installation can repeat the operation at a newer captured checkpoint.
+Regions that already use an older source retain that archive until their provider work drains.
+Direct forks of an installation with an attached archive require a separate materialization path.
+
 `discard_checkpoint_capture` installs a permanent release for one capture
 ID in its original cell. It can close an unattempted ID and prevents a late
 capture from creating archive state. Physical retirement waits for the
 recorded capture and repair readers, withdraws only the archive key, and
 purges the capture's versions and unfinished uploads. The release receipt
 and authority witness remain available. The serving installation keeps
-its own key and placement. A capture used by the current repair still
-belongs to the serving closure and cannot be discarded independently.
+its own key and placement.
+A capture used by the current repair or selected for serving replay belongs to the serving closure until the installation replaces or releases it.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.

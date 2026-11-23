@@ -325,6 +325,8 @@ pub struct DeploymentRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub retired_residences: BTreeMap<u64, RetiredResidence>,
     pub checkpoint_recovery: Option<Box<CheckpointRecovery>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_replay_capture: Option<uuid::Uuid>,
     /// Replay retains logical transactions through this position, but the restored checkpoint
     /// replaces the former serving storage and its compaction effects through the same position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -895,7 +897,7 @@ impl DeploymentRecord {
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, log_copy_servers: Vec::new(), linearizable_reads: false, checkpoint: None, replica_anchor: None, moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, deletion_observation: None,
             cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
-            checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, version: 0 }
+            checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
 
     pub fn has_live_suffix_pins(&self, now_ms: i64) -> bool {
@@ -1145,7 +1147,9 @@ fn shared_fork_lineage<'a>(child: &'a DeploymentRecord, parent: Option<&Deployme
     let parent = parent.ok_or_else(fork_conflict)?;
     let shared = parent.org == child.org;
     let lineage = if shared { &parent.lineage } else { &child.id };
-    if !reference_revision::may_publish_fork(parent.version, expected, parent.can_fork(), child.lineage == *lineage) {
+    if !reference_revision::may_publish_fork(parent.version, expected,
+        parent.can_fork() && parent.serving_replay_capture.is_none(), child.lineage == *lineage)
+    {
         return Err(fork_conflict());
     }
     Ok(shared.then_some(child.lineage.as_str()))

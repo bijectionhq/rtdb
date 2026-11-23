@@ -1828,6 +1828,114 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parked_checkpoint_keeps_serving_and_recapturing_after_original_packs_go_away() {
+    let cell = Cell::start(1, None).await;
+    let id = uuid::Uuid::new_v4();
+    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    let holder = cell.holder("shop").await.unwrap();
+    drop(client);
+    cell.node(holder).agent.park("shop").await.unwrap();
+    let parked = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    let checkpoint = parked.checkpoint.unwrap();
+    assert!(parked.holder.is_none() && parked.recovery_manifest_sha256.is_some());
+
+    let storage = cell.storage();
+    let keys = cell.keys();
+    let media = tempfile::tempdir().unwrap();
+    let archive = CellStorage::Local { root: media.path().to_owned() };
+    let operation = uuid::Uuid::new_v4();
+    let captured = rtdb_multi::archive::capture(
+        cell.directory.clone(), &storage, &archive, &keys, id, operation, None, Some(&parked),
+    ).await.unwrap();
+    let manifest = captured.manifest_sha256().unwrap();
+    let registered = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    let input = captured.objects.iter().find(|object| object.name.contains("/data/")).unwrap();
+    let object = media.path().join(format!("checkpoint-captures/{id}/{operation}/objects/{}", input.name));
+    let original = std::fs::read(&object).unwrap();
+    let mut corrupt = original.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(&object, corrupt).unwrap();
+    let retain = || rtdb_multi::archive::retain_serving_replay(
+        cell.directory.as_ref(), &storage, &archive, &keys, &registered, operation, &manifest, None,
+    );
+    assert_eq!(retain().await.unwrap_err().code, "rtdb.storage/immutable-object-conflict");
+    assert!(cell.directory.deployment(&id.to_string()).await.unwrap().unwrap().serving_replay_capture.is_none());
+    std::fs::write(object, original).unwrap();
+
+    assert_eq!(retain().await.unwrap(), captured.point);
+    let attached = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(attached.serving_replay_capture, Some(operation));
+    assert_eq!(attached.checkpoint, Some(checkpoint));
+    assert_eq!(attached.epoch, parked.epoch);
+    assert!(attached.checkpoint_recovery.is_none());
+
+    let CellStorage::Local { root } = &storage else { panic!("local cell fixture") };
+    let version = rtdb_format::keys::StorageRoot::new(
+        rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0),
+    ).unwrap().key();
+    let packs = root.join(parked.storage_prefix()).join(version).join("~packs");
+    assert!(std::fs::read_dir(&packs).unwrap().next().is_some());
+    let isolated = tempfile::tempdir().unwrap();
+    std::fs::rename(&packs, isolated.path().join("removed-original-packs")).unwrap();
+
+    let client = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&client, "SELECT total FROM orders ORDER BY _id").await, ["10"]);
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    assert_eq!(values(&client, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    let holder = cell.holder("shop").await.unwrap();
+    drop(client);
+    cell.node(holder).agent.park("shop").await.unwrap();
+    let successor = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert!(successor.checkpoint.unwrap().block > checkpoint.block);
+    let next = uuid::Uuid::new_v4();
+    let recaptured = rtdb_multi::archive::capture(
+        cell.directory.clone(), &storage, &archive, &keys, id, next, None, Some(&successor),
+    ).await.unwrap();
+    assert!(recaptured.objects.iter().any(|object| object.name == input.name));
+    let next_manifest = recaptured.manifest_sha256().unwrap();
+    let registered_successor = cell.directory.deployment(&id.to_string()).await.unwrap().unwrap();
+    assert_eq!(rtdb_multi::archive::retain_serving_replay(
+        cell.directory.as_ref(), &storage, &archive, &keys, &registered_successor, next, &next_manifest, None,
+    ).await.unwrap(), recaptured.point);
+    assert!(retain().await.is_err());
+    let reopened = connect_eventually(&cell, "shop").await;
+    assert_eq!(values(&reopened, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    drop(reopened);
+    let destination = Cell::start(1, None).await;
+    let from = admin::CellHandle {
+        name: "source",
+        directory: &cell.directory,
+        storage: &storage,
+        keys: &keys,
+        maximum_deployments: 1,
+    };
+    let to = admin::CellHandle {
+        name: "destination",
+        directory: &destination.directory,
+        storage: &destination.storage(),
+        keys: &destination.keys(),
+        maximum_deployments: 1,
+    };
+    let intent = rtdb_directory::CellTransferIntent {
+        operation: Some(uuid::Uuid::new_v4()),
+        authority: id,
+        name: "shop".into(),
+        source: rtdb_directory::CellResidence { cell: "source".into(), org: "acme".into() },
+        destination: rtdb_directory::CellResidence { cell: "destination".into(), org: "acme-destination".into() },
+    };
+    let transfer = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap();
+    let arrived = admin::activate_managed_cell_transfer(&from, &to, &transfer).await.unwrap();
+    assert!(arrived.serving_replay_capture.is_none());
+    let moved = connect_eventually(&destination, "shop").await;
+    assert_eq!(values(&moved, "SELECT total FROM orders ORDER BY _id").await, ["10", "20"]);
+    drop(moved);
+    destination.stop().await;
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority() {
     let mut cell = Cell::start(2, None).await;
     let id = uuid::Uuid::new_v4();
