@@ -159,7 +159,8 @@ Retirement of every earlier copy remains open.
 |Fresh snapshot capture retains the exact read index through capture, and hosted exact removal consumes a lineage deletion grant.
 The shared model and replay cover the R1–R8 authority transitions in a bounded residence.
 Multi records scoped native observations for diagnostic validation.
-Full storage-read and recovery-acknowledgement capability coverage, cross-owner native replay and execution evidence remain open.
+PostgreSQL source feedback uses a permit derived from checkpoint or retained-local-replay evidence.
+Full storage-read and hosted recovery-acknowledgement capability coverage, cross-owner native replay and execution evidence remain open.
 |===
 
 == Placed serving and search

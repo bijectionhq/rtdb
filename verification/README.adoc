@@ -128,6 +128,9 @@ The native recovery trace records committed directory revisions and the logkeepe
 The checker requires a covering published manifest and preserves each recorded replay hold.
 It checks each observed physical floor against the authorization held at that observation.
 Run `python3 verification/recovery_trace.py /path/to/rust-recovery-trace.json` to check the capture again.
+The same fixture supplies scoped Multi observations to the residence validator, which compares physical trim with its exact directory authorization.
+Use `python3 verification/residence_trace.py /path/to/rust-residence-observations.jsonl` to recheck those observations.
+The native replay also includes the thousand-conjunct plan on RTDB's production worker stack.
 The archived controls skip cursor admission and reopen an admitted cursor.
 It also tests catalog promotion after a binary checkpoint round trip.
 The production controls omit the pending historical index and let a tiered replacement publish without its fourth bucket.
@@ -316,6 +319,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Its controls test cross-domain dependencies, including a canceled query's provider read, an older recovery cursor, fork publication and transfer before erasure.
   `tla/ResidenceCompositionReplay.tla` checks an authored event trace against the same transitions and refuses five invalid variants at their first unmatched step.
   With `--native-replay`, it also checks copy and removal effects recorded by local disposal under a directory permit, with a separate control for removal before the relevant fork copy.
+  The expanded scenario adds the append clock, retry lifetime, naming epoch, active read index, upstream confirmation and erasure to the same residence state.
+  The authored fixture projects scoped identities before replay, and mutation controls cover the additional transitions.
+  The expanded scenario and controls are unchecked.
 * `tla/ResidenceRetirement.tla` composes durable intent and exact-identity deletion with a serving view, an in-flight provider request, a recovery cursor, a checkpoint, and a fork.
   It includes three generations, one shared file, one pair of physical versions of a logical key, and one delayed deletion grant per file.
   Its controls drop each hold or fence independently and include loss of a durable intent both before and after installation.

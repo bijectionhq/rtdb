@@ -313,6 +313,7 @@ surface UpstreamReplication {
 
     @guarantee ConfirmationFollowsRecoverableExtent
         -- Flushes and applied replay evidence can advance confirmation.
+        -- The feedback writer takes a permit derived by the confirmation state from the recoverable extent and its previously confirmed position.
 
     @guarantee QuietPublicationDoesNotPinUnrelatedWal
         -- When an adopted checkpoint covers held progress, a quiet source confirms received WAL across gaps in its publication.

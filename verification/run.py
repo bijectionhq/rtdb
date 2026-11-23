@@ -12,7 +12,7 @@ import subprocess
 import tarfile
 import tempfile
 
-from residence_trace import project
+from residence_trace import project, verify_native
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -3238,6 +3238,18 @@ RESIDENCE_AUTHORITY_CASES = (
 )
 
 
+def replay_bounded_worker_stack(args, source):
+    test = "a_thousand_unpushable_conjuncts_plan_and_run_on_a_worker_stack"
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    result = run_case(["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "statement", test, "--", "--exact"],
+                      source / "rust", args.evidence, "rust-residence-worker-stack", env)
+    if result.returncode or f"{test} ... ok" not in result.stdout:
+        raise ValueError("the deep statement did not execute through cursor disposal on the worker stack")
+
+
 def verify_tla(args, scratch):
     for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES):
         case = f"tlc-{name}"
@@ -4917,22 +4929,52 @@ def verify_native_residence_trace(args, source, scratch):
 
 def verify_native_recovery_trace(args, source):
     import copy
-    import sys
 
     label = "rust-recovery-trace"
     trace = args.evidence / f"{label}.json"
+    # The process recorder creates a new file on each capture.
+    with tempfile.TemporaryDirectory(prefix="rtdb-residence-observations-") as temporary:
+        observations = Path(temporary) / "residence.jsonl"
+        capture_native_recovery(args, source, label, trace, observations)
+        native = [json.loads(line) for line in observations.read_text().splitlines()]
+        shutil.copyfile(observations, args.evidence / "rust-residence-observations.jsonl")
+    required = {"publish-checkpoint", "admit-recovery", "authorize-trim", "apply-trim"}
+    if not required.issubset(event["event"] for event in native):
+        raise ValueError(f"{label}: the native residence capture omitted a checkpoint, hold, or trim observation")
+    verify_native(native)
+    bad_scope = copy.deepcopy(native)
+    applied = next(event for event in bad_scope if event["event"] == "apply-trim")
+    applied["epoch"] += 1
+    try:
+        verify_native(bad_scope)
+    except ValueError as error:
+        if "physical trim lacks its exact authorization" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted another journal epoch")
+
+    validate_recovery_revisions(args, label, trace)
+
+
+def capture_native_recovery(args, source, label, trace, observations):
     env = os.environ | {
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
         "CARGO_PROFILE_DEV_DEBUG": "0",
         "CARGO_PROFILE_TEST_DEBUG": "0",
         "CARGO_INCREMENTAL": "0",
         "RTDB_RECOVERY_TRACE_PATH": str(trace.resolve()),
+        "RTDB_RESIDENCE_TRACE_PATH": str(observations),
     }
     test = "a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim"
     command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--test", "cell", test, "--", "--exact"]
     baseline = run_case(command, source / "rust", args.evidence, f"{label}-capture", env)
     if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
         raise ValueError(f"{label}: the native cell did not produce its recovery trace")
+
+
+def validate_recovery_revisions(args, label, trace):
+    import copy
+    import sys
 
     validator = [sys.executable, str(ROOT / "verification/recovery_trace.py")]
     result = run_case([*validator, str(trace)], ROOT, args.evidence, f"{label}-baseline")
@@ -5849,6 +5891,7 @@ def main():
         "rust/crates/conformance/tests/node_faults.rs",
         "rust/crates/conformance/tests/recovery.rs",
         "rust/crates/node/tests/native.rs",
+        "rust/crates/node/tests/statement.rs",
         "rust/crates/node/src/database.rs",
         "rust/crates/tx/src/resolver.rs",
         "rust/crates/azure/src/copy.rs",
@@ -5890,6 +5933,12 @@ def main():
         "rust/crates/logkeeper/src/client/mod.rs",
         "rust/crates/multi/src/logs.rs",
         "rust/crates/multi/src/recovery_holds.rs",
+        "rust/crates/multi/src/residence_trace.rs",
+        "rust/crates/multi/src/hosted_recovery.rs",
+        "rust/crates/multi/src/journal/log.rs",
+        "rust/crates/pg-source/src/driver.rs",
+        "rust/crates/pg-source/src/stream.rs",
+        "rust/crates/pg-source/src/token.rs",
         "rust/crates/multi/src/store.rs",
         "rust/crates/multi/src/store/exact_retirement.rs",
         "rust/crates/multi/src/catalog_readers.rs",
@@ -5979,6 +6028,7 @@ def main():
             verify_replay_prefix(args, source)
             verify_multi_trim_admission(args, source)
             verify_native_recovery_trace(args, source)
+            replay_bounded_worker_stack(args, source)
             verify_placed_receipt_replay(args, source)
             verify_recovery_hold_replay(args, source)
             verify_checkpoint_receipts(args, source)

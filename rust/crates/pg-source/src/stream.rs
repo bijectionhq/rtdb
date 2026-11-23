@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::Result;
-use crate::{ArrowPgTransaction, Decoder, Lsn, Remote, SourceConfig, config::{identifier, replication_literal}, decoder::PG_EPOCH_MICROS, wire::{Connection, Input, protocol, server_error}};
+use crate::{ArrowPgTransaction, Decoder, Lsn, Remote, SourceConfig, config::{identifier, replication_literal}, decoder::PG_EPOCH_MICROS, token::UpstreamAcknowledgement, wire::{Connection, Input, protocol, server_error}};
 
 pub(crate) struct ChangeStream { connection: Connection, decoder: Decoder, received: Lsn }
 pub(crate) struct StreamUpdate { pub received: Lsn, pub transaction: Option<ArrowPgTransaction>, pub reply_requested: bool }
@@ -38,7 +38,8 @@ impl ChangeStream {
             }
         }
     }
-    pub async fn acknowledge(&mut self, confirmed: Lsn) -> Result<()> {
+    pub(crate) async fn acknowledge(&mut self, permit: &UpstreamAcknowledgement) -> Result<()> {
+        let confirmed = permit.through();
         let time = chrono::Utc::now().timestamp_micros().checked_sub(PG_EPOCH_MICROS).ok_or_else(|| protocol("Standby status timestamp overflow"))?;
         let mut bytes = Vec::with_capacity(34); bytes.push(b'r'); bytes.extend_from_slice(&self.received.0.to_be_bytes()); bytes.extend_from_slice(&confirmed.0.to_be_bytes()); bytes.extend_from_slice(&confirmed.0.to_be_bytes()); bytes.extend_from_slice(&time.to_be_bytes()); bytes.push(0);
         self.connection.send(b'd', &bytes).await

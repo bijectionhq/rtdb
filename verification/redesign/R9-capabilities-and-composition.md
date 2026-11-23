@@ -96,6 +96,8 @@ See [R7](R7-eraser.md#verification) for the remaining provider obligations.
 An active-loglet read index is constructed in the quorum client after validating the selected ensemble, stream and epoch.
 Fresh implicit session bases keep the protected index alive through partition capture and check that the attachment still names the same database.
 The installed journal continues to supply its own ordered barrier and retained cut.
+PostgreSQL feedback consumes an acknowledgement permit derived from its checkpoint and recoverable applied extent.
+The local replication term issues an opaque replay token only when its logs retain synced history and its store syncs checkpoints.
 The provider adapter for directory-managed exact removal accepts a grant derived from the durable authorized lineage state, including on retry.
 These values are passive evidence, while the existing journal, partition and directory remain the owners of their decisions.
 Rust compile-fail documentation covers minting a fabricated index and retirement grant.
@@ -110,11 +112,13 @@ Multi can record native observations into one new JSONL file per process via `RT
 Run `python3 verification/residence_trace.py TRACE.jsonl` to check exact retirement and trim correlations, catalog admission floors, read-index identities, scoped replay holds, scheduled archive revocation evidence and observed inline attempt outcomes.
 The sink records decision observations after the owning path returns or observes authority, so directory revision orders catalog CAS observations.
 The production and simulation owners can use the same sink when they run the same Multi machinery.
+The existing native concurrent recovery and trim fixture now supplies a second capture to this checker and a changed-journal negative control.
 The native checker validates correlations within a capture, while composed replay consumes an explicitly projected bounded history.
 Native events can be missing after cancellation, ambiguous responses, opaque or offloaded outcomes, process failure or later enablement.
 Use separate files for separate processes and keep diagnostic capture disabled when measuring strict timing.
 
 Remaining capability boundaries include mandatory held views at every storage and memory answer, current per-unit grants at every cache release, full recovery-closure evidence at every upstream acknowledgement, and general provider deletion through one exact authority.
 The authored projection abstracts plurality of held views, receipt identities and slots, network races, provider timing, and reconstruction from manifest contents.
-Cross-process trace reconstruction, observation of every runtime linearization point, configured-provider evidence and deepest-plan bounded-stack replay remain open.
+The native runner also includes the existing thousand-conjunct fixture on the production worker stack.
+Cross-process trace reconstruction, observation of every runtime linearization point, configured-provider evidence and execution of the worker-stack fixture remain open.
 The expanded model, replay controls and Rust changes have source review only.

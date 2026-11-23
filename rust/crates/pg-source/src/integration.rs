@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::Value;
-use crate::{Remote, SourceConfig, SslMode, snapshot::SnapshotReader, stream::ChangeStream, wire::Connection};
+use crate::{ConfirmationState, Remote, SourceConfig, SslMode, snapshot::SnapshotReader, stream::ChangeStream, wire::Connection};
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured PostgreSQL 17+ server with wal_level=logical and replication credentials"]
@@ -29,7 +29,8 @@ async fn exported_snapshot_and_copyboth_preserve_concurrent_updates_and_full_toa
     let mut stream = ChangeStream::open(&remote, &config, start, Arc::clone(&memory)).await.unwrap();
     let changed = tokio::time::timeout(Duration::from_secs(20), async { loop { if let Some(transaction) = stream.read().await.unwrap().transaction { break transaction; } } }).await.unwrap();
     assert!(changed.lsn > start); assert_eq!(change_cell(&changed, "value"), Value::Utf8("after".into())); assert_eq!(change_cell(&changed, "toast"), toast);
-    stream.acknowledge(changed.lsn).await.unwrap();
+    let feedback = ConfirmationState::new(changed.lsn, Some(changed.lsn)).acknowledgement();
+    stream.acknowledge(&feedback).await.unwrap();
     drop(stream);
     wait_for_slot_release(&mut control, &slot).await;
     let mut resumed = ChangeStream::open(&remote, &config, changed.lsn, Arc::clone(&memory)).await.unwrap();

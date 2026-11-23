@@ -149,14 +149,21 @@ impl ReplicationHandle {
         Ok(position)
     }
 }
+/// The applied resume token that this term can recover from its synced local history.
+pub struct RecoverableExternalToken(Arc<[u8]>);
+
+impl RecoverableExternalToken {
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+}
+
 #[derive(Clone)]
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
 impl TermHandle {
     pub fn term(&self) -> Term { self.term }
     /// The applied resume token covered by the store and the retained durable journal.
-    pub fn recoverable_external_token(&self) -> Option<Arc<[u8]>> {
+    pub fn recoverable_external_token(&self) -> Option<RecoverableExternalToken> {
         if self.handle.logs.retains_recovery_history() && self.handle.status.borrow().role == Role::Leading(self.term) {
-            self.handle.progress.current().external_token
+            self.handle.progress.current().external_token.map(RecoverableExternalToken)
         } else {
             None
         }

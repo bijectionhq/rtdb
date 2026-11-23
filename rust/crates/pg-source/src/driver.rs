@@ -141,9 +141,9 @@ impl SourceDriver {
             let mut initial_status = true;
             let failure = loop {
                 if initial_status {
-                    let confirmable = confirmation.confirmable();
-                    if let Err(error) = stream.acknowledge(confirmable.max(confirmation.confirmed())).await { break error; }
-                    confirmation.confirmed_through(confirmable);
+                    let permit = confirmation.acknowledgement();
+                    if let Err(error) = stream.acknowledge(&permit).await { break error; }
+                    confirmation.confirmed_through(permit.through());
                     initial_status = false;
                 }
                 enum Event { Read(Result<crate::stream::StreamUpdate>), Applied(Option<Result<Applied>>), Durable(std::result::Result<(), watch::error::RecvError>), Tick }
@@ -177,10 +177,10 @@ impl SourceDriver {
                     Event::Durable(change) => { change.map_err(|_| stopped())?; confirmation.adopted(durable(blocks)?); false },
                     Event::Tick => true,
                 };
-                let confirmable = confirmation.confirmable();
-                if force || confirmable > confirmation.confirmed() {
-                    if let Err(error) = stream.acknowledge(confirmable.max(confirmation.confirmed())).await { break error; }
-                    confirmation.confirmed_through(confirmable);
+                let permit = confirmation.acknowledgement();
+                if force || permit.through() > confirmation.confirmed() {
+                    if let Err(error) = stream.acknowledge(&permit).await { break error; }
+                    confirmation.confirmed_through(permit.through());
                 }
                 self.status.send_modify(|status| { status.received = confirmation.received(); status.held = confirmation.held(); status.confirmed = confirmation.confirmed(); });
             };
@@ -207,8 +207,8 @@ fn durable(blocks: &mut watch::Receiver<DriverStatus>) -> Result<Option<Lsn>> {
     Ok(token.filter(|token| token.snapshot_completed).map(|token| token.lsn))
 }
 fn recoverable_token(term: &TermHandle, confirmation: &mut ConfirmationState) -> Result<()> {
-    if let Some(bytes) = term.recoverable_external_token() {
-        let token = ResumeToken::decode(&bytes)?;
+    if let Some(recoverable) = term.recoverable_external_token() {
+        let token = ResumeToken::decode(recoverable.as_bytes())?;
         if token.snapshot_completed {
             confirmation.recovered_by_replay(token.lsn);
         }
