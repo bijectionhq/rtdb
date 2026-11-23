@@ -481,6 +481,13 @@ impl Node {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
+        let replica_capture = basis.replica_capture.as_ref();
+        if let Some(capture) = replica_capture {
+            let same_attachment = held.as_ref().is_some_and(|database| {
+                std::ptr::eq(capture.attachment.as_ptr(), Arc::as_ptr(database))
+            });
+            if !same_attachment { return Err(lost_placement(database)); }
+        }
         let hosted_fence = match cut {
             CatalogReadCut::HostedApplied { history, admission, .. } => {
                 self.ensure_indexing()?;
@@ -488,7 +495,7 @@ impl Node {
                 Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, admission))
             }
             CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
-                if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+                if replica_capture.is_none() && let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
                 None
             }
         };
@@ -572,6 +579,7 @@ impl Node {
         crate::read_currency::require_current(database, lease.as_deref())?;
         let applied_basis = applied.map(|selected| QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.to_owned(), vec![Some(selected.system_time.into())])]) },
+            replica_capture: None,
             snapshot_time: Some(selected.system_time),
             current_time: selected.system_time.into(),
             timezone: basis.timezone.clone(),
@@ -699,7 +707,7 @@ impl Node {
 
     /// The committed outcome visible to the retry when its duplicate guard ran.
     async fn historical_keyed_transaction(&self, database: &str, key: &str, retry_time: Timestamp, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let timestamp = |time: Timestamp| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
         let arguments = vec![timestamp(retry_time), timestamp(submitted_at), Value::Utf8(key.to_owned())];
@@ -729,7 +737,7 @@ impl Node {
         Ok(None)
     }
     async fn placed_outcome_key(&self, database: &str, attempt: PlacedAttempt, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<Option<TransactionKey>> {
-        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::Utf8))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let sql = "SELECT tx_id, tx_system_time FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = ?";
@@ -755,7 +763,7 @@ impl Node {
     }
 
     async fn check_placed_receipt_window(&self, database: &str, submitted_at: Timestamp, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<()> {
-        let basis = QueryBasis { snapshot: TimeBasis::default(), snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: TimeBasis::default(), replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let [installed] = context.catalog.database(database)?.partitions.as_slice() else {
             return Err(bad_attempt_outcome());
@@ -833,7 +841,7 @@ impl Node {
             }
             return Ok(if db.external_source() { result.as_ref().clone() } else { answer_duplicate(result.as_ref().clone()) });
         }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let mut cursor = prepare_query("SELECT system_time, committed, error, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?
@@ -896,7 +904,7 @@ impl Node {
     async fn read_bounded_outcome(&self, database: &str, retry: TxId, original: TransactionKey, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<TransactionResult> {
         let invalid = || Anomaly::fault("rtdb.node/bounded-retry-outcome", "The bounded retry has no matching original outcome");
         if original.tx_id >= retry { return Err(invalid()); }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context_in_placement(database, &basis, identity, placement, CatalogReadCut::Current, cancellation).await?;
         let options = rtdb_sql::PrepareOptions {
             parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]),
@@ -3491,6 +3499,7 @@ impl NativeSession {
         };
         let basis = QueryBasis {
             snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![reserved.map(Into::into)])]) },
+            replica_capture: None,
             snapshot_time: reserved,
             current_time: reserved.map_or_else(|| node.query_instant(), Into::into),
             timezone: self.state.session_timezone().to_owned(),
@@ -3668,16 +3677,22 @@ impl SessionService for NativeSessionService {
         let time = database.partition.value().live().latest_completed_tx().map(|key| key.system_time.into());
         Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
-    async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken) -> Result<TimeBasis> {
-        if !self.node.catalog.is_placed() { return self.snapshot_basis(); }
+    async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken)
+        -> Result<(TimeBasis, Option<crate::ReplicaQueryCapture>)>
+    {
+        if !self.node.catalog.is_placed() { return Ok((self.snapshot_basis()?, None)); }
         self.node.ensure_open()?;
         let database = self.database()?;
+        if !database.has_replica_read_index() { return Ok((self.snapshot_basis()?, None)); }
         let snapshot = database.capture_replica_snapshot(cancellation).await?;
         if !Arc::ptr_eq(&database, &self.database()?) {
             return Err(hosted_source_unavailable());
         }
         let time = snapshot.tx_basis().map(|key| key.system_time.into());
-        Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
+        let basis = TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) };
+        Ok((basis, Some(crate::ReplicaQueryCapture {
+            attachment: Arc::downgrade(&database), snapshot: Arc::new(snapshot),
+        })))
     }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }

@@ -160,6 +160,7 @@ impl TrieCollection {
 #[derive(Debug)]
 pub struct PartitionState {
     value: RwLock<Arc<PartitionValue>>,
+    published: Mutex<Option<Arc<PartitionValue>>>,
     retention: Mutex<Retention>,
 }
 
@@ -175,7 +176,11 @@ impl PreparedWrite {
 
 impl PartitionState {
     pub fn new(initial: PartitionValue) -> Self {
-        Self { value: RwLock::new(Arc::new(initial)), retention: Mutex::new(Retention::default()) }
+        Self {
+            value: RwLock::new(Arc::new(initial)),
+            published: Mutex::new(None),
+            retention: Mutex::new(Retention::default()),
+        }
     }
     pub fn empty(config: TrieConfig) -> Result<Self> {
         Ok(Self::new(PartitionValue::loaded(TrieCatalog::default(), TableCatalog::default().with_system_tables()?, config)?))
@@ -207,6 +212,19 @@ impl PartitionState {
         value.snapshot()
     }
 
+    /// Captures the version published by the driver at this exact cut.
+    /// Mutable state between replica application and publication carries no capture authority.
+    pub fn published_snapshot(&self, cut: CatalogCut) -> Option<Snapshot> {
+        let value = self.value.read();
+        if !matches!(value.catalog_publication, CatalogPublication::Installed(current) if current == cut) {
+            return None;
+        }
+        let published = self.published.lock();
+        let published = published.as_ref()?;
+        self.retain_catalog(published);
+        Some(published.snapshot())
+    }
+
     /// Publishes a prefix after the replica driver has finished installing it.
     /// A reset suspends publication until adoption of its new naming epoch.
     pub fn publish_catalog_cut(&self, cut: CatalogCut) -> Result<()> {
@@ -225,7 +243,10 @@ impl PartitionState {
         }
         let mut next = value.as_ref().clone();
         next.catalog_publication = CatalogPublication::Installed(cut);
-        *value = Arc::new(next);
+        let next = Arc::new(next);
+        self.retain_catalog(&next);
+        *self.published.lock() = Some(Arc::clone(&next));
+        *value = next;
         Ok(())
     }
 
@@ -350,6 +371,7 @@ impl PartitionState {
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(catalog);
         next.catalog_publication = CatalogPublication::Suspended;
+        *self.published.lock() = None;
         *value = Arc::new(next);
         Ok(())
     }

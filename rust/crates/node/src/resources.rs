@@ -21,7 +21,7 @@ pub trait ReplicaReadIndex: Send + Sync {
     async fn confirm(&self) -> Result<rtdb_storage::log::LogOffset>;
 
     /// Keeps the protected source basis alive until the database applies it.
-    async fn protect(&self) -> Result<ProtectedReadIndex> {
+    async fn protect(&self, _applied: rtdb_storage::log::LogOffset) -> Result<ProtectedReadIndex> {
         Ok(ProtectedReadIndex {
             offset: self.confirm().await?,
             wait: std::time::Duration::from_millis(20),

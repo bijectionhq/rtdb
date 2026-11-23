@@ -91,20 +91,47 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
+    pub(crate) fn has_replica_read_index(&self) -> bool {
+        self.replica_read_index.is_some()
+    }
+
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
-        self.with_confirmed_replica(cancellation, |_| Ok(())).await
+        if let Some(index) = &self.replica_read_index {
+            self.confirm_replica_cut(index.as_ref(), cancellation).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn capture_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
-        self.with_confirmed_replica(cancellation, |confirmed| {
-            let snapshot = self.partition.snapshot();
-            if confirmed.is_some_and(|position| !snapshot.catalog_cut().is_some_and(|cut| {
-                cut.replica_epoch == self.logs.replica_epoch && cut.through >= position
-            })) {
-                return Err(self.replica_behind());
+        let Some(index) = &self.replica_read_index else { return Ok(self.partition.snapshot()); };
+        // The reader can sample again if apply already passed its selection.
+        // Each retry is a fresh confirmation within the original invocation.
+        for _ in 0..3 {
+            let (barrier, position) = self.confirm_replica_cut(index.as_ref(), cancellation).await?;
+            let snapshot = match position {
+                Some(through) => self.partition.published_snapshot(CatalogCut {
+                    storage_version: self.logs.storage_version,
+                    storage_epoch: self.logs.storage_epoch,
+                    replica_epoch: self.logs.replica_epoch,
+                    through,
+                }),
+                None => Some(self.partition.snapshot()).filter(|snapshot| {
+                    snapshot.catalog_cut().is_none() && snapshot.tx_basis().is_none()
+                }),
+            };
+            if let Some(snapshot) = snapshot {
+                return tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+                    _ = self.cancellation.cancelled() => Err(self.replica_behind()),
+                    retained = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage) => {
+                        drop(barrier);
+                        retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))
+                    }
+                };
             }
-            Ok(snapshot)
-        }).await
+        }
+        Err(self.replica_behind())
     }
 
     fn replica_behind(&self) -> Anomaly {
@@ -112,24 +139,25 @@ impl Database {
             format!("This replica of {} could not establish a fresh snapshot", self.name))
     }
 
-    async fn with_confirmed_replica<T>(&self, cancellation: &CancellationToken,
-        capture: impl FnOnce(Option<ReplicaPosition>) -> Result<T>,
-    ) -> Result<T> {
-        let Some(read_index) = &self.replica_read_index else { return capture(None); };
+    async fn confirm_replica_cut(&self, read_index: &dyn ReplicaReadIndex, cancellation: &CancellationToken)
+        -> Result<(crate::ProtectedReadIndex, Option<ReplicaPosition>)>
+    {
         let confirm = async {
-            let barrier = read_index.protect().await.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
-            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
-            let confirmed = (barrier.offset.0 != -1).then_some(position);
             let mut status = self.watch_status();
+            let applied = status.borrow().installed.map_or(-1, |prefix| {
+                prefix.replica.after_offset(self.logs.replica_epoch)
+            });
+            let barrier = read_index.protect(rtdb_storage::log::LogOffset(applied)).await
+                .map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+            let confirmed = if barrier.offset.0 == -1 { None } else {
+                Some(ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?)
+            };
             let applied = status.wait_for(|status| status.role == Role::Stopped
                 || confirmed.is_none_or(|position| status.installed.is_some_and(|prefix| prefix.replica >= position)));
             let status = tokio::time::timeout(barrier.wait, applied).await
                 .map_err(|_| self.replica_behind())?.map_err(|_| self.replica_behind())?;
             if status.role == Role::Stopped { return Err(self.replica_behind()); }
-            drop(status);
-            let captured = capture(confirmed);
-            drop(barrier);
-            captured
+            Ok((barrier, confirmed))
         };
         tokio::select! {
             biased;

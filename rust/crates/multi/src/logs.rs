@@ -30,17 +30,40 @@ const SCAN_WINDOW: i64 = 256;
 const INTAKE_TIP_WINDOW: i64 = 8;
 const READ_INDEX_WITHIN: Duration = Duration::from_secs(2);
 
-struct LogletReadIndex { log: Arc<QuorumLog>, epoch: u64 }
+struct LogletReadIndex {
+    log: Arc<QuorumLog>,
+    epoch: u64,
+    custody: RecoveryAdmission,
+}
 
-#[async_trait]
-impl ReplicaReadIndex for LogletReadIndex {
-    async fn confirm(&self) -> Result<LogOffset> {
+impl LogletReadIndex {
+    async fn sample(&self) -> Result<rtdb_logkeeper::ActiveLogletReadIndex> {
         let index = tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
             .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))??;
         crate::residence_trace::record("read-index", || serde_json::json!({
             "stream": index.stream(), "epoch": index.epoch(), "ensemble": index.ensemble(), "through": index.through().0,
         }));
-        Ok(index.through())
+        Ok(index)
+    }
+}
+
+#[async_trait]
+impl ReplicaReadIndex for LogletReadIndex {
+    async fn confirm(&self) -> Result<LogOffset> { Ok(self.sample().await?.through()) }
+
+    async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> {
+        let index = self.sample().await?;
+        let offset = index.through();
+        let replay = if applied < offset {
+            self.custody.hold(applied, offset).await?
+        } else {
+            None
+        };
+        Ok(rtdb_node::ProtectedReadIndex {
+            offset,
+            wait: READ_INDEX_WITHIN,
+            retention: Some(Arc::new((index, replay))),
+        })
     }
 }
 
@@ -183,7 +206,7 @@ struct OrderedReadIndex(Arc<crate::journal::JournalLog>);
 #[async_trait]
 impl ReplicaReadIndex for OrderedReadIndex {
     async fn confirm(&self) -> Result<LogOffset> { self.0.confirm().await }
-    async fn protect(&self) -> Result<rtdb_node::ProtectedReadIndex> { self.0.protect().await }
+    async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> { self.0.protect(applied).await }
 }
 
 #[async_trait]
@@ -237,14 +260,18 @@ impl LogFactory for LogkeeperLogFactory {
             LogAccess::SourceWriter => return Err(Anomaly::unsupported("rtdb.multi/source-writer",
                 "A deployment has one writer, its holder; submissions reach it through the gateway")),
         };
-        let replica_read_index = config.require_read_index.then(|| Box::new(LogletReadIndex {
-            log: Arc::clone(&quorum), epoch: config.epoch,
-        }) as Box<dyn ReplicaReadIndex>);
+        let read_index = || -> Box<dyn ReplicaReadIndex> {
+            Box::new(LogletReadIndex {
+                log: Arc::clone(&quorum), epoch: config.epoch,
+                custody: RecoveryAdmission::new(Arc::clone(&self.holds), &config),
+            })
+        };
+        let replica_read_index = config.require_read_index.then(&read_index);
         let await_authority = if let Some(scope) = scope {
             let recovery = if access == LogAccess::ReadWrite {
                 ClosedEpochRecovery::Opened(quorum.latest()?)
             } else {
-                ClosedEpochRecovery::ReadIndex(Box::new(LogletReadIndex { log: Arc::clone(&quorum), epoch: config.epoch }))
+                ClosedEpochRecovery::ReadIndex(read_index())
             };
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery,
                 placed_receipt_retirement: config.placed_receipt_retirement }

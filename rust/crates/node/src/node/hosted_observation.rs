@@ -246,6 +246,7 @@ impl OwnedReadSession {
         }
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
+            replica_capture: None,
             snapshot_time: None,
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),
@@ -338,6 +339,7 @@ impl OwnedReadSession {
         }
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
+            replica_capture: None,
             snapshot_time: None,
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),

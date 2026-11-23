@@ -74,6 +74,7 @@ async fn a_replicated_query_without_a_current_catalog_lease_is_refused_before_ev
         let (node, owner) = running(config, NodeServices { clock, ..services() }).await;
         let basis = QueryBasis {
             snapshot: node.snapshot_basis().unwrap(),
+            replica_capture: None,
             snapshot_time: None,
             current_time: node.query_instant(),
             timezone: "UTC".into(),
@@ -193,7 +194,7 @@ async fn a_placed_query_refuses_a_database_detached_or_replaced_while_checking_i
         let (node, driver) = running(config, services).await;
         node.database_or_attach("shop".into(), Default::default()).await.unwrap().unwrap();
         let basis = QueryBasis {
-            snapshot: node.snapshot_basis().unwrap(), snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into(),
+            snapshot: node.snapshot_basis().unwrap(), replica_capture: None, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into(),
         };
         let request_node = node.clone();
         let query = tokio::spawn(async move {
@@ -3305,7 +3306,7 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
             let request = {
                 let node = node.clone(); let identity = Arc::clone(&identity); let cancellation = cancellation.clone();
                 tokio::spawn(async move {
-                    let basis = QueryBasis { snapshot: node.snapshot_basis()?, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
+                    let basis = QueryBasis { snapshot: node.snapshot_basis()?, replica_capture: None, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
                     node.query_context("xtdb", &basis, identity.as_ref(), &cancellation).await
                 })
             };
@@ -3322,7 +3323,7 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
 async fn node_shutdown_cancels_direct_query_contexts_with_independent_caller_tokens() {
     let (node, driver) = running(options(), services()).await;
     let cancellation = CancellationToken::new();
-    let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
+    let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
     let context = node.query_context("xtdb", &basis, &Authority, &cancellation).await.unwrap();
     let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
     let mut cursor = prepared.open_query(context, Vec::new()).await.unwrap();
@@ -3626,6 +3627,7 @@ async fn a_read_basis_after_the_latest_completed_tx_names_both_instants() {
     let cancellation = CancellationToken::new();
     let basis_at = |micros: i64| QueryBasis {
         snapshot: rtdb_types::TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(rtdb_types::Instant::from(Timestamp(micros)))])]) },
+        replica_capture: None,
         snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
     let error = node.query_context("xtdb", &basis_at(1_577_836_800_000_000), &Authority, &cancellation).await.err().unwrap();
     assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb/unindexed-tx", Some("system-time (2020-01-01T00:00:00Z) is after the latest completed tx (nil)")));

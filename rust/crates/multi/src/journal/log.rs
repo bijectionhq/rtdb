@@ -298,10 +298,10 @@ impl JournalLog {
 #[async_trait]
 impl ReplicaReadIndex for JournalLog {
     async fn confirm(&self) -> rtdb_types::Result<LogOffset> {
-        Ok(self.protect().await?.offset)
+        Ok(self.protect(LogOffset(-1)).await?.offset)
     }
 
-    async fn protect(&self) -> rtdb_types::Result<ProtectedReadIndex> {
+    async fn protect(&self, _applied: LogOffset) -> rtdb_types::Result<ProtectedReadIndex> {
         let mut writer = self.writer.lock().await;
         let mut retried = false;
         loop {

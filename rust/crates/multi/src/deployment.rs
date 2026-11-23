@@ -329,7 +329,7 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         replica_stream: record.stream("replica"),
         replica_seal_scope: record.replica_seal_scope(),
         epoch: record.epoch,
-        require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
+        require_read_index: record.linearizable_reads && matches!(role, Role::Holder | Role::Subscriber | Role::Compactor),
         placed_receipt_retirement: record.placed_receipt_retirement,
         log_epoch: record.log_epoch,
         transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
