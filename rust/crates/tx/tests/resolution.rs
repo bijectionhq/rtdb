@@ -712,6 +712,47 @@ async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_
 }
 
 #[tokio::test]
+async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_projection_advances() {
+    use rtdb_format::envelope::{ReplicaBody, SourceMessage};
+    use rtdb_types::{OwnedRelation, TxId};
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let owned = |revision, value| {
+        let source = SourceTransaction::new(
+            vec![TxOp::OwnedReplaceDocs {
+                relation: OwnedRelation::new("clocks").unwrap(),
+                documents: Documents::new(vec![document(value)], &context.memory).unwrap(),
+                valid_from: Some(Timestamp(0)), valid_to: None,
+            }],
+            SubmitOptions { user: Some("owner".into()), system_time: Some(Timestamp(revision)), ..Default::default() },
+            &context.memory,
+        ).unwrap();
+        let encoded = source.encode().unwrap();
+        SourceTransaction::decode(&SourceMessage::decode(encoded.as_slice()).unwrap().unwrap(), &context.memory).unwrap()
+    };
+    let results = TableRef::new("xt", "txs");
+    for (position, sample) in [(0, 100), (1, 100), (2, 99)] {
+        let snapshot = state.snapshot();
+        let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(position), Timestamp(sample), owned(sample, position), &context).await.unwrap();
+        assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+        let key = resolved.result().tx_key();
+        assert_eq!(key.tx_id, TxId(position));
+        assert_eq!(key.system_time, Timestamp(100 + position));
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("resolved transaction"); };
+        let replay = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
+        let events = replay.writes.tables()[&results].batch().unwrap();
+        let StoredOperation::Put(row) = events.view().read_event(0).unwrap().operation else { panic!("transaction row"); };
+        assert!(matches!(row["source_log_time"], Value::Timestamp { value, .. } if value == sample));
+        state.apply(resolver.take_head().unwrap().writes()).unwrap();
+    }
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(97, 3), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb/ordered-system-time");
+}
+
+#[tokio::test]
 async fn a_retry_identity_answers_its_own_body_and_refuses_another_within_its_window() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let context = context();

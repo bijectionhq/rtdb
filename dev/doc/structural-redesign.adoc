@@ -17,7 +17,10 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Coordinates
 
-History uses transaction system time, bounded by the log clock, and drives no physical decision.
+Commit order uses the ordered transaction position.
+The exact append-clock reading is a separate observation.
+Temporal SQL uses a strictly increasing system-time projection, which can advance by one chronon when an append-clock reading ties or regresses.
+A client-supplied ordinary system time is bounded by the append-clock observation.
 Reclamation uses a monotone catalog generation recorded by the residence ledger.
 Node-local monotonic durations only expire the holds of readers that stop renewing them.
 Receipt expiry uses the record's log time.
@@ -30,7 +33,8 @@ Erasure starts at publication of the erasing generation and uses the custody aut
 |Tension |Replacement |Deleted
 
 |System time as a physical clock
-|A client time is admitted only when it advances the head and does not exceed the log append time.
+|An ordinary client time is admitted only when it advances the head and does not exceed the log append time.
+An owned append witness compares against the exact log observation and uses the ordered system-time projection.
 An external source's commit time is clamped to the node clock.
 |Unbounded future client times and the resulting overflow cliff.
 

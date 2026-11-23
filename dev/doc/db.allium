@@ -277,9 +277,12 @@ value ExternalSourceToken {
 }
 
 value TransactionKey {
-    -- tx_id is monotonically increasing, assigned by the source log or off the RESOLVED head for an external-source database.
-    -- system_time is strictly increasing across a partition's committed transactions.
-    -- A client MAY specify one, and a specified system_time that does not advance on the latest completed transaction aborts the transaction.
+    -- tx_id is the increasing commit-order position, assigned by the source log or off the RESOLVED head for an external-source database.
+    -- system_time is the strictly increasing projection used by temporal SQL.
+    -- An ordinary explicit system_time that does not advance the resolved history or leads the append clock aborts the transaction.
+    -- An owned explicit time instead witnesses the append observation and uses the ordinary automatic projection.
+    -- That projection advances by a chronon when an observed clock ties or regresses.
+    -- Native source outcomes retain the unmodified append observation in xt.txs.source_log_time.
     -- Strictness is what lets a read basis name a transaction by its system_time — see snapshot_token.
     tx_id: Integer
     system_time: Timestamp

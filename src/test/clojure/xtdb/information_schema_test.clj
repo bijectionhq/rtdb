@@ -109,33 +109,37 @@
   (into {} (map (juxt :relname :oid))
         (xt/q tu/*node* "SELECT relname, oid FROM pg_catalog.pg_class")))
 
+(def ^:dynamic *source-log-time-column?* false)
+
 (deftest test-pg-attribute
   (xt/submit-tx tu/*node* test-data)
 
-  (let [{beanie "beanie", baseball "baseball", txs "txs"} (->table-oids)]
-    (t/is (= (set (for [[attrelid attname attnum atttypeid attlen] [[beanie "_id" 1 11111 -1]
-                                                                  [beanie "_system_from" 2 1184 8]
-                                                                  [beanie "_system_to" 3 1184 8]
-                                                                  [beanie "_valid_from" 4 1184 8]
-                                                                  [beanie "_valid_to" 5 1184 8]
-                                                                  [beanie "col1" 6 114 -1]
+  (let [{beanie "beanie", baseball "baseball", txs "txs"} (->table-oids)
+        attributes (cond-> [[beanie "_id" 1 11111 -1]
+                            [beanie "_system_from" 2 1184 8]
+                            [beanie "_system_to" 3 1184 8]
+                            [beanie "_valid_from" 4 1184 8]
+                            [beanie "_valid_to" 5 1184 8]
+                            [beanie "col1" 6 114 -1]
 
-                                                                  [baseball "_id" 1 11111 -1]
-                                                                  [baseball "_system_from" 2 1184 8]
-                                                                  [baseball "_system_to" 3 1184 8]
-                                                                  [baseball "_valid_from" 4 1184 8]
-                                                                  [baseball "_valid_to" 5 1184 8]
-                                                                  [baseball "col1" 6 20 8]
-                                                                  [baseball "col2" 7 20 8]
+                            [baseball "_id" 1 11111 -1]
+                            [baseball "_system_from" 2 1184 8]
+                            [baseball "_system_to" 3 1184 8]
+                            [baseball "_valid_from" 4 1184 8]
+                            [baseball "_valid_to" 5 1184 8]
+                            [baseball "col1" 6 20 8]
+                            [baseball "col2" 7 20 8]
 
-                                                                  [txs "_id" 1 20 8]
-                                                                  [txs "_system_from" 2 1184 8]
-                                                                  [txs "_system_to" 3 1184 8]
-                                                                  [txs "_valid_from" 4 1184 8]
-                                                                  [txs "_valid_to" 5 1184 8]
-                                                                  [txs "committed" 6 16 1]
-                                                                  [txs "error" 7 16384 -1]
-                                                                  [txs "system_time" 8 1184 8]]]
+                            [txs "_id" 1 20 8]
+                            [txs "_system_from" 2 1184 8]
+                            [txs "_system_to" 3 1184 8]
+                            [txs "_valid_from" 4 1184 8]
+                            [txs "_valid_to" 5 1184 8]
+                            [txs "committed" 6 16 1]
+                            [txs "error" 7 16384 -1]
+                            [txs "system_time" (if *source-log-time-column?* 9 8) 1184 8]]
+                     *source-log-time-column?* (conj [txs "source_log_time" 8 1184 8]))]
+    (t/is (= (set (for [[attrelid attname attnum atttypeid attlen] attributes]
                   {:atttypmod -1,
                    :attrelid attrelid,
                    :attidentity "",
@@ -152,7 +156,7 @@
                               attnotnull, atttypmod, attidentity, attgenerated
                        FROM pg_catalog.pg_attribute
                        WHERE attname IN ('_id', '_valid_from', '_valid_to', '_system_from', '_system_to',
-                                         'col1', 'col2', 'error', 'system_time', 'committed')"))))))
+                                         'col1', 'col2', 'error', 'source_log_time', 'system_time', 'committed')"))))))
 
 (deftest test-pg-tables
   (xt/submit-tx tu/*node* test-data)
