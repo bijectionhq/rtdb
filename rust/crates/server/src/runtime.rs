@@ -194,7 +194,7 @@ impl ServerDriver {
                 let configuration = rtdb_flight_sql::FlightConfig { address: address(&settings.host, settings.port).await?,
                     transaction_idle_timeout: settings.transaction_idle_timeout, prepared_statement_idle_timeout: settings.prepared_statement_idle_timeout,
                     session_idle_timeout: settings.session_idle_timeout, session_unclaimed_timeout: settings.session_unclaimed_timeout, playground: config.playground,
-                    forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions, hosted_controls: settings.hosted_controls.clone(), ..Default::default() };
+                    forwarded_peer: flight_peer, owned_world_host: flight_owned_worlds, owned_native_actions: settings.owned_native_actions, hosted_controls: settings.hosted_controls.clone(), audience: settings.audience, ..Default::default() };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 addresses.flight_sql = Some(handle.address());
                 Some((handle, driver))

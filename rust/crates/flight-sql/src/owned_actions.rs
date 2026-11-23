@@ -1083,13 +1083,25 @@ impl Service {
         }
         let (floor, rest) = hosted_observation::applied_read_floor(body)?;
         if !rest.is_empty() { return Err(invalid("Applied read has trailing bytes")); }
+        if let Some(source) = call.session.audience_source {
+            if floor.history() != source {
+                return Err(Status::permission_denied("The applied floor belongs to another audience source"));
+            }
+        } else if self.0.config.audience.is_some() {
+            return Err(Status::permission_denied("This source requires a reserved Flight session"));
+        }
         self.retain_new_owned_read(call, Some(&floor)).await
     }
 
     async fn retain_new_owned_read(
         &self, call: &Call, applied_floor: Option<&rtdb_node::AppliedReadFloor>,
     ) -> Result<ActionResult, Status> {
-        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+        let slots = if call.session.audience_source.is_some() {
+            &self.0.audience.as_ref().ok_or_else(unsupported)?.holds
+        } else {
+            &self.0.owned_read_slots
+        };
+        let permit = Arc::clone(slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;

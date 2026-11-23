@@ -33,6 +33,8 @@ impl AppliedReadFloor {
         Ok(Self { history, transactions, minimum })
     }
 
+    pub fn history(&self) -> uuid::Uuid { self.history }
+
     pub(super) fn cut(&self, original: Option<TransactionKey>) -> Result<CatalogReadCut> {
         let minimum = match original {
             Some(original) => confirmation_floor(original, self.minimum)?,

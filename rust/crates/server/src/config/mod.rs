@@ -26,9 +26,10 @@ pub struct FlightSettings {
     pub session_idle_timeout: Duration, pub session_unclaimed_timeout: Duration,
     pub owned_native_actions: bool,
     pub hosted_controls: Option<rtdb_flight_sql::HostedControlConfig>,
+    pub audience: Option<rtdb_flight_sql::AudienceFlightConfig>,
 }
 impl Default for FlightSettings {
-    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, hosted_controls: None } }
+    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), owned_native_actions: false, hosted_controls: None, audience: None } }
 }
 #[derive(Clone, Debug)]
 pub struct HealthSettings { pub host: String, pub port: i32 }
@@ -185,7 +186,7 @@ fn flight(value: Yaml) -> Result<FlightSettings> {
     }).transpose()?;
     let config = FlightSettings { host: fields.string("host")?.unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
         transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,
-        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), hosted_controls };
+        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)?, owned_native_actions: fields.boolean("ownedNativeActions")?.unwrap_or(false), hosted_controls, audience: None };
     fields.finish()?;
     Ok(config)
 }

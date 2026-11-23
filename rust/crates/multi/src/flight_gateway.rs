@@ -7,7 +7,7 @@ use http_body_util::{Either, Empty};
 use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, service::service_fn};
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
 use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, now_ms};
-use rtdb_flight_sql::FORWARDED_PEER_HEADER;
+use rtdb_flight_sql::{AUDIENCE_FLIGHT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpListener, sync::{OwnedSemaphorePermit, Semaphore}};
@@ -20,7 +20,9 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, control, gateway::{De
 
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
-const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v1";
+const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v2";
+const HANDSHAKE: &str = "/arrow.flight.protocol.FlightService/Handshake";
+const DO_ACTION: &str = "/arrow.flight.protocol.FlightService/DoAction";
 const MAXIMUM_HEADER_BYTES: u32 = 8 * 1024;
 const MAXIMUM_ROUTE_BYTES: usize = 4096;
 
@@ -37,6 +39,13 @@ struct Target {
 struct SessionRoute {
     target: Target,
     session: Uuid,
+    audience: Option<String>,
+}
+
+struct AudienceGateway {
+    profile: AudienceFlightConfig,
+    calls: Arc<Semaphore>,
+    transport: Client<HttpConnector, Incoming>,
 }
 
 struct Router {
@@ -47,13 +56,14 @@ struct Router {
     transport: Client<HttpConnector, Incoming>,
     calls: Arc<Semaphore>,
     deployments: Arc<DeploymentConnections>,
+    audience: Option<AudienceGateway>,
     timeout: Duration,
 }
 
 struct RoutedBody {
     body: Incoming,
     _call: OwnedSemaphorePermit,
-    _deployment: DeploymentConnection,
+    _deployment: Option<DeploymentConnection>,
 }
 
 impl Body for RoutedBody {
@@ -83,14 +93,19 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
         return Err(Anomaly::incorrect("rtdb.multi/flight-admission", "Flight SQL gateway admission limits must be positive and supported by the runtime"));
     }
 
-    let mut connector = HttpConnector::new();
-    connector.set_connect_timeout(Some(options.control_timeout));
-    connector.set_nodelay(true);
-    let transport = Client::builder(TokioExecutor::new()).http2_only(true)
-        .retry_canceled_requests(false).pool_timer(TokioTimer::new()).pool_max_idle_per_host(1)
-        .pool_idle_timeout(Duration::from_secs(30)).build(connector);
+    let transport = || {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(options.control_timeout));
+        connector.set_nodelay(true);
+        Client::builder(TokioExecutor::new()).http2_only(true)
+            .retry_canceled_requests(false).pool_timer(TokioTimer::new()).pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(30)).build(connector)
+    };
+    let audience = options.flight_audience.map(|audience| AudienceGateway {
+        profile: audience, calls: Arc::new(Semaphore::new(audience.permits())), transport: transport(),
+    });
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
-        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport,
+        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport: transport(), audience,
         calls: Arc::new(Semaphore::new(options.maximum_connections)),
         deployments: Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment)),
         timeout: options.startup_timeout });
@@ -181,7 +196,6 @@ impl Router {
         if request.method() != http::Method::POST || !request.uri().path().starts_with("/arrow.flight.protocol.FlightService/") {
             return Err(Status::unimplemented("This listener serves Arrow Flight SQL"));
         }
-        let call = Arc::clone(&self.calls).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight SQL gateway call limit reached"))?;
         let authorization = single_header(request.headers(), header::AUTHORIZATION.as_str())?;
         let bearer = authorization.and_then(|value| value.trim().split_once(' '))
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer")).map(|(_, token)| token);
@@ -190,12 +204,39 @@ impl Router {
             && cookie != bearer { return Err(Status::unauthenticated("Flight SQL cookie and bearer route disagree")); }
         let selector = single_header(request.headers(), DATABASE_HEADER)?;
         let route = bearer.or(cookie).map(|token| self.decode(token)).transpose()?;
+        let parse_audience = |value: &str| AudienceFlightConfig::parse(value)
+            .map_err(|_| Status::invalid_argument("Invalid Flight audience reservation"));
+        let requested_audience = single_header(request.headers(), AUDIENCE_FLIGHT_HEADER)?
+            .map(parse_audience).transpose()?;
+        let routed_audience = route.as_ref().and_then(|route| route.audience.as_deref())
+            .map(parse_audience).transpose()?;
+        let audience = match (route.as_ref(), requested_audience) {
+            (None, Some(source)) if request.uri().path() == HANDSHAKE => Some(source),
+            (None, None) => None,
+            (Some(_), None) => routed_audience,
+            _ => return Err(Status::permission_denied("The Flight audience is fixed at its handshake")),
+        };
+        let reserved = match audience {
+            Some(profile) => {
+                let configured = self.audience.as_ref().filter(|audience| audience.profile == profile)
+                    .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))?;
+                if routed_audience.is_some() && request.uri().path() != DO_ACTION {
+                    return Err(Status::permission_denied("The Flight audience only routes observation actions"));
+                }
+                routed_audience.map(|_| configured)
+            }
+            None => None,
+        };
+        let calls = reserved.map_or(&self.calls, |audience| &audience.calls);
+        let call = Arc::clone(calls).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight SQL gateway call limit reached"))?;
         let name = match (&route, selector) {
             (None, None) => return Err(Status::invalid_argument("Flight SQL startup requires x-xtdb-database")),
             (None, Some(selector)) => database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?.0,
             (Some(route), _) => route.target.name.as_str(),
         };
-        let deployment = self.deployments.admit(name).ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))?;
+        let deployment = if reserved.is_some() { None } else {
+            Some(self.deployments.admit(name).ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))?)
+        };
         let routing = async {
             match route {
                 Some(route) => {
@@ -213,13 +254,20 @@ impl Router {
         };
         let (target, session) = tokio::time::timeout(self.timeout, routing).await
             .map_err(|_| Status::deadline_exceeded("Timed out resolving the Flight SQL route"))??;
+        if audience.is_some_and(|profile| Uuid::parse_str(&target.deployment).ok() != Some(profile.source())) {
+            return Err(Status::permission_denied("The Flight route belongs to another audience source"));
+        }
 
         let has_bearer = bearer.is_some();
         let headers = request.headers_mut();
         headers.remove(header::HOST);
         headers.remove(header::COOKIE);
         headers.remove(FORWARDED_PEER_HEADER);
+        headers.remove(AUDIENCE_FLIGHT_HEADER);
         headers.insert(DATABASE_HEADER, header_value(&target.name)?);
+        if let Some(source) = audience {
+            headers.insert(AUDIENCE_FLIGHT_HEADER, header_value(&source.to_string())?);
+        }
         if let Some(session) = session {
             headers.insert(header::COOKIE, header_value(&format!("{COOKIE}={session}"))?);
             if has_bearer { headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {session}"))?); }
@@ -229,12 +277,13 @@ impl Router {
         let path = request.uri().path_and_query().ok_or_else(|| Status::invalid_argument("Invalid Flight SQL request path"))?.clone();
         *request.uri_mut() = Uri::builder().scheme("http").authority(target.address.as_str()).path_and_query(path)
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
-        let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
-        self.rewrite_response(response.headers_mut(), target)?;
+        let transport = reserved.map_or(&self.transport, |audience| &audience.transport);
+        let mut response = transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
+        self.rewrite_response(response.headers_mut(), target, audience)?;
         Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment })))
     }
 
-    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target) -> std::result::Result<(), Status> {
+    fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>) -> std::result::Result<(), Status> {
         let Some(cookie) = headers.remove(header::SET_COOKIE) else { return Ok(()); };
         let cookie = cookie.to_str().map_err(|_| Status::internal("Invalid private Flight SQL cookie"))?;
         if cookie.contains("Max-Age=0") {
@@ -244,7 +293,11 @@ impl Router {
         }
         let session = cookie.strip_prefix("arrow_flight_session_id=").and_then(|id| Uuid::parse_str(id).ok())
             .ok_or_else(|| Status::internal("Invalid private Flight SQL session"))?;
-        let route = self.encode(&SessionRoute { target, session })?;
+        let audience = audience.map(|profile| profile.to_string());
+        if audience.as_deref() != single_header(headers, AUDIENCE_FLIGHT_HEADER)? {
+            return Err(Status::unavailable("The holder did not acknowledge the exact Flight audience"));
+        }
+        let route = self.encode(&SessionRoute { target, session, audience })?;
         headers.insert(header::SET_COOKIE, header_value(&format!("{COOKIE}={route}"))?);
         if headers.contains_key(header::AUTHORIZATION) {
             headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {route}"))?);

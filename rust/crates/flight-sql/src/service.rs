@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-use crate::{FORWARDED_PEER_HEADER, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{AUDIENCE_FLIGHT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
@@ -25,10 +25,19 @@ pub(crate) struct Inner {
     pub owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
     pub owned_world_reads: Registry<Bytes, crate::owned_actions::OwnedWorldReadResource>,
     pub owned_read_slots: Arc<Semaphore>,
+    pub audience: Option<AudienceAdmission>,
     auth: Authentication,
     permits: Arc<Semaphore>,
     pub status: watch::Sender<ServerStatus>,
 }
+
+pub(crate) struct AudienceAdmission {
+    calls: Arc<Semaphore>,
+    pub holds: Arc<Semaphore>,
+}
+
+#[derive(Clone, Copy)]
+enum CallKind { Ordinary, Handshake, Action }
 pub(crate) struct Call {
     pub service: Service,
     pub session: Arc<Session>,
@@ -58,6 +67,11 @@ impl Call {
         } else if self.minted {
             response.metadata_mut().insert("set-cookie", format!("{}={}", auth::COOKIE, self.session.id).parse().map_err(arrow)?);
             if self.session.caller.mac.is_some() { response.metadata_mut().insert("authorization", format!("Bearer {}", self.session.id).parse().map_err(arrow)?); }
+            if let Some(source) = self.session.audience_source {
+                let audience = self.service.0.config.audience.filter(|profile| profile.source() == source)
+                    .ok_or_else(unsupported)?;
+                response.metadata_mut().insert(AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().map_err(arrow)?);
+            }
         }
         Ok(response)
     }
@@ -70,7 +84,11 @@ impl Call {
 impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>) -> Self {
         let memory = Arc::clone(node.memory());
-        Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status }))
+        let audience = config.audience.map(|audience| AudienceAdmission {
+            calls: Arc::new(Semaphore::new(audience.permits())),
+            holds: Arc::new(Semaphore::new(audience.permits())),
+        });
+        Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status }))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     pub fn sweep(&self) { self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep(); self.publish(); }
@@ -84,8 +102,26 @@ impl Service {
         });
     }
     pub async fn call<T>(&self, request: &Request<T>, body_bytes: usize) -> Result<Call, Status> {
+        self.call_with_kind(request, body_bytes, CallKind::Ordinary).await
+    }
+    async fn call_with_kind<T>(&self, request: &Request<T>, body_bytes: usize, kind: CallKind) -> Result<Call, Status> {
         if self.0.cancellation.is_cancelled() { return Err(cancelled()); }
-        let permit = Arc::clone(&self.0.permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
+        let source_headers = request.metadata().get_all(AUDIENCE_FLIGHT_HEADER);
+        let mut sources = source_headers.iter();
+        let audience_source = sources.next().map(|source| {
+            source.to_str().ok().and_then(|source| AudienceFlightConfig::parse(source).ok())
+                .filter(|profile| self.0.config.audience == Some(*profile))
+                .map(AudienceFlightConfig::source)
+                .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))
+        }).transpose()?;
+        if sources.next().is_some() || audience_source.is_some() && matches!(kind, CallKind::Ordinary) {
+            return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
+        }
+        let permits = match (audience_source, kind) {
+            (Some(_), CallKind::Action) => &self.0.audience.as_ref().ok_or_else(unsupported)?.calls,
+            _ => &self.0.permits,
+        };
+        let permit = Arc::clone(permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
         let admission = Admission::new(self.clone(), permit);
         let header_bytes = request.metadata().iter().try_fold(4096usize, |bytes, entry| {
             let size = match entry { tonic::metadata::KeyAndValueRef::Ascii(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())?, tonic::metadata::KeyAndValueRef::Binary(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())? };
@@ -107,6 +143,9 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
+            if session.audience_source != audience_source || audience_source.is_some() && !matches!(kind, CallKind::Action) {
+                return Err(Status::permission_denied("Flight session belongs to another admission class"));
+            }
             if let Some(raw) = credentials.raw() {
                 if session.caller.mac.is_none_or(|mac| !auth::equal(&mac, &self.0.auth.mac(raw))) { return Err(auth::unauthenticated("these credentials aren't the ones the session was authenticated with")); }
             }
@@ -114,6 +153,9 @@ impl Service {
             if let Err(error) = verified { if let Lookup::Found(removed) = self.0.sessions.take(&session.id) { removed.close(); } return Err(auth::auth_error(error)); }
             (session, false, lease)
         } else {
+            if audience_source.is_some() && (!matches!(kind, CallKind::Handshake) || forwarded_peer.is_none()) {
+                return Err(Status::permission_denied("An audience session requires an authenticated placed handshake"));
+            }
             let catalog = self.0.node.catalog();
             let placed_name = || requested_database.filter(|name| !name.is_empty())
                 .ok_or_else(|| Status::invalid_argument("A placed Flight SQL session requires x-xtdb-database"));
@@ -133,8 +175,13 @@ impl Service {
                 caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
                 match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
+            if audience_source.is_some() && (placement.is_none() || self.0.config.hosted_controls.as_ref()
+                .is_none_or(|controls| caller.principal.user_id() != Some(controls.owner.as_str())))
+            {
+                return Err(Status::permission_denied("An audience session requires the installed hosted principal"));
+            }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
-            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), self.memory().reserve(capacity).map_err(status)?));
+            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_source, self.memory().reserve(capacity).map_err(status)?));
             self.0.sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
@@ -187,7 +234,7 @@ impl FlightService for Service {
     type ListActionsStream = Output<flight::ActionType>;
     type DoExchangeStream = Output<flight::FlightData>;
     async fn handshake(&self, request: Request<Streaming<flight::HandshakeRequest>>) -> Result<Response<Self::HandshakeStream>, Status> {
-        let call = self.call(&request, 0).await?;
+        let call = self.call_with_kind(&request, 0, CallKind::Handshake).await?;
         result_stream(call, Vec::new())
     }
     async fn list_flights(&self, request: Request<flight::Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> { let call = self.call(&request, request.get_ref().encoded_len()).await?; Err(call.error(unsupported())) }
@@ -239,7 +286,7 @@ impl FlightService for Service {
         self.upload(call, request.into_inner()).await
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        let call = self.call(&request, request.get_ref().encoded_len()).await?;
+        let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::Action).await?;
         self.action(call, request.into_inner()).await
     }
 }

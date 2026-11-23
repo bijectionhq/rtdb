@@ -43,14 +43,15 @@ struct Placement { name: String, attachment: Weak<Database> }
 pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
+    pub audience_source: Option<uuid::Uuid>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, reservation: Arc<MemoryReservation>) -> Self {
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience_source: Option<uuid::Uuid>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
-        Self { id, caller, placement, state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }), _reservation: reservation }
+        Self { id, caller, audience_source, placement, state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }), _reservation: reservation }
     }
     pub fn closed(&self) -> bool { matches!(*self.state.lock().expect("session lock"), SessionState::Closed) }
     pub fn placed_database(&self) -> Option<&str> { self.placement.as_ref().map(|placement| placement.name.as_str()) }
