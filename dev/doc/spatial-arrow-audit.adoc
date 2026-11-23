@@ -128,6 +128,10 @@ Bijection's `schema_predecessor` and `open_root_facts` read the installed owner,
 The Arrow hosted-control point action can read one declared key at a held cut.
 The preparation path still needs a held Arrow inventory that returns all active declarations under the same owner and program observation.
 
+Ordinary hosted Flight holds and ordered commits call Bijection's PostgreSQL source verifier before advancing their retained source position.
+The verifier reads `SHOW rtdb_hosted_source_barrier` as text and checks the returned position, writer claim, and previously retained positions against `xt.txs` in a read transaction.
+A Flight replacement must certify the same source history and exact transaction ID and system-time pairs before advancing the retained frontier.
+
 == Bijection and RTDB Flight integration tests
 
 `rust/conformance/run_hosted_spatial_pair.py` starts isolated standalone and placed RTDB databases and uses a loopback TLS relay for the Bijection client.
