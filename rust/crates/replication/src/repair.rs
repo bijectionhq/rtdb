@@ -13,14 +13,14 @@ use rtdb_format::{
     envelope::ReplicaBody,
     keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key},
 };
-use rtdb_index::{PartitionValue, TrieCatalog, TrieState};
+use rtdb_index::{TableCatalog, TrieCatalog, TrieState};
 use rtdb_storage::{
     IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     cache::{BufferPool, CacheBudget},
     log::{MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions},
     object_store::ReadReservation,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp, TransactionKey};
 use tokio_util::sync::CancellationToken;
 
 use crate::{BlockDiscovery, BlockStore, PartitionLogs, RecoveredPartition, ReplicaRecord, blocks::matches_catalog_boundary, repair_decision};
@@ -167,14 +167,17 @@ impl RetainedLocalRepair {
     }
 }
 
-pub struct ReplayedPrimary {
+pub struct PrimaryReset {
     source: Arc<PartitionLogs>,
-    staged: Arc<LocalStore>,
-    view: Arc<PartitionValue>,
+    staged: Option<Arc<LocalStore>>,
+    store: Arc<dyn ObjectStore>,
+    hold: Option<Arc<dyn Send + Sync>>,
+    catalog: Arc<TrieCatalog>,
+    tables: Arc<TableCatalog>,
     target: TransactionKey,
 }
 
-pub struct PublishedReplayedPrimary {
+pub struct PublishedPrimaryReset {
     pub(crate) source: Arc<PartitionLogs>,
     pub(crate) expected: Arc<TrieCatalog>,
     pub(crate) block: BlockIndex,
@@ -182,9 +185,55 @@ pub struct PublishedReplayedPrimary {
     pub(crate) target: TransactionKey,
 }
 
-impl ReplayedPrimary {
+impl PrimaryReset {
+    pub async fn from_installed(
+        source: Arc<PartitionLogs>, installed: &BlockCatalog,
+        cut: Option<CatalogCut>, file_size_target: i64, cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        let target = installed.latest_completed_tx().ok_or_else(no_reset_transactions)?;
+        let store = Arc::clone(source.storage());
+        let hold = store.retain_catalog(cut).await?;
+        let load = async {
+            let blocks = source.recovery_block_store(file_size_target)?;
+            let (root, tables) = blocks.load(installed.block_index()).await?;
+            if installed.publication_sha256().is_none() || root.publication_sha256() != installed.publication_sha256() {
+                return Err(reset_inventory("The checkpoint root differs from the installed publication"));
+            }
+            for entry in root.table_entries()? {
+                if root.table_block_digest(entry.oid).is_none() {
+                    return Err(reset_inventory("The checkpoint has no bound table manifest"));
+                }
+                let table = tables.get(&entry.table).ok_or_else(|| reset_inventory("The checkpoint has no table block"))?;
+                for trie in table.trie_details() {
+                    for file in trie.checkpoint_files(&entry.slug, CheckpointContents::Primary)? {
+                        cancelled(cancellation)?;
+                        let key = ObjectKey::new(file)?;
+                        let size = match store.head_fresh(&key).await {
+                            Ok(head) if head.size > 0 => head.size,
+                            Ok(_) | Err(rtdb_storage::Error::MissingObject(_)) =>
+                                return Err(reset_inventory(format!("The checkpoint primary object is missing or empty: {key}"))),
+                            Err(error) => return Err(error.into()),
+                        };
+                        if key.as_str().contains("/data/") && trie.data_file_size.is_some_and(|expected| u64::try_from(expected) != Ok(size)) {
+                            return Err(reset_inventory(format!("The checkpoint primary data object has the wrong size: {key}")));
+                        }
+                    }
+                }
+            }
+            let table_catalog = TableCatalog::load(Some(root), &tables)?;
+            let primary = tables.into_iter().map(|(table, block)| (table, block.for_primary_repair())).collect();
+            let catalog = TrieCatalog::load(&primary, file_size_target, target.system_time)?;
+            Ok((Arc::new(table_catalog), Arc::new(catalog)))
+        };
+        let (tables, catalog) = match &hold {
+            Some(hold) => IoRegion::retaining(Arc::clone(hold), load).await?,
+            None => load.await?,
+        };
+        Ok(Self { source, staged: None, store, hold, catalog, tables, target })
+    }
+
     /// Rebuilds the adopted cut from a detached anchor and the journal held by this maintenance node.
-    pub async fn prepare(source: Arc<PartitionLogs>, installed: &BlockCatalog, export: &Path,
+    pub async fn from_retained(source: Arc<PartitionLogs>, installed: &BlockCatalog, export: &Path,
         file_size_target: i64, cancellation: &CancellationToken,
     ) -> Result<Self> {
         cancelled(cancellation)?;
@@ -228,30 +277,54 @@ impl ReplayedPrimary {
         let staged_blocks = BlockStore::new(staged.clone(), pool(staged.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut rebuilt = staged_blocks.recover(Default::default(), source.source_floor()?, Timestamp(0), BlockDiscovery::At(base.block_index())).await?;
         replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation).await?;
-        Ok(Self { source, staged, view: rebuilt.partition.value(), target: target_tx })
+        let value = rebuilt.partition.value();
+        let catalog = Arc::clone(value.trie_catalog());
+        let tables = Arc::clone(value.table_catalog());
+        let store = Arc::clone(source.storage());
+        Ok(Self { source, staged: Some(staged), store, hold: None, catalog, tables, target: target_tx })
     }
 
-    pub fn catalog(&self) -> &TrieCatalog { self.view.trie_catalog() }
+    pub fn catalog(&self) -> &TrieCatalog { &self.catalog }
 
-    /// Synchronizes the reconstructed pairs before the leader can publish a catalog that names them.
+    /// Copies replacement pairs before the leader can publish a catalog that names them.
     pub async fn publish_files(self, expected: Arc<TrieCatalog>, block: BlockIndex,
         cancellation: &CancellationToken,
-    ) -> Result<PublishedReplayedPrimary> {
-        let destination = self.source.local_recovery_store().ok_or_else(|| invalid("The local recovery store is unavailable"))?;
-        let (catalog, files_epoch) = expected.reset_from_primary((**self.view.trie_catalog()).clone(), block, self.target.system_time)?;
-        for entry in self.view.table_catalog().entries() {
-            for trie in self.catalog().iter_tries(&entry.table).filter(|trie| !matches!(trie.state, TrieState::Garbage { .. })) {
-                cancelled(cancellation)?;
-                let relocated = if trie.key.level() > 0 { trie.key.clone().with_epoch(files_epoch) } else { trie.key.clone() };
-                let objects = [(entry.slug.data_key(&trie.key), entry.slug.data_key(&relocated)),
-                    (entry.slug.metadata_key(&trie.key), entry.slug.metadata_key(&relocated))];
-                for (from, to) in objects {
-                    self.staged.copy_to(&ObjectKey::new(from)?, destination, &ObjectKey::new(to)?).await?;
+    ) -> Result<PublishedPrimaryReset> {
+        let (catalog, files_epoch) = expected.reset_from_primary((*self.catalog).clone(), block, self.target.system_time)?;
+        let publish = async {
+            for entry in self.tables.entries() {
+                for trie in self.catalog.iter_tries(&entry.table).filter(|trie| !matches!(trie.state, TrieState::Garbage { .. })) {
+                    cancelled(cancellation)?;
+                    let relocated = if trie.key.level() > 0 { trie.key.clone().with_epoch(files_epoch) } else { trie.key.clone() };
+                    let objects = [(entry.slug.data_key(&trie.key), entry.slug.data_key(&relocated)),
+                        (entry.slug.metadata_key(&trie.key), entry.slug.metadata_key(&relocated))];
+                    for (from, to) in objects {
+                        if let Some(staged) = &self.staged {
+                            let destination = self.source.local_recovery_store()
+                                .ok_or_else(|| invalid("The local recovery store is unavailable"))?;
+                            staged.copy_to(&ObjectKey::new(from)?, destination, &ObjectKey::new(to)?).await?;
+                        } else if from != to {
+                            self.store.copy(&ObjectKey::new(from)?, &ObjectKey::new(to)?).await?;
+                        }
+                    }
                 }
             }
+            Ok::<_, Anomaly>(())
+        };
+        match &self.hold {
+            Some(hold) => IoRegion::retaining(Arc::clone(hold), publish).await?,
+            None => publish.await?,
         }
-        Ok(PublishedReplayedPrimary { source: self.source, expected, block, catalog, target: self.target })
+        Ok(PublishedPrimaryReset { source: self.source, expected, block, catalog, target: self.target })
     }
+}
+
+fn no_reset_transactions() -> Anomaly {
+    Anomaly::incorrect("rtdb.compactor-reset/no-transactions", "Compactor reset requires a completed transaction")
+}
+
+fn reset_inventory(message: impl Into<String>) -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.compactor-reset/incomplete-inventory", message)
 }
 
 struct RepairPaths {

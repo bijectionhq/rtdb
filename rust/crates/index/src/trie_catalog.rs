@@ -374,25 +374,6 @@ impl TrieCatalog {
         }
         next
     }
-    /// Rewinds every table to its surviving L0 tries and starts a new naming epoch, so outputs planned after the reset never reuse a name planned before it.
-    pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<Self> {
-        let mut next = self.clone();
-        next.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
-        for (table, tries) in replacements {
-            let mut state = TableTries::default();
-            if let Some(previous) = self.tables.get(&table) { state.search = previous.search.clone(); state.retired = previous.retired; }
-            let mut shard = ShardValue::default();
-            for mut trie in tries {
-                if Shard::of(&trie.key) != Shard::root(0, None) { return Err(invalid("Reset accepts only unpartitioned L0 tries")); }
-                trie.state = state.retired.map_or(TrieState::Live, |as_of| TrieState::Garbage { as_of });
-                shard.insert(trie);
-            }
-            state.shards.insert(Shard::root(0, None), shard);
-            next.tables.insert(table, state);
-        }
-        Ok(next)
-    }
-
     /// Selects new physical names for the recovered compacted pairs and keeps the original L0 identities needed by ordered replay.
     pub fn reset_from_primary(&self, mut primary: Self, block: BlockIndex, as_of: Timestamp) -> Result<(Self, u64)> {
         let files_epoch = reset_epochs::recovery_file_epoch(block.0).ok_or_else(|| invalid("Recovery file epoch exhausted"))?;

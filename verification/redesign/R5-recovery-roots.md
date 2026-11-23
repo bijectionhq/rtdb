@@ -27,7 +27,7 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 
 - The L0 guard in `TrieCollector::collect_table` (`rust/crates/maintenance/src/gc.rs`, "L0 recovery files cannot be garbage collected").
 - Retained L0 identities in the trie catalog (`dev/doc/trie-cat.allium` line 9 and the code behind it).
-- `reset_to_l0` in `rust/crates/index/src/partition.rs` and `rust/crates/index/src/trie_catalog.rs`, and the L0 replacement plan in `Node::prepare_compactor_reset` (`rust/crates/node/src/operations.rs`), replaced by a reset from a root.
+- The L0 replacement plan has been removed. The default reset verifies the installed checkpoint's primary inventory and relocates the selected compacted pairs into the replacement epoch.
 - The `rtdb.replication/invalid-trie-removal` restriction on L0 deletions in the replication driver.
 
 ## State on main (2026-11-21)
@@ -59,7 +59,7 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - Multi has recovery holds for the replica suffix (`rust/crates/multi/src/recovery_holds.rs`, peer commit `e298879a0`) and checkpoint-metadata holds (`rust/crates/multi/src/checkpoint_retention.rs`).
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.
 - Compactor reset names outputs in a new epoch (R3, `ae7b66e10`), so rebuilding from a root cannot collide with pre-reset names.
-  Reset loads the installed checkpoint's bound table inventories and checks each named L0 pair before preparing publication.
+  Reset loads the installed checkpoint's bound table inventories and checks the live and nascent primary pairs before preparing publication.
 - The offline native `repair-checkpoint` command takes a known-good checkpoint digest and an exact later target digest from the same stopped local journal.
   It verifies the checkpoint publications and base table inventories, replays resolved writes into independent primary storage, and publishes a detached checkpoint with a new digest.
   The native regression takes the base from a snapshot export and removes its original primary inventory and the source's L0 files.

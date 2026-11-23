@@ -781,7 +781,9 @@ config {
 -- Snapshots captured before the advance retain their original cut.
 -- Exact and restored recovery modes and checkpoints without a matching journal boundary leave the cut unavailable.
 -- An unrecognized replica body stops further advances on that open partition.
--- A direct compactor reset suspends new cuts on that open partition.
+-- A compactor reset prepares its primary inventory from the adopted checkpoint or rebuilds it from a retained checkpoint and the held journal.
+-- It publishes the replacement compacted files under fresh names before submitting the reset against the captured block and catalog.
+-- The driver suspends new cuts until it adopts the replacement checkpoint.
 -- Providers that defer cursor admission can still report an advisory floor and open the tail in the replication driver.
 -- Exact recovery keeps its selected block. Archive recovery requires its anchor and probes only its contiguous successors.
 -- A successful cursor admission does not reserve the replica suffix against later trimming.
