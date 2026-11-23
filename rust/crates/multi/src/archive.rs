@@ -80,7 +80,7 @@ mod replica_suffix;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
 mod read_world;
 mod writable_world;
-pub(crate) use writable_world::prepare_checkpoint_replay_parent;
+pub(crate) use writable_world::{finish_checkpoint_replay_parents, prepare_checkpoint_replay_parent};
 pub(crate) use writable_world::retain_replayed_checkpoint_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::WorldPoint;
@@ -965,7 +965,14 @@ pub async fn capture(
     hosted_task: Option<rtdb_directory::HostedTask>,
     flushed: Option<&DeploymentRecord>,
 ) -> Result<Capture> {
-    capture_with_purpose(directory, storage, destination, keys, deployment, operation, hosted_task, flushed, false).await
+    capture_with_purpose(directory, storage, destination, keys, deployment, operation, hosted_task, flushed, CapturePurpose::Explicit).await
+}
+
+#[derive(Clone, Copy)]
+enum CapturePurpose {
+    Explicit,
+    AutomaticFork,
+    ReplayedWorldBase([u8; 32]),
 }
 
 async fn capture_with_purpose(
@@ -977,13 +984,13 @@ async fn capture_with_purpose(
     operation: Uuid,
     hosted_task: Option<rtdb_directory::HostedTask>,
     flushed: Option<&DeploymentRecord>,
-    automatic_fork: bool,
+    purpose: CapturePurpose,
 ) -> Result<Capture> {
     let lineage = if matches!(storage, CellStorage::S3 { .. }) {
         Some(directory.deployment(&deployment.to_string()).await?.ok_or_else(|| unavailable("The source installation no longer exists"))?.lineage)
     } else { None };
     crate::store::with_source_lineage(directory.as_ref(), lineage.as_deref(), hosted_task.as_ref(),
-        Box::pin(capture_checkpoint(directory.clone(), storage, destination, keys, deployment, operation, hosted_task.clone(), flushed, automatic_fork))).await
+        Box::pin(capture_checkpoint(directory.clone(), storage, destination, keys, deployment, operation, hosted_task.clone(), flushed, purpose))).await
 }
 
 async fn capture_checkpoint(
@@ -995,8 +1002,13 @@ async fn capture_checkpoint(
     operation: Uuid,
     hosted_task: Option<rtdb_directory::HostedTask>,
     flushed: Option<&DeploymentRecord>,
-    automatic_fork: bool,
+    purpose: CapturePurpose,
 ) -> Result<Capture> {
+    let automatic_fork = matches!(purpose, CapturePurpose::AutomaticFork);
+    let world_replay = match purpose {
+        CapturePurpose::ReplayedWorldBase(binding) => Some(binding),
+        _ => None,
+    };
     if deployment.is_nil() || operation.is_nil() || same_storage(storage, destination)
         || (automatic_fork && flushed.is_none())
     {
@@ -1039,7 +1051,7 @@ async fn capture_checkpoint(
         if let Some(registered) = record.checkpoint_captures.get(&operation) {
             if registered.archive != binding || registered.incarnation != record.incarnation
                 || registered.log_epoch != record.log_epoch
-                || registered.automatic_fork != automatic_fork
+                || registered.automatic_fork != automatic_fork || registered.world_replay != world_replay
             {
                 return Err(inconsistent("The capture operation already names another archive or lifetime"));
             }
@@ -1058,12 +1070,21 @@ async fn capture_checkpoint(
             }
             let checkpoint = record.checkpoint
                 .ok_or_else(|| unavailable("The installation has not published a checkpoint"))?;
+            if let Some(binding) = world_replay {
+                if binding == [0; 32] || record.checkpoint_captures.values()
+                    .any(|capture| capture.world_replay.is_some())
+                {
+                    return Err(inconsistent("A destination can prepare one replay parent base"));
+                }
+                crate::hosted_recovery::replay_start(record, checkpoint.boundary)?;
+            }
             record.checkpoint_captures.insert(operation, CheckpointCapture {
                 archive: binding.clone(),
                 incarnation: record.incarnation,
                 log_epoch: record.log_epoch,
                 checkpoint,
                 automatic_fork,
+                world_replay,
                 media_bound: false,
                 manifest_sha256: None,
                 remote_disposal: None,
@@ -2137,6 +2158,7 @@ mod tests {
             log_epoch: record.log_epoch,
             checkpoint,
             automatic_fork: false,
+            world_replay: None,
             media_bound: false,
             manifest_sha256: None,
             remote_disposal: None,
@@ -2261,6 +2283,7 @@ mod tests {
                     root_sha256: None,
                 },
                 automatic_fork: false,
+                world_replay: None,
                 media_bound: true,
                 manifest_sha256: None,
                 remote_disposal: None,

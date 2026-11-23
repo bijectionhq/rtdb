@@ -14,6 +14,10 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
         &'a self, call: WorldCall<'a>, binding: [u8; 32], original: Option<TransactionKey>,
     ) -> BoxFuture<'a, Result<Option<PreparedReplayParent>>>;
 
+    fn finish_replay_parents<'a>(
+        &'a self, call: WorldCall<'a>, binding: [u8; 32],
+    ) -> BoxFuture<'a, Result<()>>;
+
     fn retain_replayed_world<'a>(
         &'a self, call: WorldCall<'a>, binding: [u8; 32], world: Uuid,
     ) -> BoxFuture<'a, Result<RetainedReplayWorld>>;

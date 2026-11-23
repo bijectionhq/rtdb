@@ -623,6 +623,10 @@ pub struct CheckpointCapture {
     /// Automatically derived from a held fork's already published source.
     #[serde(default)]
     pub automatic_fork: bool,
+    /// The held restore still needs this base's raw replica history to
+    /// produce exact independent parents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_replay: Option<[u8; 32]>,
     /// Payload copying starts only after the archive's witness becomes durable.
     pub media_bound: bool,
     /// The immutable manifest accepted after verifying the complete archive.
@@ -911,6 +915,10 @@ impl DeploymentRecord {
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
         self.storage_regions.values().filter_map(StorageRegion::first_required_replica)
+            .chain(self.checkpoint_captures.values().filter(|capture| {
+                capture.world_replay.is_some() && capture.incarnation == self.incarnation
+                    && capture.log_epoch == self.log_epoch && self.lifecycle != Lifecycle::Deleted
+            }).map(|capture| capture.checkpoint.boundary.checked_add(1).filter(|offset| *offset >= 0).unwrap_or(0)))
             .chain(self.checkpoint_suffix_pins.values()
                 .filter(move |pin| pin.expires_at_ms > now_ms && pin.archive_sha256.is_none())
                 .map(|pin| {

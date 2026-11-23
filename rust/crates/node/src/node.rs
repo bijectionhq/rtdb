@@ -1116,22 +1116,44 @@ impl OwnedReadSession {
     /// Admit a placed restore only while the original writer and replay
     /// hold still own the destination and no release has sealed it.
     pub async fn replay_parent_hold(&self, binding: [u8; 32], before_replay: bool) -> Result<Vec<u8>> {
-        self.require_unscoped_root()?;
-        self.admit_access().await?;
-        if self.historical.is_some() || self.witness_scope.is_none() || binding == [0; 32] {
-            return Err(rtdb_types::OwnedWorld::unavailable());
-        }
-        let (hold, _) = self.replay_parent_control("restore").await?
-            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-        let (archive, _) = self.replay_parent_control("archive").await?
-            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-        if hold != binding
-            || archive.len() != 40
-            || self.replay_parent_control("replayed").await?.is_some()
-            || self.replay_parent_control("released").await?.is_some()
+        let archive = self.active_replay_archive(binding).await?;
+        if self.replay_parent_control("replayed").await?.is_some()
             || (before_replay && self.replay_parent_control("native-frontier.v1").await?.is_some())
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        self.check()?;
+        Ok(archive)
+    }
+
+    /// The completed inventory follows all destination parent pins and
+    /// readmissions. Only that seal releases the original replay window.
+    pub async fn sealed_replay_parents(&self, binding: [u8; 32]) -> Result<()> {
+        let archive = self.active_replay_archive(binding).await?;
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let (seal, at) = self.replay_parent_control("replayed").await?.ok_or_else(unavailable)?;
+        let (inventory, inventory_at) = self.replay_parent_control("factstore-inventory.v1").await?
+            .ok_or_else(unavailable)?;
+        let (frontier, frontier_at) = self.replay_parent_control("native-frontier.v1").await?
+            .ok_or_else(unavailable)?;
+        if seal != binding || inventory_at != at || frontier_at != at || frontier.as_slice() != b"sealed" {
+            return Err(unavailable());
+        }
+        rtdb_tx::replayed_archive_cut(&inventory, binding, &archive)?;
+        self.check()
+    }
+
+    async fn active_replay_archive(&self, binding: [u8; 32]) -> Result<Vec<u8>> {
+        self.require_unscoped_root()?;
+        self.admit_access().await?;
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        if self.historical.is_some() || self.witness_scope.is_none() || binding == [0; 32] {
+            return Err(unavailable());
+        }
+        let (hold, _) = self.replay_parent_control("restore").await?.ok_or_else(unavailable)?;
+        let (archive, _) = self.replay_parent_control("archive").await?.ok_or_else(unavailable)?;
+        if hold != binding || archive.len() != 40 || self.replay_parent_control("released").await?.is_some() {
+            return Err(unavailable());
         }
         self.check()?;
         Ok(archive)

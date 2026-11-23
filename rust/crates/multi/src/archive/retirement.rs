@@ -115,6 +115,11 @@ async fn retire_capture_inner(
                 ));
             }
             let registration = record.checkpoint_captures.get(&capture);
+            if registration.is_some_and(|capture| capture.world_replay.is_some())
+                && record.lifecycle != Lifecycle::Deleted
+            {
+                return Err(inconsistent("A held restore still requires the replay parent base"));
+            }
             let retained = registration.and_then(|value| value.manifest_sha256.as_deref());
             if registration.is_some_and(|value| value.archive != archive)
                 || manifest.is_some_and(|expected| retained != Some(expected))

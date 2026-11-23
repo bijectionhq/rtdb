@@ -132,7 +132,7 @@ async fn copy_published_fork_input(
     id.copy_from_slice(&digest.finish().as_ref()[..16]);
     let operation = Uuid::from_bytes(id);
     super::capture_with_purpose(
-        directory, storage, archive, keys, deployment, operation, hosted_task.cloned(), Some(source), true,
+        directory, storage, archive, keys, deployment, operation, hosted_task.cloned(), Some(source), super::CapturePurpose::AutomaticFork,
     ).await?;
     Ok(operation)
 }
@@ -227,6 +227,11 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
         let mut id = [0; 16];
         id.copy_from_slice(&digest.finish().as_ref()[..16]);
         let operation = Uuid::from_bytes(id);
+        if source.checkpoint_captures.get(&operation)
+            .is_some_and(|base| base.world_replay != Some(binding))
+        {
+            return Err(OwnedWorld::unavailable());
+        }
         if capture_receipt(&source, archive, deployment, operation)?.is_none() {
             held.replay_parent_hold(binding, true).await?;
             drop(held);
@@ -244,9 +249,10 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
                 Some(current)
             };
             session.open_owned_read().await?.replay_parent_hold(binding, true).await?;
-            super::capture(
+            super::capture_with_purpose(
                 Arc::clone(&directory), storage, archive, keys, deployment, operation,
                 hosted_task.cloned(), flushed.as_ref(),
+                super::CapturePurpose::ReplayedWorldBase(binding),
             ).await?;
         }
         return Ok(None);
@@ -389,6 +395,37 @@ pub(crate) async fn retain_replayed_checkpoint_world(
         basis: retained.basis,
         until: retained.until,
     })
+}
+
+pub(crate) async fn finish_checkpoint_replay_parents(
+    directory: &dyn Directory, session: &mut NativeSession, deployment: Uuid, binding: [u8; 32],
+) -> Result<()> {
+    let unavailable = OwnedWorld::unavailable;
+    let id = deployment.to_string();
+    let initial = directory.deployment(&id).await?.ok_or_else(unavailable)?;
+    let owner = session.state().user().filter(|owner| !owner.is_empty()).ok_or_else(unavailable)?;
+    admit_session(session, &initial, owner)?;
+    session.open_owned_read().await?.sealed_replay_parents(binding).await?;
+    update_installation(directory, &id, |record| {
+        if record.incarnation != initial.incarnation || record.log_epoch != initial.log_epoch
+            || record.epoch != initial.epoch || record.holder != initial.holder
+        {
+            return Err(unavailable());
+        }
+        for capture in record.checkpoint_captures.values_mut() {
+            if let Some(owner) = capture.world_replay {
+                if owner != binding || capture.incarnation != record.incarnation
+                    || capture.log_epoch != record.log_epoch || capture.manifest_sha256.is_none()
+                {
+                    return Err(unavailable());
+                }
+                capture.world_replay = None;
+                capture.automatic_fork = true;
+            }
+        }
+        Ok(())
+    }).await?;
+    Ok(())
 }
 
 fn world_record(

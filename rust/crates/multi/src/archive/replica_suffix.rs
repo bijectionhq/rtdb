@@ -518,7 +518,7 @@ mod custody_tests {
         record.checkpoint_captures.insert(capture, CheckpointCapture {
             archive: super::super::archive_binding(&archive)?,
             incarnation: record.incarnation, log_epoch: record.log_epoch, checkpoint,
-            automatic_fork: false, media_bound: true, manifest_sha256: Some(pin.manifest_sha256.clone()), remote_disposal: None,
+            automatic_fork: false, world_replay: None, media_bound: true, manifest_sha256: Some(pin.manifest_sha256.clone()), remote_disposal: None,
         });
         record.checkpoint_suffix_pins.insert(lease, pin.clone());
         let registered = directory.create_deployment(record).await?;
