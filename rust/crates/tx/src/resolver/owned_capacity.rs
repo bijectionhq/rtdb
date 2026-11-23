@@ -87,10 +87,10 @@ impl CapacityRule {
     }
 
     fn admits(&self, schema: &rtdb_types::OwnedSchema) -> Result<bool> {
-        Ok(schema.column_type(&self.column) == Some(ScalarType::Binary)
+        Ok(schema.path_column_type(&self.column) == Some(ScalarType::Binary)
             && predicates(&self.when)?
                 .into_iter()
-                .all(|(column, _)| schema.column_type(column) == Some(ScalarType::Binary)))
+                .all(|(column, _)| schema.path_column_type(column) == Some(ScalarType::Binary)))
     }
 
     fn decode(value: &Value) -> Result<Self> {

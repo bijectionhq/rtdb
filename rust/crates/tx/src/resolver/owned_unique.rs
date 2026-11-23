@@ -87,7 +87,7 @@ impl OpenTransaction<'_> {
             return Err(invalid_key());
         }
         if let Some((schema, _)) = self.read_owned_schema(owner, relation).await? {
-            if schema.column_type(column) != Some(ScalarType::Binary) {
+            if schema.path_column_type(column) != Some(ScalarType::Binary) {
                 return Err(invalid_key());
             }
         } else if snapshot.contains_table(&target) {
@@ -334,7 +334,7 @@ impl OpenTransaction<'_> {
         if policy
             .paths
             .values()
-            .any(|column| schema.column_type(column) != Some(ScalarType::Binary))
+            .any(|column| schema.path_column_type(column) != Some(ScalarType::Binary))
         {
             return Err(invalid_key());
         }

@@ -311,7 +311,7 @@ impl HeldCheckpointWorld {
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         if columns.len() != partitions.len() || partitions.iter().zip(&columns).any(|((relation, _), column)| {
             !self.open.record.schemas.relation(relation)
-                .and_then(|schema| schema.column_logical_type(column))
+                .and_then(|schema| schema.path_column_logical_type(column))
                 .is_some_and(|kind| kind.is_clear_search_text())
         }) {
             return Err(OwnedWorld::unavailable());

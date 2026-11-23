@@ -51,7 +51,7 @@ impl OpenTransaction<'_> {
         let schema = self.read_owned_schema(owner, relation).await?;
         if schema
             .as_ref()
-            .and_then(|(schema, _)| schema.column_type(&rule.column))
+            .and_then(|(schema, _)| schema.path_column_type(&rule.column))
             != Some(ScalarType::Binary)
         {
             return Err(Anomaly::incorrect(
