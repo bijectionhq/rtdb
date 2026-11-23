@@ -1,0 +1,156 @@
+{
+  "summary": "A cell transfer closes only a staging attempt, selects the drained successor in a fresh generation, activates only the selected prepared attempt with its own receipt, and disposes only generations neither record selects.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "attempt",
+    "--verify-root"
+  ],
+  "min_verified_functions": 11,
+  "controls": {
+    "close_prepared": {
+      "defect": "A prepared attempt whose receipt a placement catalog retained can be closed.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "    staging && current\n",
+          "replace": "    current\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_close",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "skip_drain": {
+      "defect": "A successor is selected while the closed generation still has admitted writes.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "    closed && drained && !prepared && fresh && match prior",
+          "replace": "    closed && !prepared && fresh && match prior"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_select_next",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "reuse_generation": {
+      "defect": "The successor copies into a generation that already holds the conflicting bytes.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "    closed && drained && !prepared && fresh && match prior",
+          "replace": "    closed && drained && !prepared && match prior"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_select_next",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "skip_successor": {
+      "defect": "A stale selector can jump over an attempt another selector already chose.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "\n        Some(prior) => prior < u32::MAX && next == prior + 1,",
+          "replace": "\n        Some(prior) => prior < next,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_select_next",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "stale_receipt": {
+      "defect": "The receipt of a closed attempt activates the destination.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "    prepared && !abandoned && receipt == source && source == destination\n",
+          "replace": "    prepared && !abandoned && source == destination\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_activate",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "activate_abandoned": {
+      "defect": "A closed generation activates.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "    prepared && !abandoned && receipt == source && source == destination\n",
+          "replace": "    prepared && receipt == source && source == destination\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_activate",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "dispose_selected": {
+      "defect": "Disposal erases the generation the source selected.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "        Some(selected) => selected != candidate,",
+          "replace": "        Some(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_dispose",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "dispose_current": {
+      "defect": "Disposal erases the generation the destination record still names.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "find": "    closed && candidate != current && match selected",
+          "replace": "    closed && match selected"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/cell_attempt.rs",
+          "function": "may_dispose",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    }
+  }
+}

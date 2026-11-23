@@ -324,6 +324,9 @@ pub struct DeploymentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_record: Option<Box<DeletionRecord>>,
     pub cell_transfer: Option<Box<CellTransfer>>,
+    /// Destination generations of closed transfer attempts, keyed by generation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub abandoned_generations: BTreeMap<uuid::Uuid, AbandonedCellGeneration>,
     pub disposal: Option<Box<DisposalReceipt>>,
     /// Serving and archive receipts for earlier stays in this same cell.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -755,6 +758,42 @@ pub struct CellTransfer {
     pub epoch: u64,
     pub source_media: CellMedia,
     pub destination_media: CellMedia,
+    /// Transfers staged before attempts were recorded have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<CellTransferAttempt>,
+}
+
+/// The source selects one destination copy at a time. Every field is fixed
+/// for the attempt, so a copier, receipt or disposal from another attempt
+/// names a different value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellTransferAttempt {
+    pub ordinal: u32,
+    pub generation: uuid::Uuid,
+    pub namespaces: StorageNamespaces,
+    pub checkpoint: Option<Checkpoint>,
+    pub sealed_journals: Vec<String>,
+}
+
+/// A destination generation whose attempt closed before preparation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonedCellGeneration {
+    pub ordinal: u32,
+    pub namespaces: StorageNamespaces,
+    pub prefix: String,
+    pub closed_at_ms: i64,
+    /// A remote prefix settles only after the write horizon from this observation.
+    pub first_empty_at_ms: Option<i64>,
+    pub disposition: Option<GenerationDisposition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationDisposition {
+    pub inventory: ServingInventory,
+    pub observed_empty_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -785,6 +824,8 @@ pub struct PreparedCellTransfer {
     pub source_incarnation: u64,
     pub destination_incarnation: u64,
     pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<CellTransferAttempt>,
 }
 
 /// The cell providers authorized for a transfer, without their credentials.
@@ -965,7 +1006,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
-            cell_transfer: None, disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
+            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
 

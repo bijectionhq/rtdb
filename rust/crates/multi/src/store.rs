@@ -1746,6 +1746,17 @@ pub async fn run_reaper(
                                 eprintln!("Storage publications for {} are pending: {}", record.id, error.code);
                             }
                         }
+                        for record in &deployments {
+                            if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                                || !crate::admin::has_pending_disposal(record)
+                            {
+                                continue;
+                            }
+                            if cancellation.is_cancelled() { return; }
+                            if let Err(error) = crate::admin::dispose_generations(directory.as_ref(), &storage, keys, &record.id).await {
+                                eprintln!("Closed transfer generations of {} are pending: {}", record.id, error.code);
+                            }
+                        }
                     }
                     for record in &deployments {
                         if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)

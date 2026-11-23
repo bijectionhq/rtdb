@@ -44,6 +44,13 @@ while IFS='|' read -r module config expected_status expected_message; do
 done <<'CONFIGURATIONS'
 RTDBCellTransfer|RTDBCellTransfer|0|No error has been found
 RTDBCellTransfer|RTDBCellTransferWithoutFrames|12|Invariant RoutedCheckpointFramed is violated
+RTDBCellTransferAttempts|RTDBCellTransferAttempts|0|No error has been found
+RTDBCellTransferAttempts|RTDBCellTransferAttemptsStaleAttempt|12|Invariant RoutedIsSelected is violated
+RTDBCellTransferAttempts|RTDBCellTransferAttemptsClosePrepared|12|Invariant ReceiptsStaySelected is violated
+RTDBCellTransferAttempts|RTDBCellTransferAttemptsSkipDrain|12|Invariant ErasedStaysEmpty is violated
+RTDBCellTransferAttempts|RTDBCellTransferAttemptsDisposeSelected|12|Invariant SelectedNeverErased is violated
+RTDBCellTransferAttempts|RTDBCellTransferAttemptsEarlySourceDisposal|12|Invariant SourceRetainedThroughSelection is violated
+RTDBCellTransferAttempts|RTDBCellTransferAttemptsReuseGeneration|13|Temporal property EventuallyActive was violated
 RTDBDeletion|RTDBDeletion|0|No error has been found
 RTDBDeletion|RTDBDeletionUndrainedAdministrator|12|Invariant NoObjectAfterReceipt is violated
 RTDBDeletion|RTDBDeletionWithoutLegacyHorizon|12|Invariant FirstInventoryFollowsExpiry is violated

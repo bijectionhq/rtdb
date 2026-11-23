@@ -8,6 +8,7 @@ pub mod agent;
 pub mod archive;
 pub mod capability;
 mod catalog_readers;
+mod cell_attempt;
 pub mod cells;
 mod checkpoint_copy_budget;
 mod checkpoint_retention;

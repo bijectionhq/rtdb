@@ -489,6 +489,11 @@ If the provider reports a missing or replaced publication after terminal authori
 
 
 
+### Cell transfer attempts
+
+[RTDBCellTransferAttempts](../multi/tla/RTDBCellTransferAttempts.tla) checks that a transfer that meets conflicting immutable bytes moves to a fresh generation only after closing and draining its attempt, that only the selected prepared attempt and its receipt can be routed, and that disposal never reaches a selected generation.
+[Verus](../verus/cell_transfer_attempt/proof.rs) checks the production guards for closing, selection, activation and disposal.
+
 ## Open questions
 
 - How many roots to keep, and whether a root is written per block or on a schedule (it bounds recovery time against storage).

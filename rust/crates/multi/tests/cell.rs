@@ -4482,3 +4482,268 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
     east.stop().await;
     west.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflicting_cell_copy_moves_through_a_fresh_destination_generation() {
+    exercise_conflicting_copy(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_transfer_selects_only_the_fresh_attempts_receipt() {
+    exercise_conflicting_copy(true).await;
+}
+
+async fn exercise_conflicting_copy(managed: bool) {
+    let map = Arc::new(MemoryCellMap::default());
+    let east = Cell::start_on(None, vec![MemberPool::General], None, None, Some((map.clone(), "east".into()))).await;
+    let west = Cell::start_on(None, vec![MemberPool::General; 2], None, None, Some((map.clone(), "west".into()))).await;
+    let (east_storage, west_storage) = (east.storage(), west.storage());
+    let east_keys = east.keys();
+    let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
+    if managed {
+        admin::set_linearizable_reads(east.directory.as_ref(), "shop", true).await.unwrap();
+    }
+    let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 30), (2, 10)").await.unwrap();
+    client.simple_query("CREATE INDEX order_totals ON orders (total, _id)").await.unwrap();
+    east.node(east.holder("shop").await.unwrap()).agent.flush("shop").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 20)").await.unwrap();
+    let history = order_history(&client).await;
+    let ordered = "SELECT _id FROM orders WHERE total >= 10 ORDER BY total";
+    let by_total = in_order(&client, ordered).await;
+    assert_eq!(by_total, ["2", "3", "1"]);
+    drop(client);
+
+    let intent = rtdb_directory::CellTransferIntent {
+        operation: Some(uuid::Uuid::new_v4()),
+        authority: original.id.parse().unwrap(),
+        name: "shop".into(),
+        source: rtdb_directory::CellResidence { cell: "east".into(), org: "acme".into() },
+        destination: rtdb_directory::CellResidence { cell: "west".into(), org: "acme".into() },
+    };
+    let interrupted = if managed {
+        admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.map(drop)
+    } else {
+        admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.map(drop)
+    };
+    assert_eq!(interrupted.unwrap_err().code, "test/key-install-interrupted");
+    let partial = west.directory.deployment(&original.id).await.unwrap().unwrap();
+    let first = partial.cell_transfer.as_ref().unwrap().attempt.clone().unwrap();
+    assert_eq!(first.ordinal, 1);
+    assert_eq!(partial.storage_generation, Some(first.generation));
+    assert!(partial.move_from.is_some());
+
+    let CellStorage::Local { root } = &west_storage else { panic!("a disposable local fixture") };
+    let staged_prefix = root.join(partial.storage_prefix());
+    let copied = files_under(&staged_prefix).into_iter()
+        .find(|path| path.extension().is_some_and(|extension| extension == "pack"))
+        .expect("the interrupted attempt staged the checkpoint pack");
+    std::fs::write(&copied, b"conflicting immutable bytes").unwrap();
+
+    let stale = rtdb_directory::PreparedCellTransfer {
+        intent: intent.clone(),
+        source_incarnation: original.incarnation,
+        destination_incarnation: partial.incarnation,
+        epoch: partial.epoch,
+        attempt: Some(first.clone()),
+    };
+    let arrived = if managed {
+        let prepared = admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap();
+        assert_eq!(prepared.attempt.as_ref().map(|attempt| attempt.ordinal), Some(2));
+        let refused = admin::activate_managed_cell_transfer(&from, &to, &stale).await.unwrap_err();
+        assert_eq!(refused.code, "rtdb.multi/cell-transfer", "the closed attempt's receipt cannot activate");
+        let mut legacy = prepared.clone();
+        legacy.attempt = None;
+        assert!(admin::activate_managed_cell_transfer(&from, &to, &legacy).await.is_err());
+        assert_eq!(admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap(), prepared);
+        let arrived = admin::activate_managed_cell_transfer(&from, &to, &prepared).await.unwrap();
+        admin::dispose_abandoned(&to, &original.id).await.unwrap().unwrap()
+            .abandoned_generations.get(&first.generation).unwrap().disposition.as_ref().unwrap();
+        assert_eq!(admin::activate_managed_cell_transfer(&from, &to, &stale).await.unwrap_err().code, "rtdb.multi/cell-transfer");
+        let _ = arrived;
+        west.directory.deployment(&original.id).await.unwrap().unwrap()
+    } else {
+        admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.unwrap()
+    };
+    assert_eq!(arrived.lifecycle, Lifecycle::Live);
+    let selected = arrived.cell_transfer.as_ref().unwrap().attempt.clone().unwrap();
+    assert_eq!(selected.ordinal, 2);
+    assert_ne!(selected.generation, first.generation);
+    assert_eq!(arrived.storage_generation, Some(selected.generation));
+    assert_eq!(selected.checkpoint, first.checkpoint);
+    assert_eq!(selected.sealed_journals, first.sealed_journals);
+    let closed = &arrived.abandoned_generations[&first.generation];
+    assert_eq!(closed.ordinal, 1);
+    assert!(closed.disposition.is_some(), "the closed generation is emptied once the destination is selected");
+    assert!(files_under(&staged_prefix).is_empty());
+    assert!(!files_under(&root.join(arrived.storage_prefix())).is_empty());
+    let tombstone = east.directory.deployment(&original.id).await.unwrap().unwrap();
+    assert_eq!(tombstone.lifecycle, Lifecycle::Deleted);
+    assert_eq!(tombstone.cell_transfer, arrived.cell_transfer);
+
+    let reader = connect_eventually(&west, "shop").await;
+    assert_eq!(values(&reader, "SELECT total FROM orders").await, ["10", "20", "30"]);
+    assert_eq!(in_order(&reader, ordered).await, by_total);
+    assert_eq!(order_history(&reader).await, history);
+    drop(reader);
+
+    let holder = west.holder("shop").await.unwrap();
+    let lost = west.node(holder);
+    let lost_id = lost.lease.id();
+    lost.stop_renewing();
+    while west.directory.member(&lost_id).await.unwrap().unwrap().lease_expires_at_ms > rtdb_directory::now_ms() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let recovered = connect_eventually(&west, "shop").await;
+    recovered.simple_query("INSERT INTO orders (_id, total) VALUES (4, 40)").await.unwrap();
+    assert_eq!(in_order(&recovered, ordered).await, ["2", "3", "1", "4"]);
+    assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["10", "20", "30", "40"]);
+    drop(recovered);
+    east.stop().await;
+    west.stop().await;
+}
+
+async fn in_order(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
+    client.simple_query(sql).await.unwrap().into_iter().filter_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+        _ => None,
+    }).collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replacement { ClosedBeforeSelection, SelectedBeforeInstall, LegacyStaged, LegacyPrepared, LegacyPreparedIntact }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_generation_replacement_resumes_from_either_record() {
+    for case in [Replacement::ClosedBeforeSelection, Replacement::SelectedBeforeInstall] {
+        exercise_interrupted_replacement(case).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_transfers_without_attempts_recover_or_activate() {
+    for case in [Replacement::LegacyStaged, Replacement::LegacyPrepared, Replacement::LegacyPreparedIntact] {
+        exercise_interrupted_replacement(case).await;
+    }
+}
+
+async fn edit(directory: &Arc<dyn Directory>, id: &str, change: impl FnOnce(&mut DeploymentRecord)) {
+    let mut record = directory.deployment(id).await.unwrap().unwrap();
+    let version = record.version;
+    change(&mut record);
+    assert!(directory.replace_deployment(record, version).await.unwrap().applied().is_some());
+}
+
+async fn exercise_interrupted_replacement(case: Replacement) {
+    let map = Arc::new(InterruptedCutover::default());
+    let east = Cell::start_on(None, vec![MemberPool::General], None, None, Some((map.clone(), "east".into()))).await;
+    let west = Cell::start_on(None, vec![MemberPool::General], None, None, Some((map.clone(), "west".into()))).await;
+    let (east_storage, west_storage) = (east.storage(), west.storage());
+    let east_keys = east.keys();
+    let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
+    let client = east.connect("shop").await;
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
+    east.node(east.holder("shop").await.unwrap()).agent.flush("shop").await.unwrap();
+    client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
+    drop(client);
+    let id = original.id.clone();
+    let move_shop = || admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None);
+
+    assert_eq!(move_shop().await.unwrap_err().code, "test/key-install-interrupted");
+    let partial = west.directory.deployment(&id).await.unwrap().unwrap();
+    let first = partial.storage_generation.unwrap();
+    let CellStorage::Local { root } = &west_storage else { panic!("a disposable local fixture") };
+    let staged_prefix = root.join(partial.storage_prefix());
+    let pack = files_under(&staged_prefix).into_iter()
+        .find(|path| path.extension().is_some_and(|extension| extension == "pack")).unwrap();
+    let closed = rtdb_directory::AbandonedCellGeneration {
+        ordinal: 1, namespaces: partial.storage_namespaces.unwrap(), prefix: partial.storage_prefix(),
+        closed_at_ms: rtdb_directory::now_ms(), first_empty_at_ms: None, disposition: None,
+    };
+    let strip = |record: &mut DeploymentRecord| { record.cell_transfer.as_mut().unwrap().attempt = None; };
+    let expected_ordinal = match case {
+        Replacement::ClosedBeforeSelection => {
+            edit(&west.directory, &id, |record| { record.abandoned_generations.insert(first, closed.clone()); }).await;
+            Some(2)
+        }
+        Replacement::SelectedBeforeInstall => {
+            edit(&west.directory, &id, |record| { record.abandoned_generations.insert(first, closed.clone()); }).await;
+            edit(&east.directory, &id, |record| {
+                let attempt = record.cell_transfer.as_mut().unwrap().attempt.as_mut().unwrap();
+                attempt.ordinal = 2;
+                attempt.generation = uuid::Uuid::new_v4();
+            }).await;
+            Some(2)
+        }
+        Replacement::LegacyStaged => {
+            std::fs::write(&pack, b"conflicting immutable bytes").unwrap();
+            edit(&west.directory, &id, strip).await;
+            edit(&east.directory, &id, strip).await;
+            Some(1)
+        }
+        Replacement::LegacyPrepared => {
+            assert_eq!(move_shop().await.unwrap_err().code, "test/cutover-interrupted");
+            let prepared = west.directory.deployment(&id).await.unwrap().unwrap();
+            assert!(prepared.move_from.is_none());
+            std::fs::write(&pack, b"conflicting immutable bytes").unwrap();
+            edit(&west.directory, &id, strip).await;
+            edit(&east.directory, &id, strip).await;
+            None
+        }
+        Replacement::LegacyPreparedIntact => {
+            assert_eq!(move_shop().await.unwrap_err().code, "test/cutover-interrupted");
+            edit(&west.directory, &id, strip).await;
+            edit(&east.directory, &id, strip).await;
+            let arrived = loop {
+                match move_shop().await {
+                    Ok(arrived) => break arrived,
+                    Err(error) if error.code == "test/cutover-interrupted" => continue,
+                    Err(error) => panic!("{error:?}"),
+                }
+            };
+            assert_eq!(arrived.storage_generation, Some(first));
+            assert!(arrived.cell_transfer.as_ref().unwrap().attempt.is_none());
+            assert!(arrived.abandoned_generations.is_empty());
+            let reader = connect_eventually(&west, "shop").await;
+            assert_eq!(values(&reader, "SELECT total FROM orders").await, ["10", "20"]);
+            drop(reader);
+            east.stop().await;
+            west.stop().await;
+            return;
+        }
+    };
+    let arrived = loop {
+        match move_shop().await {
+            Ok(arrived) => break arrived,
+            Err(error) if error.code == "test/cutover-interrupted" => continue,
+            Err(_) if case == Replacement::LegacyPrepared => {
+                // Prepared bytes are verified again before activation, and a
+                // prepared attempt is never replaced by a fresh generation.
+                assert_eq!(map.cell_of("shop").await.unwrap().as_deref(), Some("east"));
+                assert_eq!(east.directory.deployment(&id).await.unwrap().unwrap().lifecycle, Lifecycle::Moving);
+                assert_eq!(west.directory.deployment(&id).await.unwrap().unwrap().storage_generation, Some(first));
+                assert!(west.directory.deployment(&id).await.unwrap().unwrap().abandoned_generations.is_empty());
+                east.stop().await;
+                west.stop().await;
+                return;
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    };
+    let attempt = arrived.cell_transfer.as_ref().unwrap().attempt.as_ref().map(|attempt| attempt.ordinal);
+    assert_eq!(attempt, expected_ordinal);
+    assert_ne!(arrived.storage_generation, Some(first));
+    assert!(arrived.abandoned_generations[&first].disposition.is_some());
+    assert!(files_under(&staged_prefix).is_empty());
+    let reader = connect_eventually(&west, "shop").await;
+    assert_eq!(values(&reader, "SELECT total FROM orders").await, ["10", "20"]);
+    drop(reader);
+    east.stop().await;
+    west.stop().await;
+}

@@ -1228,7 +1228,10 @@ Unbounded means adding cells (spec contract `CellMap`).
    Overlapping S3 prefixes in the same named bucket are rejected before writing namespace markers.
    Retry `move-cell` with the same source, destination and namespace configuration when preparation or cutover is interrupted.
    Before preparation completes, a retry keeps the original writer fence and reuses the registered destination prefix.
-   Recovery from conflicting immutable bytes in that prefix still requires an independently fenced destination attempt.
+   When staging meets conflicting immutable bytes in that prefix, the move closes the attempt, waits for its admitted storage regions, and copies again into a fresh generation the source selects.
+   The prepared receipt names its attempt, so a receipt from a closed attempt cannot activate the destination.
+   A closed generation stays recorded on the destination until its prefix is observed empty; `admin::dispose_abandoned` retries that disposal, and disposal of the residence runs it first.
+   A prepared attempt is never replaced; a destination that fails verification after preparation keeps the source fenced for an operator.
    The destination prefix must be disjoint from all deployment prefixes recorded in the destination directory.
    Once prepared, the source records the chosen prefix, the destination staged record waits for the placement switch, and retry finishes the same switch or source tombstone.
    The destination's holder imports the old log ensemble before log-fed replicas can serve it.

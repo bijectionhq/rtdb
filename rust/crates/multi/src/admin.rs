@@ -16,6 +16,10 @@ use crate::control::{self, ControlKey, MoveTicket, Request, Response};
 use crate::deployment::{CellStorage, ensemble_servers, journal_endpoint, live_holdings, require_storage_namespaces, s3_write_lease_horizon, select_logkeepers, storage_namespaces, write_quorum};
 use crate::keys::KeyService;
 
+mod cell_attempts;
+pub use cell_attempts::dispose_abandoned;
+pub(crate) use cell_attempts::{dispose_generations, has_pending_disposal};
+
 mod holder;
 pub use holder::{HolderObservation, observe_holder};
 
@@ -870,7 +874,7 @@ pub async fn move_cell(
     let (source, target) = if at_source {
         Box::pin(prepare_cell_move(from, to, &intent, maximum_message_bytes, hosted_task)).await?
     } else {
-        prepared_cell_move(from, to, &intent).await?
+        prepared_cell_move(from, to, &intent, Selection::Route).await?
     };
     if at_source
         && !map.assign(name, to.name, Some(from.name)).await?
@@ -878,7 +882,8 @@ pub async fn move_cell(
     {
         return Err(conflict());
     }
-    settle_cell_move(from, to, &source, &target).await
+    let arrived = settle_cell_move(from, to, &source, &target).await?;
+    Ok(dispose_after_settlement(to, arrived).await)
 }
 
 /// Stages the exact move reserved by an external placement catalog. Effect
@@ -897,6 +902,7 @@ pub async fn prepare_managed_cell_transfer(
         source_incarnation: source.incarnation,
         destination_incarnation: target.incarnation,
         epoch: source.epoch,
+        attempt: source.cell_transfer.as_ref().and_then(|transfer| transfer.attempt.clone()),
     })
 }
 
@@ -909,13 +915,25 @@ pub async fn activate_managed_cell_transfer(
 ) -> Result<DeploymentRecord> {
     let intent = &prepared.intent;
     validate_managed_cell_move(from, to, intent)?;
-    let (source, target) = prepared_cell_move(from, to, intent).await?;
+    let receipt = Selection::Receipt(prepared.attempt.as_ref().map(|attempt| attempt.ordinal));
+    let (source, target) = prepared_cell_move(from, to, intent, receipt).await?;
+    let selected = source.cell_transfer.as_ref().and_then(|transfer| transfer.attempt.as_ref());
     if source.incarnation != prepared.source_incarnation || target.incarnation != prepared.destination_incarnation
-        || source.epoch != prepared.epoch
+        || source.epoch != prepared.epoch || prepared.attempt.as_ref() != selected
     {
         return Err(cell_move_conflict(from, to, &intent.name));
     }
-    settle_cell_move(from, to, &source, &target).await
+    let arrived = settle_cell_move(from, to, &source, &target).await?;
+    Ok(dispose_after_settlement(to, arrived).await)
+}
+
+/// Settlement already selected the destination. A provider that has not yet
+/// emptied a closed generation leaves it recorded for the reaper's next pass.
+async fn dispose_after_settlement(to: &CellHandle<'_>, arrived: DeploymentRecord) -> DeploymentRecord {
+    match dispose_abandoned(to, &arrived.id).await {
+        Ok(Some(disposed)) => disposed,
+        Ok(None) | Err(_) => arrived,
+    }
 }
 
 fn validate_managed_cell_move(from: &CellHandle<'_>, to: &CellHandle<'_>, intent: &CellTransferIntent) -> Result<()> {
@@ -942,10 +960,19 @@ fn intent_matches(record: &DeploymentRecord, intent: &CellTransferIntent) -> boo
     })
 }
 
+/// What selects the destination: the cell map route, which follows the
+/// source's own attempt, or a placement catalog's retained receipt.
+#[derive(Clone, Copy)]
+enum Selection {
+    Route,
+    Receipt(Option<u32>),
+}
+
 async fn prepared_cell_move(
     from: &CellHandle<'_>,
     to: &CellHandle<'_>,
     intent: &CellTransferIntent,
+    selection: Selection,
 ) -> Result<(DeploymentRecord, DeploymentRecord)> {
     let conflict = || cell_move_conflict(from, to, &intent.name);
     let source = record(from.directory.as_ref(), &intent.name).await?;
@@ -967,6 +994,20 @@ async fn prepared_cell_move(
             && target.move_from.is_none()
             && matches!(target.lifecycle, Lifecycle::Moving | Lifecycle::Live | Lifecycle::Quarantined)
     }).ok_or_else(conflict)?;
+    let selected = transfer.attempt.as_ref();
+    let generation_matches = selected.is_none_or(|attempt| target.storage_generation == Some(attempt.generation)
+        && target.storage_namespaces == Some(attempt.namespaces));
+    let abandoned = target.storage_generation.is_some_and(|generation| target.abandoned_generations.contains_key(&generation));
+    let ordinal = |record: &DeploymentRecord| record.cell_transfer.as_ref()
+        .and_then(|transfer| transfer.attempt.as_ref()).map(|attempt| attempt.ordinal);
+    if !generation_matches
+        || !crate::cell_attempt::may_activate(target.move_from.is_none(), abandoned, match selection {
+            Selection::Route => ordinal(&source),
+            Selection::Receipt(receipt) => receipt,
+        }, ordinal(&source), ordinal(&target))
+    {
+        return Err(conflict());
+    }
     if target.lifecycle == Lifecycle::Moving {
         require_storage_drained(&target)?;
         let bucket = to.storage.bucket(rtdb_storage::IoRegion::new()).await?;
@@ -1121,8 +1162,13 @@ async fn prepare_cell_move(
         return Err(conflict());
     }
     if current.lifecycle == Lifecycle::Deleted {
-        return prepared_cell_move(from, to, intent).await;
+        return prepared_cell_move(from, to, intent, Selection::Route).await;
     }
+    let current = if current.lifecycle == Lifecycle::Live {
+        cell_attempts::require_disposed(from, &current).await?
+    } else {
+        current
+    };
     let target = to.directory.deployment_by_name(&intent.name).await?;
     let source_media = cell_media(from.storage, from.keys)?;
     let destination_media = cell_media(to.storage, to.keys)?;
@@ -1151,6 +1197,17 @@ async fn prepare_cell_move(
     })?;
     let mut pending = None;
     let mut prior_residence = None;
+    let target = match target {
+        Some(previous) if previous.lifecycle == Lifecycle::Moving && previous.incarnation == arrival.incarnation
+            && previous.move_from.is_some() && intent_matches(&current, intent) && same_media(&current)
+            && previous.cell_transfer != current.cell_transfer =>
+        {
+            // The source selected a fresh attempt before the destination
+            // followed it. Only the successor of a closed generation installs.
+            Some(cell_attempts::install_selected(to, &previous, &current).await?)
+        }
+        target => target,
+    };
     if let Some(previous) = target {
         if !same_residence(&previous, intent, &intent.destination) {
             return Err(conflict());
@@ -1160,7 +1217,7 @@ async fn prepare_cell_move(
                 && intent_matches(&current, intent) && previous.cell_transfer == current.cell_transfer =>
             {
                 if previous.move_from.is_none() {
-                    return prepared_cell_move(from, to, intent).await;
+                    return prepared_cell_move(from, to, intent, Selection::Route).await;
                 }
                 arrival.ensemble.clone_from(&previous.ensemble);
                 pending = Some(previous);
@@ -1178,7 +1235,8 @@ async fn prepare_cell_move(
                 let ready = previous.disposal.as_ref().is_some_and(|receipt| {
                     receipt.deployment == previous.id && receipt.incarnation == previous.incarnation
                         && receipt.epoch == transfer.epoch && receipt.journals == previous.replica_journals
-                }) && previous.storage_regions.is_empty() && previous.archive_retirement.as_ref()
+                }) && previous.storage_regions.is_empty() && !cell_attempts::has_pending_disposal(&previous)
+                    && previous.archive_retirement.as_ref()
                     .is_none_or(|retirement| retirement.observed_empty_at_ms.is_some());
                 if !ready {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/previous-residence", "The destination is still settling its previous residence"));
@@ -1238,6 +1296,16 @@ async fn prepare_cell_move(
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-journal", "Cell moves require independent replica journals"));
     }
 
+    let sealed_journals = source_stream.servers.iter()
+        .map(|endpoint| endpoint.journal().map(str::to_owned).ok_or_else(|| unbound_inventory(endpoint.address())))
+        .collect::<Result<Vec<_>>>()?;
+    let first_attempt = rtdb_directory::CellTransferAttempt {
+        ordinal: 1,
+        generation: uuid::Uuid::new_v4(),
+        namespaces: target_binding,
+        checkpoint: current.checkpoint,
+        sealed_journals,
+    };
     let serving_archive = if current.lifecycle == Lifecycle::Live {
         let archive = Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.storage, from.keys, &current, hosted_task.as_ref())).await?;
         if archive.is_none() {
@@ -1284,6 +1352,7 @@ async fn prepare_cell_move(
             epoch: record.epoch,
             source_media: source_media.clone(),
             destination_media: destination_media.clone(),
+            attempt: Some(first_attempt.clone()),
         }));
         Ok(())
     }).await?;
@@ -1295,7 +1364,10 @@ async fn prepare_cell_move(
         staged.incarnation = arrival.incarnation;
         staged.replica_payload_trim = None;
         staged.ensemble = arrival.ensemble;
-        staged.storage_generation = Some(uuid::Uuid::new_v4());
+        staged.storage_generation = Some(source.cell_transfer.as_ref()
+            .and_then(|transfer| transfer.attempt.as_ref())
+            .map_or_else(uuid::Uuid::new_v4, |attempt| attempt.generation));
+        staged.abandoned_generations.clear();
         staged.recovery_manifest_sha256 = None;
         staged.storage_namespaces = Some(target_binding);
         staged.disposal = None;
@@ -1351,7 +1423,7 @@ async fn prepare_cell_move(
         }
     };
     if staged.move_from.is_none() {
-        return prepared_cell_move(from, to, intent).await;
+        return prepared_cell_move(from, to, intent, Selection::Route).await;
     }
 
     if staged.move_from.as_ref() != Some(&source_stream.servers) {
@@ -1368,10 +1440,29 @@ async fn prepare_cell_move(
     }
     rtdb_logkeeper::seal(&source_stream, source.epoch).await?;
     await_storage_drain(from.directory.as_ref(), from.storage, from.keys, &source).await?;
-    crate::store::reconcile_storage_regions(to.directory.as_ref(), to.storage, to.keys, &staged).await?;
-    let hosted_lineage = matches!(from.storage, CellStorage::S3 { .. }).then_some(source.lineage.as_str());
-    crate::store::with_source_lineage(from.directory.as_ref(), hosted_lineage, hosted_task.as_ref(),
-        Box::pin(stage_cell_storage(from, to, &source, &staged, hosted_task.clone()))).await?;
+    let mut source = source;
+    let mut replaced = false;
+    loop {
+        let closed = staged.storage_generation.is_some_and(|generation| staged.abandoned_generations.contains_key(&generation));
+        if closed && !replaced {
+            // An earlier invocation closed this attempt before selecting its successor.
+            (source, staged) = cell_attempts::replace(from, to, &source, &staged).await?;
+            replaced = true;
+            continue;
+        }
+        crate::store::reconcile_storage_regions(to.directory.as_ref(), to.storage, to.keys, &staged).await?;
+        let hosted_lineage = matches!(from.storage, CellStorage::S3 { .. }).then_some(source.lineage.as_str());
+        let staging = crate::store::with_source_lineage(from.directory.as_ref(), hosted_lineage, hosted_task.as_ref(),
+            Box::pin(stage_cell_storage(from, to, &source, &staged, hosted_task.clone()))).await;
+        match staging {
+            Ok(()) => break,
+            Err(error) if !replaced && cell_attempts::is_conflicting_copy(&error, &staged) => {
+                (source, staged) = cell_attempts::replace(from, to, &source, &staged).await?;
+                replaced = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
     rtdb_logkeeper::copy_retained(source_stream, target_stream, source.epoch).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
@@ -1654,6 +1745,11 @@ async fn finish_disposal_with_lock(
     if (fenced.lifecycle == Lifecycle::Deleting || fenced.moved_at_ms.is_some()) && !fenced.storage_regions.is_empty() {
         crate::store::reconcile_storage_regions(directory, storage, keys, &fenced).await?;
         fenced = directory.deployment(id).await?.ok_or_else(|| {
+            Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
+        })?;
+    }
+    if cell_attempts::has_pending_disposal(&fenced) {
+        fenced = cell_attempts::dispose_generations(directory, storage, keys, id).await?.ok_or_else(|| {
             Anomaly::incorrect("rtdb.multi/unknown-installation", format!("No installation has ID {id}"))
         })?;
     }
