@@ -104,7 +104,10 @@ The filesystem lock, synchronization calls, and binding of the receipt to the ac
 
 Coordinated native local startup holds a shared filesystem recovery gate while it discovers its checkpoint, loads table metadata and admits its replica cursor.
 Trie deletion grants and collection of old local checkpoint files or detached payloads require exclusive use of the gate through provider completion.
-The startup gate protects the selection interval. Long-lived holds for complete recovery closures remain a separate obligation.
+The startup gate protects the selection interval.
+Native startup checks the data and metadata files named by live and nascent primary tries, including each recorded data length, before accepting the root.
+Compactor reset uses the same inventory check.
+Long-lived holds for complete recovery closures remain a separate obligation.
 
 ## Retirement after an adopted compactor reset
 

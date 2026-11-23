@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool, log::LogTail};
 use rtdb_trie::{TrieConfig, TrieNode};
@@ -454,7 +454,32 @@ impl BlockStore {
             return Err(invalid("The stored checkpoint does not match or advance the admitted checkpoint in its replica journal"));
         }
         let tables = self.load_tables(&block).await?;
+        if self.store.local_maintenance_store().is_some_and(|local| local.defers_trie_releases()) {
+            self.verify_primary_inventory(&block, &tables).await?;
+        }
         Ok((block, tables))
+    }
+
+    pub(crate) async fn verify_primary_inventory(&self, root: &BlockCatalog,
+        tables: &BTreeMap<rtdb_types::TableRef, TableBlock>,
+    ) -> Result<()> {
+        let invalid_extent = |key| Anomaly::fault("rtdb.replication/checkpoint-primary-extent",
+            format!("The checkpoint primary file has the wrong length: {key}"));
+        for entry in root.table_entries()? {
+            let table = tables.get(&entry.table).ok_or_else(|| invalid("The checkpoint has no table block"))?;
+            for trie in table.trie_details() {
+                for path in trie.checkpoint_files(&entry.slug, CheckpointContents::Primary)? {
+                    let key = ObjectKey::new(path)?;
+                    let size = self.store.head_fresh(&key).await?.size;
+                    if size == 0 || key.as_str().contains("/data/")
+                        && trie.data_file_size.is_some_and(|expected| u64::try_from(expected) != Ok(size))
+                    {
+                        return Err(invalid_extent(key));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn load_tables(&self, block: &BlockCatalog) -> Result<BTreeMap<rtdb_types::TableRef, TableBlock>> {

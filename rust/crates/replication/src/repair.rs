@@ -199,27 +199,16 @@ impl PrimaryReset {
             if installed.publication_sha256().is_none() || root.publication_sha256() != installed.publication_sha256() {
                 return Err(reset_inventory("The checkpoint root differs from the installed publication"));
             }
-            for entry in root.table_entries()? {
-                if root.table_block_digest(entry.oid).is_none() {
-                    return Err(reset_inventory("The checkpoint has no bound table manifest"));
-                }
-                let table = tables.get(&entry.table).ok_or_else(|| reset_inventory("The checkpoint has no table block"))?;
-                for trie in table.trie_details() {
-                    for file in trie.checkpoint_files(&entry.slug, CheckpointContents::Primary)? {
-                        cancelled(cancellation)?;
-                        let key = ObjectKey::new(file)?;
-                        let size = match store.head_fresh(&key).await {
-                            Ok(head) if head.size > 0 => head.size,
-                            Ok(_) | Err(rtdb_storage::Error::MissingObject(_)) =>
-                                return Err(reset_inventory(format!("The checkpoint primary object is missing or empty: {key}"))),
-                            Err(error) => return Err(error.into()),
-                        };
-                        if key.as_str().contains("/data/") && trie.data_file_size.is_some_and(|expected| u64::try_from(expected) != Ok(size)) {
-                            return Err(reset_inventory(format!("The checkpoint primary data object has the wrong size: {key}")));
-                        }
-                    }
-                }
+            if root.table_entries()?.iter().any(|entry| root.table_block_digest(entry.oid).is_none()) {
+                return Err(reset_inventory("The checkpoint has no bound table manifest"));
             }
+            cancellation.run_until_cancelled(blocks.verify_primary_inventory(&root, &tables))
+                .await.ok_or_else(crate::progress::cancelled)?
+                .map_err(|error| match error.code.as_str() {
+                    "rtdb.storage/missing-object" | "rtdb.replication/checkpoint-primary-extent" =>
+                        reset_inventory(error.message.unwrap_or_default()),
+                    _ => error,
+                })?;
             let table_catalog = TableCatalog::load(Some(root), &tables)?;
             let primary = tables.into_iter().map(|(table, block)| (table, block.for_primary_repair())).collect();
             let catalog = TrieCatalog::load(&primary, file_size_target, target.system_time)?;

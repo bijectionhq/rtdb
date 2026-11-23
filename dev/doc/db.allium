@@ -775,6 +775,7 @@ config {
 -- Local archive copies and forks retain their maintenance witness through completion of admitted provider work.
 -- Other admission failures end startup with the provider error.
 -- The replication driver consumes the admitted cursor for that same log and boundary.
+-- Coordinated native local startup checks the selected checkpoint's live and nascent primary inventory while its recovery gate is held.
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
 -- Ordinary recovery with a matching journal boundary seeds the cut after the driver opens its replica tail.
 -- The driver advances the cut through delivered records after pending block adoption and resolution read-back buffers have drained.

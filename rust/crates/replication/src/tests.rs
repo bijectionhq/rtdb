@@ -2729,6 +2729,35 @@ fn produced_upload(produced: &ProducedBlock, index: i64, source: i64) -> Replica
     })
 }
 
+#[tokio::test]
+async fn native_coordinated_startup_refuses_a_checkpoint_missing_primary_data() {
+    use rtdb_storage::LocalStore;
+
+    let replay = replayed_suffix(false).await;
+    let (root, tables) = replay.blocks.load(BlockIndex(0)).await.unwrap();
+    let objects = checkpoint_dependencies(&root, &tables).unwrap();
+    let primary_data = objects.iter().find(|key| key.as_str().contains("/data/")).unwrap().clone();
+    let path = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalStore::open(path.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
+    for object in objects {
+        let bytes = replay.blocks.object_store().get_fresh(&object).await.unwrap();
+        local.put(&object, bytes).await.unwrap();
+    }
+    let store: Arc<dyn ObjectStore> = local.clone();
+    let blocks = BlockStore::new(store.clone(), Arc::new(BufferPool::new(store, 1 << 20)),
+        MemoryBudget::new(1 << 26), 100_000_000).unwrap();
+    let ready = || blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), BlockDiscovery::At(BlockIndex(0)));
+    let hold = local.hold_recovery_open().await.unwrap();
+    assert!(ready().await.is_ok());
+    local.delete(&primary_data).await.unwrap();
+    let missing = ready().await.err().unwrap();
+    assert_eq!(missing.code, "rtdb.storage/missing-object");
+    local.put(&primary_data, Bytes::from_static(b"x")).await.unwrap();
+    let damaged = ready().await.err().unwrap();
+    assert_eq!(damaged.code, "rtdb.replication/checkpoint-primary-extent");
+    drop(hold);
+}
+
 async fn offloaded(store: &MemoryStore, position: i64, sequence: i64, body: ReplicaBody, block: BlockIndex) -> (LogRecord, rtdb_storage::ObjectKey) {
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)), message: body };
     let payload = envelope.encode();
