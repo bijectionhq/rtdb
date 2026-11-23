@@ -747,7 +747,11 @@ impl<'a> OpenTransaction<'a> {
                 }
                 if let Some(replacement) = control.replacement() {
                     let valid = interval(Timestamp(0), Timestamp::MAX)?;
-                    self.buffer.put(control.table(), replacement.clone(), valid)?;
+                    let mut document = replacement.clone();
+                    if control.name() == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE {
+                        document.insert(rtdb_types::HOSTED_RECEIPT_TX_ID.into(), Value::I64(self.tx_key().tx_id.0));
+                    }
+                    self.buffer.put(control.table(), document, valid)?;
                 }
                 Ok(())
             }

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) const READ_HELD_HOSTED_CONTROL_V1: &str = "rtdb.owned.ReadHeldHostedControl.v1";
+pub(crate) const READ_HELD_HOSTED_CONTROL_V2: &str = "rtdb.owned.ReadHeldHostedControl.v2";
 
 impl Service {
     pub(super) fn hosted_control_policy(
@@ -89,7 +89,7 @@ impl Service {
                 .fields()
                 .iter()
                 .enumerate()
-                .filter(|(_, field)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
+                .filter(|(_, field)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to" | rtdb_types::HOSTED_RECEIPT_TX_ID))
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>()
         };
@@ -99,8 +99,14 @@ impl Service {
                     .batch()
                     .project(&fields(row.batch().schema_ref()))
                     .map_err(arrow)?;
+                let mut schema = row.schema_ref().as_ref().clone();
+                if let Some(tx_id) = point.receipt_tx_id {
+                    let mut metadata = schema.metadata().clone();
+                    metadata.insert("rtdb.owned.receipt_tx_id".into(), tx_id.to_string());
+                    schema = schema.with_metadata(metadata);
+                }
                 self.owned_point_reply(
-                    row.schema_ref(),
+                    &schema,
                     Some(&row),
                     present,
                     Timestamp(0),

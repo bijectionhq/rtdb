@@ -259,7 +259,7 @@ Relations without a declaration continue to infer their schema.
 Use `rtdb.owned.OpenRead.v2` with an empty body to reserve one present and retain its exact applied catalog.
 The one result body contains 16 opaque handle bytes, the signed big-endian i64 Unix microsecond present, and the signed big-endian i64 ordered transaction id.
 `rtdb.owned.OpenAppliedRead.v3` requests an already-applied hosted catalog from the current recovered holder.
-Its input is the 16-byte source installation UUID, a one-byte count from one to three, and that many exact acknowledged transaction keys.
+Its input is the 16-byte source installation UUID, a one-byte count from one to four, and that many exact transaction keys.
 Each key is a signed big-endian i64 transaction ID followed by a signed big-endian i64 ordered microsecond time.
 Its result uses the same held handle and cut format.
 The selected transaction must equal or advance both coordinates of each supplied transaction in the same history.
@@ -268,7 +268,7 @@ An inexact floor, foreign history, or a cut that cannot be retained is refused w
 The handle admits held point, historical point and hosted control reads and applied confirmation.
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
-`rtdb.owned.ConfirmAppliedHosted.v4` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
+`rtdb.owned.ConfirmAppliedHosted.v5` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
 The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
 An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.
 The original handle must come from `rtdb.owned.OpenAppliedRead.v3`.
@@ -774,7 +774,7 @@ The resolver checks all control and fact observations before any mutation and ab
 Use an absent-checked unique receipt key as one of the writes when the host needs to recover an indeterminate response.
 The response is the ordinary committed transaction-key row.
 
-`rtdb.owned.ReadHeldHostedControl.v1` uses the same installed placed owner
+`rtdb.owned.ReadHeldHostedControl.v2` uses the same installed placed owner
 and ordinary control allowlist as the commit actions. Send the original live,
 underived 16-byte held read handle, one ordinary control table prefix, then
 one terminated Arrow IPC batch with one row `_id: Utf8`. The ID is complete
@@ -783,6 +783,9 @@ and bounded to 4096 bytes. No time override is accepted.
 The response is ordinary point IPC, with the original held present and
 `valid_micros` equal to zero. A hit is one row with the complete ID,
 ordinary control fields, and its original system revision in point metadata.
+Native writes to the Root receipt table stamp their local transaction ID.
+Reading a stamped receipt also returns `rtdb.owned.receipt_tx_id` as point metadata.
+Pair it with the system revision to name the exact transaction in applied confirmation.
 An installed table with a covered absent row returns its typed schema without
 a revision or rows. Send that revision or null as `_expected_micros` in a
 subsequent checked hosted commit. A missing table or a non-epoch valid slice

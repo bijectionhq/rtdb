@@ -2,12 +2,12 @@ use super::*;
 use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
-pub(crate) const CONFIRM_APPLIED_HOSTED_V4: &str = "rtdb.owned.ConfirmAppliedHosted.v4";
+pub(crate) const CONFIRM_APPLIED_HOSTED_V5: &str = "rtdb.owned.ConfirmAppliedHosted.v5";
 
 pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadFloor, &[u8]), Status> {
     let (history, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Applied read requires a history"))?;
     let (&count, mut body) = body.split_first().ok_or_else(|| invalid("Applied read requires a transaction count"))?;
-    if !(1..=3).contains(&count) { return Err(invalid("Invalid applied read transaction count")); }
+    if !(1..=4).contains(&count) { return Err(invalid("Invalid applied read transaction count")); }
     let mut transactions = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
         let (offset, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Applied read requires a floor transaction"))?;
