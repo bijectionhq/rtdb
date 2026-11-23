@@ -187,6 +187,7 @@ pub(crate) const HELD_OWNED_RANGE_V2: &str = "rtdb.owned.ReadHeldRange.v2";
 pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
+pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
 pub(crate) const READ_HELD_WORLD_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldChanges.v1";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V1: &str = "rtdb.owned.ReadHeldMergedChanges.v1";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
@@ -1371,8 +1372,12 @@ impl Service {
             let Some(Value::I64(system)) = row.get("system_micros") else {
                 return Err(invalid("Owned historical count requires a microsecond system cut"));
             };
-            held.snapshot.count_range_at_system(&relation, &path, request, Timestamp(*system))
-                .await.map(|counted| (counted, None))
+            let counted = if measured {
+                held.snapshot.measure_range_at_system(&relation, &path, request, Timestamp(*system)).await
+            } else {
+                held.snapshot.count_range_at_system(&relation, &path, request, Timestamp(*system)).await
+            };
+            counted.map(|counted| (counted, None))
         } else if measured {
             held.snapshot.measure_range_observed(&relation, &path, request).await
         } else {

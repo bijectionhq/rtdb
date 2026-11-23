@@ -1764,6 +1764,20 @@ impl OwnedReadSession {
         Ok(result)
     }
 
+    /// Measures a covered historical Root range under the same retained cut as count.
+    pub async fn measure_range_at_system(
+        &self,
+        relation: &rtdb_types::OwnedRelation,
+        path: &rtdb_types::OwnedRelation,
+        request: crate::OwnedCountRequest<'_>,
+        system: Timestamp,
+    ) -> Result<crate::OwnedRangeCount> {
+        let context = self.ordered_root_context(relation, system).await?;
+        let result = crate::ordered_index::measure_owned_cut(context, &self.owner, relation, path, request).await?;
+        self.check_relation(relation)?;
+        Ok(result)
+    }
+
     async fn ordered_root_context(
         &self, relation: &rtdb_types::OwnedRelation, system: Timestamp,
     ) -> Result<Arc<QueryContext>> {
