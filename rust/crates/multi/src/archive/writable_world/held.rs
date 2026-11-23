@@ -223,6 +223,15 @@ impl HeldCheckpointWorld {
     pub fn initial_clock(&self) -> Timestamp { self.open.record.initial_clock() }
     pub fn clock_mode(&self) -> WorldClockMode { self.open.record.mode }
 
+    pub async fn prepare_overlay_cut(
+        &self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
+    ) -> Result<rtdb_node::OwnedForkCut> {
+        self.check()?;
+        let cut = self.open.snapshot.fork_overlay_cut(scope, &self.open.record, system).await?;
+        self.check()?;
+        Ok(cut)
+    }
+
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
     pub fn parent_pin(&self) -> Iid { self.open.record.pin }
     pub fn until(&self) -> Timestamp { self.open.retained.until }

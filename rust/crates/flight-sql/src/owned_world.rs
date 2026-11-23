@@ -10,6 +10,10 @@ use uuid::Uuid;
 /// The placed host's closed checkpoint-world authority. Flight supplies the
 /// authenticated native session and its already admitted database attachment.
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
+    fn prepare_world_overlay<'a>(
+        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut,
+    ) -> BoxFuture<'a, Result<PreparedWorldOverlay>>;
+
     fn prepare_replay_parent<'a>(
         &'a self, call: WorldCall<'a>, binding: [u8; 32], original: Option<TransactionKey>,
     ) -> BoxFuture<'a, Result<Option<PreparedReplayParent>>>;
@@ -30,6 +34,19 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
         root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
+}
+
+/// The independently archived overlay position and its bounded preparation lease.
+#[derive(serde::Serialize)]
+pub struct PreparedWorldOverlay {
+    pub world: [u8; 16],
+    pub parent_pin: [u8; 16],
+    pub capture: [u8; 16],
+    pub suffix: [u8; 16],
+    pub manifest: String,
+    pub basis: TransactionKey,
+    pub logical: Timestamp,
+    pub until: Timestamp,
 }
 
 /// An independent destination archive at an Original replayed Root cut.
@@ -97,6 +114,9 @@ pub struct WorldParentVersions {
 
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
+    fn prepare_overlay_cut<'a>(
+        &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
+    ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>>;
     fn present(&self) -> Timestamp;
     fn application_clock(&self) -> Option<Timestamp>;
     fn initial_clock(&self) -> Timestamp;

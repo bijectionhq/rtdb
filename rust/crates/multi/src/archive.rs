@@ -80,6 +80,7 @@ mod replica_suffix;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
 mod read_world;
 mod writable_world;
+pub(crate) use writable_world::prepare_checkpoint_world_overlay;
 pub(crate) use writable_world::{finish_checkpoint_replay_parents, prepare_checkpoint_replay_parent};
 pub(crate) use writable_world::retain_replayed_checkpoint_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};

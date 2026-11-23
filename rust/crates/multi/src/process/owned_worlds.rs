@@ -46,6 +46,25 @@ impl PlacedWorldHost {
 }
 
 impl OwnedWorldHost for PlacedWorldHost {
+    fn prepare_world_overlay<'a>(
+        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut,
+    ) -> BoxFuture<'a, Result<rtdb_flight_sql::PreparedWorldOverlay>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let source = self.capture_source.as_ref().ok_or_else(OwnedWorld::unavailable)?;
+            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade)
+                .ok_or_else(OwnedWorld::unavailable)?;
+            crate::archive::prepare_checkpoint_world_overlay(
+                Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
+                self.hosted_task.as_ref(), call.session, deployment, cut,
+                CheckpointReadResources {
+                    node: &self.options, memory: call.node.memory(),
+                    cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
+                },
+            ).await
+        })
+    }
+
     fn prepare_replay_parent<'a>(
         &'a self, call: WorldCall<'a>, binding: [u8; 32], original: Option<TransactionKey>,
     ) -> BoxFuture<'a, Result<Option<PreparedReplayParent>>> {
@@ -147,6 +166,12 @@ impl OwnedWorldHost for PlacedWorldHost {
 }
 
 impl OwnedWorldRead for HeldCheckpointWorld {
+    fn prepare_overlay_cut<'a>(
+        &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
+    ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>> {
+        Box::pin(HeldCheckpointWorld::prepare_overlay_cut(self, scope, system))
+    }
+
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
 
     fn application_clock(&self) -> Option<Timestamp> { HeldCheckpointWorld::application_clock(self) }

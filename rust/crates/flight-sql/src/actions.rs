@@ -87,6 +87,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
+                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V1 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V1 => Ok(vec![Ok(self.held_world_parent_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),

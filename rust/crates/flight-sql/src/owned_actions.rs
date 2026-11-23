@@ -204,6 +204,7 @@ pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtecte
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
+pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V1: &str = "rtdb.owned.PrepareHeldWorldOverlay.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
@@ -2343,6 +2344,29 @@ impl Service {
         let entry = found(call.owned_reads().take(&handle), "owned read")?;
         entry.close();
         Ok(())
+    }
+
+    pub(crate) async fn prepare_held_world_overlay_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a held world"))?;
+        let system = Timestamp(i64::from_be_bytes(rest.try_into().map_err(|_| invalid("Overlay preparation requires an exact system publication"))?));
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let scope = session.placed_history().map_err(status)?.ok_or_else(unsupported)?;
+        let cut = held.snapshot.prepare_overlay_cut(scope, system).await.map_err(status)?;
+        let charge = call.reserve(4096)?;
+        let prepared = host.prepare_world_overlay(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            cut,
+        ).await.map_err(status)?;
+        held.snapshot.check().map_err(status)?;
+        let body = serde_json::to_vec(&prepared).map_err(|_| Status::internal("Could not encode prepared overlay"))?;
+        Ok(ActionResult { body: wire::retain(body, charge) })
     }
 
     pub(crate) async fn prepare_replay_parent_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

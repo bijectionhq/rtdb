@@ -151,7 +151,7 @@ async fn copy_fork_suffix(
     restore_binding: Option<[u8; 32]>,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(Uuid, Option<Uuid>)> {
-    if !cut.is_publication() || deadline <= now() {
+    if (!cut.is_publication() && cut.overlay().is_none()) || deadline <= now() {
         return Err(OwnedWorld::unavailable());
     }
     let binding = archive_binding(archive)?;
@@ -191,6 +191,69 @@ async fn copy_fork_suffix(
     ).await?;
     replica_suffix::capture(directory, storage, archive, keys, hosted_task, deployment, suffix, pin, memory).await?;
     Ok((capture, Some(suffix)))
+}
+
+/// Materializes a separately held exact overlay position from the original
+/// placed replica stream. The result only identifies prepared archive media.
+pub(crate) async fn prepare_checkpoint_world_overlay(
+    directory: Arc<dyn Directory>, archive: &CellStorage, storage: &CellStorage,
+    agent: &crate::agent::NodeAgent, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
+    session: &mut NativeSession, deployment: Uuid, cut: rtdb_node::OwnedForkCut,
+    resources: CheckpointReadResources<'_>,
+) -> Result<rtdb_flight_sql::PreparedWorldOverlay> {
+    let unavailable = OwnedWorld::unavailable;
+    let (world, pin, logical) = cut.overlay().ok_or_else(unavailable)?;
+    let source = directory.deployment(&deployment.to_string()).await?.ok_or_else(unavailable)?;
+    let retained = source.checkpoint_worlds.get(&Uuid::from_bytes(pin.0))
+        .filter(|retained| retained.world.as_bytes() == &world.0 && retained.until > now())
+        .ok_or_else(unavailable)?;
+    admit_session(session, &source, &retained.owner)?;
+    if session.placed_history()? != Some(cut.scope()) { return Err(unavailable()); }
+    let live = session.open_owned_read().await?;
+    let (original, _charge) = live.world_registration(world).await?.filter(|(original, _)| {
+        original.pin == pin && !original.dropped && matches_retention(original, retained)
+    }).ok_or_else(unavailable)?;
+    if cut.basis() <= original.basis.system_time || cut.until() <= now() { return Err(unavailable()); }
+    let (capture, suffix) = copy_fork_suffix(
+        Arc::clone(&directory), storage, archive, keys, hosted_task, agent, deployment,
+        &source, &cut, cut.until(), None, resources.memory,
+    ).await?;
+    let suffix = suffix.ok_or_else(unavailable)?;
+    let installed = directory.deployment(&deployment.to_string()).await?.ok_or_else(unavailable)?;
+    admit_session(session, &installed, &retained.owner)?;
+    let (point, manifest) = capture_receipt(&installed, archive, deployment, capture)?.ok_or_else(unavailable)?;
+    let prepared = replica_suffix::accepted(&installed, &point, &manifest, suffix)?;
+    if !cut.matches_basis(prepared.basis) || installed.checkpoint_worlds.get(&Uuid::from_bytes(pin.0)) != Some(retained) {
+        return Err(unavailable());
+    }
+    let basis = prepared.basis;
+    let until = cut.until().min(Timestamp(prepared.expires_at_ms.saturating_mul(1000)));
+    let owner = &retained.owner;
+    let original = &original;
+    with_registered_capture_context(
+        directory.as_ref(), archive, keys, hosted_task,
+        CaptureSelection { deployment, capture, manifest: &manifest, suffix: Some(suffix), expected_basis: Some(basis) },
+        resources, |context, basis| async move {
+            let (archived, _charge) = rtdb_query::read_owned_world(Arc::clone(&context), owner, world)
+                .await?.ok_or_else(unavailable)?;
+            let publication = rtdb_query::read_owned_world_clock_revision(context, owner, world).await?;
+            if &archived != original || publication != Some((logical, basis.system_time)) {
+                return Err(unavailable());
+            }
+            Ok(())
+        },
+    ).await?;
+    // The copied position must still belong to an admitted source registration.
+    let reopened = open_world(directory.as_ref(), archive, session, deployment, Uuid::from_bytes(world.0)).await?;
+    if &reopened.record != original || now() >= until { return Err(unavailable()); }
+    let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), original, basis.system_time).await?;
+    if refreshed.overlay() != cut.overlay() || !refreshed.matches_basis(basis) || now() >= until {
+        return Err(unavailable());
+    }
+    Ok(rtdb_flight_sql::PreparedWorldOverlay {
+        world: world.0, parent_pin: pin.0, capture: *capture.as_bytes(), suffix: *suffix.as_bytes(),
+        manifest, basis, logical, until,
+    })
 }
 
 /// Retain the pre-replay base once, then independently archive one exact
