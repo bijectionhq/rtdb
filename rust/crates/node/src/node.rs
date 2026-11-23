@@ -2784,6 +2784,7 @@ pub struct OwnedRootSection {
     pub clock_slot: Option<TransactionKey>,
     pub proposal_overlay: bool,
     pub proposal_land: bool,
+    pub proposal_refusal: Vec<rtdb_tx::HostedControlWrite>,
     pub proposal_close: bool,
     pub checks: Vec<TxOp>,
     pub publication: Option<OwnedRootPublication>,
@@ -3004,6 +3005,22 @@ impl NativeSession {
         let proposal_overlay = root.proposal_overlay;
         let proposal_close = root.proposal_close;
         let proposal_land = root.proposal_land || proposal_close;
+        if root.proposal_refusal.len() != if root.proposal_land { 2 } else { 0 } {
+            return Err(unavailable());
+        }
+        let refusal = if root.proposal_land {
+            let attempt = &sections.first().ok_or_else(unavailable)?.1.attempt;
+            let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ATTEMPT_RELATION)?;
+            let marker = rtdb_tx::Documents::new(vec![rtdb_types::StructFields::from([
+                ("_id".into(), rtdb_types::Value::Utf8(attempt.clone())),
+                ("fingerprint".into(), rtdb_types::Value::Binary(fingerprint.to_vec())),
+            ])], self.service.node.memory())?;
+            Some(TxOp::OwnedInsertDocs {
+                relation, documents: marker, valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
+            })
+        } else {
+            None
+        };
         if proposal_land && (sections.len() != 1 || proposal_overlay
             || !matches!(&sections[0].1.effect, OwnedWorldEffect::Drop)
             || (root.proposal_land && proposal_close)
@@ -3110,6 +3127,9 @@ impl NativeSession {
         }
         effects = effects.saturating_add(observed.checks.len().saturating_mul(2))
             .saturating_add(observed.clocks.len());
+        if refusal.is_some() {
+            effects = effects.saturating_add(root.proposal_refusal.len() + 2);
+        }
         if effects > 4096 || now >= until { return Err(unavailable()); }
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
@@ -3143,6 +3163,11 @@ impl NativeSession {
                 settlement_pin,
                 land_root: proposal_land.then_some(section.parent_pin),
                 delete_root: delete_root.then_some(section.parent_pin) });
+        }
+        if let Some(marker) = refusal {
+            ops.push(TxOp::HostedConstraintRefusal);
+            ops.push(marker);
+            ops.extend(root.proposal_refusal.into_iter().map(TxOp::HostedControl));
         }
         self.state.execute_tx(ops, Default::default()).await
     }

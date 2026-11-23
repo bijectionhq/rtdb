@@ -1088,9 +1088,24 @@ pub(crate) async fn commit_checkpoint_world_batch(
         }
         admitted.push((retained.until, section));
     }
+    let deciding_landing = !root.proposal_refusal.is_empty();
     let outcome = session.commit_owned_world_batch(admitted, root, observed, fingerprint, controls, deadline).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
+    }
+    if deciding_landing {
+        // The same commit can retain the Proposal and record a refusal.
+        // Retire its pins only when an ordered drop is actually present.
+        terminal = match (terminal.pop(), session.open_owned_read().await) {
+            (Some((pin, retained)), Ok(held)) => {
+                let id = rtdb_types::Iid(*retained.world.as_bytes());
+                match held.world_registration(id).await {
+                    Ok(Some((world, _))) if world.dropped && world.pin.0 == *pin.as_bytes() => vec![(pin, retained)],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
     }
     if !terminal.is_empty() {
         // The ordered terminal marker is authoritative. A failed retirement leaves

@@ -13,6 +13,8 @@ const DECISION_PREFIX: &str = "root_decision:";
 const IMPACT_PREFIX: &str = "root_decision_impact:";
 const CLOCK_TASK: &str = "clock-task:";
 const ACTION_PERFORMANCE: &str = "action-performance:";
+const LANDING_RECEIPT: &str = "root_proposal_landing:";
+const LANDING_PROOF: &str = "root_proposal_landing_proof:";
 const MAX_DECISION_BYTES: usize = 1 << 20;
 
 fn invalid() -> Anomaly {
@@ -31,6 +33,10 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     };
     let primary = &ops[..index];
     let refusal = &ops[index + 1..];
+    if refusal.iter().filter_map(hosted).any(|control| landing_slot(control).is_some()) {
+        validate_landing_choice(primary, refusal, placed)?;
+        return Ok((primary, refusal));
+    }
     if refusal.iter().filter_map(hosted).any(|control| {
         control.expected().is_some() && continuation_control(control)
     }) {
@@ -169,6 +175,94 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     Ok((primary, refusal))
 }
 
+fn landing_slot(control: &HostedControlWrite) -> Option<usize> {
+    if control.name() != ADMISSION || control.expected().is_some() || control.is_check() {
+        return None;
+    }
+    let EntityId::String(id) = control.id() else { return None; };
+    if id.starts_with(LANDING_RECEIPT) { Some(0) }
+    else if id.starts_with(LANDING_PROOF) { Some(1) }
+    else { None }
+}
+
+fn validate_landing_choice(primary: &[Operation], refusal: &[Operation], placed: bool) -> Result<()> {
+    use crate::hosted_control::{ProposalLandingEffect, hosted_proposal_land};
+    use rtdb_types::Timestamp;
+
+    if !placed || refusal.len() != 3 || hosted_proposal_land(primary)
+        .is_none_or(|landing| landing.effect == ProposalLandingEffect::Close)
+    {
+        return Err(invalid());
+    }
+    let Some((attempt, fingerprint)) = primary.iter().find_map(|op| match op {
+        Operation::Public(TxOp::OwnedPublishWorld { attempt, fingerprint, land_root: Some(_), .. }) => Some((attempt, fingerprint)),
+        _ => None,
+    }) else { return Err(invalid()); };
+    let mut found_attempt = false;
+    let mut offered = [None, None];
+    let mut selected = [None, None];
+    for op in refusal {
+        match op {
+            Operation::Public(TxOp::HostedControl(control)) => {
+                let slot = landing_slot(control).ok_or_else(invalid)?;
+                let original = primary.iter().filter_map(hosted).find(|prior| {
+                    prior.id() == control.id() && landing_slot(prior) == Some(slot)
+                }).ok_or_else(invalid)?;
+                let before = original.replacement().ok_or_else(invalid)?;
+                let after = control.replacement().ok_or_else(invalid)?;
+                if control.scope() != original.scope() || !same_binding(before, after, &["admission"])
+                    || offered[slot].replace(admission_bytes(before).ok_or_else(invalid)?).is_some()
+                {
+                    return Err(invalid());
+                }
+                selected[slot] = Some(admission_bytes(after).ok_or_else(invalid)?);
+            }
+            Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to })
+                if relation.name() == ATTEMPTS && *valid_from == Some(Timestamp::MIN)
+                    && *valid_to == Some(Timestamp::MAX) =>
+            {
+                let [row] = documents.rows() else { return Err(invalid()); };
+                if found_attempt || row.len() != 2
+                    || !matches!(row.get("_id"), Some(Value::Utf8(id)) if id == attempt)
+                    || !matches!(row.get("fingerprint"), Some(Value::Binary(bytes)) if bytes.as_slice() == fingerprint)
+                {
+                    return Err(invalid());
+                }
+                found_attempt = true;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    let ([Some(before), Some(proof)], [Some(after), Some(refusal_proof)]) = (offered, selected)
+        else { return Err(invalid()); };
+    if !found_attempt || before != proof || after != refusal_proof || !landing_verdict(before, after) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn admission_bytes(document: &StructFields<Value>) -> Option<&[u8]> {
+    let Some(Value::Binary(body)) = document.get("admission") else { return None; };
+    Some(body)
+}
+
+fn landing_verdict(before: &[u8], after: &[u8]) -> bool {
+    if before.len() > MAX_DECISION_BYTES || after.len() > MAX_DECISION_BYTES {
+        return false;
+    }
+    let (Ok(mut before), Ok(after)) = (serde_json::from_slice::<serde_json::Value>(before),
+        serde_json::from_slice::<serde_json::Value>(after)) else { return false; };
+    let Some(record) = before.as_object_mut() else { return false; };
+    if record.get("outcome").and_then(serde_json::Value::as_str) != Some("applied")
+        || record.get("roots").and_then(serde_json::Value::as_array).is_none_or(Vec::is_empty)
+    {
+        return false;
+    }
+    record.insert("outcome".into(), "constraint_refused".into());
+    record.insert("roots".into(), serde_json::Value::Array(Vec::new()));
+    before == after
+}
+
 fn continuation_control(control: &HostedControlWrite) -> bool {
     control.name() == ADMISSION && matches!(control.id(), EntityId::String(id)
         if id.starts_with(CLOCK_TASK) || id.starts_with(ACTION_PERFORMANCE))
@@ -247,7 +341,7 @@ fn validate_continuation_choice(primary: &[Operation], refusal: &[Operation], pl
 }
 
 fn admission_json(document: &StructFields<Value>) -> Option<serde_json::Value> {
-    let Some(Value::Binary(body)) = document.get("admission") else { return None; };
+    let body = admission_bytes(document)?;
     if body.len() > 64 * 1024 { return None; }
     serde_json::from_slice(body).ok()
 }
@@ -437,6 +531,16 @@ pub(super) fn may_settle(error: &Anomaly) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn landing_refusal_keeps_the_request_and_withdraws_candidate_assertions() {
+        let before = br#"{"request":{"branch":"one"},"outcome":"applied","roots":[{"position":1}],"environment":{}}"#;
+        let after = br#"{"request":{"branch":"one"},"outcome":"constraint_refused","roots":[],"environment":{}}"#;
+        let foreign = br#"{"request":{"branch":"two"},"outcome":"constraint_refused","roots":[],"environment":{}}"#;
+        assert!(landing_verdict(before, after));
+        assert!(!landing_verdict(before, foreign));
+        assert!(!landing_verdict(after, before));
+    }
 
     fn publications(head: &str) -> Vec<Operation> {
         use rtdb_columnar::MemoryBudget;

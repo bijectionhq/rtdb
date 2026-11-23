@@ -4035,10 +4035,33 @@ impl Service {
             return Err(invalid("The Root section kind disagrees with its observations"));
         }
         rows_left = rows_left.checked_sub(root_witnesses.len()).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
+        let (refusal, body) = if proposal_land {
+            let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing landing refusal length"))?;
+            let (refusal, body) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+                .ok_or_else(|| invalid("Incomplete landing refusal"))?;
+            let refusal = owned_groups(refusal, true, false)?;
+            if refusal.len() != 1 || refusal[0].0.name() != "bj_fact_root_admission" {
+                return Err(invalid("A landing refusal requires its original receipt and proof"));
+            }
+            (refusal, body)
+        } else {
+            (Vec::new(), body)
+        };
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
         let (controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
+        let _refusal_charge = if proposal_land {
+            hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
+            let (refusal, charge) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;
+            if refusal.len() != 2 {
+                return Err(invalid("A landing refusal requires its original receipt and proof"));
+            }
+            root.proposal_refusal = refusal;
+            Some(charge)
+        } else {
+            None
+        };
         if proposal_overlay && !rtdb_tx::proposal_overlay_controls(&controls) {
             return Err(invalid("A Proposal overlay requires checked hosted settlement"));
         }
