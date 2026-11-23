@@ -44,6 +44,7 @@
 -- The SQL equality predicate still evaluates against the resolved rows.
 -- The native scan can seek past the remainder of an entity's history after an erase or a visible assertion that covers the requested valid interval from the lower bound of the system interval.
 -- In an owned IID bucket this shortcut requires the exact requested entity key.
+-- A scan narrowed to one ordinary IID can also skip loading pages whose greatest system time is older than a covering assertion.
 -- Ordered indexes use a new page namespace when their Date64 key encoding switches to UTC day flooring.
 -- Native writes derive a keyword IID from the bare name.
 --

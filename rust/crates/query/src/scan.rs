@@ -250,15 +250,20 @@ impl ActiveRows {
     }
 
     fn after_iid(&self, head: Head, upper: Iid) -> Result<Option<Head>> {
-        let (mut low, mut high) = (head.ordinal + 1, self.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            if self.header(middle)?.iid <= head.header.iid { low = middle + 1; }
-            else { high = middle; }
-        }
+        let low = self.seek(head.ordinal + 1, |header| header.iid <= head.header.iid)?;
         if low == self.len() { return Ok(None); }
         let header = self.header(low)?;
         Ok((header.iid <= upper).then_some(Head { header, ordinal: low, ..head }))
+    }
+
+    fn seek(&self, mut low: usize, before: impl Fn(EventHeader) -> bool) -> Result<usize> {
+        let mut high = self.len();
+        while low < high {
+            let middle = (low + high) / 2;
+            if before(self.header(middle)?) { low = middle + 1; }
+            else { high = middle; }
+        }
+        Ok(low)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +276,13 @@ impl Ord for Head {
     }
 }
 impl PartialOrd for Head { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+
+fn covers_history(header: EventHeader, bounds: TemporalBounds) -> bool {
+    header.op == EventOp::Erase
+        || (header.system_from <= bounds.system_time.lower()
+            && header.valid_time.lower() <= bounds.valid_time.lower()
+            && header.valid_time.upper() >= bounds.valid_time.upper())
+}
 
 #[derive(Clone)]
 struct RankProjection {
@@ -1602,13 +1614,46 @@ impl PartitionScan {
             if self.path_matches(task.range.lower,task.range.upper) { self.buffer_task(task).await?; }
         }
     }
+
+    async fn prune_covered_iid_pages(&mut self, selected: &mut Vec<usize>, iid: Iid) -> Result<()> {
+        if selected.len() < 2 || self.scan.table.name.table.is_owned_event_data()
+            || self.candidate_iids.as_ref().is_some_and(|iids| iids.len() != 1)
+        {
+            return Ok(());
+        }
+        let cut = self.bounds.system_time.lower();
+        let page_time = |index: usize| self.pages.entries[index].summary.temporal;
+        let Some((index, newest)) = selected.iter().copied().filter_map(|index| {
+            page_time(index).filter(|summary| summary.min_system_from <= cut)
+                .map(|summary| (index, summary.max_system_from))
+        }).max_by_key(|(_, newest)| *newest) else { return Ok(()); };
+        if !selected.iter().any(|&index| page_time(index).is_some_and(|summary| summary.max_system_from < newest)) {
+            return Ok(());
+        }
+        self.load(index).await?;
+        let rows = &self.loaded[&index].rows;
+        let row = rows.seek(0, |header| header.iid < iid || (header.iid == iid && header.system_from > cut))?;
+        if row == rows.len() { return Ok(()); }
+        let anchor = rows.header(row)?;
+        if anchor.iid == iid && covers_history(anchor, self.bounds) {
+            // A newer page may still shadow the anchor. Every page at its timestamp may affect an equal-time tie.
+            selected.retain(|&index| self.pages.entries[index].summary.temporal
+                .is_none_or(|summary| summary.max_system_from >= anchor.system_from));
+        }
+        Ok(())
+    }
+
     async fn buffer_task(&mut self,task: ScanTask) -> Result<()> {
         audience_work::scan_items(task.pages.len())?;
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
         self.read_statistics(&task.pages)?;
         let summaries: Vec<_> = task.pages.iter().map(|index|self.pages.entries[*index].summary.clone()).collect();
-        let mut selected: Vec<_> = select_pages(&summaries,self.pruning(),|summary|self.pages.entries[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
+        let pruning = self.pruning();
+        let mut selected: Vec<_> = select_pages(&summaries,pruning,|summary|self.pages.entries[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
+        if let Some(iid) = pruning.iid.filter(|_| !pruning.bypass_temporal_pruning) {
+            self.prune_covered_iid_pages(&mut selected, iid).await?;
+        }
         self.counts.pages_pruned = self.counts.pages_pruned.saturating_add((task.pages.len() - selected.len()) as u64);
         self.counts.pages_used = self.counts.pages_used.saturating_add(selected.len() as u64);
         selected.sort_by_key(|index| (matches!(self.pages.entries[*index].source,PageSource::Live { .. }),self.pages.entries[*index].priority,*index));
@@ -1626,11 +1671,7 @@ impl PartitionScan {
             self.counts.rows_read = self.counts.rows_read.saturating_add(rows.len() as u64);
             groups.push(Vec::new());
             group_reservations.push(self.execution.context.memory.reserve(256)?);
-            let (mut low, mut high) = (0, rows.len());
-            while low < high {
-                let middle = (low + high) / 2;
-                if rows.header(middle)?.iid < range_lower { low = middle + 1; } else { high = middle; }
-            }
+            let low = rows.seek(0, |header| header.iid < range_lower)?;
             if low < rows.len() {
                 let header = rows.header(low)?;
                 if header.iid <= range_upper { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal: low }); }
@@ -1719,11 +1760,7 @@ impl PartitionScan {
                 Ok(())
             })?;
             let entity = head.header.iid;
-            let covered = head.header.op == EventOp::Erase
-                || (head.header.system_from <= self.bounds.system_time.lower()
-                    && head.header.valid_time.lower() <= self.bounds.valid_time.lower()
-                    && head.header.valid_time.upper() >= self.bounds.valid_time.upper());
-            if covered && (!keyed || requested_key.is_some()) {
+            if covers_history(head.header, self.bounds) && (!keyed || requested_key.is_some()) {
                 while let Some(pending) = next.filter(|pending| pending.header.iid == entity) {
                     if let Some(following) = active[pending.active].after_iid(pending, range_upper)? {
                         heads.push(following);
@@ -3594,6 +3631,29 @@ mod tests {
         assert!(snapshot.segments(&table).is_empty());
         assert_descriptor_lifetime(snapshot.clone(), table.clone(), Arc::clone(&store), Some(metadata)).await;
         assert_combined_summary_replacement(snapshot, table, store).await;
+    }
+
+    #[tokio::test]
+    async fn a_newer_point_skips_older_files_for_the_same_iid() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let memory = MemoryBudget::new(1 << 20);
+        let system_time = Timestamp(150);
+        let mut write = TransactionBuffer::new(state.value().snapshot(),
+            TransactionKey { tx_id: TxId(1), system_time }, memory).unwrap();
+        let mut newer = events[0].clone();
+        newer.system_from = system_time;
+        newer.operation = StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(7))]));
+        write.append(table.clone(), newer).unwrap();
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let (mut scan, execution, _) = descriptor_scan(write.snapshot().unwrap(), table, storage);
+        scan.iids = Some([events[0].iid].into());
+        scan.system_time = TemporalFilter::Default;
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        assert_eq!(cursor.next_page().await.unwrap().unwrap().rows()[0].values, [Value::I64(7)]);
+        assert!(cursor.next_page().await.unwrap().is_none());
+        let counts = cursor.scan_counts().unwrap();
+        assert_eq!((counts.pages_used, counts.rows_read), (1, 1));
+        assert!(counts.pages_pruned > 0);
     }
 
     #[tokio::test]
