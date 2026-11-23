@@ -197,3 +197,23 @@ The Gradle gates emitted no reflection or boxed math warnings.
 These runs qualify the continuation on streaming recovery base `af11cd79f7`.
 A dry merge with `e263067b0c` found overlapping changes in strict hosted writes, fresh replay and retained archive ancestry.
 The merge needs to preserve the newer write and restore contracts while carrying the new reader holds and retirement checks.
+
+== Direct-main qualification of the structural work
+
+The landing composes the continuation with guarded Logkeeper append, replay archive advancement, authenticated frame reads, spatial support, and the Arrow search trees.
+The legacy repair path verifies complete bodies under an ordinary read budget.
+New archived range readers keep both the provider region and the memory charge through cancelled vault operations.
+Timestamp forks retain the checkpoint and consume the admitted, term-fenced replay prefix.
+Arrow rank pruning uses a certified UUID order and the same offset and fetch arithmetic as SQL execution.
+Compaction retains assertion-position order and selects scan tie precedence at the configured naming epoch.
+
+The complete Gradle run on `d037dd79ef` passed 3,202 unit, 3,348 property, and 5,629 integration cases, with the existing PostgreSQL slot-recreation skip.
+On runtime `4755186bae`, the unchanged JVM bindings passed all 398 unit cases and the integration case again against the rebuilt native library.
+The final native overlay passed all 615 selected cases on default stacks, including normal-stack streamed transfer and managed archive restore and move, the archive vault drain, the guarded cutoff, and UUID search with literal and prepared offsets.
+Earlier native gates checked the affected foundation crates and broad backend and simulation paths.
+
+TLC matched 48 cases across the affected archive and read-index models.
+Lean checked eleven receipt-clock and quorum-bound theorems with their controls.
+Verus matched the selected receipt, rank, limit, compaction, checkpoint, and replay handoff manifests with 73 verified functions across their baselines.
+The changed Allium specs added no diagnostics relative to `c33f341252`.
+Hosted provider checks that require a live S3 endpoint remain outside this local qualification.
