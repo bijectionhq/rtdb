@@ -91,6 +91,10 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
+    pub(crate) fn replica_read_deployment(&self) -> Option<uuid::Uuid> {
+        self.replica_read_index.as_ref()?.deployment()
+    }
+
     pub(crate) fn has_replica_read_index(&self) -> bool {
         self.replica_read_index.is_some()
     }

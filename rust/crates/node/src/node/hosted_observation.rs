@@ -106,6 +106,7 @@ impl AppliedReadFloor {
     }
 
     pub fn history(&self) -> uuid::Uuid { self.history }
+    pub(super) fn minimum(&self) -> TransactionKey { self.minimum }
 
     pub(super) fn cut<'a>(
         &self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>,

@@ -134,6 +134,12 @@ enum AppliedCatalogAdmission<'a> {
     PreparedAudience(&'a PreparedAppliedCatalog),
 }
 
+enum OwnedReadBasis<'a> {
+    ClockReservation,
+    Fresh { deployment: uuid::Uuid, required: Option<&'a AppliedReadFloor> },
+    Applied { floor: &'a AppliedReadFloor, preparation: Option<Arc<PreparedAppliedCatalog>> },
+}
+
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
     selected == floor
         || (selected.tx_id > floor.tx_id && selected.system_time >= floor.system_time)
@@ -3449,14 +3455,19 @@ impl NativeSession {
     }
     /// Retains the exact applied catalog at one store-reserved transaction for repeated reads.
     pub async fn open_owned_read(&mut self) -> Result<OwnedReadSession> {
-        self.retain_owned_read(None, None).await
+        self.retain_owned_read(OwnedReadBasis::ClockReservation).await
     }
+
+    pub async fn open_fresh_owned_read(&mut self, deployment: uuid::Uuid, required: Option<&AppliedReadFloor>) -> Result<OwnedReadSession> {
+        self.retain_owned_read(OwnedReadBasis::Fresh { deployment, required }).await
+    }
+
     /// Enrolls one nonrenewable lower catalog pin for a prepaid session before use.
     pub async fn prepare_applied_owned_reads(&mut self, floor: &AppliedReadFloor) -> Result<u64> {
         if self.service.audience_storage.is_none() || self.applied_preparation.is_some() {
             return Err(hosted_source_unavailable());
         }
-        let read = self.retain_owned_read(Some(floor), None).await?;
+        let read = self.retain_owned_read(OwnedReadBasis::Applied { floor, preparation: None }).await?;
         let preparation = PreparedAppliedCatalog::from_read(&read, &self.service.memory)?;
         let remaining = preparation.remaining_micros()?;
         self.applied_preparation = Some(Arc::new(preparation));
@@ -3469,14 +3480,17 @@ impl NativeSession {
         } else {
             None
         };
-        self.retain_owned_read(Some(floor), preparation).await
+        self.retain_owned_read(OwnedReadBasis::Applied { floor, preparation }).await
     }
     async fn retain_owned_read(
-        &mut self, applied_floor: Option<&AppliedReadFloor>,
-        applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
+        &mut self, read_basis: OwnedReadBasis<'_>,
     ) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
-        if applied_floor.is_none() && self.service.audience_storage.is_some() { return Err(hosted_source_unavailable()); }
+        let applied = match &read_basis {
+            OwnedReadBasis::Applied { floor, .. } => Some(*floor),
+            _ => None,
+        };
+        if applied.is_none() && self.service.audience_storage.is_some() { return Err(hosted_source_unavailable()); }
         let node = self.service.node.clone();
         let identity = Arc::clone(&self.service.identity);
         let database = self.state.database().to_owned();
@@ -3489,11 +3503,18 @@ impl NativeSession {
             AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
             _ => None,
         };
-        let applied_scope = applied_floor.map(|_| attached_scope.ok_or_else(hosted_source_unavailable)).transpose()?;
-        let attached = Arc::downgrade(&attached);
+        let applied_scope = applied.map(|_| attached_scope.ok_or_else(hosted_source_unavailable)).transpose()?;
+        let session_cancellation = self.state.cancellation().clone();
+        let cancellation = session_cancellation.child_token();
+        let attachment = Arc::downgrade(&attached);
         let applied_memory;
-        let (reserved, cut) = match applied_floor {
-            Some(floor) => {
+        let mut replica_capture = None;
+        let mut floor_to_check = None;
+        let mut applied_preparation = None;
+        let (reserved, cut) = match read_basis {
+            OwnedReadBasis::Applied { floor, ref preparation } => {
+                applied_preparation = preparation.clone();
+                floor_to_check = Some(floor);
                 applied_memory = node.factory.options.query.query_memory(&self.service.memory);
                 let admission = match applied_preparation.as_deref() {
                     Some(preparation) => AppliedCatalogAdmission::PreparedAudience(preparation),
@@ -3503,26 +3524,46 @@ impl NativeSession {
                 };
                 (None, floor.cut(None, &applied_memory, admission)?)
             }
-            None => {
+            OwnedReadBasis::Fresh { deployment, required } => {
+                if attached.replica_read_deployment() != Some(deployment)
+                    || deployment.is_nil() || required.is_some_and(|floor| floor.history() != deployment)
+                {
+                    return Err(hosted_source_unavailable());
+                }
+                node.admit(&database, DatabaseAccess::Read, identity.as_ref(), &cancellation).await?;
+                let snapshot = attached.capture_replica_snapshot(&cancellation).await?;
+                let present = snapshot.tx_basis().ok_or_else(hosted_source_unavailable)?;
+                if required.is_some_and(|floor| !covers_transaction(present, floor.minimum())) {
+                    return Err(hosted_source_unavailable());
+                }
+                replica_capture = Some(crate::ReplicaQueryCapture {
+                    attachment: attachment.clone(), snapshot: Arc::new(snapshot),
+                });
+                floor_to_check = required;
+                (None, CatalogReadCut::Current)
+            }
+            OwnedReadBasis::ClockReservation => {
                 let present = self.reserve_ordered_present().await?;
                 (Some(present.system_time), CatalogReadCut::Reserved(present))
             }
         };
+        let attached = attachment;
+        let selected = reserved.or_else(|| replica_capture.as_ref().and_then(|capture| {
+            capture.snapshot.tx_basis().map(|key| key.system_time)
+        }));
         let basis = QueryBasis {
-            snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![reserved.map(Into::into)])]) },
-            replica_capture: None,
-            snapshot_time: reserved,
+            snapshot: TimeBasis { databases: BTreeMap::from([(database.clone(), vec![selected.map(Into::into)])]) },
+            replica_capture,
+            snapshot_time: selected,
             current_time: reserved.map_or_else(|| node.query_instant(), Into::into),
             timezone: self.state.session_timezone().to_owned(),
         };
-        let session_cancellation = self.state.cancellation().clone();
-        let cancellation = session_cancellation.child_token();
         let context = node.query_context_in_placement(
             &database, &basis, identity.as_ref(), Some(&attached), cut, &cancellation,
         ).await?;
         let present = context.catalog.database(&database)?.partitions.first().and_then(|partition| partition.tx_basis())
             .ok_or_else(hosted_source_unavailable)?;
-        if let Some(floor) = applied_floor {
+        if let Some(floor) = floor_to_check {
             floor.require_transactions(&context, present, None).await?;
         }
         let lease = context.catalog.read_lease();

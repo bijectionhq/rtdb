@@ -223,6 +223,7 @@ pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_SCOPED_READ_V1: &str = "rtdb.owned.OpenOwnedScopedRead.v1";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
+pub(crate) const OPEN_FRESH_OWNED_READ_V1: &str = "rtdb.owned.OpenFreshRead.v1";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V4: &str = "rtdb.owned.OpenAppliedRead.v4";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
@@ -1579,6 +1580,32 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if !body.is_empty() { return Err(invalid("Owned read open takes an empty body")); }
         self.retain_new_owned_read(call, None, 0).await
+    }
+
+    pub(crate) async fn open_fresh_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if call.session.placed_database() != Some(call.database.as_str()) || call.session.audience_source().is_some() {
+            return Err(Status::permission_denied("A fresh owned read requires its ordinary placed session"));
+        }
+        let (deployment, suffix) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Fresh read requires a deployment"))?;
+        let deployment = Uuid::from_bytes(*deployment);
+        if self.0.config.reserved_applied_source == Some(deployment) {
+            return Err(Status::permission_denied("This source requires a reserved Flight session"));
+        }
+        let required = if matches!(suffix, [0]) {
+            None
+        } else {
+            let (floor, rest) = hosted_observation::applied_read_floor(body)?;
+            if !rest.is_empty() { return Err(invalid("Unexpected fresh read data")); }
+            Some(floor)
+        };
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        let snapshot = native.open_fresh_owned_read(deployment, required.as_ref()).await.map_err(status)?;
+        self.retain_owned_read(call, snapshot, Some(permit), true, 0)
     }
 
     pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

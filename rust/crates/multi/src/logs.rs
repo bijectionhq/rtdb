@@ -34,6 +34,7 @@ struct LogletReadIndex {
     log: Arc<QuorumLog>,
     epoch: u64,
     custody: RecoveryAdmission,
+    deployment: Option<uuid::Uuid>,
 }
 
 impl LogletReadIndex {
@@ -49,6 +50,7 @@ impl LogletReadIndex {
 
 #[async_trait]
 impl ReplicaReadIndex for LogletReadIndex {
+    fn deployment(&self) -> Option<uuid::Uuid> { self.deployment }
     async fn confirm(&self) -> Result<LogOffset> { Ok(self.sample().await?.through()) }
 
     async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> {
@@ -191,7 +193,7 @@ pub(crate) async fn ordered_opened(
     };
     Ok(OpenedLogs {
         source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
-        replica_read_index: Some(Box::new(OrderedReadIndex(ordered))),
+        replica_read_index: Some(Box::new(OrderedReadIndex { journal: ordered, deployment: uuid::Uuid::parse_str(&record.id).ok() })),
         await_authority: AwaitAuthority::Live {
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
             recovery: ClosedEpochRecovery::Opened(opened),
@@ -201,12 +203,13 @@ pub(crate) async fn ordered_opened(
     })
 }
 
-struct OrderedReadIndex(Arc<crate::journal::JournalLog>);
+struct OrderedReadIndex { journal: Arc<crate::journal::JournalLog>, deployment: Option<uuid::Uuid> }
 
 #[async_trait]
 impl ReplicaReadIndex for OrderedReadIndex {
-    async fn confirm(&self) -> Result<LogOffset> { self.0.confirm().await }
-    async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> { self.0.protect(applied).await }
+    fn deployment(&self) -> Option<uuid::Uuid> { self.deployment }
+    async fn confirm(&self) -> Result<LogOffset> { self.journal.confirm().await }
+    async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> { self.journal.protect(applied).await }
 }
 
 #[async_trait]
@@ -264,6 +267,7 @@ impl LogFactory for LogkeeperLogFactory {
             Box::new(LogletReadIndex {
                 log: Arc::clone(&quorum), epoch: config.epoch,
                 custody: RecoveryAdmission::new(Arc::clone(&self.holds), &config),
+                deployment: uuid::Uuid::parse_str(&config.deployment).ok(),
             })
         };
         let replica_read_index = config.require_read_index.then(&read_index);

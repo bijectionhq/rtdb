@@ -81,6 +81,7 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_FRESH_OWNED_READ_V1 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SPATIAL_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::Open).await?)]),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
                     let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
