@@ -515,6 +515,14 @@ It returns a witness for the original pin and the relation's purge frontier, ind
 The request prefixes the hosted commit body with a counted-commit byte (0 or 1), a big-endian u16 hold count, and one section per distinct hold.
 Each section has a 16-byte handle, a big-endian u16 witness count, and 16 bytes per witness nonce.
 The commit admits one to eight holds with up to 128 witnesses each.
+
+A placed write to a declared Root data relation can carry a Binary `_ordered_micros` column.
+For each row with slots, its value starts with a big-endian u16 count in 1 through 1024.
+Each slot carries a u8 field-name length, the UTF-8 field name, a big-endian u32 byte offset in that Binary field, and a big-endian signed i64 offset in microseconds.
+Slots appear in field-name and byte-offset order. Each covers eight initially zero bytes and slots cannot overlap.
+The ordered resolver writes the checked sum of acceptance time and offset into the slot in big-endian order, then removes the descriptor before checking the relation schema and staging the row.
+World overlays and archive replay require their own images without this descriptor.
+
 A held retained parent point at its original archive basis also checks the live relation lifetime.
 It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a fact that was visible at the basis and has since expired, and absence when no fact was visible at the basis.
 Live full-key range pages on a covered acceptance-lifetime path use the held present on the valid axis.

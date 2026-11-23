@@ -21,6 +21,7 @@ use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult,
 
 mod hosted_control;
 mod fixed_range;
+mod ordered_micros;
 mod owned_capacity;
 use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
@@ -1744,6 +1745,13 @@ impl<'a> OpenTransaction<'a> {
                 }
             }
         }
+        let uses_ordered_micros = documents.columns().iter().any(|name| name == ordered_micros::FIELD);
+        if uses_ordered_micros && (!relation.is_root_data()
+            || self.context.owned_witness_scope.is_none() || self.hosted_replay.is_some()
+            || !documents.has_exact_presence())
+        {
+            return Err(ordered_micros::invalid());
+        }
         if relation.is_world_catalog() {
             let unavailable = rtdb_types::OwnedWorld::unavailable;
             if from.is_some() || to.is_some() || documents.rows().len() != 1 || !documents.has_exact_presence() {
@@ -1817,6 +1825,15 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         let declaration = self.read_owned_schema(owner, relation).await?;
+        let filled = if uses_ordered_micros {
+            if declaration.is_none() {
+                return Err(ordered_micros::invalid());
+            }
+            Some(ordered_micros::fill(documents, self.tx_key().system_time, &self.context.memory)?)
+        } else {
+            None
+        };
+        let documents = filled.as_ref().unwrap_or(documents);
         if let Some(source) = self.hosted_replay.as_ref().map(|replay| replay.source_time()) {
             let (schema, _retained) = declaration.as_ref().ok_or_else(replay_period_unavailable)?;
             let valid = replay_period(from, to)?;

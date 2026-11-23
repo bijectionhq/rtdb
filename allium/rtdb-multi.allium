@@ -1354,6 +1354,9 @@ rule ConsumeIntake {
 -- An authenticated placed hold can witness the completed window under its original archive pin and the selected relation's local event and Root purge frontiers.
 -- The same placed writer can submit those read conditions with a Root publication.
 -- The ordered resolver checks each live world registration and its witness before publishing the Root effects.
+-- A placed Root writer can put an acceptance-relative timestamp into an admitted binary field.
+-- The ordered resolver fills each disjoint slot from the transaction reading and checks the completed row against its declared schema.
+-- Committed events and archive replay carry filled values and require no slot metadata.
 -- While a world is retained the archive retirement fence cannot close its capture.
 -- An initial retained fork at the original live Root key may share one ordered publication with checked Root writes and checked hosted controls.
 -- A live hold may select its accepted application publication as the initial retained basis.
