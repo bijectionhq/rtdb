@@ -571,6 +571,11 @@ Explicit earlier Root actions also accept a hold on a retained Held child.
 They resolve the selected position, schema, paths and purge history in its pinned Root archive.
 They return Root images and evidence at that position, including point absence and empty pages.
 
+`rtdb.owned.ReadHeldWorldAncestorChanges.v1` uses the same request and response framing as the archived Root change page.
+The selected position must equal the child's retained Held overlay cut, and the requested interval must start at or after the Root cut.
+`rtdb.owned.ReadHeldWorldVersion.v2` on that child certifies the address in the exact archived Held group, reads its logical clock, and resolves its timeline against the pinned Root.
+A winning Held tombstone leaves an absent slice.
+
 `rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.

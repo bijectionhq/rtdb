@@ -844,6 +844,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",
         "rtdb.owned.ReadHeldWorldParentVersionsAt.v1",
         "rtdb.owned.ReadHeldWorldParentChangesAt.v1",
+        "rtdb.owned.ReadHeldWorldAncestorChanges.v1",
         "rtdb.owned.CloseWorldRead.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
