@@ -221,6 +221,19 @@ fn object_path(id: &str) -> Result<String> {
         return Ok(format!("keys/{id}-1"));
     }
     let invalid = || Anomaly::incorrect("rtdb.multi/key-id", "Invalid deployment key identity");
+    let positive = |text: &str| {
+        text.parse::<u64>().is_ok_and(|value| value > 0 && value.to_string() == text)
+    };
+    if let Some(rest) = id.strip_prefix("journal-") {
+        let (deployment, rest) = rest.split_at_checked(36).ok_or_else(invalid)?;
+        let rest = rest.strip_prefix('-').ok_or_else(invalid)?;
+        let (incarnation, rest) = rest.split_at_checked(36).ok_or_else(invalid)?;
+        let generation = rest.strip_prefix('-').ok_or_else(invalid)?;
+        if !canonical_uuid(deployment) || !canonical_uuid(incarnation) || !positive(generation) {
+            return Err(invalid());
+        }
+        return Ok(format!("keys/{id}"));
+    }
     let (rest, checkpoint) = if let Some(rest) = id.strip_prefix("checkpoint-") {
         (rest, true)
     } else {
@@ -235,9 +248,7 @@ fn object_path(id: &str) -> Result<String> {
         (rest, None)
     };
     if !canonical_uuid(deployment)
-        || !incarnation
-            .parse::<u64>()
-            .is_ok_and(|value| value > 0 && value.to_string() == incarnation)
+        || !positive(incarnation)
         || operation.is_some_and(|text| !canonical_uuid(text))
     {
         return Err(invalid());
@@ -320,6 +331,7 @@ mod tests {
             format!("{DEPLOYMENT}-17"),
             format!("stage-{DEPLOYMENT}-17"),
             format!("checkpoint-{DEPLOYMENT}-17-{OPERATION}"),
+            format!("journal-{DEPLOYMENT}-{OPERATION}-2"),
         ] {
             assert_eq!(object_path(&id).unwrap(), format!("keys/{id}"));
         }
@@ -330,6 +342,7 @@ mod tests {
             format!("{}-17", DEPLOYMENT.to_ascii_uppercase()),
             format!("stage-{DEPLOYMENT}-17-{OPERATION}"),
             format!("checkpoint-{DEPLOYMENT}-17"),
+            format!("journal-{DEPLOYMENT}-{OPERATION}-02"),
         ] {
             assert!(object_path(&id).is_err());
         }

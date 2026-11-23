@@ -490,6 +490,23 @@ contract LogService {
         -- A gateway authenticates readiness against its invocation and the current installed journal grant.
         -- An installed journal route owns its session authority independently of the cell directory.
 
+    @invariant InstalledJournalPayloadUsesItsGrantGeneration
+        -- The installation provisions an independent journal payload key for its deployment incarnation and initial key generation.
+        -- An installed writer seals each record under the key generation on its grant.
+        -- A worker or custodian opens a chosen record under the key generation on that record's authenticated grant.
+        -- Writer replacement preserves the current key generation, including across a vacant writer state.
+        -- An operation that needs a revoked journal payload key returns rtdb/erased-under-view.
+
+    @invariant InstalledJournalErasureCommit
+        -- The next journal payload key is provisioned before the clean successor is ordered at the rotation cut.
+        -- Rotation compares the exact current writer grant and published checkpoint at the current journal head.
+        -- The successor grant keeps the enrollment and advances both the writer epoch and payload key generation.
+        -- Appends under the previous grant are fenced at the rotation cut.
+        -- The erasure commit requires a clean root at or after that cut in every crash-selectable slot.
+        -- The commit publishes its identity and arms revocation of the old generation at the same decision.
+        -- An admitted view retains its answer until its deadline, at most 120 seconds after the commit.
+        -- A held view requiring erased material then returns rtdb/erased-under-view.
+
     @invariant InstalledCheckpointPrecedesTrim
         -- A checkpoint custodian supplies the exact immutable provider manifest for one reconstructable RTDB checkpoint and journal cut.
         -- A custodian can identify the next native checkpoint by its chosen boundary, upload and exact catalog digest independently of the writer grant.

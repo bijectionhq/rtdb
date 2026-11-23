@@ -7,6 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -15,6 +16,8 @@ use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 mod archive;
+mod journal;
+pub use journal::JournalKey;
 pub use archive::ArchiveKey;
 pub use crate::cipher::object::FramedObject;
 pub(crate) use archive::legacy_archive_key;
@@ -65,6 +68,22 @@ pub trait KeyService: Send + Sync {
     fn custody_namespace(&self) -> Result<String>;
     /// Installs a key brought from another cell's key service, for a deployment that moved here.
     async fn install(&self, deployment: &str, key: [u8; KEY_BYTES]) -> Result<()>;
+
+    async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
+        self.key(&key.id()).await.map(|_| ())
+    }
+
+    async fn seal_journal_payload(&self, key: JournalKey, _io: &Arc<IoRegion>, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+        let id = key.id();
+        let material = self.existing(&id).await.map_err(journal::key_error)?;
+        crate::cipher::Cipher::new(&material).map_err(journal::key_error)?.seal(&id, &plaintext)
+    }
+
+    async fn open_journal_payload(&self, key: JournalKey, _io: &Arc<IoRegion>, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
+        let id = key.id();
+        let material = self.existing(&id).await.map_err(journal::key_error)?;
+        crate::cipher::Cipher::new(&material).map_err(journal::key_error)?.open(&id, &ciphertext)
+    }
 
     async fn archive_key(&self, id: &str, provision: bool, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
         let key = if provision { self.key(id).await? } else { self.existing(id).await? };
@@ -323,6 +342,20 @@ impl KeyService for LocalKeyService {
             Err(error) => return Err(io(error)),
         }
         self.publish(&path, DESTROYED)
+    }
+
+    async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
+        let vault = self.clone();
+        tokio::task::spawn_blocking(move || vault.provision_journal(key)).await
+            .map_err(|error| Anomaly::fault("rtdb.multi/local-key-task", error.to_string()))?
+    }
+
+    async fn seal_journal_payload(&self, key: JournalKey, io: &Arc<IoRegion>, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.journal_payload(key, io, move |cipher, id| cipher.seal(id, &plaintext)).await
+    }
+
+    async fn open_journal_payload(&self, key: JournalKey, io: &Arc<IoRegion>, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.journal_payload(key, io, move |cipher, id| cipher.open(id, &ciphertext)).await
     }
 
     async fn archive_key(&self, id: &str, provision: bool, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {

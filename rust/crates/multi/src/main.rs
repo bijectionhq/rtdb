@@ -448,7 +448,9 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             if let Some(spec) = arguments.optional("directory") {
                 directory(spec).await?.reserve_installed_journal(route.placement.deployment).await?;
             }
-            key_service(arguments.required("keys")?).await?.key(&record.key_id()).await?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            keys.key(&record.key_id()).await?;
+            keys.provision_journal_key(rtdb_multi::keys::JournalKey::new(route.placement, 1)).await?;
             println!("{}", serde_json::to_string_pretty(&record).map_err(|error| io(std::io::Error::other(error)))?);
             Ok(())
         }

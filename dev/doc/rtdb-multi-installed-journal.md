@@ -113,6 +113,44 @@ If the command reports `Unavailable`, rerun it after the deadline.
 The custodian can advance trim on a subsequent maintenance pass once all overlapping holds have been released.
 For earlier disposal, use `logkeeper ordered dispose-worker` only after verifying that the exact enrollment's processes and effect scope have permanently shut down, and keep the external disposition digest with the deployment's custody records.
 
+## Journal payload keys and erasure rotation
+
+Preparing a fresh installed deployment provisions its serving key and an independent journal payload key at generation 1.
+A writer seals both data and maintenance records with the key identified by the deployment incarnation and its grant's key generation.
+Worker recovery and checkpoint custody use each chosen record's original grant to open it.
+Ordinary writer replacement keeps the current generation.
+Replay that requires a revoked generation returns `rtdb/erased-under-view`.
+A missing key or unreadable ciphertext stops replay with a storage failure.
+The local vault performs journal cryptography inside its revocable operation authority.
+S3 and DynamoDB can store independent generation keys and check withdrawals, and still require qualification for scheduled erasure.
+
+This format requires compatible clients and voters.
+The app wire uses `LKAPPC08`, and the compact image uses `LKBASE05`.
+Existing installed journals require a cutover to a freshly installed stream for this format.
+
+### Clean checkpoint and erasure commit interface
+
+The R7 erasure coordinator still needs clean successor construction and a durable erasure commit.
+Its input is the erasure identity, custody domain, exact incumbent grant, quiesced journal cut, and the clean root and provider manifest for that cut.
+The coordinator provisions the next journal key generation before ordering rotation.
+The custodian publishes the clean checkpoint at the quiesced head and certifies its full storage closure.
+An ordinary checkpoint cut precedes its upload record, so that ordinary publication needs a separate adaptation to represent the clean state at the quiesced head.
+
+The holder orders Logkeeper's `RotateKey { grant, checkpoint }` against the exact selected checkpoint.
+The accepted decision returns the new grant and its held recovery basis at the checkpoint cut.
+A concurrent append changes the head and requires selecting a new cut and checking the clean closure again.
+A retry after an uncertain decision uses the same request identity and exact command.
+Recovery adopts the new grant and appends only under its generation from the cut.
+Any historical confirmation evidence needed by recovery must be carried into that clean closure before revocation.
+
+The erasure commit consumes durable evidence for every selectable slot, binding each slot's identity, clean root, cut, and suffix key obligations.
+The publication authority must continue to exclude older selectable roots once it has issued that evidence.
+The commit must durably bind the erasure identity, the retired key generation, the clean cut, and the provider's armed deadline as one observable result.
+Retries reconcile to the same commit and expiry.
+Existing holds keep their entitlement until the deadline, at most 120 seconds from the commit.
+Clean publication and revocation must account for offloaded record bodies, retained plaintext and dependent storage in the custody domain.
+The resulting provider and clock guarantees have to cover all outstanding key operations and grants.
+
 ## Repair the voter cohort
 
 1. Create successor manifests that keep the same logical placement and identify the predecessor digest and its receipt-verification keys. Provision the new voter volumes and run `logkeeper ordered reserve-repair` on each successor to produce signed capacity tickets. The pending votes cannot serve the journal.

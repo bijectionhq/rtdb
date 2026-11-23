@@ -67,6 +67,14 @@ A previously prepared schedule can recover after an ambiguous outcome, and the b
 Expiry depends on the local authority clock reaching the recorded time.
 Qualification of a bounded real-time deadline additionally requires an authoritative clock with an enforceable error bound.
 
+## Installed journal adapter
+
+An installed Logkeeper grant identifies the journal payload key generation.
+Chosen replay uses that generation and reports `rtdb/erased-under-view` when the required key is durably revoked.
+The Logkeeper rotation compares the exact writer grant, exact published checkpoint and journal head.
+RTDB owns the clean successor, the evidence for all selectable roots, the ordered erasure commit, and the deadline checks for held material.
+The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
+
 ## Verification
 
 `ErasureCustody.tla` models adoption of a successor, a same-domain key copy with an unresolved provider outcome, a dependent fork, an independent export and a held old view.

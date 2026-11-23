@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::keys::{JournalKey, KeyService};
+
 use ordered_logkeeper::ordered::{Checkpoint, Cut};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{
@@ -30,7 +32,7 @@ pub(super) async fn discover(
     provider: &CheckpointCustody,
     (base, through): (Checkpoint, Cut),
     objects: &ReplicaObjects,
-    material: &[u8],
+    (keys, io): (&dyn KeyService, &Arc<IoRegion>),
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<Preparation>> {
     let (mut fence, expected_block) = if genesis(base) {
@@ -50,8 +52,6 @@ pub(super) async fn discover(
     let maximum = crate::process::MAXIMUM_LOG_MESSAGE_BYTES
         + ordered_logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES as usize;
     let _page = memory.reserve(maximum * 5)?;
-    let cipher = crate::cipher::Cipher::new(material)?;
-    let stream = placement.record.replica_seal_scope();
     let mut from = base.cut;
     let mut pending = None;
     while from != through {
@@ -60,7 +60,9 @@ pub(super) async fn discover(
             .await?;
         for row in page.records {
             from = row.result.cut;
-            let frame = ReplicaFrame::decode(&cipher.open(&stream, &row.payload)?)?;
+            let key = JournalKey::new(custodian.placement(), row.grant.key_generation);
+            let bytes = IoRegion::retaining(_page.clone(), key.open(keys, io, row.payload)).await?;
+            let frame = ReplicaFrame::decode(&bytes)?;
             if fence.admit(frame.term, frame.term_sequence)?.verdict != Verdict::Apply {
                 continue;
             }

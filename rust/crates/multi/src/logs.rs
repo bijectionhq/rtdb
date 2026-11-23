@@ -153,7 +153,7 @@ pub(crate) async fn ordered_opened(
     let epoch = StorageEpoch(record.log_epoch);
     let opened = ordered.latest()?;
     let scope = PlacedAttemptScope::new(&record.stream("replica"), admission.grant.epoch)?;
-    let replica: Arc<dyn Log> = Arc::new(SealedLog::new(ordered.clone(), key, &record.replica_seal_scope())?);
+    let replica: Arc<dyn Log> = ordered.clone();
     let intake_cut = checkpoint.map(|block| crate::deployment::TransferIntakeCut {
         replica_through: block.boundary, source_through: block.source,
     });

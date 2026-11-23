@@ -1174,6 +1174,9 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
     }
     let keys = Arc::new(LocalKeyService::new(authority.data.path().join("keys")).unwrap());
     keys.key(&record.key_id()).await.unwrap();
+    keys.provision_journal_key(rtdb_multi::keys::JournalKey::new(installed.placement, 1))
+        .await
+        .unwrap();
     let serving_root = authority.data.path().join("serving");
     let storage = CellStorage::Local {
         root: serving_root.clone(),

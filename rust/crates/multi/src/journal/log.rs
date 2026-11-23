@@ -2,6 +2,7 @@
 //! and exact replay intervals.
 
 use super::{InstalledJournal, ReadFailure, WriterAdmission, latest};
+use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
@@ -10,7 +11,7 @@ use ordered_logkeeper::ordered::{
 };
 use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
 use rtdb_storage::{
-    Error, Result,
+    Error, IoRegion, Result,
     log::{
         AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange,
         LogRecord, LogReplayTail, LogTail, ReplayHead, ReplicaObjectCustody, ReplicaObjectScope,
@@ -51,6 +52,8 @@ struct Writer {
 
 struct Reads {
     journal: Arc<InstalledJournal>,
+    keys: Arc<dyn KeyService>,
+    io: Arc<IoRegion>,
     tip: AtomicI64,
     tasks: TaskTracker,
     maximum: usize,
@@ -122,6 +125,7 @@ impl Held {
 impl JournalLog {
     pub async fn open(
         journal: Arc<InstalledJournal>,
+        keys: Arc<dyn KeyService>,
         admission: WriterAdmission,
         recovery: Arc<Held>,
         maximum_message_bytes: usize,
@@ -141,9 +145,12 @@ impl JournalLog {
         let maximum_data_message =
             usize::try_from(paid_window.saturating_sub(APPEND_RECORD_CHARGE_BYTES))
                 .unwrap_or(usize::MAX)
-                .min(maximum_message_bytes);
+                .min(maximum_message_bytes)
+                .saturating_sub(SEALED_OVERHEAD);
         let reads = Arc::new(Reads {
             journal,
+            keys,
+            io: IoRegion::new(),
             tip: AtomicI64::new(latest(current.head).map_err(storage)?.0),
             tasks,
             maximum: maximum_message_bytes,
@@ -170,7 +177,7 @@ impl JournalLog {
     ) -> Result<AppendReceipt> {
         let maximum = match class {
             AppendClass::Data => self.maximum_data_message,
-            AppendClass::Maintenance => self.reads.maximum,
+            AppendClass::Maintenance => self.reads.maximum.saturating_sub(SEALED_OVERHEAD),
         };
         if payload.len() > maximum {
             return Err(Error::MessageTooLarge {
@@ -186,6 +193,8 @@ impl JournalLog {
         if current.writer.grant != Some(writer.grant) || current.head != writer.head {
             return Err(deposed(writer.grant, &current));
         }
+        let key = JournalKey::new(current.placement, writer.grant.key_generation);
+        let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
         let command = Command::Append {
             class,
@@ -443,7 +452,8 @@ impl Cursor {
                         offset,
                         timestamp: Timestamp(item.timestamp),
                     },
-                    payload_len,
+                    payload_len: payload_len.checked_sub(SEALED_OVERHEAD)
+                        .ok_or_else(|| Error::Task("The ordered record is shorter than its seal".into()))?,
                     allocation_bound: payload_len.saturating_add(DELIVERED_RECORD_OVERHEAD),
                 };
                 self.prepared = Some(Prepared {
@@ -507,7 +517,7 @@ impl Cursor {
             .ok_or_else(|| Error::Task("No record in the protected interval".into()))?;
         if first.result.cut != prepared.end
             || first.timestamp != head.metadata.timestamp.0
-            || first.payload.len() != head.payload_len
+            || first.payload.len() != head.payload_len + SEALED_OVERHEAD
         {
             return Err(Error::Task(
                 "The ordered record differs from the prepared head".into(),
@@ -521,6 +531,15 @@ impl Cursor {
             generation: placement.generation,
             writer_epoch: first.grant.epoch,
         };
+        let key = JournalKey::new(placement, first.grant.key_generation);
+        let open = IoRegion::retaining(
+            Arc::clone(held) as Arc<dyn Send + Sync>,
+            key.open(self.reads.keys.as_ref(), &self.reads.io, first.payload),
+        );
+        let payload = match &reservation {
+            Some(reservation) => reservation.retaining_io(open).await?,
+            None => open.await?,
+        };
         let record = LogRecord {
             metadata: head.metadata,
             replica_objects: Some(ReplicaObjectCustody::new(
@@ -528,7 +547,7 @@ impl Cursor {
                 Arc::clone(held) as Arc<dyn Send + Sync>,
             )),
             payload: Bytes::from_owner(Delivery {
-                bytes: first.payload,
+                bytes: payload,
                 _held: Arc::clone(held),
             }),
         };

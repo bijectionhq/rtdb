@@ -77,6 +77,14 @@ impl LocalArchiveKey {
         &self,
         operation: impl FnOnce(&[u8; KEY_BYTES]) -> Result<T> + Send + 'static,
     ) -> rtdb_storage::Result<T> {
+        self.operate_with(operation, archive_io).await
+    }
+
+    pub(super) async fn operate_with<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&[u8; KEY_BYTES]) -> Result<T> + Send + 'static,
+        map_error: fn(Anomaly) -> Error,
+    ) -> rtdb_storage::Result<T> {
         let vault = self.vault.clone();
         let id = self.id.clone();
         let locked = move || -> Result<T> {
@@ -92,7 +100,7 @@ impl LocalArchiveKey {
             }
             Ok(output)
         };
-        self.region.run_blocking(move || locked().map_err(archive_io)).await
+        self.region.run_blocking(move || locked().map_err(map_error)).await
     }
 }
 

@@ -8,6 +8,7 @@ use super::{
     Authority, Held, InstalledJournal, InstalledRoute, JournalLog, WriterAdmission,
     custody::{CheckpointCustody, Preparation, Reservation},
 };
+use crate::keys::{JournalKey, KeyService};
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
     Checkpoint, Command, Cut, Enrollment, Grant, Hold, Request, Window, service::Route,
@@ -458,7 +459,7 @@ impl Placement {
                     )
                     .await?;
                     let Some(candidate) = discovery::discover(
-                        self, custodian, &provider, cut, &objects, &material, memory,
+                        self, custodian, &provider, cut, &objects, (keys, &io), memory,
                     )
                     .await?
                     else {
@@ -488,7 +489,7 @@ impl Placement {
                         published,
                         reservation,
                         origin,
-                        &material,
+                        (keys, &material),
                         serving,
                         &io,
                         memory,
@@ -516,7 +517,7 @@ impl Placement {
         base: Checkpoint,
         reservation: Reservation,
         origin: Preparation,
-        material: &[u8],
+        (keys, material): (&dyn KeyService, &[u8]),
         serving: &crate::deployment::CellStorage,
         io: &Arc<IoRegion>,
         memory: &Arc<MemoryBudget>,
@@ -539,8 +540,11 @@ impl Placement {
                 "The prepared checkpoint has no single chosen boundary",
             ));
         };
-        let bytes = crate::cipher::Cipher::new(material)?
-            .open(&self.record.replica_seal_scope(), &boundary.payload)?;
+        let key = JournalKey::new(custodian.placement(), boundary.grant.key_generation);
+        let bytes = IoRegion::retaining(
+            _page.clone(),
+            key.open(keys, io, boundary.payload.clone()),
+        ).await?;
         let envelope = ReplicaEnvelope::decode(&bytes)?
             .ok_or_else(|| invalid("The prepared checkpoint has an unknown boundary record"))?;
         let _offloaded;
@@ -741,6 +745,7 @@ impl LogFactory for Logs {
         let max_frame = crate::process::MAXIMUM_LOG_MESSAGE_BYTES;
         let replica = JournalLog::open(
             Arc::clone(&placement.worker),
+            Arc::clone(&self.keys),
             attachment.admission,
             Held::pin(
                 Arc::clone(&placement.worker),
