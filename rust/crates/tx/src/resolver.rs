@@ -1552,25 +1552,38 @@ impl<'a> OpenTransaction<'a> {
         if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, id).await?.is_some() {
             return Ok(());
         }
-        let columns = ["_id", "_system_from", "_valid_from", "_valid_to"];
-        let mut point = rtdb_query::open_owned_point(context, owner, relation, id, Some(Interval::ALL), Some(&columns))
-            .await?.ok_or_else(lifetime_uncovered)?;
-        let mut observed = None;
-        while let Some(batch) = point.next_batch().await? {
-            for row in 0..batch.batch().num_rows() {
-                if observed.is_some() { return Err(lifetime_uncovered()); }
-                let revision = rtdb_query::owned_row_revision(batch.batch(), row, id, &self.context.memory)?;
-                let (original, _) = rtdb_query::owned_row_lifetime(batch.batch(), row, revision, lifetime)?;
-                observed = Some(original);
-            }
-        }
-        if observed != Some(created) {
+        if self.observed_owned_lifetime(context, owner, relation, id, lifetime).await?
+            != Some((created, expires))
+        {
             return Err(lifetime_uncovered());
         }
         floor.expired_created_through = rtdb_types::OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
         self.erase_owned(relation, id, OwnedChangeKind::Expired).await?;
         self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
         Ok(())
+    }
+
+    async fn observed_owned_lifetime(
+        &self,
+        context: Arc<rtdb_query::QueryContext>,
+        owner: &str,
+        relation: &rtdb_types::OwnedRelation,
+        id: &rtdb_types::EntityId,
+        duration: i64,
+    ) -> Result<Option<(Timestamp, Timestamp)>> {
+        let columns = ["_id", "_system_from", "_valid_from", "_valid_to"];
+        let Some(mut point) = rtdb_query::open_owned_point(
+            context, owner, relation, id, Some(Interval::ALL), Some(&columns),
+        ).await? else { return Ok(None); };
+        let mut observed = None;
+        while let Some(batch) = point.next_batch().await? {
+            for row in 0..batch.batch().num_rows() {
+                if observed.is_some() { return Err(lifetime_uncovered()); }
+                let revision = rtdb_query::owned_row_revision(batch.batch(), row, id, &self.context.memory)?;
+                observed = Some(rtdb_query::owned_row_lifetime(batch.batch(), row, revision, duration)?);
+            }
+        }
+        Ok(observed)
     }
 
     async fn erase_owned(
@@ -1586,9 +1599,15 @@ impl<'a> OpenTransaction<'a> {
         if relation.world().is_some() || relation.is_world_catalog() {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
-        if self.hosted_replay.is_some() && self.read_owned_schema(owner, relation).await?.is_none() {
-            return Err(replay_period_unavailable());
-        }
+        let replay_lifetime = if let Some(replay) = &self.hosted_replay {
+            let (schema, _) = self.read_owned_schema(owner, relation).await?.ok_or_else(replay_period_unavailable)?;
+            schema.lifetime_micros().map(|duration| {
+                let floor = replay.lifetime(relation).ok_or_else(lifetime_uncovered)?;
+                floor.check(duration, replay.source_time())?;
+                if floor.swept_present_through == Timestamp::MIN { return Err(lifetime_uncovered()); }
+                Ok(floor)
+            }).transpose()?
+        } else { None };
         let snapshot = self.snapshot()?;
         if snapshot.contains_table(&OwnedRelation::obsolete_purge_table(owner)) {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/purge-history-reset", "Owner-wide purge history requires a reset before native erasure"));
@@ -1599,6 +1618,14 @@ impl<'a> OpenTransaction<'a> {
         let table = relation.table(owner);
         let ordered = self.tx_key();
         let context = self.context.query_context(snapshot, ordered.system_time, &self.options.default_tz, self.trace_parent)?;
+        let kind = if let Some(floor) = replay_lifetime {
+            if self.observed_owned_lifetime(Arc::clone(&context), owner, relation, id, floor.duration)
+                .await?.is_some_and(|(_, expires)| expires > floor.swept_present_through)
+            {
+                return Err(lifetime_uncovered());
+            }
+            rtdb_types::OwnedChangeKind::Expired
+        } else { kind };
         let search = OwnedRelation::search_catalog(owner);
         if let Some(mut rows) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &search, None).await? {
             while let Some(batch) = rows.next_batch().await? {

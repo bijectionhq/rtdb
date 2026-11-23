@@ -176,7 +176,41 @@ impl OpenTransaction<'_> {
                 ));
             }
         }
+        if let Some(replay) = &replay {
+            self.restore_owned_lifetime_floors(replay, &context).await?;
+        }
         self.hosted_replay = replay;
+        Ok(())
+    }
+
+    async fn restore_owned_lifetime_floors(
+        &mut self,
+        replay: &crate::hosted_control::HostedReplay,
+        context: &Arc<rtdb_query::QueryContext>,
+    ) -> Result<()> {
+        use rtdb_types::{OwnedLifetimeFloor, OwnedRelation};
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let ordered = self.tx_key().system_time;
+        for original in replay.lifetimes() {
+            let relation = OwnedRelation::new(original.relation.as_str())?;
+            let duration = rtdb_query::read_owned_relation_schema(Arc::clone(context), owner, &relation)
+                .await?.and_then(|(schema, _)| schema.lifetime_micros()).ok_or_else(lifetime_uncovered)?;
+            let archived = original.floor();
+            archived.check(duration, replay.source_time())?;
+            let before = rtdb_query::read_owned_lifetime_floor(Arc::clone(context), owner, &relation).await?;
+            before.check(duration, ordered)?;
+            if archived.swept_present_through < before.swept_present_through {
+                return Err(lifetime_uncovered());
+            }
+            let next = OwnedLifetimeFloor {
+                duration,
+                expired_created_through: before.expired_created_through.max(archived.expired_created_through),
+                swept_present_through: archived.swept_present_through,
+            };
+            if next != before {
+                self.buffer.put(relation.lifetime_table(owner), next.record(&relation), Interval::ALL)?;
+            }
+        }
         Ok(())
     }
 }

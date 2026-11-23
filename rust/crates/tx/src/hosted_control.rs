@@ -7,6 +7,8 @@ pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const NATIVE_FRONTIER: &str = "native-frontier.v1";
 const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";
+const MAX_REPLAY_LIFETIMES: usize = 32;
+const MAX_REPLAY_LIFETIME_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +20,27 @@ pub struct HostedReplay {
     source: rtdb_types::TransactionKey,
     logical_at: u64,
     fingerprint: [u8; 32],
+    #[serde(skip)]
+    lifetimes: Vec<ReplayLifetime>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplayLifetime {
+    pub(crate) relation: String,
+    duration: i64,
+    expired_created_through: i64,
+    swept_present_through: i64,
+}
+
+impl ReplayLifetime {
+    pub(crate) fn floor(&self) -> rtdb_types::OwnedLifetimeFloor {
+        rtdb_types::OwnedLifetimeFloor {
+            duration: self.duration,
+            expired_created_through: Timestamp(self.expired_created_through),
+            swept_present_through: Timestamp(self.swept_present_through),
+        }
+    }
 }
 
 /// The only admitted hosted write shape for the held native restore ledger.
@@ -36,12 +59,14 @@ pub fn hosted_replay_controls<'a>(
     };
     let head = selected(RESTORE, NATIVE_FRONTIER).ok_or_else(replay_invalid)?;
     let encoded = replay_body(head).ok_or_else(replay_invalid)?;
-    let replay: HostedReplay = serde_json::from_slice(encoded).map_err(|_| replay_invalid())?;
+    let mut replay: HostedReplay = serde_json::from_slice(encoded).map_err(|_| replay_invalid())?;
     let source = replay.source;
     let receipt_id = format!("native-transaction/{}", source.tx_id.0);
     let receipt = selected(RESTORE, &receipt_id).ok_or_else(replay_invalid)?;
     let coordinates = selected(REPLAY_TRANSACTIONS, &receipt_id).ok_or_else(replay_invalid)?;
-    if controls.clone().filter(|control| control.name() == RESTORE).count() != 5
+    let lifetime_id = format!("native-lifetimes/{}", source.tx_id.0);
+    let lifetimes = selected(RESTORE, &lifetime_id);
+    if controls.clone().filter(|control| control.name() == RESTORE).count() != 5 + usize::from(lifetimes.is_some())
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -59,13 +84,35 @@ pub fn hosted_replay_controls<'a>(
     {
         return Err(replay_invalid());
     }
+    if let Some(lifetimes) = lifetimes {
+        let encoded = control_body(lifetimes, MAX_REPLAY_LIFETIME_BYTES)
+            .filter(|_| lifetimes.expected().is_none()).ok_or_else(replay_invalid)?;
+        replay.lifetimes = serde_json::from_slice(encoded).map_err(|_| replay_invalid())?;
+        if !(1..=MAX_REPLAY_LIFETIMES).contains(&replay.lifetimes.len())
+            || !replay.lifetimes.windows(2).all(|pair| pair[0].relation < pair[1].relation)
+        {
+            return Err(replay_invalid());
+        }
+        for lifetime in &replay.lifetimes {
+            let relation = OwnedRelation::new(lifetime.relation.as_str()).map_err(|_| replay_invalid())?;
+            if !relation.is_root_data()
+                || lifetime.floor().check(lifetime.duration, source.system_time).is_err()
+            {
+                return Err(replay_invalid());
+            }
+        }
+    }
     Ok(Some(replay))
 }
 
 fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
+    control_body(control, 4096)
+}
+
+fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]> {
     let document = control.replacement()?;
     let Value::Binary(body) = document.get("binding")? else { return None; };
-    (document.len() == 2 && body.len() <= 4096).then_some(body.as_slice())
+    (document.len() == 2 && body.len() <= max_bytes).then_some(body.as_slice())
 }
 
 impl HostedReplay {
@@ -124,6 +171,12 @@ impl HostedReplay {
     }
 
     pub(crate) fn source_time(&self) -> Timestamp { self.source.system_time }
+
+    pub(crate) fn lifetimes(&self) -> &[ReplayLifetime] { &self.lifetimes }
+
+    pub(crate) fn lifetime(&self, relation: &OwnedRelation) -> Option<rtdb_types::OwnedLifetimeFloor> {
+        self.lifetimes.iter().find(|entry| entry.relation == relation.name()).map(ReplayLifetime::floor)
+    }
 }
 
 fn replay_invalid() -> Anomaly {
@@ -444,6 +497,17 @@ mod replay_tests {
         controls[5] = projection(2)?;
         assert!(hosted_replay_controls(controls.iter()).is_err());
         controls[5] = projection(3)?;
+        let lifetime = |swept_present_through| serde_json::json!([{
+            "relation": "root_lifetime", "duration": 2, "expired_created_through": 2,
+            "swept_present_through": swept_present_through,
+        }]).to_string();
+        controls.push(replace("native-lifetimes/3", None, lifetime(3).as_bytes())?);
+        let archived = hosted_replay_controls(controls.iter())?.unwrap()
+            .lifetime(&OwnedRelation::new("root_lifetime")?).unwrap();
+        assert_eq!(archived.swept_present_through, Timestamp(3));
+        *controls.last_mut().unwrap() = replace("native-lifetimes/3", None, lifetime(5).as_bytes())?;
+        assert!(hosted_replay_controls(controls.iter()).is_err());
+        controls.pop();
         controls.pop();
         assert!(hosted_replay_controls(controls.iter()).is_err());
         Ok(())
