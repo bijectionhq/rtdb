@@ -795,13 +795,17 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
     ], AutonomousTxOptions::default()).await.unwrap();
     assert_eq!(rejected.error().unwrap().code, "rtdb.owned/count-bound-exceeded");
     let accepted = session.state_mut().execute_tx(vec![
-        deadline(), count(vec![7], 1), delete(2, None), insert(&other, 2, vec![7, 2]),
+        deadline(), count(vec![7], 1), count(vec![8], 1), delete(2, None), insert(&other, 2, vec![7, 2]),
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(accepted.committed(), "{:?}", accepted.error());
     let added = session.state_mut().execute_tx(vec![
-        deadline(), count(vec![7], 1), insert(&relation, 5, vec![7, 5]),
+        deadline(), count(vec![7], 1), count(vec![8], 1), insert(&relation, 5, vec![8, 5]),
     ], AutonomousTxOptions::default()).await.unwrap();
     assert_eq!(added.error().unwrap().code, "rtdb.owned/count-bound-exceeded");
+    let unchanged = session.state_mut().execute_tx(vec![
+        deadline(), count(vec![7], 1), count(vec![8], 1),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(unchanged.committed(), "{:?}", unchanged.error());
     let wrong_prefix = session.state_mut().execute_tx(vec![
         deadline(), count(vec![7, 1], 2),
     ], AutonomousTxOptions::default()).await.unwrap();

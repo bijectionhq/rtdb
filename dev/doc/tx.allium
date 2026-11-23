@@ -111,9 +111,9 @@
 -- A capped page publishes only whole visible commits, and a nonempty page resumes at its last visible commit.
 -- An empty owned root relation may declare an immutable cap for each distinct fixed-length prefix of its binary fact key.
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
--- A grouped owned commit may bound one complete declared Binary prefix at its ordered-present valid instant.
--- Before applying any mutation, the resolver validates the declared prefix and checks coverage against the ordered relation frontier.
--- It compares the bound with the prefix's covered counter after applying the commit's membership changes.
+-- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
+-- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
+-- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
 -- An exceeded bound aborts the entire group, including the writes and counter deltas.
 -- World writes to a governed root refuse without inherited capacity accounting.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.

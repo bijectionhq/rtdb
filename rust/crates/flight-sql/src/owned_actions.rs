@@ -40,13 +40,13 @@ pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchP
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
-pub(crate) const COMMIT_HOSTED_COUNTED_V1: &str = "rtdb.owned.CommitHostedCounted.v1";
+pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
-pub(crate) const COMMIT_HOSTED_WORLD_READS_V1: &str = "rtdb.owned.CommitHostedWorldReads.v1";
+pub(crate) const COMMIT_HOSTED_WORLD_READS_V2: &str = "rtdb.owned.CommitHostedWorldReads.v2";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
-pub(crate) const COMMIT_OWNED_V6: &str = "rtdb.owned.Commit.v6";
+pub(crate) const COMMIT_OWNED_V7: &str = "rtdb.owned.Commit.v7";
 pub(crate) const COMMIT_OWNED_V4: &str = "rtdb.owned.Commit.v4";
 pub(crate) const COMMIT_OWNED_V3: &str = "rtdb.owned.Commit.v3";
 const MAX_RANGE_WITNESSES: usize = 32;
@@ -100,6 +100,25 @@ fn owned_count_condition<'a>(call: &Call, body: &'a [u8]) -> Result<(TxOp, &'a [
     let reservation = call.reserve(prefix.len() + column.len() + 1024)?;
     let condition = TxOp::OwnedCheckCapacity { relation, column: column.into(), prefix: prefix.to_vec(), at_most };
     Ok((condition, body, reservation))
+}
+
+fn owned_count_conditions<'a>(call: &Call, body: &'a [u8]) -> Result<(Vec<TxOp>, &'a [u8], Vec<Arc<MemoryReservation>>), Status> {
+    let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing final count conditions"))?;
+    let count = usize::from(u16::from_be_bytes(*count));
+    if !(1..=MAX_GROUPED_COMMIT_ROWS).contains(&count) {
+        return Err(invalid("Invalid final count condition count"));
+    }
+    let framing = call.reserve(count * (std::mem::size_of::<TxOp>() + 32))?;
+    let mut conditions = Vec::with_capacity(count);
+    let mut charges = Vec::with_capacity(count + 1);
+    charges.push(framing);
+    for _ in 0..count {
+        let (condition, tail, charge) = owned_count_condition(call, body)?;
+        body = tail;
+        conditions.push(condition);
+        charges.push(charge);
+    }
+    Ok((conditions, body, charges))
 }
 
 fn ordered_group_count(body: &[u8]) -> Result<usize, Status> {
@@ -603,21 +622,21 @@ impl Service {
     }
 
     pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
-        self.commit_owned(call, body, format, Vec::new(), false, None).await
+        self.commit_owned(call, body, format, Vec::new(), false, Vec::new()).await
     }
 
     pub(crate) async fn commit_owned_counted_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (condition, body, _condition) = owned_count_condition(call, body)?;
+        let (conditions, body, _counts) = owned_count_conditions(call, body)?;
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
-        self.commit_owned(call, body, CommitFormat::Ordered, witnesses, false, Some(condition)).await
+        self.commit_owned(call, body, CommitFormat::Ordered, witnesses, false, conditions).await
     }
 
     pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, body: &[u8], format: CommitFormat, erase_allowed: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let allow_empty = erase_allowed || matches!(format, CommitFormat::Ordered);
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, allow_empty)?;
-        self.commit_owned(call, body, format, witnesses, erase_allowed, None).await
+        self.commit_owned(call, body, format, witnesses, erase_allowed, Vec::new()).await
     }
 
     fn owned_witness_prefix<'a>(
@@ -690,11 +709,10 @@ impl Service {
         &self, call: &Call, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
-        let (condition, body, _condition_charge) = if counted {
-            let (condition, body, reservation) = owned_count_condition(call, body)?;
-            (Some(condition), body, Some(reservation))
+        let (conditions, body, _counts) = if counted {
+            owned_count_conditions(call, body)?
         } else {
-            (None, body, None)
+            (Vec::new(), body, Vec::new())
         };
         let (witnesses, body, _witness_charge) = self.owned_witness_prefix(call, body, true)?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted commit has no deadline"))?;
@@ -715,10 +733,10 @@ impl Service {
 
         let world_checks = worlds.iter().map(|read| read.witnesses.len()).sum::<usize>();
         let world_ops = world_checks * 2 + usize::from(world_checks != 0);
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops)
-            .ok_or_else(|| invalid("Hosted world checks exceed the commit limit"))?;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len())
+            .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
-        writes.extend(condition);
+        writes.extend(conditions);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
         if replay {
@@ -781,7 +799,7 @@ impl Service {
         Ok((controls, held))
     }
 
-    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, condition: Option<TxOp>) -> Result<ActionResult, Status> {
+    async fn commit_owned(&self, call: &Call, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, conditions: Vec<TxOp>) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -792,10 +810,11 @@ impl Service {
         let CommitRequest { deadline, groups } = CommitRequest::parse(body, format)?;
         let mut rows_left = match format {
             CommitFormat::Single => usize::MAX,
-            CommitFormat::Grouped | CommitFormat::Ordered => MAX_GROUPED_COMMIT_ROWS,
+            CommitFormat::Grouped | CommitFormat::Ordered => MAX_GROUPED_COMMIT_ROWS.checked_sub(conditions.len())
+                .ok_or_else(|| invalid("Owned conditions exceed the commit limit"))?,
         };
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
-        writes.extend(condition);
+        writes.extend(conditions);
         let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, erase_allowed)?;
         self.owned_write_reply_with_witnesses(call, writes, witnesses).await
     }

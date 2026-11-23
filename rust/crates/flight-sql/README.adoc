@@ -513,7 +513,7 @@ Its source accepts immutable creation only, preserving complete identities after
 One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
 Mode 3 of `rtdb.owned.ReadHeldWorldPoint.v2` reads an ordinary point from the held parent.
 It returns a witness for the original pin and the relation's purge frontier, independent of the world's overlay.
-`rtdb.owned.CommitHostedWorldReads.v1` can order this evidence with Root writes and hosted controls.
+`rtdb.owned.CommitHostedWorldReads.v2` can order this evidence with Root writes and hosted controls.
 The request prefixes the hosted commit body with a counted-commit byte (0 or 1), a big-endian u16 hold count, and one section per distinct hold.
 Each section has a 16-byte handle, a big-endian u16 witness count, and 16 bytes per witness nonce.
 The commit admits one to eight holds with up to 128 witnesses each.
@@ -731,8 +731,8 @@ a revision or rows. Send that revision or null as `_expected_micros` in a
 subsequent checked hosted commit. A missing table or a non-epoch valid slice
 refuses the read.
 
-`rtdb.owned.CommitHostedCounted.v1` prefixes this action with the ordered-present count condition from Commit.v6.
-The resolver checks both the ordinary control observations and the final owned count in the same transaction.
+`rtdb.owned.CommitHostedCounted.v2` prefixes this action with the ordered-present count conditions from Commit.v7.
+The resolver checks the ordinary control observations and every final owned count in the same transaction.
 
 This action supports checked replacement and exact absence insertion for hosted controls.
 Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
@@ -745,18 +745,15 @@ Generic SQL keeps the existing private relation boundary.
 
 === Final-state prefix count
 
-`rtdb.owned.Commit.v6` begins with one owned root relation prefix, followed by
-Its fact groups preserve relation run order and may repeat a relation.
-one clock byte (zero for the transaction's ordered system time as valid time),
-a big-endian `u16` length and UTF-8 Binary column name (1 to 96 bytes), a
-big-endian `u16` length and complete Binary prefix (1 to 4096 bytes), then a
-nonnegative big-endian `i64` maximum. Append the Commit.v3 request, with zero
-or more witness pairs, one deadline, and the standard grouped mutation body.
+`rtdb.owned.Commit.v7` begins with a nonzero big-endian `u16` condition count.
+Each condition includes one owned Root relation prefix, a zero clock byte for the ordered-present valid time,
+a big-endian `u16` length and UTF-8 Binary column name (1 to 96 bytes), a big-endian `u16` length and complete Binary prefix (0 to 4096 bytes), and a nonnegative big-endian `i64` maximum.
+Then send zero or more witness pairs, one deadline, and the ordered mutation groups.
+The fact groups preserve relation run order and may repeat a relation.
 
-The relation must already have an immutable unconditional `DeclareCapacity.v2` rule matching
-the column and complete prefix length. The resolver checks counter coverage
-against the ordered base before applying mutations. It compares the maximum
-with the covered count after applying all of this transaction's writes.
+Each condition requires an immutable unconditional `DeclareCapacity.v2` rule matching its relation, column and complete prefix.
+The resolver checks counter coverage against the ordered base before applying mutations.
+It compares each maximum with the covered count after applying all of this transaction's writes.
 An exceeded maximum aborts the entire transaction with
 `rtdb.owned/count-bound-exceeded`. Other clocks, world overlays, and erase
 entries are unsupported by this action.

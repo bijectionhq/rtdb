@@ -219,8 +219,8 @@ struct CapacityCondition<'a> {
     at_most: i64,
 }
 
-fn capacity_condition(operations: &[Operation]) -> Result<Option<CapacityCondition<'_>>> {
-    let mut conditions = operations.iter().filter_map(|operation| match operation {
+fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Item = CapacityCondition<'_>> {
+    operations.iter().filter_map(|operation| match operation {
         Operation::Public(TxOp::OwnedCheckCapacity {
             relation,
             column,
@@ -233,54 +233,57 @@ fn capacity_condition(operations: &[Operation]) -> Result<Option<CapacityConditi
             at_most: *at_most,
         }),
         _ => None,
-    });
-    let condition = conditions.next();
-    if conditions.next().is_some() {
-        return Err(Anomaly::incorrect(
-            "rtdb.owned/duplicate-count-bound",
-            "Only one owned count bound is supported per commit",
-        ));
-    }
-    Ok(condition)
+    })
 }
 
 impl OpenTransaction<'_> {
     pub(super) async fn check_capacity_source(&self, operations: &[Operation]) -> Result<()> {
-        if let Some(CapacityCondition {
+        let mut conditions = capacity_conditions(operations).peekable();
+        if conditions.peek().is_none() {
+            return Ok(());
+        }
+        let has_deadline = operations
+            .iter()
+            .any(|op| matches!(op, Operation::Public(TxOp::OwnedDeadline { .. })));
+        let base = self.buffer.base_snapshot();
+        for CapacityCondition {
             relation,
             column,
             prefix,
             at_most,
-        }) = capacity_condition(operations)?
+        } in conditions
         {
             if at_most < 0
                 || relation.world().is_some()
                 || relation.is_world_catalog()
-                || !operations
-                    .iter()
-                    .any(|op| matches!(op, Operation::Public(TxOp::OwnedDeadline { .. })))
+                || !has_deadline
             {
                 return Err(Anomaly::incorrect(
                     "rtdb.owned/count-bound",
                     "Expected a nonnegative count bound on one owned root prefix with a deadline",
                 ));
             }
-            self.declared_prefix_count(self.buffer.base_snapshot(), relation, column, prefix)
+            self.declared_prefix_count(base.clone(), relation, column, prefix)
                 .await?;
         }
         Ok(())
     }
 
     pub(super) async fn check_final_capacity(&self, operations: &[Operation]) -> Result<()> {
-        if let Some(CapacityCondition {
+        let mut conditions = capacity_conditions(operations).peekable();
+        if conditions.peek().is_none() {
+            return Ok(());
+        }
+        let snapshot = self.snapshot()?;
+        for CapacityCondition {
             relation,
             column,
             prefix,
             at_most,
-        }) = capacity_condition(operations)?
+        } in conditions
         {
             let count = self
-                .declared_prefix_count(self.snapshot()?, relation, column, prefix)
+                .declared_prefix_count(snapshot.clone(), relation, column, prefix)
                 .await?;
             if count > at_most {
                 return Err(Anomaly::new(
