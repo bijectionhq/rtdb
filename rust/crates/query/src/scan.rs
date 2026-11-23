@@ -1783,6 +1783,14 @@ impl PartitionScan {
                 {
                     return self.rank_column(ranking, rows, &batches).map(Some);
                 }
+                if keyed && self.scan.columns[position].name == "_assertion_ordinal" {
+                    let ordinals = rows.iter().map(|row| {
+                        let (batch, index) = row.source;
+                        batches[batch as usize].header(index as usize)
+                            .map(|header| Value::I64(i64::from(header.commit_position)))
+                    }).collect::<Result<Vec<_>>>()?;
+                    return Ok(Some(crate::columnar::Column::Values(ordinals)));
+                }
                 if self.scan.columns[position].name == "user_metadata" && projected.is_some() {
                     return Ok(projected.take());
                 }
@@ -2254,12 +2262,12 @@ mod tests {
         let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
         let context = QueryContext::new(catalog, memory, Timestamp(110), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
-        for (system, valid, first_masked, expected) in [
-            (100, 15, 3, 3),
-            (100, 15, 2, 2),
-            (100, 15, 0, 1),
-            (110, 15, 2, 2),
-            (110, 25, 2, 4),
+        for (system, valid, first_masked, expected, ordinal) in [
+            (100, 15, 3, 3, 2),
+            (100, 15, 2, 2, 1),
+            (100, 15, 0, 1, 0),
+            (110, 15, 2, 2, 1),
+            (110, 25, 2, 4, 0),
         ] {
             let mut result = crate::open_owned_point_with_position_mask(
                 Arc::clone(&context), "alice", &relation, &id,
@@ -2269,6 +2277,8 @@ mod tests {
             let batch = batch.batch();
             let (column, field) = batch.schema_ref().column_with_name("v").unwrap();
             assert_eq!(rtdb_columnar::read_value(field, batch.column(column).as_ref(), 0).unwrap(), Value::I64(expected));
+            let (column, field) = batch.schema_ref().column_with_name("_assertion_ordinal").unwrap();
+            assert_eq!(rtdb_columnar::read_value(field, batch.column(column).as_ref(), 0).unwrap(), Value::I64(ordinal));
             assert!(result.next_batch().await.unwrap().is_none());
         }
         for (system, expected) in [

@@ -23,6 +23,17 @@ pub async fn open_owned_point(
     open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await
 }
 
+/// Project an owned point together with its winning event's ordinal.
+pub async fn open_owned_assertion_point(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Option<Interval>, include_edges: bool,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || relation.is_world_catalog() { return Err(address_unavailable()); }
+    open_owned_table_point_with_edges(
+        context, relation.table(owner), id.iid(), Some(id), valid, None, false, include_edges, true,
+    ).await
+}
+
 /// Read the winning revision or exact absence for an owned point.
 pub async fn read_owned_point_revision(
     context: Arc<QueryContext>,
@@ -52,7 +63,7 @@ pub async fn open_owned_lifetime_point(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
 ) -> Result<Option<QueryCursor>> {
     if owner.is_empty() || !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
-    open_owned_table_point_with_edges(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true).await
+    open_owned_table_point_with_edges(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true, false).await
 }
 
 /// Revalidates an immutable artefact's nominated row with its complete key.
@@ -78,7 +89,7 @@ pub async fn open_owned_point_at_system(
         return Err(address_unavailable());
     }
     let context = owned_context_at_system(context, system)?;
-    open_owned_point(context, owner, relation, id, Some(valid), None).await
+    open_owned_assertion_point(context, owner, relation, id, Some(valid), false).await
 }
 
 /// Resolve one retained point with the specified suffix of one commit masked.
@@ -89,7 +100,7 @@ pub async fn open_owned_point_with_position_mask(
 ) -> Result<Option<QueryCursor>> {
     if !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
     let context = owned_context_at_position(context, system, mask)?;
-    open_owned_point(context, owner, relation, id, Some(valid), None).await
+    open_owned_assertion_point(context, owner, relation, id, Some(valid), false).await
 }
 
 /// Resolve the winning valid-time slices after excluding the same commit suffix.
@@ -102,7 +113,9 @@ pub async fn open_owned_valid_during_with_position_mask(
         return Err(address_unavailable());
     }
     let context = owned_context_at_position(context, system, mask)?;
-    open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, true).await
+    open_owned_table_point_with_edges(
+        context, relation.table(owner), id.iid(), Some(id), Some(valid), None, true, true, true,
+    ).await
 }
 
 fn owned_context_at_position(
@@ -137,7 +150,9 @@ pub async fn open_owned_valid_during_at(
     }
     let context = owned_context_at_system(context, system)?;
     if owner.is_empty() { return Err(address_unavailable()); }
-    open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, true).await
+    open_owned_table_point_with_edges(
+        context, relation.table(owner), id.iid(), Some(id), Some(valid), None, true, true, true,
+    ).await
 }
 
 /// Opens the winning valid boundaries, including local world tombstones.
@@ -573,12 +588,12 @@ pub(crate) async fn open_owned_table_point(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
     valid: Option<Interval>, columns: Option<&[&str]>, history: bool,
 ) -> Result<Option<QueryCursor>> {
-    open_owned_table_point_with_edges(context, table, locator, id, valid, columns, history, history).await
+    open_owned_table_point_with_edges(context, table, locator, id, valid, columns, history, history, false).await
 }
 
 async fn open_owned_table_point_with_edges(
     context: Arc<QueryContext>, table: TableRef, locator: Iid, id: Option<&EntityId>,
-    valid: Option<Interval>, columns: Option<&[&str]>, history: bool, edges: bool,
+    valid: Option<Interval>, columns: Option<&[&str]>, history: bool, edges: bool, assertion: bool,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
@@ -589,6 +604,9 @@ async fn open_owned_table_point_with_edges(
     let mut fields: Vec<&str> = columns.map_or_else(|| table.columns.keys().map(String::as_str).collect(), |names| names.to_vec());
     for required in ["_id", "_system_from"] {
         if !fields.contains(&required) { fields.push(required); }
+    }
+    if assertion && !fields.contains(&"_assertion_ordinal") {
+        fields.push("_assertion_ordinal");
     }
     if edges {
         for required in ["_valid_from", "_valid_to"] {

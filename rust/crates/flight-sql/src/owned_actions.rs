@@ -307,6 +307,8 @@ const OWNED_SEARCH_SCOPE: &str = "rtdb.owned.search_scope";
 const OWNED_SEARCH_WITNESSES: &str = "rtdb.owned.search_witnesses";
 const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
+const OWNED_ASSERTION_ORDINAL: &str = "rtdb.owned.assertion_ordinal";
+const OWNED_ASSERTION_ORDINALS: &str = "rtdb.owned.assertion_ordinals";
 const OWNED_CHANGE_COVERAGE: &str = "rtdb.owned.change_coverage_micros";
 
 pub(crate) struct OwnedReadResource {
@@ -2151,6 +2153,7 @@ impl Service {
         let mut rows = 0usize;
         let mut retained_bytes = 0usize;
         let mut last_end = from;
+        let mut ordinals = Vec::new();
         let empty_schema;
         while let Some(page) = read.next_batch().await.map_err(status)? {
             let batch = page.batch();
@@ -2159,6 +2162,14 @@ impl Service {
             retained_bytes = wire::add(retained_bytes, batch.get_array_memory_size())?;
             if rows > MAX_HISTORY_SLICES || retained_bytes > self.0.config.maximum_message_bytes {
                 return Err(Status::resource_exhausted("Owned history exceeds its slice or response limit"));
+            }
+            if let Some(values) = batch.column_by_name("_assertion_ordinal") {
+                let values = values.as_any().downcast_ref::<Int64Array>().ok_or_else(history_invalid)?;
+                for value in values {
+                    let ordinal = value.and_then(|ordinal| u32::try_from(ordinal).ok())
+                        .ok_or_else(history_invalid)?;
+                    ordinals.push(ordinal.to_string());
+                }
             }
             for row in 0..batch.num_rows() {
                 let start = history_row_time(batch, "_valid_from", row)?.ok_or_else(history_invalid)?;
@@ -2179,11 +2190,19 @@ impl Service {
         } else {
             Arc::new(Schema::empty())
         };
-        let _metadata = call.reserve(wire::add(wire::schema_bound(&schema)?, wire::mul(pages.len(), 512)?)?)?;
+        let columns = schema.fields().iter().enumerate()
+            .filter_map(|(index, field)| (field.name() != "_assertion_ordinal").then_some(index))
+            .collect::<Vec<_>>();
+        let metadata_bound = wire::add(wire::schema_bound(&schema)?, wire::mul(pages.len(), 512)?)?;
+        let _metadata = call.reserve(wire::add(metadata_bound, wire::mul(ordinals.len(), 32)?)?)?;
         let mut metadata = schema.metadata().clone();
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
         metadata.insert(OWNED_VALID_FROM.into(), from.0.to_string());
         metadata.insert(OWNED_VALID_TO.into(), to.0.to_string());
+        if !ordinals.is_empty() {
+            if ordinals.len() != rows { return Err(history_invalid()); }
+            metadata.insert(OWNED_ASSERTION_ORDINALS.into(), ordinals.join(","));
+        }
         if let Some((revision, time)) = version {
             metadata.insert(OWNED_VERSION_REVISION.into(), revision.to_string());
             metadata.insert(OWNED_VERSION_TIME.into(), time.0.to_string());
@@ -2191,9 +2210,10 @@ impl Service {
         if let Some(nonce) = read.witness_nonce(call)? {
             metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
         }
-        let schema = Arc::new(schema.as_ref().clone().with_metadata(metadata));
+        let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let response = pages.iter().map(|page| {
-            RecordBatch::try_new(Arc::clone(&schema), page.batch().columns().to_vec()).map_err(arrow)
+            let batch = page.batch();
+            RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()).map_err(arrow)
         }).collect::<Result<Vec<_>, _>>()?;
         self.owned_stream_reply(&schema, &response)
     }
@@ -4230,8 +4250,17 @@ impl Service {
         metadata.insert(OWNED_VALID.into(), valid.0.to_string());
         if let Some(revision) = revision { metadata.insert(OWNED_REVISION.into(), revision.0.to_string()); }
         if let Some(until) = until { metadata.insert("rtdb.owned.until_micros".into(), until.0.to_string()); }
+        if let Some(ordinal) = batch.and_then(|batch| batch.column_by_name("_assertion_ordinal")) {
+            let ordinal = ordinal.as_any().downcast_ref::<Int64Array>()
+                .filter(|ordinal| ordinal.len() == 1 && ordinal.is_valid(0))
+                .ok_or_else(|| Status::internal("Owned point has an invalid assertion ordinal"))?
+                .value(0);
+            if ordinal > 0 {
+                metadata.insert(OWNED_ASSERTION_ORDINAL.into(), ordinal.to_string());
+            }
+        }
         let columns: Vec<_> = schema.fields().iter().enumerate()
-            .filter(|(_, field)| field.name() != "_system_from")
+            .filter(|(_, field)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal"))
             .map(|(index, _)| index).collect();
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))

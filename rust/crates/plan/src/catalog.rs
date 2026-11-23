@@ -34,6 +34,7 @@ impl TableBinding {
         let timestamp = || LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
         match name {
             "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+            "_assertion_ordinal" if self.name.table.is_owned_event_data() => LogicalType::Scalar(ScalarType::I64),
             "_valid_from" | "_system_from" => timestamp(),
             "_valid_to" | "_system_to" => timestamp().maybe(),
             _ => self.columns.get(name).cloned().unwrap_or(LogicalType::Null),

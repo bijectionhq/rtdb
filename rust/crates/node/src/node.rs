@@ -1812,9 +1812,10 @@ impl OwnedReadSession {
         let guard = self.relation_release_guard_for([relation], true)?;
         let context = Arc::clone(&self.context).with_owned_read_guard(guard);
         context.check_cancelled()?;
-        match (lifetime, valid) {
-            (Some(_), Some(valid)) => rtdb_query::open_owned_lifetime_point(context, &self.owner, relation, id, valid).await,
-            _ => rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await,
+        if relation.is_world_catalog() {
+            rtdb_query::open_owned_point(context, &self.owner, relation, id, valid, None).await
+        } else {
+            rtdb_query::open_owned_assertion_point(context, &self.owner, relation, id, valid, lifetime.is_some()).await
         }
     }
 
