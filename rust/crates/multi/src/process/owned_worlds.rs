@@ -295,6 +295,13 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
+    fn parent_versions_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, selected: Timestamp,
+        request: rtdb_node::OwnedVersionRequest,
+    ) -> BoxFuture<'a, Result<(rtdb_flight_sql::WorldParentVersions, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::parent_versions_at(self, relation, id, selected, request))
+    }
+
     fn version<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId,
         from: Timestamp, through: Timestamp, group: Timestamp,
