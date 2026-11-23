@@ -68,6 +68,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
 pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
+pub(crate) const COMMIT_HOSTED_AT_SLOT_V1: &str = "rtdb.owned.CommitHostedAtSlot.v1";
 pub(crate) const COMMIT_HOSTED_STAGED_V6: &str = "rtdb.owned.CommitHostedStaged.v6";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_HOSTED_WORLD_READS_V3: &str = "rtdb.owned.CommitHostedWorldReads.v3";
@@ -256,6 +257,7 @@ pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V3: &str = "rtdb.owned.PublishHeldWorldRetention.v3";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
+pub(crate) const COMMIT_HELD_WORLDS_AT_SLOT_V1: &str = "rtdb.owned.CommitHeldWorldsAtSlot.v1";
 pub(crate) const COMMIT_HELD_WORLDS_V6: &str = "rtdb.owned.CommitHeldWorlds.v6";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
@@ -927,7 +929,7 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &Bytes, counted: bool) -> Result<ActionResult, Status> {
-        self.commit_hosted_with_reads(call, body, body, counted, Vec::new(), None, false).await
+        self.commit_hosted_with_reads(call, body, body, counted, Vec::new(), None, false, None).await
     }
 
     pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
@@ -941,7 +943,7 @@ impl Service {
             _ => return Err(invalid("Invalid hosted root commit kind")),
         };
         let (worlds, body) = self.hosted_world_read_prefix(call, body)?;
-        self.commit_hosted_with_reads(call, envelope, body, counted, worlds, None, false).await
+        self.commit_hosted_with_reads(call, envelope, body, counted, worlds, None, false, None).await
     }
 
     fn hosted_world_read_prefix<'a>(
@@ -978,19 +980,44 @@ impl Service {
         Ok((worlds, body))
     }
 
+    async fn owned_clock_slot<'a>(
+        &self, call: &Call, body: &'a [u8],
+    ) -> Result<(rtdb_types::TransactionKey, &'a [u8]), Status> {
+        let scope = self.hosted_control_scope(call).await?;
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing clock slot hold"))?;
+        let original = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        original.snapshot.require_unscoped_root().map_err(status)?;
+        if original.snapshot.fork_cut(scope).await.map_err(status)?.live().is_none() {
+            return Err(Status::failed_precondition("An ordered clock slot requires a live placed Root hold"));
+        }
+        Ok((original.snapshot.present(), body))
+    }
+
     pub(crate) async fn commit_hosted_flagged_action(
-        &self, call: &Call, envelope: &Bytes, recheck_at_staging: bool,
+        &self, call: &Call, envelope: &Bytes, recheck_at_staging: bool, at_slot: bool,
     ) -> Result<ActionResult, Status> {
-        let body = envelope.as_ref();
+        let (slot, recheck_at_staging, body) = if at_slot {
+            let (slot, body) = self.owned_clock_slot(call, envelope).await?;
+            let ([mode], body) = body.split_first_chunk::<1>()
+                .ok_or_else(|| invalid("Missing clock slot commit mode"))?;
+            let recheck = match mode {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("Invalid clock slot commit mode")),
+            };
+            (Some(slot), recheck, body)
+        } else {
+            (None, recheck_at_staging, envelope.as_ref())
+        };
         self.hosted_control_policy(call)?;
         let ([flags], body) = body.split_first_chunk::<1>()
             .ok_or_else(|| invalid("Missing hosted commit flags"))?;
-        let allowed = if recheck_at_staging { 0b111 } else { 0b11 };
+        let allowed = if recheck_at_staging || at_slot { 0b111 } else { 0b11 };
         if *flags & !allowed != 0 {
             return Err(invalid("Invalid hosted commit flags"));
         }
         let counted = *flags & 1 != 0;
-        let (refusal, primary) = if !recheck_at_staging || *flags & 0b100 != 0 {
+        let (refusal, primary) = if (!recheck_at_staging && !at_slot) || *flags & 0b100 != 0 {
             let (length, body) = body.split_first_chunk::<4>()
                 .ok_or_else(|| invalid("Missing hosted refusal length"))?;
             let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
@@ -1004,12 +1031,12 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging).await
+        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
-        refusal: Option<&[u8]>, recheck_at_staging: bool,
+        refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<rtdb_types::TransactionKey>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -1045,12 +1072,16 @@ impl Service {
         let world_ops = worlds.iter()
             .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some()))
             .sum::<usize>() + usize::from(!worlds.is_empty());
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len())
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len() + usize::from(slot.is_some()))
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging, journal_before }];
+        writes.extend(slot.map(|predecessor| TxOp::OwnedClockSlot { predecessor }));
         writes.extend(conditions);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
+        if replay && slot.is_some() {
+            return Err(invalid("A replay cannot consume an ordered clock slot"));
+        }
         if recheck_at_staging && (replay || controls.iter().all(rtdb_tx::HostedControlWrite::is_check)) {
             return Err(invalid("A staging deadline requires a live hosted control replacement"));
         }
@@ -3781,8 +3812,13 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn commit_world_batch_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
-        let body = envelope.as_ref();
+    pub(crate) async fn commit_world_batch_action(&self, call: &Call, envelope: &Bytes, at_slot: bool) -> Result<ActionResult, Status> {
+        let (slot, body) = if at_slot {
+            let (slot, body) = self.owned_clock_slot(call, envelope).await?;
+            (Some(slot), body)
+        } else {
+            (None, envelope.as_ref())
+        };
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
@@ -3803,7 +3839,7 @@ impl Service {
         let mut sections = Vec::with_capacity(count);
         let mut held = Vec::with_capacity(count);
         let mut reservations = Vec::new();
-        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 2; // Global deadline and placed scope.
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 2 - usize::from(slot.is_some());
         for _ in 0..count {
             let (world, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing world batch identity"))?;
             let world = Uuid::from_bytes(*world);
@@ -3960,6 +3996,7 @@ impl Service {
             root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes: root_writes });
         }
         root.proposal_overlay = proposal_overlay;
+        root.clock_slot = slot;
         root.proposal_land = proposal_land;
         root.proposal_close = proposal_close;
         if (proposal_overlay && !proposal_eligible) || (terminal_proposal && !proposal_overlay) {

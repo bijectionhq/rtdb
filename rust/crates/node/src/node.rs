@@ -2763,6 +2763,7 @@ impl OwnedWorldFork {
 
 #[derive(Default)]
 pub struct OwnedRootSection {
+    pub clock_slot: Option<TransactionKey>,
     pub proposal_overlay: bool,
     pub proposal_land: bool,
     pub proposal_close: bool,
@@ -3035,7 +3036,7 @@ impl NativeSession {
         let mut until = deadline;
         let mut worlds = std::collections::BTreeSet::new();
         let mut attempts = std::collections::BTreeSet::new();
-        let mut effects = controls.len().saturating_add(root.checks.len()).saturating_add(2);
+        let mut effects = controls.len().saturating_add(root.checks.len()).saturating_add(2 + usize::from(root.clock_slot.is_some()));
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
@@ -3096,6 +3097,7 @@ impl NativeSession {
         let mut ops = Vec::with_capacity(effects);
         ops.push(TxOp::owned_deadline(until));
         ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
+        ops.extend(root.clock_slot.map(|predecessor| TxOp::OwnedClockSlot { predecessor }));
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         ops.extend(root.checks);
         if !observed_worlds.is_empty() {

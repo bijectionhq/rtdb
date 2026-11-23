@@ -292,6 +292,29 @@ impl TxResolver {
         let base = self.resolving_snapshot(durable)?;
         let default_time = self.smooth(log_time)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
+        let attempt = request.placed_attempt(position)?;
+        let slot = request.operations.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
+            _ => None,
+        });
+        let slot_time = slot.map(|predecessor| {
+            let mut count = 0;
+            request.operations.retain(|operation| {
+                let is_slot = matches!(operation, Operation::Public(TxOp::OwnedClockSlot { .. }));
+                count += usize::from(is_slot);
+                !is_slot
+            });
+            if count != 1 || request.options.system_time.is_some() || request.guard.is_some()
+                || request.idempotency_key().is_some() || attempt.is_none()
+                || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
+                || !request.operations.iter().any(|operation| matches!(operation,
+                    Operation::Public(TxOp::OwnedDeadline { .. })))
+            {
+                return Err(Anomaly::incorrect("rtdb.owned/invalid-clock-slot", "A clock slot requires a fresh placed transaction with a deadline"));
+            }
+            crate::system_time::clock_slot_time(predecessor, self.resolved_head, log_time)
+                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"))
+        }).transpose();
         let clock_request = match request.options.system_time {
             None => SourceTime::Automatic,
             Some(requested) if has_owned_operations => SourceTime::ObservedAppend(requested.0),
@@ -303,12 +326,15 @@ impl TxResolver {
         let selected_time = clock_request.select(self.previous_system_time(), log_time.0, default_time.0);
         let key = TransactionKey {
             tx_id: TxId(position.0),
-            system_time: Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
+            system_time: match &slot_time {
+                Ok(Some(reading)) => *reading,
+                Ok(None) => Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
+                Err(_) => default_time,
+            },
         };
-        let attempt = request.placed_attempt(position)?;
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
-        let placement = if selected_time.is_ok() {
+        let placement = if selected_time.is_ok() && slot_time.is_ok() {
             request.place_owned_periods(key.system_time, placed_periods)
         } else {
             Ok(())
@@ -344,7 +370,7 @@ impl TxResolver {
             _ => None,
         });
         let mut constraint_failed = false;
-        let mut outcome = if let Some(error) = placement.err().or(plan_error).or(retry_error) {
+        let mut outcome = if let Some(error) = slot_time.err().or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
             Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
@@ -1027,7 +1053,7 @@ impl<'a> OpenTransaction<'a> {
                 Ok(())
             },
             Operation::Public(TxOp::OwnedRequireSpatialPath { .. }) => Ok(()),
-            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id, rtdb_types::OwnedChangeKind::Erase).await,
             Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, expiry, .. }) =>

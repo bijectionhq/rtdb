@@ -931,6 +931,15 @@ refuses the read.
 `rtdb.owned.CommitHostedCounted.v2` prefixes this action with the ordered-present count conditions from Commit.v7.
 The resolver checks the ordinary control observations and every final owned count in the same transaction.
 
+`rtdb.owned.CommitHostedAtSlot.v1` orders a hosted commit at one microsecond after the placed Root hold's reserved present.
+Its body starts with the original 16-byte Root hold handle and a mode byte (0 for a normal deadline, 1 for a physical journal deadline).
+The remaining flags and groups follow CommitHostedStaged.v6, with the physical cutoff omitted in mode 0.
+`rtdb.owned.CommitHeldWorldsAtSlot.v1` prefixes the CommitHeldWorlds.v6 body with the same original Root hold handle.
+The placement and session must still own the hold.
+The ordered predecessor must still match the reserved present, and the source append must be within five seconds of the offered time.
+A missed offer returns `rtdb.owned/clock-slot-missed` and orders no application writes.
+A held offer leaves other writes free to proceed.
+
 `rtdb.owned.CommitHostedDeciding.v1` starts with a flags byte and a big-endian u32 length for the refusal section.
 The low bit selects a counted commit. The second bit selects a held-world read prefix after the refusal.
 The refusal section contains a length-prefixed fact group stream followed by the hosted control group stream.

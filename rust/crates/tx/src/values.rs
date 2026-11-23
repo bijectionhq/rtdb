@@ -1293,6 +1293,7 @@ pub enum TxOp {
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
     OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<rtdb_types::TimedJournalCutoff> },
+    OwnedClockSlot { predecessor: TransactionKey },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,
@@ -1349,7 +1350,7 @@ impl TxOp {
     }
 
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
+        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
     }
 }
 

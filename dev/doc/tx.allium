@@ -84,6 +84,10 @@
 -- An idle native session in autocommit mode with write access can reserve an ordered present by awaiting an automatically timed, empty transaction at its submitted position.
 -- The reservation records its transaction outcome, advances the session's await token, and changes no application table.
 -- Transactions that resolve later in that database history use strictly greater system times.
+-- A placed hosted Root hold offers the microsecond immediately after its reserved transaction.
+-- A hosted commit at the offer assigns that time only while the reserved transaction is the ordered predecessor and the source append remains within five seconds of the offer.
+-- An intervening ordered transaction invalidates the offer and a missed offer publishes no application effects.
+-- Holding an offer does not block unrelated submissions.
 -- Typed create-only document inserts check absence over their valid-time intervals in the ordered transaction view.
 -- An overlap aborts the entire transaction.
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.

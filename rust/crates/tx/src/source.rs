@@ -137,7 +137,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => (Value::document_retained_bytes(record)?.saturating_add(attempt.len()), None, 128),
                 Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => (attempt.len(), None, 128),
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => (relation.name().len(), None, 0),
-                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => (0, None, 0),
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) =>
@@ -422,7 +422,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
                 Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => attempt.len() + 128,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.name().len(),
-                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => 0,
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) => range_evidence_bytes(relation, fixed),
@@ -734,6 +734,11 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         Operation::Public(TxOp::HostedConstraintRefusal) => {
             body.insert("version".into(), Value::I64(1));
             "rtdb-hosted-constraint-refusal-v1"
+        }
+        Operation::Public(TxOp::OwnedClockSlot { predecessor }) => {
+            body.insert("predecessor_id".into(), Value::I64(predecessor.tx_id.0));
+            body.insert("predecessor_micros".into(), Value::I64(predecessor.system_time.0));
+            "rtdb-owned-clock-slot-v1"
         }
         Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging, journal_before }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -1638,6 +1643,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-path-v1" | "rtdb-owned-spatial-path-v1" => &["relation", "name", "columns"],
             "rtdb-owned-spatial-path-v2" | "rtdb-owned-require-spatial-path-v1" => &["relation", "name", "columns", "geometry_encoding"],
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
+            "rtdb-owned-clock-slot-v1" => &["predecessor_id", "predecessor_micros"],
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" => &["until"],
             "rtdb-hosted-constraint-refusal-v1" => &["version"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
@@ -1896,6 +1902,14 @@ impl SourceOperationReader<'_> {
                     return Err(invalid("Invalid hosted constraint receipt version"));
                 }
                 TxOp::HostedConstraintRefusal
+            }
+            "rtdb-owned-clock-slot-v1" => {
+                let (Value::I64(id), Value::I64(micros)) = (value("predecessor_id")?, value("predecessor_micros")?) else {
+                    return Err(invalid("Invalid owned clock slot predecessor"));
+                };
+                TxOp::OwnedClockSlot {
+                    predecessor: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(id), system_time: Timestamp(micros) },
+                }
             }
             "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" | "rtdb-owned-physical-deadline-v2" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };

@@ -42,6 +42,20 @@ pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i6
 }
 
 #[cfg(not(verus_keep_ghost))]
+pub(crate) fn clock_slot_time(
+    predecessor: rtdb_types::TransactionKey,
+    head: Option<rtdb_types::TransactionKey>,
+    appended: rtdb_types::Timestamp,
+) -> Option<rtdb_types::Timestamp> {
+    const HOLD_MICROS: i64 = 5_000_000;
+    if head != Some(predecessor) {
+        return None;
+    }
+    let reading = predecessor.system_time.0.checked_add(1)?;
+    (appended.0 < reading.saturating_add(HOLD_MICROS)).then_some(rtdb_types::Timestamp(reading))
+}
+
+#[cfg(not(verus_keep_ghost))]
 pub(crate) enum SourceTime {
     Automatic,
     ExactSystem { requested: i64, require_current_append: bool },
@@ -88,4 +102,21 @@ fn require_append_bound(
         return Err(TimeRejection::BehindAppend(requested));
     }
     Ok(())
+}
+
+#[cfg(all(test, not(verus_keep_ghost)))]
+mod tests {
+    use rtdb_types::{Timestamp, TransactionKey, TxId};
+
+    use super::clock_slot_time;
+
+    #[test]
+    fn clock_slot_expires_at_its_boundary_or_after_an_intervening_order() {
+        let predecessor = TransactionKey { tx_id: TxId(8), system_time: Timestamp(100) };
+        let intervening = TransactionKey { tx_id: TxId(9), system_time: Timestamp(101) };
+
+        assert_eq!(clock_slot_time(predecessor, Some(predecessor), Timestamp(5_000_100)), Some(Timestamp(101)));
+        assert_eq!(clock_slot_time(predecessor, Some(predecessor), Timestamp(5_000_101)), None);
+        assert_eq!(clock_slot_time(predecessor, Some(intervening), Timestamp(102)), None);
+    }
 }
