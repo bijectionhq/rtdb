@@ -4,11 +4,11 @@ mod storage;
 
 use super::{
     Authority, Held, InstalledJournal, InstalledRoute, JournalLog, WriterAdmission,
-    custody::{CheckpointCustody, Reservation},
+    custody::{CheckpointCustody, Preparation, Reservation},
 };
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
-    Checkpoint, Command, Enrollment, Grant, Hold, Request, service::Route,
+    Checkpoint, Command, Enrollment, Grant, Hold, Request, Window, service::Route,
 };
 use prost_types::Any;
 use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord};
@@ -38,6 +38,7 @@ struct Definition {
     custody: Option<InstalledRoute>,
     archive: crate::deployment::CellStorage,
     archive_prefix: String,
+    journal_window_bytes: Option<u64>,
     endpoints: Vec<WorkerEndpoint>,
     #[serde(default)]
     checkpoint_reservations: Vec<Reservation>,
@@ -60,6 +61,7 @@ pub(crate) struct Placement {
     pub custodian: Option<Arc<InstalledJournal>>,
     archive: crate::deployment::CellStorage,
     archive_prefix: ObjectKey,
+    journal_window_bytes: Option<u64>,
     endpoints: BTreeMap<Enrollment, WorkerEndpoint>,
     nomination: tokio::sync::Mutex<Option<Request>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
@@ -169,9 +171,16 @@ impl Routes {
             if !endpoints.contains_key(&enrollment) {
                 return Err(invalid("The local journal worker has no installed route"));
             }
+            if matches!(&entry.archive, crate::deployment::CellStorage::S3 { config } if config.terminal_scope.is_none())
+            {
+                return Err(invalid(
+                    "An ordered S3 checkpoint archive needs enrolled terminal storage",
+                ));
+            }
             let name = entry.deployment.name.clone();
             let mut checkpoint_reservations = BTreeMap::new();
             for reservation in entry.checkpoint_reservations {
+                CheckpointCustody::copy_budget(&reservation)?;
                 if reservation.custody.revision <= 1
                     || reservation.custody.allocation.is_nil()
                     || checkpoint_reservations
@@ -183,12 +192,18 @@ impl Routes {
                     ));
                 }
             }
+            if entry.journal_window_bytes == Some(0) {
+                return Err(invalid(
+                    "The installed journal window size must be positive",
+                ));
+            }
             let placement = Arc::new(Placement {
                 record: entry.deployment,
                 worker,
                 custodian,
                 archive: entry.archive,
                 archive_prefix: ObjectKey::new(entry.archive_prefix)?,
+                journal_window_bytes: entry.journal_window_bytes,
                 endpoints,
                 nomination: Default::default(),
                 checkpoint_reservations,
@@ -215,6 +230,12 @@ impl Routes {
         }).ok_or_else(|| invalid("The database attachment addresses a different installed journal worker"))?;
         Ok((Arc::clone(placement), attachment))
     }
+}
+
+pub fn read_application_route(
+    path: &Path,
+) -> Result<ordered_logkeeper::ordered::daemon::ApplicationRoute> {
+    read_manifest(path)
 }
 
 fn read_manifest<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -249,70 +270,189 @@ fn worker_endpoints(peers: Vec<WorkerEndpoint>) -> Result<BTreeMap<Enrollment, W
 }
 
 impl Placement {
+    /// Replenish only bytes the installed voters have already paid for. The
+    /// ordered decision recomputes the limit against concurrent appends.
+    pub(crate) async fn replenish(&self, route: &Route, grant: Grant) -> Result<()> {
+        let Some(custodian) = &self.custodian else {
+            return Ok(());
+        };
+        let remaining = route.window.bytes - route.window_spent;
+        let funded = self
+            .journal_window_bytes
+            .unwrap_or(route.reusable_bytes)
+            .min(route.reusable_bytes);
+        let watermark = (crate::process::MAXIMUM_LOG_MESSAGE_BYTES as u64)
+            .saturating_add(ordered_logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES)
+            .max(route.window.bytes / 4);
+        if remaining > watermark || funded <= remaining {
+            return Ok(());
+        }
+        let serial = route
+            .window
+            .serial
+            .checked_add(1)
+            .ok_or_else(|| invalid("The journal window serial space is exhausted"))?;
+        let window = Window {
+            allocation: Uuid::new_v4(),
+            serial,
+            bytes: funded,
+        };
+        custodian.fund(route, grant, window).await
+    }
+
     pub(crate) async fn publish_checkpoint(
         &self,
         keys: &dyn crate::keys::KeyService,
-        grant: Grant,
-        checkpoint: RtdbCheckpoint,
-        source: &dyn ObjectStore,
+        admission: WriterAdmission,
+        offered: Option<RtdbCheckpoint>,
+        serving: &crate::deployment::CellStorage,
         tasks: &TaskTracker,
-    ) -> Result<()> {
+    ) -> Result<Option<RtdbCheckpoint>> {
         let _publication = self.publication.lock().await;
         let custodian = self
             .custodian
             .as_ref()
             .ok_or_else(|| invalid("This placement has no checkpoint custodian"))?;
-        let current = self.worker.route().await?;
-        if current.writer.grant != Some(grant) {
-            return Err(invalid("The checkpoint writer grant has been replaced"));
-        }
-        let next_lsn = checkpoint
-            .boundary
-            .checked_add(1)
-            .and_then(|offset| u64::try_from(offset).ok())
-            .ok_or_else(|| invalid("The adopted checkpoint has no ordered replica boundary"))?;
-        let published = current.checkpoint;
-        if published.cut.next_lsn > next_lsn {
-            return Err(invalid(
-                "A later checkpoint already governs the installed journal",
-            ));
-        }
-        if published.cut.next_lsn == next_lsn {
-            return if checkpoint.root_sha256 == Some(published.root) {
-                Ok(())
-            } else {
-                Err(invalid(
-                    "The adopted checkpoint differs from the installed root",
-                ))
+        let material = material(keys, &self.record).await?;
+        let io = IoRegion::new();
+        let provider = self.checkpoint_custody(Arc::clone(&io), &material).await?;
+        let requested = offered
+            .map(|checkpoint| {
+                let next = checkpoint
+                    .boundary
+                    .checked_add(1)
+                    .and_then(|offset| u64::try_from(offset).ok())
+                    .ok_or_else(|| {
+                        invalid("The adopted checkpoint has no ordered replica boundary")
+                    })?;
+                Ok::<_, Anomaly>((checkpoint, next))
+            })
+            .transpose()?;
+
+        loop {
+            let current = custodian.route().await?;
+            let grant = admission.grant;
+            if current.writer.grant != Some(grant) {
+                return Err(invalid("The checkpoint writer grant has been replaced"));
+            }
+            let published = current.checkpoint;
+            if let Some((checkpoint, next)) = requested {
+                if published.cut.next_lsn > next {
+                    return Ok(Some(provider.open(published).await?.checkpoint));
+                }
+                if published.cut.next_lsn == next {
+                    return if checkpoint.root_sha256 == Some(published.root) {
+                        Ok(Some(checkpoint))
+                    } else {
+                        Err(invalid(
+                            "The adopted checkpoint differs from the installed root",
+                        ))
+                    };
+                }
+            }
+            let revision = published
+                .custody
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| invalid("The checkpoint custody revision space is exhausted"))?;
+            let Some(&reservation) = self.checkpoint_reservations.get(&revision) else {
+                return if requested.is_some() || current.preparing.is_some() {
+                    Err(invalid("The next exact checkpoint allocation is unfunded"))
+                } else {
+                    Ok(None)
+                };
             };
+            let origin = match (current.preparing, requested) {
+                (Some(chosen), _) => Preparation::recover(chosen, reservation)?,
+                (None, Some((checkpoint, next))) => {
+                    let through = self.hold_cut(&current, grant, next, tasks).await?;
+                    let origin = Preparation {
+                        writer: grant,
+                        base: admission.recovery.checkpoint,
+                        through: through.scope().through,
+                        checkpoint,
+                    };
+                    let source =
+                        storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                            .await?;
+                    provider
+                        .preflight(&reservation, origin, source.as_ref())
+                        .await?;
+                    custodian
+                        .prepare_checkpoint(&current, grant, origin.ordered(reservation)?)
+                        .await?;
+                    origin
+                }
+                (None, None) => return Ok(None),
+            };
+            let origin = provider.begin(&reservation, origin).await?;
+            let staged = match provider.prepared(reservation, origin).await? {
+                Some(prepared) => prepared,
+                None => {
+                    let source =
+                        storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                            .await?;
+                    provider
+                        .prepare(&reservation, origin, source.as_ref())
+                        .await?
+                }
+            };
+            let authority = custodian.route().await?;
+            provider
+                .publish(custodian, &authority, grant, staged)
+                .await?;
+            if requested.is_none_or(|(_, next)| staged.cut.next_lsn >= next) {
+                return Ok(Some(origin.checkpoint));
+            }
         }
-        let revision = published
-            .custody
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("The checkpoint custody revision space is exhausted"))?;
-        let reservation = self
-            .checkpoint_reservations
-            .get(&revision)
-            .ok_or_else(|| invalid("The next exact checkpoint allocation is unfunded"))?;
+    }
+
+    pub(crate) async fn retire_unheld_checkpoint(
+        &self,
+        keys: &dyn crate::keys::KeyService,
+    ) -> Result<()> {
+        let Some(custodian) = self.custodian.as_ref() else {
+            return Ok(());
+        };
+        let route = custodian.route().await?;
+        let Some(retired) = route.retirement else {
+            return Ok(());
+        };
+        if !retired.closed {
+            custodian
+                .close_checkpoint(&route, retired.checkpoint)
+                .await?;
+        }
+        if let crate::deployment::CellStorage::S3 { config } = &self.archive {
+            let material = material(keys, &self.record).await?;
+            let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
+            let disposition = provider.retire_s3(config, retired.checkpoint).await?;
+            let current = custodian.route().await?;
+            custodian
+                .settle_checkpoint(&current, retired.checkpoint, disposition)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn hold_cut(
+        &self,
+        current: &Route,
+        grant: Grant,
+        next_lsn: u64,
+        tasks: &TaskTracker,
+    ) -> Result<Arc<Held>> {
         let intent = self.worker.request(
-            &current,
+            current,
             Command::ProtectRange {
                 grant,
                 from: next_lsn,
                 through: next_lsn,
             },
         )?;
-        let through = Held::acquire(&self.worker, intent, tasks).await?;
-        let material = material(keys, &self.record).await?;
-        let io = IoRegion::new();
-        let provider = self.checkpoint_custody(Arc::clone(&io), &material).await?;
-        let staged = provider
-            .prepare(reservation, source, through.scope().through, checkpoint)
-            .await?;
-        let current = custodian.route().await?;
-        provider.publish(custodian, &current, grant, staged).await
+        Held::acquire(&self.worker, intent, tasks).await
     }
+
     async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {
         let route = self.worker.route().await?;
         let request = self

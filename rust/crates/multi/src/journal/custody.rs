@@ -4,7 +4,7 @@ use super::InstalledJournal;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    Checkpoint, Custody, Cut, Fingerprint, Grant, Placement, service::Route,
+    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, Placement, service::Route,
 };
 use ring::digest::{SHA256, digest};
 use rtdb_directory::Checkpoint as RtdbCheckpoint;
@@ -30,7 +30,7 @@ pub struct CheckpointCustody {
 }
 
 /// Exact space reserved by the custodian before staging any checkpoint copy.
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reservation {
     pub custody: Custody,
@@ -44,6 +44,79 @@ struct Scope {
     group: Uuid,
     generation: u64,
     log_epoch: i32,
+}
+
+/// The immutable origin of an unfinished checkpoint capture. A replacement
+/// reopens the original writer namespace with this exact published base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Preparation {
+    pub writer: Grant,
+    pub base: Checkpoint,
+    pub through: Cut,
+    pub checkpoint: RtdbCheckpoint,
+}
+
+impl Preparation {
+    pub fn ordered(self, reservation: Reservation) -> Result<CheckpointPreparation> {
+        let root = validate_cut(self.checkpoint, self.through)?;
+        let mut descriptor = [0; 32];
+        for (bytes, field) in descriptor.chunks_exact_mut(8).zip([
+            self.checkpoint.block,
+            self.checkpoint.boundary,
+            self.checkpoint.source,
+            self.checkpoint.system_time,
+        ]) {
+            bytes.copy_from_slice(&field.to_be_bytes());
+        }
+        Ok(CheckpointPreparation {
+            checkpoint: self.through,
+            root,
+            source: self.writer,
+            base: self.base,
+            custody: reservation.custody,
+            usable_bytes: reservation.usable_bytes,
+            descriptor,
+        })
+    }
+
+    pub fn recover(chosen: CheckpointPreparation, reservation: Reservation) -> Result<Self> {
+        if chosen.custody != reservation.custody || chosen.usable_bytes != reservation.usable_bytes
+        {
+            return Err(invalid(
+                "The installed provider reservation differs from the ordered preparation",
+            ));
+        }
+        let field = |offset: usize| {
+            i64::from_be_bytes(
+                chosen.descriptor[offset..offset + 8]
+                    .try_into()
+                    .expect("the ordered checkpoint field is eight bytes"),
+            )
+        };
+        let checkpoint = RtdbCheckpoint {
+            block: field(0),
+            boundary: field(8),
+            source: field(16),
+            system_time: field(24),
+            root_sha256: Some(chosen.root),
+        };
+        validate_cut(checkpoint, chosen.checkpoint)?;
+        Ok(Self {
+            writer: chosen.source,
+            base: chosen.base,
+            through: chosen.checkpoint,
+            checkpoint,
+        })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Intent {
+    scope: Scope,
+    reservation: Reservation,
+    source: Preparation,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,24 +159,135 @@ impl CheckpointCustody {
         }
     }
 
-    /// Copies the exact reconstructable closure to the independently retained
-    /// allocation. The manifest becomes the root of the recovery receipt.
-    pub async fn prepare(
+    pub(crate) async fn pending(&self, reservation: &Reservation) -> Result<Option<Preparation>> {
+        let locator = self.intent(reservation.custody)?;
+        let Some(frame) = self.metadata(&locator).await? else {
+            return Ok(None);
+        };
+        let intent: Intent = serde_json::from_slice(&frame).map_err(serialization)?;
+        if intent.scope != self.scope() || intent.reservation != *reservation {
+            return Err(invalid(
+                "The checkpoint preparation addresses a different reservation",
+            ));
+        }
+        validate_cut(intent.source.checkpoint, intent.source.through)?;
+        Ok(Some(intent.source))
+    }
+
+    /// Registers the only allowed source for this allocation before issuing
+    /// any provider writes. Immutable creation selects one racing proposal.
+    pub(crate) async fn begin(
         &self,
         reservation: &Reservation,
-        source: &dyn ObjectStore,
-        through: Cut,
-        checkpoint: RtdbCheckpoint,
-    ) -> Result<Checkpoint> {
-        let root = validate_cut(checkpoint, through)?;
-        let custody = reservation.custody;
-        if custody.allocation.is_nil() || custody.revision <= 1 {
+        source: Preparation,
+    ) -> Result<Preparation> {
+        validate_cut(source.checkpoint, source.through)?;
+        Self::copy_budget(reservation)?;
+        if let Some(existing) = self.pending(reservation).await? {
+            return if existing == source {
+                Ok(existing)
+            } else {
+                Err(invalid(
+                    "The provider preparation differs from the ordered source",
+                ))
+            };
+        }
+        let intent = Intent {
+            scope: self.scope(),
+            reservation: *reservation,
+            source,
+        };
+        let frame = serde_json::to_vec(&intent).map_err(serialization)?;
+        if frame.len() > MAX_MANIFEST_BYTES {
+            return Err(invalid(
+                "The checkpoint preparation exceeds its metadata reservation",
+            ));
+        }
+        match self
+            .store
+            .put(&self.intent(reservation.custody)?, Bytes::from(frame))
+            .await
+        {
+            Ok(()) => Ok(source),
+            Err(Error::ConflictingObject(_)) => match self.pending(reservation).await? {
+                Some(existing) if existing == source => Ok(existing),
+                _ => Err(invalid(
+                    "The provider preparation differs from the ordered source",
+                )),
+            },
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn copy_budget(reservation: &Reservation) -> Result<u64> {
+        if reservation.custody.allocation.is_nil() || reservation.custody.revision <= 1 {
             return Err(invalid("The checkpoint has no new provider reservation"));
         }
-        let copy_budget = reservation
+        reservation
             .usable_bytes
-            .checked_sub(MAX_MANIFEST_BYTES as u64)
-            .ok_or_else(|| invalid("The reservation cannot hold the checkpoint manifest"))?;
+            .checked_sub(2 * MAX_MANIFEST_BYTES as u64)
+            .ok_or_else(|| invalid("The reservation cannot hold checkpoint metadata"))
+    }
+
+    pub(crate) async fn preflight(
+        &self,
+        reservation: &Reservation,
+        origin: Preparation,
+        source: &dyn ObjectStore,
+    ) -> Result<()> {
+        let budget = Self::copy_budget(reservation)?;
+        // A permanent size refusal must precede the first provider effect
+        // and the ordered binding of a reservation to a source.
+        let _ = crate::archive::ordered_checkpoint_sources(
+            source,
+            origin.checkpoint,
+            self.epoch,
+            budget,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn prepared(
+        &self,
+        reservation: Reservation,
+        origin: Preparation,
+    ) -> Result<Option<Checkpoint>> {
+        let Some(frame) = self.metadata(&self.manifest(reservation.custody)?).await? else {
+            return Ok(None);
+        };
+        let checkpoint = Checkpoint {
+            cut: origin.through,
+            root: validate_cut(origin.checkpoint, origin.through)?,
+            manifest: fingerprint(&frame),
+            custody: reservation.custody,
+        };
+        self.read_manifest(checkpoint).await?;
+        Ok(Some(checkpoint))
+    }
+
+    /// Copies the exact reconstructable closure to the independently retained
+    /// allocation. The provider rejects a different publication of any member.
+    pub(crate) async fn prepare(
+        &self,
+        reservation: &Reservation,
+        origin: Preparation,
+        source: &dyn ObjectStore,
+    ) -> Result<Checkpoint> {
+        if self.pending(reservation).await? != Some(origin) {
+            return Err(invalid(
+                "The checkpoint copy has no matching prepared source",
+            ));
+        }
+        let Preparation {
+            through,
+            checkpoint,
+            ..
+        } = origin;
+        let root = validate_cut(checkpoint, through)?;
+        let custody = reservation.custody;
+        let manifest_locator = self.manifest(custody)?;
+        let copy_budget = Self::copy_budget(reservation)?;
         let members =
             crate::archive::ordered_checkpoint_sources(source, checkpoint, self.epoch, copy_budget)
                 .await?;
@@ -142,16 +326,14 @@ impl CheckpointCustody {
         }
         let manifest_sha256 = fingerprint(&frame);
         self.store
-            .put(&self.manifest(custody)?, Bytes::from(frame))
+            .put(&manifest_locator, Bytes::from(frame))
             .await?;
-        let prepared = Checkpoint {
+        Ok(Checkpoint {
             cut: through,
             root,
             manifest: manifest_sha256,
             custody,
-        };
-        self.open(prepared).await?;
-        Ok(prepared)
+        })
     }
 
     /// Establishes provider evidence before the custodian orders publication.
@@ -172,13 +354,29 @@ impl CheckpointCustody {
     }
 
     pub async fn open(&self, chosen: Checkpoint) -> Result<OpenedCheckpoint> {
+        let manifest = self.read_manifest(chosen).await?;
+        let checkpoint = manifest.checkpoint;
+        let store = Arc::new(ExactStore {
+            bucket: Arc::clone(&self.store),
+            prefix: self.allocation(chosen.custody),
+            members: manifest.members,
+        });
+        let root = ObjectKey::new(block_key(rtdb_types::BlockIndex(checkpoint.block))?)?;
+        let catalog = BlockCatalog::decode(&store.get(&root).await?)?;
+        crate::archive::verify_cut(&catalog, checkpoint, self.epoch)?;
+        // Enumerating the actual root again ensures every referenced member
+        // can be opened by this exact manifest before the journal can use it.
+        let _ = crate::archive::recovery_manifest_sha256(store.as_ref(), checkpoint, self.epoch)
+            .await?;
+        Ok(OpenedCheckpoint { checkpoint, store })
+    }
+
+    async fn read_manifest(&self, chosen: Checkpoint) -> Result<Manifest> {
         let locator = self.manifest(chosen.custody)?;
-        let info = self.store.head_fresh(&locator).await?;
-        let length = usize::try_from(info.size)
-            .ok()
-            .filter(|bytes| *bytes <= MAX_MANIFEST_BYTES)
-            .ok_or_else(|| invalid("The captured checkpoint manifest exceeds its reservation"))?;
-        let frame = self.store.get_fresh_exact(&locator, length).await?;
+        let frame = self
+            .metadata(&locator)
+            .await?
+            .ok_or_else(|| invalid("The exact captured checkpoint manifest is unavailable"))?;
         if fingerprint(&frame) != chosen.manifest {
             return Err(invalid(
                 "The checkpoint manifest differs from the installed receipt",
@@ -196,20 +394,67 @@ impl CheckpointCustody {
                 "The checkpoint manifest addresses a different installed history",
             ));
         }
-        let checkpoint = manifest.checkpoint;
-        let store = Arc::new(ExactStore {
-            bucket: Arc::clone(&self.store),
-            prefix: self.allocation(chosen.custody),
-            members: manifest.members,
-        });
-        let root = ObjectKey::new(block_key(rtdb_types::BlockIndex(checkpoint.block))?)?;
-        let catalog = BlockCatalog::decode(&store.get(&root).await?)?;
-        crate::archive::verify_cut(&catalog, checkpoint, self.epoch)?;
-        // Enumerating the actual root again ensures every referenced member
-        // can be opened by this exact manifest before the journal can use it.
-        let _ = crate::archive::recovery_manifest_sha256(store.as_ref(), checkpoint, self.epoch)
-            .await?;
-        Ok(OpenedCheckpoint { checkpoint, store })
+        Ok(manifest)
+    }
+
+    /// The manifest fence is installed last. Its durable token settles a
+    /// retry after the member bytes and the manifest have become unreadable.
+    pub(crate) async fn retire_s3(
+        &self,
+        config: &rtdb_s3::S3Config,
+        chosen: Checkpoint,
+    ) -> Result<Fingerprint> {
+        if config.terminal_scope.is_none() {
+            return Err(invalid(
+                "Checkpoint retirement requires enrolled terminal storage",
+            ));
+        }
+        let inventory = crate::deployment::CellStorage::s3_inventory(config).await?;
+        let effects = inventory.never_versioned_retirement().await?;
+        let token = chosen.custody.allocation;
+        let root = self.manifest(chosen.custody)?;
+        let preparation = self.intent(chosen.custody)?;
+        if !effects.confirms(&root, token).await? {
+            let selected = self.read_manifest(chosen).await?;
+            for logical in selected.members.keys() {
+                let key = self.member(chosen.custody, &ObjectKey::new(logical.as_str())?)?;
+                effects.fence_create_only(&key, token).await?;
+            }
+            effects.fence_create_only(&preparation, token).await?;
+            effects.fence_create_only(&root, token).await?;
+        }
+        if !effects.confirms(&preparation, token).await? {
+            return Err(invalid("The provider has not fenced the preparation"));
+        }
+        let scope = serde_json::to_vec(&self.scope()).map_err(serialization)?;
+        let mut attestation = ring::digest::Context::new(&SHA256);
+        attestation.update(b"rtdb.multi.ordered-checkpoint-disposition/v1");
+        attestation.update(&scope);
+        attestation.update(token.as_bytes());
+        attestation.update(&chosen.custody.revision.to_be_bytes());
+        attestation.update(&chosen.manifest);
+        Ok(attestation
+            .finish()
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 is 32 bytes"))
+    }
+
+    async fn metadata(&self, key: &ObjectKey) -> Result<Option<Bytes>> {
+        let info = match self.store.head_fresh(key).await {
+            Ok(info) => info,
+            Err(Error::MissingObject(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let length = usize::try_from(info.size)
+            .ok()
+            .filter(|bytes| *bytes <= MAX_MANIFEST_BYTES)
+            .ok_or_else(|| invalid("Checkpoint metadata exceeds its reservation"))?;
+        Ok(Some(self.store.get_fresh_exact(key, length).await?))
+    }
+
+    fn intent(&self, id: Custody) -> rtdb_storage::Result<ObjectKey> {
+        ObjectKey::new(format!("{}/prepare", self.allocation(id)))
     }
 
     fn scope(&self) -> Scope {

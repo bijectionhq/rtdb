@@ -1,6 +1,9 @@
 use super::{Routes, genesis, invalid, material};
 use crate::deployment::CellStorage;
-use crate::journal::InstalledJournal;
+use crate::journal::{
+    InstalledJournal,
+    custody::{CheckpointCustody, Preparation},
+};
 use crate::store::{EncryptingStore, ScopedCellWrites};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -104,13 +107,7 @@ impl RemoteStorageFactory for StoreFactory {
             (Some(opened.store), BlockDiscovery::AtPublished(published))
         };
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
-        let prefix = format!(
-            "{}/~ordered/{}/{}/{}",
-            placement.record.storage_prefix(),
-            placement.worker.placement().generation,
-            grant.epoch,
-            root.as_str()
-        );
+        let prefix = source_prefix(placement, grant, root);
         let writer = match (&self.storage, &self.scoped_writes) {
             (CellStorage::S3 { config }, Some(scoped)) => {
                 let authorization: Arc<dyn rtdb_s3::WriteAuthorization> = scope.clone();
@@ -132,8 +129,8 @@ impl RemoteStorageFactory for StoreFactory {
         let store = Arc::new(ServingStore {
             lower,
             upper,
-            scope,
-            _protection: protection,
+            scope: Some(scope),
+            _protection: Some(protection),
         });
         Ok(OpenedRecoveryStore {
             store,
@@ -145,13 +142,50 @@ impl RemoteStorageFactory for StoreFactory {
     }
 }
 
+fn source_prefix(placement: &super::Placement, grant: Grant, root: &ObjectKey) -> String {
+    format!(
+        "{}/~ordered/{}/{}/{}",
+        placement.record.storage_prefix(),
+        placement.worker.placement().generation,
+        grant.epoch,
+        root.as_str()
+    )
+}
+
+pub(super) async fn reopen_source(
+    placement: &super::Placement,
+    storage: &CellStorage,
+    custody: &CheckpointCustody,
+    key: &[u8],
+    io: &Arc<IoRegion>,
+    origin: Preparation,
+) -> Result<Arc<dyn ObjectStore>> {
+    let root = ObjectKey::new(crate::archive::checkpoint_storage_root()?)?;
+    let prefix = source_prefix(placement, origin.writer, &root);
+    let bucket = storage.bucket(Arc::clone(io)).await?;
+    let upper = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
+    crate::store::check_root(upper.as_ref(), &placement.record.id, false).await?;
+    let upper = Arc::new(EncryptingStore::new(upper, key)?);
+    let lower = if genesis(origin.base) {
+        None
+    } else {
+        Some(custody.open(origin.base).await?.store)
+    };
+    Ok(Arc::new(ServingStore {
+        lower,
+        upper,
+        scope: None,
+        _protection: None,
+    }))
+}
+
 /// The writer publishes only below its own scoped epoch prefix. The
 /// inherited checkpoint remains an independently retained immutable base.
 struct ServingStore {
     lower: Option<Arc<dyn ObjectStore>>,
     upper: Arc<dyn ObjectStore>,
-    scope: Arc<WriteScope>,
-    _protection: Arc<crate::journal::Held>,
+    scope: Option<Arc<WriteScope>>,
+    _protection: Option<Arc<crate::journal::Held>>,
 }
 
 impl ServingStore {
@@ -173,6 +207,11 @@ impl ServingStore {
     async fn authorize(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
         use rtdb_s3::WriteAuthorization;
         self.scope
+            .as_ref()
+            .ok_or_else(|| Error::Remote {
+                key: key.to_string(),
+                message: "A checkpoint preparation source is read-only".into(),
+            })?
             .authorize(None)
             .await
             .map_err(|error| Error::Remote {
@@ -289,11 +328,10 @@ impl ObjectStore for ServingStore {
     }
 
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        self.authorize(key).await?;
-        if self.inherited(key).await?.is_some() {
-            return Ok(());
-        }
-        self.upper.delete(key).await
+        // The writer's published objects can still be the source of an
+        // ordered checkpoint or a read whose grant has been replaced.
+        // Retention of this immutable source is owned by its installation.
+        self.authorize(key).await
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {

@@ -22,11 +22,14 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
+       rtdb-multi ordered-journal --manifest FILE\n\
+       rtdb-multi initialize-ordered-journal --manifest FILE\n\
+       rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway [--directory DIR] [--installed-journals FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -379,6 +382,41 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:7001")?).await.map_err(io)?;
             eprintln!("directory listening on {}", listener.local_addr().map_err(io)?);
             rtdb_directory::serve(listener, directory, cancellation).await
+        }
+        "ordered-journal" | "initialize-ordered-journal" => {
+            let failure = |error: Box<dyn std::error::Error + Send + Sync>| {
+                Anomaly::fault("rtdb.multi/ordered-journal", error.to_string())
+            };
+            let path = std::path::Path::new(arguments.required("manifest")?);
+            let manifest = ordered_logkeeper::ordered::daemon::Manifest::read(path).map_err(failure)?;
+            if command == "initialize-ordered-journal" {
+                manifest.initialize().map_err(failure)
+            } else {
+                manifest.run(cancellation).await.map_err(failure)
+            }
+        }
+        "prepare-ordered-deployment" => {
+            let path = std::path::Path::new(arguments.required("route")?);
+            let route = rtdb_multi::journal::hosted::read_application_route(path)?;
+            let name = arguments.required("name")?;
+            let org = arguments.required("org")?;
+            if name.is_empty() || org.is_empty() || name.contains('@') {
+                return Err(usage("The installed deployment needs a name without @ and an organization".into()));
+            }
+            let incarnation = arguments.number("incarnation", 1u64)?;
+            let log_epoch = arguments.number("log-epoch", 0i32)?;
+            if incarnation == 0 || log_epoch < 0 {
+                return Err(usage("The installed incarnation must be positive and the log epoch nonnegative".into()));
+            }
+            let mut record = rtdb_directory::DeploymentRecord::new(name, org, Vec::new(), rtdb_directory::now_ms());
+            record.id = route.placement.deployment.to_string();
+            record.lineage = record.id.clone();
+            record.incarnation = incarnation;
+            record.log_epoch = log_epoch;
+            record.linearizable_reads = true;
+            key_service(arguments.required("keys")?).await?.key(&record.key_id()).await?;
+            println!("{}", serde_json::to_string_pretty(&record).map_err(|error| io(std::io::Error::other(error)))?);
+            Ok(())
         }
         "logkeeper" => {
             let directory = directory(arguments.required("directory")?).await?;

@@ -1,4 +1,5 @@
 use aws_sdk_s3::types::ChecksumAlgorithm;
+use aws_sdk_s3::{error::ProvideErrorMetadata, primitives::ByteStream};
 use bytes::Bytes;
 use object_store::path::Path;
 use rtdb_storage::{
@@ -84,9 +85,12 @@ impl NeverVersionedRetirement<'_> {
                         "The publication does not have a positive content length",
                     ));
                 }
-                let tag = reply.e_tag().filter(|tag| strong_entity_tag(tag)).ok_or_else(|| {
-                    unavailable("The publication does not have a strong entity tag")
-                })?;
+                let tag = reply
+                    .e_tag()
+                    .filter(|tag| strong_entity_tag(tag))
+                    .ok_or_else(|| {
+                        unavailable("The publication does not have a strong entity tag")
+                    })?;
                 S3TombstoneCondition::Matches(tag.to_owned())
             }
             Err(error)
@@ -126,6 +130,57 @@ impl NeverVersionedRetirement<'_> {
             ));
         }
         Ok(path)
+    }
+
+    /// Permanently fences a key whose publication path uses conditional create.
+    /// A single provider write leaves no multipart staging to reconcile.
+    pub async fn fence_create_only(&self, key: &ObjectKey, token: Uuid) -> Result<()> {
+        if token.is_nil() {
+            return Err(unavailable(
+                "The terminal write needs an allocation identity",
+            ));
+        }
+        let target = match self.observe(key).await? {
+            NeverVersionedObject::Retired(previous) if previous == token => return Ok(()),
+            NeverVersionedObject::Retired(_) => {
+                return Err(unavailable("Another allocation retired the object"));
+            }
+            NeverVersionedObject::Open(target) => target,
+        };
+        let path = self.checked_path(key, &target)?;
+        let request = self
+            .inventory
+            .client
+            .put_object()
+            .bucket(&self.inventory.namespace.bucket)
+            .key(path.as_ref())
+            .metadata(S3_RETIREMENT_ATTRIBUTE, token.simple().to_string())
+            .body(ByteStream::from(Bytes::new()))
+            .set_request_payer(self.inventory.request_payer.clone());
+        let request = match target.condition {
+            S3TombstoneCondition::Absent => request.if_none_match("*"),
+            S3TombstoneCondition::Matches(tag) => request.if_match(tag),
+        };
+        match request.send().await {
+            Ok(reply) if reply.version_id().is_some() => {
+                return Err(unavailable("S3 versioned the retirement tombstone"));
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.as_service_error().and_then(|error| error.code())
+                    == Some("PreconditionFailed") => {}
+            Err(error) => {
+                return Err(unavailable(format!(
+                    "Installing the terminal object fence failed: {error}"
+                )));
+            }
+        }
+        if !self.confirms(key, token).await? {
+            return Err(unavailable(
+                "The terminal object fence has not been confirmed",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn reserve(
@@ -175,10 +230,12 @@ impl NeverVersionedRetirement<'_> {
             .complete_conditional(&path, upload, Bytes::new(), &target.condition)
             .await?
         {
-            PublicationResult::Published { version: None, .. } | PublicationResult::Conflict => Ok(()),
-            PublicationResult::Published { version: Some(_), .. } => {
-                Err(unavailable("S3 versioned the retirement tombstone"))
+            PublicationResult::Published { version: None, .. } | PublicationResult::Conflict => {
+                Ok(())
             }
+            PublicationResult::Published {
+                version: Some(_), ..
+            } => Err(unavailable("S3 versioned the retirement tombstone")),
         }
     }
 

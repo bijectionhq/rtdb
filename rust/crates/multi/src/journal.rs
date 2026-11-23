@@ -5,8 +5,8 @@
 //! journal owns the ordered writer, checkpoint, and replay decisions.
 
 use ordered_logkeeper::ordered::{
-    AppendResult, Checkpoint, Command, Cut, Enrollment, Grant, Hold, Outcome, Placement, Principal,
-    Refusal, Request, RequestId, Window,
+    AppendResult, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment, Fingerprint, Grant,
+    Hold, Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
     daemon::{ApplicationRoute, Client, Credentials},
     service::{
         ReplayHead, ReplayPage, Route,
@@ -283,6 +283,53 @@ impl InstalledJournal {
         Ok(result)
     }
 
+    pub async fn prepare_checkpoint(
+        &self,
+        route: &Route,
+        grant: Grant,
+        preparation: CheckpointPreparation,
+    ) -> Result<()> {
+        let request = self.request(route, Command::PrepareCheckpoint { grant, preparation })?;
+        let decision = self.execute(&request).await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::CheckpointPrepared(chosen) if chosen == preparation => Ok(()),
+            _ => Err(mismatch("The journal prepared a different checkpoint")),
+        }
+    }
+
+    pub async fn close_checkpoint(&self, route: &Route, checkpoint: Checkpoint) -> Result<()> {
+        let request = self.request(route, Command::CloseCheckpoint { checkpoint })?;
+        let decision = self.execute(&request).await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::CheckpointClosed(closed) if closed == checkpoint => Ok(()),
+            _ => Err(mismatch(
+                "The journal closed a different checkpoint allocation",
+            )),
+        }
+    }
+
+    pub async fn settle_checkpoint(
+        &self,
+        route: &Route,
+        checkpoint: Checkpoint,
+        disposition: Fingerprint,
+    ) -> Result<()> {
+        let request = self.request(
+            route,
+            Command::SettleCheckpoint {
+                checkpoint,
+                disposition,
+            },
+        )?;
+        let decision = self.execute(&request).await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::CheckpointSettled(settled) if settled == checkpoint => Ok(()),
+            _ => Err(mismatch(
+                "The journal settled a different checkpoint allocation",
+            )),
+        }
+    }
+
     pub async fn publish(&self, route: &Route, grant: Grant, checkpoint: Checkpoint) -> Result<()> {
         let decision = self
             .execute(&self.request(route, Command::Publish { grant, checkpoint })?)
@@ -363,6 +410,7 @@ fn refused(reason: Refusal) -> Anomaly {
         Refusal::Capacity => (Unavailable, "rtdb.multi/ordered-capacity"),
         Refusal::ReadPending => (Unavailable, "rtdb.multi/ordered-read-pending"),
         Refusal::Unavailable => (Unavailable, "rtdb.multi/ordered-replay-unavailable"),
+        Refusal::CohortSealed => (Unavailable, "rtdb.multi/ordered-cohort-sealed"),
         Refusal::Invalid | Refusal::WrongPlacement => {
             (Incorrect, "rtdb.multi/ordered-journal-binding")
         }

@@ -343,8 +343,10 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
         if router.deployment.as_deref().is_some_and(|id| Uuid::parse_str(id).ok() != Some(installed.deployment)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
         }
-        let (server, address, epoch) = route_ordered(name, installed, options).await?;
-        return Ok((server, Some(address), epoch, installed.deployment.to_string()));
+        let (server, worker, epoch) = route_ordered(name, installed, options, async |worker, probe| {
+            connect_serving(&worker.pgwire, &worker.control, probe, options).await
+        }).await?;
+        return Ok((server, Some(worker.control), epoch, installed.deployment.to_string()));
     }
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
@@ -417,41 +419,40 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
-pub(crate) async fn route_ordered(
-    name: &str, installed: &crate::journal::hosted::GatewayPlacement, options: &GatewayOptions,
-) -> Result<(TcpStream, String, u64)> {
+pub(crate) async fn route_ordered<T>(
+    name: &str,
+    installed: &crate::journal::hosted::GatewayPlacement,
+    options: &GatewayOptions,
+    open: impl AsyncFn(&crate::journal::hosted::WorkerEndpoint, Option<u64>) -> Result<T>,
+) -> Result<(T, crate::journal::hosted::WorkerEndpoint, u64)> {
     let view = installed.journal.route().await?;
     let incumbent = view.writer.grant.map(|grant| grant.enrollment);
     let predecessor = control::OrderedPredecessor { epoch: view.writer.epoch, enrollment: incumbent };
     let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect(
         "rtdb.multi/ordered-gateway", "The installed gateway needs a cell route credential"))?;
     let key = control::ControlKey(options.capabilities.clone());
-    if let Some(worker) = incumbent.and_then(|worker| installed.endpoints.get(&worker)) {
-        let activation = control::OrderedActivation::issue(secret, name, view.placement, predecessor, worker.enrollment, false);
-        let request = Request::ActivateOrdered { name: name.to_owned(), activation };
-        if let Ok((Response::OrderedHeld { address, epoch, proof }, probe)) = control::call_with_pgwire_probe(
-            &worker.control, request, options.control_timeout.min(WRITER_DIAL_TIMEOUT), &key,
-        ).await
-            && epoch == view.writer.epoch && address == worker.pgwire
-            && secret.verify_route(&activation.reply_binding(view.placement, epoch, &address), &proof)
-            && let Ok(stream) = connect_serving(&worker.pgwire, &worker.control, probe, options).await
-        {
-            return Ok((stream, worker.control.clone(), epoch));
-        }
-    }
+    let installed_incumbent = incumbent.and_then(|owner| installed.endpoints.get(&owner));
+    let candidates = installed_incumbent.into_iter()
+        .chain(installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent));
     let mut refused = None;
-    for worker in installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent) {
-        let activation = control::OrderedActivation::issue(secret, name, view.placement, predecessor, worker.enrollment, true);
+    for worker in candidates {
+        let takeover = Some(worker.enrollment) != incumbent;
+        let activation = control::OrderedActivation::issue(secret, name, view.placement, predecessor, worker.enrollment, takeover);
         let request = Request::ActivateOrdered { name: name.to_owned(), activation };
-        match control::call_with_pgwire_probe(&worker.control, request, options.control_timeout, &key).await {
+        let timeout = if takeover { options.control_timeout } else { options.control_timeout.min(WRITER_DIAL_TIMEOUT) };
+        match control::call_with_pgwire_probe(&worker.control, request, timeout, &key).await {
             Ok((Response::OrderedHeld { address, epoch, proof }, probe)) if address == worker.pgwire
+                && (takeover || epoch == view.writer.epoch)
                 && secret.verify_route(&activation.reply_binding(view.placement, epoch, &address), &proof) => {
                 let current = installed.journal.route().await?;
                 if current.writer.grant.is_none_or(|grant| grant.epoch != epoch || grant.enrollment != worker.enrollment) {
-                    return Err(Anomaly::new(AnomalyCategory::Conflict, control::CLAIM_CONTENDED, "The installed journal selected a different replacement worker"));
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, control::CLAIM_CONTENDED,
+                        "The installed journal selected a different writer"));
                 }
-                let stream = connect_serving(&worker.pgwire, &worker.control, probe, options).await?;
-                return Ok((stream, worker.control.clone(), epoch));
+                match open(worker, probe).await {
+                    Ok(frontend) => return Ok((frontend, worker.clone(), epoch)),
+                    Err(error) => refused = Some(error),
+                }
             }
             Ok((Response::Refused { code, message }, _)) => {
                 refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
@@ -462,6 +463,7 @@ pub(crate) async fn route_ordered(
     Err(refused.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable,
         control::WRITER_CONTROL_UNREACHABLE, "No exact enrolled worker could take the journal grant")))
 }
+
 
 async fn confirm_writer(directory: &dyn Directory, record: &DeploymentRecord, control_address: &str, options: &GatewayOptions) -> Result<(Response, String, Option<u64>)> {
     let key = control::ControlKey(options.capabilities.clone());

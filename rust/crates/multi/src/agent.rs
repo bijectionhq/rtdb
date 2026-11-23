@@ -18,7 +18,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, TransactionKey}
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
-use crate::deployment::{CellStorage, Role, database_config, ensemble_servers};
+use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
 use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
 
@@ -498,6 +498,7 @@ impl NodeAgent {
             Err(error) => {
                 self.stop_running(name).await;
                 let _ = placement.worker.release(admission.recovery).await;
+                let _ = placement.worker.vacate(admission.grant).await;
                 Err(error)
             }
         }
@@ -545,8 +546,7 @@ impl NodeAgent {
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
-            let servers = ensemble_servers(&record, members)?;
-            let configuration = database_config(&record, servers, &self.options.storage, Role::Holder);
+            let configuration = self.holder_config(&record, members)?;
             let database = self.node.database_or_attach(record.name.clone(), configuration).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the deployment"))?;
             self.await_leadership(&record.name, &database).await?;
@@ -575,7 +575,24 @@ impl NodeAgent {
         }
     }
 
-    /// Confirms that no later holder has sealed the stream before a linearizable query.
+    /// The configuration a holder opens `record` with: on its ensemble while a quorum of it is live and every member is, otherwise moving the stream to an ensemble of live logkeepers that keeps the live members (`FlushOnDegradedEnsemble`).
+    fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
+        let now = now_ms();
+        let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
+        let servers = ensemble_servers(record, members)?;
+        let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
+        if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {
+            return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
+        }
+        let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
+        let live_members = alive.iter().map(|id| &members[id]).collect();
+        let selected = select_logkeepers(&record.storage_identity(), record.ensemble.len(), live_members, &candidates);
+        if selected.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
+        let next = selected.into_iter().map(journal_endpoint).collect();
+        Ok(crate::deployment::moving_config(record, next, Some(servers), &self.options.storage, Role::Holder))
+    }
+
+    /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).
     pub async fn confirm_read(&self, name: &str) -> Result<()> {
         let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
         self.confirm_holder(name, &id, None).await
@@ -740,9 +757,9 @@ impl NodeAgent {
                 let block = flush_local(&database).await?;
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
-                placement.publish_checkpoint(self.keys.as_ref(), admission.grant, checkpoint,
-                    database.object_store().as_ref(), &self.ordered_releases).await?;
-                Ok::<_, Anomaly>(checkpoint)
+                placement.publish_checkpoint(self.keys.as_ref(), admission, Some(checkpoint),
+                    &self.options.storage, &self.ordered_releases).await?.ok_or_else(||
+                        Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
             return Ok(Response::Flushed { checkpoint });
         }
@@ -1557,25 +1574,34 @@ impl NodeAgent {
         }
         for (name, admission, database) in active {
             let Some(placement) = self.ordered.by_name(&name) else { continue; };
-            let Ok(route) = placement.worker.route().await else { continue; };
+            let route = match placement.worker.route().await {
+                Ok(route) => Some(route),
+                Err(error) if error.category == AnomalyCategory::Forbidden => None,
+                Err(_) => continue,
+            };
             let running = database.upgrade().filter(|db| db.status().role != DriverRole::Stopped);
-            if route.writer.grant == Some(admission.grant) && let Some(database) = running {
+            if let Some(route) = route
+                && route.writer.grant == Some(admission.grant)
+                && let Some(database) = running
+            {
+                let _ = placement.replenish(&route, admission.grant).await;
                 if placement.custodian.is_some() {
-                    if let Some(block) = database.status().adopted_block
-                        && let Some(checkpoint) = checkpoint_for_block(&block, placement.worker.log_epoch())
-                        && u64::try_from(checkpoint.boundary).is_ok_and(|boundary| boundary >= route.checkpoint.cut.next_lsn)
-                    {
-                        let source = database.object_store();
-                        let publish = placement.publish_checkpoint(self.keys.as_ref(), admission.grant, checkpoint,
-                            source.as_ref(), &self.ordered_releases);
-                        let _ = tokio::time::timeout(self.options.activation_timeout, publish).await;
-                    }
-                    let current = placement.worker.route().await.unwrap_or(route);
-                    if current.writer.grant == Some(admission.grant)
-                        && current.floor.next_lsn < current.checkpoint.cut.next_lsn
-                    {
-                        let _ = placement.worker.trim(&current, admission.grant, current.checkpoint.cut).await;
-                    }
+                    let checkpoint = database.status().adopted_block
+                        .and_then(|block| checkpoint_for_block(&block, placement.worker.log_epoch()))
+                        .filter(|checkpoint| u64::try_from(checkpoint.boundary).is_ok_and(|boundary| boundary >= route.checkpoint.cut.next_lsn));
+                    let publish = placement.publish_checkpoint(self.keys.as_ref(), admission, checkpoint,
+                        &self.options.storage, &self.ordered_releases);
+                    let _ = tokio::time::timeout(self.options.activation_timeout, publish).await;
+                }
+                let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());
+                let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
+                let current = placement.worker.route().await.unwrap_or(route);
+                if current.writer.grant == Some(admission.grant)
+                    && current.floor.next_lsn < current.checkpoint.cut.next_lsn
+                    && placement.worker.trim(&current, admission.grant, current.checkpoint.cut).await.is_ok()
+                    && let Ok(trimmed) = placement.worker.route().await
+                {
+                    let _ = placement.replenish(&trimmed, admission.grant).await;
                 }
                 continue;
             }

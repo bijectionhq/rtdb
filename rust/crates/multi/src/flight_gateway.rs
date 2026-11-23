@@ -33,6 +33,8 @@ struct Target {
     holder: MemberId,
     epoch: u64,
     address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrollment: Option<ordered_logkeeper::ordered::Enrollment>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +53,7 @@ struct Router {
     calls: Arc<Semaphore>,
     deployments: Option<Arc<DeploymentConnections>>,
     audience: Option<AudienceFlightConfig>,
+    options: GatewayOptions,
     timeout: Duration,
 }
 
@@ -112,7 +115,7 @@ async fn serve_listener(
         secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience,
         calls: Arc::new(Semaphore::new(limit)),
         deployments: audience.is_none().then(|| Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment))),
-        timeout: options.startup_timeout });
+        timeout: options.startup_timeout, options });
     let connections = Arc::new(Semaphore::new(limit));
     loop {
         let (stream, remote) = tokio::select! {
@@ -172,6 +175,23 @@ impl Router {
 
     async fn first_target(&self, selector: &str) -> std::result::Result<Target, Status> {
         let (name, installation) = database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?;
+        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+            if self.audience.is_some() || installation.is_some_and(|id| id != installed.deployment) {
+                return Err(Status::not_found("No matching installed Flight SQL deployment"));
+            }
+            let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, async |worker, _| {
+                let reply = control::call(&worker.control, &control::Request::FlightEndpoint { audience: false },
+                    self.timeout, &self.control).await?;
+                match reply {
+                    control::Response::FlightEndpoint { address } => Ok(address),
+                    _ => Err(Anomaly::incorrect("rtdb.multi/flight-route", "The installed writer has no Flight SQL endpoint")),
+                }
+            }).await.map_err(|_| moved())?;
+            let target = Target { name: name.to_owned(), deployment: installed.deployment.to_string(),
+                holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment) };
+            self.validate(&target).await?;
+            return Ok(target);
+        }
         let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
             .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id)
                 && self.audience.is_none_or(|profile| Uuid::parse_str(&record.id).ok() == Some(profile.source())))
@@ -186,10 +206,17 @@ impl Router {
         let reply = control::call(control, &control::Request::FlightEndpoint { audience: self.audience.is_some() }, self.timeout, &self.control).await
             .map_err(|_| Status::unavailable("The holder did not report a Flight SQL endpoint"))?;
         let control::Response::FlightEndpoint { address } = reply else { return Err(Status::unavailable("The holder has no Flight SQL endpoint")); };
-        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address })
+        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None })
     }
 
     async fn validate(&self, target: &Target) -> std::result::Result<(), Status> {
+        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(&target.name)) {
+            let Some(enrollment) = target.enrollment.filter(|id| installed.endpoints.contains_key(id)) else { return Err(moved()); };
+            let route = installed.journal.route().await.map_err(|_| moved())?;
+            return if target.deployment == installed.deployment.to_string() && route.writer.grant
+                .is_some_and(|grant| grant.epoch == target.epoch && grant.enrollment == enrollment) { Ok(()) } else { Err(moved()) };
+        }
+        if target.enrollment.is_some() { return Err(moved()); }
         let (record, member) = tokio::try_join!(self.directory.deployment(&target.deployment), self.directory.member(&target.holder)).map_err(directory_error)?;
         let current = record.zip(member).is_some_and(|(record, member)| {
             record.name == target.name && record.epoch == target.epoch && holder_is_current(&record, &member)

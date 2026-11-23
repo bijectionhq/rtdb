@@ -20,12 +20,18 @@ case "${1:-}" in
         shift
         cd "$(mktemp -d /tmp/rtdb-installation.XXXXXXXX)"
         printf '%s' "${RTDB_CELL_SECRET:?Missing cell secret}" > cell.secret
+        if [ -n "${RTDB_INSTALLED_JOURNALS_FILE:-}" ] && [ "$role" != controller ]; then
+            set -- --installed-journals "$RTDB_INSTALLED_JOURNALS_FILE" "$@"
+        fi
         case "$role" in
             gateway)
                 printf '%s' "${RTDB_TLS_KEYSTORE:?Missing TLS keystore}" | base64 --decode > gateway.p12
-                printf '%s' "${RTDB_INSTALL_TOKEN:?Missing installation token}" > install.token
                 printf '%s' "${RTDB_CONFIGURATION:?Missing gateway configuration}" > config.yaml
-                set -- --config config.yaml --install-token-file install.token "$@"
+                set -- --config config.yaml "$@"
+                if [ -n "${RTDB_INSTALL_TOKEN:-}" ]; then
+                    printf '%s' "$RTDB_INSTALL_TOKEN" > install.token
+                    set -- --install-token-file install.token "$@"
+                fi
                 if [ -n "${RTDB_DISPOSAL_TOKEN:-}" ]; then
                     printf '%s' "$RTDB_DISPOSAL_TOKEN" > disposal.token
                     set -- --disposal-token-file disposal.token "$@"
