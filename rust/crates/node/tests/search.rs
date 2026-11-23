@@ -145,6 +145,45 @@ async fn the_lane_records_a_search_file_on_every_settled_trie_of_an_indexed_tabl
 }
 
 #[tokio::test]
+async fn owned_search_counts_no_documents_for_null_or_absent_text() {
+    use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, StructFields};
+
+    let mut options = options();
+    options.owned_relations = true;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let relation = OwnedRelation::new("owned-sparse-search").unwrap();
+    let path = OwnedRelation::new("owned-sparse-body").unwrap();
+    let schema = OwnedSchema::from_json(br#"{"fields":[{"name":"body","type":{"kind":"utf8"},"optional":true,"nullable":true}],"validity":"acceptance"}"#).unwrap();
+    let rows = rtdb_tx::Documents::new(vec![
+        StructFields::from([("_id".into(), Value::I64(1))]),
+        StructFields::from([("_id".into(), Value::I64(2)), ("body".into(), Value::Null)]),
+    ], node.memory()).unwrap();
+    let installed = session.state_mut().execute_tx(vec![
+        TxOp::OwnedDeclareRelation { relation: relation.clone(), schema },
+        TxOp::OwnedDeclareSearchPath { relation: relation.clone(), name: path.clone(), column: "body".into() },
+        TxOp::OwnedInsertDocs { relation: relation.clone(), documents: rows, valid_from: None, valid_to: None },
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(installed.committed(), "{:?}", installed.error());
+
+    let held = session.open_owned_read().await.unwrap();
+    assert_eq!(held.search_corpus(&relation, &path, "invoice").await.unwrap().documents, 0);
+    let partitions = [(relation, path)];
+    let (empty, _) = held.ranked_search_page(&partitions, "invoice", 0, 4, false).await.unwrap();
+    assert_eq!(empty.total, 0);
+    let mut staged = HeldTextCorpus::new(Arc::clone(node.memory()), "invoice").unwrap();
+    staged.shadow(0, EntityId::Integer(1), Some("invoice")).unwrap();
+    let (populated, _) = held.ranked_search_with_overlay(&partitions, "invoice", 0, 4, false, None, Some(staged)).await.unwrap();
+    assert_eq!(populated.total, 1);
+    assert_eq!(populated.hits[0].id, EntityId::Integer(1));
+    drop(held);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() {
     use rtdb_types::{EntityId, OwnedRelation, StructFields};
 
