@@ -10,7 +10,7 @@ use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
-use crate::{ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
+use crate::{ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
 use crate::bounded_retry::{BOUNDED_RETRY_METADATA_KEY, BoundedRetry};
 use crate::values::{DecodedDocumentLayout, contains_fixed_size_list};
 
@@ -72,15 +72,14 @@ pub(crate) struct IdempotencyGuard {
 impl SourceTransaction {
     pub(crate) fn place_owned_periods(&mut self, ordered: Timestamp, placed: bool) -> Result<()> {
         for operation in &mut self.operations {
-            let Operation::Public(TxOp::OwnedRelativePeriod { relation, from_micros, to_micros, .. }) = operation else {
+            let Operation::Public(TxOp::OwnedRelativePeriod { relation, period, .. }) = operation else {
                 continue;
             };
             let invalid = || Anomaly::incorrect("rtdb.owned/validity-policy", "Invalid acceptance-relative Root period");
-            if !placed || !relation.is_root_data() || from_micros >= to_micros {
+            if !placed || !relation.is_root_data() {
                 return Err(invalid());
             }
-            let from = Timestamp(ordered.0.checked_add(*from_micros).ok_or_else(invalid)?);
-            let to = Timestamp(ordered.0.checked_add(*to_micros).ok_or_else(invalid)?);
+            let (from, to) = period.at(ordered).ok_or_else(invalid)?;
             if !HOSTED_INSTANT_MICROS.contains(&from.0) || !HOSTED_INSTANT_MICROS.contains(&to.0) {
                 return Err(invalid());
             }
@@ -701,14 +700,16 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             time_fields(&mut body, *valid_from, *valid_to);
             "rtdb-owned-delete-v1"
         }
-        Operation::Public(TxOp::OwnedRelativePeriod { relation, effect, from_micros, to_micros }) => {
-            body.insert("from_offset_micros".into(), Value::I64(*from_micros));
-            body.insert("to_offset_micros".into(), Value::I64(*to_micros));
+        Operation::Public(TxOp::OwnedRelativePeriod { relation, effect, period }) => {
+            let (from, to, from_offset, to_offset) = period.fields();
+            time_fields(&mut body, from, to);
+            body.insert("from_offset_micros".into(), from_offset.map_or(Value::Null, Value::I64));
+            body.insert("to_offset_micros".into(), to_offset.map_or(Value::Null, Value::I64));
             match effect {
                 OwnedPeriodEffect::Delete(id) => {
                     body.insert("relation".into(), Value::Utf8(relation.name().into()));
                     body.insert("id".into(), id.as_value());
-                    "rtdb-owned-relative-delete-v1"
+                    "rtdb-owned-relative-delete-v2"
                 },
                 OwnedPeriodEffect::Create(documents) | OwnedPeriodEffect::Replace(documents) => {
                     identities = Cow::Owned(documents.rows().iter().map(|document| {
@@ -718,9 +719,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
                     body.insert("field_presence".into(), owned_field_presence(documents));
                     docs = Some((relation.name().to_owned(), SourceDocuments::Rows(documents)));
                     if matches!(effect, OwnedPeriodEffect::Create(_)) {
-                        "rtdb-owned-relative-insert-v1"
+                        "rtdb-owned-relative-insert-v2"
                     } else {
-                        "rtdb-owned-relative-replace-v1"
+                        "rtdb-owned-relative-replace-v2"
                     }
                 },
             }
@@ -1734,14 +1735,14 @@ impl SourceOperationReader<'_> {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned erase has no relation")); };
                 TxOp::OwnedErase { relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()? }
             }
-            "rtdb-owned-relative-delete-v1" => {
-                let (Value::Utf8(relation), Value::I64(from_micros), Value::I64(to_micros)) = (
-                    value("relation")?, value("from_offset_micros")?, value("to_offset_micros")?,
-                ) else { return Err(invalid("Owned relative deletion requires a relation and two offsets")); };
+            "rtdb-owned-relative-delete-v2" => {
+                let Value::Utf8(relation) = value("relation")? else {
+                    return Err(invalid("Owned relative deletion requires a relation"));
+                };
                 TxOp::OwnedRelativePeriod {
                     relation: rtdb_types::OwnedRelation::from_source(relation)?,
                     effect: OwnedPeriodEffect::Delete(value("id")?.entity_id()?),
-                    from_micros, to_micros,
+                    period: read_relative_period(body, offset)?,
                 }
             }
             "rtdb-owned-check-v1" | "rtdb-owned-delete-v1" => {
@@ -1766,12 +1767,12 @@ impl SourceOperationReader<'_> {
                 TxOp::Sql { sql, args }
             }
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1"
-            | "rtdb-owned-relative-insert-v1" | "rtdb-owned-relative-replace-v1"
+            | "rtdb-owned-relative-insert-v2" | "rtdb-owned-relative-replace-v2"
             | "insert-docs" | "put-docs" | "patch-docs" => {
                 let docs_array = body.column_by_name("documents").ok_or_else(|| invalid("Document operation has no documents"))?;
                 let docs_union = docs_array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Document tables are not a union"))?;
                 let (table, docs_array, docs_offset) = union_leg(docs_union, offset)?;
-                let relative = matches!(name.as_str(), "rtdb-owned-relative-insert-v1" | "rtdb-owned-relative-replace-v1");
+                let relative = matches!(name.as_str(), "rtdb-owned-relative-insert-v2" | "rtdb-owned-relative-replace-v2");
                 let owned = (relative || matches!(name.as_str(), "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1"))
                     .then(|| rtdb_types::OwnedRelation::from_source(table.clone())).transpose()?;
                 let table = if owned.is_none() { Some(parse_table(&table)?) } else { None };
@@ -1779,11 +1780,8 @@ impl SourceOperationReader<'_> {
                 if lists.is_null(docs_offset) { return Err(invalid("Documents are not a list")); }
                 let rows = lists.value(docs_offset);
                 let structs = rows.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document is not a struct"))?;
-                let (valid_from, valid_to) = if relative {
-                    (None, None)
-                } else {
-                    (optional_timestamp(value("_valid_from")?)?, optional_timestamp(value("_valid_to")?)?)
-                };
+                let (valid_from, valid_to) =
+                    (optional_timestamp(value("_valid_from")?)?, optional_timestamp(value("_valid_to")?)?);
                 let iids = read_iids(body, offset)?;
                 if iids.as_ref().is_some_and(|iids| iids.len() != structs.len()) { return Err(invalid("Document and IID counts differ")); }
                 let identity = structs.fields().as_ptr() as usize;
@@ -1811,21 +1809,19 @@ impl SourceOperationReader<'_> {
                     let documents = Documents::read_arrow_with_presence(structs, layout, true, presence.as_deref(), memory)?;
                     let iids = iids.ok_or_else(|| invalid("Owned insert operation has no IIDs"))?;
                     if relative {
-                        let (Value::I64(from_micros), Value::I64(to_micros)) = (
-                            value("from_offset_micros")?, value("to_offset_micros")?,
-                        ) else { return Err(invalid("Owned relative write requires two offsets")); };
+                        let period = read_relative_period(body, offset)?;
                         for (row, iid) in documents.rows().iter().zip(iids) {
                             if document_id(row, memory)?.iid() != iid {
                                 return Err(invalid("Owned document IID does not match its identity"));
                             }
                         }
-                        let effect = if name == "rtdb-owned-relative-insert-v1" {
+                        let effect = if name == "rtdb-owned-relative-insert-v2" {
                             OwnedPeriodEffect::Create(documents)
                         } else {
                             OwnedPeriodEffect::Replace(documents)
                         };
                         return Ok(Operation::Public(TxOp::OwnedRelativePeriod {
-                            relation, effect, from_micros, to_micros,
+                            relation, effect, period,
                         }));
                     }
                     return Ok(Operation::OwnedWriteIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids, valid_from, valid_to });
@@ -1923,6 +1919,22 @@ fn cell(batch: &RecordBatch, name: &str, row: usize) -> Result<Value> {
     read_value(schema.field(index), batch.column(index).as_ref(), row)
 }
 fn optional_cell(batch: &RecordBatch, name: &str, row: usize) -> Result<Value> { if batch.schema().index_of(name).is_ok() { cell(batch, name, row) } else { Ok(Value::Null) } }
+fn read_relative_period(body: &StructArray, row: usize) -> Result<OwnedRelativePeriod> {
+    let value = |name| struct_cell(body, name, row);
+    let offset = |name| match value(name)? {
+        Value::I64(micros) => Ok(Some(Timestamp(micros))),
+        Value::Null => Ok(None),
+        _ => Err(invalid("Relative period offsets must be signed microseconds")),
+    };
+    OwnedRelativePeriod::from_fields(
+        optional_timestamp(value("_valid_from")?)?,
+        optional_timestamp(value("_valid_to")?)?,
+        offset("from_offset_micros")?,
+        offset("to_offset_micros")?,
+    )
+    .ok_or_else(|| invalid("Invalid original relative period bounds"))
+}
+
 fn optional_timestamp(value: Value) -> Result<Option<Timestamp>> {
     match value {
         Value::Null | Value::Undefined => Ok(None),
@@ -2009,28 +2021,43 @@ mod tests {
         let id = EntityId::String("entity".into());
         let memory = budget();
         let documents = Documents::new(vec![StructFields::from([("_id".into(), id.as_value())])], &memory).unwrap();
+        let relative = |from, to, from_offset, to_offset| {
+            OwnedRelativePeriod::from_fields(from, to, from_offset, to_offset).unwrap()
+        };
         let source = SourceTransaction::new(vec![
             TxOp::OwnedRelativePeriod {
                 relation: relation.clone(), effect: OwnedPeriodEffect::Replace(documents),
-                from_micros: -7, to_micros: 3,
+                period: relative(None, None, Some(Timestamp(-7)), Some(Timestamp(3))),
             },
             TxOp::OwnedRelativePeriod {
-                relation, effect: OwnedPeriodEffect::Delete(id), from_micros: 8, to_micros: 9,
+                relation: relation.clone(), effect: OwnedPeriodEffect::Delete(id.clone()),
+                period: relative(None, Some(Timestamp(133)), Some(Timestamp(8)), None),
+            },
+            TxOp::OwnedRelativePeriod {
+                relation, effect: OwnedPeriodEffect::Delete(id),
+                period: relative(Some(Timestamp(130)), None, None, Some(Timestamp(10))),
             },
         ], SubmitOptions::default(), &memory).unwrap();
         let mut replayed = roundtrip(&source);
         assert!(matches!(&replayed.operations[0], Operation::Public(TxOp::OwnedRelativePeriod {
-            from_micros: -7, to_micros: 3, ..
-        })));
+            period, ..
+        }) if *period == relative(None, None, Some(Timestamp(-7)), Some(Timestamp(3)))));
         assert!(replayed.place_owned_periods(Timestamp(123), false).is_err());
         replayed.place_owned_periods(Timestamp(123), true).unwrap();
         assert!(matches!(&replayed.operations[0], Operation::Public(TxOp::OwnedReplaceDocs {
             valid_from: Some(Timestamp(116)), valid_to: Some(Timestamp(126)), ..
         })));
         assert!(matches!(&replayed.operations[1], Operation::Public(TxOp::OwnedDelete {
-            valid_from: Some(Timestamp(131)), valid_to: Some(Timestamp(132)), ..
+            valid_from: Some(Timestamp(131)), valid_to: Some(Timestamp(133)), ..
         })));
+        assert!(matches!(&replayed.operations[2], Operation::Public(TxOp::OwnedDelete {
+            valid_from: Some(Timestamp(130)), valid_to: Some(Timestamp(133)), ..
+        })));
+        assert!(roundtrip(&source).place_owned_periods(Timestamp(125), true).is_err());
         assert!(roundtrip(&source).place_owned_periods(Timestamp(i64::MAX), true).is_err());
+        assert!(OwnedRelativePeriod::from_fields(
+            Some(Timestamp(1)), None, Some(Timestamp(2)), Some(Timestamp(3)),
+        ).is_none());
     }
 
     #[test]

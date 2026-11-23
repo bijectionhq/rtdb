@@ -1161,6 +1161,73 @@ pub enum OwnedForkRoot {
     ProposalShorten,
 }
 
+/// A finite Root interval containing at least one offset from acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnedRelativePeriod {
+    start: OwnedPeriodBound,
+    end: OwnedPeriodBound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnedPeriodBound {
+    Fixed(Timestamp),
+    Offset(i64),
+}
+
+impl OwnedPeriodBound {
+    fn from_fields(fixed: Option<Timestamp>, offset: Option<Timestamp>) -> Option<Self> {
+        match (fixed, offset) {
+            (Some(fixed), None) => Some(Self::Fixed(fixed)),
+            (None, Some(offset)) => Some(Self::Offset(offset.0)),
+            _ => None,
+        }
+    }
+
+    fn fields(self) -> (Option<Timestamp>, Option<i64>) {
+        match self {
+            Self::Fixed(fixed) => (Some(fixed), None),
+            Self::Offset(offset) => (None, Some(offset)),
+        }
+    }
+
+    fn at(self, ordered: Timestamp) -> Option<Timestamp> {
+        match self {
+            Self::Fixed(fixed) => Some(fixed),
+            Self::Offset(offset) => ordered.0.checked_add(offset).map(Timestamp),
+        }
+    }
+}
+
+impl OwnedRelativePeriod {
+    pub fn from_fields(
+        from: Option<Timestamp>,
+        to: Option<Timestamp>,
+        from_offset: Option<Timestamp>,
+        to_offset: Option<Timestamp>,
+    ) -> Option<Self> {
+        let start = OwnedPeriodBound::from_fields(from, from_offset)?;
+        let end = OwnedPeriodBound::from_fields(to, to_offset)?;
+        match (start, end) {
+            (OwnedPeriodBound::Fixed(_), OwnedPeriodBound::Fixed(_)) => return None,
+            (OwnedPeriodBound::Offset(from), OwnedPeriodBound::Offset(to)) if from >= to => return None,
+            _ => {},
+        }
+        Some(Self { start, end })
+    }
+
+    pub(crate) fn fields(self) -> (Option<Timestamp>, Option<Timestamp>, Option<i64>, Option<i64>) {
+        let (from, from_offset) = self.start.fields();
+        let (to, to_offset) = self.end.fields();
+        (from, to, from_offset, to_offset)
+    }
+
+    pub(crate) fn at(self, ordered: Timestamp) -> Option<(Timestamp, Timestamp)> {
+        let from = self.start.at(ordered)?;
+        let to = self.end.at(ordered)?;
+        (from < to).then_some((from, to))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum OwnedPeriodEffect {
     Create(Documents),
@@ -1209,10 +1276,10 @@ pub enum TxOp {
     OwnedDelete { relation: rtdb_types::OwnedRelation, id: EntityId, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedReplaceDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedInsertDocs { relation: rtdb_types::OwnedRelation, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
-    /// Resolve both finite offsets after this Root transaction is ordered.
+    /// Resolve the finite bounds at this Root transaction's ordered reading.
     OwnedRelativePeriod {
         relation: rtdb_types::OwnedRelation, effect: OwnedPeriodEffect,
-        from_micros: i64, to_micros: i64,
+        period: OwnedRelativePeriod,
     },
     InsertDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutDocs { table: TableRef, documents: Documents, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
