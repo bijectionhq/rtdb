@@ -119,8 +119,8 @@ impl CellStorage {
             CellStorage::S3 { config } => {
                 let root = config.cell_root()?;
                 let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
-                if audience { Ok(config.open_audience_cell(&root, &remotes, io).await?) }
-                else { Ok(config.open_cell(&root, &remotes, io).await?) }
+                if audience { Ok(Box::pin(config.open_audience_cell(&root, &remotes, io)).await?) }
+                else { Ok(Box::pin(config.open_cell(&root, &remotes, io)).await?) }
             }
         }
     }

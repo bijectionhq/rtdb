@@ -868,7 +868,7 @@ pub async fn move_cell(
         destination: CellResidence { cell: to.name.to_owned(), org: current.org.clone() },
     };
     let (source, target) = if at_source {
-        prepare_cell_move(from, to, &intent, maximum_message_bytes, hosted_task).await?
+        Box::pin(prepare_cell_move(from, to, &intent, maximum_message_bytes, hosted_task)).await?
     } else {
         prepared_cell_move(from, to, &intent).await?
     };
@@ -891,7 +891,7 @@ pub async fn prepare_managed_cell_transfer(
     hosted_task: Option<rtdb_directory::HostedTask>,
 ) -> Result<PreparedCellTransfer> {
     validate_managed_cell_move(from, to, intent)?;
-    let (source, target) = prepare_cell_move(from, to, intent, maximum_message_bytes, hosted_task).await?;
+    let (source, target) = Box::pin(prepare_cell_move(from, to, intent, maximum_message_bytes, hosted_task)).await?;
     Ok(PreparedCellTransfer {
         intent: intent.clone(),
         source_incarnation: source.incarnation,
@@ -1415,9 +1415,9 @@ async fn stage_cell_storage(
         crate::reference::materialize(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
         ).await?;
-        crate::archive::materialize_serving_archive(
+        Box::pin(crate::archive::materialize_serving_archive(
             from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), hosted_task.as_ref(),
-        ).await?;
+        )).await?;
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }

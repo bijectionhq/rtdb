@@ -433,7 +433,7 @@ pub(crate) async fn materialize_serving_archive(
     let Some(selected) = serving_archive(source)? else { return Ok(()); };
     let archive: CellStorage = serde_json::from_str(selected.archive)
         .map_err(|_| inconsistent("Invalid retained archive binding"))?;
-    stage::with_region(
+    Box::pin(stage::with_region(
         directory, keys, &source.id, &archive, hosted_task, Some((selected.point.operation, None)), None,
         |current| {
             if !matches!(current.lifecycle, Lifecycle::Moving)
@@ -447,12 +447,12 @@ pub(crate) async fn materialize_serving_archive(
             }
             Ok(None)
         },
-        |record, owner, io| async move {
-            let repair = ArchivedCheckpoint::load(&record, keys, owner, io, false).await?
+        |record, owner, io| Box::pin(async move {
+            let repair = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io, false)).await?
                 .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
-            repair.materialize(target, destination).await
-        },
-    ).await
+            Box::pin(repair.materialize(target, destination)).await
+        }),
+    )).await
 }
 
 struct CheckpointStore {
