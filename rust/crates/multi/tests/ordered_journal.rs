@@ -203,6 +203,8 @@ impl Authority {
                 "retry_positions": 128,
                 "retained_data_bytes": ordinary + maintenance,
                 "maintenance_bytes": maintenance,
+                "serving_lease": 60_000,
+                "clock_drift": 1_000,
             },
             "initial_checkpoint": {
                 "cut": {"next_lsn": 0, "history": initial_history},

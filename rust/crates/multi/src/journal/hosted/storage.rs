@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) struct StoreFactory {
     pub routes: Arc<Routes>,
@@ -35,6 +35,48 @@ pub(crate) struct StoreFactory {
 struct WriteScope {
     journal: Arc<InstalledJournal>,
     grant: Grant,
+    lease: ServingLease,
+}
+
+/// The worker serves bytes only within a journal-issued lease. Once a withdrawn
+/// worker's lease and the clock drift bound have passed, the journal may dispose
+/// of its holds, so every read checks the lease on the worker's monotonic clock.
+#[derive(Default)]
+struct ServingLease {
+    /// The lease deadline and the instant after which a read renews it.
+    state: std::sync::Mutex<Option<(Instant, Instant)>>,
+    renewal: tokio::sync::Mutex<()>,
+}
+
+impl WriteScope {
+    async fn serving(&self) -> Result<()> {
+        if let Some((_, renew_after)) = self.lease_state() && Instant::now() < renew_after {
+            return Ok(());
+        }
+        let _renewing = self.lease.renewal.lock().await;
+        if let Some((_, renew_after)) = self.lease_state() && Instant::now() < renew_after {
+            return Ok(());
+        }
+        let sent = Instant::now();
+        match self.journal.lease(self.grant).await {
+            Ok(length) => {
+                let length = Duration::from_millis(length);
+                let state = (sent + length, sent + length / 2);
+                *self.lease.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state);
+                Ok(())
+            }
+            Err(_) if self.lease_state().is_some_and(|(deadline, _)| Instant::now() < deadline) => Ok(()),
+            Err(error) => Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                rtdb_node::NOT_HELD,
+                format!("The installed writer has no current serving lease: {error}"),
+            )),
+        }
+    }
+
+    fn lease_state(&self) -> Option<(Instant, Instant)> {
+        *self.lease.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[async_trait]
@@ -80,6 +122,7 @@ impl RemoteStorageFactory for StoreFactory {
         let scope = Arc::new(WriteScope {
             journal: Arc::clone(&placement.worker),
             grant,
+            lease: ServingLease::default(),
         });
         scope.authorize(None).await?;
         placement.worker.replay_head(hold, hold.start).await?;
@@ -302,6 +345,12 @@ impl ServingStore {
     }
 
     async fn reading(&self, key: &ObjectKey) -> rtdb_storage::Result<&dyn ObjectStore> {
+        if let Some(scope) = &self.scope {
+            scope.serving().await.map_err(|error| Error::Remote {
+                key: key.to_string(),
+                message: error.to_string(),
+            })?;
+        }
         Ok(self.inherited(key).await?.unwrap_or(self.upper.as_ref()))
     }
 

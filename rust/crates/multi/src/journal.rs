@@ -237,6 +237,25 @@ impl InstalledJournal {
         }
     }
 
+    /// Renews the worker's serving lease under `grant` and returns its length in
+    /// journal-time milliseconds, measured from the moment the request was sent.
+    pub async fn lease(&self, grant: Grant) -> Result<u64> {
+        let route = self.route().await?;
+        let decision = self
+            .execute(&self.request(&route, Command::Lease { grant })?)
+            .await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::Leased {
+                grant: leased,
+                issued_at,
+                lease_end,
+            } if leased == grant && lease_end > issued_at => Ok(lease_end - issued_at),
+            _ => Err(mismatch(
+                "The journal returned a different serving lease result",
+            )),
+        }
+    }
+
     pub async fn replay(&self, hold: Hold, from: Cut, maximum_bytes: u64) -> Result<ReplayPage> {
         let reply = self
             .call(Operation::Replay {
