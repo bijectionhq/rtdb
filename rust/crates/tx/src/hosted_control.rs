@@ -9,6 +9,25 @@ const NATIVE_FRONTIER: &str = "native-frontier.v1";
 const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";
 const MAX_REPLAY_LIFETIMES: usize = 32;
 const MAX_REPLAY_LIFETIME_BYTES: usize = 16 * 1024;
+const MAX_REPLAY_CONSTRAINTS: usize = 64;
+const MAX_REPLAY_CONSTRAINT_BYTES: usize = 32 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReplayConstraintKind {
+    Unique,
+    Capacity,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayConstraint {
+    relation: String,
+    kind: ReplayConstraintKind,
+    writes: i64,
+    members: [u8; 32],
+}
+
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +41,8 @@ pub struct HostedReplay {
     fingerprint: [u8; 32],
     #[serde(skip)]
     lifetimes: Vec<ReplayLifetime>,
+    #[serde(skip)]
+    constraints: Vec<ReplayConstraint>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -66,7 +87,10 @@ pub fn hosted_replay_controls<'a>(
     let coordinates = selected(REPLAY_TRANSACTIONS, &receipt_id).ok_or_else(replay_invalid)?;
     let lifetime_id = format!("native-lifetimes/{}", source.tx_id.0);
     let lifetimes = selected(RESTORE, &lifetime_id);
-    if controls.clone().filter(|control| control.name() == RESTORE).count() != 5 + usize::from(lifetimes.is_some())
+    let constraint_id = format!("native-constraints/{}", source.tx_id.0);
+    let constraints = selected(RESTORE, &constraint_id);
+    if controls.clone().filter(|control| control.name() == RESTORE).count()
+        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some())
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -102,7 +126,30 @@ pub fn hosted_replay_controls<'a>(
             }
         }
     }
+    if let Some(constraints) = constraints {
+        let encoded = control_body(constraints, MAX_REPLAY_CONSTRAINT_BYTES)
+            .filter(|_| constraints.expected().is_none()).ok_or_else(replay_invalid)?;
+        replay.constraints = serde_json::from_slice(encoded).map_err(|_| replay_invalid())?;
+        if !(1..=MAX_REPLAY_CONSTRAINTS).contains(&replay.constraints.len())
+            || !replay.constraints.windows(2).all(|pair| {
+                (&pair[0].relation, pair[0].kind) < (&pair[1].relation, pair[1].kind)
+            })
+        {
+            return Err(replay_invalid());
+        }
+        for proof in &replay.constraints {
+            let relation = OwnedRelation::new(proof.relation.as_str()).map_err(|_| replay_invalid())?;
+            if !relation.is_root_data() || proof.writes <= 0 {
+                return Err(replay_invalid());
+            }
+        }
+    }
     Ok(Some(replay))
+}
+
+fn replay_constraint_mismatch() -> Anomaly {
+    Anomaly::incorrect("rtdb.hosted/constraint-proof",
+        "The held transaction does not reproduce the Original constraint effects")
 }
 
 fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
@@ -167,6 +214,26 @@ impl HostedReplay {
             _ => true,
         };
         if !matches { return Err(replay_invalid()); }
+        Ok(())
+    }
+
+    pub(crate) fn match_constraint(
+        &mut self, relation: &OwnedRelation, kind: ReplayConstraintKind, writes: i64, members: [u8; 32],
+    ) -> Result<()> {
+        let index = self.constraints.binary_search_by(|proof| {
+            (proof.relation.as_str(), proof.kind).cmp(&(relation.name(), kind))
+        }).map_err(|_| replay_constraint_mismatch())?;
+        let proof = self.constraints.remove(index);
+        if proof.writes != writes || proof.members != members {
+            return Err(replay_constraint_mismatch());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_constraints_matched(&self) -> Result<()> {
+        if !self.constraints.is_empty() {
+            return Err(replay_constraint_mismatch());
+        }
         Ok(())
     }
 

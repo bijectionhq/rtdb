@@ -4,8 +4,11 @@ use rtdb_types::{EntityId, OwnedRelation};
 
 use super::{
     owned_unique::{MAX_KEY_BYTES, unique_id},
+    replay_constraints::{ConstraintMember, ConstraintMembers},
     *,
 };
+
+use crate::hosted_control::ReplayConstraintKind;
 
 const RULE: &str = "!rule";
 const MAX_RULES: usize = 16;
@@ -510,6 +513,7 @@ impl OpenTransaction<'_> {
                 .memory
                 .reserve(64 + ids.len() * policy.rules.len() * 128)?;
             let mut locators = BTreeSet::from([EntityId::String(RULE.into()).iid()]);
+            let mut proof = self.hosted_replay.as_ref().map(|_| ConstraintMembers::default());
             for rule in &policy.rules {
                 self.apply_capacity_rule(
                     &owner,
@@ -519,8 +523,12 @@ impl OpenTransaction<'_> {
                     &base,
                     &next,
                     &mut locators,
+                    proof.as_mut(),
                 )
                 .await?;
+            }
+            if let (Some(replay), Some(proof)) = (&mut self.hosted_replay, proof) {
+                replay.match_constraint(&relation, ReplayConstraintKind::Capacity, writes, proof.finish())?;
             }
             policy.through_events = through;
             self.buffer.put(
@@ -541,6 +549,7 @@ impl OpenTransaction<'_> {
         base: &Snapshot,
         next: &Snapshot,
         locators: &mut BTreeSet<rtdb_types::Iid>,
+        mut proof: Option<&mut ConstraintMembers>,
     ) -> Result<()> {
         let qualifiers = predicates(&rule.when)?;
         let columns = std::iter::once(rule.column.as_str())
@@ -638,6 +647,10 @@ impl OpenTransaction<'_> {
             }
             if final_count == count {
                 continue;
+            }
+            if let Some(proof) = proof.as_deref_mut() {
+                let member = if final_count == 0 { ConstraintMember::Removed } else { ConstraintMember::Count(final_count) };
+                proof.insert(&id, member, &self.context.memory)?;
             }
             if final_count == 0 {
                 self.buffer.delete(storage.clone(), &id, Interval::ALL)?;

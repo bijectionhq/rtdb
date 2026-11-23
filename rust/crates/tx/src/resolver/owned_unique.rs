@@ -6,7 +6,8 @@ use rtdb_query::{
 
 use rtdb_types::{EntityId, OwnedRelation};
 
-use super::*;
+use super::{replay_constraints::{ConstraintMember, ConstraintMembers}, *};
+use crate::hosted_control::ReplayConstraintKind;
 
 pub(super) use rtdb_query::{
     OWNED_UNIQUE_KEY_MAX as MAX_KEY_BYTES, owned_unique_key_id as unique_id,
@@ -211,6 +212,7 @@ impl OpenTransaction<'_> {
                 .reserve(64 + ids.len() * policy.paths.len() * 128)?;
             let mut locators =
                 BTreeSet::from([EntityId::String(OWNED_UNIQUE_POLICY_ID.into()).iid()]);
+            let mut proof = self.hosted_replay.as_ref().map(|_| ConstraintMembers::default());
             for (path, column) in &policy.paths {
                 self.apply_unique_path(
                     &owner,
@@ -221,8 +223,12 @@ impl OpenTransaction<'_> {
                     &base,
                     &next,
                     &mut locators,
+                    proof.as_mut(),
                 )
                 .await?;
+            }
+            if let (Some(replay), Some(proof)) = (&mut self.hosted_replay, proof) {
+                replay.match_constraint(&relation, ReplayConstraintKind::Unique, writes, proof.finish())?;
             }
             policy.through_events = through_events;
             self.buffer.put(
@@ -244,6 +250,7 @@ impl OpenTransaction<'_> {
         base: &Snapshot,
         next: &Snapshot,
         locators: &mut BTreeSet<Iid>,
+        mut proof: Option<&mut ConstraintMembers>,
     ) -> Result<()> {
         let mut keys = BTreeMap::<Vec<u8>, KeyChange>::new();
         let mut allocations = Vec::new();
@@ -294,6 +301,10 @@ impl OpenTransaction<'_> {
             }
             if change.claim == change.release {
                 continue;
+            }
+            if let Some(proof) = proof.as_deref_mut() {
+                let member = change.claim.as_ref().map_or(ConstraintMember::Removed, ConstraintMember::Holder);
+                proof.insert(&locator, member, &self.context.memory)?;
             }
             if let Some(holder) = change.claim {
                 self.buffer.put(

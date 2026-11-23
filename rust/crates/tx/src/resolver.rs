@@ -22,6 +22,7 @@ use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult,
 mod hosted_control;
 mod fixed_range;
 mod ordered_micros;
+mod replay_constraints;
 mod owned_capacity;
 use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
@@ -273,6 +274,11 @@ impl TxResolver {
             }
             if has_owned_operations && outcome.is_ok() {
                 outcome = tx.finish_owned_capacity().await;
+            }
+            if outcome.is_ok() {
+                if let Some(replay) = &tx.hosted_replay {
+                    outcome = replay.require_constraints_matched();
+                }
             }
             if has_owned_operations && outcome.is_ok() {
                 outcome = tx.check_final_capacity(&request.operations).await;
