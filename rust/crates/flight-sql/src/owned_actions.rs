@@ -1342,7 +1342,7 @@ impl Service {
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World path touch has no held handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
         let [prior, accepted] = held.snapshot.path_touch(&relation, &path, &id, before, group, valid, images).await.map_err(status)?;
         let prior = self.world_point_reply(call, prior, valid, None)?;
@@ -2589,7 +2589,7 @@ impl Service {
             return Err(invalid("Historical world scope has repeated relations or trailing bytes"));
         }
         let handle = Bytes::copy_from_slice(handle);
-        let held = if matches!(selection, WorldCutSelection::AsOfParent) {
+        let held = if !matches!(selection, WorldCutSelection::AsOfLocal) {
             self.owned_world_resource(call, &handle)?
         } else {
             self.owned_world_read(call, &handle)?
@@ -2605,6 +2605,7 @@ impl Service {
         let mode = match held.snapshot.clock_mode() {
             rtdb_types::WorldClockMode::Held { .. } => 1,
             rtdb_types::WorldClockMode::Proposal => 2,
+            rtdb_types::WorldClockMode::Retained if held.snapshot.ancestor().is_some() => 1,
             rtdb_types::WorldClockMode::Retained => return Err(status(rtdb_types::OwnedWorld::unavailable())),
         };
         let selected = if matches!(selection, WorldCutSelection::AsOfLocal) {

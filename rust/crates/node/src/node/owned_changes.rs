@@ -808,7 +808,8 @@ pub async fn archived_path_touch_at_cut(
 ) -> Result<Vec<String>> {
     if before.next()? != group || group > selected { return Err(change_feed_uncovered()); }
     let page = archived_changes_at_cut(Arc::clone(&context), owner, relation, before, group, 1, false).await?;
-    require_path_touch(&page, relation, id, group, valid)?;
+    let root = relation.root_relation().unwrap_or_else(|| relation.clone());
+    require_path_touch(&page, &root, id, group, valid)?;
     let prior = context.with_owned_system_cut(before, &context.cancellation)?;
     let accepted = context.with_owned_system_cut(group, &context.cancellation)?;
     let selected = context.with_owned_system_cut(selected, &context.cancellation)?;
