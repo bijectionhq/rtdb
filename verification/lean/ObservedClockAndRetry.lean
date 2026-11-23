@@ -98,11 +98,46 @@ theorem installed_retirement_survives_clock_regression
   rw [retirement_selects_exactly_open_payloads]
   omega
 
+inductive OutcomeEvent where
+  | put (attempt : Nat)
+  | erase (attempt : Nat)
+  deriving DecidableEq
+
+def matchesAttempt (current : Nat) : OutcomeEvent → Bool
+  | .put id => id == current
+  | .erase id => id != current
+
+def acceptsOutcome (versioned : Bool) (current : Nat) (events : List OutcomeEvent) : Bool :=
+  (versioned || events.length == 1) &&
+    events.count (.put current) == 1 &&
+    events.all (matchesAttempt current)
+
+theorem legacy_accepts_only_the_single_current_outcome
+    (current : Nat) (events : List OutcomeEvent)
+    (accepted : acceptsOutcome false current events = true) :
+    events = [.put current] := by
+  cases events with
+  | nil => simp [acceptsOutcome] at accepted
+  | cons event rest =>
+    cases rest with
+    | nil => cases event <;> simp_all [acceptsOutcome, matchesAttempt]
+    | cons _ _ => simp [acceptsOutcome] at accepted
+
+theorem accepted_outcome_cannot_erase_its_current_attempt
+    (versioned : Bool) (current : Nat) (events : List OutcomeEvent)
+    (accepted : acceptsOutcome versioned current events = true)
+    (erased : .erase current ∈ events) : False := by
+  simp only [acceptsOutcome, Bool.and_eq_true] at accepted
+  have admitted := List.all_eq_true.mp accepted.2 (.erase current) erased
+  simp [matchesAttempt] at admitted
+
 #print axioms ordered_projection_preserves_the_unsmoothed_observation
 #print axioms observing_expiry_is_irreversible
 #print axioms the_first_terminal_outcome_survives_all_other_attempts
 #print axioms same_body_redeems_the_original_terminal_outcome
 #print axioms retirement_selects_exactly_open_payloads
 #print axioms installed_retirement_survives_clock_regression
+#print axioms legacy_accepts_only_the_single_current_outcome
+#print axioms accepted_outcome_cannot_erase_its_current_attempt
 
 end RTDB.ObservedClockAndRetry

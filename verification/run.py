@@ -1819,8 +1819,16 @@ def verify_lean(args, scratch):
                 "rows.filter (retained clock)", "rows",
                 ["retirement_selects_exactly_open_payloads"],
             ),
+            "accept-unmarked-multirow-outcome": (
+                "(versioned || events.length == 1)", "true",
+                ["legacy_accepts_only_the_single_current_outcome"],
+            ),
+            "erase-current-outcome": (
+                "| .erase id => id != current", "| .erase _ => true",
+                ["accepted_outcome_cannot_erase_its_current_attempt"],
+            ),
         },
-        6,
+        8,
     )
     path = Path("verification/lean/History.lean")
     controls = {
