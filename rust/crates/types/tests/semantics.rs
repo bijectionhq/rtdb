@@ -38,6 +38,7 @@ fn iids_match_existing_arrow_golden_documents() {
         (EntityId::Integer(5), "0016cf5ed68e5a5349722594ae8f5926"),
         (EntityId::Integer(28), "001e832ee50bb5bd3dab482eb130abf1"),
         (EntityId::Keyword(Keyword::parse(":solo").unwrap()), "e5c907a6fac1f49cb3f8599a43a7cbf9"),
+        (EntityId::Keyword(Keyword::parse(":team/solo").unwrap()), "045ac20a2ceec30eb2563f9d2db002a1"),
         (EntityId::uuid("424f5622-c826-4ded-a5db-e2144d665c38").unwrap(), "424f5622c8264deda5dbe2144d665c38"),
     ] {
         assert_eq!(id.iid().to_string(), expected, "{id:?}");

@@ -872,10 +872,13 @@ async fn owned_world_rows_require_the_ordered_registration_and_cannot_mix_with_r
     assert_eq!(addresses.owned_world_scope(), (false, Some(world.id)));
     assert!(accepted.writes().tables().contains_key(&addresses));
     assert!(!accepted.writes().tables().contains_key(&root.address_table("owner")));
+    let journal = local.change_journal("owner").unwrap();
+    assert_eq!(journal.owned_world_scope(), (false, Some(world.id)));
     let payload = accepted.to_replica_body(&context.memory).unwrap();
     let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = payload.body() else { panic!("expected resolved payload"); };
     let replica = decode_replica(body, Some(mixed.result().tx_key()), state.snapshot().block_index(), &context.memory).unwrap();
     assert!(replica.writes.tables().contains_key(&addresses));
+    assert!(replica.writes.tables().contains_key(&journal));
     assert!(!accepted.writes().tables().contains_key(&root.table("owner")));
     let revision = accepted.result().tx_key().system_time;
     let check = |at, expected| TxOp::OwnedCheck {

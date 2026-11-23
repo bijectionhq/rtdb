@@ -1345,6 +1345,7 @@ rule ConsumeIntake {
 -- A writable checkpoint world durably pins that capture before ordering its owner-scoped registration.
 -- A world opens against an authenticated attachment when the durable pin and ordered registration name the same cut and remain live.
 -- Child writes are confined to one world, and the ordered resolver checks that world's expiry before applying any writes.
+-- The replica validates the world scope of each shadow, collision probe and change journal against the transaction's other owned writes.
 -- A fork records its owner's declared relation schemas from the exact archived parent.
 -- The retention pin binds their digest, and the ordered resolver checks local facts against the retained schemas.
 -- A local replacement or tombstone covers only its written half-open business-valid interval.
