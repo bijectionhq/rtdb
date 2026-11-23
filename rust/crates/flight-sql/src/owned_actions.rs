@@ -2683,7 +2683,12 @@ impl Service {
     pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], mode: WorldIdentityRead) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = if matches!(mode, WorldIdentityRead::Effective) {
+            self.owned_world_resource(call, &handle)?
+        } else {
+            self.owned_world_read(call, &handle)?
+        };
         held.snapshot.check().map_err(status)?;
         let (parent_only, body) = if matches!(mode, WorldIdentityRead::EffectiveAt) {
             let (selector, rest) = body.split_first().ok_or_else(|| invalid("Historical world identities have no selector"))?;

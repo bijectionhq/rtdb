@@ -145,10 +145,8 @@ enum ArchiveRead {
     Point(ArchivePoint),
     Ancestor {
         relation: OwnedRelation,
-        id: EntityId,
-        valid: Interval,
+        read: AncestorRead,
         schema: rtdb_types::OwnedSchema,
-        schedule: bool,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<AncestorResult>>,
     },
@@ -208,9 +206,16 @@ enum ArchiveRead {
     },
 }
 
+enum AncestorRead {
+    Point { id: EntityId, valid: Interval },
+    Schedule { id: EntityId, valid: Interval },
+    Identities { valid: Timestamp, after: Option<String>, limit: usize },
+}
+
 enum AncestorResult {
     Point(Option<WorldFact>),
     Schedule(Vec<(Interval, Timestamp)>),
+    Identities(WorldIdentityPage),
 }
 
 enum OrderedRead {
@@ -600,19 +605,20 @@ impl HeldCheckpointWorld {
     }
 
     async fn read_ancestor(
-        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, schedule: bool,
+        &self, relation: &OwnedRelation, read: AncestorRead,
     ) -> Result<(AncestorResult, OwnedWorldWitness)> {
         self.check_relation(relation)?;
         let schema = self.historical_parent_schema(relation)?.clone();
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
-        let guard = self.open.snapshot.parent_point_release_guard(
-            relation, id, self.open.retained.basis.system_time,
-        ).await?;
+        let guard = match &read {
+            AncestorRead::Point { id, .. } | AncestorRead::Schedule { id, .. } =>
+                self.open.snapshot.parent_point_release_guard(relation, id, self.open.retained.basis.system_time).await?,
+            AncestorRead::Identities { .. } => self.open.snapshot.relation_release_guard([relation])?,
+        };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ancestor {
-            relation: relation.clone(), id: id.clone(), valid, schema, schedule,
-            guard: Arc::clone(&guard), reply,
+            relation: relation.clone(), read, schema, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let read = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
@@ -624,7 +630,9 @@ impl HeldCheckpointWorld {
     async fn ancestor_point(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, observed: bool,
     ) -> Result<WorldPoint> {
-        let (result, witness) = self.read_ancestor(relation, id, Interval::at(valid)?, false).await?;
+        let (result, witness) = self.read_ancestor(relation, AncestorRead::Point {
+            id: id.clone(), valid: Interval::at(valid)?,
+        }).await?;
         let AncestorResult::Point(fact) = result else { return Err(OwnedWorld::unavailable()); };
         Ok(WorldPoint { present: self.present(), fact, until: None, shadowed: false, witness: observed.then_some(witness) })
     }
@@ -1087,7 +1095,7 @@ impl HeldCheckpointWorld {
         if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
         if self.ancestor().is_some() {
             if system.is_some() { return Err(OwnedWorld::unavailable()); }
-            let (result, witness) = self.read_ancestor(relation, id, valid, true).await?;
+            let (result, witness) = self.read_ancestor(relation, AncestorRead::Schedule { id: id.clone(), valid }).await?;
             let AncestorResult::Schedule(timeline) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok((timeline, Some(witness)));
         }
@@ -1144,6 +1152,15 @@ impl HeldCheckpointWorld {
     pub async fn identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
+        if self.ancestor().is_some() {
+            Interval::at(valid)?;
+            if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
+            let (result, _) = self.read_ancestor(relation, AncestorRead::Identities {
+                valid, after: after.map(str::to_owned), limit,
+            }).await?;
+            let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
+            return Ok(page);
+        }
         self.identity_page_on_cut(relation, valid, after, limit, None).await
     }
 
@@ -1231,13 +1248,8 @@ impl HeldCheckpointWorld {
             };
             let parent = self.archive_identity_candidates(relation, valid, after, FETCH, None).await?;
 
-            // A full input page can have unseen keys beyond its last key.
-            let through = [
-                (local.keys.len() == FETCH).then(|| local.keys.last()).flatten(),
-                (parent.keys.len() == FETCH).then(|| parent.keys.last()).flatten(),
-            ].into_iter().flatten().min();
-            let candidates: std::collections::BTreeSet<_> = parent.keys.iter().chain(&local.keys).collect();
-            for key in candidates.into_iter().take_while(|key| through.is_none_or(|through| *key <= through)) {
+            let (candidates, through) = identity_candidates(&parent.keys, &local.keys, FETCH);
+            for key in candidates {
                 let id = EntityId::String(key.clone());
                 let shadow = if let Some(cut) = cut {
                     let read = cut.shadow(&id, valid).await?;
@@ -1413,6 +1425,42 @@ impl<'a> InheritedRelation<'a> {
         Ok(fact)
     }
 
+    async fn identities(&self, valid: Timestamp, after: Option<String>, limit: usize) -> Result<WorldIdentityPage> {
+        const FETCH: usize = 129;
+        let root_basis = self.root.current_time.as_micros()?;
+        let mut keys = Vec::with_capacity(limit);
+        let mut bytes = limit * 128;
+        let mut reservations = vec![self.memory.reserve(bytes)?];
+        let mut cursor = after.map(|key| {
+            let charge = self.memory.reserve(key.len())?;
+            Ok::<_, rtdb_types::Anomaly>((key, charge))
+        }).transpose()?;
+        for _ in 0..32 {
+            let after = cursor.as_ref().map(|(key, _)| key.as_str());
+            let parent = rtdb_query::owned_identity_candidates(
+                Arc::clone(&self.root), self.owner, self.relation, root_basis, valid, after, FETCH,
+            ).await?;
+            let overlay = rtdb_query::owned_identity_candidates(
+                Arc::clone(&self.overlay), self.owner, &self.shadow, self.overlay_basis, valid, after, FETCH,
+            ).await?;
+            let (candidates, through) = identity_candidates(&parent.keys, &overlay.keys, FETCH);
+            for key in candidates {
+                let id = EntityId::String(key.clone());
+                if self.point(&id, Interval::at(valid)?).await?.is_none() { continue; }
+                if keys.len() == limit {
+                    return Ok(WorldIdentityPage { keys, more: true, reservations });
+                }
+                bytes = bytes.checked_add(key.len()).filter(|bytes| *bytes <= 8 << 20)
+                    .ok_or_else(OwnedWorld::unavailable)?;
+                reservations.push(self.memory.reserve(key.len())?);
+                keys.push(key.clone());
+            }
+            let Some(through) = through else { return Ok(WorldIdentityPage { keys, more: false, reservations }); };
+            cursor = Some((through.clone(), self.memory.reserve(through.len())?));
+        }
+        Err(OwnedWorld::unavailable())
+    }
+
     async fn schedule(&self, id: &EntityId, valid: Interval) -> Result<Vec<(Interval, Timestamp)>> {
         let root_boundaries = rtdb_query::open_owned_valid_boundaries(
             Arc::clone(&self.root), self.owner, self.relation, id, valid, self.root.current_time.as_micros()?,
@@ -1432,6 +1480,15 @@ impl<'a> InheritedRelation<'a> {
         }
         Ok(timeline)
     }
+}
+
+fn identity_candidates<'a>(
+    parent: &'a [String], overlay: &'a [String], fetch: usize,
+) -> (impl Iterator<Item = &'a String>, Option<&'a String>) {
+    let through = [parent, overlay].into_iter()
+        .filter(|keys| keys.len() == fetch).filter_map(|keys| keys.last()).min();
+    let candidates: std::collections::BTreeSet<_> = parent.iter().chain(overlay).collect();
+    (candidates.into_iter().take_while(move |key| through.is_none_or(|through| *key <= through)), through)
 }
 
 fn check_archive_coverage<'a>(
@@ -1635,7 +1692,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                 point = pending.recv() => match point { Some(point) => point, None => break },
                             };
                             match request {
-                                ArchiveRead::Ancestor { relation, id, valid, schema, schedule, guard, mut reply } => {
+                                ArchiveRead::Ancestor { relation, read, schema, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         let ancestor = ancestor.as_ref().ok_or_else(OwnedWorld::unavailable)?;
@@ -1649,13 +1706,16 @@ pub(crate) async fn open_held_checkpoint_world(
                                             |overlay| {
                                                 let root = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
                                                 let overlay = overlay.with_owned_read_guard(Arc::clone(&guard));
-                                                let (owner, relation, schema, id) = (&owner, &relation, &schema, &id);
+                                                let (owner, relation, schema) = (&owner, &relation, &schema);
                                                 async move {
-                                                    let read = InheritedRelation::open(root, overlay, owner, relation, ancestor, schema, memory).await?;
-                                                    if schedule {
-                                                        Ok(AncestorResult::Schedule(read.schedule(id, valid).await?))
-                                                    } else {
-                                                        Ok(AncestorResult::Point(read.point(id, valid).await?))
+                                                    let inherited = InheritedRelation::open(root, overlay, owner, relation, ancestor, schema, memory).await?;
+                                                    match read {
+                                                        AncestorRead::Point { id, valid } =>
+                                                            Ok(AncestorResult::Point(inherited.point(&id, valid).await?)),
+                                                        AncestorRead::Schedule { id, valid } =>
+                                                            Ok(AncestorResult::Schedule(inherited.schedule(&id, valid).await?)),
+                                                        AncestorRead::Identities { valid, after, limit } =>
+                                                            Ok(AncestorResult::Identities(inherited.identities(valid, after, limit).await?)),
                                                     }
                                                 }
                                             },
@@ -2089,6 +2149,15 @@ pub(crate) async fn open_held_checkpoint_world(
 #[cfg(test)]
 mod ancestor_boundaries_tests {
     use super::*;
+
+    #[test]
+    fn merged_identities_stop_at_the_first_unseen_source() {
+        let parent = ["a".to_owned(), "c".to_owned()];
+        let overlay = ["b".to_owned(), "e".to_owned()];
+        let (candidates, through) = identity_candidates(&parent, &overlay, 2);
+        assert_eq!(through.map(String::as_str), Some("c"));
+        assert_eq!(candidates.map(String::as_str).collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
 
     #[test]
     fn retained_overlay_masks_parent_boundaries_inside_its_extent() -> Result<()> {
