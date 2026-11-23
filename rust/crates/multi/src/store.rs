@@ -16,7 +16,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
-use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::InstalledRetirement};
+use rtdb_format::{keys::StorageRoot, trie_retirement::InstalledRetirement};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, ObjectReadAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
@@ -1207,15 +1207,7 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 }
 
 fn is_collected_trie_file(key: &str) -> bool {
-    rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) || is_compacted_primary_file(key)
-}
-
-fn is_compacted_primary_file(key: &str) -> bool {
-    let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
-    name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
-        .and_then(|file| file.strip_suffix(".arrow"))
-        .and_then(|trie| trie.parse::<TrieKey>().ok())
-        .is_some_and(|trie| trie.level() > 0)
+    rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) || rtdb_format::keys::is_compacted_primary_file(key)
 }
 
 fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord, exact: bool) -> bool {
@@ -1232,7 +1224,7 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
         && record.storage_namespaces.is_some_and(|value| value.objects == required.object_namespace)
         && cut.replica_epoch.0 == record.log_epoch
         && crate::catalog_readers::readers_allow(record, &root, cut,
-            (exact && is_compacted_primary_file(&release.key)).then_some(release.key.as_str()))
+            (exact && rtdb_format::keys::is_compacted_primary_file(&release.key)).then_some(release.key.as_str()))
         && record.catalog_admission_floors.get(&root).is_some_and(|floor| {
             floor.residence == required.residence && floor.object_namespace == required.object_namespace
                 && floor.cut.storage_version == cut.storage_version && floor.cut.storage_epoch == cut.storage_epoch
@@ -1284,7 +1276,7 @@ impl ObjectStore for GarbageStore {
         files.sort_by_key(|file| file.release_order());
         let paths = files.iter().map(|file| {
             let exact = file.terminal_publication.is_some() || file.matches_publication && file.version.is_some();
-            (exact && is_compacted_primary_file(&file.key)).then_some(file.key.as_str())
+            (exact && rtdb_format::keys::is_compacted_primary_file(&file.key)).then_some(file.key.as_str())
         }).collect::<Vec<_>>();
         let (floor, allowed) = readers.close_admission(installed.cut(), &paths).await?;
         for (file, allowed) in files.into_iter().zip(&allowed) {

@@ -319,6 +319,10 @@ impl ObjectStore for EncryptingStore {
         self.inner.release_trie_files(receipt, contents).await
     }
 
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
+        self.inner.close_classic_trie_admission(cut, paths).await
+    }
+
     async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> Result<bool> {
         self.inner.classic_trie_retirement_ready(key, version).await
     }

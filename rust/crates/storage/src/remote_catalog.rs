@@ -9,7 +9,24 @@ use uuid::Uuid;
 use crate::{IoRegion, ObjectKey, io_region::IoAdmission, local_catalog::{covers, same_storage, well_formed}};
 
 const MAX_LEDGER_BYTES: usize = 1024 * 1024;
-type CatalogHolds = BTreeMap<Uuid, Option<CatalogCut>>;
+type CatalogHolds = BTreeMap<Uuid, CatalogHold>;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CatalogHold {
+    cut: Option<CatalogCut>,
+    compacted_primary_paths: Option<Vec<String>>,
+}
+
+impl CatalogHold {
+    fn retains(&self, cut: CatalogCut, path: Option<&str>) -> bool {
+        match path {
+            Some(path) => self.compacted_primary_paths.as_ref().is_none_or(|paths| {
+                paths.binary_search_by(|held| held.as_str().cmp(path)).is_ok()
+            }),
+            None => self.cut.is_none_or(|held| !covers(held, cut)),
+        }
+    }
+}
 
 #[derive(Default)]
 struct Ledger {
@@ -29,7 +46,14 @@ impl CatalogLedger {
         Arc::new(Self { client, key, path })
     }
 
-    pub async fn retain(self: &Arc<Self>, cut: Option<CatalogCut>, io: &IoRegion) -> Result<Arc<dyn Send + Sync>> {
+    pub async fn retain(self: &Arc<Self>, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>, io: &IoRegion)
+        -> Result<Arc<dyn Send + Sync>> {
+        let claim = CatalogHold { cut, compacted_primary_paths: paths.as_deref().filter(|paths| {
+            cut.is_some() && paths.windows(2).all(|pair| pair[0] < pair[1])
+                && paths.iter().all(|path| rtdb_format::keys::is_compacted_primary_file(path))
+                && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
+                    <= rtdb_types::CATALOG_PRIMARY_PATH_BYTES
+        }).map(<[String]>::to_vec) };
         let admission: IoAdmission = io.admit()?;
         let ledger = Arc::clone(self);
         let (answer, result) = oneshot::channel();
@@ -44,7 +68,7 @@ impl CatalogLedger {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
                         "The captured catalog precedes the remote collection floor or belongs to another journal"));
                 }
-                state.holds.insert(ticket, cut);
+                state.holds.insert(ticket, claim.clone());
                 uncertain = true;
                 Ok((true, ()))
             }).await;
@@ -63,21 +87,29 @@ impl CatalogLedger {
     }
 
     pub async fn advance(&self, cut: CatalogCut) -> Result<bool> {
+        Ok(self.close_admission(cut, &[None]).await?[0])
+    }
+
+    pub async fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
         if !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0 {
             return Err(unavailable("Invalid remote catalog floor"));
         }
         self.update(|state| {
-            if let Some(prior) = state.floor {
-                if covers(prior, cut) { return Ok((false, true)); }
-                if !covers(cut, prior) && !(same_storage(cut, prior) && cut.replica_epoch > prior.replica_epoch) {
-                    return Err(unavailable("The remote catalog floor belongs to another storage root or a newer journal"));
-                }
+            let closed = state.floor.is_some_and(|prior| covers(prior, cut));
+            if !closed && state.floor.is_some_and(|prior| {
+                !covers(cut, prior) && !(same_storage(cut, prior) && cut.replica_epoch > prior.replica_epoch)
+            }) {
+                return Err(unavailable("The remote catalog floor belongs to another storage root or a newer journal"));
             }
-            if state.holds.values().any(|held| !held.is_some_and(|held| covers(held, cut))) {
-                return Ok((false, false));
+            let advance = !closed && (paths.iter().any(Option::is_some)
+                || state.holds.values().all(|held| !held.retains(cut, None)));
+            if advance {
+                state.floor = Some(cut);
             }
-            state.floor = Some(cut);
-            Ok((true, true))
+            let allowed = paths.iter().map(|path| {
+                (closed || advance) && state.holds.values().all(|held| !held.retains(cut, *path))
+            }).collect();
+            Ok((advance, allowed))
         }).await
     }
 
@@ -97,7 +129,7 @@ impl CatalogLedger {
         let (sequence, floor, holds): (u64, Option<CatalogCut>, CatalogHolds) =
             serde_json::from_slice(&bytes).map_err(unavailable)?;
         if sequence == 0 || floor.is_some_and(|floor| !well_formed(floor))
-            || holds.values().any(|held| held.is_some_and(|cut| !well_formed(cut)))
+            || holds.values().any(|held| held.cut.is_some_and(|cut| !well_formed(cut)))
         {
             return Err(unavailable("Malformed remote catalog ledger"));
         }

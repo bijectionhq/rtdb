@@ -3,7 +3,7 @@ use std::{fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::Arc};
 use fs2::FileExt;
 
 use bytes::Bytes;
-use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
+use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, trie_retirement::InstalledRetirement};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
@@ -14,6 +14,7 @@ struct TrieDeletionGrant<'a> {
     store: &'a dyn ObjectStore,
     files: Vec<(ObjectKey, Option<PhysicalObjectVersion>)>,
     recovery_gate: Option<Arc<dyn Send + Sync>>,
+    remaining: bool,
 }
 
 impl<'a> TrieDeletionGrant<'a> {
@@ -45,16 +46,27 @@ impl<'a> TrieDeletionGrant<'a> {
             Some(gate)
         } else { None };
 
-        // The current conservative predicate uses the installed cut. Admission
-        // and this grant can evolve independently once holds carry reachability.
-        if !store.advance_catalog_floor(installed.cut()).await? { return Ok(None); }
-        for (file, version) in &files {
-            if !store.classic_trie_retirement_ready(file, version.as_ref()).await? { return Ok(None); }
+        let exact_paths = files.iter().map(|(key, version)| {
+            (version.is_some() && is_compacted_primary_file(key.as_str())).then_some(key.as_str())
+        }).collect::<Vec<_>>();
+        let permitted = store.close_classic_trie_admission(installed.cut(), &exact_paths).await?;
+        if permitted.len() != files.len() {
+            return Err(Anomaly::fault("rtdb.storage/trie-release", "The Classic grant returned another candidate set"));
         }
-        Ok(Some(Self { store, files, recovery_gate }))
+        let mut ready = Vec::new();
+        let mut remaining = false;
+        for ((key, version), allowed) in files.into_iter().zip(permitted) {
+            if allowed && store.classic_trie_retirement_ready(&key, version.as_ref()).await? {
+                ready.push((key, version));
+            } else {
+                remaining = true;
+            }
+        }
+        Ok(Some(Self { store, files: ready, recovery_gate, remaining }))
     }
 
-    async fn erase(self, keys: Option<&dyn ObjectCipher>) -> Result<()> {
+    async fn erase(self, keys: Option<&dyn ObjectCipher>) -> Result<bool> {
+        let complete = !self.remaining;
         let erase = async {
             if let Some(keys) = keys {
                 let names: Vec<_> = self.files.iter().map(|(file, _)| file.clone()).collect();
@@ -63,12 +75,13 @@ impl<'a> TrieDeletionGrant<'a> {
             for (file, version) in self.files {
                 self.store.settle_classic_trie(&file, version.as_ref()).await?;
             }
-            Ok(())
+            Ok::<_, Anomaly>(())
         };
         match self.recovery_gate {
             Some(gate) => IoRegion::retaining(gate, erase).await,
             None => erase.await,
-        }
+        }?;
+        Ok(complete)
     }
 }
 
@@ -155,6 +168,5 @@ pub(crate) async fn retire_with_keys(
     store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes, keys: Option<&dyn ObjectCipher>,
 ) -> Result<bool> {
     let Some(grant) = TrieDeletionGrant::authorize(store, receipt, contents).await? else { return Ok(false); };
-    grant.erase(keys).await?;
-    Ok(true)
+    grant.erase(keys).await
 }

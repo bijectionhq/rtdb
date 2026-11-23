@@ -267,14 +267,14 @@ impl CatalogReaders {
         }
         let paths = paths.filter(|paths| cut.is_some()
             && paths.windows(2).all(|window| window[0] < window[1])
-            && paths.iter().all(|path| crate::store::is_compacted_primary_file(path))
+            && paths.iter().all(|path| rtdb_format::keys::is_compacted_primary_file(path))
             && primary_path_charge(paths) <= rtdb_types::CATALOG_PRIMARY_PATH_BYTES
             && record.catalog_readers.values().filter_map(|reader| reader.compacted_primary_paths.as_deref())
                 .map(primary_path_charge).fold(primary_path_charge(paths), usize::saturating_add) <= PRIMARY_PATH_LEDGER_BYTES);
         let store = format!("{}/{}/", self.residence, self.storage_root);
         if record.storage_regions.values().any(|region| match region {
             StorageRegion::ExactRetirement { object, .. } => object.strip_prefix(&store)
-                .is_some_and(|path| crate::store::is_compacted_primary_file(path)
+                .is_some_and(|path| rtdb_format::keys::is_compacted_primary_file(path)
                     && paths.is_none_or(|paths| contains_path(paths, path))),
             _ => false,
         }) {

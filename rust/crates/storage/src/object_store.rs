@@ -181,6 +181,11 @@ pub trait ObjectStore: Send + Sync {
     async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<bool> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
+    /// Closes stale catalog admissions and checks current holds for each Classic candidate.
+    /// A path is supplied only when the installed receipt identifies an immutable compacted file.
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
+        Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()])
+    }
     /// Provider preflight for an exact publication selected by the Classic grant.
     async fn classic_trie_retirement_ready(&self, _key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> rtdb_types::Result<bool> {
         Ok(version.is_none())

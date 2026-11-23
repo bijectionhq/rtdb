@@ -177,7 +177,13 @@ impl ObjectStore for RemoteStore {
     fn permits_shared_read_cache(&self) -> bool { true }
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let Some(ledger) = &self.catalog else { return Ok(None); };
-        ledger.retain(cut, &self.io).await.map(Some)
+        ledger.retain(cut, None, &self.io).await.map(Some)
+    }
+
+    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(ledger) = &self.catalog else { return Ok(None); };
+        ledger.retain(cut, self.classic_versions.as_ref().map(|_| paths), &self.io).await.map(Some)
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
@@ -189,6 +195,17 @@ impl ObjectStore for RemoteStore {
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         crate::classic_retirement::retire(self, receipt, contents).await
+    }
+
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
+        let Some(ledger) = self.catalog.clone().filter(|_| self.classic_versions.is_some()) else {
+            return Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()]);
+        };
+        let paths = paths.iter().map(|path| path.map(str::to_owned)).collect::<Vec<_>>();
+        self.io.run_async(async move {
+            let paths = paths.iter().map(Option::as_deref).collect::<Vec<_>>();
+            Ok(ledger.close_admission(cut, &paths).await)
+        }).await?
     }
 
     async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&PhysicalObjectVersion>) -> rtdb_types::Result<bool> {

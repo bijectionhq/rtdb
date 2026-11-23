@@ -174,8 +174,8 @@ Query and fragment admission on coordinated storage uses the catalog hold withou
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
 The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
 The approved reachability contract replaces the cutoff for deletion.
-For hosted loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
-Complete claims for other file kinds, classic storage, and all recovery roots remain open.
+For hosted and versioned Classic S3 loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
+Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
 Abandoned remote hold recovery, renewal, full recovery-root integration and the remaining search, fork and uncoordinated timers remain open.
 
 |5

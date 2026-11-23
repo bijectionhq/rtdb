@@ -114,6 +114,15 @@ pub fn skipped_tx_position(path: &str) -> Option<rtdb_types::SourcePosition> {
     })
 }
 
+/// A loose data or metadata file of a compacted primary trie.
+pub fn is_compacted_primary_file(key: &str) -> bool {
+    let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
+    name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
+        .and_then(|file| file.strip_suffix(".arrow"))
+        .and_then(|trie| trie.parse::<TrieKey>().ok())
+        .is_some_and(|trie| trie.level() > 0)
+}
+
 /// The dedicated L0 data and metadata objects of an engine receipt table.
 pub fn is_receipt_l0_file(key: &str) -> bool {
     let Some((slug, file)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else {
