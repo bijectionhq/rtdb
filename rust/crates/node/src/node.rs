@@ -646,7 +646,7 @@ impl Node {
             return Err(bad_attempt_outcome());
         };
         let Some(latest) = installed.tx_basis() else { return Ok(()); };
-        if !installed.column_names(&TableRef::new("xt", "txs")).contains("receipt_time") { return Ok(()); }
+        if !installed.column_names(&rtdb_types::TableRef::new("xt", "txs")).contains("receipt_time") { return Ok(()); }
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::I64))]), default_timezone: context.timezone.clone(), ..Default::default() };
         let prepared = prepare_query("SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context, &options)?;
         let mut cursor = prepared.execute(context, vec![Value::I64(latest.tx_id.0)]).await?;

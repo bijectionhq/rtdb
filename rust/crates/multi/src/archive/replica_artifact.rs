@@ -424,13 +424,13 @@ mod tests {
         };
         let key_bytes = [4; crate::keys::KEY_BYTES];
         let receipt = encode(&terminal)?;
-        let artifact = ReplicaArtifact::new(&bucket, &key_bytes, checkpoint_transfer_prefix(&target, operation), receipt.clone(), b"test\0")?;
+        let artifact = ReplicaArtifact::new(&bucket, legacy_archive_key(&key_bytes)?, checkpoint_transfer_prefix(&target, operation), receipt.clone(), b"test\0")?;
         let entry = ArchivedReplicaEntry { lsn: 8, epoch: 1, timestamp: 11, payload: Bytes::from_static(b"inline") };
         let object = key(&format!("{}/checkpoint-transfers/{operation}.v1", target.storage_prefix()))?;
         let mut plaintext = (receipt.len() as u32).to_be_bytes().to_vec();
         plaintext.extend_from_slice(&receipt);
         plaintext.extend_from_slice(&replica_suffix::encode_records(std::slice::from_ref(&entry))?);
-        let sealed = Cipher::new(&key_bytes)?.seal_deterministic(object.as_str(), &plaintext)?;
+        let sealed = crate::cipher::Cipher::new(&key_bytes)?.seal_deterministic(object.as_str(), &plaintext)?;
         let digest = sha256(&sealed);
         bucket.put(&object, sealed).await?;
         artifact.put_manifest(artifact.chain()).await?;
