@@ -782,7 +782,10 @@ fn render<'work>(first: RenderFrame<'_>, work: &'work ExplainWork) -> Result<Wor
                 }
                 LiteralKind::Map { entries, .. } => { sink.append(&[RenderPiece::Text("{")])?; frames.push(RenderFrame::ValuePairs { entries: entries.iter(), first: true })?; }
                 LiteralKind::Struct(fields) => { sink.append(&[RenderPiece::Text("{")])?; frames.push(RenderFrame::Fields { fields: fields.iter(), first: true })?; }
-                LiteralKind::Leaf(leaf) => render_leaf(leaf.value().as_ref(), &mut sink)?,
+                LiteralKind::Leaf(leaf) => match leaf.packed_float() {
+                    Some(component) => render_float(component, &mut sink)?,
+                    None => render_leaf(leaf.value().as_ref(), &mut sink)?,
+                },
             },
             RenderFrame::RawSequence { mut values, first, close } => match values.next() {
                 Some(value) => { if !first { sink.append(&[RenderPiece::Text(" ")])?; } frames.push(RenderFrame::RawSequence { values, first: false, close })?; frames.push(RenderFrame::Raw(value))?; }
@@ -825,6 +828,21 @@ fn render<'work>(first: RenderFrame<'_>, work: &'work ExplainWork) -> Result<Wor
     }
     sink.finish()
 }
+fn render_float(value: rtdb_types::FloatComponent, sink: &mut TextSink<'_>) -> Result<()> {
+    use rtdb_types::FloatComponent;
+    const FLOAT_SAMPLE: Value = Value::F64(0.0);
+    if let FloatComponent::Null = value {
+        return sink.append(&[RenderPiece::Text("nil")]);
+    }
+    let _reservation = sink.work.memory.reserve(rtdb_expr::text_allocation_bound(&FLOAT_SAMPLE)?)?;
+    let text = match value {
+        FloatComponent::F32(value) => rtdb_types::java_f32_text(value),
+        FloatComponent::F64(value) => rtdb_types::java_f64_text(value),
+        FloatComponent::Null => unreachable!("null renders without scratch"),
+    };
+    sink.append(&[RenderPiece::Text(&text)])
+}
+
 fn render_leaf(value: &Value, sink: &mut TextSink<'_>) -> Result<()> {
     match value {
         Value::Null | Value::Undefined => sink.append(&[RenderPiece::Text("nil")]),
@@ -843,16 +861,8 @@ fn render_leaf(value: &Value, sink: &mut TextSink<'_>) -> Result<()> {
             RenderPiece::Text("-"), RenderPiece::HexBytes(&bytes[10..]), RenderPiece::Text("\""),
         ]),
         Value::Binary(bytes) | Value::FixedSizeBinary(bytes) | Value::Transit(bytes) => sink.append(&[RenderPiece::Text("#bytes \""), RenderPiece::HexBytes(bytes), RenderPiece::Text("\"")]),
-        Value::F32(value) => {
-            let _reservation = sink.work.memory.reserve(rtdb_expr::text_allocation_bound(&Value::F32(*value))?)?;
-            let text = rtdb_types::java_f32_text(*value);
-            sink.append(&[RenderPiece::Text(&text)])
-        }
-        Value::F64(value) => {
-            let _reservation = sink.work.memory.reserve(rtdb_expr::text_allocation_bound(&Value::F64(*value))?)?;
-            let text = rtdb_types::java_f64_text(*value);
-            sink.append(&[RenderPiece::Text(&text)])
-        }
+        Value::F32(value) => render_float(rtdb_types::FloatComponent::F32(*value), sink),
+        Value::F64(value) => render_float(rtdb_types::FloatComponent::F64(*value), sink),
         Value::Decimal(decimal) => {
             let _reservation = sink.work.memory.reserve(rtdb_expr::text_allocation_bound(value)?)?;
             let text = rtdb_expr::decimal_text(decimal);
@@ -919,6 +929,15 @@ mod rendering_tests {
         let work = work(&memory);
         let text = literal(RegexLiteralView::new(value), &work).unwrap();
         text.as_str().into()
+    }
+
+    #[test]
+    fn explain_reads_packed_float_leaves_at_their_original_width() {
+        let vector = Value::FixedSizeList(vec![Value::F32(0.1), Value::Null, Value::F64(-0.0), Value::F64(f64::NAN)].into());
+        let LiteralKind::FixedSizeList(cells) = RegexLiteralView::new(&vector).kind() else { panic!("typed list") };
+        let LiteralKind::Leaf(leaf) = cells.get(0).unwrap().kind() else { panic!("typed float leaf") };
+        assert!(matches!(leaf.packed_float(), Some(rtdb_types::FloatComponent::F32(value)) if value.to_bits() == 0.1f32.to_bits()));
+        assert_eq!(output(&vector), "[0.1 nil -0.0 NaN]");
     }
 
     #[test]

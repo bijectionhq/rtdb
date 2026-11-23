@@ -2011,6 +2011,9 @@ surface MaintenanceCommands {
     facing operator: ClientActor
     context db: Database
 
+    @guarantee TypedInspectionJson
+        -- File inspection writes typed floating-point cells and lists in its tagged JSON format.
+
     contracts:
         fulfils OfflineSnapshotExport
         fulfils CompactorReset

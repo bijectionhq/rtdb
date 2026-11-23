@@ -117,6 +117,13 @@ enum LeafSource<'a> { Borrowed(&'a Value), Packed(rtdb_types::ListView<'a>, usiz
 pub struct RegexLeaf<'a>(LeafSource<'a>);
 
 impl<'a> RegexLeaf<'a> {
+    pub fn packed_float(self) -> Option<rtdb_types::FloatComponent> {
+        match self.0 {
+            LeafSource::Packed(values, index) => values.typed_float(index),
+            LeafSource::Borrowed(_) => None,
+        }
+    }
+
     pub fn value(self) -> std::borrow::Cow<'a, Value> {
         match self.0 {
             LeafSource::Borrowed(value) => std::borrow::Cow::Borrowed(value),

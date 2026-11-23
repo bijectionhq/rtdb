@@ -1,8 +1,8 @@
 use std::{fs::File, io::{Read, Write}, path::Path, sync::Arc};
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, estimate_read_value_bytes, read_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, estimate_read_value_bytes, read_value};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, ipc::{self, ArrowFile, ArrowStream}};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, FloatComponent, FloatListSlice, ListKind, Result, StructFields};
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,10 +99,88 @@ fn batch(output: &mut impl Write, batch: &RecordBatch, memory: &Arc<MemoryBudget
         if row > 0 { output.write_all(b",").map_err(invalid)?; }
         let size = schema.fields().iter().enumerate().try_fold(8192usize, |size, (column, field)| size.checked_add(estimate_read_value_bytes(field, batch.column(column).as_ref(), row)?).ok_or_else(|| invalid("Row allocation exceeds addressable memory")))?;
         let _reservation = memory.reserve(size)?;
-        let values = schema.fields().iter().enumerate().map(|(column, field)| read_value(field, batch.column(column).as_ref(), row)).collect::<Result<Vec<_>>>()?;
+        let values = schema.fields().iter().enumerate().map(|(column, field)| {
+            let cell = ArrowCell { field, array: batch.column(column).as_ref(), row };
+            inspection_cell(cell)
+        }).collect::<Result<Vec<_>>>()?;
         write_json(output, &values)?;
     }
     output.write_all(b"]").map_err(invalid)
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum InspectionCell<'a> {
+    Scalar(FloatComponent),
+    FloatList(FloatList<'a>),
+    Container(Container<'a>),
+    Value(rtdb_types::Value),
+}
+
+#[derive(serde::Serialize)]
+enum FloatList<'a> {
+    List(FloatListSlice<'a>),
+    FixedSizeList(FloatListSlice<'a>),
+}
+
+#[derive(serde::Serialize)]
+enum Container<'a> {
+    List(Vec<InspectionCell<'a>>),
+    FixedSizeList(Vec<InspectionCell<'a>>),
+    Struct(StructFields<InspectionCell<'a>>),
+}
+
+fn inspection_cell(cell: ArrowCell<'_>) -> Result<InspectionCell<'_>> {
+    if let Some((values, range)) = cell.float_list_span()
+        && let Some(values) = values.float_slice(range)
+    {
+        rtdb_columnar::from_field(cell.field)?;
+        let value = match cell.sequence_kind() {
+            Some(ListKind::List) => FloatList::List(values),
+            Some(ListKind::FixedSizeList(_)) => FloatList::FixedSizeList(values),
+            _ => unreachable!("floating list span"),
+        };
+        return Ok(InspectionCell::FloatList(value));
+    }
+    if let Ok(physical) = cell.physical() {
+        use arrow_array::{Float32Array, Float64Array};
+        let component = if physical.array.is_null(physical.row) {
+            Some(FloatComponent::Null)
+        } else if let Some(values) = physical.array.as_any().downcast_ref::<Float32Array>() {
+            Some(FloatComponent::F32(values.value(physical.row)))
+        } else {
+            physical.array.as_any().downcast_ref::<Float64Array>()
+                .map(|values| FloatComponent::F64(values.value(physical.row)))
+        };
+        if let Some(component) = component {
+            rtdb_columnar::from_field(cell.field)?;
+            return Ok(InspectionCell::Scalar(component));
+        }
+    }
+    if let Some(fields) = cell.structure() {
+        rtdb_columnar::from_field(cell.field)?;
+        let fields = fields.map(|child| {
+            let name = child.field.name().clone();
+            let value = if matches!(rtdb_columnar::from_field(child.field)?, rtdb_types::LogicalType::Nothing) {
+                InspectionCell::Value(rtdb_types::Value::Undefined)
+            } else {
+                inspection_cell(child)?
+            };
+            Ok((name, value))
+        }).collect::<Result<StructFields<_>>>()?;
+        return Ok(InspectionCell::Container(Container::Struct(fields)));
+    }
+    if let Some(kind @ (ListKind::List | ListKind::FixedSizeList(_))) = cell.sequence_kind()
+        && let Some(elements) = cell.sequence()
+    {
+        rtdb_columnar::from_field(cell.field)?;
+        let values = elements.map(inspection_cell).collect::<Result<Vec<_>>>()?;
+        return Ok(InspectionCell::Container(match kind {
+            ListKind::List => Container::List(values),
+            _ => Container::FixedSizeList(values),
+        }));
+    }
+    read_value(cell.field, cell.array, cell.row).map(InspectionCell::Value)
 }
 
 fn trie_node(node: &rtdb_trie::PersistedNode) -> Value {
@@ -165,3 +243,31 @@ fn trie_details(trie: &rtdb_format::log::proto::TrieDetails) -> Value {
 fn write_json(output: &mut impl Write, value: &impl serde::Serialize) -> Result<()> { serde_json::to_writer(output, value).map_err(invalid) }
 fn bound(size: usize, factor: usize, extra: usize) -> Result<usize> { size.checked_mul(factor).and_then(|size| size.checked_add(extra)).ok_or_else(|| invalid("Inspection allocation exceeds addressable memory")) }
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.inspect/file", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_types::{LogicalType, Value as Cell};
+
+    #[test]
+    fn inspection_borrows_fixed_and_variable_float_lists_from_the_batch() {
+        for fixed in [false, true] {
+            let list = rtdb_types::ListValue::from(vec![Cell::F32(-0.0), Cell::Null, Cell::F64(f64::from_bits(0xfff8_0000_0000_0005))]);
+            let list = if fixed { Cell::FixedSizeList(list) } else { Cell::List(list) };
+            let values = [Cell::Null, list, Cell::Null];
+            let ty = LogicalType::join_all(&values.iter().map(Cell::logical_type).collect::<Vec<_>>());
+            let field = rtdb_columnar::to_field("embedding", &ty).unwrap();
+            let array = rtdb_columnar::copy_array(&ty, &values).unwrap();
+            let cell = inspection_cell(ArrowCell { field: &field, array: array.as_ref(), row: 1 }).unwrap();
+            assert!(matches!(cell, InspectionCell::FloatList(_)));
+            let absent = inspection_cell(ArrowCell { field: &field, array: array.as_ref(), row: 0 }).unwrap();
+            assert!(matches!(absent, InspectionCell::Scalar(FloatComponent::Null)));
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![field])), vec![array]).unwrap();
+            let mut out = Vec::new();
+            let memory = MemoryBudget::new(1 << 20);
+            super::batch(&mut out, &batch, &memory).unwrap();
+            assert_eq!(out, serde_json::to_vec(&values.map(|cell| [cell])).unwrap());
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}

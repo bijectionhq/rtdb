@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt, sync::Arc};
+use std::{borrow::Cow, fmt, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, UnionArray};
 use arrow_schema::{DataType, Field, UnionMode};
@@ -29,6 +29,47 @@ pub enum ListView<'a> {
     Scalars(&'a ScalarList),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum FloatComponent {
+    Null,
+    F32(f32),
+    F64(f64),
+}
+
+impl FloatComponent {
+    fn read(array: &dyn Array, index: usize) -> Option<Self> {
+        if array.is_null(index) || array.data_type() == &DataType::Null {
+            return Some(Self::Null);
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+            return Some(Self::F32(values.value(index)));
+        }
+        array.as_any().downcast_ref::<Float64Array>().map(|values| Self::F64(values.value(index)))
+    }
+}
+
+impl Serialize for FloatComponent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // The indices are the discriminants used by Value's derived Serialize implementation.
+        match self {
+            Self::Null => serializer.serialize_unit_variant("Value", 1, "Null"),
+            Self::F32(value) => serializer.serialize_newtype_variant("Value", 12, "F32", &value.to_bits()),
+            Self::F64(value) => serializer.serialize_newtype_variant("Value", 13, "F64", &value.to_bits()),
+        }
+    }
+}
+
+pub struct FloatListSlice<'a> {
+    view: ListView<'a>,
+    range: Range<usize>,
+}
+
+impl Serialize for FloatListSlice<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.range.clone().map(|index| self.view.typed_float(index).expect("float component")))
+    }
+}
+
 impl<'a> ListView<'a> {
     pub fn len(self) -> usize {
         match self {
@@ -44,6 +85,35 @@ impl<'a> ListView<'a> {
     pub fn is_empty(self) -> bool { self.len() == 0 }
 
     pub fn is_float(self) -> bool { matches!(self, Self::F32(_) | Self::F64(_) | Self::Union(_)) }
+
+    pub fn float_slice(self, range: Range<usize>) -> Option<FloatListSlice<'a>> {
+        (self.is_float() && range.start <= range.end && range.end <= self.len())
+            .then_some(FloatListSlice { view: self, range })
+    }
+
+    pub fn typed_float(self, index: usize) -> Option<FloatComponent> {
+        if index >= self.len() { return None; }
+        match self {
+            Self::F32(values) => Some(if values.is_null(index) { FloatComponent::Null } else { FloatComponent::F32(values.value(index)) }),
+            Self::F64(values) => Some(if values.is_null(index) { FloatComponent::Null } else { FloatComponent::F64(values.value(index)) }),
+            Self::Union(values) => FloatComponent::read(values.child(values.type_id(index)).as_ref(), values.value_offset(index)),
+            Self::Numeric(values) => {
+                let array = values.array();
+                if let Some(union) = array.as_any().downcast_ref::<UnionArray>() {
+                    FloatComponent::read(union.child(union.type_id(index)).as_ref(), union.value_offset(index))
+                } else {
+                    FloatComponent::read(array.as_ref(), index)
+                }
+            }
+            Self::Scalars(_) => None,
+            Self::Values(values) => match &values[index] {
+                Value::Null => Some(FloatComponent::Null),
+                Value::F32(value) => Some(FloatComponent::F32(*value)),
+                Value::F64(value) => Some(FloatComponent::F64(*value)),
+                _ => None,
+            },
+        }
+    }
 
     pub fn get(self, index: usize) -> Option<Cow<'a, Value>> {
         if index >= self.len() { return None; }
@@ -429,7 +499,20 @@ impl PartialEq for ListValue {
 
 impl Serialize for ListValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.iter())
+        use serde::ser::SerializeSeq;
+        let view = self.view();
+        if let Some(floats) = view.float_slice(0..view.len()) {
+            return floats.serialize(serializer);
+        }
+        let mut sequence = serializer.serialize_seq(Some(view.len()))?;
+        for index in 0..view.len() {
+            if let Some(component) = view.typed_float(index) {
+                sequence.serialize_element(&component)?;
+            } else {
+                sequence.serialize_element(&view.get(index).expect("index in list"))?;
+            }
+        }
+        sequence.end()
     }
 }
 
@@ -437,4 +520,15 @@ impl<'de> Deserialize<'de> for ListValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         Vec::<Value>::deserialize(deserializer).map(Self::from)
     }
+}
+
+#[test]
+fn packed_list_serialization_retains_the_value_tags_and_float_bits() {
+    let raw = vec![Value::F32(-0.0), Value::Null, Value::F64(f64::from_bits(0xfff8_0000_0000_4321))];
+    let packed = ListValue::from(raw.clone());
+    let view = packed.view();
+    assert!(matches!(view, ListView::Union(_)));
+    let expected = serde_json::to_vec(&raw).unwrap();
+    assert_eq!(serde_json::to_vec(&packed).unwrap(), expected);
+    assert_eq!(serde_json::to_vec(&view.float_slice(1..3).unwrap()).unwrap(), serde_json::to_vec(&raw[1..]).unwrap());
 }

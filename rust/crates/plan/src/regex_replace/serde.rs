@@ -38,7 +38,10 @@ impl Serialize for ValueSer<'_> {
         match self.0.kind() {
             V::Text(value) => serializer.serialize_newtype_variant("Value", 14, "Utf8", value),
             V::Keyword(value) => serializer.serialize_newtype_variant("Value", 28, "Keyword", value),
-            V::Leaf(value) => value.value().serialize(serializer),
+            V::Leaf(value) => match value.packed_float() {
+                Some(component) => component.serialize(serializer),
+                None => value.value().serialize(serializer),
+            },
             V::List(values) => serializer.serialize_newtype_variant("Value", 35, "List", &ValueSequence(values)),
             V::Set(values) => serializer.serialize_newtype_variant("Value", 36, "Set", &ValueSequence(values)),
             V::Map { entries, sorted } => { let mut object = serializer.serialize_struct_variant("Value", 37, "Map", 2)?; object.serialize_field("entries", &ValuePairs(entries))?; object.serialize_field("sorted", &sorted)?; object.end() }

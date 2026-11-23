@@ -72,6 +72,7 @@
 -- Every reference has its own replay position and every outstanding page retains its own memory.
 -- Measured operators reserve against sibling scopes of the same query budget.
 -- Each operator can report its own retained-allocation peak and the query reports the peak across all operators.
+-- EXPLAIN renders packed floating-point literals from their Arrow children at the original float width.
 -- EXPLAIN ANALYZE measures the opened Arrow operators when the query uses Arrow execution.
 -- A direct Arrow parameter projection charges its own operator scope when traced.
 -- Native query spans use the application name of their connection.
