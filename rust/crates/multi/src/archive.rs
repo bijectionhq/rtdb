@@ -2153,7 +2153,7 @@ pub(crate) async fn restore_checkpoint(
         .ok_or_else(|| inconsistent("Missing the accepted checkpoint restore"))?;
     await_storage_drain(directory, storage, keys, &fenced).await?;
     let source = administration_stream(directory, &fenced, maximum_message_bytes).await?;
-    let sealed = rtdb_logkeeper::seal(&source, pending.epoch).await?;
+    let sealed = rtdb_logkeeper::seal_recover_committed(&source, pending.epoch).await?;
     let cutoff = ReplicaPosition::from_epoch_offset(StorageEpoch(fenced.log_epoch), sealed.0)?;
     if cutoff.0 < pending.checkpoint.boundary {
         return Err(inconsistent("The sealed replica history ends before the archived checkpoint"));

@@ -84,6 +84,11 @@ impl Ensemble {
 
     pub fn stream(&self) -> String { self.config.stream.clone() }
 
+    pub fn supports_guarded(&self) -> bool {
+        self.config.write_quorum > self.len() - self.config.write_quorum
+            && self.config.servers.iter().all(|server| server.journal().is_some())
+    }
+
     fn unexpected(&self, server: usize, reply: ResponseBody) -> Error {
         let address = self.links[server].address();
         match reply {
@@ -214,7 +219,17 @@ impl Ensemble {
 
     pub async fn digest_page(&self, server: usize, from_lsn: i64, through_lsn: i64, preceding_digest: Option<[u8; 32]>) -> Result<PageDigest> {
         let preceding_digest = preceding_digest.map_or_else(Bytes::new, |digest| Bytes::copy_from_slice(&digest));
-        let request = RequestBody::DigestPage(DigestPage { stream: self.stream(), from_lsn, through_lsn, preceding_digest });
+        self.read_digest(server, DigestPage { stream: self.stream(), from_lsn, through_lsn, preceding_digest, sealed_epoch: None }).await
+    }
+
+    pub async fn guarded_digest(&self, server: usize, lsn: i64, epoch: u64) -> Result<PageDigest> {
+        self.read_digest(server, DigestPage {
+            stream: self.stream(), from_lsn: lsn, through_lsn: lsn, preceding_digest: Bytes::new(), sealed_epoch: Some(epoch),
+        }).await
+    }
+
+    async fn read_digest(&self, server: usize, page: DigestPage) -> Result<PageDigest> {
+        let request = RequestBody::DigestPage(page);
         match self.links[server].call(request).await? {
             ResponseBody::PageDigest(page) => Ok(page),
             other => Err(self.unexpected(server, other)),

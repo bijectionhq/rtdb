@@ -499,6 +499,7 @@ impl Journal {
             let mut state = placed.slot.state.lock();
             let Some(held) = state.held_mut(entry.lsn) else { continue };
             let same = held.epoch == entry.epoch && held.timestamp == entry.timestamp
+                && held.guarded == entry.guarded
                 && matches!(&held.payload, Stored::Pending(payload) if payload.as_ptr() == entry.payload.as_ptr() && payload.len() == entry.payload.len());
             if same {
                 held.payload = Stored::Written(location);
@@ -563,7 +564,7 @@ impl Journal {
                 };
                 let start = buffer.len();
                 let length = payload.len() as u32;
-                frame(id, Kind::Append(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload }), &mut buffer);
+                frame(id, Kind::Append(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload }), &mut buffer);
                 locations.push(Location { segment: sequence, offset: written + start as u64, length: (buffer.len() - start) as u32, payload: length });
                 if let Some(clock_upper_micros) = held.observed_sync.as_ref().and_then(|sample| sample.get().copied()) {
                     frame(id, Kind::ObservedSync(ObservedSync { lsn, epoch: held.epoch,
@@ -645,7 +646,7 @@ impl Journal {
                     payload
                 }
             };
-            entries.push(Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, payload });
+            entries.push(Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, payload });
         }
         Ok(Entries { entries, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn })
     }
@@ -714,11 +715,11 @@ impl Replay {
                     if entry.lsn != state.last() + 1 { return Err(corrupt(path, format!("stream {stream}'s entry {} follows {}", entry.lsn, state.last()))); }
                     let location = Location { segment: sequence, offset: at, length: framed as u32, payload: entry.payload.len() as u32 };
                     state.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
-                        payload: Stored::Written(location), observed_sync: None });
+                        guarded: entry.guarded, payload: Stored::Written(location), observed_sync: None });
                 }
                 Kind::ObservedSync(observation) => {
                     let matches = state.held_mut(observation.lsn)
-                        .is_some_and(|entry| entry.epoch == observation.epoch && entry.timestamp == observation.timestamp);
+                        .is_some_and(|entry| entry.guarded && entry.epoch == observation.epoch && entry.timestamp == observation.timestamp);
                     if !matches || observation.clock_upper_micros <= 0 ||
                         !state.track_sync(observation.lsn, Arc::new(OnceLock::from(observation.clock_upper_micros)))
                     {
@@ -831,7 +832,7 @@ pub fn inspect_retained_with_prefix(data_dir: &Path, stream: &str, requested: Op
             file = Some((location.segment, File::open(path).map_err(|error| io_error(path, error))?));
         }
         let payload = read_payload(&file.as_ref().expect("opened segment").1, path, lsn, location)?;
-        digest.append(&Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload });
+        digest.append(&Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload });
     }
     Ok(Some(JournalDigest { stream: stream.to_owned(), interval: [chain_first, last], digest: digest.digest() }))
 }
@@ -885,9 +886,9 @@ mod tests {
 
     const UNBOUNDED: usize = usize::MAX;
 
-    fn entry(lsn: i64) -> Entry { Entry { lsn, epoch: 1, timestamp: lsn, payload: Bytes::from(format!("entry {lsn}")) } }
+    fn entry(lsn: i64) -> Entry { Entry { lsn, epoch: 1, timestamp: lsn, guarded: false, payload: Bytes::from(format!("entry {lsn}")) } }
 
-    fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
+    fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
     fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, authority_revision: None, observed_append: None } }
 
@@ -919,7 +920,7 @@ mod tests {
     fn retained(journal: &Journal, slot: &Slot) -> Vec<Entry> {
         let window = {
             let state = slot.state.lock();
-            state.window(state.trim + 1, state.last(), UNBOUNDED, UNBOUNDED, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, source: journal.source(&held.payload) })
+            state.window(state.trim + 1, state.last(), UNBOUNDED, UNBOUNDED, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, source: journal.source(&held.payload) })
         };
         journal.resolve(window).unwrap().entries
     }
@@ -972,7 +973,7 @@ mod tests {
         let observation = Arc::new(OnceLock::new());
         let events = {
             let mut state = stream.state.lock();
-            let events = state.append(1, 0, vec![entry(0)], -1).events;
+            let events = state.append(1, 0, vec![Entry { guarded: true, ..entry(0) }], -1).events;
             assert!(state.track_sync(0, Arc::clone(&observation)));
             events
         };
@@ -986,13 +987,16 @@ mod tests {
         let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = recovered_slots(recovered).remove("timed").unwrap();
         assert_eq!(stream.state.lock().sync_observation(0).unwrap().get().copied(), Some(original));
-        decide(&journal, &stream, |state| state.overwrite(2, 0, vec![sized(0, 2, 3)], true, 0));
+        decide(&journal, &stream, |state| state.seal(2));
+        assert!(stream.state.lock().guarded_at_seal(2, 0));
+        decide(&journal, &stream, |state| state.overwrite(2, 0, vec![Entry { guarded: true, ..entry(0) }], true, 0));
         assert!(stream.state.lock().sync_observation(0).is_none());
         drop(journal);
 
         let (_, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = recovered_slots(recovered).remove("timed").unwrap();
         assert!(stream.state.lock().sync_observation(0).is_none());
+        assert!(stream.state.lock().guarded_at_seal(2, 0));
     }
 
     #[test]
@@ -1121,7 +1125,7 @@ mod tests {
         frame(7, Kind::Declare("a/b".into()), &mut buffer);
         frame(7, Kind::Promise(4), &mut buffer);
         let good = buffer.len();
-        frame(7, Kind::Append(Entry { lsn: 0, epoch: 4, timestamp: 1, payload: Bytes::from_static(b"torn") }), &mut buffer);
+        frame(7, Kind::Append(Entry { lsn: 0, epoch: 4, timestamp: 1, guarded: false, payload: Bytes::from_static(b"torn") }), &mut buffer);
         fs::write(&path, &buffer[..buffer.len() - 3]).unwrap();
         let (journal, recovered, _) = Journal::open(directory.path(), true, UNBOUNDED, None).unwrap();
         assert_eq!((recovered.len(), recovered[0].name.as_str(), recovered[0].state.promised, recovered[0].state.last()), (1, "a/b", 4, -1));

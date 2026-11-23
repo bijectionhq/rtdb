@@ -427,7 +427,7 @@ mod tests {
         let key_bytes = [4; crate::keys::KEY_BYTES];
         let receipt = encode(&terminal)?;
         let artifact = ReplicaArtifact::new(&bucket, legacy_archive_key(&key_bytes)?, checkpoint_transfer_prefix(&target, operation), receipt.clone(), b"test\0")?;
-        let entry = ArchivedReplicaEntry { lsn: 8, epoch: 1, timestamp: 11, payload: Bytes::from_static(b"inline") };
+        let entry = ArchivedReplicaEntry { lsn: 8, epoch: 1, timestamp: 11, payload: Bytes::from_static(b"inline"), ..Default::default() };
         let object = key(&format!("{}/checkpoint-transfers/{operation}.v1", target.storage_prefix()))?;
         let mut plaintext = (receipt.len() as u32).to_be_bytes().to_vec();
         plaintext.extend_from_slice(&receipt);

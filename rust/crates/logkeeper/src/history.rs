@@ -37,6 +37,7 @@ impl RetainedChain {
         link.update(entry.timestamp.to_be_bytes());
         link.update((entry.payload.len() as u64).to_be_bytes());
         link.update(&entry.payload);
+        if entry.guarded { link.update(b"rtdb.logkeeper/guarded-entry\0"); }
         self.0 = link.finalize();
     }
 

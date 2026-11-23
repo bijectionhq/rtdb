@@ -42,6 +42,7 @@ impl Payload for Bytes {
 pub struct Held<P = Bytes> {
     pub epoch: u64,
     pub timestamp: i64,
+    pub guarded: bool,
     pub payload: P,
     pub(super) observed_sync: Option<Arc<OnceLock<i64>>>,
 }
@@ -134,13 +135,18 @@ impl<P: Payload> StreamState<P> {
         self.entries.get_mut((lsn - self.trim - 1) as usize)
     }
 
+    pub(super) fn guarded_at_seal(&self, epoch: u64, lsn: i64) -> bool {
+        self.promised == epoch && lsn > self.trim && self.entries.get((lsn - (self.trim + 1)) as usize)
+            .is_some_and(|held| held.guarded && held.epoch < epoch)
+    }
+
     pub(super) fn sync_observation(&self, lsn: i64) -> Option<Arc<OnceLock<i64>>> {
         if lsn <= self.trim { return None; }
         self.entries.get((lsn - (self.trim + 1)) as usize)?.observed_sync.clone()
     }
 
     pub(super) fn track_sync(&mut self, lsn: i64, observation: Arc<OnceLock<i64>>) -> bool {
-        let Some(held) = self.held_mut(lsn).filter(|held| held.observed_sync.is_none()) else { return false; };
+        let Some(held) = self.held_mut(lsn).filter(|held| held.guarded && held.observed_sync.is_none()) else { return false; };
         held.observed_sync = Some(observation);
         self.retained_bytes += SYNC_OBSERVATION_OVERHEAD;
         true
@@ -168,7 +174,7 @@ impl<P: Payload> StreamState<P> {
             }
             Event::Append(entry) => {
                 self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
-                    payload: P::decided(&entry.payload), observed_sync: None });
+                    guarded: entry.guarded, payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
             Event::Trim(through) => {
@@ -322,6 +328,7 @@ impl<P: Payload> StreamState<P> {
             last_lsn: self.last(),
             commit_lsn: self.commit,
             runs: self.runs(),
+            guarded_tail: self.entries.back().is_some_and(|entry| entry.guarded),
         })
     }
 
@@ -346,7 +353,7 @@ impl<P: Payload> StreamState<P> {
 #[cfg(any(test, feature = "simulation"))]
 impl StreamState<Bytes> {
     pub fn entries(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Entries {
-        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload: held.payload.clone() });
+        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, payload: held.payload.clone() });
         Entries { entries: window.items, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn }
     }
 }
@@ -355,7 +362,7 @@ impl StreamState<Bytes> {
 mod tests {
     use super::*;
 
-    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
+    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
 
     fn synced(epoch: u64) -> StreamState {
         let mut state = <StreamState>::default();
