@@ -237,7 +237,7 @@ pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V2: &str = "rtdb.owned.PublishHeldWorldRetention.v2";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
-pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
+pub(crate) const COMMIT_HELD_WORLDS_V5: &str = "rtdb.owned.CommitHeldWorlds.v5";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -473,6 +473,16 @@ struct HostedWorldRead {
     witnesses: Vec<OwnedWorldWitness>,
     clock: Option<rtdb_types::WorldClockLimit>,
     _reservation: Arc<MemoryReservation>,
+}
+
+fn take_held_world_observations(worlds: &mut [HostedWorldRead]) -> Result<rtdb_node::OwnedWorldObservations, Status> {
+    let mut observed = rtdb_node::OwnedWorldObservations::default();
+    for read in worlds {
+        read.held.snapshot.check().map_err(status)?;
+        observed.checks.append(&mut read.witnesses);
+        observed.clocks.extend(read.clock.map(|clock| (clock, read.held.snapshot.evidence_until())));
+    }
+    Ok(observed)
 }
 
 struct OwnedRankRequest<'a> {
@@ -1089,7 +1099,7 @@ impl Service {
 
     async fn owned_write_reply_with_reads(
         &self, call: &Call, mut operations: Vec<TxOp>, witnesses: Witnesses,
-        worlds: Vec<HostedWorldRead>,
+        mut worlds: Vec<HostedWorldRead>,
     ) -> Result<ActionResult, Status> {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
@@ -1108,21 +1118,13 @@ impl Service {
                 operations.push(evidence.clone().operation());
             }
         }
-        let mut holds = Vec::new();
         if !worlds.is_empty() {
-            let mut checks = Vec::new();
-            let mut clocks = Vec::new();
-            for read in worlds {
-                read.held.snapshot.check().map_err(status)?;
-                checks.extend(read.witnesses);
-                clocks.extend(read.clock.map(|clock| (clock, read.held.snapshot.evidence_until())));
-                holds.push((read.held, read._reservation));
-            }
-            native.append_hosted_world_read_checks(&mut operations, checks, clocks).map_err(status)?;
+            let observed = take_held_world_observations(&mut worlds)?;
+            native.append_hosted_world_read_checks(&mut operations, observed).map_err(status)?;
         }
         operations.extend(refusal.into_iter().flatten());
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
-        drop(holds);
+        drop(worlds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
         self.owned_tx_reply(outcome.tx_key())
@@ -3377,7 +3379,21 @@ impl Service {
                 attempt: attempt.to_owned(), effect,
             });
         }
+        let (mut observations, body) = if let Some(body) = body.strip_prefix(&[0, 0]) {
+            (Vec::new(), body)
+        } else {
+            self.hosted_world_read_prefix(call, body)?
+        };
+        if count + observations.len() > 8 || observations.iter().any(|read| worlds.contains(&read.held.world)) {
+            return Err(invalid("World batch observations must fit the batch and use independent worlds"));
+        }
+        let observed_ops = observations.iter()
+            .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some())).sum::<usize>();
+        rows_left = rows_left.checked_sub(observed_ops).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
         let ([root_kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing Root section kind"))?;
+        if !observations.is_empty() && *root_kind >= 3 {
+            return Err(invalid("Independent observers require an ordinary world batch"));
+        }
         let (root_read, body) = match *root_kind {
             0 => (None, body),
             1 | 2 | 3 | 4 | 5 | 6 | 7 => {
@@ -3501,10 +3517,12 @@ impl Service {
             }
             root.checks.push(evidence.clone().operation());
         }
+        let observed = take_held_world_observations(&mut observations)?;
         let committed = host.commit_world_batch(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            sections, root, *fingerprint, controls, deadline,
+            sections, root, observed, *fingerprint, controls, deadline,
         ).await.map_err(status)?;
+        drop(observations);
         self.owned_tx_reply(committed)
     }
 

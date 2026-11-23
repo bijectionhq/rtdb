@@ -143,7 +143,7 @@ impl Service {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])
                 }
-                crate::owned_actions::COMMIT_HELD_WORLDS_V4 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HELD_WORLDS_V5 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {
                     let _: ActionBeginTransactionRequest = unpack(&action.body)?;

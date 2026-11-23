@@ -336,7 +336,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 55 } else { 13 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 56 } else { 13 },
             pgwire_arrow_copy_out: true,
         };
         let mut output = std::io::stdout().lock();
