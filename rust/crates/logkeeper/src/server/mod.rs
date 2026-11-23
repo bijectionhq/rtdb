@@ -278,6 +278,13 @@ async fn connection(
                     let _ = replies.send(Response { id, body: Some(body) });
                 });
             }
+            Some(RequestBody::VoteDecision(request)) => {
+                let (store, replies) = (Arc::clone(&store), replies.clone());
+                tasks.spawn(async move {
+                    let body = store.vote_decision(request).await;
+                    let _ = replies.send(Response { id, body: Some(body) });
+                });
+            }
             Some(RequestBody::DigestPage(page)) => {
                 let (store, replies) = (Arc::clone(&store), replies.clone());
                 tasks.spawn(async move {
@@ -342,7 +349,7 @@ mod tests {
         let task = tokio::spawn(journal.serve(listener, stop.clone()));
         let mut socket = TcpStream::connect(address).await.unwrap();
         for (id, epoch, target_journal) in [(1, 9, uuid::Uuid::new_v4().to_string()), (2, 1, expected)] {
-            let request = Request { id, target_journal, body: Some(RequestBody::Seal(Seal { stream: "a".into(), epoch })) };
+            let request = Request { id, target_journal, body: Some(RequestBody::Seal(Seal { stream: "a".into(), epoch, nonce: Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes()) })) };
             let mut frame = BytesMut::new();
             encode_frame(&request, &mut frame);
             socket.write_all(&frame).await.unwrap();

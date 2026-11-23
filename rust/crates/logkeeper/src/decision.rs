@@ -72,6 +72,14 @@ pub struct DecisionStatement {
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
+pub(crate) struct DecisionVoteRequest {
+    #[prost(message, required, tag = "1")]
+    pub statement: DecisionStatement,
+    #[prost(message, optional, tag = "2")]
+    pub previous: Option<StableDecision>,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
 pub struct DecisionVote {
     #[prost(bytes = "bytes", tag = "1")]
     pub key: Bytes,
@@ -146,6 +154,10 @@ impl DecisionStatement {
             key: Bytes::copy_from_slice(&signer.public_key()),
             signature: Bytes::copy_from_slice(&signer.sign(&self.installation_bytes())),
         }
+    }
+
+    pub(crate) fn origin_digest(&self) -> [u8; 32] {
+        crate::history::RetainedChain::new(&self.scope.stream, self.prefix.predecessor + 1).bytes()
     }
 
     pub fn fingerprint(&self) -> [u8; 32] {

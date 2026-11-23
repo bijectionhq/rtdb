@@ -37,12 +37,12 @@ pub(super) fn matches_body(available: usize, declared: usize, actual_checksum: u
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(
-    requires encode(Record { stream, kind: Some(kind), active_ensemble: empty(), original_append: None }).len() <= u32::MAX,
+    requires encode(Record { stream, kind: Some(kind), active_ensemble: empty(), original_append: None, certified: false }).len() <= u32::MAX,
     ensures final(buffer)@ == old(buffer)@ + frame_bytes(encode(
-        Record { stream, kind: Some(kind), active_ensemble: empty(), original_append: None })),
+        Record { stream, kind: Some(kind), active_ensemble: empty(), original_append: None, certified: false })),
 ))]
 pub(super) fn frame(stream: u64, kind: Kind, buffer: &mut BytesMut) {
-    frame_record(Record { stream, kind: Some(kind), active_ensemble: empty_bytes(), original_append: None }, buffer)
+    frame_record(Record { stream, kind: Some(kind), active_ensemble: empty_bytes(), original_append: None, certified: false }, buffer)
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(

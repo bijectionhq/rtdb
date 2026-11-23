@@ -27,6 +27,8 @@ use super::payload::{Item, Source, Stored};
 #[cfg(not(verus_keep_ghost))]
 use super::state::{Decision, StreamState, Window, WriterAuthority};
 #[cfg(not(verus_keep_ghost))]
+use crate::decision::DecisionVoteRequest;
+#[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
 #[cfg(not(verus_keep_ghost))]
 use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, ReadIndexReply, RequestBody, ResponseBody};
@@ -182,7 +184,7 @@ impl Store {
             return Outcome::Now(failed("the journal has stopped"));
         };
         if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
-        let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
+        let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision + '_>) = match body {
             RequestBody::Append(append) => (append.stream, Box::new(move |state| {
                 state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn)
             })),
@@ -200,7 +202,7 @@ impl Store {
             RequestBody::Overwrite(overwrite) => {
                 let Ok(ensemble) = overwrite.activate_ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
                 if !overwrite.complete { return Outcome::Now(failed("activation requires a complete overwrite")); }
-                (overwrite.stream, Box::new(move |state| state.repair(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.commit_lsn, ensemble)))
+                (overwrite.stream, Box::new(move |state| state.repair(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.commit_lsn, ensemble, overwrite.certified)))
             }
             RequestBody::Commit(commit) => {
                 let Ok(ensemble) = commit.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid decision ensemble")); };
@@ -210,7 +212,33 @@ impl Store {
                 let Ok(ensemble) = commit.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid publication ensemble")); };
                 (commit.stream, Box::new(move |state| state.publish(commit.epoch, commit.commit_lsn, ensemble)))
             }
-            RequestBody::Seal(seal) => (seal.stream, Box::new(move |state| state.seal(seal.epoch))),
+            RequestBody::InstallDecision(certificate) => {
+                if !self.journal.is_durable() || !certificate.authentic() {
+                    return Outcome::Now(failed("invalid portable decision certificate"));
+                }
+                let reply = certificate.statement.installation(&self.journal.signer);
+                (certificate.statement.scope.stream.clone(), Box::new(move |state| state.install_certificate(&certificate, reply)))
+            }
+            RequestBody::PublishDecision(proof) => {
+                if !self.journal.is_durable() || !proof.authentic() {
+                    return Outcome::Now(failed("invalid quorum installation proof"));
+                }
+                let key = self.journal.signer.public_key();
+                // Only a voter has checked this exact prefix against local payloads.
+                let replay = proof.certificate.votes.iter().any(|vote| vote.key.as_ref() == key);
+                (proof.certificate.statement.scope.stream.clone(), Box::new(move |state| state.expose_certificate(proof, replay)))
+            }
+            RequestBody::Seal(seal) => {
+                if seal.nonce.len() != 16 { return Outcome::Now(failed("invalid seal nonce")); }
+                let signer = &self.journal.signer;
+                (seal.stream.clone(), Box::new(move |state| {
+                    let mut decision = state.seal(seal.epoch);
+                    if let ResponseBody::Sealed(reply) = &mut decision.reply {
+                        reply.sign(&seal, signer);
+                    }
+                    decision
+                }))
+            }
             RequestBody::Trim(trim) => (trim.stream, Box::new(move |state| state.trim(trim.through_lsn))),
             RequestBody::TrimDurable(trim) => {
                 if !self.journal.is_durable() { return Outcome::Now(failed("durable trim requires a journal with fsync")); }
@@ -220,7 +248,7 @@ impl Store {
             RequestBody::CheckSynced(check) => return self.check_after_durability(&check.stream, admission, |state| state.check_synced(check.epoch)),
             RequestBody::ActivateLoglet(check) => {
                 let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
-                (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble)))
+                (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble, check.certified)))
             }
             RequestBody::ReadIndex(request) => {
                 if !self.journal.is_durable() { return Outcome::Now(failed("read indexes require a durable journal")); }
@@ -228,15 +256,29 @@ impl Store {
                 if request.nonce.len() != 16 { return Outcome::Now(failed("invalid read index nonce")); }
                 let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
                 return self.check_after_durability(&check.stream, admission, |state| {
-                    match state.read_index(check.epoch, ensemble) {
-                        ResponseBody::Accepted(accepted) => ResponseBody::ReadIndex(ReadIndexReply {
+                    match state.read_index(check.epoch, ensemble, check.certified) {
+                        ResponseBody::Accepted(accepted) => {
+                            let mut reply = ReadIndexReply {
                             nonce: request.nonce, decided: state.installed, visible: accepted.commit_lsn,
-                        }),
+                            certificate: state.certificate.as_ref().filter(|certificate| {
+                                certificate.statement.scope.epoch == check.epoch
+                                    && certificate.statement.scope.ensemble() == Some(ensemble)
+                            }).cloned(),
+                            stability: state.stability.as_ref().filter(|proof| {
+                                proof.certificate.statement.scope.epoch == check.epoch
+                                    && proof.certificate.statement.scope.ensemble() == Some(ensemble)
+                            }).cloned(),
+                            key: Bytes::new(),
+                            signature: Bytes::new(),
+                            };
+                            reply.sign(&check, &self.journal.signer);
+                            ResponseBody::ReadIndex(reply)
+                        }
                         other => other,
                     }
                 });
             }
-            RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) | RequestBody::Identify(_) | RequestBody::ConfirmAuthority(_) => return Outcome::Now(failed("not a direct mutation")),
+            RequestBody::VoteDecision(_) | RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) | RequestBody::DigestPage(_) | RequestBody::Identify(_) | RequestBody::ConfirmAuthority(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();
@@ -370,6 +412,96 @@ impl Store {
             Ok(Ok(entries)) => ResponseBody::Entries(entries),
             Ok(Err(error)) => failed(format!("reading the segments failed: {error}")),
             Err(error) => failed(format!("reading the segments failed: {error}")),
+        }
+    }
+
+    pub async fn vote_decision(&self, request: DecisionVoteRequest) -> ResponseBody {
+        let statement = request.statement;
+        let prefix = &statement.prefix;
+        if !self.journal.is_durable() || !statement.valid() {
+            return failed("invalid decision statement");
+        }
+        let own_id = crate::attestation::journal_id(&self.journal.signer.public_key()).to_string();
+        if statement.scope.journals.binary_search(&own_id).is_err() {
+            return failed("the receiving journal is outside the decision scope");
+        }
+        let previous = request.previous;
+        if let Some(proof) = &previous {
+            let earlier = &proof.certificate.statement;
+            if !proof.authentic() || earlier.scope != statement.scope
+                || earlier.prefix.through != prefix.predecessor
+                || earlier.prefix.digest != prefix.predecessor_digest
+            {
+                return failed("invalid certified predecessor");
+            }
+        } else if prefix.predecessor_digest.as_ref() != statement.origin_digest() {
+            return failed("invalid activation predecessor digest");
+        }
+        let Ok(_permit) = self.digest_pages.try_acquire() else { return failed("decision proof capacity exhausted"); };
+        let Some(slot) = self.existing(&statement.scope.stream) else { return failed("the decision stream was not found"); };
+        let first = prefix.predecessor + 1;
+        let (selection, durable, original) = {
+            let state = slot.state.lock();
+            if state.promised > statement.scope.epoch {
+                return ResponseBody::Refused(Refused { promised: state.promised, last_lsn: state.last() });
+            }
+            if !state.admits_decision(&statement)
+                || (previous.is_none() && (state.certificate.as_ref().is_some_and(|cut| {
+                    cut.statement.scope == statement.scope && cut.statement != statement
+                }) || state.commit != prefix.predecessor))
+                || first <= state.trim || prefix.through > state.last()
+            {
+                return failed("the journal does not hold the exact candidate suffix");
+            }
+            let original = prefix.guarded.then(|| state.sync_observation(prefix.through)).flatten();
+            let selection = self.select(&state, first, prefix.through, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
+            let (done, durable) = oneshot::channel();
+            let work = Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done,
+                _admission: None, authority_revision: None, observed_append: None };
+            if self.queue.send(work).is_err() {
+                return failed("the journal has stopped");
+            }
+            (selection, durable, original)
+        };
+        if !matches!(durable.await, Ok(Ok(()))) {
+            return failed("the candidate suffix is unavailable");
+        }
+        let journal = Arc::clone(&self.journal);
+        match tokio::task::spawn_blocking(move || {
+            let prefix = &statement.prefix;
+            let original_upper = original.as_ref().and_then(|sample| sample.get().copied());
+            if prefix.guarded && !original_upper.is_some_and(|upper| crate::protocol::before_guarded_cutoff(upper, prefix.guarded_before)) {
+                return failed("the guarded decision requires this journal's timely original observation");
+            }
+            let Ok(entries) = journal.resolve(selection) else { return failed("could not read the candidate suffix"); };
+            if entries.entries.first().map(|entry| entry.lsn) != Some(first)
+                || entries.entries.last().map(|entry| entry.lsn) != Some(prefix.through)
+            {
+                return failed("the candidate suffix exceeds one decision page");
+            }
+            let mut chain = RetainedChain::from_bytes(prefix.predecessor_digest.as_ref().try_into().expect("validated decision digest"));
+            for (ordinal, entry) in entries.entries.iter().enumerate() {
+                if first.checked_add(ordinal as i64) != Some(entry.lsn)
+                    || entry.epoch != statement.scope.epoch
+                    || entry.guarded != prefix.guarded
+                    || entry.guarded_before != prefix.guarded_before
+                    || entry.timed_origin.as_ref().is_some_and(|origin| {
+                        origin.stream != statement.scope.stream || origin.journals != statement.scope.journals
+                            || origin.write_quorum != u64::from(statement.scope.quorum)
+                            || !origin.original_entry_sha256.is_empty()
+                    })
+                {
+                    return failed("the candidate suffix does not match the decision admission");
+                }
+                chain.append(entry);
+            }
+            if prefix.digest.as_ref() != chain.bytes() {
+                return failed("the candidate suffix does not match the decision digest");
+            }
+            ResponseBody::DecisionVote(statement.vote(&journal.signer, original_upper))
+        }).await {
+            Ok(reply) => reply,
+            Err(error) => failed(error.to_string()),
         }
     }
 
@@ -510,7 +642,7 @@ mod tests {
         let (queue, mut work) = mpsc::unbounded_channel();
         let store = Store::new(Arc::new(journal), recovered, queue);
         let overwrite = |stream: &str| RequestBody::Overwrite(Overwrite {
-            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(),
+            stream: stream.into(), epoch: 1, from_lsn: 0, entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(), certified: false,
         });
         assert!(matches!(store.mutate(overwrite("first"), MAXIMUM_FRAME_BYTES).await, Outcome::Durable(_, _)));
         let mut second = Box::pin(store.mutate(overwrite("second"), 32));
@@ -534,7 +666,7 @@ mod tests {
         assert!(matches!(store.mutate(check(), 32).await, Outcome::Now(ResponseBody::Refused(_))));
         let incoming = RequestBody::Overwrite(Overwrite {
             stream: "pending-sync".into(), epoch: 2, from_lsn: 0,
-            entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(),
+            entries: Vec::new(), complete: true, commit_lsn: -1, activate_ensemble: Bytes::new(), certified: false,
         });
         let Outcome::Durable(installed, ResponseBody::Accepted(_)) = store.mutate(incoming, 32).await else {
             panic!("the complete overwrite must wait for the journal");
@@ -560,11 +692,11 @@ mod tests {
         let journal = Arc::new(journal);
         let (queue, work) = mpsc::unbounded_channel();
         let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
-        let check = |ensemble| LogletCheck { stream: "authority".into(), epoch: 2, ensemble };
+        let check = |ensemble| LogletCheck { stream: "authority".into(), epoch: 2, ensemble, certified: false };
         let ensemble = Bytes::from_static(&[7; 32]);
         let Outcome::Durable(installed, _) = store.mutate(RequestBody::Overwrite(Overwrite {
             stream: "authority".into(), epoch: 2, from_lsn: 0, entries: Vec::new(),
-            complete: true, commit_lsn: -1, activate_ensemble: ensemble.clone(),
+            complete: true, commit_lsn: -1, activate_ensemble: ensemble.clone(), certified: false,
         }), 32).await else { panic!("the ensemble needs a journal write"); };
         assert!(matches!(store.confirm_authority(check(ensemble.clone())), ResponseBody::Refused(_)));
 
@@ -591,7 +723,7 @@ mod tests {
             from_lsn: 0,
             entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, guarded: false, guarded_before: None, timed_origin: None, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
-            commit_lsn: 0, activate_ensemble: Bytes::new(),
+            commit_lsn: 0, activate_ensemble: Bytes::new(), certified: false,
         }), 2 << 20).await, Outcome::Durable(_, _)));
         let slot = store.existing("drop-me").unwrap();
         let capture = Captured { slot: Arc::clone(&slot), state: slot.state.lock().clone() };

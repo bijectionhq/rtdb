@@ -5,6 +5,7 @@
 
 #[cfg(any(test, feature = "simulation"))]
 use crate::protocol::Entries;
+use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionStatement, StableDecision};
 use crate::protocol::{Accepted, Entry, EpochRun, Refused, ResponseBody, Sealed, TimedJournalOrigin};
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -17,11 +18,13 @@ const SYNC_OBSERVATION_OVERHEAD: usize = 64;
 pub enum Event {
     Promise(u64),
     Synced(Option<u64>),
-    Activate { epoch: u64, ensemble: [u8; 32] },
+    Activate { epoch: u64, ensemble: [u8; 32], certified: bool },
     /// Drops every entry at or above the lsn.
     Truncate(i64),
     Append(Entry),
     Install(i64),
+    InstallCertificate(DecisionCertificate),
+    ExposeCertificate { proof: StableDecision, replay: bool },
     Commit(i64),
     Trim(i64),
     Drop(u64),
@@ -78,10 +81,13 @@ pub struct StreamState<P = Bytes> {
     /// The epoch whose writer last brought this server up to that writer's whole history.
     pub synced: Option<u64>,
     pub(super) active_ensemble: Option<[u8; 32]>,
+    pub(super) certified: bool,
     /// Entries at or below this lsn are dropped.
     pub trim: i64,
     pub commit: i64,
     pub(super) installed: i64,
+    pub(super) certificate: Option<DecisionCertificate>,
+    pub(super) stability: Option<StableDecision>,
     /// Entry `i` has lsn `trim + 1 + i`.
     pub entries: VecDeque<Held<P>>,
     pub(super) epoch_runs: VecDeque<EpochRun>,
@@ -118,7 +124,7 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
 
 impl<P> Default for StreamState<P> {
     fn default() -> Self {
-        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, trim: -1, commit: -1, installed: -1, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
+        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, certified: false, trim: -1, commit: -1, installed: -1, certificate: None, stability: None, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
     }
 }
 
@@ -171,12 +177,14 @@ impl<P: Payload> StreamState<P> {
                 if *epoch > self.promised {
                     self.promised = *epoch;
                     self.active_ensemble = None;
+                    self.certified = false;
                 }
             }
             Event::Synced(epoch) => self.synced = *epoch,
-            Event::Activate { epoch, ensemble } => {
+            Event::Activate { epoch, ensemble, certified } => {
                 debug_assert_eq!(*epoch, self.promised);
                 self.active_ensemble = Some(*ensemble);
+                self.certified = *certified;
             }
             Event::Truncate(from) => {
                 let keep = (from - self.trim - 1).clamp(0, self.entries.len() as i64);
@@ -185,6 +193,9 @@ impl<P: Payload> StreamState<P> {
                 while self.epoch_runs.back().is_some_and(|run| run.start_lsn > last) { self.epoch_runs.pop_back(); }
                 self.commit = self.commit.min(last);
                 self.installed = self.installed.min(last);
+                if let Some(certificate) = &self.certificate {
+                    self.installed = self.installed.max(certificate.statement.prefix.through);
+                }
             }
             Event::Append(entry) => {
                 self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
@@ -192,6 +203,17 @@ impl<P: Payload> StreamState<P> {
                     payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Install(lsn) => self.installed = self.installed.max((*lsn).min(self.last())),
+            Event::InstallCertificate(certificate) => {
+                self.installed = self.installed.max(certificate.statement.prefix.through);
+                self.certificate = Some(certificate.clone());
+            }
+            Event::ExposeCertificate { proof, replay } => {
+                let through = proof.certificate.statement.prefix.through;
+                self.stability = Some(proof.clone());
+                if *replay && self.last() >= through {
+                    self.commit = self.commit.max(through);
+                }
+            }
             Event::Commit(lsn) => {
                 self.commit = self.commit.max((*lsn).min(self.last()));
                 self.installed = self.installed.max(self.commit);
@@ -244,7 +266,7 @@ impl<P: Payload> StreamState<P> {
             return invalid("an append's entries must be dense from its first lsn and carry its epoch");
         }
         let last = first + entries.len() as i64 - 1;
-        let commit = self.commit_event(commit, last);
+        let commit = if self.certified { None } else { self.commit_event(commit, last) };
         let events = entries.into_iter().map(Event::Append).chain(commit).collect();
         self.persist(events, Self::accepted)
     }
@@ -291,7 +313,7 @@ impl<P: Payload> StreamState<P> {
         events.extend(entries.into_iter().map(Event::Append));
         // A partial copy keeps the epoch the server was synced at: it still holds everything it held of that writer's committed history, so recovery must still count it as that writer's witness.
         if complete && self.synced != Some(epoch) { events.push(Event::Synced(Some(epoch))); }
-        if complete { events.extend(self.commit_event(commit, last)); }
+        if complete && !self.certified { events.extend(self.commit_event(commit, last)); }
         self.persist(events, Self::accepted)
     }
 
@@ -308,7 +330,7 @@ impl<P: Payload> StreamState<P> {
     }
 
     pub(super) fn commit_bound(&mut self, epoch: u64, through: i64, ensemble: [u8; 32]) -> Decision {
-        if self.active_ensemble.is_some_and(|active| active != ensemble) {
+        if self.certified || self.active_ensemble.is_some_and(|active| active != ensemble) {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
         self.commit(epoch, through)
@@ -316,20 +338,72 @@ impl<P: Payload> StreamState<P> {
 
     pub(super) fn publish(&mut self, epoch: u64, through: i64, ensemble: [u8; 32]) -> Decision {
         if let Some(refusal) = self.check_writer(epoch) { return Decision { events: Vec::new(), reply: refusal }; }
-        if self.active_ensemble != Some(ensemble) || self.installed < through {
+        if self.certified || self.active_ensemble != Some(ensemble) || self.installed < through {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
         let events = self.commit_event(through, self.last()).into_iter().collect();
         self.persist(events, Self::accepted)
     }
 
-    pub fn repair(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32]) -> Decision {
-        if self.promised == epoch && self.active_ensemble.is_some_and(|active| active != ensemble) {
+    pub(super) fn admits_decision(&self, statement: &DecisionStatement) -> bool {
+        self.certified && statement.scope.ensemble().is_some_and(|ensemble| {
+            self.writer_authority().confirms(statement.scope.epoch, ensemble)
+        })
+    }
+
+    fn certificate_event(&self, certificate: &DecisionCertificate) -> Result<Option<Event>, ()> {
+        let statement = &certificate.statement;
+        if !self.admits_decision(statement) {
+            return Err(());
+        }
+        if let Some(current) = self.certificate.as_ref()
+            && current.statement.scope == statement.scope
+        {
+            let old = current.statement.prefix.through;
+            let next = statement.prefix.through;
+            if old == next && current.statement != *statement {
+                return Err(());
+            }
+            if old >= next {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Event::InstallCertificate(certificate.clone())))
+    }
+
+    pub(super) fn install_certificate(&mut self, certificate: &DecisionCertificate, reply: DecisionInstallation) -> Decision {
+        let Ok(event) = self.certificate_event(certificate) else {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        };
+        self.persist(event.into_iter().collect(), |_| ResponseBody::DecisionInstallation(reply))
+    }
+
+    pub(super) fn expose_certificate(&mut self, proof: StableDecision, replay: bool) -> Decision {
+        let Ok(event) = self.certificate_event(&proof.certificate) else {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        };
+        if let Some(current) = &self.stability
+            && current.certificate.statement.scope == proof.certificate.statement.scope
+        {
+            let old = current.certificate.statement.prefix.through;
+            let next = proof.certificate.statement.prefix.through;
+            if old == next && current.certificate.statement != proof.certificate.statement {
+                return Decision { events: Vec::new(), reply: self.refused() };
+            }
+            if old > next || (old == next && self.commit >= next) {
+                return Decision { events: Vec::new(), reply: self.accepted() };
+            }
+        }
+        self.persist(event.into_iter().chain([Event::ExposeCertificate { proof, replay }]).collect(), Self::accepted)
+    }
+
+    pub fn repair(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32], certified: bool) -> Decision {
+        if self.promised == epoch && self.active_ensemble.is_some_and(|active| active != ensemble || self.certified != certified) {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
         let mut overwrite = self.overwrite(epoch, from, entries, true, commit);
         if matches!(overwrite.reply, ResponseBody::Accepted(_)) {
-            overwrite.events.extend(self.activate(epoch, ensemble).events);
+            overwrite.events.extend(self.activate(epoch, ensemble, certified).events);
         }
         overwrite
     }
@@ -363,16 +437,16 @@ impl<P: Payload> StreamState<P> {
         self.check_writer(epoch).unwrap_or_else(|| self.accepted())
     }
 
-    pub fn activate(&mut self, epoch: u64, ensemble: [u8; 32]) -> Decision {
-        if self.active_ensemble.is_some_and(|active| active != ensemble) || self.check_writer(epoch).is_some() {
+    pub fn activate(&mut self, epoch: u64, ensemble: [u8; 32], certified: bool) -> Decision {
+        if self.active_ensemble.is_some_and(|active| active != ensemble || self.certified != certified) || self.check_writer(epoch).is_some() {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
-        let events = self.active_ensemble.is_none().then_some(Event::Activate { epoch, ensemble }).into_iter().collect();
+        let events = self.active_ensemble.is_none().then_some(Event::Activate { epoch, ensemble, certified }).into_iter().collect();
         self.persist(events, Self::accepted)
     }
 
-    pub fn read_index(&self, epoch: u64, ensemble: [u8; 32]) -> ResponseBody {
-        if self.active_ensemble == Some(ensemble) { self.check_synced(epoch) } else { self.refused() }
+    pub fn read_index(&self, epoch: u64, ensemble: [u8; 32], certified: bool) -> ResponseBody {
+        if self.active_ensemble == Some(ensemble) && self.certified == certified { self.check_synced(epoch) } else { self.refused() }
     }
 
     pub fn drop_stream(&mut self, epoch: u64) -> Decision {
@@ -391,6 +465,10 @@ impl<P: Payload> StreamState<P> {
             commit_lsn: self.installed,
             runs: self.runs(),
             guarded_tail: self.entries.back().is_some_and(|entry| entry.guarded),
+            certificate: self.certificate.clone(),
+            stability: self.stability.clone(),
+            key: Bytes::new(),
+            signature: Bytes::new(),
         })
     }
 
@@ -452,7 +530,7 @@ mod tests {
         let mut state = synced(1);
         let guarded = Entry { guarded: true, ..entry(0, 1) };
         assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [1; 32])), ResponseBody::Refused(_)));
-        state.activate(1, [1; 32]);
+        state.activate(1, [1; 32], false);
         assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [2; 32])), ResponseBody::Refused(_)));
         assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [1; 32])), ResponseBody::Accepted(_)));
         state.seal(2);

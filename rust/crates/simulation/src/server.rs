@@ -115,7 +115,7 @@ impl Server {
         let changed = decision.events.iter().map(|event| match event {
             Event::Truncate(from) => Some(*from),
             Event::Append(entry) => Some(entry.lsn),
-            Event::Promise(_) | Event::Install(_) | Event::Commit(_) => Some(i64::MAX),
+            Event::Promise(_) | Event::Install(_) | Event::InstallCertificate(_) | Event::ExposeCertificate { .. } | Event::Commit(_) => Some(i64::MAX),
             Event::Synced(_) | Event::Activate { .. } | Event::Trim(_) | Event::Drop(_) => None,
         }).try_fold(i64::MAX, |low, from| from.map(|from| low.min(from)));
         let snapshot = sealing.then(|| held(&self.accepted));

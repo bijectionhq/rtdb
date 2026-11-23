@@ -2,8 +2,10 @@
 
 use super::connection::{Binding, Callback, Connection, connection, remote};
 use super::{JournalEndpoint, StreamConfig, read_index_evidence::valid_reply};
+use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionScope, DecisionStatement, DecisionVote, DecisionVoteRequest, StableDecision};
 use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexReply, ReadIndexRequest, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
 use bytes::{Bytes, BytesMut};
+use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
 use std::sync::Arc;
@@ -123,8 +125,12 @@ impl Ensemble {
     }
 
     pub async fn seal(&self, server: usize, epoch: u64) -> Result<Sealed> {
-        match self.links[server].call(RequestBody::Seal(Seal { stream: self.stream(), epoch })).await? {
-            ResponseBody::Sealed(sealed) => Ok(sealed),
+        let request = Seal {
+            stream: self.stream(), epoch, nonce: Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes()),
+        };
+        match self.links[server].call(RequestBody::Seal(request.clone())).await? {
+            ResponseBody::Sealed(sealed) if self.config.servers[server].journal()
+                .is_none_or(|journal| sealed.verifies(&request, journal)) => Ok(sealed),
             other => Err(self.unexpected(server, other)),
         }
     }
@@ -147,6 +153,109 @@ impl Ensemble {
     pub async fn retire(&self, server: usize, epoch: u64) -> Result<Ack> {
         let reply = self.links[server].call(RequestBody::Retire(Retire { stream: self.stream(), epoch })).await;
         self.ack(server, reply)
+    }
+
+    pub fn decision_scope(&self, epoch: u64) -> Option<DecisionScope> {
+        let mut journals: Vec<_> = self.config.servers.iter().map(|endpoint| {
+            endpoint.journal().map(str::to_owned)
+        }).collect::<Option<_>>()?;
+        journals.sort_unstable();
+        let scope = DecisionScope {
+            stream: self.stream(), epoch, journals, quorum: u32::try_from(self.config.write_quorum).ok()?,
+        };
+        (scope.ensemble()?.as_slice() == self.identity.as_ref()).then_some(scope)
+    }
+
+    fn decision_error(&self, message: &str) -> Error {
+        Error::Remote { key: self.stream(), message: message.into() }
+    }
+
+    async fn decision_vote(&self, server: usize, request: DecisionVoteRequest) -> Result<DecisionVote> {
+        let statement = request.statement.clone();
+        match self.links[server].call(RequestBody::VoteDecision(request)).await? {
+            ResponseBody::DecisionVote(vote) if self.config.servers[server].journal().is_some_and(|journal| statement.verify_vote(&vote).as_deref() == Some(journal)) => Ok(vote),
+            ResponseBody::Refused(refusal) if refusal.promised > statement.scope.epoch =>
+                Err(Error::Deposed { epoch: statement.scope.epoch, promised: refusal.promised }),
+            other => Err(self.unexpected(server, other)),
+        }
+    }
+
+    async fn install_decision(&self, server: usize, certificate: DecisionCertificate) -> Result<DecisionInstallation> {
+        let statement = certificate.statement.clone();
+        match self.links[server].call(RequestBody::InstallDecision(certificate)).await? {
+            ResponseBody::DecisionInstallation(installation) if self.config.servers[server].journal().is_some_and(|journal| statement.verify_installation(&installation).as_deref() == Some(journal)) =>
+                Ok(installation),
+            ResponseBody::Refused(refusal) if refusal.promised > statement.scope.epoch =>
+                Err(Error::Deposed { epoch: statement.scope.epoch, promised: refusal.promised }),
+            other => Err(self.unexpected(server, other)),
+        }
+    }
+
+    pub async fn certify(
+        &self, statement: DecisionStatement, previous: Option<StableDecision>,
+    ) -> Result<DecisionCertificate> {
+        let request = DecisionVoteRequest { statement: statement.clone(), previous };
+        let mut pending: FuturesUnordered<_> = (0..self.len()).map(|server| {
+            self.decision_vote(server, request.clone())
+        }).collect();
+        let mut votes = Vec::with_capacity(self.config.write_quorum);
+        while let Some(reply) = pending.next().await {
+            match reply {
+                Ok(vote) => votes.push(vote),
+                Err(error @ Error::Deposed { .. }) => return Err(error),
+                Err(_) => (),
+            }
+            if votes.len() == self.config.write_quorum {
+                return Ok(DecisionCertificate { statement, votes });
+            }
+        }
+        Err(self.decision_error("the candidate digest did not receive a durable payload quorum"))
+    }
+
+    pub async fn stabilize(&self, certificate: DecisionCertificate) -> Result<(StableDecision, Vec<usize>)> {
+        if self.decision_scope(certificate.statement.scope.epoch).as_ref() != Some(&certificate.statement.scope)
+            || !certificate.authentic()
+        {
+            return Err(self.decision_error("the selected certificate is outside the active loglet"));
+        }
+        let mut pending: FuturesUnordered<_> = (0..self.len()).map(|server| {
+            let certificate = certificate.clone();
+            async move { (server, self.install_decision(server, certificate).await) }
+        }).collect();
+        let mut installed = Vec::with_capacity(self.config.write_quorum);
+        let mut members = Vec::with_capacity(self.config.write_quorum);
+        while let Some((server, reply)) = pending.next().await {
+            match reply {
+                Ok(receipt) => {
+                    members.push(server);
+                    installed.push(receipt);
+                }
+                Err(error @ Error::Deposed { .. }) => return Err(error),
+                Err(_) => (),
+            }
+            if installed.len() == self.config.write_quorum {
+                return Ok((StableDecision { certificate, installed }, members));
+            }
+        }
+        Err(self.decision_error("the certificate was not installed by a quorum"))
+    }
+
+    pub fn publish_proof(&self, server: usize, proof: StableDecision, callback: Callback) {
+        self.links[server].send(RequestBody::PublishDecision(proof), callback);
+    }
+
+    pub async fn ensure_replay(&self, proof: StableDecision) -> Result<()> {
+        let selected = proof.certificate.statement.prefix.through;
+        let mut pending: FuturesUnordered<_> = (0..self.len()).map(|server| {
+            let body = RequestBody::PublishDecision(proof.clone());
+            async move { self.ack(server, self.links[server].call(body).await) }
+        }).collect();
+        while let Some(reply) = pending.next().await {
+            if matches!(reply, Ok(Ack::Accepted(accepted)) if accepted.commit_lsn >= selected) {
+                return Ok(());
+            }
+        }
+        Err(self.decision_error("the certified cut is not available for replay"))
     }
 
     fn decision_request(&self, epoch: u64, through: i64) -> Commit {
@@ -174,7 +283,7 @@ impl Ensemble {
     pub fn check_synced_request(&self, epoch: u64) -> RequestBody { RequestBody::CheckSynced(Check { stream: self.stream(), epoch }) }
 
     fn loglet_check(&self, epoch: u64) -> LogletCheck {
-        LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone() }
+        LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone(), certified: self.decision_scope(epoch).is_some() }
     }
 
     pub async fn confirm_authority(&self, server: usize, epoch: u64, port: u16) -> Result<Option<u64>> {
@@ -219,10 +328,12 @@ impl Ensemble {
     }
 
     pub async fn read_index(&self, server: usize, epoch: u64, nonce: [u8; 16]) -> Result<ReadIndexReply> {
-        let request = ReadIndexRequest { loglet: Some(self.loglet_check(epoch)), nonce: Bytes::copy_from_slice(&nonce) };
+        let check = self.loglet_check(epoch);
+        let request = ReadIndexRequest { loglet: Some(check.clone()), nonce: Bytes::copy_from_slice(&nonce) };
         match self.links[server].call(RequestBody::ReadIndex(request)).await? {
             ResponseBody::ReadIndex(reply) if <[u8; 16]>::try_from(reply.nonce.as_ref()).is_ok_and(|observed| {
                 valid_reply(u128::from_be_bytes(nonce), u128::from_be_bytes(observed), reply.decided, reply.visible)
+                    && self.config.servers[server].journal().is_none_or(|journal| reply.verifies(&check, journal))
             }) => Ok(reply),
             ResponseBody::Refused(refused) if refused.promised > epoch =>
                 Err(Error::Deposed { epoch, promised: refused.promised }),
@@ -241,13 +352,13 @@ impl Ensemble {
 
     pub fn repair_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64) -> RequestBody {
         RequestBody::Overwrite(Overwrite {
-            stream: self.stream(), epoch, from_lsn: from, entries, complete: true, commit_lsn: commit, activate_ensemble: self.identity.clone(),
+            stream: self.stream(), epoch, from_lsn: from, entries, complete: true, commit_lsn: commit, activate_ensemble: self.identity.clone(), certified: self.decision_scope(epoch).is_some(),
         })
     }
 
     pub async fn overwrite(&self, server: usize, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool) -> Result<Ack> {
         let body = RequestBody::Overwrite(Overwrite {
-            stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: -1, activate_ensemble: Bytes::new(),
+            stream: self.stream(), epoch, from_lsn: from, entries, complete, commit_lsn: -1, activate_ensemble: Bytes::new(), certified: false,
         });
         let reply = self.links[server].call(body).await;
         self.ack(server, reply)

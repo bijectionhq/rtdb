@@ -10,6 +10,7 @@ mod writer;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use crate::decision::{DecisionCertificate, StableDecision};
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message;
@@ -74,6 +75,7 @@ pub struct ActiveLogletReadIndex {
     epoch: u64,
     ensemble: Bytes,
     through: LogOffset,
+    decision: Option<StableDecision>,
 }
 
 impl ActiveLogletReadIndex {
@@ -81,6 +83,7 @@ impl ActiveLogletReadIndex {
     pub fn epoch(&self) -> u64 { self.epoch }
     pub fn ensemble(&self) -> &[u8] { &self.ensemble }
     pub fn through(&self) -> LogOffset { self.through }
+    pub fn decision(&self) -> Option<&StableDecision> { self.decision.as_ref() }
 }
 
 struct Shared {
@@ -389,10 +392,46 @@ impl QuorumLog {
                 }
             }
 
-            let selected = observed.iter().map(|(_, reply)| reply.decided).max().expect("nonempty quorum");
-            let confirmed = || ActiveLogletReadIndex {
-                stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(selected),
+            let confirmed = |through, decision| ActiveLogletReadIndex {
+                stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(),
+                through: LogOffset(through), decision,
             };
+            if let Some(scope) = ensemble.decision_scope(epoch) {
+                let mut selected: Option<&DecisionCertificate> = None;
+                for (_, reply) in &observed {
+                    let Some(candidate) = &reply.certificate else { continue; };
+                    if candidate.statement.scope != scope || !candidate.authentic() {
+                        return Err(unavailable("the read quorum returned an invalid decision certificate"));
+                    }
+                    if let Some(current) = selected {
+                        let old = current.statement.prefix.through;
+                        let new = candidate.statement.prefix.through;
+                        if old == new && current.statement != candidate.statement {
+                            return Err(unavailable("the read quorum returned conflicting decisions"));
+                        }
+                        if old >= new { continue; }
+                    }
+                    selected = Some(candidate);
+                }
+                let Some(certificate) = selected else {
+                    let inherited = observed.iter().map(|(_, reply)| reply.visible).max().expect("nonempty quorum");
+                    return Ok(confirmed(inherited, None));
+                };
+                let through = certificate.statement.prefix.through;
+                let proof = observed.iter().filter_map(|(_, reply)| reply.stability.as_ref())
+                    .find(|proof| proof.certificate.statement == certificate.statement && proof.authentic());
+                let proof = match proof {
+                    Some(proof) => proof.clone(),
+                    None => ensemble.stabilize(certificate.clone()).await?.0,
+                };
+                if !observed.iter().any(|(_, reply)| reply.visible >= through) {
+                    ensemble.ensure_replay(proof.clone()).await?;
+                }
+                return Ok(confirmed(through, Some(proof)));
+            }
+
+            let selected = observed.iter().map(|(_, reply)| reply.decided).max().expect("nonempty quorum");
+            let confirmed = || confirmed(selected, None);
             if observed.iter().any(|(_, reply)| reply.visible >= selected) {
                 return Ok(confirmed());
             }

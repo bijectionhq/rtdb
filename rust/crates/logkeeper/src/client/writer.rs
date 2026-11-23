@@ -8,6 +8,8 @@ use super::guarded_recovery::{
     predecessor_commit_target, recover_guarded_tail, recovery_commit_quorum, sealed_journal_evidence, valid_guarded_source,
 };
 use super::recovery::{Holding, plan_repair, winner};
+use crate::decision::{DecisionPrefix, DecisionStatement, StableDecision};
+use crate::history::RetainedChain;
 use crate::protocol::{Accepted, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -143,6 +145,8 @@ struct Pipeline {
     next_lsn: i64,
     commit: i64,
     publication: Option<i64>,
+    stability: Option<StableDecision>,
+    activation_floor: i64,
     history: Holding,
     /// Entry `i` has lsn `buffer_first + i`; it holds every uncommitted entry and some recent committed ones.
     buffer_first: i64,
@@ -560,7 +564,7 @@ impl Writer {
         } else {
             Replica { acked: -1, installed: -1, installing: -1, publishing: -1, link: Link::Down(long_ago) }
         }).collect();
-        let pipeline = Pipeline { next_lsn: last + 1, commit: last, publication: None, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
+        let pipeline = Pipeline { next_lsn: last + 1, commit: last, publication: None, stability: None, activation_floor: last, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
         let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0 });
         {
             let mut state = writer.state.lock();
@@ -715,7 +719,120 @@ impl Writer {
         }
     }
 
+    fn advance_certified(self: &Arc<Self>, pipeline: &mut Pipeline, scope: crate::decision::DecisionScope) {
+        if pipeline.publication.is_some() {
+            return;
+        }
+        let write_quorum = self.ensemble.config.write_quorum;
+        let available = if let Some(flight) = &pipeline.guarded {
+            if !GuardedFlight::has_quorum(&flight.originals, write_quorum) { return; }
+            flight.lsn
+        } else {
+            let mut staged: Vec<_> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
+            staged.select_nth_unstable_by(write_quorum - 1, |left, right| right.cmp(left));
+            staged[write_quorum - 1].min(pipeline.next_lsn - 1)
+        };
+        if available <= pipeline.commit { return; }
+
+        let predecessor = pipeline.commit;
+        let first = (predecessor + 1 - pipeline.buffer_first) as usize;
+        let previous = pipeline.stability.clone();
+        let mut chain = match &previous {
+            Some(proof) => RetainedChain::from_bytes(
+                proof.certificate.statement.prefix.digest.as_ref().try_into().expect("certified prefix digest"),
+            ),
+            None => RetainedChain::new(&scope.stream, predecessor + 1),
+        };
+        let predecessor_digest = Bytes::copy_from_slice(&chain.bytes());
+        let mut through = predecessor;
+        let mut guarded_before = None;
+        let mut bytes = 0usize;
+        for buffered in pipeline.buffer.iter().skip(first).take(1024) {
+            let entry = &buffered.entry;
+            bytes = bytes.saturating_add(entry.payload.len())
+                .saturating_add(entry.timed_origin.as_ref().map_or(0, prost::Message::encoded_len));
+            if entry.lsn > available || (through > predecessor && bytes > (4 << 20)) {
+                break;
+            }
+            through = entry.lsn;
+            guarded_before = entry.guarded_before;
+            chain.append(entry);
+        }
+        if through == predecessor { return; }
+        let statement = DecisionStatement { scope, prefix: DecisionPrefix {
+            predecessor, predecessor_digest, through, digest: Bytes::copy_from_slice(&chain.bytes()),
+            guarded: pipeline.guarded.is_some(), guarded_before,
+        }};
+        pipeline.publication = Some(through);
+        let writer = Arc::downgrade(self);
+        let ensemble = Arc::clone(&self.ensemble);
+        tokio::spawn(async move {
+            let mut certificate = None;
+            loop {
+                let outcome = async {
+                    if certificate.is_none() {
+                        certificate = Some(ensemble.certify(statement.clone(), previous.clone()).await?);
+                    }
+                    ensemble.stabilize(certificate.clone().expect("certificate selected")).await
+                }.await;
+                let Some(owner) = writer.upgrade() else { return; };
+                match outcome {
+                    Err(error) if !matches!(error, Error::Deposed { .. }) => {
+                        if !owner.uncertain_certified(through) { return; }
+                    }
+                    settled => {
+                        owner.finish_certified(through, settled);
+                        return;
+                    }
+                }
+                drop(owner);
+                tokio::time::sleep(REPAIR_BACKOFF).await;
+            }
+        });
+    }
+
+    fn uncertain_certified(&self, through: i64) -> bool {
+        let mut state = self.state.lock();
+        let State::Open(pipeline) = &mut *state else { return false; };
+        for buffered in pipeline.buffer.iter_mut().take_while(|buffered| buffered.entry.lsn <= through) {
+            if let Some(receipt) = buffered.receipt.take() {
+                let _ = receipt.send(Err(Error::Remote {
+                    key: self.ensemble.stream(),
+                    message: "the decision outcome is unknown".into(),
+                }));
+            }
+        }
+        true
+    }
+
+    fn finish_certified(self: &Arc<Self>, through: i64, outcome: Result<(StableDecision, Vec<usize>)>) {
+        let mut state = self.state.lock();
+        if let Err(Error::Deposed { promised, .. }) = &outcome {
+            return self.depose(&mut state, *promised);
+        }
+        let State::Open(pipeline) = &mut *state else { return; };
+        debug_assert_eq!(pipeline.publication, Some(through));
+        pipeline.publication = None;
+        match outcome {
+            Ok((proof, installers)) => {
+                for server in installers { pipeline.replicas[server].installed = through; }
+                pipeline.guarded = None;
+                pipeline.stability = Some(proof.clone());
+                self.release(pipeline, through);
+                for server in 0..self.ensemble.len() {
+                    self.ensemble.publish_proof(server, proof.clone(), Box::new(|_| {}));
+                }
+                self.advance(pipeline);
+                self.repair_down(pipeline);
+            }
+            Err(_) => unreachable!("nonterminal decisions are retried before settlement"),
+        }
+    }
+
     fn advance(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        if let Some(scope) = self.ensemble.decision_scope(self.epoch) {
+            return self.advance_certified(pipeline, scope);
+        }
         let write_quorum = self.ensemble.config.write_quorum;
         if let Some(flight) = &mut pipeline.guarded && flight.begin_commit(write_quorum) {
             let flight = pipeline.guarded.as_ref().expect("started under the writer lock");
@@ -766,6 +883,9 @@ impl Writer {
     }
 
     fn publish_stable(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        if self.ensemble.decision_scope(self.epoch).is_some() {
+            return;
+        }
         let through = pipeline.commit;
         for server in 0..pipeline.replicas.len() {
             let replica = &mut pipeline.replicas[server];
@@ -872,7 +992,8 @@ impl Writer {
                 if from >= pipeline.buffer_first {
                     if pipeline.guarded.is_some() { return Err(self.guarded_outcome_unknown()); }
                     let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
-                    let body = ensemble.repair_request(epoch, from, entries, pipeline.commit);
+                    let inherited = if ensemble.decision_scope(epoch).is_some() { pipeline.activation_floor } else { pipeline.commit };
+                    let body = ensemble.repair_request(epoch, from, entries, inherited);
                     pipeline.replicas[server].link = Link::Live;
                     self.send(pipeline, server, body);
                     return Ok(());
