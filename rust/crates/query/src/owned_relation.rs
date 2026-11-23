@@ -332,14 +332,35 @@ pub async fn owned_identity_candidates(
     Ok(OwnedIdentityCandidates { keys, _charges: charges })
 }
 
-/// Reads one full identity in a relation's private uniqueness table.
-pub async fn open_owned_unique_point(
-    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, columns: &[&str],
+/// Resolve the winning key projection over a valid window at this snapshot.
+pub async fn open_owned_key_timeline(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Interval, column: &str,
 ) -> Result<Option<QueryCursor>> {
-    if owner.is_empty() {
-        return Err(Anomaly::incorrect("rtdb.owned/no-owner", "Owned relations require an authenticated principal"));
-    }
-    open_owned_table_point(context, relation.unique_table(owner), id.iid(), Some(id), None, Some(columns), false).await
+    if owner.is_empty() || valid.is_empty() { return Err(address_unavailable()); }
+    open_owned_table_point(
+        context, relation.table(owner), id.iid(), Some(id), Some(valid), Some(&[column]), true,
+    ).await
+}
+
+/// Read the private policy or an exact valid instant of a unique claim.
+pub async fn open_owned_unique_point(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Option<Interval>, columns: &[&str],
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() { return Err(address_unavailable()); }
+    open_owned_table_point(context, relation.unique_table(owner), id.iid(), Some(id), valid, Some(columns), false).await
+}
+
+/// Resolve all winning holders of one complete key in the requested period.
+pub async fn open_owned_unique_timeline(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,
+    valid: Interval,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || valid.is_empty() { return Err(address_unavailable()); }
+    open_owned_table_point(
+        context, relation.unique_table(owner), id.iid(), Some(id), Some(valid), Some(&["holder"]), true,
+    ).await
 }
 
 /// Reads one complete key from a protected capacity counter table.

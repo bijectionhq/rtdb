@@ -22,13 +22,18 @@ pub(super) struct OwnedUniqueChanges {
 struct TouchedPath {
     policy: OwnedUniquePolicy,
     writes: i64,
-    ids: BTreeSet<EntityId>,
+    affected: BTreeMap<EntityId, Vec<Interval>>,
 }
 
 #[derive(Default)]
 struct KeyChange {
-    release: Option<EntityId>,
-    claim: Option<EntityId>,
+    releases: Vec<Segment<EntityId>>,
+    claims: Vec<Segment<EntityId>>,
+}
+
+struct Segment<T> {
+    valid: Interval,
+    value: T,
 }
 
 impl OpenTransaction<'_> {
@@ -87,7 +92,7 @@ impl OpenTransaction<'_> {
             return Err(invalid_key());
         }
         if let Some((schema, _)) = self.read_owned_schema(owner, relation).await? {
-            if schema.path_column_type(column) != Some(ScalarType::Binary) {
+            if schema.lifetime_micros().is_some() || schema.path_column_type(column) != Some(ScalarType::Binary) {
                 return Err(invalid_key());
             }
         } else if snapshot.contains_table(&target) {
@@ -108,7 +113,7 @@ impl OpenTransaction<'_> {
             Some(TouchedPath {
                 policy,
                 writes: 0,
-                ids: BTreeSet::new(),
+                affected: BTreeMap::new(),
             }),
         );
         Ok(())
@@ -132,35 +137,27 @@ impl OpenTransaction<'_> {
             let path = (!policy.paths.is_empty()).then_some(TouchedPath {
                 policy,
                 writes: 0,
-                ids: BTreeSet::new(),
+                affected: BTreeMap::new(),
             });
             self.unique_changes.paths.insert(relation.clone(), path);
         }
-        let valid_at = self.owned_constraint_present();
         if let Some(path) = self
             .unique_changes
             .paths
             .get_mut(relation)
             .and_then(Option::as_mut)
         {
-            if valid.lower() != valid_at || valid.upper() != Timestamp::MAX || valid.is_empty() {
-                return Err(Anomaly::incorrect(
-                    "rtdb.owned/unique-valid-time",
-                    "Unique writes require validity from ordered present without an end",
-                ));
+            if valid.is_empty() {
+                return Err(invalid_key());
             }
             path.writes = path.writes.checked_add(1).ok_or_else(overflow)?;
-            if !path.ids.contains(id) {
-                let bytes = id
-                    .as_value()
-                    .retained_bytes()?
-                    .checked_add(1024)
-                    .ok_or_else(overflow)?;
-                self.unique_changes
-                    .reservations
-                    .push(self.context.memory.reserve(bytes)?);
-                path.ids.insert(id.clone());
-            }
+            let new_id = if path.affected.contains_key(id) {
+                0
+            } else {
+                id.as_value().retained_bytes()?.checked_add(1024).ok_or_else(overflow)?
+            };
+            self.unique_changes.reservations.push(self.context.memory.reserve(new_id + 64)?);
+            path.affected.entry(id.clone()).or_default().push(valid);
         }
         Ok(())
     }
@@ -171,7 +168,7 @@ impl OpenTransaction<'_> {
             .paths
             .values()
             .flatten()
-            .all(|path| path.ids.is_empty())
+            .all(|path| path.affected.is_empty())
         {
             return Ok(());
         }
@@ -187,7 +184,7 @@ impl OpenTransaction<'_> {
         for (relation, path) in changes.paths {
             let Some(TouchedPath {
                 mut policy,
-                ids,
+                affected,
                 writes,
             }) = path
             else {
@@ -209,7 +206,7 @@ impl OpenTransaction<'_> {
             let _locators = self
                 .context
                 .memory
-                .reserve(64 + ids.len() * policy.paths.len() * 128)?;
+                .reserve(64 + affected.len() * policy.paths.len() * 128)?;
             let mut locators =
                 BTreeSet::from([EntityId::String(OWNED_UNIQUE_POLICY_ID.into()).iid()]);
             let mut proof = self.hosted_replay.as_ref().map(|_| ConstraintMembers::default());
@@ -219,7 +216,7 @@ impl OpenTransaction<'_> {
                     &relation,
                     path,
                     column,
-                    &ids,
+                    &affected,
                     &base,
                     &next,
                     &mut locators,
@@ -248,7 +245,7 @@ impl OpenTransaction<'_> {
         relation: &OwnedRelation,
         path: &OwnedRelation,
         column: &str,
-        ids: &BTreeSet<EntityId>,
+        affected: &BTreeMap<EntityId, Vec<Interval>>,
         base: &Snapshot,
         next: &Snapshot,
         locators: &mut BTreeSet<Iid>,
@@ -256,31 +253,22 @@ impl OpenTransaction<'_> {
     ) -> Result<()> {
         let mut keys = BTreeMap::<Vec<u8>, KeyChange>::new();
         let mut allocations = Vec::new();
-        for id in ids {
-            for (snapshot, final_state) in [(base, false), (next, true)] {
-                let Some(key) = self
-                    .read_unique_key(snapshot.clone(), owner, relation, id, column)
-                    .await?
-                else {
-                    continue;
-                };
-                allocations.push(
-                    self.context
-                        .memory
-                        .reserve((key.len() + path.name().len()) * 4 + 512)?,
-                );
-                let change = keys.entry(key).or_default();
-                let slot = if final_state {
-                    &mut change.claim
-                } else {
-                    &mut change.release
-                };
-                if slot.replace(id.clone()).is_some() {
-                    return Err(if final_state {
-                        unique_taken()
-                    } else {
-                        unique_uncovered()
-                    });
+        for (id, windows) in affected {
+            for valid in merge_windows(windows.clone())? {
+                for (snapshot, final_state) in [(base, false), (next, true)] {
+                    let context = self.context.query_context(
+                        snapshot.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+                    )?;
+                    let cursor = rtdb_query::open_owned_key_timeline(
+                        context, owner, relation, id, valid, column,
+                    ).await?;
+                    for part in self.read_unique_segments(cursor, id, valid, column, &mut allocations).await? {
+                        let key = unique_key(part.value)?;
+                        allocations.push(self.context.memory.reserve(id.as_value().retained_bytes()?.saturating_add(256))?);
+                        let change = keys.entry(key).or_default();
+                        let side = if final_state { &mut change.claims } else { &mut change.releases };
+                        side.push(Segment { valid: part.valid, value: id.clone() });
+                    }
                 }
             }
         }
@@ -291,38 +279,76 @@ impl OpenTransaction<'_> {
             if !locators.insert(locator.iid()) {
                 return Err(unique_uncovered());
             }
-            let occupant = self
-                .read_unique_cell(base.clone(), owner, relation, &locator, "holder")
-                .await?
-                .map(|value| value.entity_id().map_err(|_| unique_uncovered()))
-                .transpose()?;
-            match (occupant.as_ref(), change.release.as_ref()) {
-                (Some(_), None) => return Err(unique_taken()),
-                (actual, expected) if actual != expected => return Err(unique_uncovered()),
-                _ => (),
-            }
-            if change.claim == change.release {
-                continue;
-            }
-            if let Some(proof) = proof.as_deref_mut() {
-                let member = change.claim.as_ref().map_or(ConstraintMember::Removed, ConstraintMember::Holder);
-                proof.insert(&locator, member, &self.context.memory)?;
-            }
-            if let Some(holder) = change.claim {
-                self.buffer.put(
-                    storage.clone(),
-                    StructFields::from([
-                        ("_id".into(), locator.as_value()),
-                        ("holder".into(), holder.as_value()),
-                    ]),
-                    Interval::ALL,
+            let windows = change.releases.iter().chain(&change.claims).map(|part| part.valid).collect();
+            let mut holders = Vec::new();
+            for valid in merge_windows(windows)? {
+                let context = self.context.query_context(
+                    base.clone(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
                 )?;
-            } else {
-                self.buffer
-                    .delete(storage.clone(), &locator, Interval::ALL)?;
+                let cursor = rtdb_query::open_owned_unique_timeline(context, owner, relation, &locator, valid).await?;
+                for part in self.read_unique_segments(cursor, &locator, valid, "holder", &mut allocations).await? {
+                    holders.push(Segment { valid: part.valid, value: part.value.entity_id().map_err(|_| unique_uncovered())? });
+                }
+            }
+            for Segment { valid, value: holder } in final_holders(change, holders)? {
+                if let Some(proof) = proof.as_deref_mut() {
+                    proof.insert(&locator, ConstraintMember::Occupancy { valid, holder: holder.as_ref() }, &self.context.memory)?;
+                }
+                if let Some(holder) = holder {
+                    self.buffer.put(
+                        storage.clone(),
+                        StructFields::from([
+                            ("_id".into(), locator.as_value()),
+                            ("holder".into(), holder.as_value()),
+                        ]),
+                        valid,
+                    )?;
+                } else {
+                    self.buffer.delete(storage.clone(), &locator, valid)?;
+                }
             }
         }
         Ok(())
+    }
+
+    async fn read_unique_segments(
+        &self,
+        cursor: Option<QueryCursor>,
+        id: &EntityId,
+        window: Interval,
+        column: &str,
+        allocations: &mut Vec<Arc<MemoryReservation>>,
+    ) -> Result<Vec<Segment<Value>>> {
+        let Some(mut cursor) = cursor else { return Ok(Vec::new()); };
+        let mut segments = Vec::new();
+        let mut through = window.lower();
+        while let Some(batch) = cursor.next_batch().await? {
+            self.context.check_cancelled()?;
+            let batch = batch.batch();
+            for row in 0..batch.num_rows() {
+                rtdb_query::owned_row_revision(batch, row, id, &self.context.memory)?;
+                let edge = |name: &str| {
+                    batch.column_by_name(name)
+                        .and_then(|array| array.as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>())
+                        .ok_or_else(unique_uncovered)
+                };
+                let start = edge("_valid_from")?;
+                let end = edge("_valid_to")?;
+                if start.is_null(row) {
+                    return Err(unique_uncovered());
+                }
+                let lower = Timestamp(start.value(row));
+                let upper = if end.is_null(row) { Timestamp::MAX } else { Timestamp(end.value(row)) };
+                if lower < through || lower >= upper || upper > window.upper() {
+                    return Err(unique_uncovered());
+                }
+                through = upper;
+                let value = self.read_occupancy_value_at(batch, row, column, unique_uncovered)?;
+                allocations.push(self.context.memory.reserve(value.retained_bytes()?.saturating_add(512))?);
+                segments.push(Segment { valid: Interval::new(lower, upper)?, value });
+            }
+        }
+        Ok(segments)
     }
 
     pub(super) async fn check_unique_schema(
@@ -364,26 +390,6 @@ impl OpenTransaction<'_> {
         rtdb_query::read_owned_unique_policy(context, owner, relation).await
     }
 
-    async fn read_unique_key(
-        &self, snapshot: Snapshot, owner: &str, relation: &OwnedRelation, id: &EntityId, column: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let valid = Interval::at(self.owned_constraint_present())?;
-        let cursor = rtdb_query::open_owned_point(context, owner, relation, id, Some(valid), Some(&[column])).await?;
-        match self.read_occupancy_cell(cursor, id, column, unique_uncovered).await? {
-            None => Ok(None),
-            Some(value) => Ok(Some(unique_key(value)?)),
-        }
-    }
-
-    async fn read_unique_cell(
-        &self, snapshot: Snapshot, owner: &str, relation: &OwnedRelation, id: &EntityId, column: &str,
-    ) -> Result<Option<Value>> {
-        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let cursor = rtdb_query::open_owned_unique_point(context, owner, relation, id, &[column]).await?;
-        self.read_occupancy_cell(cursor, id, column, unique_uncovered).await
-    }
-
     pub(super) async fn read_occupancy_cell(&self, cursor: Option<QueryCursor>, id: &EntityId, column: &str, uncovered: fn() -> Anomaly) -> Result<Option<Value>> {
         self.read_occupancy_row(cursor, id, uncovered).await?
             .map(|row| self.read_occupancy_value(row.batch(), column, uncovered)).transpose()
@@ -409,6 +415,72 @@ impl OpenTransaction<'_> {
     pub(super) fn read_occupancy_value_at(&self, rows: &RecordBatch, row: usize, column: &str, uncovered: fn() -> Anomaly) -> Result<Value> {
         occupancy_value_at(&self.context.memory, rows, row, column, uncovered)
     }
+}
+
+fn merge_windows(mut windows: Vec<Interval>) -> Result<Vec<Interval>> {
+    windows.sort_unstable();
+    let mut merged: Vec<Interval> = Vec::new();
+    for window in windows {
+        if let Some(last) = merged.last_mut().filter(|last| window.lower() <= last.upper()) {
+            *last = Interval::new(last.lower(), last.upper().max(window.upper()))?;
+        } else {
+            merged.push(window);
+        }
+    }
+    Ok(merged)
+}
+
+fn final_holders(
+    mut change: KeyChange,
+    mut existing: Vec<Segment<EntityId>>,
+) -> Result<Vec<Segment<Option<EntityId>>>> {
+    ordered_segments(&mut change.claims, unique_taken)?;
+    ordered_segments(&mut change.releases, unique_uncovered)?;
+    ordered_segments(&mut existing, unique_uncovered)?;
+    let edges: BTreeSet<_> = change.claims.iter().chain(&change.releases).chain(&existing)
+        .flat_map(|part| [part.valid.lower(), part.valid.upper()]).collect();
+    let mut updates: Vec<Segment<Option<EntityId>>> = Vec::new();
+    let (mut old, mut releases, mut claims) = (existing.as_slice(), change.releases.as_slice(), change.claims.as_slice());
+    for (lower, upper) in edges.iter().copied().zip(edges.iter().copied().skip(1)) {
+        let holder = holder_at(&mut old, lower);
+        let release = holder_at(&mut releases, lower);
+        let claim = holder_at(&mut claims, lower);
+        if release.is_some() && release != holder {
+            return Err(unique_uncovered());
+        }
+        if claim.is_some() && release.is_none() && holder.is_some() {
+            return Err(unique_taken());
+        }
+        if (release.is_none() && claim.is_none()) || holder == claim {
+            continue;
+        }
+        if let Some(last) = updates.last_mut().filter(|last| {
+            last.valid.upper() == lower && last.value.as_ref() == claim
+        }) {
+            last.valid = Interval::new(last.valid.lower(), upper)?;
+        } else {
+            updates.push(Segment { valid: Interval::new(lower, upper)?, value: claim.cloned() });
+        }
+    }
+    Ok(updates)
+}
+
+fn ordered_segments(segments: &mut [Segment<EntityId>], overlap: fn() -> Anomaly) -> Result<()> {
+    segments.sort_unstable_by_key(|part| part.valid);
+    if segments.windows(2).any(|pair| pair[0].valid.intersects(pair[1].valid)) {
+        return Err(overlap());
+    }
+    Ok(())
+}
+
+fn holder_at<'a>(parts: &mut &'a [Segment<EntityId>], at: Timestamp) -> Option<&'a EntityId> {
+    while let Some((head, tail)) = (*parts).split_first() {
+        if head.valid.upper() > at {
+            return head.valid.contains(at).then_some(&head.value);
+        }
+        *parts = tail;
+    }
+    None
 }
 
 pub(super) fn occupancy_value_at(

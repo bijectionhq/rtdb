@@ -69,6 +69,7 @@ pub async fn read_owned_unique_policy(
         owner,
         relation,
         &id,
+        None,
         &["paths", "through_events"],
     )
     .await?;
@@ -137,8 +138,10 @@ pub async fn lookup_owned_unique(
         .memory
         .reserve((key.len() + path.name().len()) * 4 + 4096)?;
     let id = owned_unique_path_key(path, key);
-    let cursor =
-        open_owned_unique_point(context.clone(), owner, relation, &id, &["holder"]).await?;
+    let valid = Interval::at(valid)?;
+    let cursor = open_owned_unique_point(
+        context.clone(), owner, relation, &id, Some(valid), &["holder"],
+    ).await?;
     let Some(row) = single(cursor).await? else {
         return Ok(None);
     };
@@ -146,7 +149,6 @@ pub async fn lookup_owned_unique(
     let holder = cell(&row, "holder", &context)?
         .entity_id()
         .map_err(|_| uncovered())?;
-    let valid = Interval::at(valid)?;
     let cursor =
         open_owned_point(context.clone(), owner, relation, &holder, Some(valid), None).await?;
     let row = single(cursor).await?.ok_or_else(uncovered)?;

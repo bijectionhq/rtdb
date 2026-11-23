@@ -148,6 +148,11 @@
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
 -- A local tombstone or replacement masks the archived member with the same identity.
 -- A growth beyond the current maximum aborts the world writes and accompanying effects.
+-- A Root unique claim covers the fact's exact valid interval.
+-- The ordered resolver checks the final holders of each affected key over every changed interval.
+-- Adjacent claims may use the same key, and an overlapping claim aborts the transaction.
+-- A unique point resolves the holder at the same valid instant as the returned fact.
+-- Held replay certifies the locator, interval and holder of every derived unique occupancy change.
 -- A world unique claim checks final local occupancy and the exact archived occupant for its path and key.
 -- A final local shadow can withdraw an inherited occupant and transfer the unique key in the same ordered write.
 -- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.

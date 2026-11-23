@@ -3,12 +3,12 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::{Anomaly, EntityId, Result};
+use rtdb_types::{Anomaly, EntityId, Interval, Result};
 use sha2::{Digest, Sha256};
 
 pub(super) enum ConstraintMember<'a> {
     Removed,
-    Holder(&'a EntityId),
+    Occupancy { valid: Interval, holder: Option<&'a EntityId> },
     Count(i64),
 }
 
@@ -33,11 +33,19 @@ impl ConstraintMembers {
         frame(&mut event, id);
         match member {
             ConstraintMember::Removed => event.update([0]),
-            ConstraintMember::Holder(EntityId::String(holder)) => {
-                event.update([1]);
-                frame(&mut event, holder);
-            }
-            ConstraintMember::Holder(_) => return Err(invalid()),
+            ConstraintMember::Occupancy { valid, holder } => {
+                event.update([3]);
+                event.update(valid.lower().0.to_be_bytes());
+                event.update(valid.upper().0.to_be_bytes());
+                match holder {
+                    None => event.update([0]),
+                    Some(EntityId::String(holder)) => {
+                        event.update([1]);
+                        frame(&mut event, holder);
+                    },
+                    Some(_) => return Err(invalid()),
+                }
+            },
             ConstraintMember::Count(count) => {
                 event.update([2]);
                 event.update(count.to_be_bytes());

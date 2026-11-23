@@ -3534,6 +3534,82 @@ mod tests {
         accepted.check_final_constraints(&replacement).await
     }
 
+    #[tokio::test]
+    async fn owned_unique_claims_use_the_complete_valid_interval() -> Result<()> {
+        use rtdb_types::{EntityId, OwnedRelation, OwnedSchema};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            placed_receipt_retirement: false,
+            owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("valid-unique", 1)?),
+            world_constraints: None,
+            database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory),
+            query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(),
+            authorization: Arc::new(NoRoleChecks),
+            execution_observer: None,
+            tracer: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default())?;
+        let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
+        let relation = OwnedRelation::new("facts")?;
+        let path = OwnedRelation::new("by-key")?;
+        let schema = OwnedSchema::from_json(br#"{"fields":[
+            {"name":"key","type":{"kind":"binary"},"optional":false,"nullable":false}
+        ],"validity":"bounded_period"}"#)?;
+        let document = |id: &EntityId| crate::Documents::new(vec![StructFields::from([
+            ("_id".into(), id.as_value()),
+            ("key".into(), Value::Binary(b"shared".to_vec())),
+        ])], &memory);
+        let before = EntityId::String("before".into());
+        let next = EntityId::String("next".into());
+        let correction = EntityId::String("correction".into());
+        let first = TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) };
+        let mut tx = OpenTransaction::new(state.value().snapshot(), first, &options, &context)?;
+        tx.declare_owned_relation(&relation, &schema).await?;
+        tx.declare_owned_unique_path(&relation, &path, "key").await?;
+        tx.write_owned(&relation, &document(&before)?, None, Some(Timestamp(50)), Some(Timestamp(80)), false).await?;
+        tx.write_owned(&relation, &document(&next)?, None, Some(Timestamp(80)), Some(Timestamp(100)), false).await?;
+        tx.finish_owned_unique().await?;
+        let base = tx.snapshot()?;
+
+        let second = TransactionKey { tx_id: TxId(2), system_time: Timestamp(200) };
+        let mut overlapping = OpenTransaction::new(base.clone(), second, &options, &context)?;
+        overlapping.write_owned(&relation, &document(&correction)?, None, Some(Timestamp(60)), Some(Timestamp(70)), false).await?;
+        assert_eq!(overlapping.finish_owned_unique().await.unwrap_err().code, "rtdb.owned/unique-taken");
+
+        let mut replaced = OpenTransaction::new(base.clone(), second, &options, &context)?;
+        replaced.delete_owned(&relation, &before, Some(Timestamp(60)), Some(Timestamp(70))).await?;
+        replaced.write_owned(&relation, &document(&correction)?, None, Some(Timestamp(60)), Some(Timestamp(70)), false).await?;
+        replaced.finish_owned_unique().await?;
+        let corrected = replaced.snapshot()?;
+        for (snapshot, at, expected) in [
+            (base, 65, Some(&before)),
+            (corrected.clone(), 59, Some(&before)),
+            (corrected.clone(), 60, Some(&correction)),
+            (corrected.clone(), 70, Some(&before)),
+            (corrected.clone(), 80, Some(&next)),
+            (corrected, 100, None),
+        ] {
+            let query = context.query_context(snapshot, second.system_time, "UTC", None)?;
+            let hit = rtdb_query::lookup_owned_unique(
+                query, "owner", &relation, &path, "key", b"shared", Timestamp(at),
+            ).await?;
+            match expected {
+                Some(id) => {
+                    let hit = hit.expect("expected a unique holder");
+                    assert_eq!(rtdb_query::owned_row_revision(hit.row.batch(), 0, id, &memory)?, hit.revision);
+                },
+                None => assert!(hit.is_none()),
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn error_transaction_keys_preserve_jvm_instant_text() {
         for (micros, text) in [(0, "1970-01-01T00:00:00Z"), (-1, "1969-12-31T23:59:59.999999Z"), (1000, "1970-01-01T00:00:00.001Z"), (946_684_800_000_000, "2000-01-01T00:00:00Z")] {
