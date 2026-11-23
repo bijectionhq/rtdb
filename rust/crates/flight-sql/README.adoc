@@ -566,6 +566,10 @@ A retained Held fork has two independently certified destination positions, an i
 The reply carries the destination parent media and the optional Held ancestor media with its unchanged source world, pin and logical publication.
 World readmission binds both positions to the same Original replay before the restored world opens.
 
+Explicit earlier Root actions also accept a hold on a retained Held child.
+They resolve the selected position, schema, paths and purge history in its pinned Root archive.
+They return Root images and evidence at that position, including point absence and empty pages.
+
 `rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.

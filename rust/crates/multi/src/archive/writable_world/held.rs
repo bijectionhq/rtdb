@@ -801,8 +801,8 @@ impl HeldCheckpointWorld {
             }).collect::<Result<Vec<_>>>()?;
             Some((system, schemas))
         } else { None };
-        let ancestor_schemas = if self.ancestor().is_some() {
-            if parent_at.is_some() || earlier.is_some() || frontiers.iter().any(|frontier| *frontier != 0) {
+        let ancestor_schemas = if self.ancestor().is_some() && parent_at.is_none() {
+            if earlier.is_some() || frontiers.iter().any(|frontier| *frontier != 0) {
                 return Err(OwnedWorld::unavailable());
             }
             Some(partitions.iter().map(|(relation, _)| {
