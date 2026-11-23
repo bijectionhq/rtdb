@@ -173,7 +173,7 @@ mod tests {
         let body = ReplicaEnvelope {
             term: Term(1),
             term_sequence: Some(TermSequence(0)),
-            message: ReplicaBody::NoOp(NoOp { src_msg_id: None }),
+            message: ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() }),
         };
         let bytes = Bytes::from(body.encode());
         let epoch = StorageEpoch(0);
