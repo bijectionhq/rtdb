@@ -99,20 +99,37 @@ pub(crate) async fn observe_pack_index(store: &dyn ObjectStore, pack: &ObjectKey
 }
 
 async fn read_pack_index(store: &dyn ObjectStore, pack: &ObjectKey, head: ObjectObservation<StoredObject>) -> rtdb_storage::Result<ObjectObservation<PackIndex>> {
-    let size = head.value.size;
-    if size < 8 { return Err(Error::Task(format!("{pack} is too short to be a pack"))); }
-    let trailer = store.observe_range(pack, size - 8..size).await?;
-    require_same_version(pack, head.version.as_ref(), trailer.version.as_ref())?;
-    let trailer = trailer.value.as_ref().try_into().map_err(|_| Error::Task(format!("{pack} has an incomplete trailer")))?;
+    let expected = head.version.as_ref();
+    let read = |range| async move {
+        let observed = store.observe_range(pack, range).await?;
+        require_same_version(pack, expected, observed.version.as_ref())?;
+        Ok::<_, Error>(observed.value)
+    };
+    let value = read_pack_index_with(pack, head.value.size, usize::MAX, read).await?;
+    Ok(ObjectObservation { value, version: head.version })
+}
+
+pub(crate) async fn read_pack_index_with<F, E>(
+    pack: &ObjectKey, size: u64, maximum_index_bytes: usize, read: impl Fn(Range<u64>) -> F,
+) -> std::result::Result<PackIndex, E>
+where
+    F: std::future::Future<Output = std::result::Result<Bytes, E>>,
+    E: From<Error>,
+{
+    if size < 8 { return Err(Error::Task(format!("{pack} is too short to be a pack")).into()); }
+    let trailer = read(size - 8..size).await?;
+    let trailer = trailer.as_ref().try_into().map_err(|_| Error::Task(format!("{pack} has an incomplete trailer")))?;
     let length = u64::from_be_bytes(trailer);
     let payload_end = (size - 8).checked_sub(length).ok_or_else(|| Error::Task(format!("{pack} has a malformed trailer")))?;
-    let encoded = store.observe_range(pack, payload_end..size - 8).await?;
-    require_same_version(pack, head.version.as_ref(), encoded.version.as_ref())?;
-    let index: PackIndex = serde_json::from_slice(&encoded.value).map_err(|error| Error::Task(format!("{pack} has a malformed index: {error}")))?;
-    if index.entries.values().any(|entry| !entry_fits(entry.offset, entry.length, payload_end)) {
-        return Err(Error::Task(format!("{pack} has an entry outside its payload")));
+    if length > maximum_index_bytes as u64 {
+        return Err(Error::MessageTooLarge { size: usize::try_from(length).unwrap_or(usize::MAX), maximum: maximum_index_bytes }.into());
     }
-    Ok(ObjectObservation { value: index, version: head.version })
+    let encoded = read(payload_end..size - 8).await?;
+    let index: PackIndex = serde_json::from_slice(&encoded).map_err(|error| Error::Task(format!("{pack} has a malformed index: {error}")))?;
+    if index.entries.values().any(|entry| !entry_fits(entry.offset, entry.length, payload_end)) {
+        return Err(Error::Task(format!("{pack} has an entry outside its payload")).into());
+    }
+    Ok(index)
 }
 
 fn require_same_version(pack: &ObjectKey, expected: Option<&PhysicalObjectVersion>, observed: Option<&PhysicalObjectVersion>) -> rtdb_storage::Result<()> {
@@ -828,6 +845,17 @@ pub(crate) mod tests {
         raw.put(&pack, Bytes::copy_from_slice(&u64::MAX.to_be_bytes())).await.unwrap();
         let error = read_index(&raw, &pack).await.unwrap_err();
         assert!(error.to_string().contains("malformed trailer"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_pack_index_is_refused_before_the_index_read() {
+        let pack = pack_key(0).unwrap();
+        let read = |range| async move {
+            assert_eq!(range, 101..109);
+            Ok::<_, Error>(Bytes::copy_from_slice(&101u64.to_be_bytes()))
+        };
+        let error = read_pack_index_with(&pack, 109, 100, read).await.unwrap_err();
+        assert!(matches!(error, Error::MessageTooLarge { size: 101, maximum: 100 }));
     }
 
     #[tokio::test]

@@ -1,13 +1,14 @@
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
 use rtdb_format::{catalog::BlockCatalog, keys::{TrieKey, block_key}};
-use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore};
+use rtdb_s3::{NeverVersionedRetirement, ObservedTerminalObject};
+use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{BlockIndex, PhysicalObjectVersion, Result, StorageEpoch};
 
 use crate::archive::{self, ArchivedCheckpoint};
 use crate::cipher::Cipher;
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
-use crate::packing::{PACK_DIRECTORY, PackEntry, PackIndex, block_pack, observe_pack_index, pack_block};
+use crate::packing::{PACK_DIRECTORY, PackEntry, PackIndex, block_pack, observe_pack_index, pack_block, read_pack_index_with};
 use crate::reference::{Base, References, key};
 
 use super::checkpoint_metadata_block;
@@ -74,8 +75,8 @@ pub(super) async fn reap(
         let cipher = Cipher::new(&material)?;
         let mut erased = 0;
         for (block, pack) in candidates {
-            let index = observe_pack_index(bucket, &pack).await?;
-            let Some(boundary) = covered_pack(bucket, &pack, index, block, threshold, record.log_epoch, &cipher, &archive).await?
+            let observed = ObservedPack::raw(bucket, &pack).await?;
+            let Some(boundary) = covered_pack(&observed, block, threshold, record.log_epoch, &cipher, &archive).await?
                 else { continue; };
             if !crate::checkpoint_retention::replay_archive_covers_pack(block, checkpoint.block, boundary,
                 anchor.interval[0], anchor.interval[1], checkpoint.boundary)
@@ -95,16 +96,15 @@ pub(super) async fn reap(
 }
 
 async fn covered_pack(
-    bucket: &dyn ObjectStore, pack: &ObjectKey, observation: ObjectObservation<PackIndex>,
-    block: i64, threshold: i64, log_epoch: i32,
+    pack: &ObservedPack<'_>, block: i64, threshold: i64, log_epoch: i32,
     cipher: &Cipher, archive: &ArchivedCheckpoint,
 ) -> Result<Option<i64>> {
-    let ObjectObservation { value: index, version } = observation;
+    let index = &pack.index;
     if index.written_at_ms.is_none_or(|written| written > threshold) { return Ok(None); }
     let root = block_key(BlockIndex(block))?;
     let Some(entry) = index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
         else { return Ok(None); };
-    let bytes = read_member(bucket, pack, entry, version.as_ref()).await?;
+    let bytes = pack.read_member(entry).await?;
     let catalog = BlockCatalog::decode(&cipher.open(&root, &bytes)?)?;
     if catalog.block_index().0 != block { return Ok(None); }
     let Some(boundary) = catalog.boundary_replica_position() else { return Ok(None); };
@@ -112,24 +112,56 @@ async fn covered_pack(
     if boundary < 0 { return Ok(None); }
 
     let mut has_l0 = false;
-    for (name, entry) in index.entries {
-        if checkpoint_metadata_block(&name) == Some(block) { continue; }
-        if !is_block_l0(&name, block) || entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
-        let original = read_member(bucket, pack, &entry, version.as_ref()).await?;
-        if !archive.matches_original(&key(&name)?, &original).await? { return Ok(None); }
+    for (name, entry) in &index.entries {
+        if checkpoint_metadata_block(name) == Some(block) { continue; }
+        if !is_block_l0(name, block) || entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
+        let original = pack.read_member(entry).await?;
+        if !archive.matches_original(&key(name)?, &original).await? { return Ok(None); }
         has_l0 = true;
     }
     Ok(has_l0.then_some(boundary))
 }
 
-async fn read_member(
-    bucket: &dyn ObjectStore, pack: &ObjectKey, entry: &PackEntry, version: Option<&PhysicalObjectVersion>,
-) -> rtdb_storage::Result<bytes::Bytes> {
-    let observed = bucket.observe_range(pack, entry.offset..entry.offset + entry.length).await?;
-    if observed.version.as_ref() != version || observed.value.len() as u64 != entry.length {
-        return Err(Error::ConflictingObject(pack.to_string()));
+struct ObservedPack<'a> {
+    key: &'a ObjectKey,
+    index: PackIndex,
+    storage: PackStorage<'a>,
+}
+
+enum PackStorage<'a> {
+    Raw { bucket: &'a dyn ObjectStore, version: Option<PhysicalObjectVersion> },
+    Terminal { retirement: &'a NeverVersionedRetirement<'a>, publication: ObservedTerminalObject },
+}
+
+impl<'a> ObservedPack<'a> {
+    async fn raw(bucket: &'a dyn ObjectStore, key: &'a ObjectKey) -> rtdb_storage::Result<Self> {
+        let observed = observe_pack_index(bucket, key).await?;
+        Ok(Self { key, index: observed.value, storage: PackStorage::Raw { bucket, version: observed.version } })
     }
-    Ok(observed.value)
+
+    async fn terminal(retirement: &'a NeverVersionedRetirement<'a>, key: &'a ObjectKey) -> Result<Option<Self>> {
+        let Some(publication) = retirement.observe_readable(key).await? else { return Ok(None); };
+        let read = |range| retirement.read_observed_range(key, &publication, range);
+        let index = match read_pack_index_with(key, publication.size(), MAXIMUM_MEMBER_BYTES as usize, read).await {
+            Err(error) if error.code == "rtdb.storage/message-too-large" => return Ok(None),
+            result => result?,
+        };
+        Ok(Some(Self { key, index, storage: PackStorage::Terminal { retirement, publication } }))
+    }
+
+    async fn read_member(&self, entry: &PackEntry) -> Result<bytes::Bytes> {
+        let range = entry.offset..entry.offset + entry.length;
+        match &self.storage {
+            PackStorage::Raw { bucket, version } => {
+                let observed = bucket.observe_range(self.key, range).await?;
+                if observed.version.as_ref() != version.as_ref() || observed.value.len() as u64 != entry.length {
+                    return Err(Error::ConflictingObject(self.key.to_string()).into());
+                }
+                Ok(observed.value)
+            }
+            PackStorage::Terminal { retirement, publication } => retirement.read_observed_range(self.key, publication, range).await,
+        }
+    }
 }
 
 fn is_block_l0(name: &str, block: i64) -> bool {

@@ -453,20 +453,28 @@ The S3 lifecycle regression exercises a rejected stage with the same requested n
 A second S3 regression exercises an unresolved fork publication through recovery, namespace verification, exact abort, and disposal.
 [Staging and publication model](../tla/HostedForkStage.tla)
 
-### Versioned original replay packs
+### Hosted original replay packs
 
 The hosted reaper can release an older original pack from a parked root after the current replay archive independently covers its L0 members.
-It reads the index and every verified member at one physical version, authenticates the newer published block root, and checks the certified replica prefix.
+It authenticates the newer published block root and checks the certified replica prefix.
 Existing readers, fork preparations, references and outstanding writer leases retain the pack.
-The directory records exact retirement authority and holds the selected capture until provider inventory confirms absence of the specified version.
-A reaper restart resumes authorized work under the stored fence.
+In a versioned bucket, it reads the index and every verified member at one physical version.
+The directory records exact retirement authority and holds the selected capture until provider inventory confirms absence of that version.
 [Versioned replay pack model](../tla/HostedReplayPackRetirement.tla)
+
+An enrolled never-versioned serving bucket binds the old pack's index and members to its strong entity tag.
+An index beyond the verification budget keeps the pack in place.
+The reaper holds the same capture and lineage while replacing the accepted publication with its permanent tombstone.
+Provider confirmation binds the tombstone to the retirement token, and settlement waits for the recorded upload to drain.
+A reaper restart resumes authorized work under the stored fence.
+If the provider reports a missing or replaced publication after terminal authorization, the lineage and archive remain held until the authorized token can be confirmed.
+[Never-versioned replay pack model](../tla/TerminalReplayPackRetirement.tla)
 
 ### Serving and archive removal entry points
 
 | Effect path | Current admission and evidence | Remaining composition obligation |
 | --- | --- | --- |
-| Local path sweep and hosted retirement | The local sweep reserves its lineage and copies retained data before deleting paths. The hosted path sweep withdraws inherited names, and the hosted exact collector orders physical removal against the owner fence and published references. Versioned original replay packs use independently verified archive custody. | Extend exact settlement to remaining unwitnessed legacy and unversioned releases. |
+| Local path sweep and hosted retirement | The local sweep reserves its lineage and copies retained data before deleting paths. The hosted path sweep withdraws inherited names, and the hosted exact collector orders physical removal against the owner fence and published references. Versioned and qualified never-versioned original replay packs use independently verified archive custody. | Extend settlement to remaining unwitnessed releases. |
 | `Base::initialize`, `Base::forget` and `Base::load` | Initialization adds references. Confirmed withdrawals only remove matching entries and require a current head before effect. | Connect the current-manifest contract to consumers that retain older manifests and to the authority closing and disposing a residence. |
 | Local `erase_deployment` and hosted `observe_s3_inventory` in disposal and old-residence cleanup | The administration path fences the residence, drains serving references, closes the lineage and transfers published references. Hosted disposal then purges versions and uploads through the provider inventory. Settlement atomically publishes the receipt and reopens the lineage. | Extend physical-owner read custody to administrative copies and qualify provider settlement under failure on hosted storage. |
 | `discard_local_fork` and hosted fork staging | The local path uses the unpublished prefix. Hosted preparation journals uploads on the staged child. Recovery closes admission and settles those upload IDs before ordinary inventory disposal. | Qualify exact provider settlement and task stoppage for hosted fork writers. |

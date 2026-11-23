@@ -200,8 +200,13 @@ impl Cell {
     }
 
     pub async fn add_node_with_engine(&mut self, engine_version: Option<String>) -> usize {
+        self.add_configured_node(engine_version, |_| {}).await
+    }
+
+    pub async fn add_configured_node(&mut self, engine_version: Option<String>, configure: impl FnOnce(&mut AgentOptions)) -> usize {
         let index = self.nodes.len();
-        let agent = AgentOptions::new(self.objects.clone());
+        let mut agent = AgentOptions::new(self.objects.clone());
+        configure(&mut agent);
         self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false, engine_version).await));
         index
     }

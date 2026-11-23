@@ -14,7 +14,7 @@ use crate::packing::{block_pack, observe_pack_index, pack_block};
 use crate::reference::{Base, References, stores};
 
 mod receipts;
-mod tombstones;
+pub(super) mod tombstones;
 use tombstones::TombstoneJournal;
 
 const MAXIMUM_RELEASE_BYTES: u64 = 32 << 10;

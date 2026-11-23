@@ -7,7 +7,7 @@ mod versions;
 mod terminal;
 
 #[cfg(feature = "versioning")]
-pub use versions::{NeverVersionedObject, NeverVersionedRetirement, VersionedInventory};
+pub use versions::{NeverVersionedObject, NeverVersionedRetirement, ObservedTerminalObject, VersionedInventory};
 
 use std::sync::Arc;
 use aws_credential_types::provider::SharedCredentialsProvider;

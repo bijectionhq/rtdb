@@ -11,7 +11,7 @@ pub(in crate::store) struct TombstoneJournal<'a> {
 }
 
 impl<'a> TombstoneJournal<'a> {
-    pub(super) fn new(directory: &'a dyn Directory, lineage: &'a str, token: Uuid) -> Self {
+    pub(in crate::store) fn new(directory: &'a dyn Directory, lineage: &'a str, token: Uuid) -> Self {
         Self { directory, lineage, token }
     }
 
@@ -35,7 +35,7 @@ impl<'a> TombstoneJournal<'a> {
     }
 }
 
-pub(super) async fn retire(provider: &NeverVersionedRetirement<'_>, journal: &TombstoneJournal<'_>,
+pub(in crate::store) async fn retire(provider: &NeverVersionedRetirement<'_>, journal: &TombstoneJournal<'_>,
     key: &ObjectKey, target: &S3TombstoneTarget) -> Result<()> {
     let retained = journal.upload(key).await?;
     let observed = provider.observe(key).await?;

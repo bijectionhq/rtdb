@@ -12,21 +12,82 @@ use common::s3_storage as storage;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn the_hosted_reaper_retires_only_the_archived_version_of_an_original_replay_pack() {
+    let (Some(storage), Some(archive)) = (storage(), s3_archive_storage()) else {
+        eprintln!("RTDB_S3_ENDPOINT and RTDB_S3_ARCHIVE_BUCKET are required");
+        return;
+    };
+    exercise_replay_pack_retirement(storage, archive, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_hosted_reaper_tombstones_an_original_replay_pack_in_an_enrolled_bucket() {
+    use std::collections::BTreeMap;
+
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use rtdb_s3::{S3Config, TerminalS3Scope};
+    use rtdb_types::S3ObjectNamespace;
+
+    let (Ok(provider_endpoint), Ok(bucket), Some(archive)) = (
+        std::env::var("RTDB_S3_ENDPOINT"), std::env::var("RTDB_S3_TERMINAL_FIXTURE_BUCKET"), s3_archive_storage(),
+    ) else {
+        eprintln!("A localhost S3 endpoint, terminal fixture bucket and archive bucket are required");
+        return;
+    };
+    let address: hyper::Uri = provider_endpoint.parse().unwrap();
+    assert_eq!(address.host(), Some("127.0.0.1"));
+    assert_eq!(address.scheme_str(), Some("http"));
+    assert!(address.port().is_some());
+    assert!(address.path_and_query().is_none_or(|path| path.as_str() == "/"));
+    let (proxy_address, upload, proxy) = pause_pack_upload(address).await;
+    let endpoint = format!("http://{proxy_address}/");
+    let region = "us-east-1".to_owned();
+    let mut config = S3Config::new(bucket.clone());
+    config.region = Some(region.clone());
+    config.endpoint = Some(endpoint.clone());
+    config.path_style_access_enabled = true;
+    let authority = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+    let allocation = uuid::Uuid::new_v4();
+    config.terminal_scope = Some(TerminalS3Scope { allocation, authority: authority.public_key().as_ref().try_into().unwrap() });
+    let namespace = S3ObjectNamespace { bucket, region: Some(region), endpoint: Some(endpoint.clone()) };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "policy": "create_once_v1", "namespace": namespace, "root": config.cell_root().unwrap().as_str(), "allocation": allocation,
+    })).unwrap();
+    let signature = authority.sign(&[b"rtdb.s3/terminal-enrollment/v1\0".as_slice(), &payload].concat());
+    let qualification = serde_json::to_vec(&serde_json::json!({
+        "payload": URL_SAFE_NO_PAD.encode(payload), "signature": URL_SAFE_NO_PAD.encode(signature.as_ref()),
+    })).unwrap();
+    assert_eq!(config.enroll_terminal_cell(&BTreeMap::new(), qualification.into()).await.unwrap(), allocation);
+    let role = rtdb_multi::agent::S3WriteRole {
+        arn: "arn:aws:iam::123456789012:role/rtdb-cell-writer".into(),
+        sts_endpoint: Some(provider_endpoint),
+        require_conditional_put: true,
+    };
+    exercise_replay_pack_retirement(CellStorage::S3 { config }, archive, Some(TerminalReplayFixture { role, upload })).await;
+    proxy.abort();
+}
+
+struct TerminalReplayFixture {
+    role: rtdb_multi::agent::S3WriteRole,
+    upload: std::sync::Arc<PackUpload>,
+}
+
+async fn exercise_replay_pack_retirement(storage: CellStorage, archive: CellStorage, fixture: Option<TerminalReplayFixture>) {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
     use rtdb_storage::{IoRegion, ObjectKey};
     use rtdb_types::{BlockIndex, StorageEpoch};
 
-    let (Some(storage @ CellStorage::S3 { .. }), Some(archive)) = (storage(), s3_archive_storage()) else {
-        eprintln!("RTDB_S3_ENDPOINT and RTDB_S3_ARCHIVE_BUCKET are required");
-        return;
-    };
     tokio::time::timeout(Duration::from_secs(120), async {
         let CellStorage::S3 { config } = &storage else { unreachable!() };
         let inventory = config.versioned_inventory(&config.cell_root().unwrap(), &BTreeMap::new()).await.unwrap();
-        let mut cell = Cell::start_on(Some(storage.clone()), vec![MemberPool::General], None, None, None).await;
+        let terminal = inventory.enrolled_terminal_retirement().await.unwrap();
+        let role = fixture.as_ref().map(|setup| setup.role.clone());
+        let mut cell = Cell::start_configured_with_directory(rtdb_directory::MemoryDirectory::new(), Some(storage.clone()),
+            vec![MemberPool::General], None, None, None, true, |agent| agent.s3_write_role = role.clone()).await;
         let deployment = uuid::Uuid::new_v4();
         let id = deployment.to_string();
         admin::install_deployment(cell.directory.as_ref(), deployment, "replay", "acme", 3).await.unwrap();
@@ -60,8 +121,15 @@ async fn the_hosted_reaper_retires_only_the_archived_version_of_an_original_repl
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         let original = pack(original.block);
         let current = pack(current.block);
-        let version = bucket.observe_head(&original).await.unwrap().version.expect("the serving bucket is versioned");
-        let successor = bucket.observe_head(&current).await.unwrap().version.unwrap();
+        let version = bucket.observe_head(&original).await.unwrap().version;
+        let successor = bucket.observe_head(&current).await.unwrap().version;
+        let successor_tag = if let Some(terminal) = &terminal {
+            assert!(terminal.observe_readable(&original).await.unwrap().is_some());
+            Some(terminal.observe_readable(&current).await.unwrap().unwrap().target().clone())
+        } else {
+            assert!(version.is_some() && successor.is_some());
+            None
+        };
         let keys = Arc::new(cell.keys());
         let op = uuid::Uuid::new_v4();
         let owner = hosted_test_owner();
@@ -74,23 +142,57 @@ async fn the_hosted_reaper_retires_only_the_archived_version_of_an_original_repl
             &capture.manifest_sha256().unwrap(), Some(&owner),
         ).await.unwrap();
 
+        if let Some(fixture) = &fixture {
+            let mut leased = cell.directory.deployment(&id).await.unwrap().unwrap();
+            let now = rtdb_directory::now_ms();
+            assert!(leased.active_s3_write_lease(now).is_some());
+            leased.s3_write_lease_until_ms = Some(now - 1);
+            let version = leased.version;
+            assert!(cell.directory.replace_deployment(leased, version).await.unwrap().applied().is_some());
+            fixture.upload.armed.store(true, Ordering::Relaxed);
+        }
         let stop = tokio_util::sync::CancellationToken::new();
-        let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
-            cell.directory.clone(), storage, Some(keys), Some(owner), Duration::ZERO,
+        let launch = || tokio::spawn(rtdb_multi::store::run_reaper(
+            cell.directory.clone(), storage.clone(), Some(keys.clone()), Some(owner.clone()), Duration::ZERO,
             Duration::from_millis(20), stop.clone(),
         ));
+        let mut reaper = launch();
+        let interrupted = if let Some(fixture) = &fixture {
+            fixture.upload.held.notified().await;
+            let state = cell.directory.lineage_state(&parked.lineage).await.unwrap();
+            let token = state.retirement().unwrap().token;
+            assert!(state.exact_erasure_authorized());
+            assert!(state.tombstone_upload(token, original.as_str()).unwrap().is_some());
+            let admitted = cell.directory.deployment(&id).await.unwrap().unwrap();
+            assert!(admitted.storage_regions[&token].holds_archive(op));
+            reaper.abort();
+            assert!(reaper.await.unwrap_err().is_cancelled());
+            reaper = launch();
+            Some(token)
+        } else { None };
         loop {
-            if inventory.exact_retirement_absent(&original, &version).await.unwrap()
-                && cell.directory.lineage_state(&parked.lineage).await.unwrap().retirement().is_none()
-            {
+            let retired = if let Some(terminal) = &terminal {
+                matches!(terminal.observe(&original).await.unwrap(), rtdb_s3::NeverVersionedObject::Retired(token) if !token.is_nil())
+            } else {
+                inventory.exact_retirement_absent(&original, version.as_ref().unwrap()).await.unwrap()
+            };
+            if retired && cell.directory.lineage_state(&parked.lineage).await.unwrap().retirement().is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(bucket.observe_head(&current).await.unwrap().version, Some(successor));
+        if let Some((fixture, token)) = fixture.as_ref().zip(interrupted) {
+            fixture.upload.resume.notify_one();
+            fixture.upload.completed.notified().await;
+            assert!(terminal.as_ref().unwrap().confirms(&original, token).await.unwrap());
+        }
+        assert_eq!(bucket.observe_head(&current).await.unwrap().version, successor);
+        if let Some(terminal) = &terminal {
+            assert_eq!(terminal.observe_readable(&current).await.unwrap().unwrap().target(), successor_tag.as_ref().unwrap());
+        }
         assert!(matches!(bucket.observe_head(&original).await, Err(rtdb_storage::Error::MissingObject(_))));
         cell.nodes[holder].take().unwrap().kill().await.unwrap();
-        let fresh_holder = cell.add_node().await;
+        let fresh_holder = cell.add_configured_node(None, |agent| agent.s3_write_role = role).await;
         let read = connect_eventually(&cell, "replay").await;
         assert_eq!(values(&read, "SELECT DISTINCT total FROM orders WHERE total >= 0 ORDER BY total LIMIT 2").await, ["10", "20"]);
         assert_eq!(values(&read, "SELECT detail FROM orders WHERE _id = 1").await, ["before cut"]);
@@ -100,7 +202,7 @@ async fn the_hosted_reaper_retires_only_the_archived_version_of_an_original_repl
         stop.cancel();
         reaper.await.unwrap();
         cell.stop().await;
-    }).await.expect("versioned replay pack retirement stalled");
+    }).await.expect("hosted replay pack retirement stalled");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

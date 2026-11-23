@@ -20,7 +20,8 @@ impl LineageRetirement {
             RetirementWork::S3 { deployment, target, release, .. } | RetirementWork::Tombstones { deployment, target, release, .. } => {
                 (deployment, target, Some(release))
             }
-            RetirementWork::ReplayPack { deployment, target, .. } => (deployment, target, None),
+            RetirementWork::ReplayPack { deployment, target, .. }
+            | RetirementWork::ReplayPackTombstone { deployment, target, .. } => (deployment, target, None),
             RetirementWork::Local { .. } => return false,
         };
         let prefix = format!("{}/", self.source);
@@ -33,7 +34,8 @@ impl LineageRetirement {
         let (target, marker) = match &self.work {
             RetirementWork::S3 { target, release, release_version, .. } => (target, release_version.as_ref().map(|_| release)),
             RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
-            RetirementWork::ReplayPack { target, capture, .. } => {
+            RetirementWork::ReplayPack { target, capture, .. }
+            | RetirementWork::ReplayPackTombstone { target, capture, .. } => {
                 return matches!(owner.storage_regions.get(&self.token), Some(StorageRegion::ReplayPackRetirement { object, capture: held })
                     if object == target && held == capture);
             }
@@ -72,6 +74,20 @@ pub enum RetirementWork {
         capture: Uuid,
         checkpoint: Checkpoint,
     },
+    ReplayPackTombstone {
+        deployment: String,
+        target: String,
+        tombstone: S3TombstoneTarget,
+        allocation: Uuid,
+        capture: Uuid,
+        checkpoint: Checkpoint,
+    },
+}
+
+impl RetirementWork {
+    fn uses_tombstones(&self) -> bool {
+        matches!(self, Self::Tombstones { .. } | Self::ReplayPackTombstone { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,8 +249,12 @@ impl LineageState {
 
     fn tombstone_uploads(&self, token: Uuid, key: &str) -> Result<&BTreeMap<String, String>> {
         let Admission::ErasingTombstones { retirement, uploads } = &self.admission else { return Err(lineage_busy()); };
-        let RetirementWork::Tombstones { target, release, .. } = &retirement.work else { return Err(lineage_busy()); };
-        if retirement.token != token || (key != target && key != release) { return Err(lineage_busy()); }
+        let matches = match &retirement.work {
+            RetirementWork::Tombstones { target, release, .. } => key == target || key == release,
+            RetirementWork::ReplayPackTombstone { target, .. } => key == target,
+            _ => false,
+        };
+        if retirement.token != token || !matches { return Err(lineage_busy()); }
         Ok(uploads)
     }
 
@@ -246,7 +266,8 @@ impl LineageState {
         }
         let mut next = self.clone();
         if !self.exact_erasure_authorized() {
-            if let RetirementWork::ReplayPack { capture, checkpoint, .. } = &retirement.work
+            if let RetirementWork::ReplayPack { capture, checkpoint, .. }
+                | RetirementWork::ReplayPackTombstone { capture, checkpoint, .. } = &retirement.work
                 && (owner.lifecycle != Lifecycle::Live || owner.holder.is_some()
                     || owner.active_s3_write_lease(crate::now_ms()).is_some()
                     || owner.serving_replay_capture != Some(*capture) || owner.checkpoint != Some(*checkpoint)
@@ -258,9 +279,10 @@ impl LineageState {
             {
                 return Err(lineage_busy());
             }
-            next.admission = match retirement.work {
-                RetirementWork::Tombstones { .. } => Admission::ErasingTombstones { retirement: retirement.clone(), uploads: BTreeMap::new() },
-                _ => Admission::Erasing(retirement.clone()),
+            next.admission = if retirement.work.uses_tombstones() {
+                Admission::ErasingTombstones { retirement: retirement.clone(), uploads: BTreeMap::new() }
+            } else {
+                Admission::Erasing(retirement.clone())
             };
             next.advance_version()?;
         }
@@ -273,7 +295,7 @@ impl LineageState {
             || matches!(retirement.work, RetirementWork::S3 { release_version: None, .. })
                 && !owner.storage_regions.contains_key(&retirement.token);
         let ready = match &self.admission {
-            Admission::Erasing(current) => current == retirement && !matches!(current.work, RetirementWork::Tombstones { .. }),
+            Admission::Erasing(current) => current == retirement && !current.work.uses_tombstones(),
             Admission::ErasingTombstones { retirement: current, uploads } => current == retirement && uploads.is_empty(),
             _ => false,
         };
@@ -424,7 +446,7 @@ pub(crate) fn disposal_changed() -> Anomaly {
 mod tests {
     use super::*;
     use crate::CheckpointCapture;
-    use rtdb_types::S3ObjectNamespace;
+    use rtdb_types::{S3ObjectNamespace, S3TombstoneCondition};
 
     #[test]
     fn replay_pack_authority_requires_the_selected_open_capture_and_keeps_its_custody_until_settlement() {
@@ -478,5 +500,42 @@ mod tests {
         let (settled, reopened) = state.settle_exact_owned(&changed, &retirement).unwrap();
         assert!(!settled.storage_regions.contains_key(&retirement.token));
         assert!(reopened.open_generation().is_some());
+    }
+
+    #[test]
+    fn terminal_replay_pack_keeps_its_archive_until_the_owned_upload_drains() {
+        let mut owner = DeploymentRecord::new("orders", "acme", vec![], 0);
+        let source = owner.storage_prefix();
+        let target = format!("{source}/v06/~packs/b00");
+        let capture = Uuid::new_v4();
+        let retirement = LineageRetirement {
+            token: Uuid::new_v4(), source, work: RetirementWork::ReplayPackTombstone {
+                deployment: owner.id.clone(), target: target.clone(), capture,
+                allocation: Uuid::new_v4(),
+                checkpoint: Checkpoint { block: 3, boundary: 7, source: 2, system_time: 0, root_sha256: Some([7; 32]) },
+                tombstone: S3TombstoneTarget {
+                    namespace: S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
+                    key: format!("cell/{target}"), condition: S3TombstoneCondition::Matches("\"original\"".into()),
+                },
+            },
+        };
+        owner.storage_regions.insert(retirement.token, StorageRegion::ReplayPackRetirement { object: target.clone(), capture });
+        let state = LineageState {
+            admission: Admission::ErasingTombstones { retirement: retirement.clone(), uploads: BTreeMap::new() },
+            ..LineageState::default()
+        };
+        let upload = |key: &str| LineageChange::AdmitTombstoneUpload {
+            retirement: retirement.token, key: key.to_owned(), upload: "upload".into(),
+        };
+        assert!(state.changed(upload("another-pack")).is_err());
+        let state = state.changed(upload(&target)).unwrap();
+        assert!(owner.storage_regions[&retirement.token].holds_archive(capture));
+        assert!(state.settle_exact_owned(&owner, &retirement).is_err());
+        let state = state.changed(LineageChange::SettleTombstoneUpload {
+            retirement: retirement.token, key: target, upload: "upload".into(),
+        }).unwrap();
+        let (owner, lineage) = state.settle_exact_owned(&owner, &retirement).unwrap();
+        assert!(!owner.storage_regions.contains_key(&retirement.token));
+        assert!(lineage.open_generation().is_some());
     }
 }

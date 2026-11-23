@@ -3,27 +3,54 @@ use rtdb_directory::{
     RetirementWork, StorageRegion, now_ms,
 };
 use rtdb_format::{catalog::BlockCatalog, keys::block_key};
-use rtdb_storage::{Error, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result};
+use rtdb_s3::{NeverVersionedRetirement, VersionedInventory};
+use rtdb_storage::{Error, ObjectKey, ObjectStore};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget};
 use uuid::Uuid;
 
-use super::{MAXIMUM_MEMBER_BYTES, covered_pack, eligible, is_block_l0, read_member};
+use super::{MAXIMUM_MEMBER_BYTES, ObservedPack, PackStorage, covered_pack, eligible, is_block_l0};
 use crate::archive;
 use crate::cipher::Cipher;
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
-use crate::packing::{PACK_DIRECTORY, block_pack, observe_pack_index, pack_block};
+use crate::packing::{PACK_DIRECTORY, block_pack, pack_block};
 use crate::reference::{Base, References, key};
-use crate::store::exact_retirement::{RetirementProvider, settle};
+use crate::store::exact_retirement::{settle, tombstones::{TombstoneJournal, retire}};
+
+enum Publication<'a> {
+    Version(&'a PhysicalObjectVersion),
+    Tombstone { allocation: Uuid, target: &'a S3TombstoneTarget },
+}
+
+struct ReplayRetirement<'a> {
+    deployment: &'a str,
+    target: &'a str,
+    capture: Uuid,
+    checkpoint: Checkpoint,
+    publication: Publication<'a>,
+}
+
+impl<'a> ReplayRetirement<'a> {
+    fn from_work(work: &'a RetirementWork) -> Option<Self> {
+        match work {
+            RetirementWork::ReplayPack { deployment, target, version, capture, checkpoint } =>
+                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint, publication: Publication::Version(version) }),
+            RetirementWork::ReplayPackTombstone { deployment, target, tombstone, allocation, capture, checkpoint } =>
+                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint,
+                    publication: Publication::Tombstone { allocation: *allocation, target: tombstone } }),
+            _ => None,
+        }
+    }
+}
 
 pub(in crate::store) async fn reap_hosted(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
-    bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, candidate: &DeploymentRecord, threshold: i64,
+    bucket: &dyn ObjectStore, provider: &VersionedInventory, candidate: &DeploymentRecord, threshold: i64,
 ) -> Result<()> {
     let lineage = &candidate.lineage;
     let mut state = crate::store::recover_hosted_lineage(directory, lineage).await?;
     if let Some(retirement) = state.retirement() {
-        if matches!(&retirement.work, RetirementWork::ReplayPack { deployment, .. } if *deployment == candidate.id) {
+        if ReplayRetirement::from_work(&retirement.work).is_some_and(|work| work.deployment == candidate.id) {
             finish(directory, storage, keys, task, bucket, provider, lineage, &state, retirement, threshold).await?;
         }
         return Ok(());
@@ -38,29 +65,35 @@ pub(in crate::store) async fn reap_hosted(
     let store = format!("{source}/{}", archive::checkpoint_storage_root()?);
     let prefix = format!("{store}/");
     if !Base::load(bucket, &store).await?.objects.is_empty() { return Ok(()); }
+    let terminal = provider.enrolled_terminal_retirement().await?;
     let deployments = directory.deployments().await?;
     let references = References::scan(bucket, &deployments).await?;
     for pack in bucket.list(Some(&key(&format!("{prefix}{PACK_DIRECTORY}"))?)).await? {
         let Some(block) = pack.key.as_str().strip_prefix(&prefix).and_then(pack_block) else { continue; };
         if block >= checkpoint.block || references.has_declared_reference(&pack.key) { continue; }
-        let index = match observe_pack_index(bucket, &pack.key).await {
-            Ok(index) => index,
-            Err(Error::MissingObject(_)) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if index.value.written_at_ms.is_none_or(|written| written > threshold)
-            || !index.value.entries.keys().any(|name| is_block_l0(name, block))
+        let Some(observed) = observe_pack(bucket, terminal.as_ref(), &pack.key).await? else { continue; };
+        if observed.index.written_at_ms.is_none_or(|written| written > threshold)
+            || !observed.index.entries.keys().any(|name| is_block_l0(name, block))
         {
             continue;
         }
-        let Some(version) = index.version else { continue; };
-        if !provider.available(&pack.key, &version).await? { continue; }
+        let work = match observed.storage {
+            PackStorage::Raw { version: Some(version), .. } => {
+                if !provider.exact_retirement_available(&pack.key, &version).await? { continue; }
+                RetirementWork::ReplayPack {
+                    deployment: candidate.id.clone(), target: pack.key.to_string(), version, capture, checkpoint,
+                }
+            }
+            PackStorage::Terminal { publication, .. } => RetirementWork::ReplayPackTombstone {
+                deployment: candidate.id.clone(), target: pack.key.to_string(),
+                tombstone: publication.target().clone(), allocation: publication.allocation(), capture, checkpoint,
+            },
+            PackStorage::Raw { version: None, .. } => continue,
+        };
         let retirement = LineageRetirement {
             token: Uuid::new_v4(),
             source: source.clone(),
-            work: RetirementWork::ReplayPack {
-                deployment: candidate.id.clone(), target: pack.key.to_string(), version, capture, checkpoint,
-            },
+            work,
         };
         let reserved = directory.change_lineage(lineage, LineageChange::ReserveRetirement {
             retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
@@ -76,10 +109,10 @@ pub(in crate::store) async fn reap_hosted(
 
 async fn finish(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
-    bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, lineage: &str, state: &LineageState,
+    bucket: &dyn ObjectStore, provider: &VersionedInventory, lineage: &str, state: &LineageState,
     retirement: &LineageRetirement, threshold: i64,
 ) -> Result<bool> {
-    let RetirementWork::ReplayPack { deployment, target, version, .. } = &retirement.work else { return Err(changed()); };
+    let ReplayRetirement { deployment, target, publication, .. } = ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
     let target = key(target)?;
     if !state.exact_erasure_authorized() {
         let prepared = authorize(directory, storage, keys, task, bucket, provider, lineage, retirement, threshold).await;
@@ -91,19 +124,29 @@ async fn finish(
             return prepared.map(|()| false);
         }
     }
-    provider.erase(&target, version).await?;
-    if !provider.absent(&target, version).await? { return Err(changed()); }
+    match publication {
+        Publication::Version(version) => {
+            provider.retire_observed_version(&target, version).await?;
+            if !provider.exact_retirement_absent(&target, version).await? { return Err(changed()); }
+        }
+        Publication::Tombstone { allocation, target: tombstone } => {
+            let proof = provider.enrolled_terminal_retirement().await?
+                .filter(|proof| proof.allocation() == Some(allocation)).ok_or_else(changed)?;
+            let journal = TombstoneJournal::new(directory, lineage, retirement.token);
+            retire(&proof, &journal, &target, tombstone).await?;
+        }
+    }
     settle(directory, lineage, deployment, retirement).await?;
     Ok(true)
 }
 
 async fn authorize(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
-    bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, lineage: &str,
+    bucket: &dyn ObjectStore, provider: &VersionedInventory, lineage: &str,
     retirement: &LineageRetirement, threshold: i64,
 ) -> Result<()> {
-    let RetirementWork::ReplayPack { deployment, target, version, capture, checkpoint } = &retirement.work
-        else { return Err(changed()); };
+    let ReplayRetirement { deployment, target, publication, capture, checkpoint } =
+        ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
     let target = key(target)?;
     let store = format!("{}/{}", retirement.source, archive::checkpoint_storage_root()?);
     let Some(block) = target.as_str().strip_prefix(&format!("{store}/")).and_then(pack_block)
@@ -111,7 +154,7 @@ async fn authorize(
     let Some(record) = directory.deployment(deployment).await? else { return Ok(()); };
     if !eligible(&record) || record.active_s3_write_lease(now_ms()).is_some()
         || record.lineage != lineage || record.storage_prefix() != retirement.source
-        || record.checkpoint != Some(*checkpoint) || record.serving_replay_capture != Some(*capture)
+        || record.checkpoint != Some(checkpoint) || record.serving_replay_capture != Some(capture)
         || block >= checkpoint.block || !Base::load(bucket, &store).await?.objects.is_empty()
     {
         return Ok(());
@@ -124,31 +167,48 @@ async fn authorize(
     let references = References::scan(bucket, &directory.deployments().await?).await?;
     if references.has_declared_reference(&target) { return Ok(()); }
     let cipher = Cipher::new(&material)?;
+    let terminal = match publication {
+        Publication::Version(_) => None,
+        Publication::Tombstone { allocation, .. } => {
+            let Some(terminal) = provider.enrolled_terminal_retirement().await?
+                .filter(|terminal| terminal.allocation() == Some(allocation))
+                else { return Ok(()); };
+            Some(terminal)
+        }
+    };
+    let terminal = terminal.as_ref();
     let target = &target;
     let store = &store;
     archive::with_replay_archive(directory, storage, keys, &record, Some(task), |admitted, owner, archive| async move {
-        let index = match observe_pack_index(bucket, target).await {
-            Ok(index) if index.version.as_ref() == Some(version) => index,
-            Ok(_) | Err(Error::MissingObject(_)) => return Ok(()),
-            Err(error) => return Err(error.into()),
+        let Some(observed) = observe_pack(bucket, terminal, target).await? else { return Ok(()); };
+        let same = match (&publication, &observed.storage) {
+            (Publication::Version(expected), PackStorage::Raw { version, .. }) => version.as_ref() == Some(*expected),
+            (Publication::Tombstone { target, allocation }, PackStorage::Terminal { publication, .. }) =>
+                publication.allocation() == *allocation && publication.target() == *target,
+            _ => false,
         };
-        let Some(boundary) = covered_pack(bucket, target, index, block, threshold, record.log_epoch, &cipher, &archive).await?
+        if !same { return Ok(()); }
+        let Some(boundary) = covered_pack(&observed, block, threshold, record.log_epoch, &cipher, &archive).await?
             else { return Ok(()); };
         if !crate::checkpoint_retention::replay_archive_covers_pack(block, checkpoint.block, boundary,
             anchor.interval[0], anchor.interval[1], checkpoint.boundary)
-            || !successor_present(bucket, store, *checkpoint, &cipher).await?
-            || !provider.available(target, version).await?
+            || !successor_present(bucket, terminal, store, checkpoint, &cipher).await?
+        {
+            return Ok(());
+        }
+        if let Publication::Version(version) = publication
+            && !provider.exact_retirement_available(target, version).await?
         {
             return Ok(());
         }
         let fenced = crate::admin::update_installation(directory, deployment, |latest| {
             if latest.version != admitted.version
-                || !latest.storage_regions.get(&owner).is_some_and(|region| region.admits_archive_read(*capture))
+                || !latest.storage_regions.get(&owner).is_some_and(|region| region.admits_archive_read(capture))
             {
                 return Err(changed());
             }
             latest.storage_regions.insert(retirement.token, StorageRegion::ReplayPackRetirement {
-                object: target.to_string(), capture: *capture,
+                object: target.to_string(), capture,
             });
             Ok(())
         }).await?;
@@ -158,17 +218,26 @@ async fn authorize(
     Ok(())
 }
 
-async fn successor_present(bucket: &dyn ObjectStore, store: &str, checkpoint: Checkpoint, cipher: &Cipher) -> Result<bool> {
+async fn observe_pack<'a>(bucket: &'a dyn ObjectStore, terminal: Option<&'a NeverVersionedRetirement<'a>>, key: &'a ObjectKey)
+    -> Result<Option<ObservedPack<'a>>> {
+    if let Some(terminal) = terminal { return ObservedPack::terminal(terminal, key).await; }
+    match ObservedPack::raw(bucket, key).await {
+        Ok(pack @ ObservedPack { storage: PackStorage::Raw { version: Some(_), .. }, .. }) => Ok(Some(pack)),
+        Ok(_) | Err(Error::MissingObject(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn successor_present(
+    bucket: &dyn ObjectStore, terminal: Option<&NeverVersionedRetirement<'_>>,
+    store: &str, checkpoint: Checkpoint, cipher: &Cipher,
+) -> Result<bool> {
     let root = block_key(BlockIndex(checkpoint.block))?;
     let pack = key(&format!("{store}/{}", block_pack(&root)))?;
-    let observed = match observe_pack_index(bucket, &pack).await {
-        Ok(observed) if observed.version.is_some() => observed,
-        Ok(_) | Err(Error::MissingObject(_)) => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(entry) = observed.value.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
+    let Some(observed) = observe_pack(bucket, terminal, &pack).await? else { return Ok(false); };
+    let Some(entry) = observed.index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
         else { return Ok(false); };
-    let sealed = read_member(bucket, &pack, entry, observed.version.as_ref()).await?;
+    let sealed = observed.read_member(entry).await?;
     let catalog = BlockCatalog::decode(&cipher.open(&root, &sealed)?)?;
     Ok(catalog.block_index().0 == checkpoint.block && catalog.publication_sha256() == checkpoint.root_sha256)
 }

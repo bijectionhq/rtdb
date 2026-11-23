@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use aws_sdk_s3::types::ChecksumAlgorithm;
 use aws_sdk_s3::{error::ProvideErrorMetadata, primitives::ByteStream};
 use bytes::Bytes;
@@ -16,6 +18,18 @@ pub enum NeverVersionedObject {
     Retired(Uuid),
 }
 
+pub struct ObservedTerminalObject {
+    allocation: Uuid,
+    target: S3TombstoneTarget,
+    size: u64,
+}
+
+impl ObservedTerminalObject {
+    pub fn allocation(&self) -> Uuid { self.allocation }
+    pub fn target(&self) -> &S3TombstoneTarget { &self.target }
+    pub fn size(&self) -> u64 { self.size }
+}
+
 /// The caller must hold the residence's retirement authority and enforce its
 /// bucket policy for the full lifetime of every admitted publication.
 pub struct NeverVersionedRetirement<'a> {
@@ -23,6 +37,11 @@ pub struct NeverVersionedRetirement<'a> {
 }
 
 impl VersionedInventory {
+    pub async fn enrolled_terminal_retirement(&self) -> Result<Option<NeverVersionedRetirement<'_>>> {
+        if self.terminal_allocation.is_none() { return Ok(None); }
+        self.never_versioned_retirement().await.map(Some)
+    }
+
     pub async fn never_versioned_retirement(&self) -> Result<NeverVersionedRetirement<'_>> {
         let retirement = NeverVersionedRetirement { inventory: self };
         retirement.require_never_versioned().await?;
@@ -31,6 +50,8 @@ impl VersionedInventory {
 }
 
 impl NeverVersionedRetirement<'_> {
+    pub fn allocation(&self) -> Option<Uuid> { self.inventory.terminal_allocation }
+
     async fn require_never_versioned(&self) -> Result<()> {
         let reply = self
             .inventory
@@ -53,6 +74,58 @@ impl NeverVersionedRetirement<'_> {
     }
 
     pub async fn observe(&self, key: &ObjectKey) -> Result<NeverVersionedObject> {
+        Ok(self.observe_with_size(key).await?.0)
+    }
+
+    pub async fn observe_readable(&self, key: &ObjectKey) -> Result<Option<ObservedTerminalObject>> {
+        let Some(allocation) = self.inventory.terminal_allocation else { return Ok(None); };
+        let (object, size) = self.observe_with_size(key).await?;
+        Ok(match (object, size) {
+            (NeverVersionedObject::Open(target), Some(size)) => Some(ObservedTerminalObject { allocation, target, size }),
+            _ => None,
+        })
+    }
+
+    pub async fn read_observed_range(
+        &self, key: &ObjectKey, observed: &ObservedTerminalObject, range: Range<u64>,
+    ) -> Result<Bytes> {
+        let path = self.checked_path(key, &observed.target)?;
+        let S3TombstoneCondition::Matches(tag) = &observed.target.condition else {
+            return Err(unavailable("The observed publication has no strong entity tag"));
+        };
+        if self.inventory.terminal_allocation != Some(observed.allocation) || range.is_empty() || range.end > observed.size {
+            return Err(unavailable("The read does not identify a range of the observed terminal publication"));
+        }
+        let length = usize::try_from(range.end - range.start)
+            .map_err(|_| unavailable("The observed range exceeds addressable memory"))?;
+        let last = range.end - 1;
+        let expected_range = format!("bytes {}-{last}/{}", range.start, observed.size);
+        let mut result = self.inventory.client.get_object()
+            .bucket(&self.inventory.namespace.bucket).key(path.as_ref()).if_match(tag)
+            .range(format!("bytes={}-{last}", range.start))
+            .set_request_payer(self.inventory.request_payer.clone()).send().await
+            .map_err(|error| unavailable(format!("Reading the observed terminal publication failed: {error}")))?;
+        if result.e_tag() != Some(tag.as_str()) || result.version_id().is_some() || result.delete_marker().unwrap_or(false)
+            || result.content_range() != Some(expected_range.as_str())
+            || result.content_length().and_then(|size| usize::try_from(size).ok()) != Some(length)
+            || result.metadata().is_some_and(|metadata| metadata.contains_key(S3_RETIREMENT_ATTRIBUTE))
+        {
+            return Err(unavailable("S3 returned a different range or publication"));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|_| unavailable("The terminal publication range cannot be allocated"))?;
+        while let Some(chunk) = result.body.next().await {
+            let chunk = chunk.map_err(|error| unavailable(format!("Reading the terminal publication body failed: {error}")))?;
+            if chunk.len() > length - bytes.len() {
+                return Err(unavailable("S3 returned a longer terminal publication range"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != length { return Err(unavailable("S3 returned an incomplete terminal publication range")); }
+        Ok(Bytes::from(bytes))
+    }
+
+    async fn observe_with_size(&self, key: &ObjectKey) -> Result<(NeverVersionedObject, Option<u64>)> {
         let path = self.path(key);
         let reply = self
             .inventory
@@ -63,7 +136,7 @@ impl NeverVersionedRetirement<'_> {
             .set_request_payer(self.inventory.request_payer.clone())
             .send()
             .await;
-        let condition = match reply {
+        let (condition, size) = match reply {
             Ok(reply) => {
                 if reply.version_id().is_some() || reply.delete_marker().unwrap_or(false) {
                     return Err(unavailable(
@@ -76,22 +149,19 @@ impl NeverVersionedRetirement<'_> {
                 {
                     let token = Uuid::parse_str(marker).ok().filter(|token| !token.is_nil());
                     return match (reply.content_length(), token) {
-                        (Some(0), Some(token)) => Ok(NeverVersionedObject::Retired(token)),
+                        (Some(0), Some(token)) => Ok((NeverVersionedObject::Retired(token), None)),
                         _ => Err(unavailable("S3 returned a malformed retirement tombstone")),
                     };
                 }
-                if !reply.content_length().is_some_and(|length| length > 0) {
-                    return Err(unavailable(
-                        "The publication does not have a positive content length",
-                    ));
-                }
+                let size = reply.content_length().filter(|length| *length > 0)
+                    .ok_or_else(|| unavailable("The publication does not have a positive content length"))? as u64;
                 let tag = reply
                     .e_tag()
                     .filter(|tag| strong_entity_tag(tag))
                     .ok_or_else(|| {
                         unavailable("The publication does not have a strong entity tag")
                     })?;
-                S3TombstoneCondition::Matches(tag.to_owned())
+                (S3TombstoneCondition::Matches(tag.to_owned()), Some(size))
             }
             Err(error)
                 if error
@@ -103,7 +173,7 @@ impl NeverVersionedRetirement<'_> {
                             && response.headers().get("x-amz-version-id").is_none()
                     }) =>
             {
-                S3TombstoneCondition::Absent
+                (S3TombstoneCondition::Absent, None)
             }
             Err(error) => {
                 return Err(unavailable(format!(
@@ -111,11 +181,11 @@ impl NeverVersionedRetirement<'_> {
                 )));
             }
         };
-        Ok(NeverVersionedObject::Open(S3TombstoneTarget {
+        Ok((NeverVersionedObject::Open(S3TombstoneTarget {
             namespace: self.inventory.namespace.clone(),
             key: path.to_string(),
             condition,
-        }))
+        }), size))
     }
 
     fn checked_path(&self, key: &ObjectKey, target: &S3TombstoneTarget) -> Result<Path> {
@@ -491,6 +561,39 @@ mod tests {
                 body: "<Error><Code>NoSuchUpload</Code></Error>",
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn readable_terminal_ranges_are_conditional_on_one_enrolled_publication() {
+        let response = |headers| Exchange {
+            method: "GET", path: KEY_PATH,
+            conditions: &[("if-match", "\"original\""), ("range", "bytes=2-4")],
+            status: "206 Partial Content", headers, body: "rif",
+        };
+        let (inventory, server) = fixture(vec![
+            profile(BUCKET_CHECK),
+            profile(BUCKET_CHECK),
+            head("200 OK", "Content-Length: 8\r\nETag: \"original\"\r\n"),
+            response("Content-Range: bytes 2-4/8\r\nETag: \"original\"\r\n"),
+            response("Content-Range: bytes 2-4/8\r\nETag: \"substituted\"\r\n"),
+            response("Content-Range: bytes 2-4/9\r\nETag: \"original\"\r\n"),
+        ]).await;
+        let key = ObjectKey::new("owner/data").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let unenrolled = inventory.never_versioned_retirement().await.unwrap();
+            assert!(unenrolled.observe_readable(&key).await.unwrap().is_none());
+
+            let inventory = inventory.with_terminal_allocation(Uuid::from_u128(1));
+            let retirement = inventory.never_versioned_retirement().await.unwrap();
+            let observed = retirement.observe_readable(&key).await.unwrap().unwrap();
+            assert_eq!(observed.size(), 8);
+            assert_eq!(observed.target().condition, S3TombstoneCondition::Matches("\"original\"".into()));
+            assert!(retirement.read_observed_range(&key, &observed, 2..9).await.is_err());
+            assert_eq!(retirement.read_observed_range(&key, &observed, 2..5).await.unwrap(), Bytes::from_static(b"rif"));
+            assert!(retirement.read_observed_range(&key, &observed, 2..5).await.is_err());
+            assert!(retirement.read_observed_range(&key, &observed, 2..5).await.is_err());
+            server.await.unwrap();
+        }).await.unwrap();
     }
 
     #[tokio::test]

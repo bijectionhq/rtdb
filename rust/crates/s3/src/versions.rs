@@ -11,7 +11,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3Obje
 
 #[path = "never_versioned.rs"]
 mod never_versioned;
-pub use never_versioned::{NeverVersionedObject, NeverVersionedRetirement};
+pub use never_versioned::{NeverVersionedObject, NeverVersionedRetirement, ObservedTerminalObject};
 
 fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String>) {
     if let Some((child, _)) = key.and_then(|key| key.strip_prefix(parent)).and_then(|relative| relative.split_once('/')) {
