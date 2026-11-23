@@ -24,7 +24,7 @@ use rtdb_format::{database::proto::DatabaseConfig, envelope::{SourceBody, Source
 use rtdb_maintenance::CollectionObserver;
 use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
-use rtdb_storage::cache::CacheBudget;
+use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, PlacedAttempt, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -109,7 +109,7 @@ enum CatalogReadCut<'a> {
 #[derive(Clone, Copy)]
 enum AppliedCatalogAdmission<'a> {
     Ordinary,
-    PrepareAudience,
+    PrepareAudience(&'a Arc<BufferPool>),
     PreparedAudience(&'a PreparedAppliedCatalog),
 }
 
@@ -284,23 +284,26 @@ impl Node {
     }
 
     pub fn session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>) -> Result<NativeSession> {
-        self.session_in_memory(database.into(), identity, Arc::clone(self.memory()))
+        self.session_in_memory(database.into(), identity, Arc::clone(self.memory()), None)
     }
 
-    /// Opens a native session backed by bytes already admitted by this node.
-    pub fn session_with_prepaid_memory(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>) -> Result<NativeSession> {
-        if !memory.prepaid_by(self.memory()) {
-            return Err(Anomaly::incorrect("rtdb.node/unfunded-session", "The session budget must be prepaid by this node"));
+    /// Opens a placed audience session backed by the holder's prepaid execution and cache allocations.
+    pub fn audience_session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>, cache: Arc<CacheBudget>) -> Result<NativeSession> {
+        if !self.catalog.is_placed() || !memory.prepaid_by(self.memory()) || !cache.prepaid_by(self.memory()) {
+            return Err(Anomaly::incorrect("rtdb.node/unfunded-session", "A placed audience session requires this holder's prepaid execution and cache allocations"));
         }
-        self.session_in_memory(database.into(), identity, memory)
+        self.session_in_memory(database.into(), identity, memory, Some(cache))
     }
 
-    fn session_in_memory(&self, database: String, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>) -> Result<NativeSession> {
+    fn session_in_memory(&self, database: String, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>, audience_cache: Option<Arc<CacheBudget>>) -> Result<NativeSession> {
         self.ensure_open()?;
         identity.authorize_database(&database, DatabaseAccess::Read)?;
         let local = self.catalog.database(&database)?;
         let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
-        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory });
+        let audience_storage = audience_cache.map(|cache| Arc::new(BufferPool::with_metadata_budget(
+            Arc::clone(local.storage.object_store()), cache, Arc::clone(&memory),
+        )));
+        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory, audience_storage });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
         Ok(NativeSession { state, service, applied_preparation: None })
     }
@@ -435,6 +438,7 @@ impl Node {
                 None
             }
         };
+        let audience = hosted_fence.is_some_and(|(_, _, admission)| !matches!(admission, AppliedCatalogAdmission::Ordinary));
         if let Some(previous) = &held {
             let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
             if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
@@ -488,12 +492,12 @@ impl Node {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
                 let permit = match admission {
                     AppliedCatalogAdmission::PreparedAudience(preparation) => preparation.pin(&database, cut)?,
-                    AppliedCatalogAdmission::Ordinary | AppliedCatalogAdmission::PrepareAudience =>
+                    AppliedCatalogAdmission::Ordinary | AppliedCatalogAdmission::PrepareAudience(_) =>
                         database.storage.object_store().retain_catalog(Some(cut)).await?.ok_or_else(applied_catalog_unretained)?,
                 };
                 let history = match admission {
                     AppliedCatalogAdmission::Ordinary => fence.confirm_hosted(&database).await?,
-                    AppliedCatalogAdmission::PrepareAudience | AppliedCatalogAdmission::PreparedAudience(_) =>
+                    AppliedCatalogAdmission::PrepareAudience(_) | AppliedCatalogAdmission::PreparedAudience(_) =>
                         fence.confirm_audience(&database, true).await?,
                 };
                 if uuid::Uuid::parse_str(&history).ok() != Some(expected_history) {
@@ -504,7 +508,12 @@ impl Node {
             } else {
                 rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?
             };
-            snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
+            let storage = match hosted_fence.map(|(_, _, admission)| admission) {
+                Some(AppliedCatalogAdmission::PrepareAudience(storage)) => Arc::clone(storage),
+                Some(AppliedCatalogAdmission::PreparedAudience(preparation)) => Arc::clone(preparation.storage()),
+                _ => Arc::clone(&database.storage),
+            };
+            snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage });
         }
         crate::read_currency::require_current(database, lease.as_deref())?;
         let applied_basis = applied.map(|selected| QueryBasis {
@@ -515,15 +524,16 @@ impl Node {
         });
         let basis = applied_basis.as_ref().unwrap_or(basis);
         let mut catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())))
-            .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory))
-            .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
+            .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory));
+        if !audience { catalog = catalog.with_fragmenter(self.scan_fragmenter.clone(), fragment_residence); }
         if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
         let memory = match cut {
             CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
             _ => self.factory.options.query.query_memory(&self.factory.memory),
         };
-        QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
-            .with_accelerators(Arc::clone(&self.factory.accelerators))
+        let context = QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?;
+        let context = if audience { context } else { context.with_accelerators(Arc::clone(&self.factory.accelerators)) };
+        context
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
             .map(|context| context.with_query_cpu(query_cpu))
     }
@@ -2947,7 +2957,7 @@ impl NativeSession {
     }
     /// Enrolls one nonrenewable lower catalog pin for a prepaid session before use.
     pub async fn prepare_applied_owned_reads(&mut self, floor: &AppliedReadFloor) -> Result<()> {
-        if !self.service.memory.prepaid_by(self.service.node.memory()) || self.applied_preparation.is_some() {
+        if self.service.audience_storage.is_none() || self.applied_preparation.is_some() {
             return Err(hosted_source_unavailable());
         }
         let read = self.retain_owned_read(Some(floor), None).await?;
@@ -2956,7 +2966,7 @@ impl NativeSession {
     }
     /// Retains the already-applied catalog from the current recovered hosted holder.
     pub async fn open_applied_owned_read(&mut self, floor: &AppliedReadFloor) -> Result<OwnedReadSession> {
-        let preparation = if self.service.memory.prepaid_by(self.service.node.memory()) {
+        let preparation = if self.service.audience_storage.is_some() {
             Some(Arc::clone(self.applied_preparation.as_ref().ok_or_else(hosted_source_unavailable)?))
         } else {
             None
@@ -2968,6 +2978,7 @@ impl NativeSession {
         applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
     ) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
+        if applied_floor.is_none() && self.service.audience_storage.is_some() { return Err(hosted_source_unavailable()); }
         let node = self.service.node.clone();
         let identity = Arc::clone(&self.service.identity);
         let database = self.state.database().to_owned();
@@ -2988,8 +2999,9 @@ impl NativeSession {
                 applied_memory = node.factory.options.query.query_memory(&self.service.memory);
                 let admission = match applied_preparation.as_deref() {
                     Some(preparation) => AppliedCatalogAdmission::PreparedAudience(preparation),
-                    None if self.service.memory.prepaid_by(node.memory()) => AppliedCatalogAdmission::PrepareAudience,
-                    None => AppliedCatalogAdmission::Ordinary,
+                    None => self.service.audience_storage.as_ref().map_or(
+                        AppliedCatalogAdmission::Ordinary, AppliedCatalogAdmission::PrepareAudience,
+                    ),
                 };
                 (None, floor.cut(None, &applied_memory, admission)?)
             }
@@ -3096,6 +3108,7 @@ pub(crate) struct NativeSessionService {
     pub(crate) database: String,
     placement: Option<Weak<Database>>,
     memory: Arc<MemoryBudget>,
+    audience_storage: Option<Arc<BufferPool>>,
 }
 
 impl NativeSessionService {

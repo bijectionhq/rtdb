@@ -12,7 +12,7 @@ impl NodeConfiguration {
     /// Funds the installed audience before splitting the ordinary allocation between cache and execution.
     pub fn node_options(&self, allocation_limit_bytes: usize) -> Result<NodeOptions> {
         let prepaid = self.flight_sql.as_ref().and_then(|settings| settings.audience)
-            .map_or(0, |(_, audience)| audience.execution_bytes());
+            .map_or(0, |(_, audience)| audience.prepaid_bytes());
         let ordinary = allocation_limit_bytes.checked_sub(prepaid)
             .ok_or_else(|| invalid("Memory limit cannot fund the installed Flight audience"))?;
         let cache_bytes = self.memory_cache.maximum_bytes.unwrap_or_else(|| (ordinary as f64 * self.memory_cache.maximum_ratio) as usize);

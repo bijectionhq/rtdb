@@ -6,11 +6,12 @@ use prost::Message;
 use rtdb_auth::Authenticator;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Clock, DatabaseAccess, Node, SessionIdentity};
+use rtdb_storage::cache::CacheBudget;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-use crate::{AUDIENCE_FLIGHT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{AUDIENCE_FLIGHT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
@@ -35,6 +36,7 @@ pub(crate) struct AudienceAdmission {
     calls: Arc<Semaphore>,
     session_slots: Arc<Semaphore>,
     memory: Arc<MemoryBudget>,
+    cache: Arc<CacheBudget>,
     sessions: Registry<String, Session>,
 }
 
@@ -92,11 +94,13 @@ impl Service {
     pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>) -> rtdb_types::Result<Self> {
         let memory = Arc::clone(node.memory());
         let audience = if let Some(profile) = config.audience {
+            let cache = CacheBudget::with_memory(memory.prepay(profile.cache_bytes())?);
             let memory = memory.prepay(profile.execution_bytes())?;
             Some(AudienceAdmission {
                 calls: Arc::new(Semaphore::new(profile.permits())),
                 session_slots: Arc::new(Semaphore::new(profile.permits())),
                 sessions: Registry::new(clock.clone(), memory.clone()),
+                cache,
                 memory,
             })
         } else { None };
@@ -218,7 +222,7 @@ impl Service {
             let audience_slot = audience.zip(audience_source).map(|(audience, source)| {
                 let permit = Arc::clone(&audience.session_slots).try_acquire_owned()
                     .map_err(|_| Status::resource_exhausted("Flight audience session slots are occupied"))?;
-                Ok::<_, Status>((source, permit))
+                Ok::<_, Status>(AudienceSession { source, cache: Arc::clone(&audience.cache), _permit: permit })
             }).transpose()?;
             let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_slot, memory.reserve(capacity).map_err(status)?));
             sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;

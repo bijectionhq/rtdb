@@ -3,6 +3,7 @@ use bytes::Bytes;
 use rtdb_auth::Principal;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Database, NativeSession, Node};
+use rtdb_storage::cache::CacheBudget;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -49,16 +50,22 @@ enum SessionState {
 }
 struct Placement { name: String, attachment: Weak<Database> }
 
+pub(crate) struct AudienceSession {
+    pub source: Uuid,
+    pub cache: Arc<CacheBudget>,
+    pub _permit: OwnedSemaphorePermit,
+}
+
 pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
-    audience: Option<(Uuid, OwnedSemaphorePermit)>,
+    audience: Option<AudienceSession>,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience: Option<(Uuid, OwnedSemaphorePermit)>, reservation: Arc<MemoryReservation>) -> Self {
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience: Option<AudienceSession>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self {
             id, caller, audience, placement,
@@ -66,7 +73,7 @@ impl Session {
             _reservation: reservation,
         }
     }
-    pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|(source, _)| *source) }
+    pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
 
     pub fn audience_read(&self, handle: &Bytes) -> Option<Arc<OwnedReadResource>> {
         let state = self.state.lock().expect("session lock");
@@ -141,8 +148,8 @@ impl Session {
     pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
         self.require_database(database, node)?;
         let identity = self.caller.principal.clone();
-        let native = if self.audience.is_some() {
-            node.session_with_prepaid_memory(database, identity, Arc::clone(self.memory()))
+        let native = if let Some(audience) = &self.audience {
+            node.audience_session(database, identity, Arc::clone(self.memory()), Arc::clone(&audience.cache))
         } else {
             node.session(database, identity)
         }.map_err(status)?;

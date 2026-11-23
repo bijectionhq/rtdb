@@ -138,7 +138,11 @@ pub struct CacheBudget {
 }
 
 impl CacheBudget {
-    pub fn new(limit: usize) -> Arc<Self> { Arc::new(Self { memory: MemoryBudget::new(limit), lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0) }) }
+    pub fn new(limit: usize) -> Arc<Self> { Self::with_memory(MemoryBudget::new(limit)) }
+    pub fn with_memory(memory: Arc<MemoryBudget>) -> Arc<Self> {
+        Arc::new(Self { memory, lru: Mutex::new(Lru::new()), pools: AtomicU64::new(0) })
+    }
+    pub fn prepaid_by(&self, parent: &Arc<MemoryBudget>) -> bool { self.memory.prepaid_by(parent) }
     pub fn retained_bytes(&self) -> usize { self.memory.used_bytes() }
     pub fn limit_bytes(&self) -> usize { self.memory.limit_bytes() }
 
@@ -462,6 +466,30 @@ mod fairness_tests {
         drop(first.get(&ObjectKey::new("a").unwrap()).await.unwrap());
         assert!(matches!(second.get(&ObjectKey::new("b").unwrap()).await, Err(Error::MemoryLimit { .. })));
         assert_eq!(budget.retained_bytes(), 50, "the other pool's entry survives");
+    }
+
+    #[tokio::test]
+    async fn a_prepaid_cache_admits_and_retains_objects_during_ordinary_pressure() {
+        let parent = MemoryBudget::new(200);
+        let prepaid = CacheBudget::with_memory(parent.prepay(100).unwrap());
+        assert!(prepaid.prepaid_by(&parent));
+        let store = Arc::new(MemoryStore::default());
+        let a = ObjectKey::new("a").unwrap();
+        let b = ObjectKey::new("b").unwrap();
+        store.put(&a, Bytes::from(vec![1; 60])).await.unwrap();
+        store.put(&b, Bytes::from(vec![2; 60])).await.unwrap();
+        let ordinary = BufferPool::with_budget(store.clone(), CacheBudget::with_memory(Arc::clone(&parent)));
+        let audience = BufferPool::with_budget(store, prepaid);
+        let held = ordinary.get(&a).await.unwrap();
+        let _pressure = parent.reserve(40).unwrap();
+        assert_eq!(parent.used_bytes(), parent.limit_bytes());
+        assert!(matches!(ordinary.get(&b).await, Err(Error::MemoryLimit { .. })));
+        assert!(!audience.holds(&a));
+        drop(audience.get(&a).await.unwrap());
+        drop(held);
+        drop(ordinary.get(&b).await.unwrap());
+        assert!(!ordinary.holds(&a));
+        assert!(audience.holds(&a));
     }
 }
 

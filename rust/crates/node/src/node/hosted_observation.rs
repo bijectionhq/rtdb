@@ -1,6 +1,7 @@
 use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_storage::cache::BufferPool;
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
 
@@ -12,6 +13,7 @@ use rtdb_query::QueryContext;
 pub(super) struct PreparedAppliedCatalog {
     attachment: Weak<Database>,
     floor: CatalogCut,
+    storage: Arc<BufferPool>,
     registration: Arc<Mutex<Option<Arc<dyn Send + Sync>>>>,
     expires_at: tokio::time::Instant,
     expiry: tokio::task::JoinHandle<()>,
@@ -35,8 +37,10 @@ impl PreparedAppliedCatalog {
                 drop(retired);
             }
         });
-        Ok(Self { attachment: read.attachment.clone(), floor, registration, expires_at, expiry, _reservation: reservation })
+        Ok(Self { attachment: read.attachment.clone(), floor, storage: Arc::clone(&database.storage), registration, expires_at, expiry, _reservation: reservation })
     }
+
+    pub(super) fn storage(&self) -> &Arc<BufferPool> { &self.storage }
 
     pub(super) fn check_live(&self) -> Result<()> {
         if tokio::time::Instant::now() >= self.expires_at {
