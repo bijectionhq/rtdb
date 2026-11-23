@@ -10,6 +10,98 @@ use rtdb_multi::{admin, deployment::CellStorage};
 
 use common::s3_storage as storage;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn the_hosted_reaper_retires_only_the_archived_version_of_an_original_replay_pack() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
+    use rtdb_storage::{IoRegion, ObjectKey};
+    use rtdb_types::{BlockIndex, StorageEpoch};
+
+    let (Some(storage @ CellStorage::S3 { .. }), Some(archive)) = (storage(), s3_archive_storage()) else {
+        eprintln!("RTDB_S3_ENDPOINT and RTDB_S3_ARCHIVE_BUCKET are required");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let CellStorage::S3 { config } = &storage else { unreachable!() };
+        let inventory = config.versioned_inventory(&config.cell_root().unwrap(), &BTreeMap::new()).await.unwrap();
+        let mut cell = Cell::start_on(Some(storage.clone()), vec![MemberPool::General], None, None, None).await;
+        let deployment = uuid::Uuid::new_v4();
+        let id = deployment.to_string();
+        admin::install_deployment(cell.directory.as_ref(), deployment, "replay", "acme", 3).await.unwrap();
+        let client = cell.connect("replay").await;
+        client.simple_query("CREATE INDEX replay_total ON orders (total, _id)").await.unwrap();
+        client.simple_query("INSERT INTO orders (_id, total, detail) VALUES (1, 10, 'before cut')").await.unwrap();
+        let holder = cell.holder("replay").await.unwrap();
+        let agent = &cell.node(holder).agent;
+        agent.flush("replay").await.unwrap();
+        let original = cell.directory.deployment(&id).await.unwrap().unwrap().checkpoint.unwrap();
+        client.simple_query("INSERT INTO orders (_id, total, detail) VALUES (2, 20, 'after cut')").await.unwrap();
+        agent.flush("replay").await.unwrap();
+        let database = cell.node(holder).server.node().catalog().database("replay").unwrap();
+        database.build_artefacts().await.unwrap();
+        drop(database);
+        loop {
+            let record = cell.directory.deployment(&id).await.unwrap().unwrap();
+            if record.replica_anchor.is_some_and(|anchor| anchor.interval[1] > original.boundary) { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(client);
+        agent.park("replay").await.unwrap();
+
+        let parked = cell.directory.deployment(&id).await.unwrap().unwrap();
+        let current = parked.checkpoint.unwrap();
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
+        let pack = |block| {
+            let name = rtdb_multi::packing::block_pack(&block_key(BlockIndex(block)).unwrap());
+            ObjectKey::new(format!("{}/{root}/{name}", parked.storage_prefix())).unwrap()
+        };
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let original = pack(original.block);
+        let current = pack(current.block);
+        let version = bucket.observe_head(&original).await.unwrap().version.expect("the serving bucket is versioned");
+        let successor = bucket.observe_head(&current).await.unwrap().version.unwrap();
+        let keys = Arc::new(cell.keys());
+        let op = uuid::Uuid::new_v4();
+        let owner = hosted_test_owner();
+        let capture = rtdb_multi::archive::capture(
+            cell.directory.clone(), &storage, &archive, keys.as_ref(), deployment, op, Some(owner.clone()), Some(&parked),
+        ).await.unwrap();
+        let registered = cell.directory.deployment(&id).await.unwrap().unwrap();
+        rtdb_multi::archive::retain_serving_replay(
+            cell.directory.as_ref(), &storage, &archive, keys.as_ref(), &registered, op,
+            &capture.manifest_sha256().unwrap(), Some(&owner),
+        ).await.unwrap();
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
+            cell.directory.clone(), storage, Some(keys), Some(owner), Duration::ZERO,
+            Duration::from_millis(20), stop.clone(),
+        ));
+        loop {
+            if inventory.exact_retirement_absent(&original, &version).await.unwrap()
+                && cell.directory.lineage_state(&parked.lineage).await.unwrap().retirement().is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(bucket.observe_head(&current).await.unwrap().version, Some(successor));
+        assert!(matches!(bucket.observe_head(&original).await, Err(rtdb_storage::Error::MissingObject(_))));
+        cell.nodes[holder].take().unwrap().kill().await.unwrap();
+        let fresh_holder = cell.add_node().await;
+        let read = connect_eventually(&cell, "replay").await;
+        assert_eq!(values(&read, "SELECT DISTINCT total FROM orders WHERE total >= 0 ORDER BY total LIMIT 2").await, ["10", "20"]);
+        assert_eq!(values(&read, "SELECT detail FROM orders WHERE _id = 1").await, ["before cut"]);
+        assert_eq!(values(&read, "SELECT detail FROM orders WHERE _id = 2").await, ["after cut"]);
+        assert_eq!(cell.holder("replay").await, Some(fresh_holder));
+        drop(read);
+        stop.cancel();
+        reaper.await.unwrap();
+        cell.stop().await;
+    }).await.expect("versioned replay pack retirement stalled");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn checkpoint_and_durable_tail_survive_loss_of_one_two_or_all_workers() {
@@ -554,6 +646,7 @@ async fn ordered_index_erasure_retires_the_old_hosted_provider_generation() {
         let stop = CancellationToken::new();
         let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
             cell.directory.clone(), storage.clone(), Some(Arc::new(cell.keys())),
+            None,
             Duration::from_secs(3600), Duration::from_millis(20), stop.clone(),
         ));
         let observed = loop {

@@ -1602,6 +1602,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     let stop = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
         cell.directory.clone(), cell.storage(), Some(Arc::new(cell.keys())),
+        None,
         Duration::from_secs(3600), Duration::from_millis(10), stop.clone(),
     ));
     let deletion = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2076,6 +2077,7 @@ async fn the_local_reaper_retires_an_original_l0_pack_under_verified_archive_cus
     let stop = tokio_util::sync::CancellationToken::new();
     let reaper = tokio::spawn(rtdb_multi::store::run_reaper(
         cell.directory.clone(), storage.clone(), Some(Arc::new(cell.keys())),
+        None,
         Duration::ZERO, Duration::from_millis(15), stop.clone(),
     ));
     tokio::time::timeout(Duration::from_secs(10), completed.notified()).await

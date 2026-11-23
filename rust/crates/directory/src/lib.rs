@@ -485,6 +485,10 @@ pub enum StorageRegion {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         release: Option<String>,
     },
+    ReplayPackRetirement {
+        object: String,
+        capture: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +506,7 @@ impl StorageRegion {
         let (destination, repair) = match self {
             Self::Local { archive, repair_archive, .. } |
             Self::Remote { archive, repair_archive, .. } => (*archive, *repair_archive),
+            Self::ReplayPackRetirement { capture: retained, .. } => return *retained == capture,
             Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => return false,
         };
         archive_custody::covers_archive(destination.map(|id| id.as_u128()), repair.map(|id| id.as_u128()), capture.as_u128())
@@ -520,7 +525,7 @@ impl StorageRegion {
     pub fn admits_archive_read(&self, capture: uuid::Uuid) -> bool {
         archive_custody::may_read_archive(
             self.holds_archive(capture),
-            matches!(self, Self::Remote { closed: true, .. }),
+            matches!(self, Self::Remote { closed: true, .. } | Self::ReplayPackRetirement { .. }),
         )
     }
 
@@ -529,7 +534,7 @@ impl StorageRegion {
             Self::Local { checkpoint_metadata_from, .. } |
             Self::Remote { checkpoint_metadata_from, closed: false, .. } => *checkpoint_metadata_from,
             Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } | Self::ReferenceRead { .. }
-            | Self::ExactRetirement { .. } => None,
+            | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => None,
         }
     }
 
@@ -546,7 +551,8 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_replay_from, .. }
             | Self::Remote { checkpoint_replay_from, closed: false, .. } => *checkpoint_replay_from,
-            Self::Remote { closed: true, .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => None,
+            Self::Remote { closed: true, .. } | Self::ReferenceRead { .. }
+            | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => None,
             Self::ReplicaReplay { first_required, .. } => Some(*first_required),
         }
     }
@@ -555,7 +561,16 @@ impl StorageRegion {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
-            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => false,
+            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. }
+            | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => false,
+        }
+    }
+
+    pub fn retires_reference(&self, key: &str) -> bool {
+        match self {
+            Self::ExactRetirement { object, release } => object == key || release.as_deref() == Some(key),
+            Self::ReplayPackRetirement { object, .. } => object == key,
+            _ => false,
         }
     }
 }

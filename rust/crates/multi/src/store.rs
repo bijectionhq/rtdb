@@ -721,7 +721,7 @@ pub(crate) async fn reconcile_storage_regions(
                 if directory.hosted_task_stopped(owner).await? => {
                 release_region(directory, &record.id, region, false).await?;
             }
-            StorageRegion::ExactRetirement { .. }
+            StorageRegion::ExactRetirement { .. } | StorageRegion::ReplayPackRetirement { .. }
                 if directory.lineage_state(&record.lineage).await?.retirement().is_none_or(|retirement| retirement.token != region) => {
                 release_region(directory, &record.id, region, false).await?;
             }
@@ -1674,6 +1674,7 @@ pub async fn run_reaper(
     directory: Arc<dyn Directory>,
     storage: crate::deployment::CellStorage,
     keys: Option<Arc<dyn KeyService>>,
+    hosted_task: Option<HostedTask>,
     grace: Duration,
     interval: Duration,
     cancellation: tokio_util::sync::CancellationToken,
@@ -1692,6 +1693,7 @@ pub async fn run_reaper(
                                 && !record.storage_regions.values().any(|region| {
                                     matches!(region, StorageRegion::Remote { .. } | StorageRegion::ReplicaReplay { .. }
                                         | StorageRegion::ReferenceRead { .. } | StorageRegion::ExactRetirement { .. }
+                                        | StorageRegion::ReplayPackRetirement { .. }
                                         | StorageRegion::Local { archive: Some(_), .. } | StorageRegion::Local { repair_archive: Some(_), .. })
                                         || region.checkpoint_metadata_from().is_some()
                                 })
@@ -1741,6 +1743,13 @@ pub async fn run_reaper(
                                         if cancellation.is_cancelled() { return; }
                                         if let Err(error) = exact_retirement::reap(directory.as_ref(), bucket.as_ref(), &provider, record, threshold, references.as_ref().ok(), keys.as_deref()).await {
                                             eprintln!("Exact garbage for {} is pending: {}", record.id, error.code);
+                                        }
+                                        if let (Some(keys), Some(task)) = (keys.as_deref(), hosted_task.as_ref())
+                                            && let Err(error) = replay_retirement::reap_hosted(
+                                                directory.as_ref(), &storage, keys, task, bucket.as_ref(), &provider, record, threshold,
+                                            ).await
+                                        {
+                                            eprintln!("Original replay packs for {} are pending: {}", record.id, error.code);
                                         }
                                     }
                                 }

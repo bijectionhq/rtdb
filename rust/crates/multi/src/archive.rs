@@ -239,38 +239,44 @@ pub(crate) fn has_local_replay_archive(record: &DeploymentRecord) -> Result<bool
     Ok(matches!(selected.media()?, CellStorage::Local { .. }))
 }
 
-pub(crate) async fn with_local_replay_archive<T, F, Fut>(
+pub(crate) async fn with_replay_archive<T, F, Fut>(
     directory: &dyn Directory,
     storage: &CellStorage,
     keys: &dyn KeyService,
     record: &DeploymentRecord,
+    hosted_task: Option<&rtdb_directory::HostedTask>,
     run: F,
 ) -> Result<Option<T>>
 where
-    F: FnOnce(DeploymentRecord, ArchivedCheckpoint) -> Fut,
+    F: FnOnce(DeploymentRecord, Uuid, ArchivedCheckpoint) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     let Some(operation) = record.serving_replay_capture else { return Ok(None); };
     let Some(selected) = serving_archive(record)? else { return Ok(None); };
     if record.checkpoint != Some(selected.point.checkpoint) { return Ok(None); }
     let archive = selected.media()?;
-    if !matches!(archive, CellStorage::Local { .. }) || same_storage(storage, &archive) || storage.overlaps(&archive)? {
+    let same_provider = match (storage, &archive) {
+        (CellStorage::Local { .. }, CellStorage::Local { .. }) => true,
+        (CellStorage::S3 { .. }, CellStorage::S3 { .. }) => hosted_task.is_some(),
+        _ => false,
+    };
+    if !same_provider || same_storage(storage, &archive) || storage.overlaps(&archive)? {
         return Ok(None);
     }
-    stage::with_region(
-        directory, keys, &record.id, &archive, None, Some((operation, None)), None,
+    Box::pin(stage::with_region(
+        directory, keys, &record.id, &archive, hosted_task, Some((operation, None)), None,
         |current| {
             if current.version != record.version || serving_archive(current)?.as_ref() != Some(&selected) {
                 return Err(unavailable("The installation changed before opening its replay archive"));
             }
             Ok(None)
         },
-        |admitted, owner, io| async move {
-            let archive = ArchivedCheckpoint::load(&admitted, keys, owner, io, false).await?
+        |admitted, owner, io| Box::pin(async move {
+            let archive = Box::pin(ArchivedCheckpoint::load(&admitted, keys, owner, io, false)).await?
                 .ok_or_else(|| inconsistent("The installation lost its retained replay archive"))?;
-            run(admitted, archive).await.map(Some)
-        },
-    ).await
+            run(admitted, owner, archive).await.map(Some)
+        }),
+    )).await
 }
 
 impl ArchivedCheckpoint {

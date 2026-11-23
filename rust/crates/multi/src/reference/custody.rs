@@ -67,10 +67,7 @@ impl ReferenceReads {
                     matches!(owner.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
                     owner.storage_prefix() == residence && owner.org == worker.org && owner.lineage == worker.lineage,
                     owner.storage_namespaces == Some(worker.namespaces),
-                ) || owner.storage_regions.values().any(|region| {
-                    matches!(region, StorageRegion::ExactRetirement { object: retiring, release }
-                        if *retiring == object || release.as_ref() == Some(&object))
-                }) {
+                ) || owner.storage_regions.values().any(|region| region.retires_reference(&object)) {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, CLOSED, "The reference's physical residence no longer admits reads"));
                 }
                 owner.storage_regions.insert(id, StorageRegion::ReferenceRead { custody: worker.custody.clone(), object: Some(object.clone()), archive_source: None });

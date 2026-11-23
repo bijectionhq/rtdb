@@ -1759,12 +1759,16 @@ rule ReapUnreachable {
         candidate.deleted = true
 }
 
--- Original replay pack retirement runs during the local cell sweep.
+-- Original replay pack retirement runs during the local cell sweep or through the versioned provider inventory.
 -- A parked root can retire an older original pack after the grace while it holds the exact current replay archive and the source lineage.
 -- The reaper checks every L0 member against the archived bytes and accepts checkpoint metadata for the pack's own older block.
 -- The certified replica prefix passes the pack's boundary and ends before the published boundary.
 -- Existing storage admissions, catalog readers, journal dependencies, and declared descendant references retain the original pack.
 -- New serving admissions start at the published checkpoint and acquire the selected replay archive.
+-- The hosted reaper binds the pack index and every member observation to the same physical version.
+-- It verifies the published successor root and waits for outstanding write leases to expire.
+-- Durable provider authority fences the exact pack and retains the capture through a reaper restart.
+-- The reaper reopens the lineage after the provider confirms absence of the exact version.
 
 rule WithdrawForkReferences {
     -- Each manifest update uses the successor of the sequence whose bytes it read.

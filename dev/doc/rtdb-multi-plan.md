@@ -66,6 +66,9 @@ A gateway reconnect keeps the original deployment ID.
 Restoring an older node or object copy requires a recoverable checkpoint and tail from the live directory and logkeeper ensemble.
 The directory and acknowledged quorum stream must survive this restore, and the production logkeepers must acknowledge durable writes.
 Recovery from a replacement directory or a rolled-back quorum requires a new deployment identity.
+Hosted protocol 64 adds durable replay pack retirement for versioned serving buckets.
+Upgrade all direct directory clients before enabling this reaper on a cell.
+The reaper uses its installed ECS task identity to hold the independent archive while checking the original pack.
 
 Nodes and logkeepers bound to a wildcard address require `--advertise-host` with their reachable DNS name or IP.
 Each durable logkeeper stores its member ID in the journal directory.

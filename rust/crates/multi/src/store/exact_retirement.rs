@@ -271,7 +271,7 @@ async fn forget_settled_replica_candidate(directory: &dyn Directory, deployment:
     Ok(())
 }
 
-async fn settle(directory: &dyn Directory, lineage: &str, deployment: &str, retirement: &LineageRetirement) -> Result<()> {
+pub(super) async fn settle(directory: &dyn Directory, lineage: &str, deployment: &str, retirement: &LineageRetirement) -> Result<()> {
     for _ in 0..8 {
         let Some(owner) = directory.deployment(deployment).await? else { break; };
         if directory.lineage_state(lineage).await?.retirement() != Some(retirement) {

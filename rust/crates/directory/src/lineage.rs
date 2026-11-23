@@ -4,7 +4,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3Tomb
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{DeploymentRecord, HostedTask, Lifecycle, StorageRegion, Version, next_reference_revision, reference_revision};
+use crate::{Checkpoint, DeploymentRecord, HostedTask, Lifecycle, StorageRegion, Version, next_reference_revision, reference_revision};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageRetirement {
@@ -18,19 +18,25 @@ impl LineageRetirement {
     fn matches_owner(&self, owner: &DeploymentRecord) -> bool {
         let (deployment, target, release) = match &self.work {
             RetirementWork::S3 { deployment, target, release, .. } | RetirementWork::Tombstones { deployment, target, release, .. } => {
-                (deployment, target, release)
+                (deployment, target, Some(release))
             }
+            RetirementWork::ReplayPack { deployment, target, .. } => (deployment, target, None),
             RetirementWork::Local { .. } => return false,
         };
         let prefix = format!("{}/", self.source);
         owner.id == *deployment && owner.storage_prefix() == self.source
-            && target.starts_with(&prefix) && release.starts_with(&prefix) && target != release
+            && target.starts_with(&prefix)
+            && release.is_none_or(|release| release.starts_with(&prefix) && target != release)
     }
 
     fn matches_fence(&self, owner: &DeploymentRecord) -> bool {
         let (target, marker) = match &self.work {
             RetirementWork::S3 { target, release, release_version, .. } => (target, release_version.as_ref().map(|_| release)),
             RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
+            RetirementWork::ReplayPack { target, capture, .. } => {
+                return matches!(owner.storage_regions.get(&self.token), Some(StorageRegion::ReplayPackRetirement { object, capture: held })
+                    if object == target && held == capture);
+            }
             RetirementWork::Local { .. } => return false,
         };
         matches!(owner.storage_regions.get(&self.token), Some(StorageRegion::ExactRetirement { object, release })
@@ -58,6 +64,13 @@ pub enum RetirementWork {
         release: String,
         data_tombstone: S3TombstoneTarget,
         release_tombstone: S3TombstoneTarget,
+    },
+    ReplayPack {
+        deployment: String,
+        target: String,
+        version: PhysicalObjectVersion,
+        capture: Uuid,
+        checkpoint: Checkpoint,
     },
 }
 
@@ -233,6 +246,18 @@ impl LineageState {
         }
         let mut next = self.clone();
         if !self.exact_erasure_authorized() {
+            if let RetirementWork::ReplayPack { capture, checkpoint, .. } = &retirement.work
+                && (owner.lifecycle != Lifecycle::Live || owner.holder.is_some()
+                    || owner.active_s3_write_lease(crate::now_ms()).is_some()
+                    || owner.serving_replay_capture != Some(*capture) || owner.checkpoint != Some(*checkpoint)
+                    || owner.checkpoint_capture_retirements.contains_key(capture)
+                    || owner.checkpoint_captures.get(capture).is_none_or(|archive| !archive.media_bound || archive.checkpoint != *checkpoint)
+                    || !owner.catalog_readers.is_empty()
+                    || owner.storage_regions.len() != 2
+                    || !owner.storage_regions.values().any(|region| region.admits_archive_read(*capture)))
+            {
+                return Err(lineage_busy());
+            }
             next.admission = match retirement.work {
                 RetirementWork::Tombstones { .. } => Admission::ErasingTombstones { retirement: retirement.clone(), uploads: BTreeMap::new() },
                 _ => Admission::Erasing(retirement.clone()),
@@ -393,4 +418,65 @@ fn pending_residence(owner: &DeploymentRecord) -> Result<String> {
 pub(crate) fn disposal_changed() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/reference-disposal-changed",
         "The exact residence is no longer awaiting disposal")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CheckpointCapture;
+    use rtdb_types::S3ObjectNamespace;
+
+    #[test]
+    fn replay_pack_authority_requires_the_selected_open_capture_and_keeps_its_custody_until_settlement() {
+        let mut owner = DeploymentRecord::new("orders", "acme", vec![], 0);
+        let capture = Uuid::new_v4();
+        let checkpoint = Checkpoint { block: 8, boundary: 16, source: 9, system_time: 10, root_sha256: Some([7; 32]) };
+        owner.checkpoint = Some(checkpoint);
+        owner.serving_replay_capture = Some(capture);
+        owner.checkpoint_captures.insert(capture, CheckpointCapture {
+            archive: "independent archive".to_owned(), key_namespace: None,
+            incarnation: owner.incarnation, log_epoch: owner.log_epoch, checkpoint,
+            automatic_fork: false, world_replay: None, media_bound: true,
+            manifest_sha256: Some("accepted".to_owned()), remote_disposal: None,
+        });
+        let source = owner.storage_prefix();
+        let object = format!("{source}/v06/~packs/b00");
+        let retirement = LineageRetirement {
+            token: Uuid::new_v4(), source,
+            work: RetirementWork::ReplayPack {
+                deployment: owner.id.clone(), target: object.clone(), capture, checkpoint,
+                version: PhysicalObjectVersion {
+                    namespace: S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
+                    key: format!("cell/{object}"), version: "exact-version".into(),
+                },
+            },
+        };
+        let state = LineageState::default().changed(LineageChange::ReserveRetirement {
+            retirement: retirement.clone(), observed_references: 0, generation: 0,
+        }).unwrap();
+        owner.storage_regions.insert(retirement.token, StorageRegion::ReplayPackRetirement { object: object.clone(), capture });
+        let pin = &owner.storage_regions[&retirement.token];
+        assert!(pin.holds_archive(capture) && pin.retires_reference(&object));
+        assert!(!pin.admits_archive_read(capture));
+        assert!(state.authorize_exact_owned(&owner, &retirement).is_err());
+
+        let reader = Uuid::new_v4();
+        owner.storage_regions.insert(reader, StorageRegion::Local {
+            archive: Some(capture), checkpoint_suffix: None, repair_archive: None,
+            tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        });
+        let mut changed = owner.clone();
+        changed.serving_replay_capture = Some(Uuid::new_v4());
+        assert!(state.authorize_exact_owned(&changed, &retirement).is_err());
+        let state = state.authorize_exact_owned(&owner, &retirement).unwrap();
+        let state: LineageState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(state.exact_erasure_authorized());
+        assert_eq!(state.retirement(), Some(&retirement));
+
+        changed.storage_regions.remove(&reader);
+        assert!(changed.storage_regions[&retirement.token].holds_archive(capture));
+        let (settled, reopened) = state.settle_exact_owned(&changed, &retirement).unwrap();
+        assert!(!settled.storage_regions.contains_key(&retirement.token));
+        assert!(reopened.open_generation().is_some());
+    }
 }

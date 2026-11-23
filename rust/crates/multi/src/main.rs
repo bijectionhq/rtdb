@@ -339,7 +339,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 63 } else { 13 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 64 } else { 13 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
         };
@@ -592,6 +592,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None => None,
             };
             let storage = CellStorage::parse(arguments.required("storage-root")?)?;
+            let task = hosted_task(&arguments)?;
             let recovery = if arguments.present("recovery-listen") {
                 let configuration = NodeConfiguration::from_yaml(
                     &std::fs::read_to_string(arguments.required("recovery-config")?).map_err(io)?,
@@ -599,7 +600,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 let tls_settings = configuration.server.and_then(|server| server.ssl)
                     .ok_or_else(|| usage("The recovery configuration must provide server.ssl".into()))?;
                 let tls = rtdb_server::tls::load(&tls_settings, &rtdb_columnar::MemoryBudget::new(16 << 20))?;
-                let task = hosted_task(&arguments)?;
                 let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
                 if task.is_some() && control.0.is_none() {
                     return Err(usage("Hosted recovery requires the installed --cell-secret".into()));
@@ -610,7 +610,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     storage.clone(),
                     CellStorage::parse(arguments.required("archive-root")?)?,
                     keys.clone().ok_or_else(|| usage("The recovery endpoint requires --keys".into()))?,
-                    task,
+                    task.clone(),
                     control,
                 )?;
                 let listener = tokio::net::TcpListener::bind(
@@ -621,7 +621,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None
             };
             let reaper = rtdb_multi::store::run_reaper(
-                directory.clone(), storage, keys, grace, Duration::from_secs(10), cancellation.clone(),
+                directory.clone(), storage, keys, task, grace, Duration::from_secs(10), cancellation.clone(),
             );
             if let Some((listener, tls, service)) = recovery {
                 let (_, result) = tokio::join!(reaper, async {
