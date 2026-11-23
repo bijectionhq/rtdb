@@ -445,6 +445,10 @@ Buffer copies for ownership and native sidecar or ANN state are covered separate
 The native library and release benchmark built on the candidate based on RTDB main `c28482fa90`.
 The eight focused Rust regressions and seven workspace doctests passed.
 Gradle ran 3,243 unit tests, 3,348 property tests and 5,629 integration tests successfully, with one PostgreSQL integration skip.
+The Rust workspace run on that base was stopped after the branch moved to newer main commits.
+It recorded 1,101 passes before interruption, and the seven Azure password tests that timed out passed on retry.
+The query crate passed 407 unit and integration tests on the candidate based on `6c41a06f8c`.
+The candidate based on `24a6de4610` passed 313 query and 106 transaction unit tests, including the mixed-gather ownership, vector COALESCE, SQL source encoding, and spatial source layout regressions.
 
 The release workload passed result-order and distance checks over 60 stationary and 20 churn query/filter cases on 100,000 GloVe embeddings.
 The workload also passed five temporal canaries.
