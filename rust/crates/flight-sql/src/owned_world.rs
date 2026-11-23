@@ -64,6 +64,7 @@ pub struct PreparedReplayParent {
 #[derive(serde::Serialize)]
 pub struct RetainedReplayWorld {
     pub pin: [u8; 16],
+    pub ancestor: Option<rtdb_types::OwnedWorldAncestor>,
     pub capture: [u8; 16],
     pub suffix: Option<[u8; 16]>,
     pub manifest: String,

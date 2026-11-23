@@ -1,7 +1,7 @@
 //! Bounded private world effects carried by one held native replay receipt.
 
 use rtdb_types::{
-    Anomaly, EntityId, Iid, Interval, OwnedRelation, OwnedWorld, Result, StructFields, Timestamp,
+    Anomaly, EntityId, Iid, Interval, OwnedRelation, OwnedWorld, OwnedWorldAncestor, Result, StructFields, Timestamp,
     TransactionKey, TxId, Value, WorldClockMode, WorldSchemas,
 };
 use serde::Deserialize;
@@ -12,7 +12,7 @@ use super::WorldReadmission;
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP2";
+const MAGIC: &[u8] = b"BJWP3";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
@@ -45,6 +45,7 @@ struct ArchivedWorld {
     pin: [u8; 16],
     mode: ArchivedMode,
     parent: ArchivedParent,
+    ancestor: Option<OwnedWorldAncestor>,
     until: i64,
     dropped: bool,
 }
@@ -79,7 +80,7 @@ impl ArchivedWorld {
         };
         let schemas = serde_json::to_vec(&self.parent.schemas).map_err(|_| invalid())?;
         let world = OwnedWorld {
-            ancestor: None,
+            ancestor: self.ancestor,
             id: Iid(self.id),
             pin: Iid(self.pin),
             capture: Iid(self.parent.capture),
