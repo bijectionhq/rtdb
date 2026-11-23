@@ -55,12 +55,25 @@ pub trait ArtefactBuilder: Send + Sync {
 
     async fn prepare_serving_search(&self, _snapshot: rtdb_index::Snapshot, _cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> { Ok(None) }
 
+    fn journals_search_deltas(&self) -> bool { false }
+
+    async fn prepare_search_delta(&self, _snapshot: rtdb_index::Snapshot, _write: std::sync::Arc<rtdb_index::StagedWrite>,
+        _cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> { Ok(None) }
+
+    async fn install_search_delta(&self, snapshot: rtdb_index::Snapshot, _write: &rtdb_index::StagedWrite, _delta: Option<&[u8]>,
+        cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
+        self.prepare_serving_search(snapshot, cancellation).await
+    }
+
     async fn seal_serving_search(&self, _snapshot: &Arc<PartitionValue>, _table: &TableRef, _trie: &TrieKey,
         _file: &std::path::Path, _size: u64, _cancellation: &CancellationToken) -> Result<Vec<ArtefactRecord>> { Ok(Vec::new()) }
 
     fn retire_with_owner(&self, _record: &ArtefactRecord) -> bool { false }
 
     async fn build_live_pages(&self, _snapshot: &Arc<PartitionValue>, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
+
+    async fn maintain_independent(&self, _snapshots: &dyn SnapshotSource, _publisher: &dyn ArtefactPublisher,
+        _storage: (StorageVersion, StorageEpoch), _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
 
     /// The definitions in force as of the snapshot; jobs are a function of these and the snapshot's catalog.
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>>;
@@ -326,6 +339,7 @@ impl ArtefactDriver {
 
     /// Artefacts are retired only while no job runs, since a running job may be uploading an object its definition no longer wants.
     async fn available(&mut self, cancellation: &CancellationToken, idle: bool) -> Result<Vec<ArtefactJob>> {
+        if idle { self.builder.maintain_independent(self.snapshots.as_ref(), self.publisher.as_ref(), self.storage, cancellation).await?; }
         let snapshot = self.snapshots.snapshot();
         let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;

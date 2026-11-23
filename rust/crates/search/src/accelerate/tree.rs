@@ -9,23 +9,24 @@ use tokio::sync::OnceCell;
 
 use super::*;
 use super::point::SearchWitness;
-use crate::file::{TREE_FORMAT_VERSION, TreeFile, TreeRankOrder, TreeRanked};
+use crate::{SearchRuntime, file::{TREE_FORMAT_VERSION, TreeFile, TreeRankOrder, TreeRanked}};
 
 pub(super) struct RecordedTree {
     pub(super) pack: Arc<super::routing::Pack>,
     pub(super) members: BTreeMap<u32, TrieKey>,
     discovery: bool,
     opened: OnceCell<Arc<TreeFile>>,
+    _routing: Arc<super::routing::TableRouting>,
 }
 
 impl RecordedTree {
-    fn select(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition,
-        column: usize, matching: &Query, include_packs: bool) -> Result<Vec<Self>> {
-        let routing = runtime.table_routing(request.snapshot, definition, request.storage, include_packs)?;
+    pub(super) fn select(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, definition: &SearchDefinition,
+        column: usize, matching: &Query, include_packs: bool, history: bool) -> Result<Vec<Self>> {
+        let routing = runtime.table_routing(request.snapshot, definition, request.storage, include_packs, history)?;
         Ok(routing.packs().filter_map(|pack| {
             let members = pack.visible_members(request.bounds);
             (!members.is_empty()).then(|| Self { pack: Arc::clone(pack), members,
-                discovery: pack.can_nominate(request.bounds, column, matching), opened: OnceCell::new() })
+                discovery: !history && pack.can_nominate(request.bounds, column, matching), opened: OnceCell::new(), _routing: Arc::clone(&routing) })
         }).collect())
     }
 
@@ -53,10 +54,31 @@ struct Nomination { iid: Iid, source: Option<usize>, witness: Option<SearchWitne
 enum Task {
     Open(usize),
     Expand(usize),
+    OpenLogical(usize),
+    ExpandLogical(usize),
     Legacy(usize),
     Live(usize, Arc<crate::runtime::LivePostingPage>),
     Verify(Nomination),
     VerifyBatch(BinaryHeap<Entry>),
+}
+
+pub(super) fn logical_runs<'a>(runtime: &SearchRuntime, request: &ScanRequest<'a>, definition: &SearchDefinition)
+    -> Option<Vec<&'a rtdb_format::log::proto::SearchRun>> {
+    let format = crate::file::LOGICAL_FORMAT_VERSION;
+    let id = definition.artefact_id_for(format);
+    let runs: Vec<_> = request.snapshot.trie_catalog().search_runs(&definition.table)
+        .filter(|run| run.definition_id() == id && run.definition_version() == definition.version).collect();
+    if runs.is_empty() && runtime.write_format() != format { return None; }
+    if !crate::lane::LogicalIndex::supports(definition) { return None; }
+    let covered = runs.iter().flat_map(|run| run.blocks()).collect::<BTreeSet<_>>();
+    if let Some(block) = request.snapshot.table_catalog().block_index() {
+        let extents = request.snapshot.trie_catalog().l0_source(&definition.table, rtdb_types::BlockIndex(-1), block);
+        if !extents.map(|trie| trie.key.block_index()).eq(covered) { return None; }
+        let source_rows = runs.iter().try_fold(0i64, |count, run| count.checked_add(run.source_rows()))?;
+        let durable = request.snapshot.table_catalog().metadata(&definition.table).map_or(0, |meta| meta.row_count);
+        if source_rows != durable { return None; }
+    }
+    Some(runs)
 }
 struct Entry { key: RankKey, sequence: u64, task: Task }
 
@@ -141,16 +163,63 @@ async fn visible(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, defi
 }
 
 impl SearchAccelerator {
+    pub(super) async fn logical_candidates(&self, request: &ScanRequest<'_>, definition: &SearchDefinition,
+        column: &str, query: &Query, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        let Some(runs) = logical_runs(&self.runtime, request, definition) else { return Ok(None); };
+        let Some(field) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
+        let Some(scorer) = Arc::new(Scorer::new(query.clone(), None)).for_ranking() else { return Ok(None); };
+        let mut results = BTreeSet::new();
+        let mut charge = request.memory.reserve(4096)?;
+        let mut examined = 0usize;
+        if let Some(table) = request.snapshot.table_entry(&definition.table) {
+            for run in runs {
+                if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
+                let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode);
+                if locator.is_some_and(|locator| query.terms().iter().any(|term| !locator.might_contain(field as u32, term))) { continue; }
+                work.logical_roots += 1;
+                let scanned = async {
+                    let tree = self.runtime.logical_file(request.storage, &table.slug, run, &definition.columns).await?;
+                    let mut rank = TreeRanked::open(tree, field, query, &scorer, request.bounds, TreeRankOrder::Score).await?;
+                    while rank.bound().is_some() {
+                        if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
+                        for candidate in rank.expand(request.scan.iids.as_ref(), &mut examined).await? { results.insert(candidate.iid); }
+                        if examined > self.max_candidates.saturating_mul(8) || results.len() > self.max_candidates { return Ok(false); }
+                        reserve_ranking(&mut charge, results.len())?;
+                    }
+                    Ok::<bool, Anomaly>(true)
+                }.await;
+                match scanned {
+                    Ok(true) => self.runtime.record_logical_run_read(),
+                    Ok(false) => { work.plain_decline = Some("logical-candidate-budget"); return Ok(None); }
+                    Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                    Err(error) => {
+                        self.runtime.report_run(request.database, &definition.table, run, &error);
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        work.plain_events += examined;
+        for segment in request.snapshot.iter_segments(&definition.table) {
+            let (_, covered) = self.runtime.live_pages_at(Some(request.snapshot), request.database, segment, column);
+            if !self.runtime.can_scan_live_gap(segment, column, covered)? { return Ok(None); }
+        }
+        results.extend(self.live_candidates(request, column, query)?);
+        Ok((results.len() <= self.max_candidates).then_some(results))
+    }
+
     pub(super) async fn tree_top_k(&self, request: &ScanRequest<'_>, definition: &SearchDefinition, column: &str,
         column_id: ColumnId, matching: &Query, scoring_query: Query, ascending_id: Option<ColumnId>,
-        permit_uuid_order: bool, limit: usize, scope: Option<&BTreeSet<Iid>>, include_packs: bool, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        permit_uuid_order: bool, limit: usize, scope: Option<&BTreeSet<Iid>>, include_packs: bool, include_logical: bool,
+        work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point() {
             work.tree_decline = Some("unsupported-snapshot");
             return Ok(None);
         }
         let Some(column_index) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
-        let sources = RecordedTree::select(&self.runtime, request, definition, column_index, matching, include_packs)?;
-        if sources.is_empty() && request.snapshot.serving_search::<crate::runtime::ServingPostings>().is_none() {
+        let logical = if include_packs && include_logical { logical_runs(&self.runtime, request, definition) } else { None };
+        let sources = RecordedTree::select(&self.runtime, request, definition, column_index, matching, include_packs, logical.is_some())?;
+        if logical.is_none() && sources.is_empty() && request.snapshot.serving_search::<crate::runtime::ServingPostings>().is_none() {
             work.tree_decline = Some("no-tree");
             return Ok(None);
         }
@@ -167,13 +236,16 @@ impl SearchAccelerator {
         let scorer = Arc::new(Scorer::new(scoring_query, None));
         let Some(ranking) = scorer.for_ranking() else { return Ok(None); };
         let tree_tries = sources.iter().flat_map(|source| source.members.values().cloned()).collect();
-        let visibility = super::point::PackedVisibility::new(request, &definition.table, &sources, column_index);
-        let TrieFiles::Complete(Found { files, .. }) = self.trie_files(request, definition, column, &[matching, scorer.query()],
-            LoadSearch::Rank, Some(&tree_tries)).await? else { work.tree_decline = Some("coverage"); return Ok(None); };
+        let visibility = super::point::PackedVisibility::new(request, &definition.table, &sources, column_index, logical.is_some());
+        let files = if logical.is_some() { Vec::new() } else {
+            let TrieFiles::Complete(Found { files, .. }) = self.trie_files(request, definition, column, &[matching, scorer.query()],
+                LoadSearch::Rank, Some(&tree_tries)).await? else { work.tree_decline = Some("coverage"); return Ok(None); };
+            files
+        };
         let keep_ids = ascending_id.is_some();
         let order = if keep_ids {
             TreeRankOrder::Integer
-        } else if permit_uuid_order && files.is_empty() && sources.iter().all(|source| source.pack.locator.has_canonical_uuid_iids()) {
+        } else if logical.is_none() && permit_uuid_order && files.is_empty() && sources.iter().all(|source| source.pack.locator.has_canonical_uuid_iids()) {
             TreeRankOrder::Uuid
         } else {
             TreeRankOrder::Score
@@ -190,6 +262,14 @@ impl SearchAccelerator {
         for (index, source) in sources.iter().enumerate() {
             if source.discovery {
                 frontier.push(RankKey::integer(f64::INFINITY, None), Task::Open(index));
+            }
+        }
+        let logical = logical.unwrap_or_default();
+        let mut logical_ranks = (0..logical.len()).map(|_| None).collect::<Vec<Option<TreeRanked>>>();
+        for (index, run) in logical.iter().enumerate() {
+            let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode);
+            if locator.as_ref().is_none_or(|locator| matching.terms().iter().all(|term| locator.might_contain(column_index as u32, term))) {
+                frontier.push(RankKey::integer(f64::INFINITY, None), Task::OpenLogical(index));
             }
         }
         let mut reservation = request.memory.reserve(4096)?;
@@ -224,6 +304,7 @@ impl SearchAccelerator {
         let mut deferred = BTreeMap::<Iid, rtdb_query::ResolvedSearchRow>::new();
         let mut to_verify = BTreeMap::<Iid, (RankKey, Option<SearchWitness>)>::new();
         let shared_rank = request.verifier.partition_ranking();
+        let shared_work = shared_rank.and_then(|rank| rank.register(request.snapshot));
         let trusted = request.scan.top_k.as_ref().is_some_and(|top| top.score.is_some())
             && request.verifier.permits_search_witness() && match request.scan.predicates.as_slice() {
                 [Expr::Column { id, .. }] => request.scan.matches.iter().any(|evaluated| evaluated.id == *id),
@@ -234,6 +315,11 @@ impl SearchAccelerator {
         let mut rounds = 0;
         loop {
             if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
+            if let Some(shared_work) = &shared_work {
+                let upper = frontier.ready.peek().map_or(f64::NEG_INFINITY, |entry| entry.key.score);
+                let unverified = to_verify.values().map(|(key, _)| key.score).fold(upper, f64::max);
+                if shared_work.report(unverified) { tokio::task::yield_now().await; }
+            }
             if to_verify.is_empty() && verified.len() >= limit
                 && verified_cutoff(&mut verified, limit).is_some_and(|kth| frontier.ready.peek().is_none_or(|entry| kth.beats(entry.key))) { break; }
             if to_verify.is_empty() && let Some(cutoff) = shared_rank.and_then(|rank| rank.cutoff(limit))
@@ -294,6 +380,48 @@ impl SearchAccelerator {
             }
             let Some(entry) = frontier.next() else { break; };
             match entry.task {
+                Task::OpenLogical(index) => {
+                    let table = request.snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
+                    let opened = async {
+                        let file = self.runtime.logical_file(request.storage, &table.slug, logical[index], &definition.columns).await?;
+                        TreeRanked::open(file, column_index, matching, &ranking, request.bounds, order).await
+                    }.await;
+                    let rank = match opened {
+                        Ok(rank) => rank,
+                        Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
+                        Err(error) => {
+                            self.runtime.report_run(request.database, &definition.table, logical[index], &error);
+                            work.tree_decline = Some("logical-root");
+                            return Ok(None);
+                        }
+                    };
+                    work.tree_roots += 1;
+                    work.logical_roots += 1;
+                    self.runtime.record_logical_run_read();
+                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::ExpandLogical(index)); }
+                    logical_ranks[index] = Some(rank);
+                }
+                Task::ExpandLogical(index) => {
+                    let rank = logical_ranks[index].as_mut().expect("logical rank is opened before expansion");
+                    let candidates = match rank.expand(scope, &mut work.postings_visited).await {
+                        Ok(candidates) => candidates,
+                        Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
+                        Err(error) => {
+                            self.runtime.report_run(request.database, &definition.table, logical[index], &error);
+                            work.tree_decline = Some("logical-page");
+                            return Ok(None);
+                        }
+                    };
+                    work.tree_expansions += 1;
+                    work.score_evaluations += candidates.len();
+                    nominated += candidates.len();
+                    if nominated > self.max_candidates { work.tree_decline = Some("candidate-budget"); return Ok(None); }
+                    reserve_ranking(&mut reservation, nominated)?;
+                    if let Some(bound) = rank.bound() { frontier.push(bound, Task::ExpandLogical(index)); }
+                    frontier.nominate_batch(candidates.into_iter().map(|candidate| (candidate.key, Nomination {
+                        iid: candidate.iid, source: None, witness: candidate.revision.map(SearchWitness::Logical), visibility: Vec::new(),
+                    })));
+                }
                 Task::Open(index) => {
                     work.tree_roots += 1;
                     let source = &sources[index];

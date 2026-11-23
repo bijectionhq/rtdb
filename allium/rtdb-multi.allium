@@ -1761,6 +1761,7 @@ rule ReapUnreachable {
     -- A hosted path sweep withdraws eligible inherited references and preserves the provider payloads and release markers.
     -- Owned hosted payloads and markers wait for provider retirement authority.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.
+    -- A retired logical search run carries its provider publication and the installed catalog floor before a hosted release can be recorded.
     -- A hosted pack is erased by exact version after the indexed members of that same version each have a mature release.
     -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
     -- The owner CAS checks the pack's block and the greatest covered metadata block against its current checkpoint and holds.

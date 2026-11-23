@@ -11,6 +11,7 @@ mod rank_cutoff;
 mod rank_windows;
 mod rectangle;
 pub mod runtime;
+mod delta;
 
 pub use file::{DocMatch, FORMAT_VERSION, MemberMatches, SearchFile, SearchRow, Source, build_search_file, write_group_search_file};
 pub use definitions::{SearchDefinition, definitions_in};

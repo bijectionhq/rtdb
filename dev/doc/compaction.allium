@@ -96,6 +96,8 @@ deferred available_jobs(trie_catalog: trie_cat/TrieCatalog) -> List<CompactionJo
 ------------------------------------------------------------
 
 -- CompactionJob is ephemeral (coroutine-scoped, not persisted).
+-- Primary compaction changes the Arrow locations of retained events and preserves logical full-text posting coverage.
+-- The search lane replaces runs independently using authenticated coverage over their original source extents.
 
 entity CompactionJob {
     table: trie_cat/TableRef

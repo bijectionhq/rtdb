@@ -575,6 +575,31 @@ impl ScanCursor {
                 let mut ranking = ranking.clone();
                 let mut candidate_iids = None;
                 let verifier = ScanVerifier { scan, execution, pushdowns: pushdowns.clone(), partition: snapshot, storage, canonical_entity_iids, shared_rank, counts: Default::default() };
+                if accelerate && order.is_none() && interval.is_none() && pushdowns.is_none()
+                    && scan.top_k.is_none() && scan.ordered_top_k.is_none() && scan.matches.is_empty()
+                    && bounds.valid_time.is_point() && bounds.system_time.is_point()
+                    && let Some(iids) = scan.iids.as_ref().filter(|iids| (1..=128).contains(&iids.len())) {
+                    let iids = iids.iter().copied().collect();
+                    let request = crate::ScanRequest { database: name, scan, snapshot, storage, bounds, memory: &execution.context.memory,
+                        current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+                        constants: &crate::accelerate::ExecutionConstants(execution), verifier: &verifier, partitions: database_partitions };
+                    for accelerator in execution.context.accelerators.iter() {
+                        let Some(rows) = accelerator.point_rows(&request, &iids).await? else { continue; };
+                        if rows.is_empty() { return Ok((parts, *verifier.counts.lock())); }
+                        let mut batch = match verifier.gather_search_rows(scan, rows).await {
+                            Ok(batch) => batch,
+                            Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => continue,
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
+                            let schema = Schema::new(scan.columns.clone())?;
+                            let mask = crate::columnar::predicate_mask(&batch, &predicate, &schema, execution).await?;
+                            batch = batch.select(&mask, &execution.context.memory)?;
+                        }
+                        if batch.len != 0 { parts.push_back(Part::Resolved(Some(batch))); }
+                        return Ok((parts, *verifier.counts.lock()));
+                    }
+                }
                 for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids) {
                     let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),

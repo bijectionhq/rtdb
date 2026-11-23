@@ -78,7 +78,7 @@ pub(crate) struct HostedSourceReceipt {
     pub(crate) applied: Option<TransactionKey>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchFileFormat { Tantivy, Arrow, Paged, Tree, Packed }
+pub enum SearchFileFormat { Tantivy, Arrow, Paged, Tree, Packed, Logical }
 
 fn default_search(_format: SearchFileFormat) -> SearchServices {
     #[cfg(feature = "search")] {
@@ -89,6 +89,7 @@ fn default_search(_format: SearchFileFormat) -> SearchServices {
             SearchFileFormat::Paged => rtdb_search::SearchRuntime::with_paged_files(bytes, true),
             SearchFileFormat::Tree => rtdb_search::SearchRuntime::with_tree_files(bytes),
             SearchFileFormat::Packed => rtdb_search::SearchRuntime::with_search_packs(bytes),
+            SearchFileFormat::Logical => rtdb_search::SearchRuntime::with_logical_search(bytes),
         };
         SearchServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()] }
     }

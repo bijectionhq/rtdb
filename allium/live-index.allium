@@ -466,6 +466,8 @@ rule LogErase {
 rule CommitTransaction {
     -- The resolver STAGES a committed transaction onto its queue and advances its RESOLVED head.
     -- The staged transaction is then appended to the replica log.
+    -- An admitted token delta travels in the accepted replica record and becomes searchable at the same basis as the corresponding events.
+    -- If a delta is absent, the existing proven posting prefix survives and ordinary SQL remains exact over the uncovered rows.
     --
     -- It does NOT advance the DURABLE head and does NOT refresh the external shared snapshot.
     -- Those happen only when the leader reads the transaction BACK off its own replica log and imports it (ApplyResolvedTx).

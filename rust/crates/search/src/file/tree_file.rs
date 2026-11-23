@@ -10,7 +10,7 @@ use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Re
 use sha2::{Digest, Sha256};
 use crate::rank_windows::window_of;
 
-use super::{PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
+use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
     page_tree::{Child, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
 
 pub(super) const POSTING: u8 = 0;
@@ -18,6 +18,7 @@ pub(super) const TERM: u8 = 1;
 pub(super) const DOCUMENT: u8 = 2;
 pub(super) const VISIBILITY: u8 = 3;
 pub(super) const PAGE_ROWS: u8 = 4;
+const ERASES: u8 = 5;
 const TERM_ROWS: usize = 32;
 pub(super) const DOCUMENT_ROWS: usize = 256;
 const EVENT_ROWS: usize = 1024;
@@ -30,7 +31,7 @@ fn page_kind(directory: u8) -> PageKind {
         POSTING => PageKind::Postings,
         TERM => PageKind::Terms,
         DOCUMENT => PageKind::Documents,
-        VISIBILITY => PageKind::Visibility,
+        VISIBILITY | ERASES => PageKind::Visibility,
         PAGE_ROWS => PageKind::PrimaryLayout,
         _ => unreachable!("the tree accepts only known directory types"),
     }
@@ -72,7 +73,8 @@ fn start_rows(table: Table, array: &StructArray, start: usize, len: usize) -> Re
 
 pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, StructArray)>,
     [(_, events), (_, runs), (_, row_runs)]: [(Table, StructArray); 3], plan: PostingPlan,
-    positions: Option<Vec<u32>>) -> Result<()> {
+    positions: Option<Vec<u32>>, revisions: Option<StructArray>, token_sequences: Option<StructArray>,
+    erases: Option<StructArray>) -> Result<()> {
     let take = |fields: &mut Vec<(Table, StructArray)>, field: Table| -> StructArray {
         let at = fields.iter().position(|(table, _)| *table as usize == field as usize).expect("writer populated this table");
         fields.remove(at).1
@@ -135,14 +137,31 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
         let first_window = window_of(start as u32) as usize;
         let last_window = window_of((end - 1) as u32) as usize;
         let start_row = Table::Pages.array(vec![Arc::new(arrow_array::UInt32Array::from(vec![start as u32]))])?;
-        let page = writer.page([(Table::Runs, runs.slice(start, end - start)), (Table::Pages, start_row),
-            (Table::Windows, windows.slice(first_window, last_window - first_window + 1))])?;
+        let mut fields = vec![(Table::Runs, runs.slice(start, end - start)), (Table::Pages, start_row),
+            (Table::Windows, windows.slice(first_window, last_window - first_window + 1))];
+        if let Some(sequences) = &token_sequences {
+            let sequences = sequences.slice(start, end - start);
+            let item = item_of(&Table::TokenSequences.fields()[2]);
+            fields.push((Table::TokenSequences, Table::TokenSequences.array(vec![
+                sequences.column(0).clone(), sequences.column(1).clone(),
+                list(Arc::new(arrow_array::StringArray::from(Vec::<&str>::new())), std::iter::repeat_n(0, end - start), item)?,
+                sequences.column(3).clone(), sequences.column(4).clone(),
+            ])?));
+        }
+        let page = writer.page(fields)?;
         doc_pages.push(Child { lower: ordinal(start).to_vec(), upper: ordinal(end - 1).to_vec(), page });
     }
     let doc_dir = directory(writer, DOCUMENT, doc_pages)?;
 
     let iids = events.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search IID layout");
     let mut event_pages = Vec::new();
+    if let Some(sequences) = &token_sequences {
+        for start in (0..sequences.len()).step_by(DOCUMENT_ROWS) {
+            let end = (start + DOCUMENT_ROWS).min(sequences.len());
+            let page = writer.page([(Table::TokenSequences, sequences.slice(start, end - start))])?;
+            event_pages.push(Child { lower: ordinal(start).to_vec(), upper: ordinal(end - 1).to_vec(), page });
+        }
+    }
     for start in (0..events.len()).step_by(EVENT_ROWS) {
         let end = (start + EVENT_ROWS).min(events.len());
         let start_row = Table::Pages.array(vec![Arc::new(arrow_array::UInt32Array::from(vec![start as u32]))])?;
@@ -165,6 +184,15 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
                 Arc::new(arrow_array::UInt32Array::from(local_rows)),
             ])?));
         }
+        if let Some(revisions) = &revisions {
+            let item = item_of(&Table::TextRevisions.fields()[0]);
+            let columns = revisions.column(0).as_list::<i64>();
+            let pieces: Vec<_> = (0..columns.len()).map(|index| columns.value(index).slice(start, end - start)).collect();
+            let refs = pieces.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
+            fields.push((Table::TextRevisions, Table::TextRevisions.array(vec![list(
+                arrow_select::concat::concat(&refs).map_err(fault)?, std::iter::repeat_n(end - start, columns.len()), item,
+            )?])?));
+        }
         let page = writer.page(fields)?;
         event_pages.push(Child {
             lower: event_key(iids.value(start), start as u32), upper: event_key(iids.value(end - 1), (end - 1) as u32), page,
@@ -178,7 +206,19 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
     fields.push((Table::Synopsis, Table::Synopsis.array(vec![Arc::new(
         arrow_array::FixedSizeBinaryArray::try_from_iter([synopsis].iter()).map_err(fault)?,
     )])?));
-    fields.push((Table::Root, root_table(&[(POSTING, posting_dir), (TERM, term_dir), (DOCUMENT, doc_dir), (VISIBILITY, event_dir), (PAGE_ROWS, page_dir)])?));
+    let mut directories = vec![(POSTING, posting_dir), (TERM, term_dir), (DOCUMENT, doc_dir), (VISIBILITY, event_dir), (PAGE_ROWS, page_dir)];
+    if token_sequences.is_some() || revisions.is_some() {
+        let mut erase_pages = Vec::new();
+        if let Some(erases) = erases {
+            for start in (0..erases.len()).step_by(EVENT_ROWS) {
+                let end = (start + EVENT_ROWS).min(erases.len());
+                let page = writer.page([(Table::Erases, erases.slice(start, end - start))])?;
+                erase_pages.push(Child { lower: ordinal(start).to_vec(), upper: ordinal(end - 1).to_vec(), page });
+            }
+        }
+        directories.push((ERASES, directory(writer, ERASES, erase_pages)?));
+    }
+    fields.push((Table::Root, root_table(&directories)?));
     if packed {
         let mut direct = Vec::new();
         let mut bytes = 0;
@@ -230,7 +270,7 @@ impl TreeLocator {
         input.read_exact(&mut bytes).map_err(fault)?;
         page.digest = Sha256::digest(&bytes).into();
         let decoder = arrow_ipc::reader::FileDecoder::new(Arc::clone(super::layout::schema(format)), arrow_ipc::MetadataVersion::V5);
-        let inline_root = (format == PACKED_FORMAT_VERSION && lz4_flex::block::compress(&bytes).len() <= INLINE_ROOT_BYTES)
+        let inline_root = (format >= PACKED_FORMAT_VERSION && lz4_flex::block::compress(&bytes).len() <= INLINE_ROOT_BYTES)
             .then(|| Arc::from(bytes.as_slice()));
         let root = page.decode(Buffer::from_vec(bytes), &decoder)?;
         let synopsis = table(&root, Table::Synopsis);
@@ -242,7 +282,7 @@ impl TreeLocator {
 
     pub fn encode(&self) -> String {
         let digest = encode_hex(&self.page.digest);
-        let prefix = if self.format == PACKED_FORMAT_VERSION { "v15:" } else { "" };
+        let prefix = match self.format { LOGICAL_FORMAT_VERSION => "v16:", PACKED_FORMAT_VERSION => "v15:", _ => "" };
         let header = format!("{prefix}{}:{}:{}:{}:{digest}", self.length, self.page.offset, self.page.metadata, self.page.body);
         let Some(bits) = self.synopsis.as_deref() else { return header; };
         let check = synopsis_digest(&self.page.digest, bits);
@@ -250,7 +290,7 @@ impl TreeLocator {
         if let Some(root) = &self.inline_root {
             encoded.push(':');
             encoded.push_str(&encode_hex(&lz4_flex::block::compress(root)));
-        } else if self.format == PACKED_FORMAT_VERSION && self.canonical_uuid_iids {
+        } else if self.format >= PACKED_FORMAT_VERSION && self.canonical_uuid_iids {
             encoded.push(':');
         }
         if self.canonical_uuid_iids {
@@ -261,7 +301,9 @@ impl TreeLocator {
     }
 
     pub fn decode(value: &str) -> Option<Self> {
-        let (format, value) = value.strip_prefix("v15:").map_or((TREE_FORMAT_VERSION, value), |value| (PACKED_FORMAT_VERSION, value));
+        let (format, value) = if let Some(value) = value.strip_prefix("v16:") { (LOGICAL_FORMAT_VERSION, value) }
+            else if let Some(value) = value.strip_prefix("v15:") { (PACKED_FORMAT_VERSION, value) }
+            else { (TREE_FORMAT_VERSION, value) };
         let mut fields = value.split(':');
         let length = fields.next()?.parse().ok()?;
         let offset = fields.next()?.parse().ok()?;
@@ -273,7 +315,7 @@ impl TreeLocator {
         if range.end > length || range.end - range.start > MAX_ROOT_BYTES { return None; }
         let synopsis = fields.next().and_then(decode_hex::<SYNOPSIS_BYTES>).zip(fields.next().and_then(decode_hex::<32>))
             .filter(|(bits, check)| synopsis_digest(&digest, bits) == *check).map(|(bits, _)| Arc::new(bits));
-        let root = if format == PACKED_FORMAT_VERSION { fields.next() } else { None };
+        let root = if format >= PACKED_FORMAT_VERSION { fields.next() } else { None };
         let expected = (range.end - range.start) as usize;
         let inline_root = root.filter(|hex| hex.len() <= INLINE_ROOT_BYTES * 2).and_then(decode_bytes)
             .and_then(|bytes| lz4_flex::block::decompress(&bytes, expected).ok())
@@ -348,6 +390,16 @@ pub(crate) struct PackedEvent {
     pub page: u32,
     pub row: u32,
     pub document: Option<u32>,
+    pub revision: Option<TextRevision>,
+}
+
+pub(crate) struct LogicalDocument {
+    pub iid: Iid,
+    pub sql_id: Option<i64>,
+    pub field: usize,
+    pub revision: TextRevision,
+    pub tokens: arrow_array::StringArray,
+    pub position: (Timestamp, u32),
 }
 
 impl TreeFile {
@@ -381,22 +433,24 @@ impl TreeFile {
             return Err(corrupt("Search tree belongs to another index"));
         }
         let directories = read_root(&root)?;
-        if !directories.keys().copied().eq([POSTING, TERM, DOCUMENT, VISIBILITY, PAGE_ROWS])
+        if !directories.keys().copied().eq([POSTING, TERM, DOCUMENT, VISIBILITY, PAGE_ROWS].into_iter()
+            .chain((locator.format == LOGICAL_FORMAT_VERSION).then_some(ERASES)))
             || directories.values().any(|dir| dir.page.offset >= locator.page.offset) {
             return Err(corrupt("Search tree root has incomplete directories"));
         }
-        let routes = if locator.format == PACKED_FORMAT_VERSION { read_inline_routes(&root, &directories)? } else { BTreeMap::new() };
+        let routes = if locator.format >= PACKED_FORMAT_VERSION { read_inline_routes(&root, &directories)? } else { BTreeMap::new() };
         Ok(Self { reader, root, directories, routes, format: locator.format })
     }
 
     pub(super) fn root(&self) -> &RecordBatch { &self.root }
+    pub(crate) fn format(&self) -> i32 { self.format }
 
     pub(super) fn reader(&self) -> &TreeReader { &self.reader }
 
     pub fn sections(&self) -> Result<Vec<super::Section>> { super::sections_of(&table(&self.root, Table::Sections)) }
 
     pub async fn verify(&self) -> Result<()> {
-        for kind in [TERM, POSTING, DOCUMENT, VISIBILITY, PAGE_ROWS] {
+        for &kind in self.directories.keys() {
             let pages = self.reader.leaves(self.directories[&kind]).await?;
             if self.routes.get(&kind).is_some_and(|route| !route.iter().map(|child| child.page).eq(pages.iter().copied())) {
                 return Err(corrupt("Inline search route does not cover its directory"));
@@ -469,7 +523,7 @@ impl TreeFile {
 
     pub(super) async fn term_pages(&self, column: u32, names: &[String]) -> Result<Vec<Option<RecordBatch>>> {
         use futures::{FutureExt, TryStreamExt};
-        if self.format == PACKED_FORMAT_VERSION && !table(&self.root, Table::Terms).is_empty() {
+        if self.format >= PACKED_FORMAT_VERSION && !table(&self.root, Table::Terms).is_empty() {
             return Ok(names.iter().map(|_| Some(self.root.clone())).collect());
         }
         let mut in_flight = futures::stream::FuturesOrdered::new();
@@ -526,7 +580,7 @@ impl TreeFile {
 
     pub(crate) async fn versions(&self, iids: &BTreeSet<Iid>, column: usize, budget: &Arc<MemoryBudget>)
         -> Result<(BTreeMap<Iid, Vec<PackedEvent>>, Arc<MemoryReservation>)> {
-        if self.format != PACKED_FORMAT_VERSION { return Err(corrupt("Search pack does not record logical versions")); }
+        if self.format < PACKED_FORMAT_VERSION { return Err(corrupt("Search pack does not record logical versions")); }
         let mut reservation = budget.reserve(4096usize.saturating_add(iids.len().saturating_mul(192)))?;
         let ranges: Vec<_> = iids.iter().map(|iid| (event_key(&iid.0, 0), event_key(&iid.0, u32::MAX))).collect();
         let pages = match self.routes.get(&VISIBILITY) {
@@ -556,6 +610,14 @@ impl TreeFile {
             if docs.len() != events.len() || docs.null_count() != 0 {
                 return Err(corrupt("Search version references have an incomplete row map"));
             }
+            let proofs = if self.format == LOGICAL_FORMAT_VERSION {
+                let proofs = table(batch, Table::TextRevisions);
+                let fields = proofs.column(0).as_list::<i64>();
+                if column >= fields.len() { return Err(corrupt("History pack omits its text revisions")); }
+                let digests = fields.value(column);
+                if digests.len() != events.len() || digests.null_count() != 0 { return Err(corrupt("History text revisions have the wrong size")); }
+                Some(digests)
+            } else { None };
             let first = Iid::from_slice(keys.value(0))?;
             let last = Iid::from_slice(keys.value(keys.len() - 1))?;
             if first > last { return Err(corrupt("Search versions have an invalid IID range")); }
@@ -572,11 +634,62 @@ impl TreeFile {
                             valid_time: Interval::from_micros(bounds[1].value(row), bounds[2].value(row))?, op: super::op_of(operations.value(row))? },
                         member: locations[1].value(row), page: locations[2].value(row), row: locations[3].value(row),
                         document: (document < super::NULL_DOC).then_some(document),
+                        revision: proofs.as_ref().and_then(|proofs| {
+                            let array = proofs.as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("history revision layout");
+                            let value = array.value(row);
+                            (value[0] == 1).then(|| value[1..].try_into().expect("history revisions are 32 bytes"))
+                        }),
                     });
                 }
             }
         }
         Ok((found, reservation))
+    }
+
+    pub(crate) async fn documents(&self) -> Result<Vec<LogicalDocument>> {
+        use rtdb_columnar::EntityIdRef;
+        if self.format != LOGICAL_FORMAT_VERSION { return Err(corrupt("Expected a logical search run")); }
+        let mut documents = Vec::new();
+        let records = self.all(DOCUMENT).await?;
+        let payload = self.all(VISIBILITY).await?;
+        if records.len() != payload.len() { return Err(corrupt("Search run omits analyzed token pages")); }
+        for (batch, payload) in records.into_iter().zip(payload) {
+            let runs = table(&batch, Table::Runs);
+            let sequences = table(&payload, Table::TokenSequences);
+            if sequences.len() != runs.len() { return Err(corrupt("Search run is missing token sequences")); }
+            let iids = runs.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search IID layout");
+            let ids = runs.column(2).as_binary::<i32>();
+            let fields = sequences.column(0).as_primitive::<UInt32Type>();
+            let revisions = sequences.column(1).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search revision layout");
+            let tokens = sequences.column(2).as_list::<i64>();
+            for row in 0..sequences.len() {
+                let sql_id = if ids.is_valid(row) {
+                    match EntityIdRef::from_handle_bytes(ids.value(row))? { EntityIdRef::Integer(id) => Some(id), _ => None }
+                } else { None };
+                documents.push(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
+                    field: fields.value(row) as usize, revision: revisions.value(row).try_into().map_err(fault)?,
+                    tokens: tokens.value(row).as_string::<i32>().clone(),
+                    position: (Timestamp(sequences.column(3).as_primitive::<Int64Type>().value(row)),
+                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) });
+            }
+        }
+        Ok(documents)
+    }
+
+    pub(crate) async fn erases(&self) -> Result<BTreeMap<Iid, (Timestamp, u32)>> {
+        let mut erases = BTreeMap::new();
+        for batch in self.all(ERASES).await? {
+            let rows = table(&batch, Table::Erases);
+            let iids = rows.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("erase IID layout");
+            let times = rows.column(1).as_primitive::<Int64Type>();
+            let positions = rows.column(2).as_primitive::<UInt32Type>();
+            for row in 0..rows.len() {
+                if erases.insert(Iid::from_slice(iids.value(row))?, (Timestamp(times.value(row)), positions.value(row))).is_some() {
+                    return Err(corrupt("Search file repeats an erase witness"));
+                }
+            }
+        }
+        Ok(erases)
     }
 }
 

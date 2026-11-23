@@ -187,7 +187,7 @@ impl ResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().collect(),
             db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position().0),
-            placed_attempt, acceptance_stage,
+            placed_attempt, acceptance_stage, search_delta: None,
         });
         Ok(OwnedReplicaBody { body, _reservation: reservation, _table_reservations: table_reservations })
     }

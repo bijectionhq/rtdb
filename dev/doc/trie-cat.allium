@@ -185,6 +185,9 @@ entity TrieCatalog {
     -- Per-table catalog, keyed by shard = (level, recency, part).
     -- Each shard holds three ordered lists (by block_index descending): live, nascent, garbage.
     -- Also tracks max_block_index per shard for staleness detection.
+    -- Each table also owns an independent logical search manifest of authenticated posting receipts.
+    -- Primary trie replacement and search-run replacement advance their respective inventories in the catalog cut.
+    -- A checkpoint carries active run receipts and pending retirements with the primary trie inventory.
     --
     -- addTries(tries, as_of): register new tries, transitioning superseded inputs to garbage.
     -- withPartitions(table, tries, as_of): the partition layout table would have with tries

@@ -158,6 +158,30 @@ message ArtefactEntry {
     ArtefactRecord record = 2;
 }
 
+message SearchRun {
+    string definition_id = 1;
+    int64 definition_version = 2;
+    repeated int64 blocks = 3;
+    bytes digest = 4;
+    bytes locator = 5;
+    int64 file_size = 6;
+    PublishedObjectVersion publication = 7;
+    int64 rebuild = 8;
+    int64 source_rows = 9;
+    bool has_erases = 10;
+}
+
+message SearchRunChange {
+    SearchRun run = 1;
+    repeated bytes replaces = 2;
+    bool retire_only = 3;
+}
+
+message RetiredSearchRun {
+    SearchRun run = 1;
+    int64 superseded_at = 2;
+}
+
 message ArtefactsAdded {
     int32 storage_version = 1;
     int32 storage_epoch = 2;

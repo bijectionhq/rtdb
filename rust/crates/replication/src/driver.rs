@@ -39,6 +39,15 @@ pub type ReplicationClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 pub trait ServingSearchBuilder: Send + Sync {
     async fn prepare(&self, snapshot: Snapshot, cancellation: &CancellationToken) -> Result<Option<ServingSearch>>;
 
+    fn journals_deltas(&self) -> bool { false }
+
+    async fn prepare_delta(&self, _snapshot: Snapshot, _write: Arc<StagedWrite>, _cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> { Ok(None) }
+
+    async fn install_delta(&self, snapshot: Snapshot, _write: &StagedWrite, _delta: Option<&[u8]>,
+        cancellation: &CancellationToken) -> Result<Option<ServingSearch>> {
+        self.prepare(snapshot, cancellation).await
+    }
+
     async fn seal(&self, value: &Arc<rtdb_index::PartitionValue>, table: &TableRef, trie: &TrieKey,
         file: &std::path::Path, size: u64, cancellation: &CancellationToken) -> Result<Vec<proto::ArtefactRecord>>;
 }
@@ -337,7 +346,7 @@ impl LeaderState {
     }
     fn pending_strict_write(&self) -> bool {
         self.pending.front().is_some_and(|pending| matches!(&pending.body,
-            WriteBody::Resolved(tx) if tx.staging_clock_upper().is_some()))
+            WriteBody::Resolved(tx, _) if tx.staging_clock_upper().is_some()))
     }
     fn accepting(&self) -> bool { self.can_poll_source() && self.resolution.is_none() }
     fn drained_for_strict_source(&self) -> bool { self.pending.is_empty() && self.production.is_none() }
@@ -351,7 +360,7 @@ impl LeaderState {
     fn accepting_commands(&self) -> bool { self.accepting() && self.waiting_strict_source.is_none() }
     fn pending_tx_at(&self, sequence: Option<TermSequence>) -> Option<(&Arc<PendingWrite>, &Arc<ResolvedTx>)> {
         self.pending.iter().find_map(|pending| {
-            let WriteBody::Resolved(tx) = &pending.body else { return None; };
+            let WriteBody::Resolved(tx, _) = &pending.body else { return None; };
             let expected = pending.sequence()?;
             matching_present_integer(sequence.map(|sequence| sequence.0), expected.0).then_some((pending, tx))
         })
@@ -425,10 +434,10 @@ impl ReplicationDriver {
         self
     }
 
-    async fn apply_transaction(&mut self, write: &StagedWrite) -> Result<()> {
+    async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<&[u8]>) -> Result<()> {
         let Some(builder) = &self.serving_search else { return self.partition.apply(write); };
         let prepared = self.partition.prepare_write(write)?;
-        let search = builder.prepare(prepared.snapshot(), &self.cancellation).await?;
+        let search = builder.install_delta(prepared.snapshot(), write, search_delta, &self.cancellation).await?;
         self.partition.install_write(prepared, search)
     }
     pub async fn run(mut self) -> Result<()> {
@@ -986,7 +995,7 @@ impl ReplicationDriver {
                         let expected = Arc::clone(expected);
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
-                            self.apply_transaction(head.writes()).await?;
+                            self.apply_transaction(head.writes(), message.search_delta.as_deref()).await?;
                             if head.result().committed() && let Some(operation) = head.db_op() {
                                 self.effects.apply_db_op(operation).await?;
                             }
@@ -1013,7 +1022,7 @@ impl ReplicationDriver {
                         }
                         let value = self.partition.value();
                         let rtdb_tx::ReplayedTransaction { writes, result, placed_attempt } = rtdb_tx::decode_replica(message, value.live().latest_completed_tx(), value.live().block_index(), &self.resolve.memory)?;
-                        self.apply_transaction(&writes).await?;
+                        self.apply_transaction(&writes, message.search_delta.as_deref()).await?;
                         if !leading && message.committed.unwrap_or(false) {
                             if let Some(operation) = &message.db_op {
                                 if let Err(error) = self.effects.apply_db_op(operation).await { if !error.is_caller_error() { return Err(error); } }
@@ -1034,7 +1043,9 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::ArtefactsAdded(message) => {
                     if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
-                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) { self.partition.add_artefacts(&table, artefact_entries(&message.entries)); }
+                        if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
+                            self.partition.add_artefacts_at(&table, artefact_entries(&message.entries), record.metadata.timestamp);
+                        }
                     }
                     self.progress.applied(message.source_msg_id.map(SourcePosition), None, None)?;
                     self.complete_control(&record);
@@ -1321,9 +1332,15 @@ impl ReplicationDriver {
     }
     async fn enqueue_resolved(&mut self, resolved: Arc<ResolvedTx>, completion: Option<oneshot::Sender<Result<Applied>>>) -> Result<()> {
         let strict = resolved.staging_clock_upper().is_some();
+        let search_delta = if !strict && resolved.result().committed()
+            && let Some(builder) = self.serving_search.as_ref().filter(|builder| builder.journals_deltas()) {
+            let leader = self.leader.as_ref().ok_or_else(term_ended)?;
+            let snapshot = leader.resolver()?.resolving_snapshot(self.partition.value().snapshot())?;
+            builder.prepare_delta(snapshot, Arc::clone(resolved.writes()), &leader.cancellation).await?
+        } else { None };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.resolved(resolved.writes().row_count()?)?;
-        leader.enqueue(WriteBody::Resolved(resolved), self.partition.value().live().block_index(), completion, &self.resolve.memory)?;
+        leader.enqueue(WriteBody::Resolved(resolved, search_delta), self.partition.value().live().block_index(), completion, &self.resolve.memory)?;
         if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
         Ok(())
     }
@@ -1411,6 +1428,10 @@ fn accept_artefacts(message: &mut proto::ArtefactsAdded, durable: &rtdb_index::S
     let mut rejected = BTreeSet::new();
     for entry in entries {
         let (Ok(key), Some(record)) = (entry.trie_key.as_deref().unwrap_or_default().parse::<TrieKey>(), &entry.record) else { continue };
+        if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
+            if key.level() == 0 && catalog.accepts_search_run(&table, record) { message.entries.push(entry); }
+            continue;
+        }
         let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, record) else { continue };
         if catalog.trie(&table, &key).is_some_and(|trie| trie.state == rtdb_index::TrieState::Live) { message.entries.push(entry); continue; }
         if owner.tries().iter().any(|member| member != &key && catalog.trie(&table, member).is_some()) { continue; }

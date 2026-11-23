@@ -12,13 +12,16 @@ use rtdb_text::stored_length;
 use rtdb_types::{Anomaly, EntityId, EventHeader, Iid, Result};
 
 use super::{
-    FORMAT_VERSION, TREE_FORMAT_VERSION, PACKED_FORMAT_VERSION, NO_DOC, NULL_DOC, IndexedRow, Section, SearchPage, STORED_IMPACTS, artefact_digest,
+    FORMAT_VERSION, TREE_FORMAT_VERSION, PACKED_FORMAT_VERSION, NO_DOC, NULL_DOC, IndexedRow, Section, SearchPage, TextRevision, STORED_IMPACTS, artefact_digest,
     fault, lifespan, op_code, sections_array,
     layout::{Table, Writer, item_of, list},
     paged::PostingPlan,
     postings::{POSTING_TERMS, PostingBuilder, posting_table},
 };
 use crate::{member_bounds::MemberStart, rectangle::merge_adjacent_valid_time};
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BuildMode { Combined, Postings, History }
 
 pub(super) struct Events {
     iid: FixedSizeBinaryBuilder,
@@ -129,15 +132,26 @@ struct Builder {
     sections: BTreeMap<u8, Section>,
     window_ids: Vec<Option<i64>>,
     format: i32,
+    mode: BuildMode,
+    revisions: Vec<FixedSizeBinaryBuilder>,
+    doc_columns: Vec<u32>,
+    doc_revisions: FixedSizeBinaryBuilder,
+    doc_tokens: arrow_array::builder::LargeListBuilder<StringBuilder>,
+    doc_positions: Vec<(rtdb_types::Timestamp, u32)>,
+    erases: BTreeMap<Iid, (rtdb_types::Timestamp, u32)>,
 }
 
 impl Builder {
-    fn new(columns: usize, ceiling: Option<i64>, reservation: Option<Arc<MemoryReservation>>, format: i32) -> Self {
+    fn new(columns: usize, ceiling: Option<i64>, reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode) -> Self {
         Self {
             reservation, estimated: 0,
             ceiling: ceiling.unwrap_or(i64::MAX), rows: 0, members: Vec::new(), pages: Vec::new(),
             events: Events::new(), runs: Runs::new(), columns: (0..columns).map(|_| Column::default()).collect(),
-            sections: BTreeMap::new(), window_ids: Vec::new(), format,
+            sections: BTreeMap::new(), window_ids: Vec::new(), format, mode,
+            revisions: (0..if mode == BuildMode::History { columns } else { 0 }).map(|_| FixedSizeBinaryBuilder::new(33)).collect(),
+            doc_columns: Vec::new(), doc_revisions: FixedSizeBinaryBuilder::new(32),
+            doc_tokens: arrow_array::builder::LargeListBuilder::new(StringBuilder::new()),
+            doc_positions: Vec::new(), erases: BTreeMap::new(),
         }
     }
 
@@ -165,14 +179,33 @@ impl Builder {
 
     fn put(&mut self, entities: &mut BTreeMap<Vec<u8>, Entity>, row: IndexedRow<'_>) -> Result<()> {
         self.reserve_row(&row)?;
-        let key = row.key.as_deref().unwrap_or_default();
-        if !entities.contains_key(key) {
-            entities.insert(key.to_vec(), Entity::new(self.columns.len()));
+        if self.mode == BuildMode::Postings && row.header.op == rtdb_types::EventOp::Erase {
+            self.erases.entry(row.header.iid).and_modify(|position| *position = (*position).max(row.header.system_position()))
+                .or_insert_with(|| row.header.system_position());
         }
-        let entity = entities.get_mut(key).expect("key has an entity");
-        self.events.push(row.header, row.key.as_deref())?;
-        for column in &mut self.columns { column.row_runs.push(NO_DOC); }
-        entity.push(self.rows, row)?;
+        if self.mode == BuildMode::History {
+            if row.revisions.len() != self.revisions.len() { return Err(fault("History revisions do not cover its fields")); }
+            for (column, revision) in self.revisions.iter_mut().zip(&row.revisions) {
+                let mut encoded = [0; 33];
+                if let Some(revision) = revision {
+                    encoded[0] = 1;
+                    encoded[1..].copy_from_slice(revision);
+                }
+                column.append_value(encoded).map_err(fault)?;
+            }
+        }
+        if self.mode != BuildMode::Postings {
+            self.events.push(row.header, row.key.as_deref())?;
+            for column in &mut self.columns { column.row_runs.push(NO_DOC); }
+        }
+        if self.mode != BuildMode::History {
+            let key = row.key.as_deref().unwrap_or_default();
+            if !entities.contains_key(key) {
+                entities.insert(key.to_vec(), Entity::new(self.columns.len()));
+            }
+            let entity = entities.get_mut(key).expect("key has an entity");
+            entity.push(self.rows, row)?;
+        }
         self.rows = self.rows.checked_add(1).ok_or_else(|| fault("A search file holds at most u32::MAX events"))?;
         Ok(())
     }
@@ -180,23 +213,29 @@ impl Builder {
     fn entity(&mut self, iid: Iid, key: &[u8], entity: Entity) -> Result<()> {
         let key = (!key.is_empty()).then_some(key);
         let mut visible: Vec<Vec<[i64; 4]>> = vec![Vec::new(); entity.rows.len()];
-        for (index, rectangle) in rtdb_temporal::visibility(entity.rows.iter().enumerate().map(|(index, (_, header, _))| (header, index)))? {
-            visible[index].push([
-                rectangle.valid_time.lower().0, rectangle.valid_time.upper().0,
-                rectangle.system_time.lower().0, rectangle.system_time.upper().0,
-            ]);
+        if self.mode == BuildMode::Postings {
+            for (index, (_, header, _)) in entity.rows.iter().enumerate() {
+                if header.op == rtdb_types::EventOp::Put { visible[index].push([i64::MIN, i64::MAX, i64::MIN, i64::MAX]); }
+            }
+        } else {
+            for (index, rectangle) in rtdb_temporal::visibility(entity.rows.iter().enumerate().map(|(index, (_, header, _))| (header, index)))? {
+                visible[index].push([
+                    rectangle.valid_time.lower().0, rectangle.valid_time.upper().0,
+                    rectangle.system_time.lower().0, rectangle.system_time.upper().0,
+                ]);
+            }
         }
-        for (column, values) in self.columns.iter_mut().zip(entity.columns) {
+        for (column_index, (column, values)) in self.columns.iter_mut().zip(entity.columns).enumerate() {
             let mut members = vec![Vec::new(); values.tokens.len()];
             for (index, run) in values.row_tokens.into_iter().enumerate() {
                 if visible[index].is_empty() { continue; }
                 if let Some(run) = run {
                     members[run].push(index);
-                } else {
+                } else if self.mode != BuildMode::Postings {
                     column.row_runs[entity.rows[index].0 as usize] = NULL_DOC;
                 }
             }
-            for (tokens, members) in values.tokens.into_iter().zip(members) {
+            for ((tokens, revision), members) in values.tokens.into_iter().zip(values.revisions).zip(members) {
                 if members.is_empty() { continue; }
                 let doc = self.runs.len()?;
                 if doc >= NULL_DOC { return Err(fault("A search file has too many runs")); }
@@ -219,15 +258,26 @@ impl Builder {
                 else { self.window_ids[window] = self.window_ids[window].zip(sql_id).map(|(first, id)| first.min(id)); }
                 let sql_key = sql_id.map(|id| EntityId::Integer(id).handle_bytes());
                 self.runs.push(iid, key.or(sql_key.as_deref()), length, class, rectangles)?;
+                if self.mode == BuildMode::Postings {
+                    let revision = revision.ok_or_else(|| fault("Search document has no logical text revision"))?;
+                    self.doc_columns.push(column_index as u32);
+                    self.doc_revisions.append_value(revision).map_err(fault)?;
+                    self.doc_positions.push(members.iter().map(|&index| entity.rows[index].1.system_position())
+                        .max().expect("a posting has at least one original event"));
+                    for token in tokens.iter().flatten() { self.doc_tokens.values().append_value(token); }
+                    self.doc_tokens.append(true);
+                }
                 column.runs += 1;
                 column.tokens += u64::from(length);
-                for index in members { column.row_runs[entity.rows[index].0 as usize] = doc; }
+                if self.mode != BuildMode::Postings {
+                    for index in members { column.row_runs[entity.rows[index].0 as usize] = doc; }
+                }
             }
         }
         Ok(())
     }
 
-    fn finish(self, columns: &[String], version: Option<i64>, identity: &str, output: impl Write) -> Result<Vec<Section>> {
+    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: impl Write) -> Result<Vec<Section>> {
         if self.members.is_empty() { return Err(fault("A search file holds at least one member")); }
         let sections: Vec<_> = self.sections.into_values().collect();
         let mut writer = Writer::new(output, self.format)?;
@@ -281,8 +331,29 @@ impl Builder {
             directory.push((Table::Windows, Table::Windows.array(vec![Arc::new(Int64Array::from(self.window_ids))])?));
             directory.push((Table::Blocks, plan.directory()?));
             if self.format >= TREE_FORMAT_VERSION {
+                let revisions = if self.mode == BuildMode::History {
+                    let digests = self.revisions.into_iter().map(|mut values| values.finish()).collect::<Vec<_>>();
+                    let references = digests.iter().map(|values| values as &dyn Array).collect::<Vec<_>>();
+                    Some(Table::TextRevisions.array(vec![list(arrow_select::concat::concat(&references).map_err(fault)?,
+                        std::iter::repeat_n(self.rows as usize, columns.len()), item_of(&Table::TextRevisions.fields()[0]))?])?)
+                } else { None };
+                let documents = if self.mode == BuildMode::Postings {
+                    let tokens = self.doc_tokens.finish();
+                    Some(Table::TokenSequences.array(vec![Arc::new(UInt32Array::from(self.doc_columns)), Arc::new(self.doc_revisions.finish()),
+                        list(tokens.values().clone(), (0..tokens.len()).map(|row| tokens.value_length(row) as usize),
+                            item_of(&Table::TokenSequences.fields()[2]))?,
+                        Arc::new(Int64Array::from_iter_values(self.doc_positions.iter().map(|(timestamp, _)| timestamp.0))),
+                        Arc::new(UInt32Array::from_iter_values(self.doc_positions.iter().map(|(_, position)| *position)))])?)
+                } else { None };
+                let erases = if !self.erases.is_empty() {
+                    Some(Table::Erases.array(vec![
+                        Arc::new(arrow_array::FixedSizeBinaryArray::try_from_iter(self.erases.keys().map(|iid| iid.0)).map_err(fault)?),
+                        Arc::new(Int64Array::from_iter_values(self.erases.values().map(|(time, _)| time.0))),
+                        Arc::new(UInt32Array::from_iter_values(self.erases.values().map(|(_, position)| *position))),
+                    ])?)
+                } else { None };
                 super::tree_file::write(&mut writer, directory, visibility, plan,
-                    (self.format == PACKED_FORMAT_VERSION).then_some(positions))?;
+                    (self.format >= PACKED_FORMAT_VERSION).then_some(positions), revisions, documents, erases)?;
             } else {
                 writer.page(directory)?;
                 writer.page(visibility)?;
@@ -306,6 +377,7 @@ impl Builder {
 struct EntityColumn {
     row_tokens: Vec<Option<usize>>,
     tokens: Vec<StringArray>,
+    revisions: Vec<Option<TextRevision>>,
     distinct: HashMap<u64, Vec<usize>>,
 }
 
@@ -322,17 +394,20 @@ impl Entity {
     fn push(&mut self, ordinal: u32, row: IndexedRow<'_>) -> Result<()> {
         let header = row.header;
         self.rows.push((ordinal, header, row.sql_id));
-        for (column, value) in self.columns.iter_mut().zip(row.values) {
+        let revisions = row.revisions.into_iter().chain(std::iter::repeat(None));
+        for ((column, value), revision) in self.columns.iter_mut().zip(row.values).zip(revisions) {
             column.row_tokens.push(value.map(|tokens| {
                 let mut hash = DefaultHasher::new();
                 tokens.iter().for_each(|token| token.hash(&mut hash));
+                revision.hash(&mut hash);
                 let positions = column.distinct.entry(hash.finish()).or_default();
-                if let Some(&position) = positions.iter().find(|&&position| column.tokens[position] == tokens) {
+                if let Some(&position) = positions.iter().find(|&&position| column.tokens[position] == tokens && column.revisions[position] == revision) {
                     return position;
                 }
                 let position = column.tokens.len();
                 positions.push(position);
                 column.tokens.push(tokens);
+                column.revisions.push(revision);
                 position
             }));
         }
@@ -362,6 +437,15 @@ pub(super) fn write_group<P, I>(
 ) -> Result<Vec<Section>>
 where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
+    write_group_as(columns, members, identity, version, ceiling, output, reservation, format, BuildMode::Combined)
+}
+
+pub(crate) fn write_group_as<P, I>(
+    columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: Option<i64>,
+    ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode,
+) -> Result<Vec<Section>>
+where P: IntoIterator<Item = Result<I>>, I: SearchPage,
+{
     if format == super::TANTIVY_FORMAT_VERSION {
         let version = version.ok_or_else(|| fault("Legacy publication requires an ordered definition version"))?;
         let members = members.into_iter().map(|pages| pages.into_iter().map(|page| {
@@ -373,7 +457,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         let sections = super::legacy11::write_versioned_group(columns, members, identity, version, ceiling, store, output)?;
         return Ok(sections.into_iter().map(super::legacy11::Section::into_arrow).collect());
     }
-    let mut builder = Builder::new(columns.len(), ceiling, reservation, format);
+    let mut builder = Builder::new(columns.len(), ceiling, reservation, format, mode);
     let mut previous_member_iid = None;
     for pages in members {
         builder.member()?;
@@ -382,7 +466,7 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         let mut previous_time = None;
         for page in pages {
             let page = page?;
-            builder.pages.push(builder.rows);
+            if mode != BuildMode::Postings { builder.pages.push(builder.rows); }
             for index in 0..page.len() {
                 let row = page.row(index, columns)?;
                 let iid = row.header.iid;

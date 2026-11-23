@@ -201,7 +201,7 @@ impl TableBlock {
         }).collect::<Result<Vec<_>>>()?);
         let arrow_schema = crate::ipc::write_schema_message(&schema)?;
         let column_name_to_hll = columns.iter().filter_map(|(name, column)| column.hll.as_ref().map(|hll| (name.clone(), hll.clone()))).collect();
-        Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns }), charge: None })
+        Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns, ..Default::default() }), charge: None })
     }
 
     pub fn encoded_len(&self) -> usize { self.wire.encoded_len() }
@@ -209,6 +209,13 @@ impl TableBlock {
     pub fn as_proto(&self) -> &pb::TableBlock { &self.wire }
     pub fn row_count(&self) -> i64 { self.wire.row_count.unwrap_or_default() }
     pub fn partitions(&self) -> &[pb::Partition] { &self.wire.partitions }
+
+    pub fn with_search_runs(mut self, active: Vec<crate::log::proto::SearchRun>, retired: Vec<crate::log::proto::RetiredSearchRun>) -> Self {
+        let wire = Arc::make_mut(&mut self.wire);
+        wire.search_runs = active;
+        wire.retired_search_runs = retired;
+        self
+    }
 
     pub fn trie_details(&self) -> impl Iterator<Item = &TrieDetails> {
         self.wire.partitions.iter().flat_map(|partition| &partition.tries)
@@ -224,6 +231,8 @@ impl TableBlock {
         let mut wire = self.wire.as_ref().clone();
         retain_primary(&mut wire.tries);
         for partition in &mut wire.partitions { retain_primary(&mut partition.tries); }
+        wire.search_runs.clear();
+        wire.retired_search_runs.clear();
         Self { wire: Arc::new(wire), charge: self.charge.clone() }
     }
 
@@ -241,6 +250,9 @@ impl TableBlock {
                     files.insert(slug.recorded_artefact_key(&trie, record)?);
                 }
             }
+        }
+        if contents == CheckpointContents::Replay {
+            for run in &self.wire.search_runs { files.insert(run.object_key(slug)?); }
         }
         Ok(files)
     }

@@ -66,7 +66,8 @@ impl LivePostingPage {
     }
 
     fn from_rows(segment: &rtdb_index::LiveTable, column: &str, from: u32, to: u32,
-        available: usize, cancellation: &CancellationToken) -> Result<Option<Self>> {
+        available: usize, cancellation: &CancellationToken,
+        prepared: Option<&dyn Fn(u32) -> Option<StringArray>>) -> Result<Option<Self>> {
         let mut postings = BTreeMap::<String, (Vec<u32>, crate::rank_cutoff::RankKey)>::new();
         let mut tokens = LargeListBuilder::new(StringBuilder::new());
         let mut minimum_id: Option<i64> = Some(i64::MAX);
@@ -80,7 +81,9 @@ impl LivePostingPage {
                 if estimated > available { return Ok(None); }
                 let id = crate::lane::integer_sql_id(&event);
                 minimum_id = minimum_id.zip(id).map(|(left, right)| left.min(right));
-                let analyzed = rtdb_text::analyze(text);
+                let analyzed = if let Some(prepared) = prepared {
+                    prepared(row).ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.search/invalid-delta", "Committed text row has no token sequence"))?
+                } else { rtdb_text::analyze(text) };
                 let mut frequencies = BTreeMap::<&str, u32>::new();
                 for token in analyzed.iter().flatten() {
                     tokens.values().append_value(token);
@@ -182,16 +185,30 @@ pub(crate) struct ServingPostings {
 impl ServingPostings {
     pub fn prepare(snapshot: &Snapshot, definitions: &[SearchDefinition], budget: &Arc<MemoryBudget>,
         cancellation: &CancellationToken) -> Result<Self> {
+        let columns: BTreeSet<_> = definitions.iter().flat_map(|definition| {
+            definition.columns.iter().map(|column| (definition.table.clone(), column.clone()))
+        }).collect();
+        Self::extend(snapshot, columns, None, budget, cancellation)
+    }
+
+    fn extend(snapshot: &Snapshot, columns: BTreeSet<crate::delta::Column>,
+        commit: Option<(&crate::delta::Delta, &rtdb_index::StagedWrite)>, budget: &Arc<MemoryBudget>,
+        cancellation: &CancellationToken) -> Result<Self> {
         let block = snapshot.block_index();
         let previous = snapshot.serving_search::<Self>().filter(|previous| previous.block == block);
-        let columns: BTreeSet<_> = definitions.iter().flat_map(|definition| {
-            definition.columns.iter().map(|column| (&definition.table, column))
-        }).collect();
-        let mut indexed = BTreeMap::new();
-        for (table, column) in columns {
+        let mut indexed = if commit.is_some() { Self::preserve(snapshot).columns } else { BTreeMap::new() };
+        for key in columns {
+            let (table, column) = &key;
             let Some(segment) = snapshot.iter_segments(table).next() else { continue; };
-            let key = (table.clone(), column.clone());
             let mut postings = previous.and_then(|previous| previous.columns.get(&key)).map(|entry| entry.postings.clone()).unwrap_or_default();
+            let first = match commit {
+                Some((_, write)) => segment.row_count().checked_sub(write.tables()[table].row_count() as u32)
+                    .filter(|first| *first == postings.rows),
+                None => Some(postings.rows),
+            };
+            let Some(first) = first else { continue; };
+            let tokens = |row: u32| commit.and_then(|(delta, _)| delta.tokens(&key, (row - first) as usize));
+            let prepared = commit.map(|_| &tokens as &dyn Fn(u32) -> Option<StringArray>);
             while postings.rows < segment.row_count() {
                 if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
                 let from = postings.rows;
@@ -204,7 +221,7 @@ impl ServingPostings {
                     }
                 }
                 let Ok(mut reservation) = budget.reserve(bytes) else { break; };
-                let Some(mut page) = LivePostingPage::from_rows(segment, column, from, to, bytes, cancellation)? else { break; };
+                let Some(mut page) = LivePostingPage::from_rows(segment, column, from, to, bytes, cancellation, prepared)? else { break; };
                 let retained = page.bytes();
                 if retained > bytes { break; }
                 Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").shrink_to(retained)?;
@@ -213,9 +230,20 @@ impl ServingPostings {
                 postings.rows = to;
                 postings.bytes += retained;
             }
-            indexed.insert(key, ServingColumn { segment: Arc::downgrade(segment), postings });
+            let column = ServingColumn { segment: Arc::downgrade(segment), postings };
+            indexed.insert(key, column);
         }
         Ok(Self { block, columns: indexed })
+    }
+
+    fn preserve(snapshot: &Snapshot) -> Self {
+        let block = snapshot.block_index();
+        let columns = snapshot.serving_search::<Self>().filter(|previous| previous.block == block)
+            .into_iter().flat_map(|previous| &previous.columns).filter_map(|(key, entry)| {
+                let segment = snapshot.iter_segments(&key.0).next()?;
+                Some((key.clone(), ServingColumn { segment: Arc::downgrade(segment), postings: entry.postings.clone() }))
+            }).collect();
+        Self { block, columns }
     }
 
     fn pages(&self, segment: &rtdb_index::LiveTable, column: &str) -> Option<(Vec<Arc<LivePostingPage>>, u32)> {
@@ -247,7 +275,7 @@ impl LivePostings {
         while from < segment.row_count() {
             let to = from.saturating_add(1024).min(segment.row_count());
             let remaining = LIVE_POSTING_BYTES.saturating_sub(self.bytes);
-            let Some(page) = LivePostingPage::from_rows(segment, column, from, to, remaining, cancellation)? else { break; };
+            let Some(page) = LivePostingPage::from_rows(segment, column, from, to, remaining, cancellation, None)? else { break; };
             let bytes = page.bytes();
             if bytes > remaining { break; }
             self.pages.push(Arc::new(page));
@@ -295,6 +323,7 @@ pub struct SearchRuntime {
     file_admission: Arc<MemoryBudget>,
     serving_admission: Arc<MemoryBudget>,
     serving_gaps: std::sync::atomic::AtomicU64,
+    logical_run_reads: std::sync::atomic::AtomicU64,
     tree_conversions: Mutex<BTreeMap<OpenedTreeKey, Arc<tokio::sync::OnceCell<Arc<SearchFile>>>>>,
     definitions: Mutex<Bounded<DefinitionKey, Arc<Vec<SearchDefinition>>>>,
     live: Mutex<Bounded<LiveKey, Arc<LivePostings>>>,
@@ -305,6 +334,7 @@ pub struct SearchRuntime {
     mapped: Mutex<Bounded<(String, String), OpenedFile>>,
     match_sets: Mutex<Bounded<(String, String, String, rtdb_text::Query), (std::sync::Weak<SearchFile>, Arc<crate::file::MatchSet>)>>,
     suspects: Mutex<std::collections::BTreeSet<Suspect>>,
+    suspect_runs: Mutex<BTreeSet<(String, rtdb_types::TableRef, [u8; 32])>>,
     reported: Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>,
 }
 
@@ -324,6 +354,7 @@ impl SearchRuntime {
 
     pub fn with_tree_files(file_bytes: usize) -> Arc<Self> { Self::with_format(file_bytes, crate::file::TREE_FORMAT_VERSION) }
     pub fn with_search_packs(file_bytes: usize) -> Arc<Self> { Self::with_format(file_bytes, crate::file::PACKED_FORMAT_VERSION) }
+    pub fn with_logical_search(file_bytes: usize) -> Arc<Self> { Self::with_format(file_bytes, crate::file::LOGICAL_FORMAT_VERSION) }
     pub fn with_tantivy_files(file_bytes: usize) -> Arc<Self> { Self::with_format(file_bytes, crate::file::TANTIVY_FORMAT_VERSION) }
 
     pub(crate) fn for_query(memory: Arc<MemoryBudget>) -> Arc<Self> {
@@ -339,10 +370,12 @@ impl SearchRuntime {
             trees: Mutex::new(Bounded::new(file_bytes.saturating_mul(8))),
             routing: Mutex::new(Bounded::new(file_bytes / 16)),
             file_admission, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
+            logical_run_reads: Default::default(),
             tree_conversions: Default::default(), definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
             files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)),
             mapped: Mutex::new(Bounded::new(file_bytes.saturating_mul(32))), building: Default::default(),
-            match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), reported: Default::default() })
+            match_sets: Mutex::new(Bounded::new(64 << 20)), suspects: Default::default(), suspect_runs: Default::default(),
+            reported: Default::default() })
     }
 
     pub(crate) fn write_format(&self) -> i32 { self.write_format }
@@ -351,16 +384,22 @@ impl SearchRuntime {
 
     pub(crate) fn record_serving_gap(&self) { self.serving_gaps.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
 
-    pub(crate) fn table_routing(&self, snapshot: &Snapshot, definition: &SearchDefinition, storage: &BufferPool, include_packs: bool)
+    pub fn logical_run_reads(&self) -> u64 { self.logical_run_reads.load(std::sync::atomic::Ordering::Relaxed) }
+
+    pub(crate) fn record_logical_run_read(&self) { self.logical_run_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+
+    pub(crate) fn table_routing(&self, snapshot: &Snapshot, definition: &SearchDefinition, storage: &BufferPool, include_packs: bool, history: bool)
         -> Result<Arc<crate::accelerate::routing::TableRouting>> {
         use crate::accelerate::routing::TableRouting;
 
-        let key = TableRouting::key(snapshot, definition, include_packs);
+        let key = TableRouting::key(snapshot, definition, if history { 2 } else { u8::from(include_packs) });
         let share = storage.prepaid_metadata_budget().is_none();
         if share && let Some(routing) = self.routing.lock().get(&key).filter(|routing| routing.belongs_to(snapshot)) {
             return Ok(routing);
         }
-        let routing = Arc::new(TableRouting::open(snapshot, definition, include_packs, storage.prepaid_metadata_budget())?);
+        let budget = storage.prepaid_metadata_budget();
+        let routing = Arc::new(if history { TableRouting::history(snapshot, definition, budget)? }
+            else { TableRouting::open(snapshot, definition, include_packs, budget)? });
         if share {
             let mut kept = self.routing.lock();
             if routing.bytes <= kept.limit { kept.insert(key, Arc::clone(&routing), routing.bytes); }
@@ -373,8 +412,30 @@ impl SearchRuntime {
         Ok(rtdb_index::ServingSearch::new(ServingPostings::prepare(snapshot, definitions, &self.serving_admission, cancellation)?))
     }
 
+    pub(crate) fn prepare_delta(&self, definitions: &[SearchDefinition], write: &rtdb_index::StagedWrite,
+        cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> {
+        crate::delta::prepare(definitions, write, &self.serving_admission, cancellation)
+    }
+
+    pub(crate) fn install_delta(&self, snapshot: &Snapshot, write: &rtdb_index::StagedWrite, encoded: Option<&[u8]>,
+        cancellation: &CancellationToken) -> Result<rtdb_index::ServingSearch> {
+        let Some(encoded) = encoded else { return Ok(rtdb_index::ServingSearch::new(ServingPostings::preserve(snapshot))); };
+        let result = crate::delta::Delta::read(encoded, write, &self.serving_admission).and_then(|delta| {
+            let columns = delta.columns().cloned().collect();
+            ServingPostings::extend(snapshot, columns, Some((&delta, write)), &self.serving_admission, cancellation)
+        });
+        match result {
+            Ok(index) => Ok(rtdb_index::ServingSearch::new(index)),
+            Err(_) if !cancellation.is_cancelled() => {
+                self.record_serving_gap();
+                Ok(rtdb_index::ServingSearch::new(ServingPostings::preserve(snapshot)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn can_scan_live_gap(&self, segment: &rtdb_index::LiveTable, column: &str, covered: u32) -> Result<bool> {
-        if self.write_format != crate::file::PACKED_FORMAT_VERSION { return Ok(true); }
+        if self.write_format < crate::file::PACKED_FORMAT_VERSION { return Ok(true); }
         if segment.row_count().saturating_sub(covered) > 2048 { return Ok(false); }
         let mut bytes = 0usize;
         for row in covered..segment.row_count() {
@@ -428,6 +489,25 @@ impl SearchRuntime {
             if weight <= cache.limit { cache.insert(cache_key, (Arc::downgrade(storage), Arc::clone(&tree)), weight); }
         }
         Ok(tree)
+    }
+
+    pub(crate) async fn logical_file(&self, storage: &Arc<BufferPool>, slug: &rtdb_format::keys::TableSlug,
+        run: &rtdb_format::log::proto::SearchRun, columns: &[String]) -> Result<Arc<crate::file::TreeFile>> {
+        self.open_logical(storage, slug, run, columns, false).await
+    }
+
+    pub(crate) async fn open_logical(&self, storage: &Arc<BufferPool>, slug: &rtdb_format::keys::TableSlug,
+        run: &rtdb_format::log::proto::SearchRun, columns: &[String], fresh: bool) -> Result<Arc<crate::file::TreeFile>> {
+        let key = ObjectKey::new(run.object_key(slug)?)?;
+        let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode)
+            .filter(|locator| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64)
+            .ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.search/corrupt-file", "Search run has no matching root locator"))?;
+        let identity = crate::lane::run_identity(slug, run.definition_id(), run.definition_version(), &run.blocks, run.rebuild());
+        if fresh { storage.invalidate(&key).await?; }
+        self.tree_file(storage, &key, &locator, columns, &identity, run.definition_version(), fresh).await.map_err(|error| match error {
+            FileError::Missing => rtdb_types::Anomaly::fault("rtdb.storage/missing-object", key.as_str()),
+            FileError::Corrupt(error) | FileError::Unavailable(error) => error,
+        })
     }
 
     pub(crate) async fn materialized_tree(
@@ -713,6 +793,24 @@ impl SearchRuntime {
     pub fn report(&self, suspect: Suspect) {
         let database = suspect.database.clone();
         if self.suspects.lock().insert(suspect) { self.notifier(&database).notify_one(); }
+    }
+    pub(crate) fn report_run(&self, database: &str, table: &rtdb_types::TableRef,
+        run: &rtdb_format::log::proto::SearchRun, error: &rtdb_types::Anomaly) {
+        if !FileError::from_anomaly(error.clone()).needs_repair() { return; }
+        if let Ok(id) = run.identity() {
+            let mut suspects = self.suspect_runs.lock();
+            if suspects.len() < 1024 && suspects.insert((database.to_owned(), table.clone(), id)) {
+                self.notifier(database).notify_one();
+            }
+        }
+    }
+
+    pub(crate) fn suspect_runs(&self, database: &str) -> Vec<(rtdb_types::TableRef, [u8; 32])> {
+        self.suspect_runs.lock().iter().filter(|(name, _, _)| name == database).map(|(_, table, id)| (table.clone(), *id)).collect()
+    }
+
+    pub(crate) fn clear_run(&self, database: &str, table: &rtdb_types::TableRef, id: [u8; 32]) {
+        self.suspect_runs.lock().remove(&(database.to_owned(), table.clone(), id));
     }
     fn notifier(&self, database: &str) -> Arc<tokio::sync::Notify> { Arc::clone(self.reported.lock().entry(database.to_string()).or_default()) }
     pub fn suspects(&self, database: &str) -> Vec<Suspect> { self.suspects.lock().iter().filter(|suspect| suspect.database == database).cloned().collect() }

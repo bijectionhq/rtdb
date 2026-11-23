@@ -319,7 +319,7 @@ pub(super) async fn run(documents: i64, iterations: usize) {
 struct InterleavedSearch {
     accelerator: Arc<SearchAccelerator>,
     baseline: AtomicBool,
-    compare_packs: bool,
+    target_format: u8,
     diagnostics: Mutex<Option<Json>>,
 }
 
@@ -331,9 +331,10 @@ impl ScanAccelerator for InterleavedSearch {
 
     async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
         use rtdb_search::accelerate::experiment::workload::Policy;
-        let policy = match (self.baseline.load(Ordering::Relaxed), self.compare_packs) {
-            (true, true) => Policy::Tree14,
-            (true, false) => Policy::Baseline,
+        let policy = match (self.baseline.load(Ordering::Relaxed), self.target_format) {
+            (true, 16) => Policy::Pack15,
+            (true, 15) => Policy::Tree14,
+            (true, _) => Policy::Baseline,
             (false, _) => Policy::Current,
         };
         let (selection, diagnostics) = self.accelerator.workload_selection(request, policy).await?;
@@ -403,7 +404,7 @@ fn sql_bench_services(clock: &Arc<TickClock>, remote: bool, cache: &std::path::P
     }
 }
 
-pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, compare_packs: bool) {
+pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, target_format: u8) {
     use rtdb_format::database::proto::{DatabaseConfig, LocalLog, database_config};
     use rtdb_node::Membership;
     assert!(documents >= 4000 && iterations > 0);
@@ -444,9 +445,14 @@ pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, compare_pa
         basis
     };
     let mut builds = BTreeMap::new();
-    for format in [14, 15].into_iter().take(if compare_packs { 2 } else { 1 }) {
+    let experimental_runtime = |format| match format {
+        16 => SearchRuntime::with_logical_search(768 << 20),
+        15 => SearchRuntime::with_search_packs(768 << 20),
+        _ => SearchRuntime::with_tree_files(768 << 20),
+    };
+    for format in 14..=target_format {
         let mut services = fixture(&format!("v{format}"));
-        let runtime = if format == 15 { SearchRuntime::with_search_packs(768 << 20) } else { SearchRuntime::with_tree_files(768 << 20) };
+        let runtime = experimental_runtime(format);
         services.artefact_kinds = vec![runtime.artefacts()];
         services.scan_accelerators = vec![runtime.accelerator()];
         let (node, driver) = Node::open(options.clone(), services).await.unwrap();
@@ -461,8 +467,8 @@ pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, compare_pa
         tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
     }
     let mut services = fixture("read");
-    let runtime = if compare_packs { SearchRuntime::with_search_packs(768 << 20) } else { SearchRuntime::with_tree_files(768 << 20) };
-    let scan = Arc::new(InterleavedSearch { accelerator: runtime.accelerator(), baseline: AtomicBool::new(false), compare_packs, diagnostics: Mutex::new(None) });
+    let runtime = experimental_runtime(target_format);
+    let scan = Arc::new(InterleavedSearch { accelerator: runtime.accelerator(), baseline: AtomicBool::new(false), target_format, diagnostics: Mutex::new(None) });
     services.artefact_kinds = vec![runtime.artefacts()];
     services.scan_accelerators = vec![scan.clone()];
     let (node, driver) = Node::open(options, services).await.unwrap();
@@ -473,7 +479,8 @@ pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, compare_pa
     let tries = catalog.current_tries(&table);
     assert!(tries.iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f14"))));
     assert!(tries.iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f13"))));
-    if compare_packs { assert!(tries.iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f15")))); }
+    if target_format >= 15 { assert!(tries.iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f15")))); }
+    if target_format == 16 { assert!(catalog.search_runs(&table).next().is_some()); }
     let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
     let cold_case = CASES[3];
     let cold_base = cold_case.statement(basis, basis);
@@ -497,13 +504,15 @@ pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, compare_pa
                 let start = Instant::now();
                 let actual = query(&mut session, &sql).await;
                 let ms = elapsed(start);
-                assert_eq!(actual, expected, "{} format {}", case.name, 13 + usize::from(compare_packs) + variant);
+                assert_eq!(actual, expected, "{} format {}", case.name, target_format as usize - 1 + variant);
                 let profile = scan.diagnostics.lock().unwrap().take().expect("the SQL query produces a ranked scan");
                 if iteration > 0 { samples[variant].push(ms); }
                 diagnostics[variant] = profile;
             }
         }
-        if compare_packs {
+        if target_format == 16 {
+            assert!(diagnostics[1]["tree"]["logical_roots"].as_u64().unwrap_or_default() > 0, "{} {diagnostics:?}", case.name);
+        } else if target_format == 15 {
             assert!(diagnostics[1]["tree"]["packed_resolved"].as_u64().unwrap_or_default() > 0, "{} {diagnostics:?}", case.name);
         } else if case.name == "phrase" {
             assert_eq!(diagnostics[1]["tree"]["decline"], "phrase-paged");
@@ -512,10 +521,13 @@ pub(super) async fn run_ranked_sql(documents: i64, iterations: usize, compare_pa
             assert_eq!(diagnostics[1]["tree"]["retained_rows"].as_u64(), Some(case.limit as u64));
         }
         let [baseline, current] = samples;
-        cases.push(if compare_packs { json!({"case": case.name, "limit": case.limit, "format14_ms": baseline, "format15_ms": current, "diagnostics": diagnostics}) }
-            else { json!({"case": case.name, "limit": case.limit, "format13_ms": baseline, "format14_ms": current, "diagnostics": diagnostics}) });
+        cases.push(match target_format {
+            16 => json!({"case": case.name, "limit": case.limit, "format15_ms": baseline, "format16_ms": current, "diagnostics": diagnostics}),
+            15 => json!({"case": case.name, "limit": case.limit, "format14_ms": baseline, "format15_ms": current, "diagnostics": diagnostics}),
+            _ => json!({"case": case.name, "limit": case.limit, "format13_ms": baseline, "format14_ms": current, "diagnostics": diagnostics}),
+        });
     }
-    println!("{}", json!({"documents": documents, "warm_samples_per_format": iterations, "tree_build_ms": builds[&14], "pack_build_ms": builds.get(&15),
+    println!("{}", json!({"documents": documents, "warm_samples_per_format": iterations, "tree_build_ms": builds[&14], "pack_build_ms": builds.get(&15), "logical_build_ms": builds.get(&16),
         "storage": if remote { "azure-emulator" } else { "local" }, "tries": tries.len(), "cases": cases,
         "cold": {"case": cold_case.name, "milliseconds": cold_ms, "diagnostics": cold_diagnostics}}));
     drop(session);

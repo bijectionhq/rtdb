@@ -95,6 +95,7 @@ pub(crate) struct TreeRanked {
     order: TreeRankOrder,
     checked_frequencies: BTreeSet<(usize, usize)>,
     checked_positions: BTreeSet<(usize, usize)>,
+    sparse_phrase: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +106,7 @@ pub(crate) struct TreeCandidate {
     pub member: u32,
     pub document: u32,
     pub key: RankKey,
+    pub revision: Option<super::TextRevision>,
     pub rectangles: Vec<[i64; 4]>,
 }
 
@@ -116,7 +118,8 @@ impl TreeRanked {
         let names = term_ids.keys().map(|term| term.to_string()).collect::<Vec<_>>();
         let pages = file.term_pages(column as u32, &names).await?;
         let terms = pages.into_iter().zip(names).map(|(page, term)| Term::read(page, column as u32, &term)).collect::<Result<Vec<_>>>()?;
-        let phrases = matching.phrases().iter().map(|phrase| phrase.iter().map(|term| term_ids[term.as_str()]).collect()).collect();
+        let phrases: Vec<Vec<usize>> = matching.phrases().iter()
+            .map(|phrase| phrase.iter().map(|term| term_ids[term.as_str()]).collect()).collect();
         let matching: Vec<_> = matching.terms().iter().map(|term| term_ids[term.as_str()]).collect();
         let score_terms: Vec<_> = scoring.scorer().query().terms().iter().map(|term| term_ids[term.as_str()]).collect();
         let pages = table(file.root(), Table::Pages);
@@ -133,9 +136,11 @@ impl TreeRanked {
         let leading = if matching.iter().all(|&index| terms[index].is_some()) {
             matching.iter().copied().min_by_key(|&index| terms[index].as_ref().expect("matching term is present").frequency)
         } else { None };
+        let sparse_phrase = file.format() == super::LOGICAL_FORMAT_VERSION && !phrases.is_empty()
+            && leading.is_some_and(|index| terms[index].as_ref().is_some_and(|term| term.frequency <= 1024));
         let mut rank = Self { file, terms, leading, matching, scoring: score_terms, phrases, scorer: scoring.clone(),
             ready: BinaryHeap::new(), members, documents, bounds, order,
-            checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new() };
+            checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new(), sparse_phrase };
         if let Some(leading) = leading {
             let node = rank.terms[leading].as_ref().expect("leading term is present").node;
             let floors = rank.uuid_floors(std::iter::once(node.first)).await?;
@@ -245,11 +250,17 @@ impl TreeRanked {
         if let Some(Work { job: Job::Node(node), .. }) = self.ready.peek() {
             let node = *node;
             self.ready.pop();
-            self.open_node(node).await?;
+            if self.sparse_phrase {
+                for leaf in rank_tree::leaves(self.file.reader(), node, node.first, node.last).await? {
+                    self.open_node(leaf).await?;
+                }
+            } else {
+                self.open_node(node).await?;
+            }
             return Ok(Vec::new());
         }
         let mut windows = BTreeMap::new();
-        let batch = if self.order == TreeRankOrder::Uuid { 1 } else { 4 };
+        let batch = if self.order == TreeRankOrder::Uuid { 1 } else if self.sparse_phrase { 16 } else { 4 };
         while windows.len() < batch && self.ready.peek().is_some_and(|work| matches!(work.job, Job::Windows(_))) {
             let Some(Work { first, job: Job::Windows(blocks), .. }) = self.ready.pop() else { unreachable!() };
             windows.insert(first, blocks);
@@ -313,21 +324,28 @@ impl TreeRanked {
             if starts.len() != 1 || start.is_null(0) || start.value(0) as usize > requested {
                 return Err(corrupt("Search document directory has an invalid page start"));
             }
-            docs.insert(requested, (start.value(0), table(page, Table::Runs)));
+            let revisions = (self.file.format() == super::LOGICAL_FORMAT_VERSION).then(|| table(page, Table::TokenSequences));
+            docs.insert(requested, (start.value(0), table(page, Table::Runs), revisions));
         }
         let mut candidates = Vec::new();
         let mut frequencies = Vec::with_capacity(self.scoring.len());
         for (window, doc) in nominated {
             let start = document_page(doc);
-            let (first, runs) = &docs[&start];
+            let (first, runs, revisions) = &docs[&start];
             let record = Document::at(runs, (doc - first) as usize)?;
             if scope.is_some_and(|scope| !scope.contains(&record.iid))
                 || !record.visibility.iter().any(|&rect| meets(rect, self.bounds)) { continue; }
             frequencies.clear();
             frequencies.extend(self.scoring.iter().map(|&term| in_window(term, window).map_or(0, |posting| posting.frequency(doc))));
             let score = self.scorer.scorer().score(&frequencies, stored_length(record.length as usize));
+            let revision = revisions.as_ref().map(|sequences| {
+                let row = (doc - first) as usize;
+                if row >= sequences.len() { return Err(corrupt("Ranked document has no text revision")); }
+                sequences.column(1).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search revision layout")
+                    .value(row).try_into().map_err(|_| corrupt("Ranked document has an invalid text revision"))
+            }).transpose()?;
             candidates.push(TreeCandidate { iid: record.iid, member: document_member(&self.members, doc) as u32, document: doc,
-                key: self.key(score, record.id, Some(record.iid)), rectangles: record.visibility });
+                key: self.key(score, record.id, Some(record.iid)), rectangles: record.visibility, revision });
         }
         Ok(candidates)
     }

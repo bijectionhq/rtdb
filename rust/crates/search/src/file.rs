@@ -39,9 +39,13 @@ pub(crate) use layout::FooterLocator;
 pub const FORMAT_VERSION: i32 = 13;
 pub(crate) const TREE_FORMAT_VERSION: i32 = 14;
 pub(crate) const PACKED_FORMAT_VERSION: i32 = 15;
+pub(crate) const LOGICAL_FORMAT_VERSION: i32 = 16;
+pub(crate) type TextRevision = [u8; 32];
 pub(crate) use page_tree::PageCache;
 pub(crate) use tree_file::{MAX_ROOT_BYTES, TreeFile, TreeLocator};
+pub(crate) use tree_file::LogicalDocument;
 pub(crate) use tree_rank::{TreeRankOrder, TreeRanked};
+pub(crate) use write::{BuildMode, write_group_as};
 pub(crate) fn encode_tantivy_stats(sections: &[Section]) -> Vec<u8> { legacy11::encode_catalog(sections) }
 pub(crate) const LEGACY_FORMAT_VERSION: i32 = 12;
 pub(crate) const TANTIVY_FORMAT_VERSION: i32 = 11;
@@ -69,6 +73,7 @@ pub(crate) struct IndexedRow<'a> {
     pub key: Option<Cow<'a, [u8]>>,
     pub sql_id: Option<i64>,
     pub values: Vec<Option<StringArray>>,
+    pub revisions: Vec<Option<TextRevision>>,
 }
 
 pub(crate) trait SearchPage {
@@ -91,7 +96,7 @@ impl SearchPage for Vec<SearchRow> {
             Some(EntityId::Integer(id)) if EntityId::Integer(*id).iid() == header.iid => Some(*id),
             _ => None,
         };
-        Ok(IndexedRow { header, key: row.identity.as_ref().map(|id| Cow::Owned(id.handle_bytes())), sql_id, values })
+        Ok(IndexedRow { header, key: row.identity.as_ref().map(|id| Cow::Owned(id.handle_bytes())), sql_id, values, revisions: Vec::new() })
     }
 }
 

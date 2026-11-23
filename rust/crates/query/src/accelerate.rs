@@ -8,7 +8,7 @@ use rtdb_format::keys::TrieKey;
 use rtdb_index::{RowSource, Snapshot};
 use rtdb_plan::{ColumnId, Expr, Scan, Schema};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Iid, Result, RowVersion, TemporalBounds, Value};
+use rtdb_types::{EventHeader, Iid, Result, RowVersion, TemporalBounds, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::context::Execution;
@@ -76,7 +76,26 @@ pub trait CandidateVerifier: Send + Sync {
 
 pub struct PartitionRanking {
     winners: parking_lot::Mutex<PartitionWinners>,
+    work: parking_lot::Mutex<BTreeMap<usize, f64>>,
     memory: Arc<MemoryBudget>,
+}
+
+pub struct PartitionRankWork<'a> {
+    ranking: &'a PartitionRanking,
+    partition: usize,
+    _charge: Arc<MemoryReservation>,
+}
+
+impl PartitionRankWork<'_> {
+    pub fn report(&self, bound: f64) -> bool {
+        let mut work = self.ranking.work.lock();
+        work.insert(self.partition, bound);
+        work.values().any(|&other| other > bound)
+    }
+}
+
+impl Drop for PartitionRankWork<'_> {
+    fn drop(&mut self) { self.ranking.work.lock().remove(&self.partition); }
 }
 
 #[derive(Default)]
@@ -100,7 +119,14 @@ impl Ord for ScoredIid {
 }
 
 impl PartitionRanking {
-    pub(crate) fn new(memory: Arc<MemoryBudget>) -> Self { Self { winners: Default::default(), memory } }
+    pub(crate) fn new(memory: Arc<MemoryBudget>) -> Self { Self { winners: Default::default(), work: Default::default(), memory } }
+
+    pub fn register(&self, partition: &Snapshot) -> Option<PartitionRankWork<'_>> {
+        let charge = self.memory.reserve(256).ok()?;
+        let partition = std::ptr::from_ref(partition) as usize;
+        self.work.lock().insert(partition, f64::INFINITY);
+        Some(PartitionRankWork { ranking: self, partition, _charge: charge })
+    }
 
     pub fn add_verified(&self, limit: usize, rows: impl IntoIterator<Item = (Iid, f64)>) {
         if !(1..=4096).contains(&limit) { return; }
@@ -142,6 +168,34 @@ pub struct ResolvedSearchRow {
     pub version: RowVersion,
     pub location: SearchRowLocation,
     pub visibility: TemporalBounds,
+}
+
+pub struct LocatedHistoryEvent<W> {
+    pub header: EventHeader,
+    pub location: SearchRowLocation,
+    pub witness: Option<W>,
+}
+
+pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHistoryEvent<W>>>, bounds: TemporalBounds,
+    clamp_valid_time: bool, memory: &Arc<MemoryBudget>) -> Result<Option<Vec<(ResolvedSearchRow, Option<W>)>>> {
+    if !bounds.system_time.is_point() || !bounds.valid_time.is_point() { return Ok(None); }
+    let mut visible = Vec::new();
+    let mut resolver = rtdb_temporal::HistoryResolver::new_in(bounds, clamp_valid_time, Arc::clone(memory));
+    for events in history.values_mut() {
+        events.sort_unstable_by_key(|event| std::cmp::Reverse(event.header.system_position()));
+        if events.windows(2).any(|pair| pair[0].header.version() == pair[1].header.version()) { return Ok(None); }
+        let first = visible.len();
+        for event in events {
+            rtdb_storage::audience_work::scan_items(1)?;
+            resolver.resolve_fragments(&event.header, |valid_time, system_time| {
+                visible.push((ResolvedSearchRow { version: event.header.version(), location: event.location.clone(),
+                    visibility: TemporalBounds { valid_time, system_time } }, event.witness));
+                Ok(())
+            })?;
+        }
+        if visible.len() - first > 1 { return Ok(None); }
+    }
+    Ok(Some(visible))
 }
 
 #[derive(Clone)]
@@ -294,6 +348,8 @@ pub trait OrderedBatches: Send {
 #[async_trait]
 pub trait ScanAccelerator: Send + Sync {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
+    /// Resolves complete, pinned histories for an explicit set of entities.
+    async fn point_rows(&self, _request: &ScanRequest<'_>, _iids: &BTreeSet<Iid>) -> Result<Option<Vec<ResolvedSearchRow>>> { Ok(None) }
     /// Optionally supplies the scores of a ranked point scan alongside its candidate scope.
     async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
         let Some(iids) = self.candidate_iids(request).await? else { return Ok(None); };

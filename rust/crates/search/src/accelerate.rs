@@ -18,7 +18,7 @@ use rtdb_plan::{BinaryOp, Catalog, Expr};
 use rtdb_query::{MatchAnswers, QueryContext, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TableRef, TemporalBounds, Timestamp, Value};
 
 use crate::{KIND, SearchDefinition, SearchFile, rank_cutoff::RankKey, runtime::{Suspect, TrieFile}};
 
@@ -83,12 +83,34 @@ impl ScanAccelerator for SearchAccelerator {
         }
     }
 
+    async fn point_rows(&self, request: &ScanRequest<'_>, iids: &BTreeSet<Iid>) -> Result<Option<Vec<rtdb_query::ResolvedSearchRow>>> {
+        let table = &request.scan.table.name.table;
+        if table.is_owned_event_data() || TableRef::owned_schema(&table.schema)
+            || (self.runtime.write_format() != crate::file::LOGICAL_FORMAT_VERSION
+                && request.snapshot.trie_catalog().search_runs(table).next().is_none()) { return Ok(None); }
+        let result = async {
+            let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory,
+                request.current_time, request.cancellation).await?;
+            let Some(definition) = definitions.iter().find(|definition| &definition.table == table
+                && !definition.columns.is_empty() && crate::lane::LogicalIndex::supports(definition)) else { return Ok(None); };
+            let sources = tree::RecordedTree::select(&self.runtime, request, definition, 0, &Query::parse(""), true, true)?;
+            let history = point::PackedVisibility::new(request, table, &sources, 0, true);
+            history.resolve(&self.runtime, request, definition, &sources, iids).await
+                .map(|result| result.map(|rows| rows.into_iter().map(|row| row.row).collect()))
+        }.await;
+        match result {
+            Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
+            result => result,
+        }
+    }
+
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
         if request.storage.prepaid_metadata_budget().is_some() { return Ok(None); }
         if request.scan.top_k.is_some() && request.scan.iids.as_ref().is_some_and(|iids| iids.len() <= 128) {
             return Ok(None);
         }
         let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
+        if tree::logical_runs(&self.runtime, request, &definition).is_some() { return Ok(None); }
         let query = Query::parse(query);
         let files = match self.trie_files(request, &definition, column, &[&query], LoadSearch::Match, None).await? {
             TrieFiles::Complete(found) | TrieFiles::Partial(found) => found.files,
@@ -115,6 +137,7 @@ struct Narrowing<'a> {
     skip_retry: bool,
     estimate_first: bool,
     omit_packs: bool,
+    omit_logical: bool,
     scope: Option<&'a BTreeSet<Iid>>,
 }
 
@@ -134,6 +157,7 @@ struct NarrowingWork {
     plain_events: usize,
     estimated_postings: Option<usize>,
     tree_roots: usize,
+    logical_roots: usize,
     tree_expansions: usize,
     uncovered_live_rows: usize,
     retained_rank_rows: usize,
@@ -187,6 +211,9 @@ impl SearchAccelerator {
         }
         if let Some(scope) = options.scope {
             return Ok(Some(scope.clone()));
+        }
+        if !options.omit_packs && !options.omit_logical && let Some(found) = self.logical_candidates(request, &definition, column, &query, work).await? {
+            return Ok(Some(found));
         }
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition, column, &[&query], LoadSearch::Match, None).await? else {
             work.plain_decline = Some("coverage");
@@ -938,7 +965,8 @@ impl SearchAccelerator {
         let scoring_query = Query::parse(&text);
         if !options.estimate_first && !options.baseline {
             let (result, io) = crate::file::observe_tree_io(self.tree_top_k(request, definition, column, top_k.column, matching,
-                scoring_query.clone(), ascending_id, uuid_order, limit, options.scope, !options.omit_packs, work)).await;
+                scoring_query.clone(), ascending_id, uuid_order, limit, options.scope, !options.omit_packs,
+                !options.omit_logical, work)).await;
             work.tree_io = io;
             if let Some(result) = result? { return Ok(Some(result)); }
         }

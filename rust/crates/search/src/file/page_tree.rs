@@ -283,7 +283,7 @@ pub(super) struct TreeReader {
 
 impl TreeReader {
     pub fn new(source: PageSource, length: u64, format: i32) -> Self {
-        Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(format)), MetadataVersion::V5), packed: format == super::PACKED_FORMAT_VERSION }
+        Self { source, length, decoder: FileDecoder::new(Arc::clone(schema(format)), MetadataVersion::V5), packed: format >= super::PACKED_FORMAT_VERSION }
     }
 
     pub fn inline_page(&self, page: PageRef, bytes: Arc<[u8]>) -> Result<RecordBatch> {

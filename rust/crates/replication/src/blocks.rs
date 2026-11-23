@@ -98,6 +98,8 @@ impl RecoveredBlockConfirmation {
         let token_bytes = catalog.external_source_token().map_or(0, <[u8]>::len);
         let bytes = table_blocks.iter().try_fold(token_bytes, |bytes, (table, block)| {
             let names = table.schema.len().checked_add(table.table.len())?.checked_add(1024)?;
+            let bytes = block.as_proto().search_runs.iter().filter(|run| run.blocks == [catalog.block_index().0])
+                .try_fold(bytes, |bytes, run| bytes.checked_add(run.encoded_size())?.checked_add(1024))?;
             l0_details(block, &key).try_fold(bytes, |bytes, detail| {
                 bytes.checked_add(names)?.checked_add(detail.encoded_size())
             })
@@ -577,6 +579,9 @@ pub(crate) fn l0_tries(index: BlockIndex, tables: &BTreeMap<rtdb_types::TableRef
             });
             let mut trie = CatalogTrie::notification(key.clone(), detail.data_file_size.unwrap_or_default(), summary)?;
             trie.artefacts = detail.artefacts.clone();
+            for run in block.as_proto().search_runs.iter().filter(|run| run.blocks == [index.0]) {
+                trie.artefacts.push(proto::SearchRunChange { run: Some(run.clone()), ..Default::default() }.to_artefact()?);
+            }
             if notification.as_ref().is_some_and(|existing| existing != &trie) {
                 return Err(invalid("Conflicting L0 notifications for one table and block"));
             }

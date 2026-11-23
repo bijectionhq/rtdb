@@ -6,6 +6,7 @@ pub mod config;
 pub mod data;
 pub mod diagnostics;
 pub mod envelope;
+pub mod search_manifest;
 pub mod hll;
 pub mod ipc;
 mod ipc_decimal;

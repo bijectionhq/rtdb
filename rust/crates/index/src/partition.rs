@@ -55,20 +55,27 @@ impl PartitionValue {
 }
 
 #[derive(Debug)]
-struct CheckpointTries(BTreeMap<TableRef, BTreeSet<TrieKey>>);
+struct CheckpointTries {
+    tries: BTreeMap<TableRef, BTreeSet<TrieKey>>,
+    search: BTreeMap<TableRef, BTreeSet<[u8; 32]>>,
+}
 
 impl CheckpointTries {
     fn capture(catalog: &TrieCatalog) -> Self {
-        Self(catalog.tables().map(|table| {
+        let tries = catalog.tables().map(|table| {
             let keys = catalog.iter_tries(table)
                 .filter(|trie| matches!(trie.state, TrieState::Live | TrieState::Nascent))
                 .map(|trie| trie.key.clone()).collect();
             (table.clone(), keys)
-        }).collect())
+        }).collect();
+        let search = catalog.tables().map(|table| {
+            (table.clone(), catalog.search_runs(table).filter_map(|run| run.identity().ok()).collect())
+        }).collect();
+        Self { tries, search }
     }
 
     fn requires(&self, table: &TableRef, key: &TrieKey) -> bool {
-        self.0.get(table).is_some_and(|keys| keys.contains(key))
+        self.tries.get(table).is_some_and(|keys| keys.contains(key))
     }
 }
 
@@ -87,7 +94,10 @@ impl BlockPreparation {
         let mut trie_catalog = self.captured.trie_catalog.as_ref().clone();
         for (table, tries) in tries { trie_catalog = trie_catalog.with_tries(table.clone(), tries.clone(), as_of)?; }
         let catalog = self.table_catalog()?;
-        catalog.tables().iter().map(|(table, meta)| Ok((table.clone(), meta.to_block(trie_catalog.partitions(table)?)?))).collect()
+        catalog.tables().iter().map(|(table, meta)| {
+            let block = meta.to_block(trie_catalog.partitions(table)?)?;
+            Ok((table.clone(), trie_catalog.with_search_manifest(table, block)))
+        }).collect()
     }
 }
 
@@ -116,6 +126,19 @@ impl TrieCollection {
                 && !trie.artefacts.is_empty()
                 && !self.protected(table, &trie.key)
         }).map(|trie| &trie.key)
+    }
+
+    pub fn eligible_search_runs(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &rtdb_format::log::proto::SearchRun> {
+        self.current.trie_catalog().retired_search_runs(table).filter_map(move |retired| {
+            if retired.superseded_at() > as_of.0 { return None; }
+            let run = retired.run.as_ref()?;
+            let id = run.identity().ok()?;
+            let checkpoint = self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.search.get(table));
+            let protected = any_reference_requires(checkpoint.is_some_and(|keys| keys.contains(&id)), self.readers.len(), |reader| {
+                self.readers[reader].search_runs(table).any(|run| run.identity().is_ok_and(|key| key == id))
+            });
+            (!protected).then_some(run)
+        })
     }
 
     fn protected(&self, table: &TableRef, key: &TrieKey) -> bool {
@@ -273,8 +296,12 @@ impl PartitionState {
         Ok(())
     }
     pub fn add_artefacts(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>) {
+        self.add_artefacts_at(table, entries, Timestamp(0));
+    }
+
+    pub fn add_artefacts_at(&self, table: &TableRef, entries: Vec<(TrieKey, rtdb_format::log::proto::ArtefactRecord)>, as_of: Timestamp) {
         let mut value = self.value.write();
-        let trie_catalog = value.trie_catalog.with_artefacts(table, entries);
+        let trie_catalog = value.trie_catalog.with_artefacts_at(table, entries, as_of);
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(trie_catalog);
         *value = Arc::new(next);

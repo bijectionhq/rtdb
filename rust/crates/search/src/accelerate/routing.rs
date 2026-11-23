@@ -8,7 +8,7 @@ use rtdb_types::{MemoryBudget, MemoryReservation, Result, TableRef, TemporalBoun
 
 use crate::{KIND, SearchDefinition, file::{self, PACKED_FORMAT_VERSION, Section, TREE_FORMAT_VERSION, TreeLocator}};
 
-pub(crate) type RoutingKey = (usize, TableRef, String, i64, bool);
+pub(crate) type RoutingKey = (usize, TableRef, String, i64, u8);
 
 pub(crate) struct TableRouting {
     catalog: Weak<TrieCatalog>,
@@ -41,8 +41,8 @@ impl Pack {
 }
 
 impl TableRouting {
-    pub fn key(snapshot: &Snapshot, definition: &SearchDefinition, packs: bool) -> RoutingKey {
-        (Arc::as_ptr(snapshot.trie_catalog_ref()) as usize, definition.table.clone(), definition.name.clone(), definition.version, packs)
+    pub fn key(snapshot: &Snapshot, definition: &SearchDefinition, layout: u8) -> RoutingKey {
+        (Arc::as_ptr(snapshot.trie_catalog_ref()) as usize, definition.table.clone(), definition.name.clone(), definition.version, layout)
     }
 
     pub fn belongs_to(&self, snapshot: &Snapshot) -> bool {
@@ -52,25 +52,33 @@ impl TableRouting {
     pub fn packs(&self) -> impl Iterator<Item = &Arc<Pack>> { self.packs.iter() }
 
     pub fn open(snapshot: &Snapshot, definition: &SearchDefinition, include_packs: bool, budget: Option<&Arc<MemoryBudget>>) -> Result<Self> {
+        let ids: Vec<_> = [PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION].into_iter()
+            .filter(|format| include_packs || *format == TREE_FORMAT_VERSION).map(|format| (definition.artefact_id_for(format), format)).collect();
+        Self::open_formats(snapshot, definition, &ids, budget)
+    }
+
+    pub fn history(snapshot: &Snapshot, definition: &SearchDefinition, budget: Option<&Arc<MemoryBudget>>) -> Result<Self> {
+        Self::open_formats(snapshot, definition, &[(crate::lane::history_id(definition), file::LOGICAL_FORMAT_VERSION)], budget)
+    }
+
+    fn open_formats(snapshot: &Snapshot, definition: &SearchDefinition, ids: &[(String, i32)], budget: Option<&Arc<MemoryBudget>>) -> Result<Self> {
         let mut packs = BTreeMap::<ObjectKey, Pack>::new();
         let mut bytes = 1024usize;
         let mut reservation = budget.map(|budget| budget.reserve(bytes)).transpose()?;
         let table = &definition.table;
         if let Some(entry) = snapshot.table_entry(table) {
-            let ids: Vec<_> = [PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION].into_iter()
-                .filter(|format| include_packs || *format == TREE_FORMAT_VERSION).map(|format| definition.artefact_id_for(format)).collect();
             for trie in snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == rtdb_index::TrieState::Live) {
-                let Some(record) = ids.iter().find_map(|id| trie.artefact(KIND, id, definition.version)) else { continue; };
+                let Some((record, expected)) = ids.iter().find_map(|(id, format)| trie.artefact(KIND, id, definition.version).map(|record| (record, *format))) else { continue; };
                 let Some(stats) = record.stats.as_deref() else { continue; };
                 if let Some(reservation) = &mut reservation {
                     let reservation = Arc::get_mut(reservation).expect("routing construction owns its admission");
-                    let root = if record.definition_id().ends_with("f15") { file::MAX_ROOT_BYTES as usize } else { 0 };
+                    let root = if expected >= PACKED_FORMAT_VERSION { file::MAX_ROOT_BYTES as usize } else { 0 };
                     let peak = bytes.saturating_add(stats.len().saturating_mul(2)).saturating_add(2048).saturating_add(root);
                     if peak > reservation.bytes() { reservation.grow_to(peak)?; }
                 }
                 let Some(locator) = file::decode_tree_locator(stats).filter(|locator| {
                     i64::try_from(locator.length).ok() == record.file_size
-                        && record.definition_id() == definition.artefact_id_for(locator.format())
+                        && locator.format() == expected
                 }) else { continue; };
                 let owner = ArtefactOwner::of(&trie.key, record)?;
                 let Some(member) = owner.tries().iter().position(|key| key == &trie.key) else { continue; };

@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{SearchRow, file::{IndexedRow, SearchPage, artefact_identity, write_versioned_group}, definitions::SearchDefinition};
 use rtdb_maintenance::input::{download, open_input, read_page};
 
+mod logical;
+pub(crate) use logical::{LogicalIndex, history_id, run_identity};
+
 pub const KIND: &str = "search";
 
 /// A partition group's members share one search file while their data files together hold at most this many bytes.
@@ -47,11 +50,12 @@ pub struct SearchBuilder {
     clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>,
     runtime: Arc<crate::SearchRuntime>,
     columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
+    scrubbed: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), [u8; 32]>>,
 }
 
 impl SearchBuilder {
     pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>, runtime: Arc<crate::SearchRuntime>) -> Self {
-        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()) }
+        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), scrubbed: Mutex::new(BTreeMap::new()) }
     }
     async fn search_definitions(&self, partition: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<SearchDefinition>> {
         let now = (self.clock)();
@@ -66,10 +70,43 @@ impl SearchBuilder {
 impl ArtefactBuilder for SearchBuilder {
     fn builds_live_pages(&self) -> bool { true }
 
-    fn prepares_serving_search(&self) -> bool { self.runtime.write_format() == crate::file::PACKED_FORMAT_VERSION }
+    fn prepares_serving_search(&self) -> bool { self.runtime.write_format() >= crate::file::PACKED_FORMAT_VERSION }
+
+    fn journals_search_deltas(&self) -> bool { self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION }
+
+    async fn prepare_search_delta(&self, snapshot: rtdb_index::Snapshot, write: Arc<rtdb_index::StagedWrite>,
+        cancellation: &CancellationToken) -> Result<Option<bytes::Bytes>> {
+        if write.tables().values().all(|table| table.row_count() == 0) { return Ok(None); }
+        let result = async {
+            let definitions = self.runtime.definitions(&self.database, &[snapshot], &self.storage,
+                &self.memory, (self.clock)(), cancellation).await?;
+            let runtime = Arc::clone(&self.runtime);
+            let cancellation = cancellation.clone();
+            tokio::task::spawn_blocking(move || runtime.prepare_delta(&definitions, &write, &cancellation)).await.map_err(fault)?
+        }.await;
+        match result {
+            Err(error) if is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); Ok(None) }
+            result => result,
+        }
+    }
+
+    async fn install_search_delta(&self, snapshot: rtdb_index::Snapshot, write: &rtdb_index::StagedWrite,
+        delta: Option<&[u8]>, cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
+        if !self.journals_search_deltas() { return self.prepare_serving_search(snapshot, cancellation).await; }
+        let delta = delta.filter(|delta| delta.len() <= crate::delta::MAX_BYTES);
+        let reservation = delta.and_then(|bytes| self.memory.reserve(bytes.len()).ok());
+        let delta = delta.filter(|_| reservation.is_some()).map(<[u8]>::to_vec);
+        let runtime = Arc::clone(&self.runtime);
+        let write = write.clone();
+        let cancellation = cancellation.clone();
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            runtime.install_delta(&snapshot, &write, delta.as_deref(), &cancellation).map(Some)
+        }).await.map_err(fault)?
+    }
 
     fn retire_with_owner(&self, record: &ArtefactRecord) -> bool {
-        record.definition_id().ends_with("f15")
+        record.definition_id().ends_with("f15") || record.definition_id().ends_with("f16h")
     }
 
     async fn prepare_serving_search(&self, snapshot: rtdb_index::Snapshot, cancellation: &CancellationToken)
@@ -104,6 +141,14 @@ impl ArtefactBuilder for SearchBuilder {
         };
         let mut records = Vec::new();
         for definition in definitions.into_iter().filter(|definition| &definition.table == table) {
+            if definition.id.ends_with("f16h") {
+                let public = logical::LogicalIndex::from_history(&definition);
+                match self.seal_logical(&public, snapshot, trie, file, size, cancellation).await {
+                    Ok(record) => records.push(record),
+                    Err(error) if is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
+                    Err(error) => return Err(error),
+                }
+            }
             let job = ArtefactJob { definition, owner: ArtefactOwner::Trie(trie.clone()) };
             match self.build(&job, rtdb_maintenance::ArtefactSource::Local { data: file, size }, snapshot, cancellation).await {
                 Ok(record) => records.push(record),
@@ -112,6 +157,14 @@ impl ArtefactBuilder for SearchBuilder {
             }
         }
         Ok(records)
+    }
+
+    async fn maintain_independent(&self, snapshots: &dyn rtdb_maintenance::SnapshotSource, publisher: &dyn rtdb_maintenance::ArtefactPublisher,
+        storage: (rtdb_types::StorageVersion, rtdb_types::StorageEpoch), cancellation: &CancellationToken) -> Result<()> {
+        if self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION {
+            self.refresh_logical(snapshots, publisher, storage, cancellation).await?;
+        }
+        Ok(())
     }
 
     async fn build_live_pages(&self, partition: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<()> {
@@ -136,19 +189,22 @@ impl ArtefactBuilder for SearchBuilder {
         let definitions = self.search_definitions(snapshot, cancellation).await?;
         let mut columns = self.columns.lock();
         Ok(definitions.iter().map(|definition| {
-            let id = definition.artefact_id_for(self.runtime.write_format());
+            let logical = self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION && logical::LogicalIndex::supports(definition);
+            let format = if logical { crate::file::LOGICAL_FORMAT_VERSION } else { self.runtime.write_format().min(crate::file::PACKED_FORMAT_VERSION) };
+            let id = if logical { logical::history_id(definition) } else { definition.artefact_id_for(format) };
             for format in [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION] {
                 columns.insert((definition.table.clone(), definition.artefact_id_for(format), definition.version), definition.columns.clone());
             }
+            columns.insert((definition.table.clone(), logical::history_id(definition), definition.version), definition.columns.clone());
             ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version,
-                historical: definition.history, group_bytes: Some(group_bytes(&self.memory)), packed: self.prepares_serving_search() }
+                historical: definition.history, group_bytes: (!logical).then(|| group_bytes(&self.memory)), packed: self.prepares_serving_search() }
         }).collect())
     }
 
     fn retained_definitions(&self, definitions: &[ArtefactDefinition]) -> Vec<ArtefactDefinition> {
         definitions.iter().flat_map(|definition| {
             let prefix = definition.id.rsplit_once('f').map_or(definition.id.as_str(), |(prefix, _)| prefix);
-            [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION]
+            ["11", "12", "13", "14", "15", "16h"]
                 .map(|format| ArtefactDefinition { id: format!("{prefix}f{format}"), ..definition.clone() })
         }).collect()
     }
@@ -182,8 +238,10 @@ impl ArtefactBuilder for SearchBuilder {
         let definition = &job.definition;
         let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), owner: job.owner.clone(), artefact_id: definition.id.clone(), version: definition.version };
         let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
-        let format = definition.id.rsplit_once('f').and_then(|(_, format)| format.parse::<i32>().ok())
-            .filter(|format| matches!(*format, crate::file::TANTIVY_FORMAT_VERSION | crate::file::LEGACY_FORMAT_VERSION | crate::file::FORMAT_VERSION | crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION))
+        let history = definition.id.ends_with("f16h");
+        let format = definition.id.rsplit_once('f').and_then(|(_, format)| {
+            if history { Some(crate::file::LOGICAL_FORMAT_VERSION) } else { format.parse::<i32>().ok() }
+        }).filter(|format| matches!(*format, crate::file::TANTIVY_FORMAT_VERSION | crate::file::LEGACY_FORMAT_VERSION | crate::file::FORMAT_VERSION | crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION | crate::file::LOGICAL_FORMAT_VERSION))
             .ok_or_else(|| fault("Search artefact definition has an unsupported format"))?;
         let record = |stats: Vec<u8>, size: u64| -> Result<ArtefactRecord> {
             Ok(ArtefactRecord {
@@ -301,12 +359,17 @@ impl ArtefactBuilder for SearchBuilder {
                 let mut rows = PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), owned);
                 rows.uuid_iids.clone_from(&uuid_iids);
                 rows.seal = seal.clone();
+                if history { rows.mode = crate::file::BuildMode::History; }
                 rows
             });
-            let sections = write_versioned_group(&columns, members, &identity, version, ceiling, file, Some(indexing), format)?;
+            let sections = if history {
+                crate::file::write_group_as(&columns, members, &identity, Some(version), ceiling, file, Some(indexing), format, crate::file::BuildMode::History)?
+            } else {
+                write_versioned_group(&columns, members, &identity, version, ceiling, file, Some(indexing), format)?
+            };
             let mut file = std::fs::File::open(output).map_err(fault)?;
             match format {
-                crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION => {
+                crate::file::TREE_FORMAT_VERSION | crate::file::PACKED_FORMAT_VERSION | crate::file::LOGICAL_FORMAT_VERSION => {
                     let canonical = uuid_iids.is_some_and(|proof| proof.load(Ordering::Relaxed));
                     let locator = crate::file::TreeLocator::read(&mut file, format)?.with_uuid_iid_evidence(canonical);
                     crate::file::encode_tree_stats(&sections, &locator)
@@ -334,19 +397,26 @@ fn is_search_gap(error: &Anomaly, cancellation: &CancellationToken) -> bool {
 }
 
 fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
-    seal: Option<&(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>) -> Result<IndexedRow<'a>> {
+    seal: Option<&(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>, mode: crate::file::BuildMode) -> Result<IndexedRow<'a>> {
     let header = event.header();
     let cached = seal.and_then(|(snapshot, segment)| {
         let postings = snapshot.serving_search::<crate::runtime::ServingPostings>()?;
         let row = segment.row_of_version(header.version()).ok().flatten()?;
         Some((postings, segment, row))
     });
-    let values = columns.iter().map(|column| Ok(match event.put_text(column)? {
+    let revisions = if mode == crate::file::BuildMode::Combined { Vec::new() } else {
+        columns.iter().map(|column| Ok(match event.put_text(column)? {
+            PutText::Utf8(text) => Some(logical::text_revision(text)),
+            _ => None,
+        })).collect::<Result<_>>()?
+    };
+    let values = if mode == crate::file::BuildMode::History { Vec::new() } else { columns.iter().map(|column| Ok(match event.put_text(column)? {
         PutText::Missing => None,
+        PutText::Other if mode == crate::file::BuildMode::Postings => None,
         PutText::Utf8(text) => Some(cached.and_then(|(postings, segment, row)| postings.tokens_for_row(segment, column, row))
             .unwrap_or_else(|| rtdb_text::analyze(text))),
         PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
-    })).collect::<Result<_>>()?;
+    })).collect::<Result<_>>()? };
     let key = if with_identity {
         let key = event.physical_entity_key().ok_or_else(|| fault("Owned search event is missing its complete identity"))?;
         let identity = EntityIdRef::from_handle_bytes(key)?;
@@ -358,7 +428,7 @@ fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
         None
     };
     let sql_id = if with_identity { None } else { integer_sql_id(&event) };
-    Ok(IndexedRow { header, key, sql_id, values })
+    Ok(IndexedRow { header, key, sql_id, values, revisions })
 }
 
 fn uuid_id_matches_iid(event: &EventRef<'_>) -> bool {
@@ -386,7 +456,7 @@ pub(crate) fn test_row(row: IndexedRow<'_>) -> Result<SearchRow> {
 
 #[cfg(test)]
 fn search_batch(batch: &EventBatch, columns: &[String], owned: bool) -> Result<Vec<SearchRow>> {
-    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, None).and_then(test_row)).collect()
+    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, None, crate::file::BuildMode::Combined).and_then(test_row)).collect()
 }
 
 pub(crate) struct ArrowSearchPage {
@@ -395,6 +465,7 @@ pub(crate) struct ArrowSearchPage {
     with_identity: bool,
     uuid_iids: Option<Arc<AtomicBool>>,
     seal: Option<(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>,
+    mode: crate::file::BuildMode,
 }
 
 impl SearchPage for ArrowSearchPage {
@@ -407,7 +478,7 @@ impl SearchPage for ArrowSearchPage {
         {
             proof.store(false, Ordering::Relaxed);
         }
-        search_row(event, columns, self.with_identity, self.seal.as_ref())
+        search_row(event, columns, self.with_identity, self.seal.as_ref(), self.mode)
     }
 }
 
@@ -420,12 +491,13 @@ pub(crate) struct PageRows {
     with_identity: bool,
     uuid_iids: Option<Arc<AtomicBool>>,
     seal: Option<(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>,
+    mode: crate::file::BuildMode,
 }
 
 impl PageRows {
     fn new(reader: ArrowFile, opening: Arc<MemoryReservation>, memory: Arc<MemoryBudget>,
            cancellation: CancellationToken, with_identity: bool) -> Self {
-        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity, uuid_iids: None, seal: None }
+        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity, uuid_iids: None, seal: None, mode: crate::file::BuildMode::Combined }
     }
 }
 
@@ -441,7 +513,7 @@ impl Iterator for PageRows {
         self.page += 1;
         Some(read_page(&mut self.reader, page, &self.memory).and_then(|owned| {
             let events = EventBatch::new(owned.batch().clone())?;
-            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone(), seal: self.seal.clone() })
+            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone(), seal: self.seal.clone(), mode: self.mode })
         }))
     }
 }

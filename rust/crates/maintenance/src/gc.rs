@@ -6,14 +6,14 @@ use futures::{StreamExt, stream};
 use rtdb_format::{
     catalog::{BlockCatalog, TableEntry},
     keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key},
-    log::proto::PublishedObjectVersion,
+    log::proto::{ArtefactEntry, ArtefactsRemoved, PublishedObjectVersion, SearchRunChange},
 };
 use rtdb_index::{PartitionState, TrieCatalog};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, Result, TableRef, Timestamp};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use crate::{CycleWorker, SnapshotSource, TrieDeletionPublisher};
+use crate::{ArtefactPublisher, CycleWorker, SnapshotSource, TrieDeletionPublisher};
 use crate::retirement_intent::{self, FileRelease, PendingRetirement};
 
 #[derive(Clone, Debug)]
@@ -70,6 +70,8 @@ pub struct TrieCollector {
     clock: CollectorClock,
     /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
     first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
+    first_search_observed: Mutex<BTreeMap<(TableRef, [u8; 32]), i64>>,
+    search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     store: Arc<dyn ObjectStore>,
     partition: Arc<PartitionState>,
     publisher: Arc<dyn TrieDeletionPublisher>,
@@ -81,7 +83,13 @@ impl TrieCollector {
     pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
-        Ok(Self { clock, first_observed: Mutex::default(), store, partition, publisher, observer, config })
+        Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), search: None,
+            store, partition, publisher, observer, config })
+    }
+
+    pub fn with_search(mut self, publisher: Arc<dyn ArtefactPublisher>, version: rtdb_types::StorageVersion, epoch: rtdb_types::StorageEpoch) -> Self {
+        self.search = Some((publisher, version, epoch));
+        self
     }
 
     /// Keeps the eligible tries whose reader lease has elapsed since this collector first observed them.
@@ -145,7 +153,8 @@ impl TrieCollector {
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection.clone(), async {
                     self.collect_table(&entry, &keys, &groups, cut, collection.current().trie_catalog(), &release).await?;
-                    self.collect_search_seals(&entry, &seals, cut, cancellation).await
+                    self.collect_search_seals(&entry, &seals, cut, cancellation).await?;
+                    self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await
                 }).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
@@ -165,7 +174,41 @@ impl TrieCollector {
         for object in self.store.list(Some(&prefix)).await? {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let Some((ArtefactOwner::Trie(owner), kind, id, _)) = entry.slug.parse_artefact_key(object.key.as_str()) else { continue; };
-            if seals.contains(&owner) && kind == "search" && id.ends_with("f15") { self.store.delete(&object.key).await?; }
+            if seals.contains(&owner) && kind == "search" && (id.ends_with("f15") || id.ends_with("f16h")) {
+                self.store.delete(&object.key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn collect_search_runs(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection, as_of: Timestamp,
+        cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
+        let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
+        let lease = self.config.reader_lease_micros()?;
+        let now = (self.clock)();
+        let eligible: BTreeMap<_, _> = collection.eligible_search_runs(&entry.table, as_of)
+            .filter_map(|run| run.identity().ok().map(|id| (id, run))).collect();
+        let waiting = {
+            let mut first = self.first_search_observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            first.retain(|(table, digest), _| table != &entry.table || eligible.contains_key(digest));
+            eligible.into_iter().filter_map(|(digest, run)| {
+                let first = *first.entry((entry.table.clone(), digest)).or_insert(now);
+                rtdb_storage::read_lease::collection_waited(first, lease, now).then_some(run)
+            }).collect::<Vec<_>>()
+        };
+        let mut entries = Vec::new();
+        for run in waiting {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let key = ObjectKey::new(run.object_key(&entry.slug)?)?;
+            if !self.store.release_search_run(&key, run.publication.as_ref(), cut).await? { continue; }
+            let trie_key = TrieKey::l0(rtdb_types::BlockIndex(run.blocks[0]))?.to_string();
+            let record = SearchRunChange { run: Some(run.clone()), retire_only: Some(true), ..Default::default() }.to_artefact()?;
+            entries.push(ArtefactEntry { trie_key: Some(trie_key), record: Some(record) });
+            if entries.len() >= self.config.chunk_size { break; }
+        }
+        if !entries.is_empty() {
+            publisher.remove(ArtefactsRemoved { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
+                table_name: Some(entry.table.schema_and_table()), entries, source_msg_id: None }).await?;
         }
         Ok(())
     }

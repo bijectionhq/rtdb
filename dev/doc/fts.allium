@@ -111,6 +111,7 @@ entity SearchJob {
 config {
     -- See: server config `search: {enabled, threads, writeFormat}` and NodeOptions.
     -- The configured format determines which files new jobs write.
+    -- Format 16 gives each public history-enabled definition a manifest of logical posting runs.
     write_format: Integer = 11
     -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
     enabled: Boolean = true
@@ -168,6 +169,13 @@ rule SearchJobRuns {
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
     -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
+    -- A format 16 writer seals a posting run over the table's original block extent and a history file over the block's primary Arrow locations.
+    -- A run nominates an entity and text revision for a field, with terms and positions established by that definition's analyzer.
+    -- A primary rewrite replaces the corresponding history locations while preserving the text revision's posting coverage.
+    -- Replacement posting runs cover the exact union of the active receipts they supersede.
+    -- The lane removes postings whose contributing events all precede an erase and retains postings with surviving later events.
+    -- A scan admits logical negative evidence only with complete durable source coverage at its pinned basis.
+    -- Ranked search and explicit entity point reads can resolve the same complete temporal history.
     when: job: SearchJob.created
 
     ensures:
@@ -186,6 +194,9 @@ rule RetireSearchFiles {
     -- GC collects an artefact under a retired trie or under a group with no remaining members.
     -- A format 15 file and every superseded singleton stay available to pinned readers.
     -- Sealed level-0 search files retire once their trie is obsolete in the checkpoint and all reader holds have expired.
+    -- A format 16 run retires on ordered replacement or when its definition leaves force.
+    -- An ordered upload receipt for a rejected replacement is itself eligible for retirement.
+    -- Collection waits for active catalog captures, the latest recovery checkpoint, and the reader lease before releasing a retired run.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
     -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
     when: DefinitionsInForceChanged(table)
@@ -203,6 +214,7 @@ rule RepairUnreadableSearchFile {
     -- If the group build finds an original member's data file missing and the catalog has superseded or collected that member, the lane builds a file for each remaining live member that still needs one.
     -- A single ArtefactsAdded message replaces the shared records after the new files have been uploaded.
     -- A report is dropped when no live member still records that search file or the definition has left force.
+    -- A damaged format 16 run with readable source inputs is repaired by ordered publication of a new immutable run over the same extents.
     when: SearchFileUnreadable(table, owner, definition)
 
     ensures:

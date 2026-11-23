@@ -97,6 +97,7 @@ impl ShardValue {
 struct TableTries {
     shards: BTreeMap<Shard, ShardValue>,
     l1h_recencies: BTreeMap<BlockIndex, BTreeSet<CivilDate>>,
+    search: std::sync::Arc<crate::search_manifest::SearchManifest>,
 }
 
 impl TableTries {
@@ -232,10 +233,38 @@ impl TrieCatalog {
     pub fn garbage_tries(&self, table: &TableRef, as_of: Timestamp) -> Vec<&CatalogTrie> {
         self.all_tries(table).into_iter().filter(|trie| trie.key.level() != 0 && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)).collect()
     }
+    pub fn search_runs(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::SearchRun> {
+        self.tables.get(table).into_iter().flat_map(|state| state.search.active())
+    }
+    pub fn retired_search_runs(&self, table: &TableRef) -> impl Iterator<Item = &log_pb::RetiredSearchRun> {
+        self.tables.get(table).into_iter().flat_map(|state| state.search.retired())
+    }
+
+    pub fn with_search_manifest(&self, table: &TableRef, block: TableBlock) -> TableBlock {
+        block.with_search_runs(self.search_runs(table).cloned().collect(), self.retired_search_runs(table).cloned().collect())
+    }
+
+    pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
+        let Ok(change) = log_pb::SearchRunChange::from_artefact(record) else { return false; };
+        let Some(run) = &change.run else { return false; };
+        run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some()))
+    }
+
     pub fn with_tries(&self, table: TableRef, tries: impl IntoIterator<Item = CatalogTrie>, as_of: Timestamp) -> Result<Self> {
         let mut next = self.clone();
         let state = next.tables.entry(table).or_default();
-        for trie in tries { state.apply(trie, self.file_size_target, as_of)?; }
+        for mut trie in tries {
+            trie.artefacts.retain(|record| {
+                if record.kind() != rtdb_format::search_manifest::RECORD_KIND { return true; }
+                if trie.key.level() == 0 && let Ok(change) = log_pb::SearchRunChange::from_artefact(record)
+                    && !change.retire_only() && change.replaces.is_empty()
+                    && change.run.as_ref().is_some_and(|run| run.blocks == [trie.key.block_index().0]) {
+                    std::sync::Arc::make_mut(&mut state.search).apply_uploaded(change, as_of);
+                }
+                false
+            });
+            state.apply(trie, self.file_size_target, as_of)?;
+        }
         Ok(next)
     }
     pub fn without_tries(&self, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Self {
@@ -254,9 +283,20 @@ impl TrieCatalog {
     }
     /// Keeps the first record for each definition version, except when a live trie replaces its obsolete group's record with its own.
     pub fn with_artefacts(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>) -> Self {
+        self.with_artefacts_at(table, entries, Timestamp(0))
+    }
+
+    pub fn with_artefacts_at(&self, table: &TableRef, entries: impl IntoIterator<Item = (TrieKey, log_pb::ArtefactRecord)>, as_of: Timestamp) -> Self {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
+                if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
+                    if key.level() == 0 && self.accepts_search_run(table, &record)
+                        && let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) {
+                        std::sync::Arc::make_mut(&mut state.search).apply_uploaded(change, as_of);
+                    }
+                    continue;
+                }
                 let Ok(owner) = rtdb_format::keys::ArtefactOwner::of(&key, &record) else { continue; };
                 let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
                 let (kind, id, version) = (record.kind(), record.definition_id(), record.definition_version());
@@ -287,6 +327,13 @@ impl TrieCatalog {
         let mut next = self.clone();
         if let Some(state) = next.tables.get_mut(table) {
             for (key, record) in entries {
+                if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
+                    if let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) && change.retire_only()
+                        && let Some(run) = change.run {
+                        std::sync::Arc::make_mut(&mut state.search).forget(&run);
+                    }
+                    continue;
+                }
                 let Some(trie) = state.shards.get_mut(&Shard::of(&key)).and_then(|shard| shard.tries.get_mut(&key.block_index())).filter(|trie| trie.key == key) else { continue };
                 trie.artefacts.retain(|held| (held.kind(), held.definition_id(), held.definition_version()) != (record.kind(), record.definition_id(), record.definition_version()));
             }
@@ -299,6 +346,7 @@ impl TrieCatalog {
         next.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
         for (table, tries) in replacements {
             let mut state = TableTries::default();
+            if let Some(previous) = self.tables.get(&table) { state.search = previous.search.clone(); }
             let mut shard = ShardValue::default();
             for mut trie in tries {
                 if Shard::of(&trie.key) != Shard::root(0, None) { return Err(invalid("Reset accepts only unpartitioned L0 tries")); }
@@ -330,6 +378,7 @@ impl TrieCatalog {
             }
         }
         for (table, old) in &self.tables {
+            primary.tables.entry(table.clone()).or_default().search = std::sync::Arc::clone(&old.search);
             for (shard, old) in old.shards.iter().filter(|(shard, _)| shard.level == 0) {
                 let new = primary.tables.entry(table.clone()).or_default().shards.entry(shard.clone()).or_default();
                 new.max_block_index = new.max_block_index.max(old.max_block_index);
@@ -374,6 +423,8 @@ impl TrieCatalog {
             }
             let reconstruct_watermarks = partitions.first().is_some_and(|partition| partition.max_block_index.is_none());
             let mut state = TableTries::default();
+            let wire = blocks[&table].as_proto();
+            state.search = std::sync::Arc::new(crate::search_manifest::SearchManifest::load(&wire.search_runs, &wire.retired_search_runs)?);
             for partition in partitions {
                 let shard = decode_shard(&partition)?;
                 let mut value = ShardValue::default();

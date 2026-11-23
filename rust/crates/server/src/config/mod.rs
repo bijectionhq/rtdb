@@ -259,7 +259,8 @@ fn search(value: Option<Yaml>) -> Result<SearchSettings> {
         13 => rtdb_node::SearchFileFormat::Paged,
         14 => rtdb_node::SearchFileFormat::Tree,
         15 => rtdb_node::SearchFileFormat::Packed,
-        _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.config/search-format", "search.writeFormat must be 11, 12, 13, 14, or 15")),
+        16 => rtdb_node::SearchFileFormat::Logical,
+        _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.config/search-format", "search.writeFormat must be between 11 and 16")),
     };
     let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true),
         threads: positive(fields.integer("threads")?.unwrap_or(1) as i64, "threads")?, write_format };

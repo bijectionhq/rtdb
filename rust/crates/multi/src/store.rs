@@ -1106,6 +1106,10 @@ impl ObjectStore for EncryptingStore {
         }
         self.inner.release_trie_files(receipt, contents).await
     }
+    async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
+        self.inner.release_search_run(key, publication, cut).await
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await.and_then(plain) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await.and_then(plain) }
     async fn observe_head(&self, key: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
@@ -1339,7 +1343,6 @@ impl GarbageStore {
         }).await?;
         Ok(())
     }
-
     async fn write_release(&self, key: &ObjectKey, trie_floor: Option<CatalogAdmissionFloor>, version: Option<&PhysicalObjectVersion>) -> rtdb_storage::Result<()> {
         self.write_release_record(key, trie_floor, version, None, None).await
     }
@@ -1369,6 +1372,7 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 }
 
 fn is_collected_trie_file(key: &str) -> bool {
+    if rtdb_format::search_manifest::is_run_key(key) { return true; }
     let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
     name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
         .and_then(|file| file.strip_suffix(".arrow"))
@@ -1437,6 +1441,22 @@ impl ObjectStore for GarbageStore {
             self.write_release_record(&ObjectKey::new(&file.key)?, Some(floor.clone()), version, None, file.terminal_publication.as_ref()).await?;
         }
         Ok(())
+    }
+    async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
+        let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
+        let Some(cut) = cut else { return Ok(false); };
+        if !readers.advance(cut).await? { return Ok(false); }
+        let floor = readers.trie_release_floor(cut).await?;
+        let terminal = published.and_then(rtdb_format::log::proto::PublishedObjectVersion::terminal_publication);
+        let version = self.retirement_version(key).await?.filter(|version| published.is_some_and(|published| {
+            *published == rtdb_format::log::proto::PublishedObjectVersion::from(version.clone())
+        }));
+        if version.is_none() && terminal.is_none() {
+            return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
+        }
+        self.write_release_record(key, Some(floor), version.as_ref(), None, terminal.as_ref()).await?;
+        Ok(true)
     }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }

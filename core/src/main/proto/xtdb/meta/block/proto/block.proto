@@ -32,6 +32,8 @@ message TableBlock {
     repeated Partition partitions = 5;
     // keyed by the Arrow field name a column's data is written under, as `arrow_schema` is.
     map<string, xtdb.cols.proto.ColumnMeta> columns = 6;
+    repeated xtdb.log.proto.SearchRun search_runs = 7;
+    repeated xtdb.log.proto.RetiredSearchRun retired_search_runs = 8;
 }
 
 message TxKey {

@@ -166,6 +166,15 @@ pub trait ObjectStore: Send + Sync {
     async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<()> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
+    async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        if self.defers_trie_releases() {
+            let Some(cut) = cut else { return Ok(false); };
+            if !self.advance_catalog_floor(cut).await? { return Ok(false); }
+        }
+        self.delete(key).await?;
+        Ok(true)
+    }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
     /// Reads current metadata for the key from the backing provider.
     /// The default is suitable when `head` already obtains current provider metadata.

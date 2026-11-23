@@ -317,6 +317,8 @@ rule TrieGcLoopRunsCycle {
 
 rule GarbageCollectTries {
     -- Run one cycle: collect garbage from every table in the table catalog.
+    -- The same cycle releases superseded logical search runs once the current checkpoint and all admitted readers have moved past their receipts and the collection lease has elapsed.
+    -- Hosted release binds the provider publication to a catalog floor before acknowledgement.
     -- Tables are processed concurrently up to `tableParallelism`, with DELETE
     -- operations bounded across the cycle by `deleteParallelism`. Both bounds
     -- are out-of-spec implementation parameters (see TrieGarbageCollector.kt).

@@ -15,6 +15,7 @@ When `CREATE SEARCH INDEX IF NOT EXISTS` finds an existing definition at its ord
 The node configuration's `search: {enabled, threads}` switches the lane and the scan accelerator together.
 The server option `search: {writeFormat: 14}` selects the bounded Arrow layout for newly built files.
 The option `search: {writeFormat: 15}` adds snapshot-native search packs and commit-time serving postings.
+The option `search: {writeFormat: 16}` adds independent Arrow posting runs for public history-enabled indexes and resolves their candidates through the pinned primary history.
 The server defaults to format 11.
 Upgrade all readers and maintenance lanes sharing the database before enabling Arrow writes.
 

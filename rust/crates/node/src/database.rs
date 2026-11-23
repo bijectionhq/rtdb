@@ -421,6 +421,18 @@ impl rtdb_replication::ServingSearchBuilder for PrepareSearch {
         self.0.prepare_serving_search(snapshot, cancellation).await
     }
 
+    fn journals_deltas(&self) -> bool { self.0.journals_search_deltas() }
+
+    async fn prepare_delta(&self, snapshot: rtdb_index::Snapshot, write: Arc<rtdb_index::StagedWrite>, cancellation: &CancellationToken)
+        -> Result<Option<bytes::Bytes>> {
+        self.0.prepare_search_delta(snapshot, write, cancellation).await
+    }
+
+    async fn install_delta(&self, snapshot: rtdb_index::Snapshot, write: &rtdb_index::StagedWrite, delta: Option<&[u8]>, cancellation: &CancellationToken)
+        -> Result<Option<rtdb_index::ServingSearch>> {
+        self.0.install_search_delta(snapshot, write, delta, cancellation).await
+    }
+
     async fn seal(&self, value: &Arc<rtdb_index::PartitionValue>, table: &rtdb_types::TableRef, trie: &TrieKey,
         file: &std::path::Path, size: u64, cancellation: &CancellationToken) -> Result<Vec<rtdb_format::log::proto::ArtefactRecord>> {
         self.0.seal_serving_search(value, table, trie, file, size, cancellation).await
@@ -549,10 +561,11 @@ impl MaintenanceSupervisor {
     async fn start_term(&mut self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
+        let artefacts = Arc::new(PublishArtefacts { replication: self.replication.clone(), cancellation: cancellation.clone() });
         let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.partition), publisher, Arc::clone(&self.observer), self.options.garbage.clone(), {
             let clock = Arc::clone(&self.clock);
             Arc::new(move || clock.monotonic_micros())
-        })?);
+        })?.with_search(artefacts, self.logs.storage_version, self.logs.storage_epoch));
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), self.partition.clone(), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;

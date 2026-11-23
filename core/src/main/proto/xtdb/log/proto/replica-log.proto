@@ -57,6 +57,7 @@ message ResolvedTx {
     // The two coordinates checked by a strict writer before staging this
     // committed attempt. Both travel with its effect through journal recovery.
     AcceptanceStage acceptance_stage = 11;
+    bytes search_delta = 12;
 }
 
 message AcceptanceStage {

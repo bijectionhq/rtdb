@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{PartitionLogs, ReplicaMetadata, ReplicationClock, progress::term_ended};
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
-pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>), Message(ReplicaBody) }
+pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>, Option<bytes::Bytes>), Message(ReplicaBody) }
 #[derive(Clone, Debug)]
 pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Control, TrieRemoval(ReplicaPosition) }
 
@@ -31,7 +31,7 @@ pub(crate) struct PendingWrite {
 }
 impl PendingWrite {
     pub fn new(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let extra = match &body { WriteBody::Resolved(_) => 1024, WriteBody::Message(body) => Self::message_bound(body)? };
+        let extra = match &body { WriteBody::Resolved(..) => 1024, WriteBody::Message(body) => Self::message_bound(body)? };
         Ok(Self::reserved(body, block, completion, memory.reserve(extra)?))
     }
     pub fn clone_message(body: &ReplicaBody, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
@@ -48,7 +48,7 @@ impl PendingWrite {
     pub fn append_stamp(&self) -> Option<&AppendStamp> { self.append.get() }
     pub fn sequence(&self) -> Option<TermSequence> { self.append_stamp().map(|stamp| stamp.sequence) }
     fn stamp_append(&self, sequence: TermSequence, frame: &[u8]) -> Result<()> {
-        let fingerprint = matches!(&self.body, WriteBody::Resolved(_)).then(|| fingerprint(frame));
+        let fingerprint = matches!(&self.body, WriteBody::Resolved(..)).then(|| fingerprint(frame));
         self.append.set(AppendStamp { sequence, fingerprint })
             .map_err(|_| Anomaly::fault("rtdb.replication/invalid-transition", "Pending replica write was submitted twice"))
     }
@@ -121,7 +121,7 @@ impl ReplicaAppender {
     }
     fn durable_commit_observation(&self, body: &WriteBody) -> Option<DurableCommitObservation> {
         let observer = self.durable_commit_observer.as_ref()?;
-        let WriteBody::Resolved(tx) = body else { return None; };
+        let WriteBody::Resolved(tx, _) = body else { return None; };
         (tx.result().committed() && tx.placed_attempt().is_some()).then(|| DurableCommitObservation {
             ordered_at: tx.result().tx_key().system_time,
             staging_clock_upper: tx.staging_clock_upper(),
@@ -164,7 +164,7 @@ impl ReplicaAppender {
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let resolved;
                     let (body, allow_offload) = match &request.write.body {
-                        WriteBody::Resolved(tx) => match tx.inline_replica_body() {
+                        WriteBody::Resolved(tx, _) => match tx.inline_replica_body() {
                             Some(body) => (body, false),
                             None => match tx.to_replica_body(&self.memory) {
                                 Ok(body) => { resolved = body; (resolved.body(), true) }
@@ -175,10 +175,17 @@ impl ReplicaAppender {
                     };
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
-                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
+                    let mut envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
+                    let _search_copy = if let WriteBody::Resolved(_, Some(delta)) = &request.write.body
+                        && let ReplicaBody::ResolvedTx(tx) = &mut envelope.message
+                        && tx.acceptance_stage.is_none()
+                        && let Ok(charge) = self.memory.reserve(delta.len().saturating_mul(8)) {
+                        tx.search_delta = Some(delta.to_vec());
+                        Some(charge)
+                    } else { None };
                     let guarded = matches!(&envelope.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some());
                     let journal_before = match &request.write.body {
-                        WriteBody::Resolved(tx) => tx.journal_before(),
+                        WriteBody::Resolved(tx, _) => tx.journal_before(),
                         WriteBody::Message(_) => None,
                     };
                     let observation = self.durable_commit_observation(&request.write.body);

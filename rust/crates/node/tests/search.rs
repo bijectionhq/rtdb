@@ -1574,3 +1574,106 @@ async fn packed_search_preserves_rank_across_commit_flush_correction_and_restart
         tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
     }
 }
+
+#[tokio::test]
+async fn logical_postings_survive_compaction_while_pinned_history_keeps_its_payload() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use tokio_util::sync::CancellationToken;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut settings = options();
+    settings.automatic_artefacts = false;
+    settings.automatic_gc = false;
+    settings.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: path("store"), epoch: Some(0) })),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let template = services();
+    let ranked = "SELECT _id, body, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, '\"audit report\"') ORDER BY score DESC, _id ASC LIMIT 1";
+    let oracle = "SELECT _id, body, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, '\"audit report\"') OR _id = -99 ORDER BY score DESC, _id ASC LIMIT 1";
+    let point = "SELECT body FROM docs WHERE _id = 1";
+    let table = TableRef::new("public", "docs");
+    let stop = CancellationToken::new();
+    for restart in [false, true] {
+        let runtime = rtdb_search::SearchRuntime::with_logical_search(64 << 20);
+        let services = NodeServices {
+            resources: Arc::new(NativeResources::default().with_local_log_clock(Arc::clone(&template.clock), false)),
+            artefact_kinds: vec![runtime.artefacts()],
+            scan_accelerators: vec![runtime.accelerator()],
+            ..template.clone()
+        };
+        let (node, driver) = Node::open(settings.clone(), services).await.unwrap();
+        let driver = tokio::spawn(driver.run());
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+        if !restart {
+            for statement in [
+                "CREATE SEARCH INDEX docs_body ON docs (body)",
+                "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report report', marks: 1}, {_id: 2, body: 'audit report'}, {_id: 3, body: 42}",
+            ] {
+                assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
+            }
+            let before = rows(session.query_sql(oracle, vec![]).await.unwrap()).await;
+            assert_eq!(before[0][0], Value::I64(1));
+            assert_eq!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await, before);
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+            let pinned = session.query_sql(ranked, vec![]).await.unwrap();
+            let old_catalog = database.trie_catalog();
+            assert_eq!(old_catalog.search_runs(&table).count(), 1);
+            for statement in [
+                "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report report', marks: 2}",
+                "INSERT INTO docs RECORDS {_id: 1, body: 'corrected text', marks: 3}",
+            ] {
+                assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
+            }
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+            assert_eq!(database.trie_catalog().search_runs(&table).count(), 2);
+            database.build_artefacts().await.unwrap();
+            let merged = database.trie_catalog();
+            assert_eq!(merged.search_runs(&table).count(), 1);
+            assert_eq!(merged.retired_search_runs(&table).count(), 2);
+            assert_eq!(merged.search_runs(&table).next().unwrap().blocks.len(), 2);
+            database.compaction().unwrap().compact_all().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+            database.build_artefacts().await.unwrap();
+            assert!(database.trie_catalog().search_runs(&table).eq(merged.search_runs(&table)));
+            assert_eq!(rows(pinned).await, before);
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+        }
+        assert_eq!(database.trie_catalog().search_runs(&table).count(), 1);
+        let expected = rows(session.query_sql(oracle, vec![]).await.unwrap()).await;
+        assert_eq!(expected[0][0], Value::I64(2));
+        let reads = runtime.logical_run_reads();
+        assert_eq!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await, expected);
+        assert!(runtime.logical_run_reads() > reads, "ranking must consume logical runs after primary compaction and recovery");
+        assert_eq!(rows(session.query_sql(point, vec![]).await.unwrap()).await, vec![vec![Value::Utf8("corrected text".into())]]);
+        assert_eq!(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'audit')", vec![]).await.unwrap()).await,
+            vec![vec![Value::I64(2)]]);
+        if restart {
+            let before_erase = database.trie_catalog();
+            assert!(session.state_mut().execute_tx(vec![sql("ERASE FROM docs WHERE _id = 2")],
+                AutonomousTxOptions::default()).await.unwrap().committed());
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+            database.build_artefacts().await.unwrap();
+            let erased = database.trie_catalog();
+            assert!(erased.search_runs(&table).any(|run| run.has_erases()));
+            assert!(erased.retired_search_runs(&table).count() > before_erase.retired_search_runs(&table).count());
+            assert!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await.is_empty());
+            assert!(session.state_mut().execute_tx(vec![sql("INSERT INTO docs RECORDS {_id: 2, body: 'audit report'}")],
+                AutonomousTxOptions::default()).await.unwrap().committed());
+            assert_eq!(rows(session.query_sql(ranked, vec![]).await.unwrap()).await, expected);
+        }
+        node.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+    }
+}

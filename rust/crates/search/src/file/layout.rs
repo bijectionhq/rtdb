@@ -38,13 +38,17 @@ pub(super) enum Table {
     RankNodes,
     Versions,
     Routes,
+    TextRevisions,
+    TokenSequences,
+    Erases,
 }
 
 impl Table {
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 24] = [
         Self::Header, Self::Columns, Self::Members, Self::Pages, Self::Events,
         Self::Runs, Self::RowRuns, Self::Sections, Self::Terms, Self::Postings,
         Self::Windows, Self::Blocks, Self::Frequencies, Self::Positions, Self::Directory, Self::Root, Self::ImpactIds, Self::Synopsis, Self::RankNodes, Self::Versions, Self::Routes,
+        Self::TextRevisions, Self::TokenSequences, Self::Erases,
     ];
 
     fn field(self) -> Field {
@@ -132,12 +136,22 @@ impl Table {
                 ("offset", T::UInt64, false), ("metadata", T::UInt32, false), ("body", T::UInt64, false),
                 ("digest", T::FixedSizeBinary(32), false),
             ])),
+            Self::TextRevisions => ("text_revisions", fields([("digests", list_type(T::FixedSizeBinary(33)), false)])),
+            Self::TokenSequences => ("token_sequences", fields([
+                ("column", T::UInt32, false), ("revision", T::FixedSizeBinary(32), false),
+                ("tokens", list_type(T::Utf8), false),
+                ("system_from", T::Int64, false), ("commit_position", T::UInt32, false),
+            ])),
+            Self::Erases => ("erases", fields([
+                ("iid", T::FixedSizeBinary(16), false),
+                ("system_from", T::Int64, false), ("commit_position", T::UInt32, false),
+            ])),
         };
         Field::new(name, list_type(T::Struct(fields)), false)
     }
 
     pub(super) fn fields(self) -> Fields {
-        let T::LargeList(item) = schema(super::PACKED_FORMAT_VERSION).field(self as usize).data_type().clone() else { unreachable!() };
+        let T::LargeList(item) = schema(super::LOGICAL_FORMAT_VERSION).field(self as usize).data_type().clone() else { unreachable!() };
         let T::Struct(fields) = item.data_type() else { unreachable!() };
         fields.clone()
     }
@@ -166,6 +180,7 @@ fn tables(format: i32) -> &'static [Table] {
         LEGACY_FORMAT_VERSION => &Table::ALL[..10],
         FORMAT_VERSION => &Table::ALL[..14],
         super::TREE_FORMAT_VERSION => &Table::ALL[..19],
+        super::PACKED_FORMAT_VERSION => &Table::ALL[..21],
         _ => &Table::ALL,
     }
 }
@@ -174,11 +189,13 @@ pub(super) fn schema(format: i32) -> &'static SchemaRef {
     static LEGACY: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(LEGACY_FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
     static PAGED: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
     static TREE: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(super::TREE_FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
-    static PACKED: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(Table::ALL.map(Table::field).to_vec())));
+    static PACKED: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tables(super::PACKED_FORMAT_VERSION).iter().copied().map(Table::field).collect::<Vec<_>>())));
+    static LOGICAL: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(Table::ALL.map(Table::field).to_vec())));
     match format {
         LEGACY_FORMAT_VERSION => &LEGACY,
         FORMAT_VERSION => &PAGED,
         super::PACKED_FORMAT_VERSION => &PACKED,
+        super::LOGICAL_FORMAT_VERSION => &LOGICAL,
         _ => &TREE,
     }
 }

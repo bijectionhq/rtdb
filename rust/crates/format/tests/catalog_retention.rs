@@ -34,6 +34,25 @@ fn table_block_clones_keep_the_decoded_schema_charged() {
 }
 
 #[test]
+fn replay_checkpoint_lists_active_search_roots_alongside_primary_closure() {
+    use rtdb_format::{catalog::CheckpointContents, keys::TableSlug, log::proto::{RetiredSearchRun, SearchRun}};
+
+    let slug = TableSlug::recorded("public$example").unwrap();
+    let run = |id| SearchRun { definition_id: Some("examplef16".into()), definition_version: Some(3), blocks: vec![0],
+        digest: Some(vec![id; 32]), file_size: Some(100), locator: Some(vec![1]), source_rows: Some(1), ..Default::default() };
+    let active = run(5);
+    let retired = RetiredSearchRun { run: Some(run(6)), superseded_at: Some(8) };
+    let block = TableBlock::from_parts(Default::default(), &Default::default(), 0, Vec::new()).unwrap()
+        .with_search_runs(vec![active.clone()], vec![retired.clone()]);
+    let block = TableBlock::decode(&block.encode()).unwrap();
+    assert_eq!(block.as_proto().search_runs, [active.clone()]);
+    assert_eq!(block.as_proto().retired_search_runs, [retired]);
+    let replay = block.checkpoint_trie_files(&slug, CheckpointContents::Replay).unwrap();
+    assert_eq!(replay.into_iter().collect::<Vec<_>>(), [active.object_key(&slug).unwrap()]);
+    assert!(block.checkpoint_trie_files(&slug, CheckpointContents::Primary).unwrap().is_empty());
+}
+
+#[test]
 fn a_table_block_manifest_covers_exactly_the_recorded_oids() {
     let table = TableEntry::new(16_384, TableRef::new("public", "example")).unwrap();
     let legacy = proto::Block { tables: vec![table.to_proto()], ..Default::default() };

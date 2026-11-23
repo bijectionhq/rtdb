@@ -203,8 +203,9 @@ async fn main() {
         return;
     }
     #[cfg(feature = "fts-experiments")]
-    if workload == "ranked-sql" || workload == "ranked-pack" {
-        same_files::run_ranked_sql(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap(), workload == "ranked-pack").await;
+    if matches!(workload.as_str(), "ranked-sql" | "ranked-pack" | "ranked-logical") {
+        let format = match workload.as_str() { "ranked-logical" => 16, "ranked-pack" => 15, _ => 14 };
+        same_files::run_ranked_sql(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap(), format).await;
         return;
     }
     #[cfg(feature = "fts-experiments")]
