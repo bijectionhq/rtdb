@@ -119,8 +119,8 @@ impl CellStorage {
             CellStorage::S3 { config } => {
                 let root = config.cell_root()?;
                 let remotes = std::collections::BTreeMap::<String, rtdb_s3::S3Credentials>::new();
-                if audience { Ok(config.open_audience_cell(&root, &remotes, io).await?) }
-                else { Ok(config.open_cell(&root, &remotes, io).await?) }
+                if audience { Ok(Box::pin(config.open_audience_cell(&root, &remotes, io)).await?) }
+                else { Ok(Box::pin(config.open_cell(&root, &remotes, io)).await?) }
             }
         }
     }
@@ -244,6 +244,8 @@ pub struct LogkeeperLogConfig {
     pub epoch: u64,
     #[serde(default)]
     pub require_read_index: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub placed_receipt_retirement: bool,
     /// A snapshot reader's checkpoint: its logs end there and never advance, so it reads no logkeeper.
     #[serde(default)]
     pub frozen_at: Option<rtdb_directory::Checkpoint>,
@@ -253,7 +255,15 @@ pub struct LogkeeperLogConfig {
     /// Inclusive original intake position consumed before a transferred target may write.
     #[serde(default)]
     pub transferred_source_through: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_intake_cut: Option<TransferIntakeCut>,
     pub write_quorum: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferIntakeCut {
+    pub replica_through: i64,
+    pub source_through: i64,
 }
 
 pub fn write_quorum(ensemble: usize) -> usize { ensemble / 2 + 1 }
@@ -320,10 +330,15 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
         replica_seal_scope: record.replica_seal_scope(),
         epoch: record.epoch,
         require_read_index: record.linearizable_reads && matches!(role, Role::Subscriber | Role::Compactor),
+        placed_receipt_retirement: record.placed_receipt_retirement,
         log_epoch: record.log_epoch,
         transferred_source_through: record.checkpoint_transfer_activation.as_deref().map(|activation| {
             let terminal = activation.replica.bootstrap.terminal.source_through;
             record.checkpoint.map_or(terminal, |checkpoint| terminal.max(checkpoint.source))
+        }),
+        transfer_intake_cut: record.checkpoint_transfer_activation.as_deref().map(|activation| {
+            let terminal = &activation.replica.bootstrap.terminal;
+            TransferIntakeCut { replica_through: terminal.replica_through, source_through: terminal.source_through }
         }),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
         previous_servers,

@@ -48,6 +48,25 @@ Search artefacts do not supply ambient statistics.
 Two-argument scores therefore depend only on the resolved row and query.
 Corpus-relative queries derive their statistics from the applicable admitted rows or receive them explicitly.
 
+## Operation-only capture revocation
+
+The local archive broker gives checkpoint readers and exporters key operations under the original capture authority.
+The same key protects the captured root and its archived replica suffix.
+An independent stage reseals the verified plaintext with its own installation key.
+The broker orders irreversible vault closure against every active cryptographic operation.
+The directory publishes the revocation observation after that closure has completed.
+A previously issued handle cannot decrypt another object after the observation, including ciphertext already retained by the handle's owner.
+The source capture and its copies are distinct custody domains only after a completed independent re-encryption.
+The authenticated preparation first closes new archive admissions, and the revocation commit waits for outstanding regions and provider operations.
+Preparation can take an unbounded time.
+The contract excludes plaintext already returned and depends on keeping vault material outside recoverable backups and older material-exporting binaries.
+Serving history and existing exported keys still require a separately qualified deadline authority.
+
+The scheduled capture action arms a single immutable due time at the same broker.
+A previously prepared schedule can recover after an ambiguous outcome, and the broker recovers its schedule from durable storage before it performs cryptography after restart.
+Expiry depends on the local authority clock reaching the recorded time.
+Qualification of a bounded real-time deadline additionally requires an authoritative clock with an enforceable error bound.
+
 ## Verification
 
 `ErasureCustody.tla` models adoption of a successor, a same-domain key copy with an unresolved provider outcome, a dependent fork, an independent export and a held old view.
@@ -56,6 +75,14 @@ It abstracts the provider, the clock and all cache invalidation.
 Certification also needs a native replay of copy-completed-with-lost-reply, cross-domain export, and revoke-after-recovery with a surviving row and an admitted reader.
 Check the provider's actual key versions and cache grants when verifying a completion receipt.
 Physical history collection and metadata retention are separate acceptance checks.
+
+[CaptureKeyRevocation](../tla/CaptureKeyRevocation.tla) checks the local capture broker's prepare, provider closure, durable observation and inventory settlement.
+A lost-reply witness recovers and settles a closed key while a separately keyed copy remains readable.
+Controls expose stale-handle decryption, undrained active operations, raw material export, early publication, early inventory settlement and destination-key aliasing.
+
+[CaptureScheduledExpiry](../tla/CaptureScheduledExpiry.tla) checks that acknowledged schedules survive restart and that an operation crossing expiry returns no cryptographic result.
+The completion-time check assumes the authority's clock is monotonic within the modeled schedule.
+Controls expose a lost schedule, an early acknowledgement, a changed due time and a late result.
 
 [RecoveryCustodyHandoff](../lean/RecoveryCustodyHandoff.lean) proves joint safety for arbitrary unit identities and finite schedules of confirmation, independent copy admission, erasure commit, revocation, and physical retirement.
 The replacement cut covers the acknowledged upstream position, and its declared primary and replay units are readable and disjoint from the retiring custody set.

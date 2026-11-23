@@ -6,13 +6,17 @@ use vstd::multiset::Multiset;
 use vstd::prelude::*;
 
 pub(super) type Head = (usize, usize);
-pub(super) type Key = (u128, i64, u32);
+pub(super) type Key = (u128, i64, u32, usize, usize, usize);
 
 #[cfg(verus_keep_ghost)]
 verus! {
     pub open spec fn ordered_keys(left: Key, right: Key) -> bool {
-        left.0 < right.0
-            || (left.0 == right.0 && (left.1 > right.1 || (left.1 == right.1 && left.2 >= right.2)))
+        if left.0 != right.0 { left.0 < right.0 }
+        else if left.1 != right.1 { left.1 > right.1 }
+        else if left.2 != right.2 { left.2 > right.2 }
+        else if left.3 != right.3 { left.3 < right.3 }
+        else if left.4 != right.4 { left.4 < right.4 }
+        else { left.5 <= right.5 }
     }
 
     pub open spec fn valid_head(pages: Seq<Seq<Key>>, head: Head) -> bool {
@@ -173,8 +177,12 @@ verus! {
     ensures out == !ordered_keys(right, left),
 ))]
 pub(super) fn precedes(left: Key, right: Key) -> bool {
-    left.0 < right.0
-        || (left.0 == right.0 && (left.1 > right.1 || (left.1 == right.1 && left.2 > right.2)))
+    if left.0 != right.0 { return left.0 < right.0; }
+    if left.1 != right.1 { return left.1 > right.1; }
+    if left.2 != right.2 { return left.2 > right.2; }
+    if left.3 != right.3 { return left.3 < right.3; }
+    if left.4 != right.4 { return left.4 < right.4; }
+    left.5 < right.5
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(

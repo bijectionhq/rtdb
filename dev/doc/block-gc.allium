@@ -23,16 +23,10 @@
 -- On local Multi storage, the reaper may retire a mixed pack below the published checkpoint under the replay archive handoff in rtdb-multi.allium.
 -- Its old checkpoint boundary lies within an excluded replica prefix and every L0 member has an authenticated copy under independent archive custody.
 --
--- Offloaded replica-message payloads (`oversized/b{idx}-{uuid}.binpb`, see db.allium's OversizedMessage) are collected by the same cycle, keyed on block index and swept by the same rule.
--- They are the one kind here whose read path is not confined to startup: a payload is fetched while APPLYING its replica-log record, so `blocks_to_keep` doubles as the bound on how far a follower may lag before its payloads are collected under it.
--- The block-file reasoning above therefore does NOT carry over — a delete here can break a running read path, and that is the price of having no replica-log coordination.
--- A follower past the bound does not skip the record: the fetch throws out of the replica tail, which notifies the watchers' error state, and since that state is absorbing the database stops consuming and stays unqueryable until the process restarts.
---
--- A native local store can retain a separately exported current checkpoint as a repair base.
--- The block collector skips its checkpoint metadata and offloaded replica payloads at or above the installed anchor.
--- Anchor replacement and physical removal serialize at the storage root.
--- A durable successor anchor permits the ordinary block retention rule to collect older files.
--- The store retains the anchor across restarts.
+-- Offloaded replica-message payloads (`oversized/b{idx}-{uuid}.binpb`, see db.allium's OversizedMessage) belong to the durable history of each record that references them.
+-- A follower can fetch such a payload while applying a record from a block whose catalog files have already been collected.
+-- Block collection preserves offloaded payloads.
+-- Storage disposal may remove them after the deployment's journal and all serving and recovery admissions end.
 --
 -- Per-database, leader-only, signal-driven. Same lifecycle and trigger model
 -- as Trie GC (see gc.allium): constructed when the LeaderSystem opens,
@@ -234,8 +228,6 @@ rule GarbageCollectBlocks {
 
         for table in table_catalog.all_tables:
             DeleteGarbage(table_block_files(table))
-
-        DeleteGarbage(offloaded_payload_files())
 }
 
 rule DeleteGarbageRule {
@@ -346,12 +338,7 @@ surface BlockGcAdmin {
 --                                   (BlockGarbageCollector.kt)
 --   table_block_files(table)      — enumerate `tables/{table}/blocks/b*.binpb`
 --                                   (BlockGarbageCollector.kt)
---   offloaded_payload_files()     — enumerate `oversized/b*-*.binpb`
---                                   (BlockGarbageCollector.kt)
---   parse_block_index(path)       — decode lex-hex block index from a path
---                                   (storage/PathTools.kt, and
---                                   ReplicaMessage.OversizedMessage.blockIndexOf
---                                   for the offloaded-payload key)
+--   parse_block_index(path)       — decode the lex-hex block index from a checkpoint metadata path
 --   require_or_fail(cond)         — assertion that throws on false
 --   ObjectStoreDelete(path)       — DELETE one key (storage/ObjectStore.kt)
 

@@ -16,6 +16,7 @@ pub struct PlacedAttemptScope {
 }
 
 impl PlacedAttemptScope {
+    pub fn history_fingerprint(self) -> [u8; 32] { self.history }
     pub fn writer_epoch(self) -> u64 { self.writer_epoch.get() }
     pub fn same_history(self, other: Self) -> bool { self.history == other.history }
 
