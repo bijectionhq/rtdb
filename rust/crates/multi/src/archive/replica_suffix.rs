@@ -855,6 +855,7 @@ mod custody_tests {
         let location = tempfile::tempdir().unwrap();
         let directory_path = location.path().join("directory");
         std::fs::create_dir(&directory_path).unwrap();
+        MemoryDirectory::initialize(&directory_path)?;
         let directory = MemoryDirectory::open(&directory_path)?;
         let storage = CellStorage::Local { root: location.path().join("serving") };
         let archive = CellStorage::Local { root: location.path().join("archive") };
