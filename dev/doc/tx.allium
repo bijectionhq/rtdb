@@ -60,6 +60,8 @@
 -- Computed VALUES and replayed literal pages admit their results column by column.
 -- Column tables preserve one semantic page across the input list's batches.
 -- Numeric list expression pages retain typed child arrays and validity through the list cursor.
+-- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.
+-- Score calculation and nullable result construction use Arrow input arrays and output buffers.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
 -- Computed UNNEST gathers the original payload from Arrow positions and evaluates only its list operands.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.

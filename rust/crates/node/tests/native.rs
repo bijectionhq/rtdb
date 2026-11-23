@@ -5825,3 +5825,42 @@ async fn cosine_distance_ranks_the_versions_that_pass_the_filter_at_each_valid_p
     }
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn guarded_cosine_leaves_disabled_zero_norm_vectors_unread() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let embedding = |x, y| Value::FixedSizeList(vec![Value::F32(x), Value::F32(y)].into());
+    let document = |id, enabled, vector| StructFields::from([
+        ("_id".into(), Value::I64(id)),
+        ("enabled".into(), enabled),
+        ("embedding".into(), vector),
+    ]);
+    let put = put_rows(&node, "vectors", vec![
+        document(1, Value::Bool(true), embedding(1.0, 0.0)),
+        document(2, Value::Bool(false), embedding(0.0, 0.0)),
+        document(3, Value::Null, embedding(0.0, 0.0)),
+    ], Some(Timestamp(0)), None);
+    assert!(session.state_mut().execute_tx(vec![put], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let by_row = "SELECT CASE WHEN enabled THEN COSINE_DISTANCE(embedding, $1) ELSE NULL END AS distance FROM vectors ORDER BY _id";
+    let result = session.query_sql(by_row, vec![embedding(1.0, 0.0)]).await.unwrap();
+    assert_eq!(rows(result).await, [vec![Value::F64(0.0)], vec![Value::Null], vec![Value::Null]]);
+
+    let by_argument = "SELECT CASE WHEN $2 THEN COSINE_DISTANCE(embedding, $1) ELSE NULL END AS distance FROM vectors ORDER BY _id";
+    let result = session.query_sql(by_argument, vec![embedding(0.0, 0.0), Value::Bool(false)]).await.unwrap();
+    assert_eq!(rows(result).await, [vec![Value::Null], vec![Value::Null], vec![Value::Null]]);
+    let invalid = session.query_sql(by_argument, vec![embedding(1.0, 0.0), Value::Bool(true)]).await;
+    let error = match invalid {
+        Ok(mut result) => loop {
+            match result.next_batch().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break None,
+                Err(error) => break Some(error),
+            }
+        },
+        Err(error) => Some(error),
+    }.expect("the selected zero vector cannot be scored");
+    assert_eq!(error.code, "rtdb.vector/zero-norm");
+    stop(&node, driver).await;
+}

@@ -1,7 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::{
-    Array, FixedSizeListArray, Float16Array, Float32Array, Float64Array, ListArray, UnionArray,
+    Array, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, ListArray, UnionArray,
     builder::Float64Builder,
 };
 use arrow_schema::{DataType, Field};
@@ -26,18 +26,88 @@ fn inputs(expr: &Expr) -> Option<(ColumnId, &Expr)> {
     }
 }
 
-pub(crate) struct Projection {
-    position: usize,
-    query: CosineVector,
-    _memory: Arc<MemoryReservation>,
+pub(crate) enum Projection {
+    Null,
+    Score {
+        position: usize,
+        guard: Option<usize>,
+        query: CosineVector,
+        _memory: Arc<MemoryReservation>,
+    },
+}
+
+fn boolean(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Null => Some(false),
+        _ => None,
+    }
+}
+
+fn arrow_boolean(cell: ArrowCell<'_>) -> Option<bool> {
+    let cell = cell.physical().ok()?;
+    match cell.field.data_type() {
+        DataType::Null if cell.field.is_nullable() => Some(false),
+        DataType::Boolean if cell.field.metadata().is_empty() => {
+            let values = cell.array.as_any().downcast_ref::<BooleanArray>()?;
+            Some(values.is_valid(cell.row) && values.value(cell.row))
+        }
+        _ => None,
+    }
+}
+
+fn guard_at(column: &Column, row: usize) -> Option<bool> {
+    match column {
+        Column::Values(values) => boolean(values.get(row)?),
+        column => match column.arrow_cell(row)? {
+            Some((array, field, _, row)) => arrow_boolean(ArrowCell { array, field, row }),
+            None => Some(false),
+        },
+    }
 }
 
 impl Projection {
     pub(crate) fn bind(
         expr: &Expr, schema: &Schema, parameters: &crate::parameters::BoundParameters, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<Self>> {
-        let Some((id, reference)) = inputs(expr) else { return Ok(None); };
+        let (condition, score) = match expr {
+            Expr::Case { branches, otherwise } if matches!(otherwise.as_ref(), Expr::Literal(Value::Null)) => {
+                let [(condition, score)] = branches.as_slice() else { return Ok(None); };
+                (Some(condition), score)
+            }
+            expr => (None, expr),
+        };
+        let Some((id, reference)) = inputs(score) else { return Ok(None); };
         let Some(position) = schema.position(id) else { return Ok(None); };
+        let guard = match condition {
+            None => None,
+            Some(Expr::Column { id, .. }) => {
+                let Some(column) = schema.get(*id) else { return Ok(None); };
+                if !column.data_type.unencoded().legs().iter().all(|ty| matches!(ty, LogicalType::Null | LogicalType::Scalar(ScalarType::Bool))) {
+                    return Ok(None);
+                }
+                schema.position(*id)
+            }
+            Some(condition) => {
+                let selected = match condition {
+                    Expr::Literal(value) => boolean(value),
+                    Expr::Parameter { index, .. } => {
+                        if let Some((batch, row)) = parameters.arrow_input(*index) {
+                            let batch = batch.batch();
+                            arrow_boolean(ArrowCell { field: batch.schema_ref().field(*index), array: batch.column(*index).as_ref(), row })
+                        } else {
+                            parameters.get(*index).ok().flatten().and_then(boolean)
+                        }
+                    }
+                    _ => None,
+                };
+                match selected {
+                    Some(true) => None,
+                    Some(false) => return Ok(Some(Self::Null)),
+                    None => return Ok(None),
+                }
+            }
+        };
         let prepared = match reference {
             Expr::Literal(value) => prepare_value(value, memory),
             Expr::Parameter { index, .. } => {
@@ -61,13 +131,26 @@ impl Projection {
             }),
             _ => Ok(None),
         }?;
-        Ok(prepared.map(|(query, _memory)| Self { position, query, _memory }))
+        Ok(prepared.map(|(query, _memory)| Self::Score { position, guard, query, _memory }))
     }
 
     pub(crate) fn column(&self, batch: &ColumnBatch) -> Option<Column> {
-        let column = batch.columns.get(self.position)?;
+        let Self::Score { position, guard, query, .. } = self else {
+            return Some(score_column(Float64Array::new_null(batch.len)));
+        };
+        let column = batch.columns.get(*position)?;
+        let guard = match guard {
+            Some(guard) => Some(batch.columns.get(*guard)?),
+            None => None,
+        };
         let mut output = Float64Builder::with_capacity(batch.len);
         for row in 0..batch.len {
+            if let Some(guard) = guard
+                && !guard_at(guard, row)?
+            {
+                output.append_null();
+                continue;
+            }
             let Some((array, field, _, row)) = column.arrow_cell(row)? else {
                 output.append_null();
                 continue;
@@ -79,23 +162,27 @@ impl Projection {
             }
             let (array, components) = span(cell)?;
             let score = if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
-                self.query.score(values.values()[components].iter().map(|&value| f64::from(value)))?
+                query.score(values.values()[components].iter().map(|&value| f64::from(value)))?
             } else if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
-                self.query.score(values.values()[components].iter().copied())?
+                query.score(values.values()[components].iter().copied())?
             } else if let Some(values) = array.as_any().downcast_ref::<Float16Array>() {
-                self.query.score(values.values()[components].iter().map(|value| value.to_f64()))?
+                query.score(values.values()[components].iter().map(|value| value.to_f64()))?
             } else {
                 let values = ListView::Union(array.as_any().downcast_ref::<UnionArray>()?);
                 if components.clone().any(|i| values.float_component(i).is_none()) { return None; }
-                self.query.score(components.map(|i| values.float_component(i).expect("component verified")) )?
+                query.score(components.map(|i| values.float_component(i).expect("component verified")) )?
             };
             output.append_value(score);
         }
-        Some(Column::Arrow {
-            array: Arc::new(output.finish()),
-            field: Arc::new(Field::new("cosine_distance", DataType::Float64, true)),
-            logical: Some(LogicalType::Scalar(ScalarType::F64).maybe()),
-        })
+        Some(score_column(output.finish()))
+    }
+}
+
+fn score_column(array: Float64Array) -> Column {
+    Column::Arrow {
+        array: Arc::new(array),
+        field: Arc::new(Field::new("cosine_distance", DataType::Float64, true)),
+        logical: Some(LogicalType::Scalar(ScalarType::F64).maybe()),
     }
 }
 
