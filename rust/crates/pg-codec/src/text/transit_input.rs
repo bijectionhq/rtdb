@@ -8,6 +8,8 @@ use rtdb_types::{Anomaly, ListBuilder, Result, StructFields, Value};
 use super::{invalid, normalize_keyword, transit as native};
 use crate::{DecodedValue, Format, size_error};
 
+mod ids;
+
 pub(super) fn decode_json(bytes: &[u8]) -> Result<Value> {
     transit::decode_json_with(bytes, &mut NativeInput)?.into_value()
 }
@@ -21,10 +23,18 @@ pub fn decode_transit_sequence<T>(bytes: &[u8], format: Format, mut convert: imp
 }
 
 pub fn decode_transit_msgpack(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<DecodedValue> {
+    decode_msgpack(bytes, memory, Shape::Value)
+}
+
+pub fn decode_transit_transaction(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<DecodedValue> {
+    decode_msgpack(bytes, memory, Shape::Transaction)
+}
+
+fn decode_msgpack(bytes: &[u8], memory: &Arc<MemoryBudget>, shape: Shape) -> Result<DecodedValue> {
     let (input, wire_reservation) = transit::decode_msgpack_with_in(bytes, memory, &mut NativeInput)?;
     let bound = input.conversion_bound()?.checked_add(8192).ok_or_else(size_error)?;
     let mut reservation = memory.reserve(bound)?;
-    let value = input.into_value()?;
+    let value = input.convert(shape)?;
     drop(wire_reservation);
     let retained = value.retained_bytes()?.checked_add(8192).ok_or_else(size_error)?;
     Arc::get_mut(&mut reservation).expect("Transit conversion owns its reservation").shrink_to(retained)?;
@@ -175,7 +185,15 @@ fn len(items: &[Input]) -> usize {
     }).sum()
 }
 
-fn list(items: Vec<Input>) -> Result<Value> {
+#[derive(Clone, Copy)]
+enum Shape { Value, Transaction, Operations, Operation, DeleteIds }
+
+fn list(items: Vec<Input>, shape: Shape) -> Result<Value> {
+    if matches!(shape, Shape::DeleteIds)
+        && let Some(ids) = ids::pack(&items) {
+        return Ok(Value::List(ids));
+    }
+    let element = if matches!(shape, Shape::Operations) { Shape::Operation } else { Shape::Value };
     let mut list = ListBuilder::with_capacity(len(&items));
     for item in items {
         match item {
@@ -183,17 +201,26 @@ fn list(items: Vec<Input>) -> Result<Value> {
             Input::Floats(values) => values.into_iter().for_each(|value| list.push_f64(value)),
             Input::TaggedF32(value) => list.push_f32(value as f32),
             Input::TaggedFloats(values) => values.into_iter().for_each(|value| list.push_f32(value as f32)),
-            value => list.push(value.into_value()?),
+            value => list.push(value.convert(element)?),
         }
     }
     Ok(Value::List(list.finish()))
 }
 
 impl Input {
-    fn into_value(self) -> Result<Value> {
+    fn into_value(self) -> Result<Value> { self.convert(Shape::Value) }
+
+    fn convert(self, shape: Shape) -> Result<Value> {
         Ok(match self {
-            Self::Array(items) => return list(items),
+            Self::Array(items) => return list(items, shape),
             Self::Map(entries) => {
+                let deletes = matches!(shape, Shape::Operation) && entries.iter().rev()
+                    .find(|(key, _)| match key {
+                        Self::String(key) => key == "op",
+                        Self::Keyword(key) => normalize_keyword(key) == "op",
+                        _ => false,
+                    })
+                    .is_some_and(|(_, value)| matches!(value, Self::String(kind) if matches!(kind.as_str(), "delete-docs" | "erase-docs")));
                 let mut fields = StructFields::new();
                 for (key, value) in entries {
                     let key = match key {
@@ -201,14 +228,19 @@ impl Input {
                         Self::Keyword(key) => normalize_keyword(&key),
                         _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-map-key", "Source maps require string or keyword keys")),
                     };
-                    fields.insert(key, value.into_value()?);
+                    let field_shape = match (shape, key.as_str()) {
+                        (Shape::Transaction, "operations") => Shape::Operations,
+                        (Shape::Operation, "ids") if deletes => Shape::DeleteIds,
+                        _ => Shape::Value,
+                    };
+                    fields.insert(key, value.convert(field_shape)?);
                 }
                 Value::Struct(fields)
             }
             Self::Tagged(tag, representation) => match tag.as_str() {
                 "list" => {
                     let Self::Array(items) = *representation else { return Err(invalid("Transit list requires an array")); };
-                    return list(items);
+                    return list(items, shape);
                 }
                 "set" => {
                     let Self::Array(items) = *representation else { return Err(invalid("Transit set requires an array")); };
@@ -310,7 +342,8 @@ mod tests {
         let Some(Value::List(list)) = fields.get("vec") else { panic!("expected list"); };
         let ListView::Union(union) = list.view() else { panic!("expected a packed float union"); };
         assert_eq!(union.child(union.type_id(0)).as_primitive::<Float64Type>().value(0).to_bits(), (-0.0f64).to_bits());
-        assert!(union.child(union.type_id(1)).is_null(union.value_offset(1)));
+        assert_eq!(union.child(union.type_id(1)).data_type(), &DataType::Null);
+        assert!(union.logical_nulls().unwrap().is_null(1));
         assert_eq!(union.child(union.type_id(2)).as_primitive::<Float64Type>().value(1).to_bits(), f64::NAN.to_bits());
         assert_eq!(union.child(union.type_id(3)).as_primitive::<Float32Type>().value(0).to_bits(), (-0.0f32).to_bits());
     }

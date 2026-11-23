@@ -127,6 +127,22 @@ impl<'a> ListView<'a> {
 }
 
 impl ListValue {
+    /// Retains a non-null canonical ID column, including the original signed integer widths.
+    pub fn from_entity_id_arrow(field: Arc<Field>, values: ArrayRef) -> Option<Self> {
+        let valid = match field.data_type() {
+            DataType::Union(fields, UnionMode::Dense) => {
+                field.metadata().is_empty() && fields.iter().all(|(_, field)| entity_id_scalar(field).is_some())
+            }
+            _ => entity_id_scalar(&field).is_some(),
+        };
+        if !valid || field.data_type() != values.data_type() || values.logical_null_count() != 0 { return None; }
+        if Self::supports_numeric_arrow(&field) {
+            Self::from_numeric_arrow(field, values)
+        } else {
+            Self::from_scalar_arrow(field, values)
+        }
+    }
+
     /// Builds a list from fallible cells, keeping a packable numeric input in typed storage.
     pub fn try_from_cells(cells: impl Iterator<Item = Result<Value>>) -> Result<Self> {
         let mut builder = ListBuilder::with_capacity(cells.size_hint().0);
@@ -295,6 +311,20 @@ impl ListValue {
             },
         }
     }
+}
+
+fn entity_id_scalar(field: &Field) -> Option<ScalarType> {
+    let extension = field.metadata().get("ARROW:extension:name").map(String::as_str);
+    Some(match (field.data_type(), extension) {
+        (DataType::Utf8, None) if field.metadata().is_empty() => ScalarType::Utf8,
+        (DataType::Utf8, Some("xt/clj-keyword")) => ScalarType::Keyword,
+        (DataType::FixedSizeBinary(16), Some("uuid")) => ScalarType::Uuid,
+        (DataType::Int8, None) if field.metadata().is_empty() => ScalarType::I8,
+        (DataType::Int16, None) if field.metadata().is_empty() => ScalarType::I16,
+        (DataType::Int32, None) if field.metadata().is_empty() => ScalarType::I32,
+        (DataType::Int64, None) if field.metadata().is_empty() => ScalarType::I64,
+        _ => return None,
+    })
 }
 
 impl From<Vec<Value>> for ListValue {

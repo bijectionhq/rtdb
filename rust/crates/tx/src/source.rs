@@ -555,7 +555,11 @@ enum SourceDocuments<'a> {
 
 impl SourceDocuments<'_> {
     fn columns(&self) -> &[String] {
-        match self { Self::Rows(documents) => documents.columns(), Self::Arrow(documents) | Self::Canonical { documents, .. } => documents.columns() }
+        match self {
+            Self::Rows(documents) => documents.columns(),
+            Self::Arrow(documents) => documents.submitted_rows().map_or_else(|| documents.columns(), Documents::columns),
+            Self::Canonical { documents, .. } => documents.columns(),
+        }
     }
     fn len(&self) -> usize {
         match self { Self::Rows(documents) => documents.rows().len(), Self::Arrow(documents) | Self::Canonical { documents, .. } => documents.array().len() }
@@ -1292,59 +1296,63 @@ fn iid_vector(lists: &[Cow<'_, [Iid]>], field: &Field, arrays: &mut BatchBuilder
 }
 
 fn document_leg(mut lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>) -> Result<ArrayRef> {
-    if lists.len() > 1 {
-        // Coalescing sees the original field presence and the first occurrence of each logical type.
-        for list in &mut lists {
-            if let SourceDocuments::Arrow(documents) = list
-                && let Some(rows) = documents.submitted_rows() {
-                *list = SourceDocuments::Rows(rows);
+    let all_submitted = lists.len() > 1 && lists.iter().all(|list| {
+        matches!(list, SourceDocuments::Arrow(documents) if documents.submitted_rows().is_some())
+    });
+    if !all_submitted {
+        if lists.len() > 1 {
+            for list in &mut lists {
+                if let SourceDocuments::Arrow(documents) = list
+                    && let Some(rows) = documents.submitted_rows() {
+                    *list = SourceDocuments::Rows(rows);
+                }
             }
         }
-    }
-    if lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
-        && lists.iter().any(|list| matches!(list, SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some()))
-    {
-        let stable = lists.iter().try_fold(true, |stable, list| match list {
-            SourceDocuments::Canonical { documents, .. } if stable => legacy_page_has_stable_layout(documents, arrays),
-            _ => Ok(stable),
-        })?;
-        if stable {
-            let pages = lists.iter().map(|list| match list {
-                SourceDocuments::Canonical { documents, .. } => {
-                    let mut builder = BatchBuilder::new(4096, memory)?;
-                    let array = canonical_document_struct(std::slice::from_ref(list), documents.row_count(), &mut builder, memory)?;
-                    own_documents(array, builder, memory).map(Some)
+        if lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
+            && lists.iter().any(|list| matches!(list, SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some()))
+        {
+            let stable = lists.iter().try_fold(true, |stable, list| match list {
+                SourceDocuments::Canonical { documents, .. } if stable => legacy_page_has_stable_layout(documents, arrays),
+                _ => Ok(stable),
+            })?;
+            if stable {
+                let pages = lists.iter().map(|list| match list {
+                    SourceDocuments::Canonical { documents, .. } => {
+                        let mut builder = BatchBuilder::new(4096, memory)?;
+                        let array = canonical_document_struct(std::slice::from_ref(list), documents.row_count(), &mut builder, memory)?;
+                        own_documents(array, builder, memory).map(Some)
+                    }
+                    _ => Ok(None),
+                }).collect::<Result<Vec<_>>>()?;
+                let mixed = lists.iter().zip(&pages).map(|(list, page)| {
+                    page.as_ref().map_or(*list, SourceDocuments::Arrow)
+                }).collect::<Vec<_>>();
+                if let Some(leg) = mixed_document_leg(&mixed, arrays)? { return Ok(leg); }
+            }
+            let legacy = lists.iter().map(|list| match list {
+                SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some() => {
+                    documents.read_legacy_owned_rows(memory).map(Some)
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            let mixed = lists.iter().zip(&pages).map(|(list, page)| {
-                page.as_ref().map_or(*list, SourceDocuments::Arrow)
-            }).collect::<Vec<_>>();
-            if let Some(leg) = mixed_document_leg(&mixed, arrays)? { return Ok(leg); }
+            let mixed = lists.into_iter().zip(&legacy).map(|(list, rows)| {
+                rows.as_ref().map_or(list, SourceDocuments::Rows)
+            }).collect();
+            return document_leg(mixed, arrays, memory);
         }
-        let legacy = lists.iter().map(|list| match list {
-            SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some() => {
-                documents.read_legacy_owned_rows(memory).map(Some)
-            }
-            _ => Ok(None),
-        }).collect::<Result<Vec<_>>>()?;
-        let mixed = lists.into_iter().zip(&legacy).map(|(list, rows)| {
-            rows.as_ref().map_or(list, SourceDocuments::Rows)
-        }).collect();
-        return document_leg(mixed, arrays, memory);
-    }
-    let arrow = lists.iter().map(|list| match list {
-        SourceDocuments::Arrow(documents) => Some(documents.array()),
-        SourceDocuments::Rows(_) | SourceDocuments::Canonical { .. } => None,
-    }).collect::<Option<Vec<_>>>();
-    if let Some(pages) = arrow
-        && let Some(leg) = arrow_document_leg(&pages, arrays)? {
-        return Ok(leg);
-    }
-    if lists.iter().all(|list| !matches!(list, SourceDocuments::Canonical { .. }))
-        && lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
-        && let Some(leg) = mixed_document_leg(&lists, arrays)? {
-        return Ok(leg);
+        let arrow = lists.iter().map(|list| match list {
+            SourceDocuments::Arrow(documents) => Some(documents.array()),
+            SourceDocuments::Rows(_) | SourceDocuments::Canonical { .. } => None,
+        }).collect::<Option<Vec<_>>>();
+        if let Some(pages) = arrow
+            && let Some(leg) = arrow_document_leg(&pages, arrays)? {
+            return Ok(leg);
+        }
+        if lists.iter().all(|list| !matches!(list, SourceDocuments::Canonical { .. }))
+            && lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
+            && let Some(leg) = mixed_document_leg(&lists, arrays)? {
+            return Ok(leg);
+        }
     }
     let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
     let structs = canonical_document_struct(&lists, *offsets.last().expect("document origin") as usize, arrays, memory)?;
@@ -1927,15 +1935,20 @@ fn canonical_document_struct(
         let mut cells = Vec::with_capacity(length);
         for list in lists {
             let start = cells.len();
-            match list {
-                SourceDocuments::Rows(documents) => {
+            let submitted = match list {
+                SourceDocuments::Rows(documents) => Some(*documents),
+                SourceDocuments::Arrow(documents) => documents.submitted_rows(),
+                SourceDocuments::Canonical { .. } => None,
+            };
+            match (submitted, list) {
+                (Some(documents), _) => {
                     if let Some(declared) = documents.declared_types().and_then(|columns| columns.get(name))
                         && ty != *declared {
                         ty = ty.join(declared);
                     }
                     cells.extend(documents.rows().iter().map(|row| row.get(name).map(|value| DocumentCell::Value(Cow::Borrowed(value)))));
                 }
-                SourceDocuments::Arrow(documents) | SourceDocuments::Canonical { documents, .. } => {
+                (None, SourceDocuments::Arrow(documents) | SourceDocuments::Canonical { documents, .. }) => {
                     if let Some((field, array)) = document_column(documents.array(), name) {
                         let declared = documents.column_type(name).ok_or_else(|| invalid("Document column has no logical type"))?;
                         if !matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Submitted)) && &ty != declared {
@@ -1959,6 +1972,7 @@ fn canonical_document_struct(
                         cells.extend(std::iter::repeat_with(|| None).take(list.len()));
                     }
                 }
+                (None, SourceDocuments::Rows(_)) => unreachable!("row documents retain their submitted layout"),
             }
             for cell in cells[start..].iter().flatten() {
                 let actual = if legacy_arrow
@@ -1977,6 +1991,14 @@ fn canonical_document_struct(
             }
         }
         if present < length || present == 0 { ty = ty.maybe(); }
+        if struct_backfill_depth(&ty) == 0
+            && let Ok(field) = to_field(name, &ty)
+            && let Ok(Some((array, _writer))) = coalesce_submitted_numeric_lists(lists, &field, memory)
+            && let Ok(column) = arrays.column(array.get_array_memory_size(), || Ok(array)) {
+            columns.push(column);
+            schema.push(Arc::new(field));
+            continue;
+        }
         let cells = cells.iter().map(Option::as_ref).collect::<Vec<_>>();
         let (field, column) = canonical_cells(name, ty, &cells, arrays, memory, legacy_arrow)?;
         schema.push(field);
@@ -2094,6 +2116,47 @@ fn legacy_owned_arrow_documents(
     let layout = DecodedDocumentLayout::new(&fields, memory)?;
     let canonical = rtdb_columnar::build_struct_array(fields, &columns, array.len(), None)?;
     ArrowDocuments::from_source(canonical.as_struct(), layout, source_bytes, memory)
+}
+
+fn coalesce_submitted_numeric_lists(
+    lists: &[SourceDocuments<'_>], field: &Field, memory: &Arc<MemoryBudget>,
+) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
+    let DataType::List(element) = field.data_type() else { return Ok(None); };
+    if lists.len() < 2 || !field.metadata().is_empty()
+        || !rtdb_types::ListValue::supports_numeric_arrow(element) {
+        return Ok(None);
+    }
+    fn submitted_page<'a>(list: &SourceDocuments<'a>) -> Option<&'a StructArray> {
+        match *list {
+            SourceDocuments::Arrow(documents) if documents.submitted_rows().is_some() => Some(documents.array()),
+            _ => None,
+        }
+    }
+    let Some(pages) = lists.iter().map(submitted_page).collect::<Option<Vec<_>>>() else { return Ok(None); };
+    let ty = from_field(field)?;
+    let bound = pages.iter().try_fold(4096usize, |bytes, page| {
+        bytes.checked_add(document_column_bound(page, field, &ty)?).ok_or_else(overflow)
+    })?;
+    let mut reservation = memory.reserve(bound)?;
+    let columns = pages.iter().map(|page| align_document_column(page, field, None, &mut Vec::new()))
+        .collect::<Result<Vec<_>>>()?;
+    let counts = columns.iter().try_fold((0usize, 0i32), |(rows, children), column| {
+        if column.data_type() != field.data_type() { return None; }
+        let offsets = column.as_list::<i32>().value_offsets();
+        Some((rows.checked_add(column.len())?, children.checked_add(offsets.last()? - offsets.first()?)?))
+    });
+    let Some((rows, children)) = counts else { return Ok(None); };
+    let selection_bound = rows.checked_add(children as usize).and_then(|cells| cells.checked_mul(128)).ok_or_else(overflow)?;
+    let selection = memory.reserve(selection_bound)?;
+    let inputs = columns.iter().map(|column| column.as_ref()).collect::<Vec<_>>();
+    let picks = inputs.iter().enumerate().flat_map(|(page, column)| (0..column.len()).map(move |row| (page, row))).collect::<Vec<_>>();
+    let array = rtdb_columnar::copy_selected_cells(&inputs, &picks)?;
+    drop(picks);
+    drop(inputs);
+    drop(columns);
+    drop(selection);
+    Arc::get_mut(&mut reservation).expect("Coalescing owns the column reservation").shrink_to(array.get_array_memory_size())?;
+    Ok(Some((array, reservation)))
 }
 
 fn document_offsets(lengths: impl IntoIterator<Item = usize>) -> Result<Vec<i32>> {
@@ -3296,6 +3359,15 @@ mod tests {
             StructFields::from([("_id".into(), Value::I64(3)), ("vec".into(), Value::list(vec![Value::F32(-0.0), Value::F64(f64::from_bits(0x7ff8_0000_0000_0007))]))]),
             StructFields::from([("_id".into(), Value::I64(4)), ("vec".into(), Value::Null)]),
         ], &memory).unwrap();
+        let submitted_first = ArrowDocuments::from_submitted_rows(&first, &memory).unwrap();
+        let submitted_second = ArrowDocuments::from_submitted_rows(&second, &memory).unwrap();
+        let layouts = [SourceDocuments::Arrow(&submitted_first), SourceDocuments::Arrow(&submitted_second)];
+        let rows = [SourceDocuments::Rows(&first), SourceDocuments::Rows(&second)];
+        let mut arrays = BatchBuilder::new(4096, &memory).unwrap();
+        let expected = canonical_document_struct(&rows, 4, &mut arrays, &memory).unwrap();
+        let (field, expected) = document_column(expected.as_struct(), "vec").unwrap();
+        let (actual, _lease) = coalesce_submitted_numeric_lists(&layouts, field, &memory).unwrap().expect("typed coalescing");
+        assert_eq!(actual.to_data(), expected.to_data());
         let valid_from = Some(Timestamp(123));
         let valid_to = Some(Timestamp(456));
 

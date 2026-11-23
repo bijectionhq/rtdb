@@ -4,7 +4,7 @@ use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, arrow_relayou
 use rtdb_format::transit::{TransitValue as T, encode_json};
 use rtdb_node::AutonomousTxOptions;
 use rtdb_tx::{ArrowDocumentWrite, ArrowDocuments, Documents, SqlArguments, TxOp, UserMetadata};
-use rtdb_types::{ListValue, LogicalType, Result, ScalarType, TableRef, Timestamp, Value};
+use rtdb_types::{ListValue, ListView, LogicalType, Result, ScalarType, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 use crate::statement::SessionHandle;
 
@@ -47,7 +47,7 @@ pub(crate) struct TransactionInput {
 
 impl TransactionInput {
     pub(crate) fn decode(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let (value, reservation) = rtdb_pg_codec::decode_transit_msgpack(bytes, memory)?.into_parts();
+        let (value, reservation) = rtdb_pg_codec::decode_transit_transaction(bytes, memory)?.into_parts();
         Ok(Self { value, reservation })
     }
 }
@@ -140,8 +140,11 @@ fn operation_value(value: Value, memory: &Arc<MemoryBudget>) -> Result<Option<Tx
 fn delete_arguments(ids: &ListValue, times: &[Option<Timestamp>], memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
     if let Some((field, column)) = ids.packed_column() {
         let ty = ids.element_type();
-        let signed = ty.legs().iter().all(|leg| matches!(leg, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)));
-        if signed && let Ok(args) = packed_delete_arguments(&ty, &field, column, times, memory) {
+        let supported = ty.legs().iter().all(|leg| matches!(leg, LogicalType::Scalar(
+            ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::Utf8 | ScalarType::Keyword | ScalarType::Uuid
+        )));
+        if supported
+            && let Ok(args) = packed_delete_arguments(&ty, &field, column, times, memory) {
             return Ok(args);
         }
     }
@@ -178,8 +181,13 @@ fn packed_delete_arguments(
         fields.push(field);
     }
     let target = to_field(&format!("?_{}", fields.len()), ty)?;
-    let bound = arrow_relayout_bound(ids.as_ref(), source, &target)?.max(ids.get_array_memory_size());
-    columns.push(builder.column(bound, || relayout_arrow_column(ids, source, &target).map(|(_, array)| array))?);
+    let ids = if *source == target.clone().with_name(source.name()) {
+        builder.column(ids.get_array_memory_size(), || Ok(ids))?
+    } else {
+        let bound = arrow_relayout_bound(ids.as_ref(), source, &target)?.max(ids.get_array_memory_size());
+        builder.column(bound, || relayout_arrow_column(ids, source, &target).map(|(_, array)| array))?
+    };
+    columns.push(ids);
     fields.push(target);
     let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).map_err(|error| crate::invalid(error.to_string()))?;
     SqlArguments::from_row_encoded_arrow(builder.finish(batch)?, memory)
@@ -227,6 +235,91 @@ fn signed_delete_ids_keep_the_buffer_and_canonical_source_layout() {
             Default::default(), &memory,
         ).unwrap().encode().unwrap();
         assert_eq!(encode(arrow).as_slice(), encode(old).as_slice());
+    }
+}
+
+#[test]
+fn transit_delete_and_erase_ids_bind_the_decoded_columns_with_legacy_source_bytes() {
+    use arrow_array::{Array, cast::AsArray};
+
+    let memory = MemoryBudget::new(1 << 25);
+    let tag = |tag: &str, representation| T::Tagged { tag: tag.into(), representation: Box::new(representation) };
+    let ids = [
+        T::String("places/one".into()),
+        T::Keyword("places/one".into()),
+        tag("u", T::Array(vec![T::Integer(i64::MIN), T::Integer(-2)])),
+        tag("i16", T::Integer(5)),
+        T::Integer(i64::MIN),
+        tag("u", T::String("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into())),
+    ];
+    let encode = |sql: String, args| rtdb_tx::SourceTransaction::new(
+        vec![TxOp::Sql { sql, args: Some(args) }], Default::default(), &memory,
+    ).unwrap().encode().unwrap();
+
+    for (kind, ids, time) in [
+        ("delete-docs", ids[..1].to_vec(), Some(Timestamp(1))),
+        ("erase-docs", ids[1..2].to_vec(), None),
+        ("erase-docs", ids[2..3].to_vec(), None),
+        ("delete-docs", ids.iter().cycle().take(263).cloned().collect(), Some(Timestamp(2))),
+    ] {
+        let mut operation = vec![
+            (T::String("op".into()), T::String(kind.into())),
+            (T::String("table".into()), T::String("docs".into())),
+            (T::Keyword("ids".into()), tag("list", T::Array(ids.clone()))),
+        ];
+        if let Some(time) = time {
+            operation.push((T::String("valid_from".into()), tag("time/instant", T::String(format!("1970-01-01T00:00:00.00000{}Z", time.0)))));
+        }
+        let request = T::Map(vec![(T::String("operations".into()), T::Array(vec![T::Map(operation)]))]);
+        let payload = rtdb_format::transit::encode_msgpack(&request).unwrap();
+        let TransactionInput { value, reservation: _wire } = TransactionInput::decode(&payload, &memory).unwrap();
+        let mut request = fields(value).unwrap();
+        let [operation] = list(request.remove("operations").unwrap()).unwrap().into_values().try_into().unwrap();
+        let Some(Value::List(decoded)) = operation.field("ids") else { panic!("expected delete IDs"); };
+        let ListView::Scalars(_) = decoded.view() else { panic!("expected packed IDs"); };
+        let (source, array) = decoded.packed_column().unwrap();
+        let Some(TxOp::Sql { sql, args: Some(arrow) }) = operation_value(operation, &memory).unwrap() else { panic!("expected SQL"); };
+        let page = arrow.single_arrow_page().unwrap().batch();
+        let index = page.num_columns() - 1;
+        assert_eq!(page.schema_ref().field(index), &source.as_ref().clone().with_name(format!("?_{index}")));
+        let column = page.column(index);
+        assert_eq!(column.to_data().buffers()[0].as_ptr(), array.to_data().buffers()[0].as_ptr());
+        if let Some(union) = column.as_union_opt() {
+            assert_eq!(union.type_ids().as_ptr(), array.as_union().type_ids().as_ptr());
+        }
+
+        let legacy = SqlArguments::from_rows(ids.into_iter().map(|id| {
+            let id = rtdb_pg_codec::from_transit(id).unwrap();
+            if time.is_some() { vec![delete_time(time), Value::Null, id] } else { vec![id] }
+        }).collect(), &memory).unwrap();
+        assert_eq!(encode(sql.clone(), arrow).as_slice(), encode(sql, legacy).as_slice());
+    }
+}
+
+#[test]
+fn transit_delete_ids_preserve_native_tag_errors_and_invalid_id_errors() {
+    let memory = MemoryBudget::new(1 << 24);
+    let tagged = |tag: &str, repr| T::Tagged { tag: tag.into(), representation: Box::new(repr) };
+    for (id, code) in [
+        (T::Null, "xtdb/invalid-id"),
+        (tagged("time/date", T::String("2020-01-01".into())), "xtdb/invalid-id"),
+        (tagged("u", T::String("invalid".into())), "xtdb.postgres/invalid-column-value"),
+    ] {
+        let operation = T::Map(vec![
+            (T::String("op".into()), T::String("delete-docs".into())),
+            (T::String("table".into()), T::String("docs".into())),
+            (T::String("ids".into()), T::Array(vec![T::String("id".into()), id])),
+        ]);
+        let request = T::Map(vec![(T::String("operations".into()), T::Array(vec![operation.clone()]))]);
+        let payload = rtdb_format::transit::encode_msgpack(&request).unwrap();
+        let legacy = rtdb_pg_codec::from_transit(operation).and_then(|value| operation_value(value, &memory)).unwrap_err();
+        assert_eq!(legacy.code, code);
+        let actual = TransactionInput::decode(&payload, &memory).and_then(|input| {
+            let mut request = fields(input.value)?;
+            let [operation] = list(request.remove("operations").unwrap())?.into_values().try_into().unwrap();
+            operation_value(operation, &memory)
+        }).unwrap_err();
+        assert_eq!(actual, legacy);
     }
 }
 

@@ -439,6 +439,8 @@ variant TxMessage : SourceMessage {
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
     -- Transit COPY and embedded Transit puts and patches with compatible document IDs submit Arrow columns in the row writer's source layout.
     -- Coalescing those documents uses submitted field presence and type order to preserve the source layout.
+    -- Compatible numeric list columns are coalesced from their submitted Arrow buffers in that layout.
+    -- Embedded Transit delete and erase arguments retain their ID column in the row writer's source layout, with the request order and valid-time bounds.
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
     -- Source decoding retains the Arrow columns and presence policy for compatible legacy Root, publication, and world shadow writes.

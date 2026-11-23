@@ -6,7 +6,7 @@ use crate::interval::parse as interval;
 mod column;
 pub use column::read_text_column;
 mod transit_input;
-pub use transit_input::{decode_transit_msgpack, decode_transit_sequence};
+pub use transit_input::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction};
 
 /// The caller covers decoding allocations and the returned value with its own reservation.
 /// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
@@ -18,7 +18,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         700 => Value::F32(float32(text)?), 701 => Value::F64(float(text)?),
         1700 => decimal(text)?,
         17 => Value::Binary(if let Some(hex) = text.strip_prefix("\\x") { if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); } hex.as_bytes().chunks_exact(2).map(|pair| { let text = std::str::from_utf8(pair).map_err(invalid)?; u8::from_str_radix(text, 16).map_err(invalid) }).collect::<Result<_>>()? } else { text.as_bytes().to_vec() }),
-        2950 => Value::Uuid(*uuid::Uuid::parse_str(text).map_err(invalid)?.as_bytes()),
+        2950 => Value::Uuid(parse_uuid(text)?),
         1082 => Value::calendar_date(rtdb_types::CivilDate::parse_iso(text)?, rtdb_types::DateUnit::Day),
         1083 => Value::Time { value: rtdb_types::parse_iso_local_time(text)? as i64, unit: TimeUnit::Nanosecond, bit_width: 64 },
         1114 => { let value = rtdb_types::parse_sql_timestamp_literal(text)?; if !matches!(&value, Value::Timestamp { timezone: None, .. }) { return Err(invalid("Invalid PostgreSQL local timestamp")); } value },
@@ -202,15 +202,12 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
             let string = || match representation.as_ref() { T::String(text) => Ok(text.as_str()), _ => Err(invalid("Transit tag requires text")) };
             match tag.as_str() {
                 "u" => match representation.as_ref() {
-                    T::String(text) => read_text(2950, text)?,
+                    T::String(text) => Value::Uuid(parse_uuid(text)?),
                     T::Array(parts) => {
                         let [T::Integer(high), T::Integer(low)] = parts.as_slice() else {
                             return Err(invalid("Transit UUID requires two signed 64-bit words"));
                         };
-                        let mut bytes = [0; 16];
-                        bytes[..8].copy_from_slice(&high.to_be_bytes());
-                        bytes[8..].copy_from_slice(&low.to_be_bytes());
-                        Value::Uuid(bytes)
+                        Value::Uuid(uuid_words(*high, *low))
                     }
                     _ => return Err(invalid("Transit UUID requires text or two signed 64-bit words")),
                 },
@@ -265,6 +262,17 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         T::Symbol(_) => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-symbol", "Source symbols have no Arrow document value type")),
     })
 }
+fn parse_uuid(text: &str) -> Result<[u8; 16]> {
+    Ok(*uuid::Uuid::parse_str(text).map_err(invalid)?.as_bytes())
+}
+
+fn uuid_words(high: i64, low: i64) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&high.to_be_bytes());
+    bytes[8..].copy_from_slice(&low.to_be_bytes());
+    bytes
+}
+
 fn cast_transit_number(tag: &str, value: Value) -> Result<Value> {
     use rtdb_types::ScalarType;
     let scalar = match tag {
