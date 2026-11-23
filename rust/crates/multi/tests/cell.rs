@@ -501,6 +501,57 @@ async fn auditing_a_pristine_deployment_does_not_allocate_its_encryption_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
+    use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
+    use rtdb_storage::log::{Log, LogOffset};
+    use rtdb_types::{JournalEndpoint, PlacedAttemptScope, SourcePosition, Term, TermSequence, Timestamp};
+
+    let cell = Cell::start(0, None).await;
+    let directory = cell.directory.as_ref();
+    let deployment = admin::create_deployment(directory, "strict", "acme", 3).await.unwrap();
+    let authority = uuid::Uuid::parse_str(&deployment.id).unwrap();
+    let scope = deployment.stream("replica");
+    let stream = rtdb_logkeeper::StreamConfig {
+        servers: cell.logkeepers.iter().filter(|keeper| deployment.ensemble.contains(&keeper.lease.id()))
+            .map(|keeper| JournalEndpoint::Member { address: keeper.address.to_string(), journal: keeper.lease.id().0 })
+            .collect(),
+        stream: scope.clone(), write_quorum: 2, maximum_message_bytes: 4 << 20,
+    };
+    let keys = cell.keys();
+    let key = keys.key(&deployment.key_id()).await.unwrap();
+    let placed = PlacedAttemptScope::new(&scope, 1).unwrap().issue()
+        .identify(SourcePosition(3), Some("owner")).unwrap();
+    let body = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)),
+        message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
+            tx_id: Some(3), src_msg_id: Some(3), system_time_micros: Some(100), committed: Some(true),
+            placed_attempt: Some(placed.encode().to_vec()),
+            acceptance_stage: Some(proto::AcceptanceStage { clock_upper_micros: Some(120), cutoff_micros: Some(150) }),
+            ..Default::default()
+        }),
+    };
+    let broadcast = rtdb_logkeeper::open_writer(stream.clone(), 1, Default::default()).await.unwrap();
+    let writer = rtdb_multi::logs::SealedLog::new(broadcast, &key, &deployment.replica_seal_scope()).unwrap();
+    let durable = writer.enqueue(body.encode().into(), Timestamp(124)).await.unwrap().durable().await.unwrap();
+    assert_eq!(durable.offset, LogOffset(0));
+    drop(writer);
+    assert_eq!(rtdb_logkeeper::seal_recover_committed(&stream, 2).await.unwrap(), LogOffset(0));
+
+    let report = admin::audit_acceptance_quorum(directory, &keys, authority, deployment.incarnation,
+        deployment.log_epoch, 0, 4 << 20).await.unwrap();
+    assert_eq!(report.authority, authority);
+    assert_eq!(report.replica_stream, scope);
+    assert_eq!(report.required_replica_quorum, 2);
+    assert_eq!(report.acceptance.replica_offset, 0);
+    assert_eq!(report.acceptance.source_position, 3);
+    assert_eq!(report.acceptance.staging_clock_upper_micros, 120);
+    assert_eq!(report.replica_append_sample_micros, 124);
+    assert!(report.quorum_observed_clock_upper_micros > 124);
+    assert!(admin::audit_acceptance_quorum(directory, &keys, authority, deployment.incarnation,
+        deployment.log_epoch + 1, 0, 4 << 20).await.is_err());
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_holding_flushes_then_keeps_serving_under_the_same_epoch() {
     let cell = Cell::start_with_idle_flush(Duration::from_millis(100)).await;
     let directory = cell.directory.as_ref();

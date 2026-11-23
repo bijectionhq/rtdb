@@ -44,6 +44,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
        rtdb-multi move-observed-holder --directory DIR --observation FILE --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
+       rtdb-multi audit-acceptance --directory DIR --keys PATH --id UUID --incarnation N --log-epoch N --replica-offset N\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
@@ -887,6 +888,21 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             if arguments.present("require-quorum") && report.replica_digests.len() < report.required_replica_quorum {
                 return Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/audit-quorum", "A write quorum could not verify a common committed interval"));
             }
+            Ok(())
+        }
+        "audit-acceptance" => {
+            let authority = installation_id(&arguments)?;
+            let incarnation = arguments.required("incarnation")?.parse()
+                .map_err(|_| usage("--incarnation must be a positive integer".into()))?;
+            let log_epoch = arguments.required("log-epoch")?.parse()
+                .map_err(|_| usage("--log-epoch must be a nonnegative integer".into()))?;
+            let offset = arguments.required("replica-offset")?.parse()
+                .map_err(|_| usage("--replica-offset must be a nonnegative integer".into()))?;
+            let directory = directory(arguments.required("directory")?).await?;
+            let keys = key_service(arguments.required("keys")?).await?;
+            let report = admin::audit_acceptance_quorum(directory.as_ref(), keys.as_ref(), authority,
+                incarnation, log_epoch, offset, 4 << 20).await?;
+            println!("{}", serde_json::to_string_pretty(&report).expect("an acceptance audit serializes"));
             Ok(())
         }
         "audit-log" => {
