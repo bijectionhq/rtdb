@@ -26,4 +26,4 @@ pub use hosted_control::{
     hosted_replay_controls, replayed_archive_cut, replayed_parent_logical_time,
     replayed_world_parent, replayed_world_parent_locator,
 };
-pub use hosted_control::{is_proposal_landing_frontier, is_proposal_landing_period};
+pub use hosted_control::{is_proposal_landing_frontier, proposal_landing_write_rows};

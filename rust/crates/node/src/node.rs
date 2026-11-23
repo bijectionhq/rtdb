@@ -2416,21 +2416,11 @@ impl NativeSession {
                     || root.publication.as_ref().is_none_or(|root| {
                         if root.attempt != sections[0].1.attempt { return true; }
                         let mut facts = root.writes.iter().filter(|op| !rtdb_tx::is_proposal_landing_frontier(op));
-                        if let Some(fact) = facts.clone().next()
-                            && facts.clone().count() == 1
-                            && rtdb_tx::is_proposal_landing_period(fact)
-                        {
-                            return false;
-                        }
                         let mut rows = 0usize;
-                        facts.any(|op| match op {
-                            TxOp::OwnedReplaceDocs { relation, documents, valid_from: None, valid_to: None }
-                            | TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None }
-                                if relation.is_root_data() && !documents.rows().is_empty() => {
-                                    rows = rows.saturating_add(documents.rows().len());
-                                    rows > rtdb_tx::MAX_PROPOSAL_LAND_ROWS
-                                }
-                            _ => true,
+                        facts.any(|op| {
+                            let Some(count) = rtdb_tx::proposal_landing_write_rows(op) else { return true; };
+                            rows = rows.saturating_add(count);
+                            rows > rtdb_tx::MAX_PROPOSAL_LAND_ROWS
                         }) || rows == 0
                     })
                     || !rtdb_tx::proposal_land_controls(&controls)

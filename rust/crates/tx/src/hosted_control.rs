@@ -955,7 +955,7 @@ mod retained_release_tests {
         assert!(is_proposal_landing_frontier(&marker));
         operations.push(Operation::Public(marker));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
-            world, pin, effect: ProposalLandingEffect::Points,
+            world, pin, effect: ProposalLandingEffect::WithPoints,
         }));
 
         operations.push(Operation::Public(frontier("public_fact_head:BAAAAAAAAAAAAAAAAAAAAA")?));
@@ -981,7 +981,7 @@ mod retained_release_tests {
             relation, id: replacement, valid_at: Timestamp(4), expected: Some(Timestamp(1)),
         }));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
-            world, pin, effect: ProposalLandingEffect::Points,
+            world, pin, effect: ProposalLandingEffect::WithPoints,
         }));
         Ok(())
     }
@@ -1013,7 +1013,7 @@ mod retained_release_tests {
                 valid_from: Some(start), valid_to: Some(Timestamp(20)),
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(generation) },
+            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(Timestamp(2)) },
             TxOp::OwnedPublishWorld {
                 world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(generation), advance_to: None, drop_world: true,
@@ -1024,9 +1024,10 @@ mod retained_release_tests {
             relation: relation.clone(), basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(3), system_time: Timestamp(4) },
             scope, frontier: 0, until: Timestamp(100), fixed: None,
         }));
-        operations.push(Operation::Public(TxOp::OwnedCheckWorldPurge {
-            relation: local, pin, frontier: 0, local_frontier: Some(0),
-        }));
+        let local_window = TxOp::OwnedCheckWorldPurge {
+            relation: local.clone(), pin, frontier: 0, local_frontier: Some(0),
+        };
+        operations.push(Operation::Public(local_window.clone()));
         let root_point = |valid_at| Operation::Public(TxOp::OwnedCheck {
             relation: relation.clone(), id: id.clone(), valid_at, expected: None,
         });
@@ -1035,12 +1036,46 @@ mod retained_release_tests {
         operations.pop();
         operations.push(root_point(start));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
-            world, pin, effect: ProposalLandingEffect::FixedPeriod,
+            world, pin, effect: ProposalLandingEffect::FixedPeriods,
         }));
         let root_point = operations.pop().unwrap();
         operations.pop();
         operations.push(root_point);
         assert_eq!(hosted_proposal_land(&operations), None);
+        operations.push(Operation::Public(local_window));
+
+        let second = EntityId::String("second".into());
+        let second_start = Timestamp(21);
+        operations.extend([
+            TxOp::OwnedReplaceDocs {
+                relation: relation.clone(), documents: crate::Documents::new(vec![row("second")], &memory)?,
+                valid_from: Some(second_start), valid_to: Some(Timestamp(30)),
+            },
+            TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
+            TxOp::OwnedCheck { relation: local, id: second.clone(), valid_at: second_start, expected: Some(generation) },
+            TxOp::OwnedCheck {
+                relation, id: second, valid_at: second_start, expected: None,
+            },
+        ].into_iter().map(Operation::Public));
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::FixedPeriods,
+        }));
+
+        let points = OwnedRelation::new("points")?;
+        let local = points.in_world(world)?;
+        let point = EntityId::String("key".into());
+        operations.extend([
+            TxOp::OwnedReplaceDocs {
+                relation: points.clone(), documents: crate::Documents::new(vec![row("key")], &memory)?,
+                valid_from: None, valid_to: None,
+            },
+            TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
+            TxOp::OwnedCheck { relation: local, id: point.clone(), valid_at: start, expected: Some(generation) },
+            TxOp::OwnedCheck { relation: points, id: point, valid_at: start, expected: Some(Timestamp(1)) },
+        ].into_iter().map(Operation::Public));
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::WithPoints,
+        }));
         Ok(())
     }
 }
@@ -1227,10 +1262,18 @@ fn finite_landing_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Opti
     (Timestamp::MIN < from && from < to && to < Timestamp::MAX).then_some(from)
 }
 
-pub fn is_proposal_landing_period(op: &crate::TxOp) -> bool {
-    matches!(op, crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
-        if relation.is_root_data() && documents.rows().len() == 1
-            && finite_landing_period(*valid_from, *valid_to).is_some())
+pub fn proposal_landing_write_rows(op: &crate::TxOp) -> Option<usize> {
+    use crate::TxOp;
+    let (relation, documents) = match op {
+        TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None } =>
+            (relation, documents),
+        TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
+            if (valid_from.is_none() && valid_to.is_none())
+                || finite_landing_period(*valid_from, *valid_to).is_some() =>
+            (relation, documents),
+        _ => return None,
+    };
+    (relation.is_root_data() && !documents.rows().is_empty()).then_some(documents.rows().len())
 }
 
 pub(crate) fn proposal_landing_frontier_rows(op: &crate::source::Operation) -> Option<&crate::Documents> {
@@ -1245,8 +1288,8 @@ pub(crate) fn proposal_landing_frontier_rows(op: &crate::source::Operation) -> O
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProposalLandingEffect {
-    Points,
-    FixedPeriod,
+    WithPoints,
+    FixedPeriods,
     Close,
 }
 
@@ -1319,10 +1362,7 @@ pub(crate) fn hosted_proposal_land(
     if writes.is_empty() || frontiers.len() > writes.len() || close && !frontiers.is_empty() {
         return None;
     }
-    let fixed_period = writes.values().any(|(_, _, start, _)| start.is_some());
-    if fixed_period && writes.len() != 1 {
-        return None;
-    }
+    let all_fixed_periods = writes.values().all(|(_, _, start, _)| start.is_some());
     if operations.iter().filter_map(Operation::owned_relation)
         .any(|relation| relation.is_world_catalog() || relation.world().is_some_and(|other| other != world))
     {
@@ -1348,7 +1388,9 @@ pub(crate) fn hosted_proposal_land(
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision) })
         ] if guarded == &local && checked == &local && observed == &id && *original == pin
-            && start.is_none_or(|start| start == *valid_at && Some(*revision) == expected_clock)));
+            && start.is_none_or(|start| {
+                start == *valid_at && expected_clock.is_some_and(|tip| *revision <= tip)
+            })));
         if start.is_some() {
             let root_window = operations.iter().any(|op| matches!(op,
                 Operation::Public(TxOp::OwnedCheckRange { relation: checked, fixed: None, .. }) if checked == relation
@@ -1364,6 +1406,6 @@ pub(crate) fn hosted_proposal_land(
     (expected_clock.is_some() && proposal_land_controls(controls)).then_some(HostedProposalLanding {
         world,
         pin,
-        effect: if fixed_period { ProposalLandingEffect::FixedPeriod } else { ProposalLandingEffect::Points },
+        effect: if all_fixed_periods { ProposalLandingEffect::FixedPeriods } else { ProposalLandingEffect::WithPoints },
     })
 }

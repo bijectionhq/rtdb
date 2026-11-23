@@ -1242,7 +1242,7 @@ impl<'a> OpenTransaction<'a> {
                 || record.basis.system_time != parent || deadline.is_none()
                 || operations.len().saturating_add(2) > 4096
                 || operations.iter().filter(|op| matches!(op, Operation::Public(TxOp::OwnedCheckWorldScope { .. }))).count() != 1
-                || (effect == ProposalLandingEffect::Points && self.read_owned_revision(
+                || (effect == ProposalLandingEffect::WithPoints && self.read_owned_revision(
                     owner,
                     &rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
                     &rtdb_types::EntityId::String("head".into()),
