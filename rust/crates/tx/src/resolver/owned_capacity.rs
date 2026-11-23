@@ -274,14 +274,14 @@ struct Delta {
     claims: i64,
 }
 
-struct CapacityCondition<'a> {
-    relation: &'a OwnedRelation,
-    column: &'a str,
-    prefix: &'a [u8],
-    at_most: i64,
+pub(super) struct CapacityCondition<'a> {
+    pub(super) relation: &'a OwnedRelation,
+    pub(super) column: &'a str,
+    pub(super) prefix: &'a [u8],
+    pub(super) at_most: i64,
 }
 
-fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Item = CapacityCondition<'_>> {
+pub(super) fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Item = CapacityCondition<'_>> {
     operations.iter().filter_map(|operation| match operation {
         Operation::Public(TxOp::OwnedCheckCapacity {
             relation,
@@ -434,8 +434,11 @@ impl OpenTransaction<'_> {
     pub(super) async fn check_final_constraints(&self, operations: &[Operation]) -> Result<()> {
         if let Some(archive) = self.context.world_constraints.as_deref() {
             self.check_world_constraints(operations, archive).await?;
+        } else if capacity_conditions(operations).any(|condition| condition.relation.world().is_some()) {
+            return Err(count_uncovered(uncovered()));
         }
-        let mut conditions = capacity_conditions(operations).peekable();
+        let mut conditions = capacity_conditions(operations)
+            .filter(|condition| condition.relation.world().is_none()).peekable();
         if conditions.peek().is_none() {
             return Ok(());
         }

@@ -785,16 +785,19 @@ The predecessor archive pin is eligible for retirement only after the order acce
 The response has the v1 layout.
 A failed order can leave its preallocated archival pin retained until expiry without a visible registration.
 
-`rtdb.owned.CommitHeldWorlds.v4` orders one to eight world publications with optional Root facts and checks.
-Its request starts with a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
+`rtdb.owned.DecideHeldWorlds.v1` orders one to eight world publications with optional Root facts and checks.
+The first byte signals an offered clock slot, final count conditions and a refusal alternative in its three low bits.
+The optional slot handle precedes a big-endian i64 deadline, one 32-byte attempt fingerprint, and a big-endian u16 world count.
 Each world supplies the 16-byte world ID and original held handle, a u16 witness count and its 16-byte nonces, and a 22-byte attempt ID.
 One effect byte follows. Overlay (0) carries the relation groups prefixed with a u32 byte length. Clock advance (1) carries the i64 target. Drop (2) carries no payload.
 The expected prior clock comes from the original hold. Overlay publication advances it by one microsecond. An explicit target must increase it and fit within the ordered commit time.
-After the worlds, a byte selects no Root section (0), Root validation (1), or Root publication (2).
+The worlds precede the held observations and any final count conditions.
+A count scope of 0 selects Root and 1 selects the single held Proposal.
+The next byte selects the Root section kind, starting with no Root section (0), Root validation (1), and Root publication (2).
 Kinds 1 and 2 carry the original 16-byte Root hold. Kind 2 also carries its 22-byte attempt ID.
 Next come a u16 Root range witness count and the original handle/nonce pairs, then the u32 byte length and ordered Root fact groups.
 Kind 1 supplies point checks, range checks, or both. Kind 2 also supplies Root inserts, replacements, or deletes.
-The request ends with the common check-only hosted ownership groups.
+A length-prefixed refusal control stream precedes the primary hosted controls when the refusal bit is set.
 Root kind 3 carries the original live Root handle and selects a single retained world Drop with zero world witnesses and no Root fact operations.
 It requires an original hosted check and one or two replacements with present expectations. The retained terminal registration and checked replacements order together.
 The Root head, local writes, clocks, terminal registrations and immutable attempt markers share one transaction key in the commit reply.
@@ -804,6 +807,9 @@ It uses the Root hold, range witnesses and group framing of kind 1, and reuses t
 The Root groups must include the original positive point check for the deleted fact.
 The hosted groups require at least one check and allow one to five checked replacements, including at least one existing owner row.
 Root kind 5 can settle a bounded-period Proposal overlay and its hosted receipt in one transaction.
+An overlay may carry ordered Binary index key slots in its nested fact struct.
+RTDB fills these from the selected source reading before checking archived and local claims.
+The fact payload retains the authored expression for landing.
 Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
 The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
 Root kind 6 lands a reviewed Proposal under the original live Root and Proposal holds.

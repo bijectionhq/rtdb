@@ -1,4 +1,4 @@
-//! Fill a placed Root fact's binary timestamp slots before staging its row.
+//! Fill a placed fact's binary timestamp slots before staging its row.
 
 use std::sync::Arc;
 
@@ -7,7 +7,7 @@ use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 
 use crate::Documents;
 
-pub(super) const FIELD: &str = "_ordered_micros";
+pub(crate) const FIELD: &str = "_ordered_micros";
 const MAX_SLOTS: usize = 1_024;
 const WIDTH: usize = std::mem::size_of::<i64>();
 const SORT_KEY_SLOT: u32 = 1 << 31;
@@ -19,6 +19,25 @@ pub(super) fn fill(
     allows_key_slot: impl Fn(&str) -> bool,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Documents> {
+    fill_documents(documents, ordered, allows_key_slot, false, memory)
+}
+
+pub(crate) fn fill_proposal_keys(
+    documents: &Documents, ordered: Timestamp, memory: &Arc<MemoryBudget>,
+) -> Result<Documents> {
+    fill_documents(documents, ordered, |column| {
+        column.strip_prefix("p_").is_some_and(|hex| hex.len() == 32
+            && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+    }, true, memory)
+}
+
+fn fill_documents(
+    documents: &Documents,
+    ordered: Timestamp,
+    allows_key_slot: impl Fn(&str) -> bool,
+    proposal_key: bool,
+    memory: &Arc<MemoryBudget>,
+) -> Result<Documents> {
     let bytes = documents.rows().iter().try_fold(4096usize, |bytes, row| {
         let retained = Value::document_retained_bytes(row)?;
         bytes.checked_add(retained).ok_or_else(invalid)
@@ -27,7 +46,9 @@ pub(super) fn fill(
     let mut rows = documents.rows().to_vec();
     for row in &mut rows {
         match row.remove(FIELD) {
-            Some(Value::Binary(slots)) => fill_row(row, &slots, ordered, &allows_key_slot)?,
+            Some(Value::Binary(slots)) if !proposal_key || !rtdb_types::WorldShadow::is_tombstone(row) => {
+                fill_row(row, &slots, ordered, &allows_key_slot, proposal_key)?;
+            },
             None | Some(Value::Null | Value::Undefined) => (),
             _ => return Err(invalid()),
         }
@@ -41,8 +62,9 @@ fn fill_row(
     slots: &[u8],
     ordered: Timestamp,
     allows_key_slot: impl Fn(&str) -> bool,
+    proposal_key: bool,
 ) -> Result<()> {
-    fill_slots(slots, ordered, allows_key_slot, |column, start, bytes| {
+    fill_binary_slots(slots, ordered, allows_key_slot, proposal_key, |column, start, bytes| {
         let Some(Value::Binary(value)) = row.get_mut(column) else { return Err(invalid()); };
         fill_bytes(value, start, bytes)
     })
@@ -60,6 +82,16 @@ pub(super) fn fill_slots(
     slots: &[u8],
     ordered: Timestamp,
     allows_key_slot: impl Fn(&str) -> bool,
+    fill: impl FnMut(&str, usize, [u8; WIDTH]) -> Result<()>,
+) -> Result<()> {
+    fill_binary_slots(slots, ordered, allows_key_slot, false, fill)
+}
+
+fn fill_binary_slots(
+    slots: &[u8],
+    ordered: Timestamp,
+    allows_key_slot: impl Fn(&str) -> bool,
+    proposal_key: bool,
     mut fill: impl FnMut(&str, usize, [u8; WIDTH]) -> Result<()>,
 ) -> Result<()> {
     let (count, mut remaining) = slots.split_first_chunk::<2>().ok_or_else(invalid)?;
@@ -82,6 +114,7 @@ pub(super) fn fill_slots(
         if column.is_empty() || column.starts_with('_')
             || column < previous.0 || (column == previous.0 && start < previous.1)
             || (sort_key && !allows_key_slot(column))
+            || (proposal_key && (!sort_key || system_revision))
         {
             return Err(invalid());
         }
@@ -106,7 +139,7 @@ pub(super) fn fill_slots(
     Ok(())
 }
 
-pub(super) fn invalid() -> Anomaly {
+pub(crate) fn invalid() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/ordered-micros", "Invalid ordered binary time slots")
 }
 
@@ -129,7 +162,7 @@ mod tests {
     fn fills_the_signed_offset_at_acceptance() {
         let mut row = StructFields::from([("payload".into(), Value::Binary(vec![0; 18]))]);
         let slots = slots(&[("payload", 1, -7), ("payload", 10, 3)]);
-        fill_row(&mut row, &slots, Timestamp(123), |_| false).unwrap();
+        fill_row(&mut row, &slots, Timestamp(123), |_| false, false).unwrap();
         let Value::Binary(bytes) = &row["payload"] else { panic!("Expected binary payload"); };
         assert_eq!(&bytes[1..9], &116i64.to_be_bytes());
         assert_eq!(&bytes[10..18], &126i64.to_be_bytes());
@@ -142,8 +175,8 @@ mod tests {
             ("p_a".into(), Value::Binary(vec![0; 16])),
         ]);
         let slots = slots(&[("body", 0, -7), ("p_a", SORT_KEY_SLOT, -7), ("p_a", SORT_KEY_SLOT | 8, 4)]);
-        assert!(fill_row(&mut row.clone(), &slots, Timestamp(3), |_| false).is_err());
-        fill_row(&mut row, &slots, Timestamp(3), |column| column == "p_a").unwrap();
+        assert!(fill_row(&mut row.clone(), &slots, Timestamp(3), |_| false, false).is_err());
+        fill_row(&mut row, &slots, Timestamp(3), |column| column == "p_a", false).unwrap();
         assert_eq!(row["body"], Value::Binary((-4i64).to_be_bytes().to_vec()));
         let Value::Binary(key) = &row["p_a"] else { panic!("Expected binary key"); };
         assert_eq!(&key[..8], &(((-4i64) as u64) ^ (1 << 63)).to_be_bytes());
@@ -155,9 +188,9 @@ mod tests {
     fn rejects_overlapping_slots_and_micros_overflow() {
         let row = StructFields::from([("payload".into(), Value::Binary(vec![0; 16]))]);
         let overlapping = slots(&[("payload", 0, 0), ("payload", 7, 0)]);
-        assert!(fill_row(&mut row.clone(), &overlapping, Timestamp(0), |_| false).is_err());
+        assert!(fill_row(&mut row.clone(), &overlapping, Timestamp(0), |_| false, false).is_err());
         let overflow = slots(&[("payload", 0, 1)]);
-        assert!(fill_row(&mut row.clone(), &overflow, Timestamp(i64::MAX), |_| false).is_err());
+        assert!(fill_row(&mut row.clone(), &overflow, Timestamp(i64::MAX), |_| false, false).is_err());
     }
 
     #[test]
@@ -179,8 +212,8 @@ mod tests {
 
         let mut row = StructFields::from([("body".into(), Value::Binary(vec![0; 8]))]);
         let with_offset = slots(&[("body", SYSTEM_REVISION_SLOT, 1)]);
-        assert!(fill_row(&mut row, &with_offset, Timestamp(1), |_| false).is_err());
+        assert!(fill_row(&mut row, &with_offset, Timestamp(1), |_| false, false).is_err());
         let revision = slots(&[("body", SYSTEM_REVISION_SLOT, 0)]);
-        assert!(fill_row(&mut row, &revision, Timestamp(i64::MAX), |_| false).is_err());
+        assert!(fill_row(&mut row, &revision, Timestamp(i64::MAX), |_| false, false).is_err());
     }
 }

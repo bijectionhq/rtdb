@@ -108,6 +108,26 @@ impl SourceTransaction {
         Ok(())
     }
 
+    pub(crate) fn place_proposal_keys(&mut self, ordered: Timestamp, placed: bool) -> Result<()> {
+        use crate::resolver::ordered_micros;
+        for operation in &mut self.operations {
+            let (relation, documents) = match operation {
+                Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. }
+                    | TxOp::OwnedReplaceDocs { relation, documents, .. })
+                | Operation::OwnedWriteIids { relation, documents, .. } => (relation, documents),
+                _ => continue,
+            };
+            if relation.world().is_none() || !documents.columns().iter().any(|name| name == ordered_micros::FIELD) {
+                continue;
+            }
+            if !placed {
+                return Err(ordered_micros::invalid());
+            }
+            *documents = ordered_micros::fill_proposal_keys(documents, ordered, &self.memory)?;
+        }
+        Ok(())
+    }
+
     pub fn uses_staging_deadline(&self) -> bool {
         self.operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::OwnedDeadline { recheck_at_staging: true, .. })))

@@ -29,7 +29,7 @@ mod retention;
 pub use retention::installed_receipt_time;
 mod fixed_range;
 mod owned_region;
-mod ordered_micros;
+pub(crate) mod ordered_micros;
 mod replay_constraints;
 mod replay_worlds;
 mod owned_capacity;
@@ -338,6 +338,7 @@ impl TxResolver {
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
         let placement = if selected_time.is_ok() && slot_time.is_ok() {
             request.place_owned_periods(key.system_time, placed_periods)
+                .and_then(|()| request.place_proposal_keys(key.system_time, placed_periods))
         } else {
             Ok(())
         };

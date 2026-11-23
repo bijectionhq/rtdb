@@ -2,7 +2,7 @@ use rtdb_plan::Catalog;
 use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, PlacedAttemptScope, WorldClockMode, WorldShadow};
 
 use super::{
-    owned_capacity::{CapacityRule, predicates, uncovered},
+    owned_capacity::{CapacityCondition, CapacityRule, capacity_conditions, predicates, uncovered},
     owned_unique::{
         invalid_key as invalid_unique_key, merge_windows, occupancy_value_at, ordered_segments,
         unique_key, unique_segment_interval, unique_taken, unique_uncovered, Segment,
@@ -40,6 +40,7 @@ struct RuleCounts<'a> {
     rule: &'a CapacityRule,
     qualifiers: Vec<(&'a str, &'a [u8])>,
     buckets: BTreeMap<Vec<u8>, [i64; 2]>,
+    final_bounds: BTreeMap<&'a [u8], i64>,
 }
 
 struct UniqueClaims<'a> {
@@ -249,6 +250,14 @@ impl ArchivedWorldConstraints<'_> {
         }
         parent.check_cancelled()?;
         for rule in self.rules {
+            if rule.final_bounds.iter().any(|(&key, maximum)|
+                rule.buckets.get(key).is_some_and(|counts| counts[1] > *maximum))
+            {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Conflict, "rtdb.owned/count-bound-exceeded",
+                    "The final owned world prefix count exceeds its transaction bound",
+                ));
+            }
             if rule.buckets.values().any(|&[before, after]| after > before && after > rule.rule.cap) {
                 return Err(Anomaly::new(
                     AnomalyCategory::Conflict, "rtdb.owned/capacity-exceeded",
@@ -359,6 +368,11 @@ impl OpenTransaction<'_> {
                 groups.entry(write.relation).or_default().push(write);
             }
         }
+        let mut bounds = BTreeMap::<&OwnedRelation, Vec<CapacityCondition<'_>>>::new();
+        for bound in capacity_conditions(operations).filter(|bound| bound.relation.world().is_some()) {
+            groups.entry(bound.relation).or_default();
+            bounds.entry(bound.relation).or_default().push(bound);
+        }
         if groups.is_empty() { return Ok(()); }
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let base = self.buffer.base_snapshot();
@@ -371,7 +385,8 @@ impl OpenTransaction<'_> {
             let root = overlay.root_relation().ok_or_else(uncovered)?;
             let policy = self.capacity_policy(final_state.clone(), owner, &root).await?;
             let unique_policy = self.unique_policy(final_state.clone(), owner, &root).await?;
-            if policy.rules.is_empty() && unique_policy.paths.is_empty() { continue; }
+            let asserted = bounds.remove(overlay).unwrap_or_default();
+            if policy.rules.is_empty() && unique_policy.paths.is_empty() && asserted.is_empty() { continue; }
             let frontier = final_state.relation_event_frontier(&root.table(owner))?;
             if !policy.rules.is_empty() && frontier != policy.through_events {
                 return Err(uncovered());
@@ -386,10 +401,30 @@ impl OpenTransaction<'_> {
             if !unique_policy.paths.is_empty() {
                 reservations.push(self.context.memory.reserve(1024 + unique_policy.paths.len() * 256)?);
             }
+            if !asserted.is_empty()
+                && (world.mode != WorldClockMode::Proposal || !schema.has_acceptance_validity()
+                    || schema.has_opaque_columns() || schema.lifetime_micros().is_some()
+                    || asserted.iter().any(|bound| !policy.rules.iter().any(|rule| {
+                        rule.column == bound.column && rule.when.is_empty()
+                            && rule.bucket(bound.prefix) == Some(bound.prefix)
+                    })))
+            {
+                return Err(uncovered());
+            }
             let mut rules = Vec::new();
             for rule in &policy.rules {
                 if !rule.admits(schema)? { return Err(uncovered()); }
-                let mut counts = RuleCounts { rule, qualifiers: predicates(&rule.when)?, buckets: BTreeMap::new() };
+                let mut counts = RuleCounts { rule, qualifiers: predicates(&rule.when)?,
+                    buckets: BTreeMap::new(), final_bounds: BTreeMap::new() };
+                for bound in asserted.iter().filter(|bound| rule.column == bound.column
+                    && rule.when.is_empty() && rule.bucket(bound.prefix) == Some(bound.prefix))
+                {
+                    reservations.push(self.context.memory.reserve(bound.prefix.len().saturating_add(192))?);
+                    counts.buckets.entry(bound.prefix.to_vec()).or_insert([0, 0]);
+                    counts.final_bounds.entry(bound.prefix)
+                        .and_modify(|maximum| *maximum = (*maximum).min(bound.at_most))
+                        .or_insert(bound.at_most);
+                }
                 for row in writes.iter().flat_map(|write| write.documents.rows()) {
                     if WorldShadow::is_tombstone(row) { continue; }
                     if let Some(key) = rule.key(&counts.qualifiers, |name| Ok(row.get(name).cloned().unwrap_or(Value::Undefined)))?

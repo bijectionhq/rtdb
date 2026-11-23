@@ -2899,6 +2899,7 @@ pub struct OwnedWorldWrite {
     pub shadow: rtdb_types::WorldShadow,
     pub create_only: bool,
     pub valid: Option<rtdb_types::Interval>,
+    pub ordered_keys: Option<Vec<u8>>,
 }
 
 fn expiry_nomination_digest(
@@ -3167,9 +3168,11 @@ impl NativeSession {
         if !(1..=8).contains(&sections.len()) || controls.is_empty()
             || (!retained_release && !proposal_overlay && !proposal_land && controls.iter().any(|control| !control.is_check()))
             || root.checks.iter().any(|check| match check {
-                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. }
-                | TxOp::OwnedCheckCapacity { relation, .. } =>
+                TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),
+                TxOp::OwnedCheckCapacity { relation, .. } => relation.is_world_catalog()
+                    || relation.world().is_some_and(|world| !proposal_overlay
+                        || sections.first().is_none_or(|(_, section)| section.world != world)),
                 _ => true,
             })
         {
@@ -3356,7 +3359,7 @@ impl NativeSession {
     fn append_world_writes(
         &self, ops: &mut Vec<TxOp>, world: rtdb_types::Iid, writes: Vec<OwnedWorldWrite>,
     ) -> Result<()> {
-        for OwnedWorldWrite { relation, id, shadow, valid, create_only } in writes {
+        for OwnedWorldWrite { relation, id, shadow, valid, create_only, ordered_keys } in writes {
             if create_only && (valid.is_some()
                 || !matches!(&shadow, rtdb_types::WorldShadow::Present(_)))
             {
@@ -3364,7 +3367,14 @@ impl NativeSession {
             }
             let relation = relation.in_world(world)?;
             let _encode = self.service.node.memory().reserve(shadow.allocation_bound()?)?;
-            let documents = rtdb_tx::Documents::new(vec![shadow.record(&id)?], self.service.node.memory())?;
+            let mut row = shadow.record(&id)?;
+            if let Some(slots) = ordered_keys {
+                if rtdb_types::WorldShadow::is_tombstone(&row) {
+                    return Err(rtdb_types::OwnedWorld::unavailable());
+                }
+                row.insert("_ordered_micros".into(), rtdb_types::Value::Binary(slots));
+            }
+            let documents = rtdb_tx::Documents::new(vec![row], self.service.node.memory())?;
             let valid_from = valid.map(|valid| valid.lower());
             let valid_to = valid.map(|valid| valid.upper());
             ops.push(if create_only {

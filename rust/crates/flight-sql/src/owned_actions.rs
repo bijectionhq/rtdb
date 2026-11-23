@@ -116,10 +116,14 @@ impl<'a> CommitRequest<'a> {
     }
 }
 
-fn owned_count_condition<'a>(call: &Call, body: &'a [u8]) -> Result<(TxOp, &'a [u8], Arc<MemoryReservation>), Status> {
+fn owned_count_condition<'a>(call: &Call, body: &'a [u8], world: Option<rtdb_types::Iid>) -> Result<(TxOp, &'a [u8], Arc<MemoryReservation>), Status> {
     let (relation, body) = split_relation(body)?;
-    let Some((&0, body)) = body.split_first() else {
-        return Err(invalid("Owned count bound requires the ordered-present valid clock"));
+    let ([scope], body) = body.split_first_chunk::<1>()
+        .ok_or_else(|| invalid("Missing final count scope"))?;
+    let relation = match *scope {
+        0 => relation,
+        1 => relation.in_world(world.ok_or_else(|| invalid("A Proposal count requires its held world"))?).map_err(status)?,
+        _ => return Err(invalid("Invalid final count scope")),
     };
     let (column, body) = count_component(body, 96)?;
     let column = std::str::from_utf8(column).map_err(|_| invalid("Owned count column must be UTF-8"))?;
@@ -134,7 +138,7 @@ fn owned_count_condition<'a>(call: &Call, body: &'a [u8]) -> Result<(TxOp, &'a [
     Ok((condition, body, reservation))
 }
 
-fn owned_count_conditions<'a>(call: &Call, body: &'a [u8]) -> Result<(Vec<TxOp>, &'a [u8], Vec<Arc<MemoryReservation>>), Status> {
+fn owned_count_conditions<'a>(call: &Call, body: &'a [u8], world: Option<rtdb_types::Iid>) -> Result<(Vec<TxOp>, &'a [u8], Vec<Arc<MemoryReservation>>), Status> {
     let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing final count conditions"))?;
     let count = usize::from(u16::from_be_bytes(*count));
     if !(1..=MAX_GROUPED_COMMIT_ROWS).contains(&count) {
@@ -145,7 +149,7 @@ fn owned_count_conditions<'a>(call: &Call, body: &'a [u8]) -> Result<(Vec<TxOp>,
     let mut charges = Vec::with_capacity(count + 1);
     charges.push(framing);
     for _ in 0..count {
-        let (condition, tail, charge) = owned_count_condition(call, body)?;
+        let (condition, tail, charge) = owned_count_condition(call, body, world)?;
         body = tail;
         conditions.push(condition);
         charges.push(charge);
@@ -920,7 +924,7 @@ impl Service {
     pub(crate) async fn commit_owned_counted_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
         let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (conditions, body, _counts) = owned_count_conditions(call, body)?;
+        let (conditions, body, _counts) = owned_count_conditions(call, body, None)?;
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
         self.commit_owned(call, envelope, body, CommitFormat::Ordered, witnesses, false, conditions).await
     }
@@ -1081,7 +1085,7 @@ impl Service {
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
-            owned_count_conditions(call, body)?
+            owned_count_conditions(call, body, None)?
         } else {
             (Vec::new(), body, Vec::new())
         };
@@ -3875,7 +3879,7 @@ impl Service {
                 return Err(invalid("Invalid Root cut decision flags"));
             }
             let groups = if *flags & 1 != 0 {
-                let (counts, groups, charges) = owned_count_conditions(call, groups)?;
+                let (counts, groups, charges) = owned_count_conditions(call, groups, None)?;
                 rows_left = rows_left.checked_sub(counts.len())
                     .ok_or_else(|| invalid("Fork exceeds its effect limit"))?;
                 root.checks.extend(counts);
@@ -4090,7 +4094,8 @@ impl Service {
                     let (overlay, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
                         .ok_or_else(|| invalid("Incomplete world overlay"))?;
                     let mut writes = Vec::new();
-                    self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
+                    self.decode_world_writes(call, owned_groups(overlay, true, false)?,
+                        mode == rtdb_types::WorldClockMode::Proposal, &mut rows_left, &mut writes, &mut reservations)?;
                     if writes.is_empty() { return Err(invalid("The world overlay has no writes")); }
                     for write in writes.iter().filter(|write| write.create_only) {
                         let absence_at = match mode {
@@ -4134,7 +4139,8 @@ impl Service {
             .map(|read| read.witnesses.len() * 2 + usize::from(read.clock.is_some())).sum::<usize>();
         rows_left = rows_left.checked_sub(observed_ops).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
         let (counts, body, _counts) = if *flags & 2 != 0 {
-            owned_count_conditions(call, body)?
+            let world = (sections.len() == 1).then(|| sections[0].world);
+            owned_count_conditions(call, body, world)?
         } else { (Vec::new(), body, Vec::new()) };
         rows_left = rows_left.checked_sub(counts.len())
             .ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
@@ -4306,7 +4312,7 @@ impl Service {
     }
 
     fn decode_world_writes(
-        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, rows_left: &mut usize,
+        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, proposal: bool, rows_left: &mut usize,
         writes: &mut Vec<rtdb_node::OwnedWorldWrite>, reservations: &mut Vec<Arc<MemoryReservation>>,
     ) -> Result<(), Status> {
         use rtdb_node::OwnedWorldWrite;
@@ -4348,10 +4354,18 @@ impl Service {
                 if create_only && valid.is_some() {
                     return Err(invalid("A create-only Proposal effect uses acceptance validity"));
                 }
+                let mut ordered_keys = None;
                 let shadow = match (operation.as_str(), payload) {
                     ("delete", Value::Null) => WorldShadow::Deleted,
                     ("replace" | "insert", Value::Struct(mut fields)) => {
                         strip_owned_absence(&mut fields)?;
+                        if let Some(slots) = fields.remove("_ordered_micros") {
+                            ordered_keys = match slots {
+                                Value::Binary(slots) if proposal => Some(slots),
+                                Value::Undefined | Value::Null => None,
+                                _ => return Err(invalid("Only an admitted Proposal can place ordered keys")),
+                            };
+                        }
                         if fields.keys().any(|name| name.starts_with('_')) {
                             return Err(invalid("Owned world fact contains a reserved field"));
                         }
@@ -4361,7 +4375,7 @@ impl Service {
                     }
                     _ => return Err(invalid("Owned world writes require a complete fact or a null deletion")),
                 };
-                writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid, create_only });
+                writes.push(OwnedWorldWrite { relation: relation.clone(), id, shadow, valid, create_only, ordered_keys });
             }
         }
         Ok(())
