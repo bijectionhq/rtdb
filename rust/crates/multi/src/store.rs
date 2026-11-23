@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
 use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES}};
-use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
+use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
@@ -277,8 +277,8 @@ impl RemoteStorageFactory for CellStoreFactory {
         Ok(std::borrow::Cow::Owned(store.cache_identity()?))
     }
 
-    /// Encryption sits above the node's disk cache, which therefore holds ciphertext.
-    async fn wrap_cached(&self, configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
+    /// Both views use the key of the same admitted storage residence. The ordinary disk cache holds ciphertext.
+    async fn wrap_stores(&self, configuration: &Any, cached: Arc<dyn ObjectStore>, uncached: Arc<dyn ObjectStore>) -> Result<OpenedServingStores> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let record = self.directory.deployment(&config.deployment).await?
@@ -289,7 +289,18 @@ impl RemoteStorageFactory for CellStoreFactory {
             Some(material) => material,
             None => self.enroll_serving_key(&config, &id).await?,
         };
-        Ok(Arc::new(EncryptingStore::new(cached, &material)?))
+        let ordinary = Arc::new(EncryptingStore::new(cached, &material)?);
+        let audience = if matches!(config.storage, CellStorage::S3 { .. }) && config.writer_epoch == Some(record.epoch)
+            && record.holder.is_some() && record.linearizable_reads && record.lifecycle == Lifecycle::Live
+            && !config.compactor && config.snapshot_block.is_none()
+        {
+            Uuid::parse_str(&record.id).ok().filter(|source| !source.is_nil()).map(|source| {
+                Ok::<_, Anomaly>(AudienceReadStorage { source, store: Arc::new(EncryptingStore::new(uncached, &material)?) })
+            }).transpose()?
+        } else {
+            None
+        };
+        Ok(OpenedServingStores { ordinary, audience })
     }
 }
 
@@ -2013,22 +2024,63 @@ mod tests {
         }).unwrap() };
         let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         for writer_epoch in [None, Some(1)] {
-            let result = factory.wrap_cached(&configuration(writer_epoch), cached.clone()).await;
+            let result = factory.wrap_stores(&configuration(writer_epoch), cached.clone(), cached.clone()).await;
             assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
         }
         assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
-        factory.wrap_cached(&configuration(Some(2)), cached.clone()).await.unwrap();
+        factory.wrap_stores(&configuration(Some(2)), cached.clone(), cached.clone()).await.unwrap();
         assert!(keys.existing_key(&record.key_id()).await.unwrap().is_some());
-        factory.wrap_cached(&configuration(None), cached.clone()).await.unwrap();
+        factory.wrap_stores(&configuration(None), cached.clone(), cached.clone()).await.unwrap();
 
         std::fs::remove_file(root.path().join("keys").join(format!("{}.key", record.key_id()))).unwrap();
         crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
             record.replica_journals.insert("replica".into());
             Ok(())
         }).await.unwrap();
-        let result = factory.wrap_cached(&configuration(Some(2)), cached).await;
+        let result = factory.wrap_stores(&configuration(Some(2)), cached.clone(), cached).await;
         assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
         assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn audience_storage_reads_uncached_objects_for_the_exact_writer() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let root = tempfile::tempdir().unwrap();
+        let local = CellStorage::Local { root: root.path().join("objects") };
+        let keys = Arc::new(crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap());
+        let bucket = local.bucket(IoRegion::new()).await.unwrap();
+        let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
+        let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
+        record.epoch = 2;
+        record.holder = Some(MemberId("writer".into()));
+        record.linearizable_reads = true;
+        let record = directory.create_deployment(record).await.unwrap();
+        let factory = CellStoreFactory {
+            directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
+            scoped_writes: None, hosted_task: None, local_witnesses: None,
+        };
+        let storage: CellStorage = serde_json::from_value(serde_json::json!({
+            "kind": "s3",
+            "config": { "bucket": "cell-objects" }
+        })).unwrap();
+        let configuration = |writer_epoch| Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&CellStoreConfig {
+            storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
+            writer_epoch, compactor: false, snapshot_block: None,
+        }).unwrap() };
+        let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        let uncached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        let stores = factory.wrap_stores(&configuration(Some(2)), cached.clone(), uncached.clone()).await.unwrap();
+        let audience = stores.audience.unwrap();
+        assert_eq!(audience.source, Uuid::parse_str(&record.id).unwrap());
+        let material = keys.existing_key(&record.key_id()).await.unwrap().unwrap();
+        let object = key("blocks/b00.binpb");
+        let bytes = Bytes::from_static(b"catalog");
+        EncryptingStore::new(uncached.clone(), &material).unwrap().put(&object, bytes.clone()).await.unwrap();
+        assert!(matches!(stores.ordinary.get(&object).await, Err(Error::MissingObject(_))));
+        assert_eq!(audience.store.get(&object).await.unwrap(), bytes);
+
+        let stale = factory.wrap_stores(&configuration(Some(1)), cached, uncached).await.unwrap();
+        assert!(stale.audience.is_none());
     }
 
     #[tokio::test]

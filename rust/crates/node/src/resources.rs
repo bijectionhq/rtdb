@@ -47,8 +47,19 @@ pub struct DatabaseResources {
     pub io: Arc<IoRegion>,
 }
 
+pub struct AudienceReadStorage {
+    pub source: uuid::Uuid,
+    pub store: Arc<dyn ObjectStore>,
+}
+
+pub struct OpenedServingStores {
+    pub ordinary: Arc<dyn ObjectStore>,
+    pub audience: Option<AudienceReadStorage>,
+}
+
 pub struct DatabaseStorage {
     pub store: Arc<dyn ObjectStore>,
+    pub audience_storage: Option<AudienceReadStorage>,
     /// How recovery finds the latest block: listing, unless the provider knows where to start.
     pub blocks: rtdb_replication::BlockDiscovery,
     pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
@@ -89,9 +100,12 @@ pub trait RemoteStorageFactory: Send + Sync {
     /// A remote store normally uses a disk cache. An isolated read-only
     /// factory may opt out to avoid retaining an extra physical copy.
     fn use_disk_cache(&self) -> bool { true }
-    /// Wraps the store after the node's disk cache, so that whatever this adds (decryption, say) happens above the cache and the cache holds only what `open` returned.
-    async fn wrap_cached(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> { Ok(cached) }
-    /// Identifies the raw objects returned by `open` before `wrap_cached`.
+    /// Wraps the two views of the same admitted storage. The disk cache sees only what `open` returned.
+    /// An audience view must preserve the same placement, object mapping and custody without using the ordinary disk cache.
+    async fn wrap_stores(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>, _uncached: Arc<dyn ObjectStore>) -> Result<OpenedServingStores> {
+        Ok(OpenedServingStores { ordinary: cached, audience: None })
+    }
+    /// Identifies the raw objects returned by `open` before `wrap_stores`.
     /// Two configurations may share an identity when a matching immutable key has the same bytes in both.
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<Cow<'a, [u8]>> {
         Ok(Cow::Borrowed(&configuration.value))
@@ -271,6 +285,7 @@ impl ResourceFactory for NativeResources {
             let mut blocks = rtdb_replication::BlockDiscovery::List;
             let mut checkpoint_metadata = None;
             let mut fragment_storage = None;
+            let mut audience_storage = None;
             let store: Arc<dyn ObjectStore> = match &configuration.storage {
                 None | Some(database_config::Storage::InMemoryStorage(_)) => Arc::new(MemoryStore::default()),
                 Some(database_config::Storage::LocalStorage(storage)) => {
@@ -293,14 +308,16 @@ impl ResourceFactory for NativeResources {
                         let cache = self.disk_cache.as_ref().ok_or_else(|| invalid("Remote storage requires a disk cache"))?;
                         let identity = factory.cache_identity(configuration)?;
                         let namespace = cache_namespace(&configuration.type_url, &identity, storage_epoch)?;
-                        cache.scope_in(namespace, remote, Arc::clone(&io))?
+                        cache.scope_in(namespace, Arc::clone(&remote), Arc::clone(&io))?
                     } else {
-                        remote
+                        Arc::clone(&remote)
                     };
-                    factory.wrap_cached(configuration, storage).await?
+                    let opened = factory.wrap_stores(configuration, storage, remote).await?;
+                    audience_storage = opened.audience;
+                    opened.ordinary
                 }
             };
-            Ok(DatabaseStorage { store, blocks, checkpoint_metadata, fragment_storage, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, audience_storage, blocks, checkpoint_metadata, fragment_storage, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened

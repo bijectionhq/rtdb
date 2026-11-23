@@ -149,7 +149,7 @@ impl Session {
         self.require_database(database, node)?;
         let identity = self.caller.principal.clone();
         let native = if let Some(audience) = &self.audience {
-            node.audience_session(database, identity, Arc::clone(self.memory()), Arc::clone(&audience.cache))
+            node.audience_session(database, identity, audience.source, Arc::clone(self.memory()), Arc::clone(&audience.cache))
         } else {
             node.session(database, identity)
         }.map_err(status)?;
