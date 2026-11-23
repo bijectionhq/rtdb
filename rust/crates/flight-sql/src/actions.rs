@@ -138,7 +138,7 @@ impl Service {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V2 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
+                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V3 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
                 crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::PUBLISH_WORLD_CUT_V2 => {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])

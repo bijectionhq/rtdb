@@ -330,6 +330,20 @@ impl OwnedWorld {
         self.id != next.id && next.id == next.pin && self.shares_retained_archive(next)
     }
 
+    /// Retain the exact Root publication already held by this world.
+    pub fn can_retain_parent(&self, next: &Self) -> bool {
+        self.ancestor.is_none()
+            && next.ancestor.is_none()
+            && self.mode != WorldClockMode::Proposal
+            && self.parent_publication.is_some()
+            && self.id != next.id
+            && next.id == next.pin
+            && !self.dropped && !next.dropped
+            && next.mode == WorldClockMode::Retained
+            && next.until <= self.until
+            && self.same_parent_archive(next)
+    }
+
     /// A retained child takes its own custody of the source's exact media.
     pub fn can_retain_overlay(&self, next: &Self) -> bool {
         let Some(overlay) = &next.ancestor else { return false; };
@@ -346,15 +360,17 @@ impl OwnedWorld {
         };
         same_overlay && self.id != next.id && next.id == next.pin && !self.dropped && !next.dropped
             && next.mode == WorldClockMode::Retained && next.until <= self.until
-            && self.capture == next.capture && self.suffix == next.suffix
-            && self.manifest == next.manifest && self.basis == next.basis
-            && self.parent_publication == next.parent_publication && self.schemas == next.schemas
+            && self.same_parent_archive(next)
     }
 
     fn shares_retained_archive(&self, next: &Self) -> bool {
         self.ancestor.is_none() && next.ancestor.is_none() && self.pin != next.pin && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
-            && self.capture == next.capture && self.suffix == next.suffix
+            && self.same_parent_archive(next)
+    }
+
+    fn same_parent_archive(&self, next: &Self) -> bool {
+        self.capture == next.capture && self.suffix == next.suffix
             && self.manifest == next.manifest && self.basis == next.basis
             && self.parent_publication == next.parent_publication && self.schemas == next.schemas
     }
@@ -471,6 +487,28 @@ impl WorldShadow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_parent_retention_preserves_the_original_root_and_lease() -> Result<()> {
+        let source = OwnedWorld {
+            id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([2; 16]), suffix: None,
+            ancestor: None, manifest: "a".repeat(43),
+            basis: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
+            parent_publication: Some(Timestamp(100)), mode: WorldClockMode::Held { start: Timestamp(120) },
+            until: Timestamp(300), schemas: WorldSchemas::new(BTreeMap::new())?, dropped: false,
+        };
+        let child = OwnedWorld {
+            id: Iid([3; 16]), pin: Iid([3; 16]), until: Timestamp(200),
+            mode: WorldClockMode::Retained, ..source.clone()
+        };
+        assert!(source.can_retain_parent(&child));
+        assert_eq!(child.initial_clock(), Timestamp(100));
+        assert!(!source.can_retain_parent(&OwnedWorld { until: Timestamp(301), ..child.clone() }));
+        assert!(!source.can_retain_parent(&OwnedWorld { capture: Iid([4; 16]), ..child.clone() }));
+        let dropped = OwnedWorld { dropped: true, ..source };
+        assert!(!dropped.can_retain_parent(&child));
+        Ok(())
+    }
 
     #[test]
     fn exact_held_ancestor_requires_independent_retained_child() -> Result<()> {
