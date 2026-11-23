@@ -29,6 +29,7 @@ pub struct CheckpointCustody {
     placement: Placement,
     epoch: StorageEpoch,
     prefix: ObjectKey,
+    provider: Fingerprint,
     local: Option<local::LocalArchive>,
 }
 
@@ -47,6 +48,7 @@ struct Scope {
     group: Uuid,
     generation: u64,
     log_epoch: i32,
+    provider: Fingerprint,
 }
 
 /// The immutable origin of an unfinished checkpoint capture. A replacement
@@ -153,12 +155,14 @@ impl CheckpointCustody {
         prefix: ObjectKey,
         placement: Placement,
         epoch: StorageEpoch,
+        provider: Fingerprint,
     ) -> Self {
         Self {
             store,
             placement,
             epoch,
             prefix,
+            provider,
             local: None,
         }
     }
@@ -169,6 +173,7 @@ impl CheckpointCustody {
     }
 
     async fn reader(&self, custody: Custody) -> Result<Arc<dyn ObjectStore>> {
+        self.require_provider(custody)?;
         let Some(local) = &self.local else {
             return Ok(Arc::clone(&self.store));
         };
@@ -186,6 +191,8 @@ impl CheckpointCustody {
         key: &ObjectKey,
         body: Bytes,
     ) -> rtdb_storage::Result<()> {
+        self.require_provider(custody)
+            .map_err(|error| Error::Task(error.to_string()))?;
         let Some(local) = &self.local else {
             return self.store.put(key, body).await;
         };
@@ -262,7 +269,10 @@ impl CheckpointCustody {
     }
 
     pub(crate) fn copy_budget(reservation: &Reservation) -> Result<u64> {
-        if reservation.custody.allocation.is_nil() || reservation.custody.revision <= 1 {
+        if reservation.custody.allocation.is_nil()
+            || reservation.custody.revision <= 1
+            || reservation.custody.provider == [0; 32]
+        {
             return Err(invalid("The checkpoint has no new provider reservation"));
         }
         reservation
@@ -277,6 +287,7 @@ impl CheckpointCustody {
         origin: Preparation,
         source: &dyn ObjectStore,
     ) -> Result<()> {
+        self.require_provider(reservation.custody)?;
         let budget = Self::copy_budget(reservation)?;
         // A permanent size refusal must precede the first provider effect
         // and the ordered binding of a reservation to a source.
@@ -447,6 +458,7 @@ impl CheckpointCustody {
     }
 
     pub(crate) async fn retire_local(&self, chosen: Checkpoint) -> Result<Fingerprint> {
+        self.require_provider(chosen.custody)?;
         let local = self
             .local
             .as_ref()
@@ -468,6 +480,7 @@ impl CheckpointCustody {
         config: &rtdb_s3::S3Config,
         chosen: Checkpoint,
     ) -> Result<Fingerprint> {
+        self.require_provider(chosen.custody)?;
         if config.terminal_scope.is_none() {
             return Err(invalid(
                 "Checkpoint retirement requires enrolled terminal storage",
@@ -533,7 +546,17 @@ impl CheckpointCustody {
             group: self.placement.group,
             generation: self.placement.generation,
             log_epoch: self.epoch.0,
+            provider: self.provider,
         }
+    }
+
+    fn require_provider(&self, custody: Custody) -> Result<()> {
+        if custody.provider != self.provider {
+            return Err(invalid(
+                "The installed checkpoint belongs to a different physical archive",
+            ));
+        }
+        Ok(())
     }
 
     fn allocation(&self, id: Custody) -> String {

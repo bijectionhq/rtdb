@@ -24,6 +24,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
+       rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
        rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
@@ -394,6 +395,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             } else {
                 manifest.run(cancellation).await.map_err(failure)
             }
+        }
+        "ordered-archive-identity" => {
+            let storage = CellStorage::parse(arguments.required("archive-root")?)?;
+            let identity = rtdb_multi::journal::hosted::archive_identity(&storage, arguments.required("archive-prefix")?).await?;
+            println!("{}", serde_json::to_string(&identity).map_err(|error| io(std::io::Error::other(error)))?);
+            Ok(())
         }
         "prepare-ordered-deployment" => {
             let path = std::path::Path::new(arguments.required("route")?);

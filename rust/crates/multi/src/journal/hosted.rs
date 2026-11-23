@@ -232,6 +232,37 @@ impl Routes {
     }
 }
 
+/// Resolves the installed physical archive and its exact checkpoint prefix.
+pub async fn archive_identity(
+    storage: &crate::deployment::CellStorage,
+    prefix: &str,
+) -> Result<[u8; 32]> {
+    let prefix = ObjectKey::new(prefix)?;
+    let bucket = storage.bucket(IoRegion::new()).await?;
+    archive_owner(storage, bucket.as_ref(), &prefix).await
+}
+
+async fn archive_owner(
+    storage: &crate::deployment::CellStorage,
+    bucket: &dyn ObjectStore,
+    prefix: &ObjectKey,
+) -> Result<[u8; 32]> {
+    let namespace = crate::deployment::existing_storage_namespace(bucket)
+        .await?
+        .filter(|namespace| !namespace.is_nil())
+        .ok_or_else(|| invalid("The checkpoint archive has no installed physical namespace"))?;
+    let mut owner = ring::digest::Context::new(&ring::digest::SHA256);
+    owner.update(b"rtdb.multi.ordered-checkpoint-provider/v1");
+    owner.update(namespace.as_bytes());
+    owner.update(&storage.custody_namespace()?);
+    owner.update(prefix.as_str().as_bytes());
+    Ok(owner
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 has 32 bytes"))
+}
+
 pub fn read_application_route(
     path: &Path,
 ) -> Result<ordered_logkeeper::ordered::daemon::ApplicationRoute> {
@@ -495,6 +526,7 @@ impl Placement {
         material: &[u8],
     ) -> Result<CheckpointCustody> {
         let bucket = self.archive.bucket(io).await?;
+        let owner = archive_owner(&self.archive, bucket.as_ref(), &self.archive_prefix).await?;
         let store: Arc<dyn ObjectStore> =
             Arc::new(crate::store::EncryptingStore::new(bucket, material)?);
         let custody = CheckpointCustody::new(
@@ -502,6 +534,7 @@ impl Placement {
             self.archive_prefix.clone(),
             self.worker.placement(),
             self.worker.log_epoch(),
+            owner,
         );
         match &self.archive {
             crate::deployment::CellStorage::S3 { .. } => Ok(custody),
@@ -609,6 +642,7 @@ async fn material(
 fn genesis(checkpoint: Checkpoint) -> bool {
     checkpoint.cut.next_lsn == 0
         && checkpoint.custody.revision == 1
+        && checkpoint.custody.provider == [0; 32]
         && checkpoint.root == [0; 32]
         && checkpoint.manifest == [0; 32]
 }
