@@ -170,6 +170,7 @@ pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V1: &str = "rtdb.owned.OpenAppliedRead.v1";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_WORLD_VERSION_V1: &str = "rtdb.owned.ReadHeldWorldVersion.v1";
 pub(crate) const HELD_WORLD_TOUCH_AFTER_V1: &str = "rtdb.owned.ReadHeldWorldTouchAfter.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
 pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
@@ -1117,6 +1118,48 @@ impl Service {
         let (id, identity) = point_identity(call, batch)?;
         let valid = history_request_endpoint(batch, "valid_micros")?;
         Ok((before, group, relation, path, id, valid, identity))
+    }
+
+    pub(crate) async fn held_world_version_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World version has no held handle"))?;
+        let (group, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("World version has no group time"))?;
+        let group = Timestamp(i64::from_be_bytes(*group));
+        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, arrow_bytes) = split_relation(request)?;
+        let batch = request_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 3 || batch.num_rows() != 1 {
+            return Err(invalid("World version requires one typed identity and two system endpoints"));
+        }
+        let (id, _identity) = point_identity(call, batch)?;
+        let from = history_request_endpoint(batch, "system_from_micros")?;
+        let through = history_request_endpoint(batch, "system_to_micros")?;
+        let slices = held.snapshot.version(&relation, &id, from, through, group).await.map_err(status)?;
+        if slices.len() > 128 { return Err(history_invalid()); }
+        let _framing = call.reserve(wire::mul(slices.len() + 1, 256)?)?;
+        let header = ActionResult { body: wire::retain(group.0.to_be_bytes().to_vec(), call.reserve(8)?) };
+        let mut bytes = header.encoded_len();
+        let mut replies = vec![Ok(header)];
+        let mut last = Timestamp::MIN;
+        for (interval, point) in slices {
+            if interval.lower() < last || interval.is_empty() || point.present != group || point.row.is_none()
+                || point.witness.is_some() || point.until.is_some()
+            {
+                return Err(history_invalid());
+            }
+            last = interval.upper();
+            let reply = self.world_point_reply_with_extent(call, point, interval.lower(), None, Some(interval))?;
+            bytes = wire::add(bytes, reply.encoded_len())?;
+            if bytes > self.0.config.maximum_message_bytes {
+                return Err(Status::resource_exhausted("World version exceeds the Flight response limit"));
+            }
+            replies.push(Ok(reply));
+        }
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(replies)
     }
 
     pub(crate) async fn held_world_touch_after_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2253,9 +2296,20 @@ impl Service {
     }
 
     fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>) -> Result<ActionResult, Status> {
+        self.world_point_reply_with_extent(call, result, valid_at, nonce, None)
+    }
+
+    fn world_point_reply_with_extent(
+        &self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>,
+        extent: Option<rtdb_types::Interval>,
+    ) -> Result<ActionResult, Status> {
         let mut metadata = std::collections::HashMap::from([
             ("rtdb.owned.world_shadowed".into(), u8::from(result.shadowed).to_string()),
         ]);
+        if let Some(extent) = extent {
+            metadata.insert(OWNED_VALID_FROM.into(), extent.lower().0.to_string());
+            metadata.insert(OWNED_VALID_TO.into(), extent.upper().0.to_string());
+        }
         if let Some(nonce) = nonce {
             metadata.insert(WORLD_POINT_WITNESS.into(), nonce.simple().to_string());
         }
