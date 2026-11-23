@@ -151,6 +151,10 @@ Goal: every point and range read in production agrees with the bitemporal refere
 5. Exercise the 10/20/15/40 correction, tied times across a cut and expiry during idleness.
 6. Compare paired histories with independent clock samples and the same funded observation schedule. Controls use order as the clock, floor the clock only on writes, charge hidden work to public turns, reopen on cap plus await, collapse tied positions and substitute an older winner after erasure.
 
+The [exact-cut model](tla/ExactTemporalCut.tla) and [Lean selection laws](lean/ExactTemporalCut.lean) exercise the position and cap distinction.
+The model includes no-lead, position-tie, erased-winner and cap-plus-await controls, with reachability cases for late correction, ties and erasure.
+Production refinement includes persistence and stable identity through forks, compaction and recovery.
+
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 
 ## W5 · Compaction refinement

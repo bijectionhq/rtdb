@@ -1932,6 +1932,8 @@ def verify_lean(args, scratch):
             verify_group_publication(args, scratch)
             verify_reader_reclamation_minimality(args, scratch)
             verify_basis_tokens(args, scratch)
+            verify_lean_model(args, scratch, Path("verification/lean/ExactTemporalCut.lean"),
+                              "exact-temporal-cut", {}, 4)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
@@ -3275,12 +3277,29 @@ def replay_bounded_worker_stack(args, source):
         raise ValueError("the deep statement did not execute through cursor disposal on the worker stack")
 
 
+def exact_temporal_cut_cases():
+    cases = {
+        "": None,
+        "Lead": "NoLead",
+        "Cap": "ExactResult",
+        "Tie": "TiePrecedence",
+        "Survivor": "ExactResult",
+        "BackdatedReach": "NoBackdatedSuffix",
+        "TieReach": "NoTiedCut",
+        "ErasureReach": "NoErasedWinner",
+    }
+    return (("ExactTemporalCut", f"ExactTemporalCut{suffix}", None, invariant)
+            for suffix, invariant in cases.items())
+
+
 def verify_tla(args, scratch):
-    for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES):
+    for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES, *exact_temporal_cut_cases()):
         case = f"tlc-{name}"
         directory = scratch / case
         clone_file(Path(f"verification/tla/{module}.tla"), directory)
         config_name = "KernelProgress" if name in {"eventual-ack", "unfair-apply"} else module
+        if module == "ExactTemporalCut":
+            config_name = name
         config = clone_file(Path(f"verification/tla/{config_name}.cfg"), directory)
         if mutation:
             replace_once(config, *mutation)
