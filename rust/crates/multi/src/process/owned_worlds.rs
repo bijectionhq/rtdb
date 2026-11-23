@@ -239,23 +239,13 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
 
-    fn path_touch_after<'a>(
-        &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
-        group: Timestamp, valid: Timestamp,
-    ) -> BoxFuture<'a, Result<WorldPointResult>> {
-        Box::pin(async move {
-            let fact = HeldCheckpointWorld::path_touch_after(self, relation, path, id, group, valid).await?;
-            Ok(path_touch_result(group, (Some(fact), true)))
-        })
-    }
-
     fn path_touch<'a>(
         &'a self, relation: &'a OwnedRelation, path: &'a OwnedRelation, id: &'a EntityId,
-        before: Timestamp, group: Timestamp, valid: Timestamp,
+        before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
     ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>> {
         Box::pin(async move {
             if before.next()? != group { return Err(rtdb_types::OwnedWorld::unavailable()); }
-            let [prior, accepted] = HeldCheckpointWorld::path_touch(self, relation, path, id, group, valid).await?;
+            let [prior, accepted] = HeldCheckpointWorld::path_touch(self, relation, path, id, group, valid, images).await?;
             Ok([path_touch_result(before, prior), path_touch_result(group, accepted)])
         })
     }
