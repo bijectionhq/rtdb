@@ -298,7 +298,14 @@ impl TxResolver {
                         match &request.guard {
                             Some(SourceGuard::Application(guard)) => {
                                 let guard_time = crate::guard_attribution::guard_time_at(index, guard.after_bootstrap, guard.submitted_at.0);
-                                error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into))
+                                let error = error.with_context(IDEMPOTENCY_GUARD_RESULT, guard_time.map_or(false.into(), Into::into));
+                                if let (Some(sample), Some(id)) = (guard_time, request.idempotency_key())
+                                    && let Some(original) = tx.historical_guard_original(id, Timestamp(sample)).await?
+                                {
+                                    crate::guard_attribution::with_historical_original(error, original)
+                                } else {
+                                    error
+                                }
                             }
                             Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_)) => error.with_context(IDEMPOTENCY_GUARD_RESULT, false.into()),
                             None => error,
@@ -2315,6 +2322,8 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.declare_document_types(&table, [(&error_column, &LogicalType::Scalar(ScalarType::Transit).maybe()), (&metadata_column, &metadata_type)])
     }
 }
+
+pub const HISTORICAL_KEYED_TRANSACTION_SQL: &str = "SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM public.rtdb_idempotency_keys FOR SYSTEM_TIME AS OF ? FOR VALID_TIME FROM ? TO NULL AS k WHERE k._id = ? ORDER BY k._system_from DESC LIMIT 1)";
 
 /// How long, from source-log admission, a receipt answers retries of its identity.
 pub const RECEIPT_WINDOW_MICROS: i64 = 3_600_000_000;

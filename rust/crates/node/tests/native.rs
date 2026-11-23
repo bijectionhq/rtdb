@@ -3868,7 +3868,8 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
             })),
             ..Default::default()
         };
-        let runtime = services();
+        let clock = Arc::new(ReplayTestClock(AtomicI64::new(1_000_000)));
+        let runtime = NodeServices { clock: clock.clone(), ..services() };
         let resources = NativeResources::default().with_local_log_clock(Arc::clone(&runtime.clock), false);
         let cancellation = CancellationToken::new();
         let mut seeded = resources.open("xtdb", &config, LogAccess::ReadWrite, cancellation.clone()).await.unwrap();
@@ -3920,14 +3921,24 @@ async fn legacy_source_and_typed_duplicate_outcomes_survive_recovery() {
         let legacy_retry = node.await_transaction("xtdb", ids[1], &Authority, &cancellation).await.unwrap();
         assert_eq!(legacy_retry.tx_key(), original.tx_key());
 
+        clock.0.store(1_000_000 + rtdb_tx::RECEIPT_WINDOW_MICROS, Ordering::Relaxed);
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], Default::default()).await.unwrap().committed());
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &cancellation).await.unwrap();
+        drop(session);
         stop(&node, driver).await;
+
+        clock.0.store(999_999, Ordering::Relaxed);
 
         let (reopened, driver) = running(settings, fresh_local_services(&runtime)).await;
         let result = reopened.await_transaction("xtdb", ids[1], &Authority, &cancellation).await.unwrap();
         assert!(result.committed());
         assert_eq!(result.tx_key(), original.tx_key());
         let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
-        assert_eq!(rows(session.query_sql("SELECT _id FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+        assert_eq!(rows(session.query_sql("SELECT _id FROM docs", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+        let projection = format!("SELECT user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = {}", ids[1].0);
+        assert_eq!(rows(session.query_sql(&projection, vec![]).await.unwrap()).await, [vec![Value::Null]]);
         drop(session);
         stop(&reopened, driver).await;
     }).await.unwrap();

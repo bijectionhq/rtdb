@@ -1194,26 +1194,34 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
     assert_eq!(row["user_metadata"], Value::Null);
     state.apply(resolver.take_head().unwrap().writes()).unwrap();
 
-    let projection = async |snapshot: rtdb_index::Snapshot, check_predicate: bool| {
+    let query = async |snapshot: rtdb_index::Snapshot, text: &str| {
         let snapshot = snapshot.with_system_time_cap(Some(Timestamp(100))).unwrap();
         let catalog = CatalogSnapshot::new("xtdb", [(
             "xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&context.storage) },
         )].into(), false).unwrap();
         let query_context = QueryContext::new(catalog, Arc::clone(&context.memory), Timestamp(100), "UTC", context.query_options.clone(), &context.cancellation).unwrap();
-        let text = if check_predicate {
-            "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0 AND user_metadata IS NOT NULL"
-        } else {
-            "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0"
-        };
         let sql = rtdb_sql::prepare_in(text, &query_context.catalog, &Default::default(), &context.memory).unwrap();
         let mut result = PreparedQuery::from_prepared(sql, &context.memory).unwrap().execute(query_context, vec![]).await.unwrap();
-        let owned = result.next_batch().await.unwrap()?;
-        let page = owned.batch();
-        Some((0..page.num_columns()).map(|col| {
-            rtdb_columnar::read_value(page.schema().field(col), page.column(col).as_ref(), 0).unwrap()
-        }).collect::<Vec<_>>())
+        let mut values = Vec::new();
+        while let Some(batch) = result.next_batch().await.unwrap() {
+            let page = batch.batch();
+            for row in 0..page.num_rows() {
+                values.push((0..page.num_columns()).map(|col| {
+                    rtdb_columnar::read_value(page.schema().field(col), page.column(col).as_ref(), row).unwrap()
+                }).collect::<Vec<_>>());
+            }
+        }
+        values
     };
-    assert_eq!(projection(state.snapshot(), true).await, Some(vec![Value::Bool(true), metadata]));
+    let history = "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0";
+    let predicate = "SELECT committed, user_metadata FROM xt.txs FOR ALL VALID_TIME WHERE _id = 0 AND user_metadata IS NOT NULL";
+    assert_eq!(query(state.snapshot(), predicate).await, [vec![Value::Bool(true), metadata]]);
+    let ordinals = "SELECT attname, attnum, atttypid FROM pg_catalog.pg_attribute         WHERE attrelid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = 'txs')         AND attname IN ('receipt_time', 'source_log_time', 'system_time') ORDER BY attnum";
+    assert_eq!(query(state.snapshot(), ordinals).await, [
+        vec![Value::Utf8("receipt_time".into()), Value::I32(8), Value::I32(1184)],
+        vec![Value::Utf8("source_log_time".into()), Value::I32(9), Value::I32(1184)],
+        vec![Value::Utf8("system_time".into()), Value::I32(10), Value::I32(1184)],
+    ]);
     let expiry = 100 + RECEIPT_WINDOW_MICROS;
     let cut = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(expiry), request(vec![], &context), &context).await.unwrap();
     let sidecar = cut.writes().tables()[&TableRef::new("xt", "idempotency_receipts")].batch().unwrap();
@@ -1221,6 +1229,6 @@ async fn source_metadata_expires_at_the_installed_cut_but_its_historical_outcome
     assert_eq!(erased.iid, EntityId::Integer(0).iid());
     assert!(matches!(erased.operation, StoredOperation::Erase));
     state.apply(resolver.take_head().unwrap().writes()).unwrap();
-    assert_eq!(projection(state.snapshot(), false).await, Some(vec![Value::Bool(true), Value::Null]));
-    assert_eq!(projection(state.snapshot(), true).await, None);
+    assert_eq!(query(state.snapshot(), history).await, [vec![Value::Bool(true), Value::Null]]);
+    assert!(query(state.snapshot(), predicate).await.is_empty());
 }

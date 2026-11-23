@@ -14,6 +14,7 @@ pub use inspection::{OperationRows, OperationValue, decode_operation_rows};
 pub use submission::{prepare_submission, prepare_submission_with_sql_options};
 
 pub use values::*;
+pub use guard_attribution::attributed_historical_guard_original;
 pub use source::SourceTransaction;
 pub use resolver::*;
 pub use replica::{ReplayedTransaction, decode_replica};

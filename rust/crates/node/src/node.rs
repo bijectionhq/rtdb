@@ -594,7 +594,7 @@ impl Node {
             generate_series_end_exclusive: context.options.generate_series_end_exclusive,
             ..Default::default()
         };
-        let sql = "SELECT _id, system_time FROM xt.txs FOR ALL VALID_TIME WHERE committed = true AND system_time = (SELECT k._system_from FROM public.rtdb_idempotency_keys FOR SYSTEM_TIME AS OF ? FOR VALID_TIME FROM ? TO NULL AS k WHERE k._id = ? ORDER BY k._system_from DESC LIMIT 1)";
+        let sql = rtdb_tx::HISTORICAL_KEYED_TRANSACTION_SQL;
         let prepared = match prepare_query(sql, &context, &options) {
             Ok(prepared) => prepared,
             Err(error) if error.code == "xtdb/table-not-found" || error.code.contains("unknown-table") => return Ok(None),
@@ -767,6 +767,13 @@ impl Node {
                     && let Some(original) = rtdb_tx::bounded_retry_original(error)?
                 {
                     return self.read_bounded_outcome(database, tx_id, original, identity, placement, cancellation).await;
+                }
+                if !db.external_source()
+                    && let Some(error) = &error
+                    && is_historical_guard_abort(error)
+                    && let Some(original) = rtdb_tx::attributed_historical_guard_original(error)?
+                {
+                    return Ok(TransactionResult::Committed { tx_key: original });
                 }
                 if !db.external_source()
                     && let Some(error) = &error

@@ -52,6 +52,25 @@ impl OpenTransaction<'_> {
 }
 
 impl OpenTransaction<'_> {
+    pub(super) async fn historical_guard_original(&self, key: &str, submitted_at: Timestamp) -> Result<Option<rtdb_types::TransactionKey>> {
+        let markers = rtdb_types::TableRef::new("public", "rtdb_idempotency_keys");
+        if !self.snapshot()?.contains_table(&markers) { return Ok(None); }
+        let mut cursor = self.open_query(
+            super::HISTORICAL_KEYED_TRANSACTION_SQL,
+            vec![super::time_value(self.tx_key().system_time), super::time_value(submitted_at), Value::Utf8(key.into())],
+        ).await?;
+        while let Some(page) = cursor.next_batch().await? {
+            let page = page.batch();
+            if page.num_rows() == 0 { continue; }
+            let cell = |index| read_value(page.schema().field(index), page.column(index).as_ref(), 0);
+            let (Value::I64(id), Value::Timestamp { value, unit: TimeUnit::Microsecond, .. }) = (cell(0)?, cell(1)?) else {
+                return Err(Anomaly::fault("rtdb.tx/legacy-guard-original", "The duplicate guard has no matching original transaction key"));
+            };
+            return Ok(Some(rtdb_types::TransactionKey { tx_id: TxId(id), system_time: Timestamp(value) }));
+        }
+        Ok(None)
+    }
+
     /// Progressively replaces expired payloads with committed erase events.
     /// Reused legacy keys are grouped by their newest interval before erasure.
     pub(super) async fn retire_expired_receipts(&mut self, clock: RetentionClock) -> Result<()> {

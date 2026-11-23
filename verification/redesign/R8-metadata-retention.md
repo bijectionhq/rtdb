@@ -93,6 +93,9 @@ An applied prefix remains a causal token independently of the attempt receipt.
 
 New source-log submissions store user metadata as finite-validity payloads keyed by their transaction identifiers.
 The immutable result row keeps the transaction coordinate, commit flag and structured result error.
+A newly resolved legacy-guard duplicate carries its original coordinate in the structured outcome, so historical redemption does not require keeping the expiring application key.
+A structured result error may carry application-provided context, including an assertion message.
+Redacting arbitrary historical error text is a separate policy from retiring user metadata.
 Current reads of `xt.txs.user_metadata` select the payload at the installed receipt clock, including when the requested system time is earlier.
 Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
 The collector retains a legacy key's predecessors while a newer interval of that key is still active.
