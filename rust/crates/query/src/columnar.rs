@@ -3223,7 +3223,15 @@ impl BatchCursor for BatchExpressions {
                 let next = lease.bytes().checked_add(bound).ok_or_else(size_error)?;
                 match lease.grow_to(next) {
                     Ok(()) => {
-                        if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? { columns.push(column); continue; }
+                        if let Some(column) = projection::column(kernel, &self.schema, &batch, parameters)? {
+                            if !matches!(expression, rtdb_plan::Expr::Column { .. } | rtdb_plan::Expr::RowCopy(_))
+                                && let Column::Arrow { field, array, .. } = &column
+                            {
+                                rtdb_columnar::validate_projected_decimals(field, array.as_ref())?;
+                            }
+                            columns.push(column);
+                            continue;
+                        }
                         lease.shrink_to(retained)?;
                     }
                     Err(error) if matches!(kernel, rtdb_plan::Expr::List(_)) && error.code == "rtdb/memory-budget-exceeded" => {},

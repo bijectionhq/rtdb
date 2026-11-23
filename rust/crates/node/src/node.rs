@@ -104,7 +104,7 @@ impl NodeServices {
         let search = default_search(format);
         Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
             compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
-            artefact_kinds: search.artefact_kinds, scan_accelerators: search.scan_accelerators }
+            artefact_kinds: search.artefact_kinds.into_iter().chain([Arc::new(rtdb_spatial::SpatialArtefacts) as Arc<dyn rtdb_maintenance::ArtefactKind>]).collect(), scan_accelerators: search.scan_accelerators }
     }
 }
 
@@ -2042,6 +2042,29 @@ impl OwnedReadSession {
         path: &rtdb_types::OwnedRelation, request: crate::OwnedRangeRequest<'_>, valid: Timestamp,
     ) -> Result<crate::OwnedRangePage> {
         self.range_page(&relation.in_world(world)?, path, crate::ordered_index::RowBounds::Compound(request), Some(valid)).await
+    }
+
+    /// Evaluates a spatial path at this held cut.
+    pub async fn spatial(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.spatial_projected(relation, path, request, observe, rtdb_spatial::Projection::Identities).await
+    }
+
+    /// Evaluates a spatial path and returns the requested Arrow projection at this held cut.
+    pub async fn spatial_projected(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let lease = context.catalog.read_lease();
+        let work = rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection);
+        let page = rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, work)).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((page, witness))
     }
 
     /// Reads one covered page from the named ordered path at this held cut.

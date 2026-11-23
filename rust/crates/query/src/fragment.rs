@@ -5,11 +5,13 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
+use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
 use rtdb_plan::{Scan, TemporalFilter};
 use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::columnar::{Column, ColumnBatch, compact_arrow_rows, fragment_column, nested_layout};
 use crate::context::{Execution, OuterRows, QueryContext, cancelled};
@@ -132,7 +134,15 @@ pub trait ScanFragmenter: Send + Sync {
     /// The fragment's rows as encoded by `encode_fragment` on the node it belongs to, or `None` when that node is this one.
     /// An error, like `None`, has the coordinator scan the fragment itself.
     async fn dispatch(&self, fragment: &ScanFragment) -> Result<Option<Vec<u8>>>;
+
+    async fn dispatch_reply(&self, fragment: &ScanFragment, memory: &Arc<MemoryBudget>) -> Result<Option<FragmentReply>> {
+        let Some(bytes) = self.dispatch(fragment).await? else { return Ok(None) };
+        let memory = Arc::clone(memory);
+        Ok(Some(Box::pin(async move { FragmentBytes::from_vec(bytes, &memory) })))
+    }
 }
+
+pub type FragmentReply = BoxFuture<'static, Result<FragmentBytes>>;
 
 /// Evaluates a delegated scan at the coordinator's exact captured transaction head.
 pub async fn evaluate_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<Vec<u8>> {
@@ -183,6 +193,21 @@ pub struct FragmentBytes { bytes: Vec<u8>, reservation: Arc<MemoryReservation> }
 impl FragmentBytes {
     pub(crate) fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
         Ok(Self { bytes: Vec::new(), reservation: memory.reserve(0)? })
+    }
+
+    pub fn from_vec(bytes: Vec<u8>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(bytes.capacity())?;
+        Ok(Self { bytes, reservation })
+    }
+
+    pub async fn read_from(reader: &mut (impl AsyncRead + Unpin), length: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut reservation = memory.reserve(length)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|error| invalid("fragment-decode", error))?;
+        Arc::get_mut(&mut reservation).expect("The fragment reader owns its reservation").grow_to(bytes.capacity())?;
+        bytes.resize(length, 0);
+        reader.read_exact(&mut bytes).await.map_err(|error| invalid("fragment-decode", error))?;
+        Ok(Self { bytes, reservation })
     }
 
     pub fn as_slice(&self) -> &[u8] { &self.bytes }

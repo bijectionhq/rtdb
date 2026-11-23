@@ -1,5 +1,5 @@
 use arrow_array::{
-    Array, ListArray, StructArray,
+    Array, RecordBatch, ListArray, StructArray,
     cast::AsArray,
     types::{
         Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, Int16Type, Int32Type,
@@ -17,6 +17,33 @@ pub struct ArrowCell<'a> {
 }
 
 impl<'a> ArrowCell<'a> {
+    pub fn named(batch: &'a RecordBatch, name: &str, row: usize) -> Option<Self> {
+        let (index, field) = batch.schema_ref().column_with_name(name)?;
+        Some(Self {
+            field,
+            array: batch.column(index).as_ref(),
+            row,
+        })
+    }
+
+    pub fn int64(self) -> Option<i64> {
+        let Self { field, array, row } = self.physical().ok()?;
+        if field.data_type() != &DataType::Int64
+            || field.metadata().contains_key(crate::EXTENSION_NAME_KEY)
+            || array.is_null(row)
+        {
+            return None;
+        }
+        Some(array.as_primitive::<Int64Type>().value(row))
+    }
+
+    pub fn list(self) -> Option<impl ExactSizeIterator<Item = Self> + 'a> {
+        if self.sequence_kind() != Some(ListKind::List) {
+            return None;
+        }
+        self.sequence()
+    }
+
     pub fn signed_integer(self) -> Option<i64> {
         use arrow_array::{cast::AsArray, types::*};
         use arrow_schema::DataType;

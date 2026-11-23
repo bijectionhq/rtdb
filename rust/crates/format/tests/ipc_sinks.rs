@@ -11,6 +11,29 @@ fn page() -> RecordBatch {
 }
 
 #[test]
+fn owned_ipc_reuses_aligned_message_values_and_retains_their_reservation() {
+    use arrow_buffer::Buffer;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_format::ipc::OwnedStream;
+
+    let batch = page();
+    let encoded = Buffer::from(write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap());
+    let start = encoded.as_ptr() as usize;
+    let within = start..start + encoded.len();
+    let memory = MemoryBudget::new(1 << 20);
+    let stream = OwnedStream::read_buffer(encoded.clone(), &memory).unwrap();
+    let values = Arc::clone(stream.pages()[0].batch().column(0));
+    drop(stream);
+    let values_view = values.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(within.contains(&(values_view.values().as_ptr() as usize)));
+    assert_eq!(values_view.values().as_ref(), &[1, 2, 3]);
+    assert!(memory.used_bytes() > 0);
+    drop(values);
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(OwnedStream::read_buffer(encoded.slice_with_length(0, encoded.len() - 8), &memory).is_err());
+}
+
+#[test]
 fn owned_stream_admits_wide_arrow_batches_without_row_value_materialization() {
     use arrow_array::ArrayRef;
     use rtdb_columnar::MemoryBudget;

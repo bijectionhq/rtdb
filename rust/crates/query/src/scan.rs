@@ -9,7 +9,7 @@ use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{data::PutText, ipc::{PageDecoder, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
@@ -112,6 +112,34 @@ impl DataFile {
         let layout = Arc::new(CachedLayout { decoder, _reservation: Arc::clone(&opening), _dictionaries: dictionaries });
         Ok((layout, opening))
     }
+}
+
+#[doc(hidden)]
+pub async fn visit_trie_iids(
+    context: &crate::QueryContext, storage: Arc<BufferPool>, slug: &TableSlug, trie: &TrieKey,
+    mut visit: impl FnMut(Iid) -> Result<()>,
+) -> Result<()> {
+    context.check_cancelled()?;
+    let mut file = DataFile {
+        storage, key: ObjectKey::new(slug.data_key(trie))?,
+        metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
+    };
+    let pages = file.open(&context.memory).await?.layout.decoder.page_count();
+    for page in 0..pages {
+        context.check_cancelled()?;
+        let (events, _charged) = match file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+            Some(held) => (held.batch.view().clone(), context.memory.reserve(held.bound)?),
+            None => {
+                let (batch, charge) = file.decode_page(page, &context.memory).await?;
+                (EventBatch::new(batch)?, charge)
+            }
+        };
+        for row in 0..events.len() {
+            context.check_cancelled_at(row)?;
+            visit(events.iid(row)?)?;
+        }
+    }
+    Ok(())
 }
 
 fn page_buffer(bytes: CacheLease) -> Buffer {
@@ -430,20 +458,21 @@ struct Fragment { request: Arc<ScanFragment>, fallback: PartitionScan, state: Fr
 enum FragmentState { Pending, Dispatched(Dispatch), Remote(VecDeque<crate::columnar::ColumnBatch>), Local }
 
 /// A dispatch in flight, abandoned with the scan.
-struct Dispatch(tokio::task::JoinHandle<Result<Option<Vec<u8>>>>);
+struct Dispatch(tokio::task::JoinHandle<Result<Option<crate::FragmentReply>>>);
 impl Drop for Dispatch { fn drop(&mut self) { self.0.abort(); } }
 
 impl Fragment {
-    fn dispatch(&mut self, fragmenter: &Arc<dyn ScanFragmenter>) {
+    fn dispatch(&mut self, fragmenter: &Arc<dyn ScanFragmenter>, memory: &Arc<MemoryBudget>) {
         if !matches!(self.state, FragmentState::Pending) { return; }
         let (fragmenter, request) = (Arc::clone(fragmenter), Arc::clone(&self.request));
-        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(async move { fragmenter.dispatch(&request).await })));
+        let memory = Arc::clone(memory);
+        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(async move { fragmenter.dispatch_reply(&request, &memory).await })));
     }
     async fn next_batch(&mut self, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
         if let FragmentState::Dispatched(dispatch) = &mut self.state {
             let answer = (&mut dispatch.0).await;
             self.state = match answer {
-                Ok(Ok(Some(bytes))) => match crate::fragment::decode_batches(&bytes, memory) {
+                Ok(Ok(Some(reply))) => match reply.await.and_then(|bytes| crate::fragment::decode_batches(bytes.as_slice(), memory)) {
                     Ok(batches) => FragmentState::Remote(batches.into()),
                     Err(_) => FragmentState::Local,
                 },
@@ -632,7 +661,7 @@ impl ScanCursor {
     pub(crate) async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         // Every fragment is dispatched at the first pull, so the nodes they belong to read them side by side.
         if let Some(fragmenter) = self.fragmenter.take() {
-            for part in &mut self.parts { if let Part::Fragment(fragment) = part { fragment.dispatch(&fragmenter); } }
+            for part in &mut self.parts { if let Part::Fragment(fragment) = part { fragment.dispatch(&fragmenter, &self.memory); } }
         }
         while let Some(part) = self.parts.front_mut() {
             let batch = match part { Part::Local(partition) => partition.next_batch().await?, Part::Fragment(fragment) => fragment.next_batch(&self.memory).await?,

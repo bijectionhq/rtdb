@@ -1,10 +1,10 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_buffer::Buffer;
-use arrow_ipc::{reader::{StreamReader, read_record_batch}, writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter}};
+use arrow_ipc::{reader::{StreamDecoder, read_record_batch}, writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter}};
 use arrow_schema::{Schema, SchemaRef};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Result, Value};
@@ -210,18 +210,21 @@ impl SpillReader {
     pub fn read_arrow(&mut self, allow_empty: bool, error: &str) -> Result<Option<OwnedBatch>> {
         let Some((bytes, mut reservation)) = self.read_frame(6)? else { return Ok(None); };
         let ipc_error = |cause: arrow_schema::ArrowError| invalid(error, cause);
-        let mut ipc = StreamReader::try_new(Cursor::new(bytes), None).map_err(ipc_error)?;
-        let batch = ipc.next().ok_or_else(|| invalid("invalid-spill", "Arrow spill frame contains no batch"))?.map_err(ipc_error)?;
-        if (!allow_empty && batch.num_rows() == 0) || ipc.next().transpose().map_err(ipc_error)?.is_some() {
+        let mut bytes = Buffer::from_vec(bytes);
+        let mut ipc = StreamDecoder::new();
+        let batch = ipc.decode(&mut bytes).map_err(ipc_error)?
+            .ok_or_else(|| invalid("invalid-spill", "Arrow spill frame contains no batch"))?;
+        if (!allow_empty && batch.num_rows() == 0) || ipc.decode(&mut bytes).map_err(ipc_error)?.is_some() || !bytes.is_empty() {
             return Err(invalid("invalid-spill", "Arrow spill frame must contain exactly one admissible batch"));
         }
+        ipc.finish().map_err(ipc_error)?;
         drop(ipc);
         let overflow = || invalid(error, "Arrow spill size overflow");
         let schema = batch.schema_ref().fields().iter().try_fold(256usize, |bytes, field| {
             field.size().checked_mul(4).and_then(|size| bytes.checked_add(size))
                 .and_then(|bytes| bytes.checked_add(std::mem::size_of::<crate::columnar::Column>())).ok_or_else(overflow)
         })?;
-        let bytes = batch.get_array_memory_size().checked_add(schema).ok_or_else(overflow)?;
+        let bytes = rtdb_columnar::shared_allocation_size(&batch)?.checked_add(schema).ok_or_else(overflow)?;
         let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
         if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
         OwnedBatch::with_reservation(batch, reservation).map(Some)

@@ -2303,6 +2303,9 @@ rule RefineKeyForLargeDeployments {
     -- The request identifies the coordinator's opened storage residence and replica epoch.
     -- The router and the executor each check that identity against their own authority.
     -- The executor holds the captured snapshot until admitted provider reads have completed.
+    -- A reader sends length-framed Arrow IPC when the coordinator advertises binary reply support.
+    -- Readers execute concurrently and the coordinator admits each binary reply against query memory before receiving its body in fragment order.
+    -- A coordinator can read the earlier base64 reply during a rolling upgrade.
     when: ScanPlanned(deployment, scan)
 
     requires: deployment.cache_bytes > PerMemberCacheShare()

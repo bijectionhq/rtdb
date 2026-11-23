@@ -73,12 +73,10 @@ fn membership_key(input: &Schema,dependent: &Schema,comparison: &Expr) -> Option
 }
 
 pub(crate) fn batch_membership_keys(input: &Schema, dependent: &Schema, comparison: &Expr) -> Option<(usize, usize)> {
-    use rtdb_types::ScalarType as S;
     let MarkKeys::Membership { probe, candidate } = membership_key(input, dependent, comparison)? else { return None; };
     let probe_type = &input.fields()[probe].data_type;
     let candidate_type = &dependent.fields()[candidate].data_type;
-    let scalar = |ty: &LogicalType| ty.legs().into_iter().all(|leg| matches!(leg,
-        LogicalType::Null | LogicalType::Scalar(S::Bool | S::I8 | S::I16 | S::I32 | S::I64 | S::F32 | S::F64 | S::Utf8 | S::Binary)));
+    let scalar = |ty: &LogicalType| ty.legs().into_iter().all(|leg| matches!(leg, LogicalType::Null | LogicalType::Scalar(_)));
     (scalar(probe_type) && scalar(candidate_type) && rtdb_plan::validate_equality_types(probe_type, candidate_type).is_ok())
         .then_some((probe, candidate))
 }
@@ -269,8 +267,8 @@ impl MembershipSpill {
 
 fn membership_hash(batch: &ColumnBatch, row: usize, key: usize, context: &crate::QueryContext) -> Result<u32> {
     let column = &batch.columns[key];
-    if let Some(key) = crate::scalar_key::ScalarKey::read(column, row) {
-        return Ok(crate::join_storage::combine_cell_hash(0, key.hash() as i32));
+    if let Some(hash) = crate::set_keys::vector_cell_hash(column, row) {
+        return Ok(crate::join_storage::combine_cell_hash(0, hash));
     }
     let _scratch = context.memory.reserve(column.bound(row)?)?;
     hash_values(std::iter::once(&column.value(row)?))

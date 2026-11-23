@@ -1081,6 +1081,11 @@ impl ObjectStore for EncryptingStore {
         let exact = object::sealed_size(key, length)?;
         self.open(key, self.inner.get_fresh_exact(key, exact).await?)
     }
+    fn exact_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        let sealed = object::sealed_size(key, length)?;
+        let scratch_bytes = sealed.checked_mul(3).ok_or_else(|| Error::Task("Encrypted object allocation size overflow".into()))?;
+        Ok(ObjectReadAllocation { retained_bytes: sealed, scratch_bytes })
+    }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         let exact = object::sealed_size(key, length)?;
         let observed = self.inner.observe_fresh_exact(key, exact).await?;
@@ -2217,6 +2222,23 @@ mod tests {
         assert!(unsupported.audience.is_none());
         let stale = factory.wrap_stores(&configuration(Some(1)), cached, Some(uncached)).await.unwrap();
         assert!(stale.audience.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_encrypted_posting_reads_admit_scratch_and_require_the_recorded_size() {
+        let store = Arc::new(EncryptingStore::new(Arc::new(MemoryStore::default()), &[7; 32]).unwrap());
+        let key = key("tables/orders/artefacts/l00-b00/spatial/geo-v1.bin");
+        let bytes = Bytes::from_static(b"spatial postings");
+        store.put(&key, bytes.clone()).await.unwrap();
+        let allocation = store.exact_object_allocation(&key, bytes.len()).unwrap();
+        let peak = allocation.retained_bytes + allocation.scratch_bytes;
+        let fallback = rtdb_columnar::MemoryBudget::new(0);
+        let too_small = rtdb_storage::cache::BufferPool::new(store.clone(), peak - 1);
+        assert!(matches!(too_small.get_exact_or(&key, bytes.len(), &fallback).await, Err(Error::MemoryLimit { .. })));
+        let pool = rtdb_storage::cache::BufferPool::new(store, peak);
+        assert_eq!(pool.get_exact_or(&key, bytes.len(), &fallback).await.unwrap().as_slice(), bytes.as_ref());
+        assert!(pool.get_exact_or(&key, bytes.len() - 1, &fallback).await.is_err());
+        assert_eq!(pool.pool_retained_bytes(), 0);
     }
 
     #[tokio::test]

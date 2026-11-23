@@ -1933,6 +1933,7 @@ surface QueryAccess {
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
         -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
+        -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
@@ -1947,6 +1948,7 @@ surface QueryAccess {
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
+        -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
         -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
         -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.

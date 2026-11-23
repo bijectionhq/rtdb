@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use base64::Engine;
+use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{Directory, MemberId, MemberPool, MemberRecord, now_ms};
-use rtdb_query::{FragmentDepth, ScanFragment, ScanFragmenter, TriePrefix};
+use rtdb_query::{FragmentDepth, FragmentReply, ScanFragment, ScanFragmenter, TriePrefix};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef};
 
-use crate::control::{self, Request, Response};
+use crate::control::{self, Request};
 
 #[derive(Clone, Debug)]
 pub struct FragmentOptions {
@@ -55,12 +55,12 @@ pub struct CellFragmenter {
     above_bytes: AtomicU64,
     depth: FragmentDepth,
     timeout: Duration,
-    failures: AtomicU64,
+    failures: Arc<AtomicU64>,
 }
 
 impl CellFragmenter {
     pub fn new(directory: Arc<dyn Directory>, object_namespace: uuid::Uuid, options: &FragmentOptions, cache_bytes: u64, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, object_namespace, secret, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: AtomicU64::new(0) })
+        Arc::new(Self { directory, object_namespace, secret, member: OnceLock::new(), above_bytes: AtomicU64::new(options.above_bytes.unwrap_or(cache_bytes)), depth: options.depth, timeout: options.timeout, failures: Arc::new(AtomicU64::new(0)) })
     }
 
     /// Names this node once its lease is registered; until then, every fragment is read here.
@@ -86,15 +86,6 @@ impl CellFragmenter {
         Ok(first.filter(|first| first.id != *me).and_then(|first| first.control_address.clone()))
     }
 
-    async fn read_on(&self, control_address: &str, fragment: &ScanFragment) -> Result<Vec<u8>> {
-        let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-cell-secret", "Fragments are read elsewhere only in a cell with a secret"))?;
-        let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone(), grant: secret.node_grant(fragment.database()) };
-        match control::call(control_address, &request, self.timeout, &control::ControlKey(self.secret.clone())).await? {
-            Response::Fragment { batches } => base64::engine::general_purpose::STANDARD.decode(batches).map_err(|error| Anomaly::fault("rtdb.multi/fragment-response", error.to_string())),
-            Response::Refused { code, message } => Err(Anomaly::new(AnomalyCategory::Unavailable, code, message)),
-            other => Err(Anomaly::fault("rtdb.multi/fragment-response", format!("A reader answered a fragment with {other:?}"))),
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -104,9 +95,25 @@ impl ScanFragmenter for CellFragmenter {
     }
 
     async fn dispatch(&self, fragment: &ScanFragment) -> Result<Option<Vec<u8>>> {
-        let Some(control_address) = self.place(fragment).await? else { return Ok(None) };
-        let read = self.read_on(&control_address, fragment).await;
-        if read.is_err() { self.failures.fetch_add(1, Ordering::Relaxed); }
-        read.map(Some)
+        let memory = MemoryBudget::new(control::MAXIMUM_FRAGMENT_BYTES as usize + 8);
+        let Some(reply) = self.dispatch_reply(fragment, &memory).await? else { return Ok(None) };
+        Ok(Some(reply.await?.into_bytes()))
+    }
+
+    async fn dispatch_reply(&self, fragment: &ScanFragment, memory: &Arc<MemoryBudget>) -> Result<Option<FragmentReply>> {
+        let Some(address) = self.place(fragment).await? else { return Ok(None) };
+        let secret = self.secret.as_ref().ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-cell-secret", "Fragments are read elsewhere only in a cell with a secret"))?;
+        let request = Request::ScanFragment { name: fragment.database().to_owned(), fragment: fragment.clone(), grant: secret.node_grant(fragment.database()) };
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let stream = control::start_fragment(&address, request, deadline, &control::ControlKey(self.secret.clone())).await.inspect_err(|_| {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        })?;
+        let memory = Arc::clone(memory);
+        let failures = Arc::clone(&self.failures);
+        Ok(Some(Box::pin(async move {
+            control::receive_fragment(stream, &address, deadline, &memory).await.inspect_err(|_| {
+                failures.fetch_add(1, Ordering::Relaxed);
+            })
+        })))
     }
 }

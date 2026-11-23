@@ -1,6 +1,10 @@
 use std::sync::Arc;
+use arrow_array::Array;
+use arrow_buffer::i256;
 use arrow_schema::{DataType, Field, Schema, UnionFields};
 use rtdb_types::{Anomaly, Result};
+
+use crate::ArrowCell;
 
 /// Reserved native field metadata; external Arrow schemas must reject this key on ingress.
 pub const INTERNAL_DECIMAL_SCALE_KEY: &str = "rtdb:internal:decimal-scale-i32";
@@ -51,6 +55,43 @@ pub fn decimal_field_parameters(field: &Field) -> Result<Option<DecimalParameter
 
 /// Reads the true scale of a native field, validating both logical decimal parameters.
 pub fn decimal_scale(field: &Field) -> Result<Option<i32>> { Ok(decimal_field_parameters(field)?.map(|parameters| parameters.scale)) }
+
+/// Validates the decimal coefficients in a computed Arrow result, including reachable nested cells.
+pub fn validate_projected_decimals(field: &Field, array: &dyn Array) -> Result<()> {
+    fn has_decimal(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Struct(fields) => fields.iter().any(|field| has_decimal(field.data_type())),
+            DataType::Union(fields, _) => fields.iter().any(|(_, field)| has_decimal(field.data_type())),
+            DataType::List(field) | DataType::FixedSizeList(field, _) | DataType::Map(field, _)
+            | DataType::RunEndEncoded(_, field) => has_decimal(field.data_type()),
+            _ => decimal_parameters(data_type).is_some(),
+        }
+    }
+
+    fn validate(cell: ArrowCell<'_>) -> Result<()> {
+        if !has_decimal(cell.field.data_type()) { return Ok(()); }
+        let cell = cell.physical()?;
+        if cell.is_null()? { return Ok(()); }
+        if let Some(mut children) = cell.structure() { return children.try_for_each(validate); }
+        if let Some(mut children) = cell.sequence() { return children.try_for_each(validate); }
+        let Some((parameters, mut coefficient)) = cell.decimal_coefficient()? else { return Ok(()); };
+        let precision = parameters.precision;
+        if precision >= 77 { return Ok(()); }
+        if precision > 0 {
+            let width = usize::from(parameters.bit_width / 8);
+            let start = coefficient.len() - width;
+            let sign = if coefficient[start] & 0x80 == 0 { 0 } else { 0xff };
+            coefficient[..start].fill(sign);
+            let coefficient = i256::from_be_bytes(coefficient);
+            let limit = i256::from_i128(10).wrapping_pow(precision as u32);
+            if coefficient > -limit && coefficient < limit { return Ok(()); }
+        }
+        Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"))
+    }
+
+    if !has_decimal(field.data_type()) { return Ok(()); }
+    (0..array.len()).try_for_each(|row| validate(ArrowCell { field, array, row }))
+}
 
 /// Attaches logical parameters after the caller has established matching physical decimal storage.
 pub fn with_decimal_parameters(mut field: Field, parameters: DecimalParameters) -> Result<Field> {

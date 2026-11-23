@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -179,6 +180,8 @@ impl PageDecoder {
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
+
+    pub fn page_count(&self) -> usize { self.blocks.len() }
 
     fn block(&self, page: usize) -> Result<&arrow_ipc::Block> {
         self.blocks.get(page).ok_or_else(|| invalid(format!("Page {page} is outside its Arrow file")))
@@ -376,18 +379,9 @@ impl<R: Read> ArrowStream<R> {
     }
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.projected) }
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        while let Some((mut metadata, body)) = read_message(&mut self.reader)? {
-            let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
-            validate_lz4_lengths(&message, &body)?;
-            nulls::normalize(&mut metadata, &body, &self.schema)?;
-            let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
+        while let Some((metadata, body)) = read_message(&mut self.reader)? {
             let body = if body.is_empty() { Buffer::default() } else { Buffer::from(body) };
-            if let Some(batch) = message.header_as_record_batch() {
-                return arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(&self.schema), &self.dictionaries, self.projection.as_deref(), &message.version()).map(Some).map_err(invalid);
-            }
-            if let Some(dictionary) = message.header_as_dictionary_batch() {
-                arrow_ipc::reader::read_dictionary(&body, dictionary, &self.schema, &mut self.dictionaries, &message.version()).map_err(invalid)?;
-            } else { return Err(invalid("Unexpected Arrow stream message")); }
+            if let Some(batch) = decode_stream_batch(Cow::Owned(metadata), &body, &self.schema, &mut self.dictionaries, self.projection.as_deref())? { return Ok(Some(batch)); }
         }
         Ok(None)
     }
@@ -441,9 +435,48 @@ impl OwnedStream {
         Ok(Self { schema, pages, _reservation: reservation })
     }
 
+    pub fn read_buffer(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(stream_bound(&bytes, true, arrow_descriptors)?)?;
+        let mut position = 0;
+        let (header, body) = stream_message(&bytes, &mut position)?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
+        if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
+        let schema = decoded_schema::adapt(&Arc::new(read_schema_header(header)?))?;
+        let mut dictionaries = HashMap::new();
+        let mut pages = Vec::new();
+        while let Some((header, body)) = stream_message(&bytes, &mut position)? {
+            let body = bytes.slice_with_length(body.start, body.len());
+            if let Some(batch) = decode_stream_batch(Cow::Borrowed(header), &body, &schema, &mut dictionaries, None)? {
+                pages.push(OwnedBatch::with_reservation(batch, Arc::clone(&reservation))?);
+            }
+        }
+        Ok(Self { schema, pages, _reservation: reservation })
+    }
+
     pub fn schema(&self) -> &SchemaRef { &self.schema }
     pub fn pages(&self) -> &[OwnedBatch] { &self.pages }
     pub fn into_pages(self) -> Vec<OwnedBatch> { self.pages }
+}
+
+fn decode_stream_batch(
+    mut metadata: Cow<'_, [u8]>, body: &Buffer, schema: &SchemaRef,
+    dictionaries: &mut HashMap<i64, ArrayRef>, projection: Option<&[usize]>,
+) -> Result<Option<RecordBatch>> {
+    let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
+    validate_lz4_lengths(&message, body)?;
+    let data = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()));
+    if let Some(data) = data {
+        let nodes = data.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
+        if nodes.iter().any(|node| node.null_count() < 0) {
+            nulls::normalize(metadata.to_mut(), body, schema)?;
+        }
+    }
+    let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
+    if let Some(batch) = message.header_as_record_batch() {
+        return arrow_ipc::reader::read_record_batch(body, batch, Arc::clone(schema), dictionaries, projection, &message.version()).map(Some).map_err(invalid);
+    }
+    let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Unexpected Arrow stream message"))?;
+    arrow_ipc::reader::read_dictionary(body, dictionary, schema, dictionaries, &message.version()).map_err(invalid)?;
+    Ok(None)
 }
 
 fn row_descriptors(rows: usize) -> Result<usize> { allocation_mul(allocation_add(rows, 1)?, 4096) }
@@ -541,21 +574,26 @@ fn stream_bound(bytes: &[u8], terminated: bool, field_bound: fn(usize) -> Result
     let mut position = 0;
     let mut bound = 8192;
     while position < bytes.len() {
-        let mut length = inspection_i32(bytes, &mut position)?;
-        if length == -1 { length = inspection_i32(bytes, &mut position)?; }
-        if length == 0 {
+        let Some((header, body)) = stream_message(bytes, &mut position)? else {
             if terminated && position != bytes.len() { return Err(invalid("Bytes follow IPC stream end marker")); }
             return Ok(bound);
-        }
-        let end = allocation_add(position, usize::try_from(length).map_err(invalid)?)?;
-        let header = bytes.get(position..end).ok_or_else(|| invalid("Arrow stream metadata is truncated"))?;
-        let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
-        let body_end = allocation_add(end, usize::try_from(message.bodyLength()).map_err(invalid)?)?;
-        let body = bytes.get(end..body_end).ok_or_else(|| invalid("Arrow stream body is truncated"))?;
-        bound = allocation_add(bound, framed_message_bound(header, body, header.len(), field_bound)?)?;
-        position = body_end;
+        };
+        bound = allocation_add(bound, framed_message_bound(header, &bytes[body], header.len(), field_bound)?)?;
     }
     if terminated { Err(invalid("IPC stream has no end marker")) } else { Ok(bound) }
+}
+
+fn stream_message<'a>(bytes: &'a [u8], position: &mut usize) -> Result<Option<(&'a [u8], std::ops::Range<usize>)>> {
+    let mut length = inspection_i32(bytes, position)?;
+    if length == -1 { length = inspection_i32(bytes, position)?; }
+    if length == 0 { return Ok(None); }
+    let end = allocation_add(*position, usize::try_from(length).map_err(invalid)?)?;
+    let header = bytes.get(*position..end).ok_or_else(|| invalid("Arrow stream metadata is truncated"))?;
+    let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
+    let body_end = allocation_add(end, usize::try_from(message.bodyLength()).map_err(invalid)?)?;
+    if body_end > bytes.len() { return Err(invalid("Arrow stream body is truncated")); }
+    *position = body_end;
+    Ok(Some((header, end..body_end)))
 }
 
 /// Bounds the footer, dictionaries and all record batches decoded from an immutable IPC file.

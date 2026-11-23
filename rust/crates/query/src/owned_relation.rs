@@ -526,13 +526,71 @@ pub fn owned_row_revision(
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum OwnedSpatialProjection<'a> {
+    Identities,
+    Documents,
+    SelectedDocuments(&'a [&'a str]),
+}
+
+impl OwnedSpatialProjection<'_> {
+    pub fn has_documents(self) -> bool { !matches!(self, Self::Identities) }
+
+    pub fn includes(self, field: &str) -> bool {
+        match self {
+            Self::Identities => false,
+            Self::Documents => true,
+            Self::SelectedDocuments(columns) =>
+                matches!(field, "_id" | "_system_from") || columns.contains(&field),
+        }
+    }
+}
+
+/// Scans resolved rows of a held owned relation for spatial refinement.
+pub async fn open_owned_spatial_scan(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    geometry: Option<&str>, partition: &[String], valid_at: Timestamp,
+    iids: std::collections::BTreeSet<Iid>, projection: OwnedSpatialProjection<'_>,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || relation.world().is_some() || relation.is_world_catalog() {
+        return Err(address_unavailable());
+    }
+    if iids.is_empty() { return Ok(None); }
+    let name = QualifiedTable {
+        database: context.catalog.default_database().to_owned(), table: relation.table(owner),
+    };
+    let context = context.for_owned_relation(name.clone(), None);
+    let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
+    let mut fields = vec!["_id"];
+    fields.extend(geometry);
+    fields.extend(partition.iter().map(String::as_str));
+    if projection.has_documents() {
+        for name in table.columns.keys().map(String::as_str).chain(["_system_from"]) {
+            if projection.includes(name) && !fields.contains(&name) { fields.push(name); }
+        }
+    }
+    let columns = fields.into_iter().enumerate().map(|(index, name)| Field {
+            id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false,
+            unnamed: false, data_type: table.scan_column_type(name),
+        }).collect::<Vec<_>>();
+    let scan = Arc::new(Relation::scan(Scan {
+        table, columns,
+        valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
+            value: valid_at.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
+        })),
+        system_time: TemporalFilter::Default, clamp_valid_time: false, iids: Some(iids),
+        predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
+    })?);
+    PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
+}
+
 /// Reads the fixed protected path catalog shape for engine maintenance and resolution.
 pub async fn open_owned_path_catalog(
     context: Arc<QueryContext>,
     catalog: &TableRef,
     path: Option<&str>,
 ) -> Result<Option<QueryCursor>> {
-    if !catalog.is_owned_path_catalog() && !catalog.is_owned_search_catalog() {
+    if !catalog.is_owned_path_catalog() && !catalog.is_owned_search_catalog() && !catalog.is_owned_spatial_catalog() {
         return Err(Anomaly::incorrect("rtdb.owned/path-catalog", "Expected an owned path catalog"));
     }
     open_private_catalog(

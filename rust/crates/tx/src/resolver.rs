@@ -857,9 +857,13 @@ impl<'a> OpenTransaction<'a> {
             Operation::Public(TxOp::OwnedDeclareUniquePath { relation, name, column }) =>
                 self.declare_owned_unique_path(relation, name, column).await,
             Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns }) =>
-                self.declare_owned_path(relation, name, columns, false).await,
+                self.declare_owned_path(relation, name, columns, OwnedPathKind::Ordered).await,
+            Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
+                self.drop_owned_spatial_path(relation, name).await,
+            Operation::Public(TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
+                self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
-                self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
+                self.declare_owned_path(relation, name, std::slice::from_ref(column), OwnedPathKind::Search).await,
             Operation::Public(TxOp::HostedConstraintRefusal) => {
                 Err(Anomaly::incorrect("rtdb.hosted/constraint-receipt", "Unexpected refusal boundary"))
             }
@@ -1028,17 +1032,52 @@ impl<'a> OpenTransaction<'a> {
         rtdb_query::read_owned_relation_schema(context, owner, relation).await
     }
 
+    async fn drop_owned_spatial_path(
+        &mut self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+    ) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        let catalog = rtdb_types::OwnedRelation::spatial_catalog(owner);
+        let target = relation.table(owner);
+        let snapshot = self.snapshot()?;
+        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let Some(mut cursor) = rtdb_query::open_owned_path_catalog(context, &catalog, Some(path.name())).await? else {
+            return Ok(());
+        };
+        let mut present = false;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            for row in 0..batch.num_rows() {
+                let cell = |index| rtdb_columnar::read_value(batch.schema_ref().field(index), batch.column(index).as_ref(), row);
+                if present
+                    || !matches!(cell(0)?, Value::Utf8(name) if name == path.name())
+                    || !matches!(cell(1)?, Value::Utf8(name) if name == target.schema)
+                    || !matches!(cell(2)?, Value::Utf8(name) if name == target.table)
+                {
+                    return Err(Anomaly::incorrect("rtdb.owned/spatial-path", "Spatial path belongs to another relation"));
+                }
+                present = true;
+            }
+        }
+        if present { self.buffer.delete(catalog, &rtdb_types::EntityId::String(path.name().into()), Interval::ALL)?; }
+        Ok(())
+    }
+
     async fn declare_owned_path(
         &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation,
-        columns: &[String], search: bool,
+        columns: &[String], kind: OwnedPathKind,
     ) -> Result<()> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let target = relation.table(owner);
-        if search && self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
+        if kind != OwnedPathKind::Ordered && self.owned_changes.get(relation.name()).is_some_and(|group| group.erased) {
             return Err(purge_path_uncovered());
         }
-        let catalog = if search { rtdb_types::OwnedRelation::search_catalog(owner) } else { rtdb_types::OwnedRelation::path_catalog(owner) };
+        let catalog = match kind {
+            OwnedPathKind::Search => rtdb_types::OwnedRelation::search_catalog(owner),
+            OwnedPathKind::Ordered => rtdb_types::OwnedRelation::path_catalog(owner),
+            OwnedPathKind::Spatial => rtdb_types::OwnedRelation::spatial_catalog(owner),
+        };
         let declaration = self.read_owned_schema(owner, relation).await?;
         let snapshot = self.snapshot()?;
         if declaration.is_none() && !snapshot.contains_table(&target) {
@@ -1046,7 +1085,14 @@ impl<'a> OpenTransaction<'a> {
         }
         let declared_type = |name: &str| declaration.as_ref().and_then(|(schema, _)| schema.path_column_type(name));
         let available = snapshot.column_names(&target);
-        if search {
+        if kind == OwnedPathKind::Spatial {
+            if !(1..=16).contains(&columns.len())
+                || columns.iter().collect::<std::collections::BTreeSet<_>>().len() != columns.len()
+                || columns.iter().any(|column| column.starts_with('_') || declared_type(column) != Some(rtdb_types::ScalarType::Binary))
+            {
+                return Err(Anomaly::incorrect("rtdb.owned/spatial-path-columns", "Owned spatial paths require distinct declared Binary columns, geometry first"));
+            }
+        } else if kind == OwnedPathKind::Search {
             let [column] = columns else { return Err(invalid_search_path_column()); };
             let clear = if declaration.is_some() {
                 declared_type(column) == Some(rtdb_types::ScalarType::Utf8)
@@ -2481,6 +2527,13 @@ async fn require_empty_insert(mut cursor: QueryCursor) -> Result<()> {
 
 fn insert_exists() -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.tx/exists", "Insert overlaps an existing document")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnedPathKind {
+    Ordered,
+    Search,
+    Spatial,
 }
 
 fn invalid_search_path_column() -> Anomaly {

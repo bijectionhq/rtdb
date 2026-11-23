@@ -1,0 +1,94 @@
+= Arrow serialization audit
+
+This inventory follows the native geospatial path from Bijection's clear Root invocation through RTDB's owned actions, primary pages, spatial postings, and held result pages.
+
+[cols="1,2,2",options="header"]
+|===
+| Path | Avoidable conversion | Current path
+
+| Bijection write admission
+| The admission check serialized admitted geometry to WKB and discarded the bytes.
+| Admission checks the geometry model.
+The writer appends WKB into the location carrier after its tag and optional position accuracy.
+
+| Bijection spatial pagination
+| Every page encoded the same query geometry and canonical scalar partition values and rebuilt Arrow filters.
+| The invocation prepares the filter columns once and shares their buffers across page requests.
+Each page adds its own continuation, bound, and observation flag.
+
+| Spatial Flight request decode
+| The stream reader copied each message body into a new allocation after Flight had already received it.
+| The decoder retains the received allocation and reads messages from buffer slices.
+
+| Held exact-key lookup
+| The handler converted a binary key and its valid-time parameter through a generic document map.
+| It reads the valid time directly and decodes the selected identity cell.
+
+| RTDB partition refinement
+| The action cloned the region and partition values, and the scan cloned partition bytes into scalar expression values.
+| The request borrows the Arrow cells and compares the partition columns on the resolved Arrow row.
+
+| RTDB spatial posting build
+| Covering keys and IIDs accumulated in row records before conversion to Arrow for IPC.
+| The lane appends directly to typed Arrow columns and sorts row positions, then gathers each persisted page in order.
+
+| RTDB held and maintenance path catalog
+| The catalog reader materialized generic values and a list tree to resolve the spatial definition.
+| It reads the path name, table, columns, and generation from typed Arrow cells.
+
+| RTDB spatial posting read
+| The file reader copied individual page bodies from the cached IPC allocation.
+| Validated page ranges become Arrow buffer slices of the existing cache lease.
+
+| RTDB held document projection
+| The scan selected a separate one-row document batch for each provisional hit and copied those rows again into the result.
+| Selection retains the source pages and winning positions.
+The response gathers the final rows once and reuses the identifier buffers when their layout conforms to the existing wire schema.
+
+| RTDB held document transport
+| Full document replies gathered and serialized geometry and index carriers that Bijection discarded on receipt.
+| Bijection prepares the document columns from its held layout, and the projected Flight action gathers just those columns, identity, and revision.
+Refinement reads its geometry and partition columns from the held Arrow pages.
+An unrestricted projected read skips the geometry column unless the client requests it.
+The projected reply carries the identity once and associates the document by its Arrow row position.
+
+| Bijection held reply decode
+| Message decoding copied the returned IPC body, and document identity checks and pagination re-encoded the received addresses.
+| The decoder consumes the owned reply buffer, and the spatial page validates and reuses the original canonical address text.
+|===
+
+Arrow IPC provides the Flight and persisted posting representations.
+IPC decompression and alignment, legacy metadata normalization, and ordered gathering can allocate buffers for their physical layouts.
+The geometry kernel consumes the geometry carrier for coverings and exact predicates.
+Bijection converts application values at its API boundary and preserves their canonical images for document semantics.
+Owned action headers carry authorization, framing, and held-read controls.
+
+== Remaining conversions
+
+[cols="1,3",options="header"]
+|===
+| Path | Remaining conversion
+
+| Clear Root geometry writes
+| Create and grouped commit actions decode the received Arrow batch into document maps before the transaction source rebuilds document columns.
+Geometry and partition binary payloads pass through the row representation even though the spatial lane reads them from Arrow.
+
+| Spatial path declaration and removal
+| Declaration reads one Arrow row through the generic document adapter before creating the ordered control operation.
+The resolver materializes the existing catalog fields and column list for an idempotent declaration, and the fields used to find a drop target.
+Index construction and held reads already borrow the same catalog fields from Arrow.
+
+| Held identity projection
+| An identity-only reply reconstructs its outer ID vector from native hit identities.
+The document projections can reuse the gathered identity vector when its Arrow layout conforms to the wire schema.
+The legacy full-document reply also carries the identity in the document struct.
+
+| Stateless pagination
+| The client can reuse Arrow filter buffers, and the current wire request still sends the unchanged filter payload on each page.
+The server decodes the query geometry again when each request arrives.
+
+| Unindexed trie fallback
+| A fallback scan can copy a selected page when its cache lease slices a larger allocation.
+The copy lets the page release the rest of that allocation.
+A complete posting object and its Arrow pages use retained buffer slices.
+|===

@@ -200,6 +200,7 @@ const OWNED_SCHEMA_PREFIX: &str = "rtdb_owned_";
 const OWNED_SCHEMA_V1: &str = "rtdb_owned_v1";
 const OWNED_PATH_CATALOG: &str = ".ordered-paths";
 const OWNED_SEARCH_CATALOG: &str = ".search-paths";
+const OWNED_SPATIAL_CATALOG: &str = ".spatial-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 pub const OWNED_ATTEMPT_RELATION: &str = "fact_attempts";
 pub const OWNED_ROOT_PUBLICATION_RELATION: &str = "fact_publications";
@@ -261,6 +262,8 @@ impl OwnedRelation {
     pub fn path_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_PATH_CATALOG) }
 
     pub fn search_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SEARCH_CATALOG) }
+    pub fn spatial_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_SPATIAL_CATALOG) }
+
     pub fn relation_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RELATION_CATALOG) }
 
     pub fn world_clock_table(owner: &str) -> TableRef { owned_table(owner, OWNED_WORLD_CLOCKS) }
@@ -392,13 +395,18 @@ impl TableRef {
         name.strip_prefix(OWNED_UNIQUE_PREFIX).or_else(|| name.strip_prefix(OWNED_CAPACITY_PREFIX))
     }
 
+    pub fn is_owned_spatial_catalog(&self) -> bool {
+        self.table.split_once('-').is_some_and(|(_, name)| name == OWNED_SPATIAL_CATALOG)
+            && self.supported_owned_name()
+    }
+
     pub fn is_owned_unique_table(&self) -> bool {
         self.table.split_once('-').is_some_and(|(_, name)| name.starts_with(OWNED_UNIQUE_PREFIX)) && self.supported_owned_name()
     }
 
     /// True only for ordinary owned relations within this protected catalog's namespace.
     pub fn owns_path_target(&self, target: &Self) -> bool {
-        (self.is_owned_path_catalog() || self.is_owned_search_catalog())
+        (self.is_owned_path_catalog() || self.is_owned_search_catalog() || self.is_owned_spatial_catalog())
             && target.supported_owned_name()
             && target.table.split_once('-').is_some_and(|(_, logical)| OwnedRelation::new(logical).is_ok())
             && target.table[..64] == self.table[..64]
@@ -418,7 +426,7 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_RELATION_CATALOG | OWNED_WORLD_CLOCKS)
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_SPATIAL_CATALOG | OWNED_RELATION_CATALOG | OWNED_WORLD_CLOCKS)
                         || name.strip_prefix(OWNED_LIFETIME_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())

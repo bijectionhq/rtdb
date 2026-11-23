@@ -431,6 +431,39 @@ Every selected partition must have complete format 11 search artefacts at the he
 A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
 An overlay requires the configured placed hosted-control owner, the live Root validity and requested evidence. One Arrow batch carries `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8` for one to 64 exact staged shadows. Null text masks the old run. The whole-relation witnesses still describe the original source.
 
+=== Owned spatial paths
+
+Send `rtdb.owned.DeclareSpatialPath.v1` with the relation prefix and one Arrow row with `_id: Utf8` and `columns: List<Utf8>`.
+The first column is the WGS84 XY geometry carrier, followed by up to 15 equality partition columns.
+All columns must be declared Binary fields of the owned relation.
+The geometry carrier is ISO WKB prefixed by byte zero, byte one for a position of unknown accuracy, or byte two followed by eight little-endian bytes of finite nonnegative Float64 accuracy in metres and a Point.
+The path fixes the WGS84 ellipsoid and great elliptic edge model.
+`rtdb.owned.DropSpatialPath.v1` takes the relation and path prefixes.
+
+`rtdb.owned.SpatialHeld.v1` takes the 16-byte held read handle, the relation and path prefixes, and one terminated Arrow IPC batch with one row.
+The columns are `partition: List<Binary>`, `region: Binary`, `predicate: Utf8`, `valid_micros: Int64`, `limit: Int64`, `observe: Bool`, `reported_center: Bool`, `radius_m: Float64?` and `after: Utf8?` for string ids.
+The action also accepts the other owned identity types in `after`.
+Use predicate `all` and an empty region for an unrestricted read.
+Topology predicates include `intersects`, `disjoint`, `covers`, `covered_by`, `contains`, `within`, `equals`, `touches`, `crosses` and `overlaps`.
+`within_distance` uses the supplied radius.
+`inside`, `outside`, `uncertain` and `unknown` classify a reported position against a geometry.
+`nearest` ranks by exact distance and identity, takes an optional radius, and takes no continuation.
+Position candidates for nearest require `reported_center`.
+
+The response contains `_id` and optional `distance_m: Float64`, with the held cut, selected valid instant and `rtdb.owned.spatial_more` in schema metadata.
+`rtdb.owned.SpatialHeld.v2` takes the same request and adds a `document` Arrow struct to each hit.
+The struct contains the resolved row's fields and `_system_from` at the original held cut.
+A placed observed read can return `rtdb.owned.range_witness` even on an empty page.
+Spatial posting files carry sorted partition, cell and IID Arrow columns.
+The read covers settled tries and the captured live tail and refuses explicitly when it cannot cover or refine the selected population within its work allowance.
+Reads without posting coverage use the native Arrow page reader for candidate identities and evaluate geometry only after resolving the visible row.
+See link:../../../dev/doc/spatial.allium[the spatial path specification].
+
+`rtdb.owned.SpatialHeld.v3` adds `document_columns: List<Utf8>` to select the fields in `document`.
+The list may be empty and may contain up to 128 distinct owned field names.
+The struct contains `_system_from` and the requested fields available in the held relation schema.
+The top-level `_id` identifies both the hit and its document.
+
 `rtdb.owned.DeclareUniquePath.v1` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name and `column: Utf8` for the canonical Binary key column.
 Declare up to 16 immutable named unique paths per owned relation before writing relation data. An exact retry of the declaration keeps its original definition. An existing empty typed relation must declare the key as Binary.
