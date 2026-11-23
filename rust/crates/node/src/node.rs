@@ -1299,28 +1299,29 @@ impl OwnedReadSession {
         self.relation_release_guard_for([relation], true)?()
     }
 
-    /// A scoped read binds its original held cut, even when the point is absent.
-    pub async fn scoped_entity_region(
-        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: Interval,
-    ) -> Result<Option<Arc<rtdb_types::OwnedRangeEvidence>>> {
-        if self.scoped_root.is_none() { return Ok(None); }
-        let Some(evidence) = self.relation_witness(relation)? else { return Ok(None); };
+    /// A completed point can bind the exact identity region at its original held cut.
+    pub async fn entity_region_witness(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
+        valid: Interval,
+    ) -> Result<Option<OwnedRangeWitness>> {
+        self.require_scoped_relation(relation)?;
+        let Some(mut evidence) = self.relation_witness(relation)? else { return Ok(None); };
         let anchor = self.covered_range_anchor(relation, evidence.frontier).await?;
-        Ok(Some(Arc::new(rtdb_types::OwnedRangeEvidence::Entity {
+        evidence.region = Some(Arc::new(rtdb_types::OwnedRangeEvidence::Entity {
             anchor, region: rtdb_types::OwnedEntityRegion { id: id.clone(), valid },
-        })))
+        }));
+        Ok(Some(evidence))
     }
 
-    pub fn scoped_point_witness(
+    pub fn is_scoped_root(&self) -> bool {
+        self.scoped_root.is_some()
+    }
+
+    pub fn scoped_lifetime_point_witness(
         &self, relation: &rtdb_types::OwnedRelation, expiry: Option<Timestamp>,
-        region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
     ) -> Result<Option<OwnedRangeWitness>> {
-        if self.scoped_root.is_none() { return Ok(None); }
-        let mut witness = self.relation_witness_for(relation, true, expiry)?;
-        if let Some(witness) = witness.as_mut() {
-            witness.region = region;
-        }
-        Ok(witness)
+        if !self.is_scoped_root() { return Ok(None); }
+        self.relation_witness_for(relation, true, expiry)
     }
 
     pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {

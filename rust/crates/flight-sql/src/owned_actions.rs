@@ -206,6 +206,7 @@ pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V4: &str = "rtdb.owned.OpenAppliedRead.v4";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_OWNED_FIXED_POINT_V1: &str = "rtdb.owned.ReadHeldFixedPoint.v1";
 pub(crate) const HELD_WORLD_VERSION_V2: &str = "rtdb.owned.ReadHeldWorldVersion.v2";
 pub(crate) const HELD_WORLD_TOUCH_IMAGES_V1: &str = "rtdb.owned.ReadHeldWorldTouchImages.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
@@ -1650,7 +1651,7 @@ impl Service {
             .ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
     }
 
-    pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], with_valid: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], time: PointTime) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -1659,8 +1660,9 @@ impl Service {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, id, valid, _identity) = point_request(call, request, if with_valid { PointTime::Optional } else { PointTime::Default })?;
-        self.execute_owned_point(&held.snapshot, &relation, &id, valid, Some((call, &held))).await
+        let (relation, id, valid, _identity) = point_request(call, request, time)?;
+        let fixed = matches!(time, PointTime::Required);
+        self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held))).await
     }
 
     pub(crate) async fn held_owned_historical_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -3380,7 +3382,7 @@ impl Service {
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
-        let valid_at = valid.ok_or_else(|| invalid("Owned world point requires a valid_micros instant"))?;
+        let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
             2 | 3 => held.snapshot.read_parent_point(&relation, &id, valid_at, *mode == 3).await,
@@ -4156,24 +4158,35 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
-        self.execute_owned_point(&snapshot, &relation, &id, None, None).await
+        self.execute_owned_point(&snapshot, &relation, &id, None, false, None).await
     }
 
     async fn execute_owned_point(
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
-        origin: Option<(&Call, &OwnedReadResource)>,
+        fixed: bool, origin: Option<(&Call, &OwnedReadResource)>,
     ) -> Result<ActionResult, Status> {
         let present = snapshot.system_time();
         let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
-        // This action also serves the preview of moving-clock reads.
-        let region = if lifetime.is_none() && origin.is_some() {
-            snapshot.scoped_entity_region(relation, id, Interval::ALL).await.map_err(status)?
+        if fixed && lifetime.is_some() {
+            return Err(invalid("An owned lifetime point requires its ordered present"));
+        }
+        let evidence = if lifetime.is_none() && origin.is_some() && (fixed || snapshot.is_scoped_root()) {
+            let region = if fixed {
+                Interval::at(valid.ok_or_else(|| invalid("An owned fixed point requires a valid instant"))?).map_err(status)?
+            } else {
+                Interval::ALL
+            };
+            snapshot.entity_region_witness(relation, id, region).await.map_err(status)?
         } else {
             None
         };
         let witness = |expiry| origin.map(|(call, held)| {
-            let evidence = snapshot.scoped_point_witness(relation, expiry, region).map_err(status)?;
+            let evidence = if lifetime.is_some() {
+                snapshot.scoped_lifetime_point_witness(relation, expiry).map_err(status)?
+            } else {
+                evidence
+            };
             evidence.map(|evidence| held.remember(call, relation, evidence)).transpose()
         }).transpose().map(Option::flatten);
         let memory = origin.map_or(self.memory(), |(call, _)| call.memory());
@@ -4306,7 +4319,7 @@ fn with_point_witness(schema: &Schema, nonce: Option<Uuid>) -> Schema {
 }
 
 #[derive(Clone, Copy)]
-enum PointTime { Default, Optional, Required }
+pub(crate) enum PointTime { Default, Optional, Required }
 
 fn point_request(
     call: &Call, body: &[u8], time: PointTime,
