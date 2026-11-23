@@ -96,6 +96,7 @@ impl OwnedReadSession {
             present: self.present,
             witness_scope: None,
             applied_scope: None,
+            applied_preparation: None,
             witness_until: selected,
             fork_until: self.fork_until,
             cancellation,

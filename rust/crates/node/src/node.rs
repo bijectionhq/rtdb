@@ -2,6 +2,7 @@ mod historical_owned_read;
 mod hosted_control;
 mod hosted_observation;
 pub use hosted_observation::{AppliedOwnedPoint, AppliedReadFloor};
+use hosted_observation::PreparedAppliedCatalog;
 mod owned_changes;
 mod owned_usage;
 pub use owned_usage::OwnedStorageUsage;
@@ -93,7 +94,12 @@ impl NodeServices {
 enum CatalogReadCut<'a> {
     Current,
     Reserved(TransactionKey),
-    HostedApplied { minimum: TransactionKey, history: uuid::Uuid, memory: &'a Arc<MemoryBudget> },
+    HostedApplied {
+        minimum: TransactionKey,
+        history: uuid::Uuid,
+        memory: &'a Arc<MemoryBudget>,
+        preparation: Option<&'a PreparedAppliedCatalog>,
+    },
 }
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
@@ -274,7 +280,7 @@ impl Node {
         let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
         let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
-        Ok(NativeSession { state, service })
+        Ok(NativeSession { state, service, applied_preparation: None })
     }
     pub fn snapshot_basis(&self) -> Result<TimeBasis> {
         self.ensure_open()?;
@@ -397,10 +403,10 @@ impl Node {
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
         let hosted_fence = match cut {
-            CatalogReadCut::HostedApplied { history, .. } => {
+            CatalogReadCut::HostedApplied { history, preparation, .. } => {
                 self.ensure_indexing()?;
                 if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
-                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history))
+                Some((self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?, history, preparation))
             }
             CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
                 if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
@@ -456,10 +462,14 @@ impl Node {
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = snapshot.with_system_time_cap(cap)?;
-            let snapshot = if let Some((fence, expected_history)) = hosted_fence {
+            let snapshot = if let Some((fence, expected_history, preparation)) = hosted_fence {
                 let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
-                let permit = database.storage.object_store().retain_catalog(Some(cut)).await?
-                    .ok_or_else(applied_catalog_unretained)?;
+                let permit = if let Some(preparation) = preparation {
+                    preparation.pin(&database, cut)?
+                } else {
+                    database.storage.object_store().retain_catalog(Some(cut)).await?
+                        .ok_or_else(applied_catalog_unretained)?
+                };
                 let history = fence.confirm_hosted(&database).await?;
                 if uuid::Uuid::parse_str(&history).ok() != Some(expected_history) {
                     return Err(hosted_source_unavailable());
@@ -1094,6 +1104,7 @@ pub struct OwnedReadSession {
     present: TransactionKey,
     witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     applied_scope: Option<rtdb_types::PlacedAttemptScope>,
+    applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
     witness_until: Timestamp,
     fork_until: Timestamp,
     cancellation: CancellationToken,
@@ -1139,7 +1150,7 @@ impl OwnedReadSession {
         Ok(Self {
             context, node: self.node.clone(), identity: Arc::clone(&self.identity),
             database: self.database.clone(), owner: self.owner.clone(), present: self.present,
-            witness_scope: self.witness_scope, applied_scope: None, witness_until: self.witness_until, fork_until: self.fork_until,
+            witness_scope: self.witness_scope, applied_scope: None, applied_preparation: None, witness_until: self.witness_until, fork_until: self.fork_until,
             cancellation, session_cancellation: self.session_cancellation.clone(),
             historical: None, scoped_root: Some(relations), attachment: self.attachment.clone(),
             _reservation: reservation,
@@ -2549,7 +2560,11 @@ fn expiry_nomination_digest(
     digest.finalize().into()
 }
 
-pub struct NativeSession { pub(crate) state: Session, pub(crate) service: Arc<NativeSessionService> }
+pub struct NativeSession {
+    pub(crate) state: Session,
+    pub(crate) service: Arc<NativeSessionService>,
+    applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
+}
 impl NativeSession {
     pub fn track_replica_read_session(&self) -> Result<impl Send + use<>> {
         Ok(self.service.database()?.track_replica_read_session())
@@ -2930,13 +2945,30 @@ impl NativeSession {
     }
     /// Retains the exact applied catalog at one store-reserved transaction for repeated reads.
     pub async fn open_owned_read(&mut self) -> Result<OwnedReadSession> {
-        self.retain_owned_read(None).await
+        self.retain_owned_read(None, None).await
+    }
+    /// Enrolls one nonrenewable lower catalog pin for a prepaid session before use.
+    pub async fn prepare_applied_owned_reads(&mut self, floor: &AppliedReadFloor) -> Result<()> {
+        if !self.service.memory.prepaid_by(self.service.node.memory()) || self.applied_preparation.is_some() {
+            return Err(hosted_source_unavailable());
+        }
+        let read = self.retain_owned_read(Some(floor), None).await?;
+        self.applied_preparation = Some(Arc::new(PreparedAppliedCatalog::from_read(&read, &self.service.memory)?));
+        Ok(())
     }
     /// Retains the already-applied catalog from the current recovered hosted holder.
     pub async fn open_applied_owned_read(&mut self, floor: &AppliedReadFloor) -> Result<OwnedReadSession> {
-        self.retain_owned_read(Some(floor)).await
+        let preparation = if self.service.memory.prepaid_by(self.service.node.memory()) {
+            Some(Arc::clone(self.applied_preparation.as_ref().ok_or_else(hosted_source_unavailable)?))
+        } else {
+            None
+        };
+        self.retain_owned_read(Some(floor), preparation).await
     }
-    async fn retain_owned_read(&mut self, applied_floor: Option<&AppliedReadFloor>) -> Result<OwnedReadSession> {
+    async fn retain_owned_read(
+        &mut self, applied_floor: Option<&AppliedReadFloor>,
+        applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
+    ) -> Result<OwnedReadSession> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
         let node = self.service.node.clone();
         let identity = Arc::clone(&self.service.identity);
@@ -2956,7 +2988,7 @@ impl NativeSession {
         let (reserved, cut) = match applied_floor {
             Some(floor) => {
                 applied_memory = node.factory.options.query.query_memory(&self.service.memory);
-                (None, floor.cut(None, &applied_memory)?)
+                (None, floor.cut(None, &applied_memory, applied_preparation.as_deref())?)
             }
             None => {
                 let present = self.reserve_ordered_present().await?;
@@ -2994,17 +3026,19 @@ impl NativeSession {
         let placement = attached.clone();
         let guarded_node = node.clone();
         let guarded_database = database.clone();
+        let guarded_preparation = applied_preparation.clone();
         let context = context.with_owned_read_guard(Arc::new(move || {
             if clock.monotonic_micros() >= deadline {
                 return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/read-expired", "The retained owned read expired"));
             }
             guarded_node.attached_database(&guarded_database, Some(&attached))?;
             if let Some(lease) = &lease { lease.check()?; }
+            if let Some(preparation) = &guarded_preparation { preparation.check_live()?; }
             Ok(())
         }));
         context.check_cancelled()?;
         Ok(OwnedReadSession {
-            context, node, identity, database, owner, present, witness_scope, applied_scope, witness_until, fork_until: witness_until,
+            context, node, identity, database, owner, present, witness_scope, applied_scope, applied_preparation, witness_until, fork_until: witness_until,
             cancellation, session_cancellation, historical: None, scoped_root: None, attachment: placement, _reservation: charge,
         })
     }

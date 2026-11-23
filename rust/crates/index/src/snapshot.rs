@@ -44,6 +44,10 @@ impl Snapshot {
         self.catalog_read = Some(CatalogRead { _permit: permit });
         self
     }
+    /// Clones the storage registration that was attached when the catalog was captured.
+    pub fn catalog_read_permit(&self) -> Option<Arc<dyn Send + Sync>> {
+        self.catalog_read.as_ref().map(|read| Arc::clone(&read._permit))
+    }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     /// Whether a transaction's own uncommitted writes are layered over this snapshot.
     pub fn has_overlays(&self) -> bool { !self.layered.is_empty() }

@@ -2,6 +2,7 @@ use super::*;
 use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
+pub(crate) const PREPARE_APPLIED_READ_V1: &str = "rtdb.owned.PrepareAppliedRead.v1";
 pub(crate) const CONFIRM_APPLIED_HOSTED_V5: &str = "rtdb.owned.ConfirmAppliedHosted.v5";
 
 pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadFloor, &[u8]), Status> {
@@ -54,6 +55,19 @@ fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Stat
 }
 
 impl Service {
+    pub(crate) async fn prepare_applied_read_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
+        let source = call.session.audience_source().ok_or_else(unsupported)?;
+        let (floor, rest) = applied_read_floor(body)?;
+        if !rest.is_empty() { return Err(invalid("Applied preparation has trailing bytes")); }
+        if floor.history() != source {
+            return Err(Status::permission_denied("The applied preparation belongs to another audience source"));
+        }
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        native.prepare_applied_owned_reads(&floor).await.map_err(status)
+    }
+
     pub(crate) async fn confirm_applied_hosted_action(
         &self,
         call: &Call,

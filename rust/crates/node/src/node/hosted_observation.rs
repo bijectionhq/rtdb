@@ -1,11 +1,71 @@
-use std::sync::Arc;
+use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
 
+use crate::Database;
 use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, prepare_query, read_value};
 use rtdb_query::QueryContext;
+
+/// One storage registration for a lower bound on the physical catalogs read by a prepared session.
+pub(super) struct PreparedAppliedCatalog {
+    attachment: Weak<Database>,
+    floor: CatalogCut,
+    registration: Arc<Mutex<Option<Arc<dyn Send + Sync>>>>,
+    expires_at: tokio::time::Instant,
+    expiry: tokio::task::JoinHandle<()>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PreparedAppliedCatalog {
+    pub(super) fn from_read(read: &OwnedReadSession, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(2048)?;
+        let database = read.context.catalog.database(&read.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
+        let floor = snapshot.catalog_cut().ok_or_else(unavailable)?;
+        let registration = snapshot.catalog_read_permit().ok_or_else(unavailable)?;
+        let registration = Arc::new(Mutex::new(Some(registration)));
+        let weak = Arc::downgrade(&registration);
+        let expires_at = tokio::time::Instant::now() + Duration::from_secs(180);
+        let expiry = tokio::spawn(async move {
+            tokio::time::sleep_until(expires_at).await;
+            if let Some(registration) = weak.upgrade() {
+                let retired = registration.lock().expect("applied catalog lease").take();
+                drop(retired);
+            }
+        });
+        Ok(Self { attachment: read.attachment.clone(), floor, registration, expires_at, expiry, _reservation: reservation })
+    }
+
+    pub(super) fn check_live(&self) -> Result<()> {
+        if tokio::time::Instant::now() >= self.expires_at {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-preparation-expired",
+                "The prepared applied catalog lease expired"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn pin(&self, database: &Arc<Database>, cut: CatalogCut) -> Result<Arc<dyn Send + Sync>> {
+        self.check_live()?;
+        if !self.attachment.upgrade().is_some_and(|original| Arc::ptr_eq(&original, database))
+            || !covers_catalog(self.floor, cut)
+        {
+            return Err(unavailable());
+        }
+        // The older durable registration prevents advancing the retirement floor past this capture.
+        self.registration.lock().expect("applied catalog lease").as_ref().cloned().ok_or_else(unavailable)
+    }
+}
+
+impl Drop for PreparedAppliedCatalog {
+    fn drop(&mut self) { self.expiry.abort(); }
+}
+
+fn covers_catalog(floor: CatalogCut, cut: CatalogCut) -> bool {
+    cut.storage_version == floor.storage_version && cut.storage_epoch == floor.storage_epoch
+        && cut.replica_epoch == floor.replica_epoch && cut.through >= floor.through
+}
 
 /// Exact original ordinary Root point condition. Absence is a condition.
 pub struct AppliedOwnedPoint {
@@ -36,12 +96,15 @@ impl AppliedReadFloor {
 
     pub fn history(&self) -> uuid::Uuid { self.history }
 
-    pub(super) fn cut<'a>(&self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>) -> Result<CatalogReadCut<'a>> {
+    pub(super) fn cut<'a>(
+        &self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>,
+        preparation: Option<&'a PreparedAppliedCatalog>,
+    ) -> Result<CatalogReadCut<'a>> {
         let minimum = match original {
             Some(original) => confirmation_floor(original, self.minimum)?,
             None => self.minimum,
         };
-        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory })
+        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory, preparation })
     }
 
     pub(super) async fn require_transactions(
@@ -264,7 +327,7 @@ impl OwnedReadSession {
         };
         let current = self.node.query_context_in_placement(
             &self.database, &basis, self.identity.as_ref(), Some(&self.attachment),
-            floor.cut(Some(self.present), &self.context.memory)?, &self.cancellation,
+            floor.cut(Some(self.present), &self.context.memory, self.applied_preparation.as_deref())?, &self.cancellation,
         ).await?;
         let database = current.catalog.database(&self.database)?;
         let [captured] = database.partitions.as_slice() else {
@@ -308,6 +371,26 @@ mod tests {
 
     fn cut(offset: i64, time: i64) -> TransactionKey {
         TransactionKey { tx_id: TxId(offset), system_time: Timestamp(time) }
+    }
+
+    #[test]
+    fn a_preparation_covers_only_forward_catalogs_in_its_residence() {
+        use rtdb_types::{ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let floor = CatalogCut {
+            storage_version: StorageVersion(1), storage_epoch: StorageEpoch(2),
+            replica_epoch: StorageEpoch(3), through: ReplicaPosition(10),
+        };
+        assert!(covers_catalog(floor, floor));
+        assert!(covers_catalog(floor, CatalogCut { through: ReplicaPosition(11), ..floor }));
+        for other in [
+            CatalogCut { through: ReplicaPosition(9), ..floor },
+            CatalogCut { storage_version: StorageVersion(2), ..floor },
+            CatalogCut { storage_epoch: StorageEpoch(4), ..floor },
+            CatalogCut { replica_epoch: StorageEpoch(4), ..floor },
+        ] {
+            assert!(!covers_catalog(floor, other));
+        }
     }
 
     #[test]
