@@ -181,8 +181,8 @@ impl DmlBuffer {
             TxOp::OwnedCheckWorldPurge { relation, .. } => relation.name().len(),
             TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal => 0,
             TxOp::OwnedDeclareFixedRange { relation, rule } => relation.name().len() + rule.path.capacity() + rule.column.capacity(),
-            TxOp::OwnedCheckRange { relation, fixed, .. } =>
-                relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes()),
+            TxOp::OwnedCheckRange { relation, region, .. } =>
+                relation.name().len() + region.as_ref().map_or(0, |region| region.retained_bytes()),
             TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. } => sql.capacity(),
             TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. } => table.schema.capacity().checked_add(table.table.capacity()).ok_or_else(allocation_overflow)?,
         }.checked_add(std::mem::size_of::<BufferedOperation>() * 2 + 128).ok_or_else(allocation_overflow)?;

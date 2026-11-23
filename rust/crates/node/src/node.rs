@@ -26,7 +26,7 @@ use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::{BufferPool, CacheBudget};
 use rtdb_tx::{IDEMPOTENCY_GUARD_RESULT, RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, PlacedAttempt, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, Interval, LogicalType, PlacedAttempt, ReplicaPosition, Result, ScalarType, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -1116,21 +1116,21 @@ pub struct OwnedRangeWitness {
     scope: rtdb_types::PlacedAttemptScope,
     frontier: i64,
     until: Timestamp,
-    fixed: Option<Arc<rtdb_types::FixedRangeEvidence>>,
+    region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
 }
 
 impl OwnedRangeWitness {
     pub fn operation(self) -> TxOp {
         TxOp::OwnedCheckRange {
-            relation: self.relation, basis: self.basis, scope: self.scope, frontier: self.frontier, until: self.until, fixed: self.fixed,
+            relation: self.relation, basis: self.basis, scope: self.scope, frontier: self.frontier, until: self.until, region: self.region,
         }
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes())
+        self.region.as_ref().map_or(0, |region| region.retained_bytes())
     }
 
-    pub fn same_range(&self, other: &Self) -> bool { self.fixed == other.fixed && self.until == other.until }
+    pub fn same_range(&self, other: &Self) -> bool { self.region == other.region && self.until == other.until }
 
     pub fn matches_scope(&self, scope: Option<rtdb_types::PlacedAttemptScope>) -> bool {
         Some(self.scope) == scope
@@ -1299,12 +1299,28 @@ impl OwnedReadSession {
         self.relation_release_guard_for([relation], true)?()
     }
 
-    /// A completed scoped point can conservatively depend on its relation's frontier.
+    /// A scoped read binds its original held cut, even when the point is absent.
+    pub async fn scoped_entity_region(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: Interval,
+    ) -> Result<Option<Arc<rtdb_types::OwnedRangeEvidence>>> {
+        if self.scoped_root.is_none() { return Ok(None); }
+        let Some(evidence) = self.relation_witness(relation)? else { return Ok(None); };
+        let anchor = self.covered_range_anchor(relation, evidence.frontier).await?;
+        Ok(Some(Arc::new(rtdb_types::OwnedRangeEvidence::Entity {
+            anchor, region: rtdb_types::OwnedEntityRegion { id: id.clone(), valid },
+        })))
+    }
+
     pub fn scoped_point_witness(
         &self, relation: &rtdb_types::OwnedRelation, expiry: Option<Timestamp>,
+        region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
     ) -> Result<Option<OwnedRangeWitness>> {
         if self.scoped_root.is_none() { return Ok(None); }
-        self.relation_witness_for(relation, true, expiry)
+        let mut witness = self.relation_witness_for(relation, true, expiry)?;
+        if let Some(witness) = witness.as_mut() {
+            witness.region = region;
+        }
+        Ok(witness)
     }
 
     pub async fn fork_cut(&self, scope: rtdb_types::PlacedAttemptScope) -> Result<OwnedForkCut> {
@@ -2267,8 +2283,8 @@ impl OwnedReadSession {
         let page = self.range_page(relation, path, crate::ordered_index::RowBounds::Compound(request), valid_at).await?;
         let mut evidence = self.relation_witness(relation)?;
         if let (Some(evidence), Some(valid_at)) = (evidence.as_mut(), valid_at.filter(|_| after.is_none())) {
-            evidence.fixed = self.fixed_range_evidence(relation, path, evidence.frontier, valid_at, lower, upper)
-                .await.unwrap_or(None).map(Arc::new);
+            evidence.region = self.fixed_range_evidence(relation, path, evidence.frontier, valid_at, lower, upper)
+                .await.unwrap_or(None).map(rtdb_types::OwnedRangeEvidence::FixedPath).map(Arc::new);
         }
         self.check_relation(relation)?;
         Ok((page, evidence))
@@ -2359,7 +2375,7 @@ impl OwnedReadSession {
         guard()?;
         Ok(Some(OwnedRangeWitness {
             relation: relation.clone(), basis: self.present, scope, frontier,
-            until: expiry.map_or(self.witness_until, |expiry| expiry.min(self.witness_until)), fixed: None,
+            until: expiry.map_or(self.witness_until, |expiry| expiry.min(self.witness_until)), region: None,
         }))
     }
 

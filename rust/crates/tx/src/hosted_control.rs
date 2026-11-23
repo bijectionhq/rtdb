@@ -1210,7 +1210,7 @@ mod retained_release_tests {
         ].into_iter().map(Operation::Public).collect::<Vec<_>>();
         operations.push(Operation::Public(TxOp::OwnedCheckRange {
             relation: relation.clone(), basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(3), system_time: Timestamp(4) },
-            scope, frontier: 0, until: Timestamp(100), fixed: None,
+            scope, frontier: 0, until: Timestamp(100), region: None,
         }));
         let local_window = TxOp::OwnedCheckWorldPurge {
             relation: local.clone(), pin, frontier: 0, local_frontier: Some(0),
@@ -1676,7 +1676,7 @@ pub(crate) fn hosted_proposal_land(
             }))));
         if starts[0].is_some() {
             let root_window = operations.iter().any(|op| matches!(op,
-                Operation::Public(TxOp::OwnedCheckRange { relation: checked, fixed: None, .. }) if checked == relation
+                Operation::Public(TxOp::OwnedCheckRange { relation: checked, region: None, .. }) if checked == relation
             ));
             let local_window = operations.iter().any(|op| matches!(op,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation: checked, pin: original, local_frontier: Some(_), .. })

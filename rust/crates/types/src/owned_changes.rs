@@ -106,6 +106,37 @@ pub fn expired_lifetime_interval(created: Timestamp, expiry: Timestamp) -> Resul
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedEntityRegion {
+    pub id: EntityId,
+    pub valid: Interval,
+}
+
+impl OwnedEntityRegion {
+    pub fn intersects(&self, touch: &OwnedChange) -> bool {
+        self.id == touch.id && self.valid.intersects(touch.valid)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnedRangeEvidence {
+    FixedPath(crate::FixedRangeEvidence),
+    Entity { anchor: i64, region: OwnedEntityRegion },
+}
+
+impl OwnedRangeEvidence {
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::FixedPath(fixed) => fixed.retained_bytes(),
+            Self::Entity { region, .. } => 1024 + match &region.id {
+                EntityId::String(text) => text.capacity(),
+                EntityId::Keyword(keyword) => keyword.retained_bytes(),
+                EntityId::Integer(_) | EntityId::Uuid(_) => 0,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedChangeGroup {
     pub revision: u64,
     pub system_time: Timestamp,

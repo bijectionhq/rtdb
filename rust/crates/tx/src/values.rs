@@ -1306,7 +1306,7 @@ pub enum TxOp {
     OwnedCheckRange {
         relation: rtdb_types::OwnedRelation, basis: rtdb_types::TransactionKey,
         scope: rtdb_types::PlacedAttemptScope, frontier: i64, until: Timestamp,
-        fixed: Option<Arc<rtdb_types::FixedRangeEvidence>>,
+        region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
     },
     OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
     OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },

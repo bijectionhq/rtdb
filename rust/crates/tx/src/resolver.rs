@@ -27,6 +27,7 @@ mod retry;
 mod retention;
 pub use retention::installed_receipt_time;
 mod fixed_range;
+mod owned_region;
 mod ordered_micros;
 mod replay_constraints;
 mod replay_worlds;
@@ -1921,7 +1922,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 continue;
             }
-            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, fixed }) = operation {
+            if let Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, region }) = operation {
                 let base = self.buffer.base_snapshot();
                 let unavailable = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/range-witness-unavailable",
                     "Owned range witness is no longer admissible");
@@ -1935,9 +1936,13 @@ impl<'a> OpenTransaction<'a> {
                 }
                 let head = base.relation_event_frontier(&relation.table(owner))?;
                 if head != *frontier {
-                    let exact = if let Some(evidence) = fixed {
-                        self.verify_fixed_range(&base, owner, relation, basis.system_time, *frontier, head, evidence).await.unwrap_or(false)
-                    } else { false };
+                    let exact = match region.as_deref() {
+                        Some(rtdb_types::OwnedRangeEvidence::FixedPath(evidence)) =>
+                            self.verify_fixed_range(&base, owner, relation, basis.system_time, *frontier, head, evidence).await,
+                        Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) =>
+                            self.verify_owned_entity_region(&base, owner, relation, basis.system_time, *frontier, head, *anchor, region).await,
+                        None => Ok(false),
+                    }.unwrap_or(false);
                     if !exact {
                         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-range",
                             "The observed owned relation changed before ordering"));

@@ -1124,7 +1124,7 @@ async fn owned_range_witness_checks_only_its_relation_before_mutation() {
     assert!(initial.result().committed());
     let check = |witness_scope, until| TxOp::OwnedCheckRange {
         relation: watched.clone(), basis: initial.result().tx_key(), scope: witness_scope, frontier: 1, until: Timestamp(until),
-        fixed: None,
+        region: None,
     };
     let unrelated = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put(&other)]), &context).await.unwrap();
@@ -1148,6 +1148,63 @@ async fn owned_range_witness_checks_only_its_relation_before_mutation() {
         source(vec![put(&other), check(scope, 200)]), &context).await.unwrap();
     assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-range");
     assert!(!stale.writes().tables().contains_key(&other.table("owner")));
+}
+
+#[tokio::test]
+async fn entity_region_refuses_a_shadowed_phantom_and_allows_disjoint_assertions() {
+    use rtdb_format::envelope::SourceMessage;
+    use rtdb_types::{EntityId, Interval, OwnedEntityRegion, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope};
+
+    let mut context = context();
+    let scope = PlacedAttemptScope::new("installed-replica", 1).unwrap();
+    context.owned_witness_scope = Some(scope);
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let relation = OwnedRelation::new("facts").unwrap();
+    let put = |id: &str, from, to| TxOp::OwnedReplaceDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::Utf8(id.into())), ("value".into(), Value::I64(from)),
+        ])], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)),
+    };
+    let source = |operations| {
+        let request = SourceTransaction::new(
+            operations, SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory,
+        ).unwrap().with_placed_seed(Some(scope.issue()));
+        let encoded = request.encode().unwrap();
+        let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        SourceTransaction::decode(&message, &context.memory).unwrap()
+    };
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let initial = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100),
+        source(vec![put("other", 400, 500)]), &context).await.unwrap();
+    assert!(initial.result().committed());
+
+    let id = EntityId::String("wanted".into());
+    let valid = Interval::from_micros(400, 500).unwrap();
+    let check = || TxOp::OwnedCheckRange {
+        relation: relation.clone(), basis: initial.result().tx_key(), scope, frontier: 1,
+        until: Timestamp(200),
+        region: Some(Arc::new(OwnedRangeEvidence::Entity {
+            anchor: 1, region: OwnedEntityRegion { id: id.clone(), valid },
+        })),
+    };
+    let disjoint = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
+        source(vec![put("other", 425, 475), put("wanted", 500, 600)]), &context).await.unwrap();
+    assert!(disjoint.result().committed());
+    let accepted = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(102),
+        source(vec![check()]), &context).await.unwrap();
+    assert!(accepted.result().committed(), "{:?}", accepted.result().error());
+
+    let shadowed = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(103),
+        source(vec![put("wanted", 425, 475), TxOp::OwnedDelete {
+            relation: relation.clone(), id: id.clone(),
+            valid_from: Some(Timestamp(425)), valid_to: Some(Timestamp(475)),
+        }]), &context).await.unwrap();
+    assert!(shadowed.result().committed(), "{:?}", shadowed.result().error());
+    let stale = resolver.resolve_source(state.snapshot(), SourcePosition(4), Timestamp(104),
+        source(vec![check()]), &context).await.unwrap();
+    assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-range");
 }
 
 #[tokio::test]
@@ -1193,7 +1250,7 @@ async fn fixed_range_checks_full_old_and_new_keys_at_the_pinned_valid_instant() 
     ]), "key").unwrap();
     let check = |basis, frontier, revision| TxOp::OwnedCheckRange {
         relation: relation.clone(), basis, scope, frontier, until: Timestamp(200),
-        fixed: Some(Arc::new(FixedRangeEvidence { rule: rule.clone(), revision, lower: Some(lower.clone()), upper: Some(upper.clone()) })),
+        region: Some(Arc::new(rtdb_types::OwnedRangeEvidence::FixedPath(FixedRangeEvidence { rule: rule.clone(), revision, lower: Some(lower.clone()), upper: Some(upper.clone()) }))),
     };
     let other = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(101),
         source(vec![put("zz", 5, 400, 500), put("middle", 8, 500, 550)]), &context).await.unwrap();

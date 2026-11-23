@@ -140,8 +140,8 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
-                Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) =>
-                    (range_evidence_bytes(relation, fixed), None, 0),
+                Operation::Public(TxOp::OwnedCheckRange { relation, region, .. }) =>
+                    (range_evidence_bytes(relation, region), None, 0),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedSweepExpired { relation, id, .. }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. }) => (relation.name().len(), None, 0),
@@ -425,7 +425,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
-                Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) => range_evidence_bytes(relation, fixed),
+                Operation::Public(TxOp::OwnedCheckRange { relation, region, .. }) => range_evidence_bytes(relation, region),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedSweepExpired { relation, id, .. }
                     | TxOp::OwnedRelativePeriod { relation, effect: OwnedPeriodEffect::Delete(id), .. }) =>
                     relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?,
@@ -640,18 +640,26 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("rule".into(), rule.to_value());
             "rtdb-owned-fixed-range-v1"
         }
-        Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, fixed }) => {
+        Operation::Public(TxOp::OwnedCheckRange { relation, basis, scope, frontier, until, region }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("basis_id".into(), Value::I64(basis.tx_id.0));
             body.insert("basis_time".into(), Value::I64(basis.system_time.0));
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
             body.insert("frontier".into(), Value::I64(*frontier));
             body.insert("until".into(), Value::I64(until.0));
-            if let Some(fixed) = fixed {
-                body.insert("fixed".into(), fixed.to_value());
-                "rtdb-owned-check-range-v2"
-            } else {
-                "rtdb-owned-check-range-v1"
+            match region.as_deref() {
+                Some(rtdb_types::OwnedRangeEvidence::FixedPath(fixed)) => {
+                    body.insert("fixed".into(), fixed.to_value());
+                    "rtdb-owned-check-range-v2"
+                },
+                Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) => {
+                    body.insert("anchor".into(), Value::I64(*anchor));
+                    body.insert("entity".into(), region.id.as_value());
+                    body.insert("valid_from".into(), Value::I64(region.valid.lower().0));
+                    body.insert("valid_to".into(), Value::I64(region.valid.upper().0));
+                    "rtdb-owned-check-range-v3"
+                },
+                None => "rtdb-owned-check-range-v1",
             }
         }
         Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, attempt, fingerprint, root }) => {
@@ -1660,6 +1668,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-world-clock-v1" => &["scope", "world", "pin", "before"],
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
+            "rtdb-owned-check-range-v3" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "anchor", "entity", "valid_from", "valid_to"],
             "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
             "rtdb-owned-erase-v2" => &["relation", "id"],
             "rtdb-owned-sweep-expired-v2" => &["relation", "id", "created", "expiry", "scope"],
@@ -1854,7 +1863,7 @@ impl SourceOperationReader<'_> {
                     rule: rtdb_types::FixedRangeRule::from_value(&value("rule")?)?,
                 }
             }
-            "rtdb-owned-check-range-v1" | "rtdb-owned-check-range-v2" => {
+            "rtdb-owned-check-range-v1" | "rtdb-owned-check-range-v2" | "rtdb-owned-check-range-v3" => {
                 let (Value::Utf8(relation), Value::I64(basis_id), Value::I64(basis_time),
                     Value::Binary(scope), Value::I64(frontier), Value::I64(until)) =
                     (value("relation")?, value("basis_id")?, value("basis_time")?, value("scope")?, value("frontier")?, value("until")?)
@@ -1864,9 +1873,25 @@ impl SourceOperationReader<'_> {
                     basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(basis_id), system_time: Timestamp(basis_time) },
                     scope: rtdb_types::PlacedAttemptScope::decode(&scope)?,
                     frontier, until: Timestamp(until),
-                    fixed: if name == "rtdb-owned-check-range-v2" {
-                        Some(Arc::new(rtdb_types::FixedRangeEvidence::from_value(&value("fixed")?)?))
-                    } else { None },
+                    region: match name.as_str() {
+                        "rtdb-owned-check-range-v2" => Some(Arc::new(rtdb_types::OwnedRangeEvidence::FixedPath(
+                            rtdb_types::FixedRangeEvidence::from_value(&value("fixed")?)?,
+                        ))),
+                        "rtdb-owned-check-range-v3" => {
+                            let (Value::I64(anchor), Value::I64(from), Value::I64(to)) =
+                                (value("anchor")?, value("valid_from")?, value("valid_to")?)
+                            else { return Err(invalid("Owned entity range witness has invalid bounds")); };
+                            let valid = rtdb_types::Interval::from_micros(from, to)?;
+                            if anchor < 0 || valid.is_empty() {
+                                return Err(invalid("Owned entity range witness needs a covered, nonempty region"));
+                            }
+                            let id = value("entity")?.entity_id()?;
+                            Some(Arc::new(rtdb_types::OwnedRangeEvidence::Entity {
+                                anchor, region: rtdb_types::OwnedEntityRegion { id, valid },
+                            }))
+                        },
+                        _ => None,
+                    },
                 }
             }
             "rtdb-owned-check-world-scope-v1" | "rtdb-owned-check-world-clock-v1" => {
@@ -3545,6 +3570,6 @@ fn capacity_condition_bytes(relation: &rtdb_types::OwnedRelation, column_bytes: 
         .and_then(|size| size.checked_add(prefix_bytes)).ok_or_else(overflow)
 }
 
-fn range_evidence_bytes(relation: &rtdb_types::OwnedRelation, fixed: &Option<Arc<rtdb_types::FixedRangeEvidence>>) -> usize {
-    relation.name().len() + fixed.as_ref().map_or(0, |fixed| fixed.retained_bytes())
+fn range_evidence_bytes(relation: &rtdb_types::OwnedRelation, region: &Option<Arc<rtdb_types::OwnedRangeEvidence>>) -> usize {
+    relation.name().len() + region.as_ref().map_or(0, |region| region.retained_bytes())
 }

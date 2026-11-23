@@ -4166,8 +4166,14 @@ impl Service {
         let present = snapshot.system_time();
         let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
+        // This action also serves the preview of moving-clock reads.
+        let region = if lifetime.is_none() && origin.is_some() {
+            snapshot.scoped_entity_region(relation, id, Interval::ALL).await.map_err(status)?
+        } else {
+            None
+        };
         let witness = |expiry| origin.map(|(call, held)| {
-            let evidence = snapshot.scoped_point_witness(relation, expiry).map_err(status)?;
+            let evidence = snapshot.scoped_point_witness(relation, expiry, region).map_err(status)?;
             evidence.map(|evidence| held.remember(call, relation, evidence)).transpose()
         }).transpose().map(Option::flatten);
         let memory = origin.map_or(self.memory(), |(call, _)| call.memory());
