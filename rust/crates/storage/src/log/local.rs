@@ -619,7 +619,7 @@ mod retention_tests {
         let keys = vault.log_keys(&path, true, IoRegion::new()).map_err(|error| Error::Task(error.to_string()))?;
         let mut writer = Writer {
             file: File::options().read(true).write(true).create_new(true).open(path.as_ref())
-                .map_err(|error| Error::io(&path, error))?,
+                .map_err(|error| Error::io(path.as_ref(), error))?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
             keys: Some(Arc::clone(&keys)),
@@ -632,13 +632,13 @@ mod retention_tests {
         let end = prefix_end(&mut writer.file, &path, maximum, records[1].offset, false)?;
         let header = read_record_header_at(&mut writer.file, &path, maximum, 0, end)?;
         let mut sealed = vec![0; header.payload_size];
-        writer.file.read_exact(&mut sealed).map_err(|error| Error::io(&path, error))?;
+        writer.file.read_exact(&mut sealed).map_err(|error| Error::io(path.as_ref(), error))?;
         keys.retire_record(0, records[0].timestamp.0, &sealed)?;
         assert!(matches!(keys.open_record(0, records[0].timestamp.0, &sealed), Err(Error::ErasedUnderView)));
         for _ in 0..2 {
             settle_prefix(&mut writer.file, &path, maximum, end, Some(&keys))?;
         }
-        writer.file.seek(SeekFrom::Start(end)).map_err(|error| Error::io(&path, error))?;
+        writer.file.seek(SeekFrom::Start(end)).map_err(|error| Error::io(path.as_ref(), error))?;
         assert_eq!(read_record(&mut writer.file, &path, maximum, Some(&keys))?.payload, Bytes::from_static(b"retained boundary"));
         Ok(())
     }
@@ -648,7 +648,7 @@ mod retention_tests {
         let scratch = tempfile::NamedTempFile::new().map_err(|error| Error::Task(error.to_string()))?;
         let path = Arc::new(scratch.path().to_path_buf());
         let mut writer = Writer {
-            file: scratch.reopen().map_err(|error| Error::io(&path, error))?,
+            file: scratch.reopen().map_err(|error| Error::io(path.as_ref(), error))?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
             keys: None,
@@ -661,12 +661,12 @@ mod retention_tests {
         let end = prefix_end(&mut writer.file, &path, 1024, before, false)?;
         for _ in 0..2 { settle_prefix(&mut writer.file, &path, 1024, end, None)?; }
 
-        let bytes = fs::read(path.as_ref()).map_err(|error| Error::io(&path, error))?;
+        let bytes = fs::read(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
         assert!(bytes[HEADER_BYTES as usize..HEADER_BYTES as usize + b"old receipt".len()].iter().all(|byte| *byte == 0));
         assert_eq!(inspect(&mut writer.file, &path, 1024, false)?, before);
-        writer.file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(&path, error))?;
+        writer.file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path.as_ref(), error))?;
         assert!(matches!(read_record(&mut writer.file, &path, 1024, None), Err(Error::UnavailableLogRange { requested: 0, .. })));
-        writer.file.seek(SeekFrom::Start(before.0 as u64)).map_err(|error| Error::io(&path, error))?;
+        writer.file.seek(SeekFrom::Start(before.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
         assert_eq!(read_record(&mut writer.file, &path, 1024, None)?.payload.as_ref(), b"surviving suffix");
         Ok(())
     }
