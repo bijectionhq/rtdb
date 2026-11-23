@@ -997,22 +997,22 @@ fn put_columns<E: EncodedEvent>(
             columns.push(column);
             continue;
         }
-        let _scratch = builder.as_deref().map(|builder| {
-            let bytes = documents.iter().try_fold(0usize, |bytes, doc| {
+        let read_bytes = builder.as_deref().map(|_| {
+            documents.iter().try_fold(0usize, |bytes, doc| {
                 let cell = match doc.put_column(&name) {
                     Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::estimate_read_cell_bytes(field, array, row)?,
                     Some(PutColumn::Absent) => std::mem::size_of::<Value>(),
                     None => 0,
                 };
                 bytes.checked_add(cell).ok_or_else(event_size)
-            })?;
-            builder.reserve_scratch(bytes)
+            })
         }).transpose()?;
         if copy && let Some(column) = selected::column(documents, &field, &ty, builder.as_deref_mut())? {
             schema.push(Arc::new(field));
             columns.push(column);
             continue;
         }
+        let _scratch = builder.as_deref().zip(read_bytes).map(|(builder, bytes)| builder.reserve_scratch(bytes)).transpose()?;
         let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
             let values = cells.iter().map(|cell| cell.as_ref().clone()).collect::<Vec<_>>();
@@ -1058,6 +1058,54 @@ pub fn copy_compaction_batch<E: EncodedEvent>(
     let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
     let batch = event_batch_with_recency(events, put_fields, iid_encoding, recency, true, Some(&mut builder), redacted_leg)?;
     builder.finish_with_metadata(batch, metadata)
+}
+
+/// Compacts already aligned spill pages into one event batch in range order.
+pub fn copy_spill_event_ranges(
+    sources: &[(&EventBatch, std::ops::Range<usize>)], memory: &Arc<MemoryBudget>,
+) -> Result<Option<OwnedBatch>> {
+    let Some((first, _)) = sources.first() else { return Ok(None); };
+    let schema = first.arrow().schema_ref();
+    if matches!(schema.field(first.iid).data_type(), DataType::RunEndEncoded(..)) {
+        return Ok(None);
+    }
+    let DataType::Union(legs, _) = schema.field(first.op).data_type() else { return Err(invalid("Missing operation union fields")); };
+    if let Some((_, put)) = legs.iter().find(|(_, field)| field.name() == "put") {
+        let document = rtdb_columnar::from_field(put)?;
+        // The event writer merges adjacent equal values in run fields at any depth.
+        if document.unencoded() != document { return Ok(None); }
+    }
+    for (page, rows) in sources {
+        if page.arrow().schema_ref() != schema { return Ok(None); }
+        for row in rows.clone() {
+            if page.header(row)?.op == EventOp::Put {
+                let (_, document, offset) = page.operation(row)?;
+                let document = document.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Put operations must contain document structs"))?;
+                if !document.is_valid(offset) || document.fields().iter().zip(document.columns()).any(|(field, array)| {
+                    !columns::valid_cell(field, array.as_ref(), offset, true)
+                }) { return Ok(None); }
+            }
+        }
+    }
+    let count = sources.iter().try_fold(0usize, |count, (_, rows)| {
+        count.checked_add(rows.len()).ok_or_else(event_size)
+    })?;
+    let metadata = crate::ipc::schema_translation_bound(schema)?;
+    let base = count.checked_mul(32).and_then(|bytes| bytes.checked_add(metadata)).ok_or_else(event_size)?;
+    let mut builder = BatchBuilder::new(base, memory)?;
+    let picks = sources.iter().enumerate().flat_map(|(source, (_, rows))| {
+        rows.clone().map(move |row| Some((source, row)))
+    }).collect::<Vec<_>>();
+    let arrays = schema.fields().iter().enumerate().map(|(column, field)| {
+        let values = sources.iter().map(|(page, _)| page.arrow().column(column).as_ref()).collect::<Vec<_>>();
+        let bound = picks.iter().flatten().try_fold(metadata, |bound, &(source, row)| {
+            rtdb_columnar::estimate_event_copy_cell_bytes(field, values[source], row)?
+                .checked_mul(4).and_then(|bytes| bound.checked_add(bytes)).ok_or_else(event_size)
+        })?;
+        builder.column(bound, || rtdb_columnar::copy_event_cells(&values, &picks))
+    }).collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(Arc::clone(schema), arrays).map_err(invalid)?;
+    builder.finish_with_metadata(batch, metadata).map(Some)
 }
 
 fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool, builder: Option<&mut BatchBuilder>, redacted_leg: bool) -> Result<RecordBatch> {

@@ -39,6 +39,11 @@ impl<'a> ColumnPresence<'a> {
         Ok(true)
     }
 
+    /// Returns the logical field for a validated alias that can use the selected leaf's buffers.
+    pub fn stored_alias(&self, array: &dyn Array, row: usize) -> Result<Option<Field>> {
+        stored_alias(&self.logical, self.field, array, row)
+    }
+
     pub fn is_present(&self, array: &dyn Array, row: usize) -> Result<bool> {
         if row >= array.len() || array.data_type() != self.field.data_type() { return Err(layout()); }
         if let Some(plan) = &self.plan {
@@ -46,6 +51,39 @@ impl<'a> ColumnPresence<'a> {
         }
         if self.check { check_cell(self.field, array, row, false)?; }
         present(self.field, array, row)
+    }
+}
+
+fn stored_alias(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Option<Field>> {
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => {
+            let union = array.as_union();
+            let tag = union.type_id(row);
+            let (_, child) = fields.iter().find(|(id, _)| *id == tag).ok_or_else(layout)?;
+            let logical = union_read_type(logical, child)?;
+            stored_alias(&logical, child, union.child(tag).as_ref(), union.value_offset(row))
+        }
+        DataType::RunEndEncoded(ends, child) => {
+            let physical;
+            let value = if let LogicalType::RunEndEncoded { value, .. } = logical { value.as_ref() }
+                else { physical = from_field(child)?; &physical };
+            macro_rules! in_run {
+                ($ty:ty) => {{
+                    let run = array.as_run::<$ty>();
+                    stored_alias(value, child, run.values().as_ref(), run.get_physical_index(row))
+                }}
+            }
+            match ends.data_type() {
+                DataType::Int16 => in_run!(Int16Type),
+                DataType::Int32 => in_run!(Int32Type),
+                DataType::Int64 => in_run!(Int64Type),
+                _ => Err(layout()),
+            }
+        }
+        _ => {
+            let expected = to_field(field.name(), logical)?;
+            Ok((expected.data_type() == field.data_type() && expected.metadata() != field.metadata()).then_some(expected))
+        }
     }
 }
 

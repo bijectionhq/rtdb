@@ -2,6 +2,7 @@ use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -47,7 +48,7 @@ struct FinalWriter<'a> {
 }
 
 impl FinalWriter<'_> {
-    fn leaf(&mut self, events: &[PageEvent]) -> Result<usize> {
+    fn leaf<E: rtdb_format::data::EncodedEvent>(&mut self, events: &[E]) -> Result<usize> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         let batch = self.schema.batch(events, self.memory)?;
         self.page(batch.batch())
@@ -62,14 +63,34 @@ impl FinalWriter<'_> {
         Ok(leaf)
     }
 
-    fn rows(&mut self, events: &[PageEvent], depth: usize, page_size: usize) -> Result<usize> {
-        if events.is_empty() { return self.metadata.write_nil(); }
-        if events.len() <= page_size || depth == 64 || events.first().map(|event| event.iid) == events.last().map(|event| event.iid) { return self.leaf(events); }
+    fn spill_ranges(&mut self, sources: &[(&EventBatch, Range<usize>)]) -> Result<usize> {
+        if sources.iter().all(|(page, _)| page.arrow().schema_ref() == &self.arrow_schema) {
+            match rtdb_format::data::copy_spill_event_ranges(sources, self.memory) {
+                Ok(Some(batch)) => return self.page(batch.batch()),
+                Ok(None) => {}
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let events = sources.iter().flat_map(|(page, rows)| rows.clone().map(|row| page.borrow_event(row)))
+            .collect::<Result<Vec<_>>>()?;
+        self.leaf(&events)
+    }
+
+    fn split_spill(&mut self, page: &EventBatch, rows: Range<usize>, depth: usize, page_size: usize) -> Result<usize> {
+        if rows.is_empty() { return self.metadata.write_nil(); }
+        if rows.len() <= page_size || depth == 64 || page.iid(rows.start)? == page.iid(rows.end - 1)? {
+            return self.spill_ranges(&[(page, rows)]);
+        }
         let mut children = [None; 4];
-        let mut start = 0;
+        let mut start = rows.start;
         for (part, child) in children.iter_mut().enumerate() {
-            let end = start + events[start..].partition_point(|event| usize::from(bucket(event.iid, depth)) <= part);
-            if start < end { *child = Some(self.rows(&events[start..end], depth + 1, page_size)?); }
+            let (mut end, mut hi) = (start, rows.end);
+            while end < hi {
+                let middle = end + (hi - end) / 2;
+                if usize::from(bucket(page.iid(middle)?, depth)) <= part { end = middle + 1; } else { hi = middle; }
+            }
+            if start < end { *child = Some(self.split_spill(page, start..end, depth + 1, page_size)?); }
             start = end;
         }
         self.metadata.write_iid_branch(children)
@@ -87,19 +108,26 @@ impl FinalWriter<'_> {
                 return self.page(&restored);
             }
             drop(_descriptors);
-            let (events, _charge) = page_events(&page, leaf, self.memory)?;
-            drop(page);
-            return self.rows(&events, depth, page_size);
+            let _charge = self.memory.reserve(super::decoded_bound(page.batch())?)?;
+            let page = EventBatch::new(page.batch().clone())?;
+            return self.spill_ranges(&[(&page, 0..leaf.rows)]);
         }
         if (leaves.len() == 1 && leaves[0].path.len() == depth) || total <= page_size {
-            let mut rows = Vec::new();
-            let mut charges = Vec::new();
+            let mut pages = Vec::with_capacity(leaves.len());
+            let mut charges = Vec::with_capacity(leaves.len());
             for leaf in leaves {
-                let (mut events, charge) = read_events(reader, leaf, self.memory)?;
-                rows.append(&mut events);
-                charges.push(charge);
+                let page = read_page(reader, leaf.page, self.memory)?;
+                if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
+                charges.push(self.memory.reserve(super::decoded_bound(page.batch())?)?);
+                let restored = rtdb_format::ipc::restore_spill_page_schema(page.batch(), &self.arrow_schema)?;
+                pages.push(EventBatch::new(restored.unwrap_or_else(|| page.batch().clone()))?);
             }
-            return self.rows(&rows, depth, page_size);
+            if total == 0 { return self.metadata.write_nil(); }
+            if let [page] = pages.as_slice() {
+                return self.split_spill(page, 0..total, depth, page_size);
+            }
+            let sources = pages.iter().map(|page| (page, 0..page.len())).collect::<Vec<_>>();
+            return self.spill_ranges(&sources);
         }
         if depth >= 64 { return Err(crate::invalid("Page tree exceeds IID width")); }
         let mut children = [None; 4];

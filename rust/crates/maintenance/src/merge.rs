@@ -109,7 +109,7 @@ struct MergeFile {
 struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool, topology: bool, include_origins: bool, include_positions: bool, redacted_leg: bool }
 
 impl OutputSchema {
-    fn batch(&self, events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    fn batch<E: EncodedEvent>(&self, events: &[E], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
         let batch = copy_compaction_batch(events, self.put.clone(), self.iid_encoding, self.recency, self.redacted_leg, memory)?;
         let batch = if self.topology {
             rtdb_format::data::with_topology_commit_positions(batch, memory)?
@@ -659,6 +659,74 @@ mod tests {
         layout::normalize(&spill, &fields, &config, &memory, &data, &meta, &CancellationToken::new()).unwrap();
         assert_eq!(std::fs::read(data).unwrap(), std::fs::read(reference).unwrap());
         assert_eq!(std::fs::read(meta).unwrap(), metadata.write().unwrap());
+    }
+
+    #[test]
+    fn normalization_splits_and_coalesces_spill_ranges_with_identical_file_bytes() {
+        use rtdb_types::{ScalarType, Value};
+
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryBudget::new(32 << 20);
+        let fields = Some(StructFields::from([("v".into(), LogicalType::list(LogicalType::Scalar(ScalarType::F64).maybe()).maybe())]));
+        let events = [0, 1, 128, 129].into_iter().map(|first| {
+            let mut iid = [0; 16];
+            iid[0] = first;
+            StoredEvent {
+                position: None,
+                iid: Iid(iid), system_from: Timestamp(10), valid_time: Interval::ALL,
+                origin: None, commit_position: 0, entity_key: None, recency: None,
+                operation: if first == 1 { StoredOperation::Delete } else {
+                    StoredOperation::Put(StructFields::from([("v".into(), Value::list(vec![
+                        Value::F64(-0.0), Value::Null, Value::F64(f64::from_bits(0x7ff8_0000_0000_0042)),
+                    ]))]))
+                },
+            }
+        }).collect::<Vec<_>>();
+        let schema = OutputSchema { put: fields.clone(), iid_encoding: None, recency: false, keyed: false, include_origins: false, include_positions: false, redacted_leg: false }.schema().unwrap();
+        for (name, page_size) in [("split", 2), ("coalesce", 4)] {
+            let directory = directory.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let config = MergeConfig { page_size, ..Default::default() };
+            let data = directory.join("data.arrow");
+            let meta = directory.join("meta.arrow");
+            let mut spill = MergeFile::new(directory.join("spill.arrow"), None, false, &[], &fields, false, false, false, false, &config, &memory).unwrap();
+            let events_in = |events: &[StoredEvent]| {
+                EventBatch::new(build_event_batch(events, fields.clone(), None).unwrap()).unwrap().page_events().unwrap()
+            };
+            if name == "split" {
+                spill.write(&events_in(&events), vec![], &fields, &config, &memory).unwrap();
+            } else {
+                spill.write(&events_in(&events[..2]), vec![0], &fields, &config, &memory).unwrap();
+                spill.write(&events_in(&events[2..]), vec![2], &fields, &config, &memory).unwrap();
+            }
+            spill.finish(&config).unwrap();
+
+            let (mut reader, _reservation) = open_input(File::open(&spill.path).unwrap(), &memory).unwrap();
+            let pages = (0..spill.leaves.len()).map(|page| {
+                let decoded = read_page(&mut reader, page, &memory).unwrap();
+                EventBatch::new(decoded.batch().clone()).unwrap()
+            }).collect::<Vec<_>>();
+            let ranges = if name == "split" { vec![(&pages[0], 2..4)] } else { vec![(&pages[0], 0..2), (&pages[1], 0..2)] };
+            assert!(rtdb_format::data::copy_spill_event_ranges(&ranges, &memory).unwrap().is_some());
+
+            let reference = directory.join("rebuilt.arrow");
+            let mut writer = ArrowFileWriter::new(create_file(&reference).unwrap(), &schema).unwrap();
+            let mut metadata = rtdb_format::metadata::MetadataBuilder::new(false, true);
+            let mut leaves = Vec::new();
+            for events in events.chunks(page_size) {
+                let batch = rtdb_format::data::copy_event_batch_with_recency(events, fields.clone(), None, false).unwrap();
+                leaves.push(metadata.write_leaf(&batch).unwrap());
+                writer.write_event_page(&batch, &memory).unwrap();
+            }
+            if name == "split" { metadata.write_iid_branch([Some(leaves[0]), None, Some(leaves[1]), None]).unwrap(); }
+            let (metadata, _) = metadata.finish().unwrap();
+            writer.finish().unwrap();
+
+            layout::normalize(&spill, &fields, &config, &memory, &data, &meta, &CancellationToken::new()).unwrap();
+            assert_eq!(std::fs::read(data).unwrap(), std::fs::read(reference).unwrap());
+            assert_eq!(std::fs::read(meta).unwrap(), metadata.write().unwrap());
+        }
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

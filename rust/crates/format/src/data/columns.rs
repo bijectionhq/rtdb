@@ -131,7 +131,7 @@ fn add_copy_bound(bytes: usize, cell: usize) -> Result<usize> {
     cell.checked_mul(4).and_then(|cell| bytes.checked_add(cell)).ok_or_else(event_size)
 }
 
-fn valid_cell(field: &Field, array: &dyn Array, row: usize, bottom: bool) -> bool {
+pub(super) fn valid_cell(field: &Field, array: &dyn Array, row: usize, bottom: bool) -> bool {
     let extension = field.metadata().get(EXTENSION_NAME_KEY).map(String::as_str);
     match field.data_type() {
         DataType::Null => field.is_nullable() || bottom,

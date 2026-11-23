@@ -177,6 +177,7 @@ config {
 --     This recurses until each leaf fits within the page size limit.
 --   If a branch has fewer rows than the page size: coalesce all descendant leaves into a single page.
 --   A spill leaf that already fits the page size uses its decoded buffers with the declared output schema when IPC decoding only adapted field nullability.
+--   Splitting and coalescing compatible spill pages select row ranges in Arrow and compact their columns in page order.
 --
 -- A file whose data carries `_recency` is laid out as RecencyCellLayout sets out instead.
 -- In native compaction, one IID's history can occupy several historical files when its assertions have different recency partitions.
@@ -246,7 +247,7 @@ contract OutputSegmentLayout {
         -- Numeric list bounds read supported Arrow children at their physical width, including half-precision floats.
 
     @invariant MillisecondDateStatisticsUseEpochDays
-        -- A millisecond date's page statistics and value hash use its epoch day, obtained by truncating the stored milliseconds divided by milliseconds per day toward zero.
+        -- A millisecond date's page statistics and value hash use the UTC epoch day containing the stored instant.
         -- The numeric statistic is that epoch day multiplied by seconds per day.
 
     @invariant HistoricalRowsCarryComputedRecency

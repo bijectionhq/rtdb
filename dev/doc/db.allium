@@ -856,6 +856,9 @@ config {
 --      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
 --      The live trie writer gathers compatible document vectors from the leaf's selected positions when a field's layout changes during the block.
 --      An encoded document column gathers physical run positions and coalesces consecutive values with identical stored representations.
+--      A selected named union leg can use its logical field over compatible stored Arrow buffers.
+--      Timestamp ranges write their selected endpoint integers in the declared range layout.
+--      Packed numeric list copies preserve the selected tags and payload bits of null numeric slots when the persisted layout retains them.
 --      A block cut with no transactions in it therefore writes no tries whatsoever.
 --   2. Compute the trie layout those L0 tries imply, which is what the per-table block files record and what the trie catalog will hold once the adopt has added them.
 --   3. Build the per-table block files and upload one for EVERY table the table catalog knows, not only the tables from step 1.
