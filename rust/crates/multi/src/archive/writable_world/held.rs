@@ -318,7 +318,7 @@ impl HeldCheckpointWorld {
     ) -> Result<rtdb_node::OwnedMergedChanges> {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(relations)?;
-        self.require_archive_coverage(Vec::new(), Arc::clone(&guard)).await?;
+        self.require_accepted_archive_scope(relations).await?;
         let page = self.open.snapshot.world_merged_changes_ordered(self.open.record.id, relations, after, through, limit, descending).await?;
         guard()?;
         self.check()?;
@@ -1509,6 +1509,7 @@ fn search_row_text<'a>(row: &'a StructFields<Value>, column: &str) -> Result<Opt
 
 struct InheritedRelation<'a> {
     root: Arc<rtdb_query::QueryContext>,
+    overlay_media: Arc<rtdb_query::QueryContext>,
     overlay: Arc<rtdb_query::QueryContext>,
     owner: &'a str,
     relation: &'a OwnedRelation,
@@ -1527,29 +1528,39 @@ impl<'a> InheritedRelation<'a> {
         schema: &'a rtdb_types::OwnedSchema, memory: &'a Arc<MemoryBudget>,
     ) -> Result<Self> {
         let unavailable = OwnedWorld::unavailable;
-        check_archive_coverage(&root, owner, [(relation, 0)])?;
-        check_archive_coverage(&overlay, owner, [(relation, 0)])?;
         let world = Iid(*ancestor.world.as_bytes());
+        let shadow = relation.in_world(world)?;
+        let root_cut = root.current_time.as_micros()?;
+        let media_cut = overlay.current_time.as_micros()?;
+        if media_cut != ancestor.basis.system_time {
+            return Err(unavailable());
+        }
+        check_archive_coverage(&root, owner, [(relation, 0)])?;
+        check_archive_coverage(&overlay, owner, [(relation, 0), (&shadow, 0)])?;
+        require_parent_journal(&root, owner, relation, root_cut).await?;
+        require_parent_journal(&overlay, owner, &shadow, ancestor.system).await?;
+        let overlay_media = overlay;
+        let overlay = if ancestor.system == media_cut {
+            Arc::clone(&overlay_media)
+        } else {
+            overlay_media.with_owned_system_cut(ancestor.system, &overlay_media.cancellation)?
+        };
         let (record, _charge) = rtdb_query::read_owned_world(Arc::clone(&overlay), owner, world)
             .await?.ok_or_else(unavailable)?;
-        let overlay = if ancestor.system == ancestor.basis.system_time {
-            overlay
-        } else {
-            overlay.with_owned_system_cut(ancestor.system, &overlay.cancellation)?
-        };
         let clock = rtdb_query::read_owned_world_clock_revision(Arc::clone(&overlay), owner, world).await?;
         let root_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&root), owner, relation).await?;
+        let overlay_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&overlay), owner, relation).await?;
         if record.dropped || record.ancestor.is_some() || record.pin.0 != *ancestor.pin.as_bytes()
             || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
-            || record.basis != ancestor.source_root || ancestor.source_root.system_time > root.current_time.as_micros()?
+            || record.basis != ancestor.source_root || ancestor.source_root.system_time > root_cut
             || clock != Some((ancestor.logical, ancestor.system))
             || !root_schema.is_some_and(|(actual, _)| &actual == schema)
+            || !overlay_schema.is_some_and(|(actual, _)| &actual == schema)
         {
             return Err(unavailable());
         }
-        let shadow = relation.in_world(world)?;
         Ok(Self {
-            root, overlay, owner, relation, shadow, world, initial_clock: record.initial_clock(),
+            root, overlay_media, overlay, owner, relation, shadow, world, initial_clock: record.initial_clock(),
             overlay_basis: ancestor.system, schema, memory,
         })
     }
@@ -1610,7 +1621,7 @@ impl<'a> InheritedRelation<'a> {
             return Err(OwnedWorld::unavailable());
         }
         rtdb_node::archived_changes_at_cut(
-            Arc::clone(&self.overlay), self.owner, &self.shadow, after, through, limit, reverse,
+            Arc::clone(&self.overlay_media), self.owner, &self.shadow, after, through, limit, reverse,
         ).await
     }
 
@@ -1686,7 +1697,7 @@ impl<'a> InheritedRelation<'a> {
         if clock != valid { return Err(unavailable()); }
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(unavailable)?);
         let columns = rtdb_node::archived_path_touch_at_cut(
-            Arc::clone(&self.overlay), self.owner, &self.shadow, path, id,
+            Arc::clone(&self.overlay_media), self.owner, &self.shadow, path, id,
             self.overlay_basis, before, group, valid,
         ).await?;
         rtdb_node::stable_owned_path_columns(&self.root, &accepted, self.owner, self.relation, path).await?;
@@ -1849,7 +1860,7 @@ fn check_archive_coverage<'a>(
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
     for (relation, expected) in frontiers {
-        if snapshot.relation_event_frontier(&relation.purge_table(owner))? != expected {
+        if snapshot.owned_routing_inventory(owner, relation)?.mask_events != expected {
             return Err(OwnedWorld::unavailable());
         }
     }
@@ -1945,15 +1956,12 @@ async fn require_parent_journal(
     let unavailable = OwnedWorld::unavailable;
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
-    let table = relation.table(owner);
-    let journal = relation.change_journal(owner)?;
-    let data_events = snapshot.relation_event_frontier(&table)?;
-    let entries = snapshot.relation_event_frontier(&journal)?;
-    if entries == 0 && data_events == 0 && snapshot.trie_entries(&table).is_empty()
-        && snapshot.trie_entries(&journal).is_empty()
-    {
+    let inventory = snapshot.owned_routing_inventory(owner, relation)?;
+    if inventory.journal_exhausted() {
         return Ok(());
     }
+    let data_events = inventory.data_events;
+    let entries = inventory.journal_events;
     if entries < 2 { return Err(unavailable()); }
     let floor = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, 0).await?;
     let first = rtdb_query::read_owned_journal_header(Arc::clone(context), owner, relation, 1).await?;
@@ -2348,6 +2356,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         check_archive_coverage(&context, &owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
                                         let context = Arc::clone(&context).with_owned_read_guard(guard);
                                         for (relation, expected) in schemas {
+                                            require_parent_journal(&context, &owner, &relation, parent_time).await?;
                                             let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&context), &owner, &relation).await?;
                                             if !actual.is_some_and(|(schema, _)| schema == expected) {
                                                 return Err(OwnedWorld::unavailable());

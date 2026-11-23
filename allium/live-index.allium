@@ -21,6 +21,9 @@
 --   Columnar puts retain their Arrow values alongside resolved IIDs and valid-time intervals until the events are encoded.
 --   A positioned owned append returns the ordinal it stored in the event header for use by the resolver's change journal.
 --   Rebuilding an unpositioned archive event leaves the original ordinal inventory available to positioned effects.
+--   The owned relation's routing inventory reads the applied data, change-journal and purge event frontiers under the same snapshot.
+--   A relation is exhausted when its data and purge frontiers are zero and its serving trie inventory is empty.
+--   A feed is exhausted when the relation is exhausted and its change journal also has a zero frontier and no serving tries.
 --   Row-based operations carry homogeneous floating-point lists as typed Arrow component buffers.
 --   Staged rows ARE read, by the transactions resolving behind them (read-your-writes), and that stays within the discipline only because the reader is the same owner — the term's own coroutine.
 --   Nothing else may read staged rows.

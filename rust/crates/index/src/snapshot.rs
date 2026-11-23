@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, Result, TableRef, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, OwnedRelation, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
 
@@ -26,6 +26,28 @@ pub struct Snapshot {
     system_time_cap: Option<Timestamp>,
     catalog_cut: Option<CatalogCut>,
     catalog_read: Option<CatalogRead>,
+}
+
+/// Routing coordinates carried by the captured catalog and its applied event
+/// inventories. A query may lower the system cap, so these physical counts
+/// are upper bounds at a lowered cut. Zero still proves positive exhaustion.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnedRoutingInventory {
+    pub data_events: i64,
+    pub journal_events: i64,
+    pub mask_events: i64,
+    has_data_tries: bool,
+    has_journal_tries: bool,
+}
+
+impl OwnedRoutingInventory {
+    pub fn data_exhausted(self) -> bool {
+        self.data_events == 0 && self.mask_events == 0 && !self.has_data_tries
+    }
+
+    pub fn journal_exhausted(self) -> bool {
+        self.data_exhausted() && self.journal_events == 0 && !self.has_journal_tries
+    }
 }
 
 impl Snapshot {
@@ -127,6 +149,20 @@ impl Snapshot {
         })
     }
 
+    /// Capture one admitted physical relation. Live resolution, compaction
+    /// and replay all contribute through the same relation event frontiers.
+    pub fn owned_routing_inventory(&self, owner: &str, relation: &OwnedRelation) -> Result<OwnedRoutingInventory> {
+        let data = relation.table(owner);
+        let journal = relation.change_journal(owner)?;
+        Ok(OwnedRoutingInventory {
+            data_events: self.relation_event_frontier(&data)?,
+            journal_events: self.relation_event_frontier(&journal)?,
+            mask_events: self.relation_event_frontier(&relation.purge_table(owner))?,
+            has_data_tries: self.trie_catalog.has_current_tries(&data),
+            has_journal_tries: self.trie_catalog.has_current_tries(&journal),
+        })
+    }
+
     /// Newer delta segments precede older ones, preserving operation order at equal system times.
     pub fn segments(&self, table: &TableRef) -> Vec<Arc<LiveTable>> { self.iter_segments(table).cloned().collect() }
 
@@ -175,5 +211,26 @@ impl Snapshot {
             next.system_time_cap = Some(write.tx_key().system_time);
         }
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod owned_routing_tests {
+    use super::OwnedRoutingInventory;
+
+    #[test]
+    fn an_empty_inventory_has_no_data_journal_tries_or_masks() {
+        let empty = OwnedRoutingInventory {
+            data_events: 0,
+            journal_events: 0,
+            mask_events: 0,
+            has_data_tries: false,
+            has_journal_tries: false,
+        };
+        assert!(empty.journal_exhausted());
+        assert!(!(OwnedRoutingInventory { mask_events: 1, ..empty }).data_exhausted());
+        assert!(!(OwnedRoutingInventory { has_data_tries: true, ..empty }).data_exhausted());
+        assert!(!(OwnedRoutingInventory { has_journal_tries: true, ..empty }).journal_exhausted());
+        assert!(!(OwnedRoutingInventory { journal_events: 1, ..empty }).journal_exhausted());
     }
 }

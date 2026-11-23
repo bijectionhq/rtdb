@@ -353,7 +353,7 @@ async fn owned_projection(
     relation: &rtdb_types::OwnedRelation,
     identity: Option<&Value>,
 ) -> Result<OwnedProjection> {
-    let empty = snapshot.relation_event_frontier(&definition.table)? == 0;
+    let empty = snapshot.owned_routing_inventory(owner, relation)?.data_exhausted();
     let mut types = snapshot.column_types_for(&definition.table, definition.columns.clone());
     if empty || relation.world().is_some() {
         let root = relation.root_relation();

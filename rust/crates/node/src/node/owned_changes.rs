@@ -1047,17 +1047,12 @@ async fn cover_journal(
     if snapshot.tx_basis().is_none_or(|basis| basis.system_time != present) || after > present {
         return Err(change_feed_uncovered());
     }
-    let journal = relation.change_journal(owner)?;
-    let table = relation.table(owner);
-    let root_frontier = snapshot.relation_event_frontier(&table)?;
-    let journal_frontier = snapshot.relation_event_frontier(&journal)?;
-    if journal_frontier == 0
-        && root_frontier == 0
-        && snapshot.trie_entries(&table).is_empty()
-        && snapshot.trie_entries(&journal).is_empty()
-    {
+    let inventory = snapshot.owned_routing_inventory(owner, relation)?;
+    if inventory.journal_exhausted() {
         return Ok(None);
     }
+    let root_frontier = inventory.data_events;
+    let journal_frontier = inventory.journal_events;
     if journal_frontier < 2 {
         return Err(change_feed_uncovered());
     }

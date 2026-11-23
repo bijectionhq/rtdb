@@ -11,7 +11,7 @@ pub use catalog::{TableCatalog, TableMeta, absent_type, declare_column_types, me
 pub use live::{BlockPages, IndexBatch, LiveIndex, LiveRowLineage, LiveRowProof, LiveTable, LocatedRows, RowSource, ServingSearch, StagedWrite, TableWrite, TransactionBuffer};
 pub use partition::{BlockPreparation, PartitionState, PartitionValue, PreparedWrite, TrieCollection};
 pub use rtdb_types::CatalogCut;
-pub use snapshot::Snapshot;
+pub use snapshot::{OwnedRoutingInventory, Snapshot};
 pub use trie_catalog::{CatalogTrie, Shard, TrieCatalog, TrieState};
 pub use rtdb_format::catalog::TableEntry;
 pub use rtdb_format::data::{StoredEvent, StoredOperation};

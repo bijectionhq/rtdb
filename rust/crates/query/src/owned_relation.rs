@@ -29,6 +29,13 @@ pub async fn open_owned_assertion_point(
     valid: Option<Interval>, include_edges: bool,
 ) -> Result<Option<QueryCursor>> {
     if owner.is_empty() || relation.is_world_catalog() { return Err(address_unavailable()); }
+    let database = context.catalog.database(context.catalog.default_database())?;
+    if let [snapshot] = database.partitions.as_slice() {
+        if snapshot.owned_routing_inventory(owner, relation)?.data_exhausted() {
+            context.check_cancelled()?;
+            return Ok(None);
+        }
+    }
     open_owned_table_point_with_edges(
         context, relation.table(owner), id.iid(), Some(id), valid, None, false, include_edges, true,
     ).await
