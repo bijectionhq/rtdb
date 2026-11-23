@@ -84,6 +84,16 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<()>>,
     },
+    ParentAsOf {
+        requested: Timestamp,
+        schemas: Vec<(OwnedRelation, rtdb_types::OwnedSchema)>,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<Timestamp>>,
+    },
+    ParentPointAt {
+        system: Timestamp,
+        point: ArchivePoint,
+    },
     AcceptedScope {
         schemas: Vec<(OwnedRelation, rtdb_types::OwnedSchema)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
@@ -121,6 +131,7 @@ enum ArchiveRead {
         lower: Option<StructFields<Value>>,
         upper: Option<StructFields<Value>>,
         valid: Timestamp,
+        earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         read: OrderedRead,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<OrderedResult>>,
@@ -322,6 +333,67 @@ impl HeldCheckpointWorld {
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         guard()?;
         self.check()
+    }
+
+    pub async fn select_parent_as_of(
+        &self, relations: &[OwnedRelation], requested: Timestamp,
+    ) -> Result<Timestamp> {
+        self.check()?;
+        if !(1..=32).contains(&relations.len()) || relations.iter().collect::<std::collections::BTreeSet<_>>().len() != relations.len()
+            || requested >= self.parent_basis().system_time
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        let guard = self.open.snapshot.relation_release_guard(relations)?;
+        let mut schemas = Vec::with_capacity(relations.len());
+        for relation in relations {
+            schemas.push((relation.clone(), self.historical_parent_schema(relation)?.clone()));
+            let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+            if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        }
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentAsOf {
+            requested, schemas, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let selected = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        guard()?;
+        self.check()?;
+        Ok(selected)
+    }
+
+    pub async fn parent_point_at(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, system: Timestamp,
+    ) -> Result<Option<WorldFact>> {
+        self.check_relation(relation)?;
+        if system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+        let schema = self.historical_parent_schema(relation)?;
+        let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+        if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let guard = self.open.snapshot.parent_point_release_guard(relation, id, system).await?;
+        let valid = Interval::at(valid)?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentPointAt {
+            system, point: ArchivePoint {
+                relation: relation.clone(), id: id.clone(), valid, lifetime: None,
+                expected_schema: Some(schema.clone()), guard: Arc::clone(&guard), reply,
+            },
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let fact = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        if let Some(fact) = &fact {
+            if fact.revision > system { return Err(OwnedWorld::unavailable()); }
+            schema.validate_row(&fact.row)?;
+        }
+        guard()?;
+        self.check_relation(relation)?;
+        Ok(fact)
+    }
+
+    fn historical_parent_schema(&self, relation: &OwnedRelation) -> Result<&rtdb_types::OwnedSchema> {
+        self.open.record.schemas.relation(relation)
+            .filter(|schema| relation.is_root_data() && !schema.has_opaque_columns() && schema.lifetime_micros().is_none())
+            .ok_or_else(OwnedWorld::unavailable)
     }
 
     pub async fn accepted_point(
@@ -612,7 +684,7 @@ impl HeldCheckpointWorld {
         let read = OrderedRead::Page {
             after: request.after.cloned(), descending: request.descending, limit: request.limit,
         };
-        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read).await?;
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read, None).await?;
         let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((page, witness))
     }
@@ -653,7 +725,7 @@ impl HeldCheckpointWorld {
     pub async fn count(
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>,
     ) -> Result<(u64, OwnedWorldWitness)> {
-        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count).await?;
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count, None).await?;
         let OrderedResult::Count(count) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((count, witness))
     }
@@ -663,26 +735,56 @@ impl HeldCheckpointWorld {
     ) -> Result<(OwnedRangeCount, OwnedWorldWitness)> {
         if self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
         let (result, witness) = self.ordered(
-            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Measure,
+            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Measure, None,
         ).await?;
         let OrderedResult::Measure(measured) = result else { return Err(OwnedWorld::unavailable()); };
         Ok((measured, witness))
     }
 
+    pub async fn parent_range_at(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>,
+        valid: Timestamp, system: Timestamp,
+    ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
+        let read = OrderedRead::Page {
+            after: request.after.cloned(), descending: request.descending, limit: request.limit,
+        };
+        let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read, Some(system)).await?;
+        let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((page, witness))
+    }
+
+    pub async fn parent_count_at(
+        &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'_>, system: Timestamp,
+    ) -> Result<(u64, OwnedWorldWitness)> {
+        let (result, witness) = self.ordered(
+            relation, path, request.lower, request.upper, request.valid_at, OrderedRead::Count, Some(system),
+        ).await?;
+        let OrderedResult::Count(count) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok((count, witness))
+    }
+
     async fn ordered(
         &self, relation: OwnedRelation, path: OwnedRelation, lower: Option<&StructFields<Value>>,
-        upper: Option<&StructFields<Value>>, valid: Timestamp, read: OrderedRead,
+        upper: Option<&StructFields<Value>>, valid: Timestamp, read: OrderedRead, system: Option<Timestamp>,
     ) -> Result<(OrderedResult, OwnedWorldWitness)> {
         self.check_relation(&relation)?;
         Interval::at(valid)?;
         let guard = self.open.snapshot.relation_release_guard([&relation])?;
-        let witness = self.open.snapshot.world_relation_witnesses(
-            self.open.record.id, [&relation],
-        ).await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+        let (witness, earlier) = if let Some(system) = system {
+            let schema = self.historical_parent_schema(&relation)?;
+            if system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+            let witness = self.open.snapshot.world_parent_witness(self.open.record.id, &relation).await?;
+            if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+            (witness, Some((system, schema.clone())))
+        } else {
+            let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [&relation])
+                .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
+            (witness, None)
+        };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ordered {
             relation, path, frontier: witness.purge_frontier(), lower: lower.cloned(), upper: upper.cloned(),
-            valid, read, guard: Arc::clone(&guard), reply,
+            valid, earlier, read, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let result = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
@@ -1015,6 +1117,72 @@ fn check_archive_coverage<'a>(
     Ok(())
 }
 
+async fn historical_parent_context(
+    context: Arc<rtdb_query::QueryContext>, owner: &str, requested: Timestamp,
+    schemas: &[(OwnedRelation, rtdb_types::OwnedSchema)],
+) -> Result<(Arc<rtdb_query::QueryContext>, Timestamp)> {
+    let unavailable = OwnedWorld::unavailable;
+    let parent = context.current_time.as_micros()?;
+    if requested >= parent { return Err(unavailable()); }
+    check_archive_coverage(&context, owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
+    if snapshot.tx_basis().is_none_or(|basis| basis.system_time != parent)
+        || snapshot.system_time_cap() != Some(parent)
+        || snapshot.relation_event_frontier(&rtdb_types::TableRef::new("public", "bj_rtdb_restore_hold"))? != 0
+    {
+        return Err(unavailable());
+    }
+    let publication = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+    if snapshot.relation_event_frontier(&publication.purge_table(owner))? != 0 {
+        return Err(unavailable());
+    }
+    require_parent_journal(&context, owner, &publication, requested).await?;
+    let requested_context = context.with_owned_system_cut(requested, &context.cancellation)?;
+    let selected = rtdb_query::read_owned_root_publication(requested_context, owner).await?.ok_or_else(unavailable)?;
+    if selected > requested { return Err(unavailable()); }
+    require_parent_journal(&context, owner, &publication, selected).await?;
+    let capped = context.with_owned_system_cut(selected, &context.cancellation)?;
+    for (relation, expected) in schemas {
+        require_parent_journal(&context, owner, relation, selected).await?;
+        let actual = rtdb_query::read_owned_relation_schema(Arc::clone(&capped), owner, relation).await?;
+        if !actual.is_some_and(|(schema, _)| &schema == expected) { return Err(unavailable()); }
+    }
+    capped.check_cancelled()?;
+    Ok((capped, selected))
+}
+
+async fn require_parent_journal(
+    context: &Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation, selected: Timestamp,
+) -> Result<()> {
+    let unavailable = OwnedWorld::unavailable;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
+    let table = relation.table(owner);
+    let journal = relation.change_journal(owner)?;
+    let data_events = snapshot.relation_event_frontier(&table)?;
+    let entries = snapshot.relation_event_frontier(&journal)?;
+    if entries == 0 && data_events == 0 && snapshot.trie_entries(&table).is_empty()
+        && snapshot.trie_entries(&journal).is_empty()
+    {
+        return Ok(());
+    }
+    if entries < 2 { return Err(unavailable()); }
+    let floor = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, 0).await?;
+    let first = rtdb_query::read_owned_journal_header(Arc::clone(context), owner, relation, 1).await?;
+    let head = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, entries - 1).await?;
+    if floor.value != Value::Null || floor.system_time != first.committed_at
+        || floor.through_events >= first.through_events || (floor.through_events != 0 && selected < floor.system_time)
+        || head.through_events != data_events || head.system_time > context.current_time.as_micros()?
+        || (entries > 2 && (head.system_time <= first.committed_at || head.through_events <= first.through_events))
+        || (entries == 2 && (head.system_time != first.committed_at || head.through_events != first.through_events))
+        || !matches!(head.value, Value::List(touches) if !touches.is_empty())
+    {
+        return Err(unavailable());
+    }
+    Ok(())
+}
+
 const MAX_HISTORY_SLICES: usize = 128;
 
 fn history_limit() -> rtdb_types::Anomaly {
@@ -1120,6 +1288,41 @@ pub(crate) async fn open_held_checkpoint_world(
                                     ));
                                     let _ = reply.send(coverage);
                                 }
+                                ArchiveRead::ParentAsOf { requested, schemas, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        let (_, selected) = historical_parent_context(context, &owner, requested, &schemas).await?;
+                                        Ok(selected)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
+                                ArchiveRead::ParentPointAt { system, point } => {
+                                    let ArchivePoint { relation, id, valid, guard, expected_schema, mut reply, .. } = point;
+                                    let read = async {
+                                        guard()?;
+                                        let schema = expected_schema.ok_or_else(OwnedWorld::unavailable)?;
+                                        let context = Arc::clone(&context).with_owned_read_guard(guard);
+                                        let schemas = [(relation.clone(), schema)];
+                                        let (context, selected) = historical_parent_context(context, &owner, system, &schemas).await?;
+                                        if selected != system { return Err(OwnedWorld::unavailable()); }
+                                        let batches = read_checkpoint_point_in_context(context, CheckpointPoint {
+                                            owner: &owner, relation: &relation, id: &id, valid: Some(valid),
+                                        }, None).await?;
+                                        decode_point(batches.unwrap_or_default(), &id, memory, None)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
                                 ArchiveRead::AcceptedScope { schemas, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
@@ -1219,11 +1422,17 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, read, guard, mut reply } => {
+                                ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, earlier, read, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner, [(&relation, frontier)])?;
                                         let context = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let context = if let Some((system, schema)) = earlier {
+                                            let schemas = [(relation.clone(), schema)];
+                                            let (context, selected) = historical_parent_context(context, &owner, system, &schemas).await?;
+                                            if selected != system { return Err(OwnedWorld::unavailable()); }
+                                            context
+                                        } else { context };
                                         let (lower, upper) = (lower.as_ref(), upper.as_ref());
                                         let result = match read {
                                             OrderedRead::Page { after, descending, limit } => {

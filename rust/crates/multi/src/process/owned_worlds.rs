@@ -182,6 +182,17 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::measure(self, relation, path, request))
     }
+    fn parent_range_at<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::parent_range_at(self, relation, path, request, valid, system))
+    }
+    fn parent_count_at<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>> {
+        Box::pin(HeldCheckpointWorld::parent_count_at(self, relation, path, request, system))
+    }
     fn overlay_range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {
@@ -292,6 +303,21 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
     ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>> {
         Box::pin(HeldCheckpointWorld::select_accepted_scope(self, relations, requested))
+    }
+
+    fn select_parent_as_of<'a>(
+        &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
+    ) -> BoxFuture<'a, Result<Timestamp>> {
+        Box::pin(HeldCheckpointWorld::select_parent_as_of(self, relations, requested))
+    }
+
+    fn parent_point_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>> {
+        Box::pin(async move {
+            let fact = HeldCheckpointWorld::parent_point_at(self, relation, id, valid, system).await?;
+            Ok(path_touch_result(system, (fact, false)))
+        })
     }
 
     fn preflight_accepted_scope<'a>(

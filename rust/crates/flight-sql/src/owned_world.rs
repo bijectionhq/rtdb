@@ -105,6 +105,13 @@ pub trait OwnedWorldRead: Send + Sync {
     fn measure<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>,
     ) -> BoxFuture<'a, Result<(OwnedRangeCount, OwnedWorldWitness)>>;
+    fn parent_range_at<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
+    fn parent_count_at<'a>(
+        &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedCountRequest<'a>, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(u64, OwnedWorldWitness)>>;
     fn overlay_range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
@@ -152,6 +159,12 @@ pub trait OwnedWorldRead: Send + Sync {
     fn select_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
     ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>>;
+    fn select_parent_as_of<'a>(
+        &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
+    ) -> BoxFuture<'a, Result<Timestamp>>;
+    fn parent_point_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn preflight_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], system: Timestamp,
     ) -> BoxFuture<'a, Result<Timestamp>>;
