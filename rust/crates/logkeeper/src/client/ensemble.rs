@@ -6,7 +6,6 @@ use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, Di
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
@@ -64,20 +63,13 @@ impl Ensemble {
             },
         }).collect();
         let mut journals: Vec<_> = config.servers.iter().filter_map(JournalEndpoint::journal).collect();
-        let mut identity = Sha256::new();
-        if journals.len() == config.servers.len() {
-            identity.update(b"rtdb.logkeeper/ensemble/v2");
-        } else {
-            identity.update(b"rtdb.logkeeper/ensemble/v1");
+        let identified = journals.len() == config.servers.len();
+        if !identified {
             journals = config.servers.iter().map(JournalEndpoint::address).collect();
         }
         journals.sort_unstable();
-        identity.update((config.write_quorum as u64).to_be_bytes());
-        for journal in journals {
-            identity.update((journal.len() as u64).to_be_bytes());
-            identity.update(journal.as_bytes());
-        }
-        Self { config, links, identity: Bytes::copy_from_slice(&identity.finalize()) }
+        let identity = crate::protocol::ensemble_identity(identified, config.write_quorum as u64, journals);
+        Self { config, links, identity: Bytes::copy_from_slice(&identity) }
     }
 
     pub fn len(&self) -> usize { self.links.len() }
@@ -87,6 +79,20 @@ impl Ensemble {
     pub fn supports_guarded(&self) -> bool {
         self.config.write_quorum > self.len() - self.config.write_quorum
             && self.config.servers.iter().all(|server| server.journal().is_some())
+    }
+
+    pub fn timed_origin(&self) -> crate::protocol::TimedJournalOrigin {
+        let mut journals: Vec<_> = self.config.servers.iter().map(|server| {
+            server.journal().expect("guarded ensemble identity").to_owned()
+        }).collect();
+        journals.sort_unstable();
+        crate::protocol::TimedJournalOrigin {
+            journals, write_quorum: self.config.write_quorum as u64, stream: self.stream(),
+        }
+    }
+
+    pub fn matches_timed_origin(&self, identity: &[u8]) -> bool {
+        crate::protocol::timed_origin_fingerprint(&self.config.stream, &self.identity).as_slice() == identity
     }
 
     fn unexpected(&self, server: usize, reply: ResponseBody) -> Error {
@@ -228,12 +234,20 @@ impl Ensemble {
 
     pub async fn digest_page(&self, server: usize, from_lsn: i64, through_lsn: i64, preceding_digest: Option<[u8; 32]>) -> Result<PageDigest> {
         let preceding_digest = preceding_digest.map_or_else(Bytes::new, |digest| Bytes::copy_from_slice(&digest));
-        self.read_digest(server, DigestPage { stream: self.stream(), from_lsn, through_lsn, preceding_digest, sealed_epoch: None }).await
+        self.read_digest(server, DigestPage { stream: self.stream(), from_lsn, through_lsn, preceding_digest, sealed_epoch: None, certified_entry_digest: Bytes::new() }).await
     }
 
     pub async fn guarded_digest(&self, server: usize, lsn: i64, epoch: u64) -> Result<PageDigest> {
         self.read_digest(server, DigestPage {
             stream: self.stream(), from_lsn: lsn, through_lsn: lsn, preceding_digest: Bytes::new(), sealed_epoch: Some(epoch),
+            certified_entry_digest: Bytes::new(),
+        }).await
+    }
+
+    pub async fn original_digest(&self, server: usize, lsn: i64, digest: &[u8; 32]) -> Result<PageDigest> {
+        self.read_digest(server, DigestPage {
+            stream: self.stream(), from_lsn: lsn, through_lsn: lsn, preceding_digest: Bytes::new(), sealed_epoch: None,
+            certified_entry_digest: Bytes::copy_from_slice(digest),
         }).await
     }
 

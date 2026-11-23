@@ -10,8 +10,8 @@ mod protocol;
 mod local;
 mod server;
 
-pub use client::{CertifiedRangeReader, CopyFrom, JournalSyncObservation, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, bootstrap_committed_page, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, seal, seal_recover_committed, trim, trim_all, verify_certified_range};
-pub use protocol::Entry as ArchivedReplicaEntry;
+pub use client::{CertifiedRangeReader, CopyFrom, JournalSyncObservation, Loglet, QuorumLog, RetainedAudit, StreamConfig, audit_retained, bootstrap_committed_page, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, original_sync_observations, retire, seal, seal_recover_committed, timely_original_sync_upper, trim, trim_all, verify_certified_range};
+pub use protocol::{Entry as ArchivedReplicaEntry, TimedJournalOrigin};
 pub use local::LocalListener;
 pub use rtdb_types::JournalEndpoint;
 pub use server::{AuthorityListener, JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};

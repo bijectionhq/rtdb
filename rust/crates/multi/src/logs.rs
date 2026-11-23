@@ -227,7 +227,7 @@ impl LogFactory for LogkeeperLogFactory {
                     Some(previous) => {
                         member_ids(previous)?;
                         self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
-                        let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
+                        let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0, write_quorum: crate::deployment::write_quorum(previous.len()) }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
                         // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
                         self.recorder.record(&config.deployment, config.epoch, ensemble).await?;
                         moved

@@ -5,8 +5,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 use super::ensemble::{Ensemble, MAXIMUM_BATCH_ENTRIES};
-use super::{StreamConfig, validate};
+use super::{JournalEndpoint, StreamConfig, validate};
 use crate::history::RetainedChain;
+use crate::protocol::{Entry, before_guarded_cutoff};
 use crate::server::JournalDigest;
 
 /// Fingerprints of the same committed range on all responding members of an ensemble.
@@ -56,7 +57,7 @@ pub async fn certify_observed_entry(
         }
         agreed = Some(digest);
         agreeing += 1;
-        if let Some(synced_clock_upper_micros) = page.synced_clock_upper_micros {
+        if page.original_append == Some(true) && let Some(synced_clock_upper_micros) = page.synced_clock_upper_micros {
             if synced_clock_upper_micros <= 0 {
                 return Err(Anomaly::fault("rtdb.logkeeper/sync-observation-clock", "A journal returned an invalid sync sample"));
             }
@@ -69,6 +70,72 @@ pub async fn certify_observed_entry(
     let digest = agreed.filter(|_| agreeing >= config.write_quorum).ok_or_else(range_unavailable)?;
     observations.sort_unstable_by_key(|observation| observation.synced_clock_upper_micros);
     Ok((JournalDigest::from_digest_bytes(config.stream.clone(), [offset, offset], digest), observations))
+}
+
+/// Read the retained observations of the original voters for an already certified timed entry.
+pub async fn original_sync_observations(
+    certificate: &JournalDigest, entry: &Entry, endpoints: Vec<JournalEndpoint>, maximum_message_bytes: usize,
+) -> Result<Vec<JournalSyncObservation>> {
+    verify_certified_range(certificate, std::slice::from_ref(entry))?;
+    let Some(origin) = entry.timed_origin.as_ref().filter(|_| entry.valid_guard()) else {
+        return Err(range_unavailable());
+    };
+    let offset = entry.lsn;
+    let mut original = RetainedChain::new(&origin.stream, offset);
+    original.append(entry);
+    let digest = original.bytes();
+    let origin_identity = origin.fingerprint();
+    // An address can have been reused by a different journal. Each probe binds the expected
+    // identity on the connection, and at most one result per original voter can contribute.
+    let mut by_journal = BTreeMap::new();
+    for endpoint in endpoints {
+        if let Some(journal) = endpoint.journal()
+            && origin.journals.binary_search_by(|id| id.as_str().cmp(journal)).is_ok()
+        {
+            by_journal.entry(journal.to_owned()).or_insert(endpoint);
+        }
+    }
+    if by_journal.is_empty() { return Ok(Vec::new()); }
+    let ensemble = Ensemble::new(StreamConfig {
+        servers: by_journal.into_values().collect(), stream: origin.stream.clone(),
+        write_quorum: 1, maximum_message_bytes,
+    });
+    let mut pending = (0..ensemble.len()).map(|server| {
+        let (ensemble, digest) = (&ensemble, &digest);
+        async move { (server, ensemble.original_digest(server, offset, digest).await) }
+    }).collect::<FuturesUnordered<_>>();
+    let mut observations = Vec::new();
+    while let Some((server, reply)) = pending.next().await {
+        let Ok(page) = reply else { continue };
+        if page.through_lsn == offset && page.digest.as_ref() == digest.as_slice()
+            && page.timed_origin_identity.as_ref() == origin_identity.as_slice()
+            && page.guarded_before == entry.guarded_before && page.original_append == Some(true)
+            && let Some(synced_clock_upper_micros) = page.synced_clock_upper_micros.filter(|sample| *sample > 0)
+        {
+            observations.push(JournalSyncObservation {
+                journal: ensemble.config.servers[server].journal().expect("filtered original identities").to_owned(),
+                synced_clock_upper_micros,
+            });
+        }
+    }
+    Ok(observations)
+}
+
+/// The original quorum's earliest qualifying upper bound, if it can be recovered.
+pub fn timely_original_sync_upper(entry: &Entry, observations: &[JournalSyncObservation]) -> Option<i64> {
+    let cutoff = entry.guarded_before?;
+    let origin = entry.timed_origin.as_ref().filter(|_| entry.valid_guard())?;
+    let mut by_journal = BTreeMap::<&str, i64>::new();
+    for observation in observations {
+        let journal = observation.journal.as_str();
+        let sample = observation.synced_clock_upper_micros;
+        if before_guarded_cutoff(sample, Some(cutoff)) && origin.journals.binary_search_by(|id| id.as_str().cmp(journal)).is_ok() {
+            by_journal.entry(journal).and_modify(|stored| *stored = (*stored).min(sample)).or_insert(sample);
+        }
+    }
+    let mut samples: Vec<_> = by_journal.into_values().collect();
+    samples.sort_unstable();
+    samples.get(origin.write_quorum as usize - 1).copied()
 }
 
 /// Compares independently read replicas without appending, sealing or advancing their commit positions.
@@ -308,7 +375,7 @@ pub fn verify_certified_range(certificate: &JournalDigest, entries: &[crate::pro
     }
     let mut chain = RetainedChain::new(&certificate.stream, first);
     for (index, entry) in entries.iter().enumerate() {
-        if first.checked_add(i64::try_from(index).map_err(|_| range_unavailable())?) != Some(entry.lsn) {
+        if !entry.valid_guard() || first.checked_add(i64::try_from(index).map_err(|_| range_unavailable())?) != Some(entry.lsn) {
             return Err(range_unavailable());
         }
         chain.append(entry);
@@ -374,7 +441,27 @@ fn incomplete(ensemble: &Ensemble, server: usize, position: i64) -> Anomaly {
 
 #[cfg(test)]
 mod tests {
-    use super::quorum_overlap;
+    use super::{JournalSyncObservation, quorum_overlap, timely_original_sync_upper};
+    use crate::protocol::{Entry, TimedJournalOrigin};
+
+    #[test]
+    fn timed_audit_requires_distinct_original_votes_strictly_before_the_cutoff() {
+        let journal = |id| uuid::Uuid::from_u128(id).to_string();
+        let entry = Entry {
+            lsn: 0, epoch: 1, guarded: true, guarded_before: Some(100),
+            timed_origin: Some(TimedJournalOrigin {
+                journals: (1..=3).map(journal).collect(), write_quorum: 2, stream: "original".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let sample = |id, synced_clock_upper_micros| JournalSyncObservation {
+            journal: journal(id), synced_clock_upper_micros,
+        };
+        let mut observations = vec![sample(1, 75), sample(1, 80), sample(2, 100), sample(3, 110), sample(4, 10)];
+        assert_eq!(timely_original_sync_upper(&entry, &observations), None);
+        observations.push(sample(3, 99));
+        assert_eq!(timely_original_sync_upper(&entry, &observations), Some(99));
+    }
 
     #[test]
     fn the_latest_comparison_range_falls_back_when_retained_windows_do_not_overlap_at_the_tip() {

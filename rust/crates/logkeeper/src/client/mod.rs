@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use writer::{AppendTime, Tip, Writer};
 
-pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, verify_certified_range};
+pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, original_sync_observations, timely_original_sync_upper, verify_certified_range};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
@@ -43,6 +43,7 @@ pub struct StreamConfig {
 pub struct Loglet {
     pub servers: Vec<JournalEndpoint>,
     pub start_lsn: i64,
+    pub write_quorum: usize,
 }
 
 /// Where a moved stream's new loglet starts holding its history.
@@ -117,7 +118,7 @@ pub async fn open_writer(config: StreamConfig, epoch: u64, cancellation: Cancell
 }
 
 fn loglet_config(loglet: &Loglet, like: &StreamConfig) -> rtdb_types::Result<StreamConfig> {
-    let config = StreamConfig { servers: loglet.servers.clone(), ..like.clone() };
+    let config = StreamConfig { servers: loglet.servers.clone(), write_quorum: loglet.write_quorum, ..like.clone() };
     validate(&config)?;
     Ok(config)
 }
@@ -141,7 +142,7 @@ fn earlier(chain: &[Loglet], start: i64, like: &StreamConfig) -> rtdb_types::Res
 }
 
 /// Moves the stream to `new.servers` at `epoch`: seals the last loglet of `chain` at `epoch`, recovers its committed tail, copies it onto the new ensemble from where `from` says, and returns the stream's only writer at that epoch, which appends to the new ensemble alone.
-/// `chain` lists the stream's earlier loglets oldest first; each is read with `new`'s stream name and write quorum.
+/// `chain` lists the stream's earlier loglets oldest first; each uses its own write quorum under `new`'s stream name.
 /// Lsns stay dense across the move, and [`QuorumLog::loglets`] gives the chain to record and hand to readers.
 /// An `open_writer` or `seal` of the old ensemble at `epoch` or below is refused afterwards.
 pub async fn open_writer_on(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, from: CopyFrom, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
@@ -195,7 +196,7 @@ pub async fn bootstrap_committed_page(
 /// Reads committed entries from whichever reachable server has the highest commit lsn, failing over on error.
 pub async fn open_reader(config: StreamConfig, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&config)?;
-    let current = Loglet { servers: config.servers.clone(), start_lsn: 0 };
+    let current = Loglet { servers: config.servers.clone(), start_lsn: 0, write_quorum: config.write_quorum };
     open_reader_on(vec![current], config, cancellation).await
 }
 
@@ -205,8 +206,8 @@ pub async fn open_reader_on(chain: Vec<Loglet>, config: StreamConfig, cancellati
     validate(&config)?;
     validate_chain(&chain)?;
     let current = chain.last().expect("validated non-empty");
-    if current.servers != config.servers {
-        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-chain", "a reader's servers are its chain's last loglet's"));
+    if current.servers != config.servers || current.write_quorum != config.write_quorum {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-chain", "the reader and its last loglet must name the same ensemble"));
     }
     let (start, earlier) = (current.start_lsn, earlier(&chain, current.start_lsn, &config)?);
     let ensemble = Arc::new(Ensemble::new(config));
@@ -384,8 +385,8 @@ impl QuorumLog {
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
     pub fn loglets(&self) -> Vec<Loglet> {
         let shared = &self.shared;
-        shared.earlier.iter().map(|loglet| Loglet { servers: loglet.ensemble.config.servers.clone(), start_lsn: loglet.start })
-            .chain([Loglet { servers: shared.ensemble.config.servers.clone(), start_lsn: shared.start }])
+        shared.earlier.iter().map(|loglet| Loglet { servers: loglet.ensemble.config.servers.clone(), start_lsn: loglet.start, write_quorum: loglet.ensemble.config.write_quorum })
+            .chain([Loglet { servers: shared.ensemble.config.servers.clone(), start_lsn: shared.start, write_quorum: shared.ensemble.config.write_quorum }])
             .collect()
     }
 

@@ -116,6 +116,9 @@ impl Store {
                 if !self.journal.is_durable() || !entry.guarded || !entry.valid_guard() || append.first_lsn.checked_sub(1) != Some(append.commit_lsn) {
                     return Outcome::Now(failed("a guarded sync observation requires one guarded entry after a committed prefix"));
                 }
+                if entry.timed_origin.as_ref().is_some_and(|origin| origin.stream != append.stream) {
+                    return Outcome::Now(failed("the timed entry must name its original stream"));
+                }
                 Some((append.first_lsn, entry.guarded_before))
             }
             RequestBody::Append(append) if !append.guarded_ensemble.is_empty() || append.entries.iter().any(|entry| entry.guarded || !entry.valid_guard()) => {
@@ -280,7 +283,7 @@ impl Store {
 
     /// Selects entries in `[from, to]` and where to find each payload, under the stream's lock.
     fn select(&self, state: &StreamState<Stored>, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Window<Item> {
-        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, source: self.journal.source(&held.payload) })
+        state.window(from, to, max_entries, max_bytes, |lsn, held| Item { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, timed_origin: held.timed_origin.as_deref().cloned(), source: self.journal.source(&held.payload) })
     }
 
     /// Held entries in `[from, to)`, committed or not; a selection with payloads still on disk is resolved by `entries`.
@@ -317,26 +320,29 @@ impl Store {
         };
         let Ok(_page) = self.digest_pages.try_acquire() else { return failed("history proof capacity exhausted"); };
         let Some(slot) = self.existing(&page.stream) else { return failed("the stream was not found"); };
-        let (window, durable, observation, original_append) = {
+        let exact = page.from_lsn == page.through_lsn;
+        let lookup_original = !page.certified_entry_digest.is_empty();
+        if lookup_original && (!exact || !page.preceding_digest.is_empty() || page.sealed_epoch.is_some() || page.certified_entry_digest.len() != 32) {
+            return failed("an original observation requires one certified entry");
+        }
+        let (window, durable, observation) = {
             let state = slot.state.lock();
+            let observation = exact.then(|| state.sync_observation(page.from_lsn)).flatten();
             let admitted = match page.sealed_epoch {
+                None if lookup_original => observation.as_ref().is_some_and(|sample| sample.get().is_some()),
                 None => page.through_lsn <= state.commit,
-                Some(epoch) => page.from_lsn == page.through_lsn && page.preceding_digest.is_empty()
-                    && state.guarded_at_seal(epoch, page.from_lsn),
+                Some(epoch) => exact && page.preceding_digest.is_empty() && state.guarded_at_seal(epoch, page.from_lsn),
             };
             if state.dropped || page.from_lsn <= state.trim || !admitted {
-                return failed("the digest interval is outside the committed or sealed guarded window");
+                return failed("the digest interval is outside the requested retained window");
             }
             let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
-            let observation = (page.from_lsn == page.through_lsn)
-                .then(|| state.sync_observation(page.from_lsn)).flatten();
-            let original_append = page.sealed_epoch.map(|_| observation.is_some());
             let (done, durable) = oneshot::channel();
             // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
             if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
                 return failed("the journal has stopped");
             }
-            (window, durable, observation, original_append)
+            (window, durable, observation)
         };
         if !matches!(durable.await, Ok(Ok(()))) { return failed("the digest interval was not made durable"); }
         let journal = Arc::clone(&self.journal);
@@ -352,10 +358,20 @@ impl Store {
                 }
                 chain.append(entry);
             }
+            let digest = chain.bytes();
+            let timed_origin = exact.then_some(last.timed_origin.as_ref()).flatten();
+            if lookup_original && (timed_origin.is_none_or(|origin| origin.stream != page.stream)
+                || digest.as_slice() != page.certified_entry_digest.as_ref())
+            {
+                return failed("this journal does not hold the certified original");
+            }
             ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn,
-                digest: Bytes::copy_from_slice(&chain.bytes()),
-                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()), original_append,
-                guarded_before: (page.from_lsn == page.through_lsn).then_some(last.guarded_before).flatten() })
+                digest: Bytes::copy_from_slice(&digest),
+                original_append: (exact && last.guarded).then_some(observation.is_some()),
+                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()),
+                guarded_before: exact.then_some(last.guarded_before).flatten(),
+                timed_origin_identity: timed_origin.map_or_else(Bytes::new, |origin| Bytes::copy_from_slice(&origin.fingerprint())),
+            })
         }).await {
             Ok(reply) => reply,
             Err(error) => failed(error.to_string()),
@@ -399,7 +415,7 @@ impl Selected {
         let Window { items, commit_lsn, trim_lsn, last_lsn } = self.0;
         let entries = items.into_iter().map(|item| {
             let Source::Ready(payload) = item.source else { unreachable!("checked above") };
-            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, guarded_before: item.guarded_before, payload }
+            Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, guarded: item.guarded, guarded_before: item.guarded_before, timed_origin: item.timed_origin, payload }
         }).collect();
         Ok(ResponseBody::Entries(Entries { entries, commit_lsn, trim_lsn, last_lsn }))
     }
@@ -500,7 +516,7 @@ mod tests {
             stream: "drop-me".into(),
             epoch: 1,
             from_lsn: 0,
-            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, guarded: false, guarded_before: None, payload: Bytes::from(vec![1; 2 << 20]) }],
+            entries: vec![Entry { lsn: 0, epoch: 1, timestamp: 0, guarded: false, guarded_before: None, timed_origin: None, payload: Bytes::from(vec![1; 2 << 20]) }],
             complete: true,
             commit_lsn: 0, activate_ensemble: Bytes::new(),
         }), 2 << 20).await, Outcome::Durable(_, _)));

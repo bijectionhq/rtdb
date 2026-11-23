@@ -39,6 +39,10 @@ impl RetainedChain {
         link.update(&entry.payload);
         if entry.guarded { link.update(b"rtdb.logkeeper/guarded-entry\0"); }
         if let Some(before) = entry.guarded_before { link.update(before.to_be_bytes()); }
+        if let Some(origin) = &entry.timed_origin {
+            link.update(b"rtdb.logkeeper/timed-original-ensemble\0");
+            link.update(origin.fingerprint());
+        }
         self.0 = link.finalize();
     }
 

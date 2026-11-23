@@ -154,7 +154,7 @@ async fn the_recovered_predecessor_cannot_confirm_a_successor_read_index() {
     let first = append(previous.as_ref(), "first", 1).await.offset;
 
     let current_config = config(&[1, 2, 3]);
-    let chain = vec![Loglet { servers: previous_config.servers.clone(), start_lsn: 0 }];
+    let chain = vec![Loglet { servers: previous_config.servers.clone(), start_lsn: 0, write_quorum: previous_config.write_quorum }];
     let moved = open_writer_on(chain, current_config, 2, CopyFrom::Retained, CancellationToken::new()).await.unwrap();
     assert!(previous_reader.read_index(1).await.is_err());
     assert!(previous_reader.read_index(2).await.is_err());

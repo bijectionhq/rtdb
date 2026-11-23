@@ -545,7 +545,8 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
         assert_eq!(writer.latest().unwrap(), LogOffset(-1));
     }
     let clock = || Timestamp(124);
-    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, None))
+    let journal_cutoff = Timestamp(i64::MAX);
+    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, Some(journal_cutoff)))
         .await.unwrap().durable().await.unwrap();
     assert_eq!(durable.offset, LogOffset(0));
     drop(writer);
@@ -556,6 +557,12 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     assert_eq!(report.authority, authority);
     assert_eq!(report.replica_stream, scope);
     assert_eq!(report.required_replica_quorum, 2);
+    assert_eq!(report.required_original_quorum, Some(2));
+    assert_eq!(report.original_replica_stream.as_deref(), Some(scope.as_str()));
+    let mut roster: Vec<_> = stream.servers.iter().map(|server| server.journal().unwrap().to_owned()).collect();
+    roster.sort_unstable();
+    assert_eq!(report.original_journals, roster);
+    assert_eq!(report.journal_cutoff_micros, Some(journal_cutoff.0));
     assert_eq!(report.acceptance.replica_offset, 0);
     assert_eq!(report.acceptance.source_position, 3);
     assert_eq!(report.acceptance.staging_clock_upper_micros, 120);

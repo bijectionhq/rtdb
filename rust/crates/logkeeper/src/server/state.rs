@@ -5,7 +5,7 @@
 
 #[cfg(any(test, feature = "simulation"))]
 use crate::protocol::Entries;
-use crate::protocol::{Accepted, Entry, EpochRun, Refused, ResponseBody, Sealed};
+use crate::protocol::{Accepted, Entry, EpochRun, Refused, ResponseBody, Sealed, TimedJournalOrigin};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -44,13 +44,20 @@ pub struct Held<P = Bytes> {
     pub timestamp: i64,
     pub guarded: bool,
     pub guarded_before: Option<i64>,
+    pub timed_origin: Option<Box<TimedJournalOrigin>>,
     pub payload: P,
     pub(super) observed_sync: Option<Arc<OnceLock<i64>>>,
 }
 
 impl<P: Payload> Held<P> {
+    fn retained_origin_bytes(&self) -> usize {
+        self.timed_origin.as_deref().map_or(0, |origin| {
+            <TimedJournalOrigin as prost::Message>::encoded_len(origin) + 8
+        })
+    }
+
     fn retained_size(&self) -> usize {
-        self.payload.bytes() + RETAINED_ENTRY_OVERHEAD
+        self.payload.bytes() + RETAINED_ENTRY_OVERHEAD + self.retained_origin_bytes()
             + usize::from(self.observed_sync.is_some()) * SYNC_OBSERVATION_OVERHEAD
     }
 }
@@ -178,7 +185,7 @@ impl<P: Payload> StreamState<P> {
             }
             Event::Append(entry) => {
                 self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
-                    guarded: entry.guarded, guarded_before: entry.guarded_before,
+                    guarded: entry.guarded, guarded_before: entry.guarded_before, timed_origin: entry.timed_origin.clone().map(Box::new),
                     payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
@@ -237,6 +244,11 @@ impl<P: Payload> StreamState<P> {
     pub(super) fn append_observed(&mut self, epoch: u64, first: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32]) -> Decision {
         if !self.writer_authority().confirms(epoch, ensemble) {
             return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        if entries.iter().any(|entry| !entry.valid_guard()
+            || entry.timed_origin.as_ref().is_some_and(|origin| origin.ensemble_identity() != ensemble))
+        {
+            return invalid("the timed entry must name the activated original ensemble");
         }
         self.append(epoch, first, entries, commit)
     }
@@ -360,7 +372,7 @@ impl<P: Payload> StreamState<P> {
             let mut bytes = 0usize;
             let skip = (from - self.trim - 1) as usize;
             for (held, lsn) in self.entries.iter().skip(skip).zip(from..=to).take(max_entries) {
-                bytes = bytes.saturating_add(held.payload.bytes());
+                bytes = bytes.saturating_add(held.payload.bytes()).saturating_add(held.retained_origin_bytes());
                 if bytes > max_bytes && !items.is_empty() { break; }
                 items.push(item(lsn, held));
             }
@@ -372,7 +384,7 @@ impl<P: Payload> StreamState<P> {
 #[cfg(any(test, feature = "simulation"))]
 impl StreamState<Bytes> {
     pub fn entries(&self, from: i64, to: i64, max_entries: usize, max_bytes: usize) -> Entries {
-        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, payload: held.payload.clone() });
+        let window = self.window(from, to, max_entries, max_bytes, |lsn, held| Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, timed_origin: held.timed_origin.as_deref().cloned(), payload: held.payload.clone() });
         Entries { entries: window.items, commit_lsn: window.commit_lsn, trim_lsn: window.trim_lsn, last_lsn: window.last_lsn }
     }
 }
@@ -381,7 +393,7 @@ impl StreamState<Bytes> {
 mod tests {
     use super::*;
 
-    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, guarded_before: None, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
+    fn entry(lsn: i64, epoch: u64) -> Entry { Entry { lsn, epoch, timestamp: lsn, guarded: false, guarded_before: None, timed_origin: None, payload: Bytes::from(format!("{lsn}@{epoch}")) } }
 
     fn synced(epoch: u64) -> StreamState {
         let mut state = <StreamState>::default();

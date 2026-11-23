@@ -44,6 +44,7 @@ pub(crate) struct Item {
     pub timestamp: i64,
     pub guarded: bool,
     pub guarded_before: Option<i64>,
+    pub timed_origin: Option<crate::protocol::TimedJournalOrigin>,
     pub source: Source,
 }
 

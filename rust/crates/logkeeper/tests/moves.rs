@@ -48,10 +48,10 @@ async fn a_stream_moved_to_a_new_ensemble_keeps_everything_acknowledged_and_fenc
     let new = quorum_of(&ensemble, &[2, 3, 4], "moved");
     let a = history_with_a_minority_suffix(&mut ensemble, "moved").await;
 
-    let chain = vec![Loglet { servers: old.servers.clone(), start_lsn: 0 }];
+    let chain = vec![Loglet { servers: old.servers.clone(), start_lsn: 0, write_quorum: old.write_quorum }];
     let b = open_writer_on(chain, new.clone(), 2, CopyFrom::Retained, CancellationToken::new()).await.unwrap();
     assert_eq!(b.latest().unwrap(), LogOffset(4), "the minority suffix was never acknowledged and is dropped");
-    assert_eq!(b.loglets(), [Loglet { servers: new.servers.clone(), start_lsn: 0 }], "the new ensemble holds everything the old one retained");
+    assert_eq!(b.loglets(), [Loglet { servers: new.servers.clone(), start_lsn: 0, write_quorum: new.write_quorum }], "the new ensemble holds everything the old one retained");
     for position in 5..10 { assert_eq!(append(b.as_ref(), &format!("b{position}"), position).await.offset, LogOffset(position)); }
     b.confirm_leadership().await.unwrap();
     assert_eq!(committed(b.as_ref()).await, expected(9));
@@ -75,10 +75,10 @@ async fn a_reader_handed_the_chain_reads_the_whole_history_across_a_move() {
     let new = quorum_of(&ensemble, &[2, 3, 4], "chained");
     let _a = history_with_a_minority_suffix(&mut ensemble, "chained").await;
 
-    let chain = vec![Loglet { servers: old.servers.clone(), start_lsn: 0 }];
+    let chain = vec![Loglet { servers: old.servers.clone(), start_lsn: 0, write_quorum: old.write_quorum }];
     let b = open_writer_on(chain.clone(), new.clone(), 2, CopyFrom::Lsn(3), CancellationToken::new()).await.unwrap();
     let loglets = b.loglets();
-    assert_eq!(loglets, [chain[0].clone(), Loglet { servers: new.servers.clone(), start_lsn: 3 }]);
+    assert_eq!(loglets, [chain[0].clone(), Loglet { servers: new.servers.clone(), start_lsn: 3, write_quorum: new.write_quorum }]);
     for position in 5..8 { assert_eq!(append(b.as_ref(), &format!("b{position}"), position).await.offset, LogOffset(position)); }
     assert_eq!(committed(b.as_ref()).await, expected(7), "the writer reads below its loglet from the earlier one");
 

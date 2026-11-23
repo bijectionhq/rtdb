@@ -339,16 +339,20 @@ async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, his
         }
     }
     let quorum = ensemble.config.write_quorum;
-    if possible < quorum { return Ok(TailDecision::Discard); }
-
     let Ok(exact) = ensemble.guarded_digest(source, offset, epoch).await else { return Ok(TailDecision::Unknown); };
-    if exact.through_lsn != offset || exact.digest.len() != 32 { return Ok(TailDecision::Unknown); }
+    if exact.through_lsn != offset || exact.digest.len() != 32
+        || (exact.guarded_before.is_some() && !ensemble.matches_timed_origin(&exact.timed_origin_identity))
+    {
+        return Ok(TailDecision::Unknown);
+    }
     let mut evidence = GuardedEvidence { possible, observed: 0 };
     evidence.record_exact(&exact);
     let mut pending: FuturesUnordered<_> = holding.into_iter().filter(|server| *server != source)
         .map(|server| ensemble.guarded_digest(server, offset, epoch)).collect();
     while matches!(evidence.decision(quorum), TailDecision::Unknown) && let Some(reply) = pending.next().await {
-        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest && proof.guarded_before == exact.guarded_before {
+        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest
+            && proof.guarded_before == exact.guarded_before && proof.timed_origin_identity == exact.timed_origin_identity
+        {
             evidence.record_exact(&proof);
         }
     }
@@ -613,16 +617,17 @@ impl Writer {
         } else { None };
         // The stream owns its records as a durable log owns its file: a payload carrying its producer's budget charge is copied, so the charge ends with the append.
         let payload = Bytes::copy_from_slice(&payload);
-        let (timestamp, guarded_before) = match time {
-            AppendTime::Ordinary(timestamp) => (timestamp, None),
+        let (timestamp, guarded_before, timed_origin) = match time {
+            AppendTime::Ordinary(timestamp) => (timestamp, None, None),
             AppendTime::Guarded(guard) => {
                 let before = guard.journal_before().map(|before| before.0);
-                (guard.sample()?, before)
+                let origin = before.map(|_| self.ensemble.timed_origin());
+                (guard.sample()?, before, origin)
             }
         };
         pipeline.guarded = guarded;
         pipeline.next_lsn = next;
-        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, guarded: pipeline.guarded.is_some(), guarded_before, payload };
+        let entry = Entry { lsn, epoch: self.epoch, timestamp: timestamp.0, guarded: pipeline.guarded.is_some(), guarded_before, timed_origin, payload };
         pipeline.history.push(lsn, self.epoch);
         let (receipt, durable) = oneshot::channel();
         pipeline.buffered_bytes += entry.payload.len();
@@ -1004,7 +1009,8 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_recovery_excludes_a_minority_and_requires_original_evidence_to_commit() {
-        use crate::client::StreamConfig;
+        use crate::client::{Loglet, StreamConfig, certify_committed_range, copy_certified_range, open_writer_on,
+            original_sync_observations, timely_original_sync_upper};
         use crate::server::{PreparedJournal, ServerOptions};
         use rtdb_types::JournalEndpoint;
         use tokio::net::TcpListener;
@@ -1014,7 +1020,7 @@ mod tests {
         let mut endpoints = Vec::new();
         let mut directories = Vec::new();
         let mut servers = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let directory = tempfile::tempdir().unwrap();
             let options = ServerOptions { data_dir: directory.path().to_owned(), fsync: true, cache_bytes: 0 };
             let (provider, journal) = PreparedJournal::open_for_member(options, uuid::Uuid::new_v4().to_string()).await.unwrap();
@@ -1029,8 +1035,9 @@ mod tests {
             ("copied", 1, 1, None, -1), ("late", 3, 0, Some(1), -1),
             ("move-recovered-tail", 2, 0, Some(i64::MAX), 0),
         ] {
-            let ensemble = Ensemble::new(StreamConfig { servers: endpoints.clone(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
-            let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true, guarded_before };
+            let ensemble = Ensemble::new(StreamConfig { servers: endpoints[..3].to_vec(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
+            let timed_origin = guarded_before.map(|_| ensemble.timed_origin());
+            let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true, guarded_before, timed_origin };
             for server in 0..3 {
                 deposed_by(1, ensemble.overwrite(server, 1, 0, Vec::new(), true).await.unwrap()).unwrap();
                 deposed_by(1, ensemble.activate(server, 1).await.unwrap()).unwrap();
@@ -1060,6 +1067,23 @@ mod tests {
                     predecessor_witnesses += usize::from(sealed.commit_lsn == expected);
                 }
                 assert!(predecessor_witnesses >= ensemble.config.write_quorum);
+
+                let destination = StreamConfig {
+                    servers: vec![endpoints[3].clone()], write_quorum: 1, ..ensemble.config.clone()
+                };
+                let chain = vec![Loglet {
+                    servers: ensemble.config.servers.clone(), start_lsn: 0, write_quorum: ensemble.config.write_quorum,
+                }];
+                let moved = open_writer_on(chain, destination.clone(), 4, CopyFrom::Retained, cancellation.clone()).await.unwrap();
+                let certificate = certify_committed_range(&destination, 0, 0).await.unwrap();
+                let copied = copy_certified_range(&destination, &certificate, 1024, 1).await.unwrap();
+                assert_eq!(copied, [entry.clone()]);
+                assert!(original_sync_observations(&certificate, &copied[0], destination.servers.clone(), 1024)
+                    .await.unwrap().is_empty());
+                let original = original_sync_observations(&certificate, &copied[0], endpoints.clone(), 1024).await.unwrap();
+                assert_eq!(original.len(), 2);
+                assert!(timely_original_sync_upper(&copied[0], &original).is_some());
+                drop(moved);
             } else {
                 assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), expected);
             }

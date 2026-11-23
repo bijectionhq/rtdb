@@ -1950,6 +1950,9 @@ pub struct AuditAcceptanceQuorum {
     pub replica_stream: String,
     pub replica_digest: String,
     pub required_replica_quorum: usize,
+    pub original_replica_stream: Option<String>,
+    pub original_journals: Vec<String>,
+    pub required_original_quorum: Option<u64>,
     pub acceptance: AuditAcceptanceStage,
     pub replica_append_sample_micros: i64,
     pub journal_cutoff_micros: Option<i64>,
@@ -1990,16 +1993,35 @@ pub async fn audit_acceptance_quorum(
         return Err(not_strict());
     };
     let stage = tx.checked_acceptance_stage()?.ok_or_else(not_strict)?;
+    let (original_journals, required_original_quorum, journal_sync_observations) = match &entry.timed_origin {
+        Some(origin) => {
+            let members = members(directory).await?;
+            let mut known = BTreeMap::new();
+            for endpoint in stream.servers.iter().chain(&current.replica_journals).chain(&current.log_copy_servers) {
+                if let Some(journal) = endpoint.journal() {
+                    known.entry(journal).or_insert(endpoint);
+                }
+            }
+            let endpoints = origin.journals.iter().filter_map(|journal| {
+                members.get(&MemberId(journal.clone())).filter(|member| member.role == MemberRole::Logkeeper)
+                    .map(journal_endpoint).or_else(|| known.get(journal.as_str()).map(|endpoint| (**endpoint).clone()))
+            }).collect();
+            let observations = rtdb_logkeeper::original_sync_observations(&proof, &entry, endpoints, maximum_message_bytes).await?;
+            (origin.journals.clone(), Some(origin.write_quorum), observations)
+        }
+        None if entry.guarded_before.is_none() => (Vec::new(), None, journal_sync_observations),
+        None => return Err(not_strict()),
+    };
+    let quorum_sync_clock_upper_micros = rtdb_logkeeper::timely_original_sync_upper(&entry, &journal_sync_observations);
     let after = directory.deployment(&id).await?.filter(|record|
         record.id == id && record.incarnation == incarnation && record.log_epoch == log_epoch && record.lifecycle != Lifecycle::Deleted,
     ).ok_or_else(unavailable)?;
     if replica_servers(directory, &after).await? != stream.servers { return Err(unavailable()); }
-    let quorum_sync_clock_upper_micros = journal_sync_observations.get(stream.write_quorum - 1)
-        .map(|observation| observation.synced_clock_upper_micros);
-
     Ok(AuditAcceptanceQuorum {
         authority, incarnation, log_epoch, replica_stream: proof.stream, replica_digest: proof.digest,
         required_replica_quorum: stream.write_quorum,
+        original_replica_stream: entry.timed_origin.as_ref().map(|origin| origin.stream.clone()),
+        original_journals, required_original_quorum,
         acceptance: AuditAcceptanceStage {
             replica_offset: offset, source_position: stage.source_position.0, term: term.0,
             ordered_at_micros: stage.ordered_at.0, staging_clock_upper_micros: stage.clock_upper.0,

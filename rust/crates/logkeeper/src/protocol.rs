@@ -4,6 +4,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub(crate) const MAXIMUM_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -25,12 +26,67 @@ pub struct Entry {
     /// Exclusive bound on a qualifying original journal's rounded UTC upper sample.
     #[prost(sfixed64, optional, tag = "6")]
     pub guarded_before: Option<i64>,
+    /// The exact voter roster needed to interpret a physical cutoff after a move.
+    #[prost(message, optional, tag = "7")]
+    pub timed_origin: Option<TimedJournalOrigin>,
 }
 
 impl Entry {
     pub(crate) fn valid_guard(&self) -> bool {
-        self.guarded_before.is_none_or(|before| self.guarded && before > 0)
+        match (self.guarded_before, &self.timed_origin) {
+            (None, None) => true,
+            (Some(before), Some(origin)) => self.guarded && before > 0 && origin.valid(),
+            _ => false,
+        }
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct TimedJournalOrigin {
+    #[prost(string, repeated, tag = "1")]
+    pub journals: Vec<String>,
+    #[prost(uint64, tag = "2")]
+    pub write_quorum: u64,
+    #[prost(string, tag = "3")]
+    pub stream: String,
+}
+
+impl TimedJournalOrigin {
+    pub(crate) fn valid(&self) -> bool {
+        let count = self.journals.len() as u64;
+        !self.stream.is_empty() && count / 2 < self.write_quorum && self.write_quorum <= count
+            && self.journals.windows(2).all(|pair| pair[0] < pair[1])
+            && self.journals.iter().all(|id| rtdb_types::valid_journal_identity(id))
+    }
+
+    pub(crate) fn ensemble_identity(&self) -> [u8; 32] {
+        ensemble_identity(true, self.write_quorum, self.journals.iter().map(String::as_str))
+    }
+
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        timed_origin_fingerprint(&self.stream, &self.ensemble_identity())
+    }
+}
+
+pub(crate) fn timed_origin_fingerprint(stream: &str, ensemble: &[u8]) -> [u8; 32] {
+    let mut origin = Sha256::new();
+    origin.update(b"rtdb.logkeeper/timed-original/v1");
+    origin.update((stream.len() as u64).to_be_bytes());
+    origin.update(stream.as_bytes());
+    origin.update(ensemble);
+    origin.finalize().into()
+}
+
+pub(crate) fn ensemble_identity<'a>(identified: bool, quorum: u64, members: impl IntoIterator<Item = &'a str>) -> [u8; 32] {
+    let mut identity = Sha256::new();
+    if identified { identity.update(b"rtdb.logkeeper/ensemble/v2"); }
+    else { identity.update(b"rtdb.logkeeper/ensemble/v1"); }
+    identity.update(quorum.to_be_bytes());
+    for member in members {
+        identity.update((member.len() as u64).to_be_bytes());
+        identity.update(member.as_bytes());
+    }
+    identity.finalize().into()
 }
 
 pub(crate) fn before_guarded_cutoff(upper: i64, before: Option<i64>) -> bool {
@@ -189,6 +245,9 @@ pub(crate) struct DigestPage {
     /// An exact guarded entry may be inspected before commit only at this seal.
     #[prost(uint64, optional, tag = "5")]
     pub sealed_epoch: Option<u64>,
+    /// Retrieve a retained original sample for an exact, independently certified entry.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub certified_entry_digest: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -315,11 +374,13 @@ pub struct PageDigest {
     pub digest: Bytes,
     #[prost(sfixed64, optional, tag = "3")]
     pub synced_clock_upper_micros: Option<i64>,
-    /// For an exact guarded probe at a durable seal, this journal's local origin.
+    /// For an exact guarded probe, this journal's local append provenance.
     #[prost(bool, optional, tag = "4")]
     pub original_append: Option<bool>,
     #[prost(sfixed64, optional, tag = "5")]
     pub guarded_before: Option<i64>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub timed_origin_identity: Bytes,
 }
 
 /// Confirms only the promised writer. It conveys no append or commit position.

@@ -231,6 +231,14 @@ async fn connection(
             let _ = replies.send(reply(failed("the operation addresses another journal")));
             continue;
         }
+        if let Some(RequestBody::AppendObserved(append)) = &request.body
+            && let [entry] = append.entries.as_slice()
+            && let Some(origin) = &entry.timed_origin
+            && (request.target_journal.is_empty() || !origin.journals.iter().any(|journal| journal == identity.as_ref()))
+        {
+            let _ = replies.send(reply(failed("a timed original append must address a member of its ensemble")));
+            continue;
+        }
         match request.body {
             None => { let _ = replies.send(reply(failed("a request without a body"))); }
             Some(RequestBody::Identify(_)) => {

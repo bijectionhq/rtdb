@@ -58,7 +58,11 @@ Only a sample strictly below the record's journal cutoff supplies a vote, includ
 Recovery copies carry the entry without creating observations of the original append.
 Recovery of a retained guarded tip records its commit on the predecessor quorum before copying the tip to a new ensemble.
 An interrupted copy can therefore recover the predecessor's selected outcome while the directory still names that predecessor.
-The audit includes each matching journal's retained sample and the quorum order statistic when enough original samples survive.
+The raw timed entry binds the original stream, journal identities and quorum size across moves and archives.
+The audit reports current quorum agreement separately from the original quorum's sync bound.
+It can read a retained original sample matching the certified entry even when that journal lacks a local commit marker.
+The sync bound is the original quorum's order statistic among distinct samples below the stored cutoff.
+It remains absent if the required original samples are unavailable.
 It also reports the audit process's rounded clock immediately after establishing quorum agreement.
 The audit time includes probe latency and requires bounded clock uncertainty when compared with the writer's sample.
 
