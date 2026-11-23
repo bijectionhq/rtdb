@@ -733,28 +733,32 @@ impl HeldCheckpointWorld {
     }
     pub async fn ranked_search(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp,
+        valid: Timestamp, staged: Option<rtdb_node::HeldTextCorpus>,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
-        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, None).await
+        if staged.is_some() && (self.clock_mode() != WorldClockMode::Proposal || valid != self.present().system_time) {
+            return Err(OwnedWorld::unavailable());
+        }
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, None, staged).await
     }
 
     pub async fn ranked_search_at(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp, parent_only: bool,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
-        self.ranked_search_on_cut(partitions, query, offset, limit, valid, Some((system, parent_only)), None).await
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, Some((system, parent_only)), None, None).await
     }
 
     pub async fn ranked_search_parent_at(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
-        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, Some(system)).await
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, Some(system), None).await
     }
 
     async fn ranked_search_on_cut(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
+        staged: Option<rtdb_node::HeldTextCorpus>,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
@@ -815,8 +819,13 @@ impl HeldCheckpointWorld {
         } else {
             Vec::new()
         };
+        let has_staged = staged.is_some();
         let overlay = if use_overlay {
-            Some(self.search_overlay(&partitions, &columns, valid, &query, &guard,
+            let corpus = match staged {
+                Some(staged) => staged,
+                None => rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), &query)?,
+            };
+            Some(self.search_overlay(&partitions, &columns, valid, corpus, &guard,
                 earlier.map(|(system, _)| system)).await?)
         } else {
             None
@@ -829,7 +838,7 @@ impl HeldCheckpointWorld {
         let page = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = match page {
-            Err(error) if !historical && earlier.is_none() && writable && error.code == "rtdb.owned/search-uncovered" => {
+            Err(error) if !has_staged && !historical && earlier.is_none() && writable && error.code == "rtdb.owned/search-uncovered" => {
                 self.rank_visible_documents(&partitions, &columns, &query, offset, limit, valid, &guard).await?
             }
             other => other?,
@@ -841,9 +850,9 @@ impl HeldCheckpointWorld {
 
     async fn search_overlay(
         &self, partitions: &[(OwnedRelation, OwnedRelation)], columns: &[String], valid: Timestamp,
-        query: &str, guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>, system: Option<Timestamp>,
+        mut corpus: rtdb_node::HeldTextCorpus,
+        guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>, system: Option<Timestamp>,
     ) -> Result<rtdb_node::HeldTextCorpus> {
-        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
         let mut remaining = 4096usize;
         for (partition, ((relation, _), column)) in partitions.iter().zip(columns).enumerate() {
             let cut = if let Some(system) = system {
@@ -868,6 +877,7 @@ impl HeldCheckpointWorld {
                 }
                 for key in &candidates.keys {
                     let id = EntityId::String(key.clone());
+                    if corpus.contains_shadow(partition, &id) { continue; }
                     if let Some(cut) = &cut {
                         let shadow = cut.shadow(&id, valid).await?;
                         let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?

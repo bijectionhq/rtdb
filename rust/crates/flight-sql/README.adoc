@@ -550,7 +550,11 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
-`rtdb.owned.SearchHeldWorld.v1` takes the original 16-byte world handle and a signed big-endian i64 valid instant, then the same partition, offset, limit, evidence flag and query framing as SearchHeld.v5.
+`rtdb.owned.SearchHeldWorld.v2` takes the original 16-byte world handle, a signed big-endian i64 valid instant and the big-endian u32 overlay IPC byte length, then the overlay bytes and the same partition, offset, limit, evidence flag and query framing as SearchHeld.v5.
+A zero overlay length selects the committed corpus.
+A nonempty overlay uses the same staged layout as SearchHeld.v5 and requires the installed placed writer, the live Proposal's present as the valid instant and original evidence from that writer's placement.
+A stage replaces the indexed contribution of the same typed identity in either committed layer.
+The scope includes the full stage, and the stage requires covered archived search artifacts.
 The evidence flag must be one, and every partition must have unchanged Root purge frontiers since the archive cut. Retained worlds require complete clear-text artefacts.
 Writable held and proposal worlds require a declared clear-text column in the archived relation and installed world schema. They exhaust the exact held local UTF-8 shadow keys, including tombstones and replacements without text. Matching typed archived runs are excluded before collecting token lengths or term frequencies. The local text and unshadowed archive contribute to one corpus and one rank window.
 The indexed branch limits the overlay to 4,096 shadow keys and 8 MiB of text, and uses the existing 100,000 matching-candidate limit across both sources. Only unavailable archive artefact coverage permits the bounded exact row path (4,096 visible identities and 8 MiB of text). Incomplete identity pages or unavailable purge coverage refuse the operation.

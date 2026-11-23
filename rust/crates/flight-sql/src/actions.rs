@@ -59,7 +59,7 @@ impl Service {
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
-                crate::owned_actions::SEARCH_HELD_WORLD_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),
+                crate::owned_actions::SEARCH_HELD_WORLD_V2 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_RANGE_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_COUNT_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt).await?)]),
                 crate::owned_actions::HELD_WORLD_RANGE_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRange).await?)]),
