@@ -89,7 +89,7 @@ impl Service {
         if let Some(turn) = &turn {
             turn.admit_action().map_err(|error| call.error(Status::resource_exhausted(error.to_string())))?;
         }
-        let work = async {
+        let work = Box::pin(async {
             let action_type = action.r#type.as_str();
             if let Some(source) = call.session.audience_source() {
                 audience_work::decode_bytes(action.encoded_len())
@@ -339,7 +339,7 @@ impl Service {
                 }
                 _ => Err(unsupported()),
             }
-        };
+        });
         let owner = call.audience_io_owner();
         let work = async move {
             match owner {
