@@ -158,6 +158,9 @@ impl PartitionLogs {
         self.source.record_applied(LogOffset(position.after_offset(self.source_epoch)));
     }
     pub(crate) fn replica_guarded_append_limit(&self) -> Option<usize> { self.replica.maximum_guarded_append_bytes() }
+    pub(crate) fn replica_timed_original_append_limit(&self) -> Option<usize> {
+        self.replica.maximum_timed_original_append_bytes()
+    }
     pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
         allow_offload: bool, journal_before: Option<Timestamp>, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
         let stage = match &envelope.message {

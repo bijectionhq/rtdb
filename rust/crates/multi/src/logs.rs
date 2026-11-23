@@ -449,6 +449,9 @@ impl Log for SealedLog {
     fn maximum_guarded_append_bytes(&self) -> Option<usize> {
         self.inner.maximum_guarded_append_bytes()?.checked_sub(SEALED_OVERHEAD)
     }
+    fn maximum_timed_original_append_bytes(&self) -> Option<usize> {
+        self.inner.maximum_timed_original_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+    }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await

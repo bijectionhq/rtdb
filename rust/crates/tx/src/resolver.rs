@@ -131,8 +131,16 @@ impl ResolvedTx {
     }
 
     fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, journal_before: Option<Timestamp>, memory: &Arc<MemoryBudget>) -> Result<()> {
-        let (writer, maximum) = writer.and_then(|writer| writer.maximum_inline_bytes.map(|maximum| (writer, maximum)))
-            .ok_or_else(|| Anomaly::unsupported("rtdb.owned/replica-inline-unavailable", "The writer has no installed inline replica limit"))?;
+        let (writer, maximum) = if journal_before.is_some() {
+            writer.and_then(|writer| writer.maximum_timed_original_bytes.map(|maximum| (writer, maximum)))
+                .ok_or_else(|| Anomaly::unsupported(
+                    "rtdb.owned/timed-original-quorum-unavailable",
+                    "The installed journal cannot enforce the original quorum cutoff",
+                ))?
+        } else {
+            writer.and_then(|writer| writer.maximum_inline_bytes.map(|maximum| (writer, maximum)))
+                .ok_or_else(|| Anomaly::unsupported("rtdb.owned/replica-inline-unavailable", "The writer has no installed inline replica limit"))?
+        };
         // Both coordinates use fixed-width fields. Reserving them before the
         // capacity check makes substituting the live sample size invariant.
         let mut body = self.encode_replica_body(memory, Some(AcceptanceStage {
@@ -196,6 +204,7 @@ impl ResolvedTx {
 pub struct WriterPublication<'a> {
     pub clock: &'a (dyn Fn() -> Timestamp + Send + Sync),
     pub maximum_inline_bytes: Option<usize>,
+    pub maximum_timed_original_bytes: Option<usize>,
 }
 
 pub struct TxResolver {

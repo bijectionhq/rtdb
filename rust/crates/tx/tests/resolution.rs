@@ -1221,7 +1221,11 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     apply_staged(&mut resolver);
     let expired = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(4), Timestamp(50),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
-        Some(WriterPublication { clock: &|| Timestamp(199), maximum_inline_bytes: Some(1 << 20) }),
+        Some(WriterPublication {
+            clock: &|| Timestamp(199),
+            maximum_inline_bytes: Some(1 << 20),
+            maximum_timed_original_bytes: None,
+        }),
     ).await.unwrap();
     assert_eq!(expired.result().error().unwrap().code, "rtdb.owned/expired");
     assert!(expired.placed_attempt().is_some());
@@ -1238,7 +1242,11 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     apply_staged(&mut resolver);
     let oversized = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(5), Timestamp(105),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
-        Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(100) }),
+        Some(WriterPublication {
+            clock: &|| Timestamp(198),
+            maximum_inline_bytes: Some(100),
+            maximum_timed_original_bytes: None,
+        }),
     ).await.unwrap();
     assert_eq!(oversized.result().error().unwrap().code, "rtdb.owned/replica-inline-bound");
     assert!(oversized.placed_attempt().is_some());
@@ -1246,9 +1254,35 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     assert!(!oversized.writes().tables().contains_key(&facts.table("owner")));
 
     apply_staged(&mut resolver);
+    let mut staging_only = TxResolver::new(
+        Some(oversized.result().tx_key()), SourcePosition(5), None, &context.memory,
+    ).unwrap();
+    let physical = TxOp::OwnedDeadline {
+        until: Timestamp(200),
+        recheck_at_staging: true,
+        journal_before: Some(Timestamp(220)),
+    };
+    let refused = staging_only.resolve_source_for_writer(
+        state.snapshot(), SourcePosition(6), Timestamp(106),
+        source(vec![physical, replacement(100, 2), native_fact()]), &context,
+        Some(WriterPublication {
+            clock: &|| Timestamp(198),
+            maximum_inline_bytes: Some(1 << 20),
+            maximum_timed_original_bytes: None,
+        }),
+    ).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb.owned/timed-original-quorum-unavailable");
+    assert!(!refused.writes().tables().contains_key(&table));
+    assert!(!refused.writes().tables().contains_key(&facts.table("owner")));
+    assert!(refused.staging_clock_upper().is_none());
+
     let accepted = resolver.resolve_source_for_writer(state.snapshot(), SourcePosition(6), Timestamp(106),
         source(vec![staging_deadline(), replacement(100, 2), native_fact()]), &context,
-        Some(WriterPublication { clock: &|| Timestamp(198), maximum_inline_bytes: Some(1 << 20) }),
+        Some(WriterPublication {
+            clock: &|| Timestamp(198),
+            maximum_inline_bytes: Some(1 << 20),
+            maximum_timed_original_bytes: None,
+        }),
     ).await.unwrap();
     assert!(accepted.result().committed(), "{:?}", accepted.result().error());
     assert!(accepted.writes().tables().contains_key(&table));

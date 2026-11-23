@@ -534,6 +534,10 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     let cutoff = Timestamp(150);
     let staging = Timestamp(120);
     assert!(writer.maximum_guarded_append_bytes().is_some());
+    assert_eq!(
+        writer.maximum_timed_original_append_bytes(),
+        writer.maximum_guarded_append_bytes()
+    );
     for late in [118, 149, 200] {
         let clock = || Timestamp(late);
         let result = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, None)).await;

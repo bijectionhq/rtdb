@@ -566,6 +566,9 @@ impl Log for QuorumLog {
     fn maximum_guarded_append_bytes(&self) -> Option<usize> {
         self.maximum_append_bytes().filter(|_| self.shared.ensemble.supports_guarded())
     }
+    fn maximum_timed_original_append_bytes(&self) -> Option<usize> {
+        self.maximum_guarded_append_bytes()
+    }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         self.enqueue_at(payload, AppendTime::Ordinary(timestamp))

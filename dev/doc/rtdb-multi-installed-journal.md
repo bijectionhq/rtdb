@@ -42,6 +42,9 @@ The manifests contain arrays. A node entry includes:
 
 A gateway entry includes `name`, the exact `deployment` UUID, a `journal` scope with routing authority and credential paths, and the same enrolled worker endpoints. Native PGWire and ordinary Flight SQL follow the journal route, authenticate worker readiness, and compare it with the current grant. A Flight session must reconnect when the journal orders a different grant. The ordered installation currently serves fresh reads on the holder. The explicit frozen-snapshot selector and audience Flight use separate recovery paths.
 
+The installed Logkeeper adapter currently supports the writer-local staging deadline.
+The physical receiver requires timed original quorum durability and refuses accepting writes on this adapter.
+
 ## Observe recovery and maintenance
 
 A worker obtains a grant against the last observed writer state. It opens the exact checkpoint and protected suffix named by that decision, waits until replay has applied through the granted cut, and confirms the grant before reporting readiness. Old file writes remain scoped to their grant-specific serving prefix.

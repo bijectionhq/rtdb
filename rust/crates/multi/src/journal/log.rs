@@ -595,6 +595,9 @@ impl Log for JournalLog {
         payload: Bytes,
         guard: GuardedAppend<'_>,
     ) -> Result<AppendReceipt> {
+        if guard.journal_before().is_some() {
+            return Err(Error::GuardedAppendUnsupported);
+        }
         self.enqueue_at(AppendClass::Data, payload, || guard.sample())
             .await
     }

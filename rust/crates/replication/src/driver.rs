@@ -1373,11 +1373,12 @@ impl ReplicationDriver {
         let context = Arc::clone(&self.resolve);
         let clock = Arc::clone(&self.clock);
         let maximum_inline_bytes = self.logs.replica_guarded_append_limit();
+        let maximum_timed_original_bytes = self.logs.replica_timed_original_append_limit();
         leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
             let SourceInput { position, log_time, work, _decode_charge } = source;
             let result = match work {
                 SourceWork::Resolve(request) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
-                    Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes })).await,
+                    Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,
                 SourceWork::Skip(message) => async {
                     let digits = position.0.to_string();
                     let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;

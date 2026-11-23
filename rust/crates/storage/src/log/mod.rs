@@ -165,8 +165,11 @@ pub trait Log: Send + Sync {
     /// The provider's fixed size limit for one append, before any provider-specific wrapping.
     /// Absence means callers cannot admit an inline-only write using this provider.
     fn maximum_append_bytes(&self) -> Option<usize> { None }
-    /// The provider also implements guarded admission for an append of this size.
+    /// The provider checks the writer's final ordered staging sample before append.
     fn maximum_guarded_append_bytes(&self) -> Option<usize> { None }
+    /// The provider can enforce an exclusive cutoff on the durable sync of an
+    /// exact original quorum, including when a successor resolves the append.
+    fn maximum_timed_original_append_bytes(&self) -> Option<usize> { None }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     /// Appends a recovery record through reserved maintenance capacity when the provider has it.
@@ -177,7 +180,8 @@ pub trait Log: Send + Sync {
     async fn available_append_capacity(&self) -> Result<Option<AppendCapacity>> { Ok(None) }
     /// In-process source owners can release bytes through this durably applied position.
     fn record_applied(&self, _through: LogOffset) {}
-    /// Fixes append order only if the provider's final admission sample is inside the guard.
+    /// Fixes append order only if the provider's final admission sample is inside
+    /// the guard. A journal cutoff also requires the timed original quorum.
     async fn enqueue_guarded(&self, _payload: Bytes, _guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
         Err(Error::GuardedAppendUnsupported)
     }

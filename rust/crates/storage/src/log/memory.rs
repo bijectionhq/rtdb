@@ -115,6 +115,9 @@ impl Log for MemoryLog {
     }
 
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
+        if guard.journal_before().is_some() {
+            return Err(Error::GuardedAppendUnsupported);
+        }
         self.enqueue_at(payload, |_| guard.sample())
     }
 
@@ -225,6 +228,23 @@ impl LogReplayTail for MemoryTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_staging_clock_cannot_certify_an_original_durable_quorum() {
+        let log = MemoryLog::new(1024);
+        let clock = || Timestamp(10);
+        let timed = GuardedAppend::new(&clock, Timestamp(10), Timestamp(20), Some(Timestamp(25)));
+        assert!(log.maximum_guarded_append_bytes().is_some());
+        assert!(log.maximum_timed_original_append_bytes().is_none());
+        assert!(matches!(
+            log.enqueue_guarded(Bytes::from_static(b"timed"), timed).await,
+            Err(Error::GuardedAppendUnsupported)
+        ));
+        assert_eq!(log.latest().unwrap(), LogOffset(-1));
+        let staged = GuardedAppend::new(&clock, Timestamp(10), Timestamp(20), None);
+        let record = log.enqueue_guarded(Bytes::from_static(b"staged"), staged).await.unwrap();
+        assert_eq!(record.durable().await.unwrap().offset, LogOffset(0));
+    }
 
     #[tokio::test]
     async fn an_appended_payload_releases_its_producers_charge() {
