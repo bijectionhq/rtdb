@@ -41,7 +41,7 @@ fn cell(value: &Value, depth: usize) -> Result<T> {
         Value::Uri(value) => tagged_text("r", value.clone()),
         Value::Date(value) => tagged_text("time/date", value.date().to_string()),
         Value::DateDay(value) => tagged_text("time/date", date_text(i64::from(*value))?),
-        Value::DateMilli(value) => tagged_text("time/date", date_text(value / 86_400_000)?),
+        Value::DateMilli(value) => tagged_text("time/date", date_text(value.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY))?),
         Value::Time { value, unit, .. } => tagged_text("time/time", time_text(nanos(*value, *unit), false)?),
         Value::Timestamp { value, unit, timezone } => tagged_text(
             if timezone.is_some() { "time/zoned-date-time" } else { "time/date-time" },

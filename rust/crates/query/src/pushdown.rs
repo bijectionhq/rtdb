@@ -158,6 +158,8 @@ impl Pushdowns {
             let Some((_, filter)) = self.columns.iter().find(|(id, _)| *id == field.id) else { continue; };
             let Some(bloom) = &filter.bloom else { continue; };
             let Some(column) = columns.root_column(&field.name) else { return Ok(false); };
+            // A mixed column's persisted byte Bloom does not cover its Date64 leg.
+            if crate::page_metadata::may_have_date64(&field.data_type) { continue; }
             if let Some(bytes) = column.bloom() {
                 let _reservation = memory.reserve(bytes.len().checked_mul(8).and_then(|bytes| bytes.checked_add(1 << 20)).ok_or_else(size_error)?)?;
                 if !bloom.intersects(&BloomFilter::from_bytes(bytes)?) { return Ok(false); }
@@ -326,3 +328,34 @@ fn collect_keys(expr: &Expr, build: &Schema, probe: &Schema, bitmap_bound: usize
 fn keyword(name: &str) -> TransitValue { TransitValue::Keyword(name.into()) }
 fn map_bound(count: usize) -> Result<usize> { count.checked_mul(512).and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error) }
 fn size_error() -> rtdb_types::Anomaly { invalid("pushdown-size", "Join filter allocation exceeds addressable memory") }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::metadata::LeafColumns;
+    use rtdb_types::StructFields;
+
+    #[test]
+    fn byte_bloom_does_not_hide_a_date64_value_in_a_mixed_column() {
+        let memory = MemoryBudget::new(2 << 20);
+        let mut bloom = BloomFilter::default();
+        bloom.insert_value(&Value::DateDay(-1)).unwrap();
+        let filters = Pushdowns {
+            columns: vec![(ColumnId(0), Arc::new(ColumnFilter {
+                bloom: Some(bloom),
+                iids: None,
+                _reservation: memory.reserve(1024).unwrap(),
+            }))],
+            _reservation: memory.reserve(1024).unwrap(),
+        };
+        let page = LeafColumns::new(vec![Value::Struct(StructFields::from([
+            ("col-name".into(), Value::Utf8("d".into())),
+            ("root-col?".into(), Value::Bool(true)),
+            ("bloom".into(), Value::Binary(BloomFilter::default().to_bytes().unwrap())),
+        ]))]);
+        let stats = page.statistics().unwrap();
+        let field = Field { id: ColumnId(0), name: "d".into(), qualifier: None, qualified_only: false, unnamed: false,
+            data_type: LogicalType::from_legs([LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::DateMilli)]) };
+        assert!(filters.page_matches(&[field], &stats, &memory).unwrap());
+    }
+}
