@@ -294,6 +294,21 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         Box::pin(HeldCheckpointWorld::select_accepted_scope(self, relations, requested))
     }
 
+    fn select_parent_as_of<'a>(
+        &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
+    ) -> BoxFuture<'a, Result<Timestamp>> {
+        Box::pin(HeldCheckpointWorld::select_parent_as_of(self, relations, requested))
+    }
+
+    fn parent_point_at<'a>(
+        &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<WorldPointResult>> {
+        Box::pin(async move {
+            let fact = HeldCheckpointWorld::parent_point_at(self, relation, id, valid, system).await?;
+            Ok(path_touch_result(system, (fact, false)))
+        })
+    }
+
     fn preflight_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], system: Timestamp,
     ) -> BoxFuture<'a, Result<Timestamp>> {

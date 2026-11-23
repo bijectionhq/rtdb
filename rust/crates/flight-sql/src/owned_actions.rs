@@ -202,6 +202,11 @@ pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParen
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
 pub(crate) const RETAIN_REPLAYED_WORLD_V1: &str = "rtdb.owned.RetainReplayedWorld.v1";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
+pub(crate) const SELECT_HELD_WORLD_PARENT_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldParentAsOf.v1";
+pub(crate) const HELD_WORLD_PARENT_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentPointAt.v1";
+
+pub(crate) enum WorldCutSelection { ExactLocal, AsOfLocal, AsOfParent }
+
 pub(crate) const SELECT_HELD_WORLD_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldAsOf.v1";
 pub(crate) const HELD_WORLD_AT_PREFLIGHT_V1: &str = "rtdb.owned.PreflightHeldWorldAt.v1";
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
@@ -2321,7 +2326,7 @@ impl Service {
         Ok(entry)
     }
 
-    pub(crate) async fn held_world_at_preflight_action(&self, call: &Call, body: &[u8], select: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_at_preflight_action(&self, call: &Call, body: &[u8], selection: WorldCutSelection) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world scope has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world scope has no ordered present"))?;
@@ -2340,12 +2345,17 @@ impl Service {
             return Err(invalid("Historical world scope has repeated relations or trailing bytes"));
         }
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        if matches!(selection, WorldCutSelection::AsOfParent) {
+            let selected = held.snapshot.select_parent_as_of(&relations, system).await.map_err(status)?;
+            for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
+            return Ok(ActionResult { body: wire::retain(selected.0.to_be_bytes().to_vec(), call.reserve(8)?) });
+        }
         let mode = match held.snapshot.clock_mode() {
             rtdb_types::WorldClockMode::Held { .. } => 1,
             rtdb_types::WorldClockMode::Proposal => 2,
             rtdb_types::WorldClockMode::Retained => return Err(status(rtdb_types::OwnedWorld::unavailable())),
         };
-        let selected = if select {
+        let selected = if matches!(selection, WorldCutSelection::AsOfLocal) {
             held.snapshot.select_accepted_scope(&relations, system).await.map_err(status)?
         } else {
             let clock = held.snapshot.preflight_accepted_scope(&relations, system).await.map_err(status)?;
@@ -2362,7 +2372,7 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, call.reserve(17)?) })
     }
 
-    pub(crate) async fn held_world_point_at_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_point_at_action(&self, call: &Call, body: &[u8], parent: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
@@ -2370,7 +2380,11 @@ impl Service {
         let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, id, valid, _identity) = point_request(call, body, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
-        let point = held.snapshot.accepted_point(&relation, &id, valid, system).await.map_err(status)?;
+        let point = if parent {
+            held.snapshot.parent_point_at(&relation, &id, valid, system).await
+        } else {
+            held.snapshot.accepted_point(&relation, &id, valid, system).await
+        }.map_err(status)?;
         if point.present != system || point.witness.is_some() || point.until.is_some() {
             return Err(history_invalid());
         }
