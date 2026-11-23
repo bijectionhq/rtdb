@@ -639,7 +639,7 @@ mod tests {
             servers: vec![], deployment: record.id.clone(), key_id: record.key_id(),
             replica_stream: record.stream("replica"), replica_seal_scope: record.replica_seal_scope(),
             write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
-            transferred_source_through: None, frozen_at: None, previous_servers: None,
+            transferred_source_through: None, transfer_intake_cut: None, frozen_at: None, previous_servers: None,
         };
         let directory_files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {

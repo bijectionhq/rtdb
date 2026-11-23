@@ -508,7 +508,9 @@ mod tests {
     async fn a_certified_replica_payload_requires_settled_trim_and_retries_the_exact_version() {
         use rtdb_directory::{Checkpoint, JournalAnchor, ReplicaPayloadTrim};
 
-        let directory = MemoryDirectory::new();
+        let state = tempfile::tempdir().unwrap();
+        MemoryDirectory::initialize(state.path()).unwrap();
+        let directory = MemoryDirectory::open(state.path()).unwrap();
         let bucket = VersionedReleaseStore::default();
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         record.checkpoint = Some(Checkpoint { block: 1, boundary: 7, source: 5, system_time: 0, root_sha256: Some([1; 32]) });
@@ -545,6 +547,8 @@ mod tests {
         let lost_reply = reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap_err();
         assert_eq!(lost_reply.code, "fixture/provider-reply-lost");
         assert!(directory.lineage_state(&record.lineage).await.unwrap().exact_erasure_authorized());
+        drop(directory);
+        let directory = MemoryDirectory::open(state.path()).unwrap();
         reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
         assert_eq!(provider.attempts.load(Ordering::Relaxed), 2);
         assert_eq!(bucket.get(&target).await.unwrap().as_ref(), b"another version");
