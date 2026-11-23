@@ -52,6 +52,8 @@ entity SpatialPostings {
 -- Only visible rows supply geometry to the read's exact predicate.
 -- A range page advances in complete typed identity order at the original hold.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
+-- A ranked distance window excludes its exact lower radius and includes its upper radius when supplied.
+-- Consecutive distance windows opened on one held read use its original snapshot and valid instant.
 -- The held nearest capability retains complete keys, physical IIDs, and exact distances in ranked Arrow columns.
 -- A ranked continuation anchors on the exact previous distance and complete identity.
 -- Each ranked page resolves only its selected IIDs against the original held cut and validates complete identity before gathering the document columns.

@@ -950,6 +950,13 @@ async fn check_spatial_pages_at_the_original_cut() {
         hold: &[u8], path: &str, valid: i64, after: Option<&str>, region: &[u8],
         predicate: &str, document_columns: Option<ArrayRef>,
     ) -> Bytes {
+        query_window(hold, path, valid, after, region, predicate, document_columns, None)
+    }
+
+    fn query_window(
+        hold: &[u8], path: &str, valid: i64, after: Option<&str>, region: &[u8],
+        predicate: &str, document_columns: Option<ArrayRef>, window: Option<(f64, Option<f64>)>,
+    ) -> Bytes {
         let mut body = hold.to_vec();
         frame(&mut body, "places");
         frame(&mut body, path);
@@ -964,11 +971,14 @@ async fn check_spatial_pages_at_the_original_cut() {
             ("limit", Arc::new(Int64Array::from(vec![1]))),
             ("observe", Arc::new(BooleanArray::from(vec![false]))),
             ("reported_center", Arc::new(BooleanArray::from(vec![false]))),
-            ("radius_m", Arc::new(Float64Array::from(vec![None::<f64>]))),
+            ("radius_m", Arc::new(Float64Array::from(vec![window.and_then(|(_, radius)| radius)]))),
             ("after", Arc::new(StringArray::from(vec![after]))),
         ];
         if let Some(selected) = document_columns {
             columns.push(("document_columns", selected));
+        }
+        if let Some((after_radius, _)) = window {
+            columns.push(("after_radius_m", Arc::new(Float64Array::from(vec![after_radius]))));
         }
         ipc(&mut body, columns);
         body.into()
@@ -1145,6 +1155,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     let mut rank_capability = hold.to_vec();
     let mut continuation: Option<Bytes> = None;
     let mut previous_distance = None;
+    let mut tied_distance = None;
     for (expected, more) in [("a", true), ("d", true), ("b", false)] {
         let replies = if let Some(next) = &continuation {
             client.action("rtdb.owned.SpatialRankNext.v1", next.clone()).await.unwrap()
@@ -1160,6 +1171,7 @@ async fn check_spatial_pages_at_the_original_cut() {
         let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
         assert_eq!(ids.value(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), expected);
         let distance = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
+        if expected == "a" { tied_distance = Some(distance); }
         if let Some(bound) = schema.metadata().get("rtdb.owned.spatial_next_distance_m") {
             assert!(bound.parse::<f64>().unwrap() >= distance);
             assert!(more);
@@ -1197,6 +1209,30 @@ async fn check_spatial_pages_at_the_original_cut() {
         rtdb_columnar::EntityIdRef::String("b"));
     client.action("rtdb.owned.SpatialClose.v1", rank_capability.into()).await.unwrap();
     assert_eq!(client.action("rtdb.owned.SpatialRankNext.v1", last).await.unwrap_err().code(), tonic::Code::NotFound);
+
+    let complete_radius = tied_distance.unwrap();
+    let outside_radius = previous_distance.unwrap();
+    let window = |lower, upper| query_window(hold, path, valid, None, &point(0.0), "nearest",
+        Some(select(&["location"])), Some((lower, upper)));
+    let expanded = client.action("rtdb.owned.SpatialRankOpen.v2", window(complete_radius, Some(outside_radius))).await.unwrap();
+    let mut stream = StreamReader::try_new(expanded[0].body.as_ref(), None).unwrap();
+    assert_eq!(stream.schema().metadata()["rtdb.owned.present_micros"], valid.to_string());
+    assert_eq!(stream.schema().metadata()["rtdb.owned.spatial_more"], "0");
+    let batch = stream.next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("b"));
+    assert_eq!(batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap().value(0), outside_radius);
+    let geometry = batch.column(2).as_any().downcast_ref::<arrow_array::StructArray>().unwrap()
+        .column_by_name("location").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(geometry.value(0), point(2.0));
+    assert!(stream.next().is_none());
+    let empty = client.action("rtdb.owned.SpatialRankOpen.v2", window(outside_radius, Some(outside_radius))).await.unwrap();
+    let mut stream = StreamReader::try_new(empty[0].body.as_ref(), None).unwrap();
+    assert_eq!(stream.schema().metadata()["rtdb.owned.spatial_more"], "0");
+    assert!(stream.next().is_none());
+    for lower in [f64::NAN, f64::INFINITY, -1.0, outside_radius + 1.0] {
+        assert_eq!(client.action("rtdb.owned.SpatialRankOpen.v2", window(lower, Some(outside_radius))).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
 
     let mut wrong_type = ListBuilder::new(Int64Builder::new());
     wrong_type.append(true);

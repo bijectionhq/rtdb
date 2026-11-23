@@ -2266,14 +2266,14 @@ impl OwnedReadSession {
 
     pub async fn open_spatial_nearest(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
-        request: rtdb_spatial::Request<'_>, observe: bool, projection: rtdb_spatial::Projection<'_>,
+        request: rtdb_spatial::Request<'_>, after_radius: Option<f64>, observe: bool, projection: rtdb_spatial::Projection<'_>,
     ) -> Result<(HeldSpatialNearest, rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
         let lease = context.catalog.read_lease();
         let limit = request.limit;
         let work = async {
-            let ranking = rtdb_spatial::PreparedNearest::prepare(Arc::clone(&context), &self.owner, relation, path, request).await?;
+            let ranking = rtdb_spatial::PreparedNearest::prepare(Arc::clone(&context), &self.owner, relation, path, request, after_radius).await?;
             let page = ranking.page(Arc::clone(&context), &self.owner, None, limit, projection).await?;
             Ok::<_, Anomaly>((ranking, page))
         };

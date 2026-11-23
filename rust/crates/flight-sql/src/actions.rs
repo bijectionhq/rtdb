@@ -87,6 +87,7 @@ impl Service {
                     Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body, ranked).await?)])
                 }
                 crate::owned_actions::SPATIAL_RANK_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::RankOpen).await?)]),
+                crate::owned_actions::SPATIAL_RANK_OPEN_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::RankWindow).await?)]),
                 crate::owned_actions::SPATIAL_CLOSE_OWNED => {
                     self.close_spatial_owned_action(&call, &action.body)?;
                     Ok(Vec::new())

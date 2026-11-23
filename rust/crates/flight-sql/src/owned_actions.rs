@@ -43,13 +43,14 @@ pub(crate) const SPATIAL_OPEN_OWNED: &str = "rtdb.owned.SpatialOpen.v1";
 pub(crate) const SPATIAL_NEXT_OWNED: &str = "rtdb.owned.SpatialNext.v1";
 pub(crate) const SPATIAL_CLOSE_OWNED: &str = "rtdb.owned.SpatialClose.v1";
 pub(crate) const SPATIAL_RANK_OPEN_OWNED: &str = "rtdb.owned.SpatialRankOpen.v1";
+pub(crate) const SPATIAL_RANK_OPEN_OWNED_V2: &str = "rtdb.owned.SpatialRankOpen.v2";
 pub(crate) const SPATIAL_RANK_NEXT_OWNED: &str = "rtdb.owned.SpatialRankNext.v1";
 const SPATIAL_FILTER_TOKEN: &str = "rtdb.owned.spatial_filter";
 const MAX_SPATIAL_FILTERS: usize = 32;
 pub(crate) const SPATIAL_HELD_OWNED_V3: &str = "rtdb.owned.SpatialHeld.v3";
 
 #[derive(Clone, Copy)]
-pub(crate) enum SpatialHeldWire { V1, V2, V3, Open, RankOpen }
+pub(crate) enum SpatialHeldWire { V1, V2, V3, Open, RankOpen, RankWindow }
 pub(crate) const DROP_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DropSpatialPath.v1";
 pub(crate) const DROP_OWNED_SPATIAL_PATH_V2: &str = "rtdb.owned.DropSpatialPath.v2";
 pub(crate) const DECLARE_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DeclareSpatialPath.v1";
@@ -2599,8 +2600,10 @@ impl Service {
         let (relation, request) = split_relation(request)?;
         let (path, request) = split_relation(request)?;
         let batch = decode_retained_batch(call, body.slice_ref(request))?;
-        let selected_documents = matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::RankOpen);
-        let expected_columns = 9 + usize::from(selected_documents);
+        let ranked_window = matches!(wire, SpatialHeldWire::RankWindow);
+        let ranked = ranked_window || matches!(wire, SpatialHeldWire::RankOpen);
+        let selected_documents = ranked || matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open);
+        let expected_columns = 9 + usize::from(selected_documents) + usize::from(ranked_window);
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_columns {
             return Err(invalid("Owned held spatial read requires one request row"));
         }
@@ -2609,7 +2612,7 @@ impl Service {
         let projection = match wire {
             SpatialHeldWire::V1 => rtdb_spatial::Projection::Identities,
             SpatialHeldWire::V2 => rtdb_spatial::Projection::Documents,
-            SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::RankOpen => {
+            SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::RankOpen | SpatialHeldWire::RankWindow => {
                 document_columns = spatial_document_columns(input)?;
                 rtdb_spatial::Projection::SelectedDocuments(&document_columns)
             }
@@ -2625,6 +2628,13 @@ impl Service {
         if region.len() > 1 << 20 { return Err(invalid("Owned held spatial region exceeds its byte limit")); }
         let partition = spatial_partition(input)?;
         let radius = owned_scalar::<Float64Array>(input, "radius_m")?.map(|(array, row)| array.value(row));
+        let after_radius = if ranked_window {
+            let (values, row) = owned_scalar::<Float64Array>(input, "after_radius_m")?
+                .ok_or_else(|| invalid("A spatial rank window requires a Float64 lower radius"))?;
+            Some(values.value(row))
+        } else {
+            None
+        };
         let predicate = rtdb_spatial::Predicate::parse(predicate.value(predicate_row), radius, reported_center.value(center_row)).map_err(status)?;
         let after = match input.schema_ref().column_with_name("after") {
             Some((index, field)) => selected_cell(field, input.column(index).as_ref(), 0).map_err(status)?
@@ -2642,8 +2652,8 @@ impl Service {
         let limit = usize::try_from(limit.value(limit_row)).map_err(|_| invalid("Invalid spatial limit"))?;
         let observe = observe.value(observe_row);
         let request = rtdb_spatial::Request { partition, region: region.into(), predicate, valid_at, page, limit };
-        let (page, witness, prepared) = if matches!(wire, SpatialHeldWire::RankOpen) {
-            let (ranking, page, witness) = held.snapshot.open_spatial_nearest(&relation, &path, request, observe, projection)
+        let (page, witness, prepared) = if ranked {
+            let (ranking, page, witness) = held.snapshot.open_spatial_nearest(&relation, &path, request, after_radius, observe, projection)
                 .await.map_err(status)?;
             (page, witness, Some(RetainedSpatialQuery::Nearest(ranking)))
         } else {

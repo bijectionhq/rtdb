@@ -34,14 +34,15 @@ impl PreparedNearest {
         relation: &OwnedRelation,
         path: &OwnedRelation,
         request: Request<'_>,
+        after_radius: Option<f64>,
     ) -> Result<Self> {
-        if !matches!(request.predicate, Predicate::Nearest { .. })
-            || !matches!(request.page, PageOrder::NearestOnce)
-            || !(1..=128).contains(&request.limit)
-        {
-            return Err(kernel::invalid(
-                "A prepared ranking requires an initial nearest request",
-            ));
+        let invalid = || kernel::invalid("A prepared ranking requires an initial nearest request");
+        let Predicate::Nearest { radius_m, .. } = request.predicate else { return Err(invalid()); };
+        if !matches!(request.page, PageOrder::NearestOnce) || !(1..=128).contains(&request.limit) {
+            return Err(invalid());
+        }
+        if after_radius.is_some_and(|after| !after.is_finite() || after < 0.0 || radius_m.is_some_and(|upper| after > upper)) {
+            return Err(kernel::invalid("Invalid spatial rank window"));
         }
         let region = PreparedRegion::new(&request.region, request.predicate, &context.memory)?;
         let mut ranking = RankingBuilder::new(&context.memory)?;
@@ -55,11 +56,9 @@ impl PreparedNearest {
             Projection::Identities,
             true,
             |_, _, id, iid, distance| {
-                ranking.push(
-                    id,
-                    iid.ok_or_else(inconsistent_ranking)?,
-                    distance.ok_or_else(inconsistent_ranking)?,
-                )
+                let distance = distance.ok_or_else(inconsistent_ranking)?;
+                if after_radius.is_some_and(|after| distance <= after) { return Ok(()); }
+                ranking.push(id, iid.ok_or_else(inconsistent_ranking)?, distance)
             },
         )
         .await?;

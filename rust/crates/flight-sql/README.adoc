@@ -488,6 +488,9 @@ The identity starts with tag 0 for UTF-8 text, 1 for UTF-8 keyword, 2 for a big-
 A continuation uses the original filter, valid instant, and held cut and can be retried with the same body.
 `rtdb.owned.SpatialClose.v1` takes the held read handle and filter capability, returning no result.
 `rtdb.owned.SpatialRankOpen.v1` takes a projected nearest request and returns a page from the held exact ranking.
+`rtdb.owned.SpatialRankOpen.v2` adds a required finite, nonnegative `after_radius_m: Float64` to the Arrow request.
+The ranking includes exact distances strictly greater than `after_radius_m` and at most `radius_m` when an upper radius is supplied.
+The held read handle fixes the snapshot across consecutive radius windows.
 `rtdb.owned.SpatialRankNext.v1` uses the same capability framing as `SpatialNext.v1` with a big-endian Float64 distance before the complete identity.
 Every nonterminal ranked reply supplies the next exact distance in `rtdb.owned.spatial_next_distance_m`.
 
