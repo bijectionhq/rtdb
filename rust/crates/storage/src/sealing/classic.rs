@@ -217,38 +217,52 @@ impl ClassicObjectKeys {
 
     /// Settles the slot at the original vault after the residence has excluded all uses.
     pub async fn withdraw(&self, key: &ObjectKey) -> crate::Result<()> {
-        if key.as_str() == OWNER {
-            return Err(Error::InvalidKey(key.to_string()));
-        }
-        let path = self.name(key);
-        self.region
-            .run_blocking(move || {
-                let _lock = lock(&path)?;
-                let fence = path.with_extension("closed");
-                match File::options().write(true).create_new(true).open(&fence) {
-                    Ok(file) => crate::sync_file(&file).map_err(io(&fence))?,
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(io(&fence)(error)),
-                }
-                let parent = path.parent().expect("the slot has its vault directory");
-                sync_directory(parent).map_err(io(parent))?;
-                for file in [&path, &path.with_extension("pending")] {
-                    match fs::remove_file(file) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == ErrorKind::NotFound => {}
-                        Err(error) => return Err(io(file)(error)),
-                    }
-                }
-                sync_directory(parent).map_err(io(parent))
-            })
-            .await
+        self.withdraw_units(std::slice::from_ref(key)).await
     }
+
+    async fn withdraw_units(&self, keys: &[ObjectKey]) -> crate::Result<()> {
+        if keys.is_empty() { return Ok(()); }
+        let paths = keys.iter().map(|key| {
+            if key.as_str() == OWNER { return Err(Error::InvalidKey(key.to_string())); }
+            Ok(self.name(key))
+        }).collect::<crate::Result<Vec<_>>>()?;
+        self.region.run_blocking(move || {
+            for path in paths { withdraw_slot(&path)?; }
+            Ok(())
+        }).await?;
+        super::drain_unit_delivery().await;
+        Ok(())
+    }
+}
+
+fn withdraw_slot(path: &Path) -> crate::Result<()> {
+    let _lock = lock(path)?;
+    let fence = path.with_extension("closed");
+    match File::options().write(true).create_new(true).open(&fence) {
+        Ok(file) => crate::sync_file(&file).map_err(io(&fence))?,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io(&fence)(error)),
+    }
+    let parent = path.parent().expect("the slot has its vault directory");
+    sync_directory(parent).map_err(io(parent))?;
+    for file in [path, path.with_extension("pending").as_path()] {
+        match fs::remove_file(file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io(file)(error)),
+        }
+    }
+    sync_directory(parent).map_err(io(parent))
 }
 
 #[async_trait::async_trait]
 impl ObjectCipher for ClassicObjectKeys {
     async fn withdraw(&self, key: &ObjectKey) -> crate::Result<()> {
         ClassicObjectKeys::withdraw(self, key).await
+    }
+
+    async fn withdraw_all(&self, keys: &[ObjectKey]) -> crate::Result<()> {
+        self.withdraw_units(keys).await
     }
 
     async fn operate(

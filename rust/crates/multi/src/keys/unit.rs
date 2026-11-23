@@ -287,7 +287,9 @@ impl LocalKeyService {
             };
             Ok(complete())
         })
-        .await?
+        .await??;
+        rtdb_storage::sealing::drain_unit_delivery().await;
+        Ok(())
     }
 
     pub(super) async fn withdraw_local_unit(
@@ -307,7 +309,9 @@ impl LocalKeyService {
             };
             Ok(complete())
         })
-        .await?
+        .await??;
+        rtdb_storage::sealing::drain_unit_delivery().await;
+        Ok(())
     }
 }
 

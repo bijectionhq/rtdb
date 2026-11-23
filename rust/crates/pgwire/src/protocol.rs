@@ -602,7 +602,8 @@ impl ProtocolSession {
                         Some(encoded) => body.cell(encoded.as_slice())?,
                     }
                 }
-                writer.row_body(&body.bytes).await
+                let grant = query.cursor.delivery_grant().await?;
+                grant.deliver(writer.row_body(&body.bytes)).await.map_err(crate::wire::delivery_error)
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }
             query.row += 1; query.sent = query.sent.checked_add(1).ok_or_else(|| protocol("Result row count overflow"))?; emitted += 1;
@@ -615,7 +616,10 @@ impl ProtocolSession {
         self.extended = false; self.portals.remove("");
         let permit = self.replay_permit.take();
         let result = self.simple_statements(source, permit, writer).await;
-        if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
+        if let Err(error) = result {
+            if error.anomaly().code == "xtdb.pgwire/connection-error" { return Err(error.anomaly().clone()); }
+            writer.error(error.anomaly(), self.environment()?.fallback(), false).await?;
+        }
         if self.copy.is_none() { self.report_ready(writer).await?; }
         Ok(())
     }

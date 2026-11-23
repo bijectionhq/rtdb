@@ -2,6 +2,8 @@
 
 pub mod cipher;
 mod classic;
+mod delivery;
+pub use delivery::{PlaintextDelivery, PlaintextView, drain_unit_delivery};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
 pub use classic::{ClassicKeyVault, ClassicObjectKeys};
 
@@ -34,6 +36,11 @@ pub trait ObjectCipher: Send + Sync {
             "The object cipher has no Classic withdrawal authority".into(),
         ))
     }
+
+    async fn withdraw_all(&self, names: &[ObjectKey]) -> crate::Result<()> {
+        for name in names { self.withdraw(name).await?; }
+        Ok(())
+    }
 }
 
 pub enum UnitOperation {
@@ -44,6 +51,7 @@ pub enum UnitOperation {
     Frames(FramedObject, Range<usize>, Bytes),
     SealValue(String, Bytes),
     OpenValue(String, Bytes),
+    Grant,
 }
 
 impl UnitOperation {
@@ -53,6 +61,7 @@ impl UnitOperation {
 
     pub fn apply(self, key: &Cipher, name: &ObjectKey) -> crate::Result<UnitOutput> {
         match self {
+            Self::Grant => Ok(UnitOutput::Granted),
             Self::Seal(body) => key.seal_object(name, &body).map(UnitOutput::Bytes),
             Self::Open(sealed) => key.open_object(name, &sealed).map(UnitOutput::Bytes),
             Self::OpenRetained(sealed) => key
@@ -77,20 +86,28 @@ impl UnitOperation {
 pub enum UnitOutput {
     Bytes(Bytes),
     Header(FramedObject),
+    Granted,
 }
 
 impl UnitOutput {
     pub fn bytes(self) -> crate::Result<Bytes> {
         match self {
             Self::Bytes(bytes) => Ok(bytes),
-            Self::Header(_) => Err(Error::Task("Expected unit bytes".into())),
+            _ => Err(Error::Task("Expected unit bytes".into())),
+        }
+    }
+
+    fn granted(self) -> crate::Result<()> {
+        match self {
+            Self::Granted => Ok(()),
+            _ => Err(Error::Task("Expected a key owner’s delivery grant".into())),
         }
     }
 
     pub fn header(self) -> crate::Result<FramedObject> {
         match self {
             Self::Header(header) => Ok(header),
-            Self::Bytes(_) => Err(Error::Task("Expected a sealed unit header".into())),
+            _ => Err(Error::Task("Expected a sealed unit header".into())),
         }
     }
 }
@@ -139,7 +156,12 @@ impl EncryptingStore {
     async fn crypt(&self, name: &ObjectKey, operation: UnitOperation) -> crate::Result<UnitOutput> {
         match &self.keys {
             ObjectKeys::Deployment(cipher) => operation.apply(cipher, name),
-            ObjectKeys::Units(ledger) => ledger.operate(name, operation).await,
+            ObjectKeys::Units(ledger) => {
+                let reads_plaintext = !operation.provisions();
+                let output = ledger.operate(name, operation).await?;
+                if reads_plaintext { PlaintextView::track(ledger, name)?; }
+                Ok(output)
+            }
         }
     }
 

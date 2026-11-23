@@ -212,7 +212,10 @@ impl Service {
                     Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() },
                 };
                 read.admit(&service, &_call).await?;
-                for data in encoded { yield data; }
+                for data in encoded {
+                    cursor.delivery_grant().await.map_err(status)?.check().map_err(status)?;
+                    yield data;
+                }
             }
         });
         let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)

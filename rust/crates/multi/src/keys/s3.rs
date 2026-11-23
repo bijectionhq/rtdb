@@ -213,7 +213,9 @@ impl KeyService for S3KeyService {
 
     async fn withdraw_unit_key(&self, slot: UnitSlot, _io: &Arc<IoRegion>) -> Result<()> {
         self.require_never_versioned().await?;
-        self.withdraw_current(&format!("keys/{}", slot.id())).await
+        self.withdraw_current(&format!("keys/{}", slot.id())).await?;
+        rtdb_storage::sealing::drain_unit_delivery().await;
+        Ok(())
     }
 
     async fn withdraw_unit_scope(&self, scope: UnitScope, _io: &Arc<IoRegion>) -> Result<()> {

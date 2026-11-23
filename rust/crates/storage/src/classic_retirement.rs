@@ -56,10 +56,11 @@ impl<'a> TrieDeletionGrant<'a> {
 
     async fn erase(self, keys: Option<&dyn ObjectCipher>) -> Result<()> {
         let erase = async {
+            if let Some(keys) = keys {
+                let names: Vec<_> = self.files.iter().map(|(file, _)| file.clone()).collect();
+                keys.withdraw_all(&names).await?;
+            }
             for (file, version) in self.files {
-                if let Some(keys) = keys {
-                    keys.withdraw(&file).await?;
-                }
                 self.store.settle_classic_trie(&file, version.as_ref()).await?;
             }
             Ok(())

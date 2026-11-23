@@ -161,11 +161,13 @@ impl S3KeyService {
     pub(super) async fn withdraw_registered_scope(&self, scope: UnitScope) -> Result<()> {
         self.require_never_versioned().await?;
         self.withdraw_current(&marker(scope)).await?;
-        stream::iter(0..=u8::MAX)
+        let drain = rtdb_storage::sealing::drain_unit_delivery();
+        let settle = stream::iter(0..=u8::MAX)
             .map(|shard| self.withdraw_shard(scope, shard))
             .buffer_unordered(RETIREMENT_PARALLELISM)
-            .try_for_each(|()| async { Ok(()) })
-            .await?;
+            .try_for_each(|()| async { Ok(()) });
+        let ((), result) = tokio::join!(drain, settle);
+        result?;
         self.require_never_versioned().await
     }
 

@@ -6,6 +6,14 @@ use rtdb_types::{Anomaly, PgType, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{network, protocol};
 
+pub(crate) fn delivery_error(error: Anomaly) -> Anomaly {
+    if matches!(error.code.as_str(), "rtdb.storage/plaintext-delivery-expired" | "rtdb.storage/read-lease-expired") {
+        network(error.message.as_deref().unwrap_or("The plaintext delivery grant expired"))
+    } else {
+        error
+    }
+}
+
 pub(crate) const STARTUP_LIMIT: usize = 10_000;
 /// ErrorResponse field carrying a placement interruption code in every detail format.
 pub const ANOMALY_CODE_FIELD: u8 = b'y';

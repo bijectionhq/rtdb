@@ -197,6 +197,7 @@ impl PreparedQuery {
 
     /// Opens the query with one row of a bound Arrow batch.
     pub async fn execute_arrow_columns(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
+        let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
             Box::pin(self.open_arrow(context, batch, row, types, text, Batching::Columns))
@@ -222,6 +223,7 @@ impl PreparedQuery {
     pub async fn execute_parameter_projection(
         &self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], text: Option<&str>,
     ) -> Result<Option<QueryCursor>> {
+        let context = context.with_plaintext();
         measured_open(Arc::clone(&context), Box::pin(async { self.open_parameter_projection(context, arguments, types, text) })).await
     }
 
@@ -301,6 +303,7 @@ impl PreparedQuery {
     }
 
     async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+        let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
             Box::pin(self.open_retained(context, parameters, text, batching))
@@ -711,7 +714,7 @@ impl QueryCursor {
         if retained > reservation.bytes() { return Err(invalid("row-reservation", "Owned rows exceed their memory reservation")); }
         let runtime_schema = RuntimeSchema::fixed(&schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
     pub fn context(&self) -> &Arc<QueryContext> { &self.context }
@@ -730,9 +733,13 @@ impl QueryCursor {
         } else {
             self.next_batch().await?.as_ref().map(encode)
         };
-        self.context.catalog.check_view_lease()?;
-        self.context.check_cancelled()?;
+        self.delivery_grant().await?;
         Ok(answer)
+    }
+
+    /// Rechecks the units behind batches retained by a caller after a pull or encoding.
+    pub async fn delivery_grant(&self) -> Result<rtdb_storage::sealing::PlaintextDelivery> {
+        self.context.delivery_grant().await
     }
 
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {

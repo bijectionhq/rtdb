@@ -15,6 +15,10 @@ impl ReadLease {
     /// A lease without a deadline admits nothing: its catalog was never confirmed current.
     pub fn new(deadline: Option<i64>, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self { Self { deadline, clock } }
     pub fn deadline(&self) -> Option<i64> { self.deadline }
+    pub(crate) fn remaining(&self) -> std::time::Duration {
+        let remaining = self.deadline.map_or(0, |deadline| deadline.saturating_sub((self.clock)()));
+        std::time::Duration::from_micros(u64::try_from(remaining).unwrap_or_default())
+    }
     /// The earlier of two leases; a query over several databases holds every one of them.
     pub fn earlier(self: Arc<Self>, other: Arc<Self>) -> Arc<Self> {
         match (self.deadline, other.deadline) {
