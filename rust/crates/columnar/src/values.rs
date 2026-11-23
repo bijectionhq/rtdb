@@ -1,5 +1,5 @@
 use rtdb_types::StructFields;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
@@ -600,22 +600,26 @@ fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalTyp
         }
     }
     let array = build(value_type, &distinct, check_precision)?;
+    pack_runs(to_field("", logical)?.data_type(), width, ends, array.as_ref())
+}
+
+/// Encodes the selected values of consecutive runs with the event writer's run-end layout.
+pub fn pack_runs(data_type: &DataType, width: RunEndWidth, ends: Vec<usize>, values: &dyn Array) -> Result<ArrayRef> {
     let runs: ArrayRef = match width {
         RunEndWidth::I16 => {
             let ends = ends.into_iter().map(i16::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;
-            Arc::new(RunArray::<Int16Type>::try_new(&Int16Array::from(ends), array.as_ref()).map_err(super::arrow_error)?)
+            Arc::new(RunArray::<Int16Type>::try_new(&Int16Array::from(ends), values).map_err(super::arrow_error)?)
         }
         RunEndWidth::I32 => {
             let ends = ends.into_iter().map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;
-            Arc::new(RunArray::<Int32Type>::try_new(&Int32Array::from(ends), array.as_ref()).map_err(super::arrow_error)?)
+            Arc::new(RunArray::<Int32Type>::try_new(&Int32Array::from(ends), values).map_err(super::arrow_error)?)
         }
         RunEndWidth::I64 => {
             let ends = ends.into_iter().map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;
-            Arc::new(RunArray::<Int64Type>::try_new(&Int64Array::from(ends), array.as_ref()).map_err(super::arrow_error)?)
+            Arc::new(RunArray::<Int64Type>::try_new(&Int64Array::from(ends), values).map_err(super::arrow_error)?)
         }
     };
-    let data_type = to_field("", logical)?.data_type().clone();
-    let data = runs.to_data().into_builder().data_type(data_type).build().map_err(super::arrow_error)?;
+    let data = runs.to_data().into_builder().data_type(data_type.clone()).build().map_err(super::arrow_error)?;
     Ok(make_array(data))
 }
 
@@ -649,6 +653,14 @@ impl<'a> ColumnReader<'a> {
 /// `read_value` for a caller that has derived `logical` from `field` once, for many cells of the column.
 pub fn read_value_as(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> { read_typed(logical, field, array, row) }
 
+pub(crate) fn union_read_type<'a>(logical: &'a LogicalType, child: &Field) -> Result<Cow<'a, LogicalType>> {
+    if let LogicalType::Union(legs) = logical
+        && let Some(leg) = legs.iter().find(|leg| crate::schema::leg_name(leg).is_ok_and(|name| name == *child.name())) {
+        return Ok(Cow::Borrowed(leg));
+    }
+    from_field(child).map(Cow::Owned)
+}
+
 /// `read_value` with the field's logical type already derived, so nested cells reuse their parent's types.
 fn read_typed(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
     if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
@@ -672,11 +684,8 @@ fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> 
         let union = downcast::<UnionArray>(array)?;
         let id = union.type_id(row);
         let child = fields.iter().find_map(|(child_id, field)| (child_id == id).then_some(field)).ok_or_else(layout_error)?;
-        let leg = match logical { LogicalType::Union(legs) => legs.iter().find(|leg| crate::schema::leg_name(leg).is_ok_and(|name| name == *child.name())), _ => None };
-        return match leg {
-            Some(leg) => read_typed(leg, child, union.child(id).as_ref(), union.value_offset(row)),
-            None => read_value(child, union.child(id).as_ref(), union.value_offset(row)),
-        };
+        let leg = union_read_type(logical, child)?;
+        return read_typed(&leg, child, union.child(id).as_ref(), union.value_offset(row));
     }
     if array.is_null(row) { return Ok(Value::Null); }
     match logical {

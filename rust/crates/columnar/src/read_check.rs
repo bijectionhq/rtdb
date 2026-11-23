@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use arrow_array::{Array, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, ScalarType, UriParts};
+use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, ScalarType, UriParts, Value};
 
-use crate::{EXTENSION_NAME_KEY, MemoryBudget, from_field, leg_name, schema::scalar_reader_accepts};
+use crate::{EXTENSION_NAME_KEY, MemoryBudget, from_field, leg_name, read_value_as, schema::scalar_reader_accepts, to_field};
+use crate::values::union_read_type;
 
 pub struct ColumnPresence<'a> {
     field: &'a Field,
-    bottom: bool,
+    logical: LogicalType,
     plan: Option<ReadPlan>,
     check: bool,
 }
@@ -16,10 +17,27 @@ impl<'a> ColumnPresence<'a> {
     pub fn new(field: &'a Field) -> Result<Self> {
         let logical = from_field(field)?;
         let plan = ambiguous_union(field, &logical)?.then(|| ReadPlan::new(field, &logical));
-        Ok(Self { field, bottom: logical == LogicalType::Nothing, plan, check: needs_check(field, false) })
+        Ok(Self { field, logical, plan, check: needs_check(field, false) })
     }
 
-    pub fn is_bottom(&self) -> bool { self.bottom }
+    pub fn is_bottom(&self) -> bool { self.logical == LogicalType::Nothing }
+
+    pub fn uses_parent_validity(&self) -> bool {
+        self.plan.is_none() && !self.check
+            && !matches!(self.field.data_type(), DataType::Null | DataType::Union(..) | DataType::RunEndEncoded(..))
+    }
+
+    /// Checks a stored event slot and reports whether its logical read follows its physical layout.
+    pub fn validate_stored(&self, array: &dyn Array, row: usize) -> Result<bool> {
+        if self.is_bottom() { return Ok(true); }
+        if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
+        if array.data_type() != self.field.data_type() { return Err(layout()); }
+        if self.plan.is_some() {
+            return present_as(&self.logical, self.field, array, row).map(|(_, follows_layout)| follows_layout);
+        }
+        self.is_present(array, row)?;
+        Ok(true)
+    }
 
     pub fn is_present(&self, array: &dyn Array, row: usize) -> Result<bool> {
         if row >= array.len() || array.data_type() != self.field.data_type() { return Err(layout()); }
@@ -29,6 +47,92 @@ impl<'a> ColumnPresence<'a> {
         if self.check { check_cell(self.field, array, row, false)?; }
         present(self.field, array, row)
     }
+}
+
+// A named union leg can override its child's type. Track whether the read
+// uses the child's stored representation as well as whether it is present.
+fn present_as(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<(bool, bool)> {
+    if logical == &LogicalType::Nothing {
+        return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read"));
+    }
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => {
+            let union = array.as_union();
+            let id = union.type_id(row);
+            let (_, child) = fields.iter().find(|(tag, _)| *tag == id).ok_or_else(layout)?;
+            let selected = union_read_type(logical, child)?;
+            return present_as(&selected, child, union.child(id).as_ref(), union.value_offset(row));
+        }
+        DataType::RunEndEncoded(ends, child) => {
+            let derived;
+            let logical = match logical {
+                LogicalType::RunEndEncoded { value, .. } => value.as_ref(),
+                _ => { derived = from_field(child)?; &derived }
+            };
+            macro_rules! in_run {
+                ($ty:ty) => {{
+                    let runs = array.as_run::<$ty>();
+                    present_as(logical, child, runs.values().as_ref(), runs.get_physical_index(row))
+                }}
+            }
+            return match ends.data_type() {
+                DataType::Int16 => in_run!(Int16Type),
+                DataType::Int32 => in_run!(Int32Type),
+                DataType::Int64 => in_run!(Int64Type),
+                _ => Err(layout()),
+            };
+        }
+        DataType::Null if array.is_null(row) || logical == &LogicalType::Null => return Ok((false, field.is_nullable())),
+        _ if array.is_null(row) => return Ok((false, true)),
+        _ if logical == &LogicalType::Null => return Ok((false, false)),
+        _ => {}
+    }
+    let physical = from_field(field)?;
+    let physical = required(&physical);
+    let logical = required(logical);
+    if physical == logical && !ambiguous_union(field, logical)? {
+        if needs_check(field, false) { check_cell(field, array, row, false)?; }
+        return Ok((true, true));
+    }
+    match (field.data_type(), logical) {
+        (DataType::Struct(fields), LogicalType::Struct(types)) => {
+            let mut follows_layout = true;
+            for (field, child) in fields.iter().zip(array.as_struct().columns()) {
+                let ty = types.get(field.name()).ok_or_else(layout)?;
+                follows_layout &= if ty == &LogicalType::Nothing {
+                    field.data_type() == &DataType::Null && !field.is_nullable()
+                } else {
+                    present_as(ty, field, child.as_ref(), row)?.1
+                };
+            }
+            Ok((true, follows_layout))
+        }
+        (DataType::List(_) | DataType::FixedSizeList(_, _), LogicalType::List { kind, element })
+            if matches!(kind, ListKind::List | ListKind::Set | ListKind::FixedSizeList(_)) => {
+            let (field, values) = match field.data_type() {
+                DataType::List(child) => (child, array.as_list::<i32>().value(row)),
+                DataType::FixedSizeList(child, _) => (child, array.as_fixed_size_list().value(row)),
+                _ => unreachable!(),
+            };
+            let mut follows_layout = matches!(physical, LogicalType::List { kind: stored, .. } if stored == kind);
+            for row in 0..values.len() { follows_layout &= present_as(element, field, values.as_ref(), row)?.1; }
+            Ok((true, follows_layout))
+        }
+        (_, LogicalType::Scalar(_)) => {
+            let expected = to_field(field.name(), logical)?;
+            if expected.data_type() == array.data_type() {
+                if needs_check(&expected, false) { check_cell(&expected, array, row, false)?; }
+                Ok((true, false))
+            } else {
+                Ok((!matches!(read_value_as(logical, field, array, row)?, Value::Null | Value::Undefined), false))
+            }
+        }
+        _ => Ok((!matches!(read_value_as(logical, field, array, row)?, Value::Null | Value::Undefined), false)),
+    }
+}
+
+fn required(ty: &LogicalType) -> &LogicalType {
+    match ty { LogicalType::Maybe(value) => value, other => other }
 }
 
 fn present(field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
@@ -84,6 +188,7 @@ pub fn validate_readable_cell(field: &Field, array: &dyn Array, logical: &Logica
     }
     Ok(())
 }
+
 
 fn ambiguous_union(field: &Field, logical: &LogicalType) -> Result<bool> {
     if let DataType::Union(children, UnionMode::Dense) = field.data_type() {

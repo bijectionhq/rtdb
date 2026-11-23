@@ -612,6 +612,56 @@ mod tests {
     }
 
     #[test]
+    fn normalization_reuses_a_spill_page_with_nullable_union_components() {
+        use rtdb_types::{ListKind, ScalarType, Value};
+
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data.arrow");
+        let meta = directory.path().join("meta.arrow");
+        let memory = MemoryBudget::new(32 << 20);
+        let config = MergeConfig::default();
+        let values = [Value::FixedSizeList(vec![Value::F32(-0.0), Value::F64(f64::from_bits(0x7ff8_0000_0000_0042)), Value::Null].into()), Value::Null];
+        let item = LogicalType::from_legs([LogicalType::Scalar(ScalarType::F32), LogicalType::Scalar(ScalarType::F64), LogicalType::Null]);
+        let fields = Some(StructFields::from([("v".into(), LogicalType::List {
+            kind: ListKind::FixedSizeList(3), element: Box::new(item),
+        }.maybe())]));
+        let events = values.into_iter().map(|value| StoredEvent { position: None,
+            iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+            origin: None, commit_position: 0, entity_key: None, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
+        }).collect::<Vec<_>>();
+        let input = EventBatch::new(build_event_batch(&events, fields.clone(), None).unwrap()).unwrap();
+        let mut spill = MergeFile::new(directory.path().join("spill.arrow"), None, false, &[], &fields, false, false, false, false, false, &config, &memory).unwrap();
+        spill.write(&input.page_events().unwrap(), vec![], &fields, &config, &memory).unwrap();
+        spill.finish(&config).unwrap();
+
+        let expected = rtdb_format::data::copy_event_batch_with_recency(&events, fields.clone(), None, false).unwrap();
+        let (mut reader, _reservation) = open_input(File::open(&spill.path).unwrap(), &memory).unwrap();
+        let decoded = read_page(&mut reader, 0, &memory).unwrap();
+        assert_ne!(decoded.batch().schema(), expected.schema());
+        let restored = rtdb_format::ipc::restore_spill_page_schema(decoded.batch(), expected.schema_ref()).unwrap().unwrap();
+        let components = |batch: &arrow_array::RecordBatch| {
+            use arrow_array::cast::AsArray;
+            let op = batch.column_by_name("op").unwrap().as_union();
+            let put = op.child(op.type_id(0)).as_struct();
+            let values = put.column(0).as_fixed_size_list().values().as_union();
+            values.child(values.type_id(0)).to_data().buffers()[0].as_ptr()
+        };
+        assert_eq!(components(decoded.batch()), components(&restored));
+        let reference = directory.path().join("rebuilt.arrow");
+        let mut writer = ArrowFileWriter::new(create_file(&reference).unwrap(), expected.schema_ref()).unwrap();
+        writer.write_event_page(&expected, &memory).unwrap();
+        writer.finish().unwrap();
+        let mut metadata = rtdb_format::metadata::MetadataBuilder::new(false, true);
+        metadata.write_leaf(&expected).unwrap();
+        let (metadata, _) = metadata.finish().unwrap();
+
+        layout::normalize(&spill, &fields, &config, &memory, &data, &meta, &CancellationToken::new()).unwrap();
+        assert_eq!(std::fs::read(data).unwrap(), std::fs::read(reference).unwrap());
+        assert_eq!(std::fs::read(meta).unwrap(), metadata.write().unwrap());
+    }
+
+    #[test]
     fn normalization_retains_governed_event_keys_and_positions_in_the_output_file() {
         let directory = tempfile::tempdir().unwrap();
         let spill = directory.path().join("merge.arrow");
@@ -727,7 +777,7 @@ mod tests {
 
     #[test]
     fn compaction_retains_the_ordered_prefix_at_a_tied_sql_time() {
-        use rtdb_types::{EventPosition, TxId};
+        use rtdb_types::{EventPosition, LogicalType, ScalarType, TxId, Value};
         let memory = MemoryBudget::new(1 << 20);
         let events = [12, 11].map(|transaction| StoredEvent {
             position: Some(EventPosition { transaction: TxId(transaction), ordinal: 0 }),

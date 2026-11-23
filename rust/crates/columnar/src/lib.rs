@@ -29,10 +29,10 @@ pub use hash::{decimal_cell_as_f64, hash_cell, hash_float_components, hash_value
 pub use memory::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn, Selection, retain_array, retain_buffer, retain_buffer_with_owner, shared_allocation_size};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
 pub use text::{TextCell, binary_cell, selected_cell, text_cell, utf8_list};
-pub use values::{ColumnReader, build_array, build_struct_array, copy_array, copy_evaluated_cells, read_value, read_value_as, repack_numeric_list, repack_scalar_list, struct_field_cell};
+pub use values::{ColumnReader, build_array, build_struct_array, copy_array, copy_evaluated_cells, pack_runs, read_value, read_value_as, repack_numeric_list, repack_scalar_list, struct_field_cell};
 
 use rtdb_types::Anomaly;
 
-fn arrow_error(error: arrow_schema::ArrowError) -> Anomaly {
+pub fn arrow_error(error: arrow_schema::ArrowError) -> Anomaly {
     Anomaly::incorrect("rtdb/invalid-arrow", error.to_string())
 }

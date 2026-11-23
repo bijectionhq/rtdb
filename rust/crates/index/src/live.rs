@@ -809,10 +809,10 @@ impl PendingTable {
             if next_event != upto {
                 let rows = &self.events[next_event..upto];
                 let batch = owned_event_batch(rows, has_put.then(|| fields.clone()), true, budget)?;
-                ordered.extend(EventBatch::new(batch.batch().clone())?.page_events()?);
+                EventBatch::new(batch.batch().clone())?.extend_page_events(&mut ordered)?;
             }
             if let Some(batch) = batch {
-                ordered.extend(batch.events.page_events()?);
+                batch.events.extend_page_events(&mut ordered)?;
             }
             next_event = upto;
         }
@@ -1304,6 +1304,43 @@ fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index
     assert_ne!(memory.used_bytes(), 0);
     drop(arrow);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn staged_mixed_row_and_arrow_writes_keep_vector_layout_and_command_order() {
+    use rtdb_types::ScalarType;
+
+    let memory = MemoryBudget::new(16 << 20);
+    let base = crate::PartitionState::empty(Default::default()).unwrap();
+    let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(10) };
+    let mut transaction = TransactionBuffer::new(base.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+    let table = TableRef::new("public", "vectors");
+    let event = |id, value| StoredEvent {
+        position: None,
+        iid: EntityId::Integer(id).iid(), system_from: key.system_time, valid_time: Interval::ALL,
+        origin: None, commit_position: 0, entity_key: None, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), value)])),
+    };
+    let first = event(1, Value::list(vec![Value::F32(-0.0), Value::Null]));
+    let middle = event(2, Value::FixedSizeList(vec![Value::F32(f32::from_bits(0x7fc0_0042)), Value::F64(-0.0), Value::Null].into()));
+    let last = event(3, Value::Null);
+    let StoredOperation::Put(document) = &middle.operation else { unreachable!() };
+    let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("v".into(), document["v"].logical_type())]);
+    let arrow = owned_event_batch(std::slice::from_ref(&middle), Some(fields), true, &memory).unwrap();
+
+    transaction.append_to(&table, first.clone()).unwrap();
+    transaction.append_batch(&table, arrow).unwrap();
+    transaction.append_to(&table, last.clone()).unwrap();
+    let staged = transaction.stage().unwrap();
+    let batch = staged.tables[&table].batch.as_ref().unwrap();
+    let mut reference = [first, middle, last];
+    for (ordinal, event) in reference.iter_mut().enumerate() {
+        event.position = Some(EventPosition { transaction: key.tx_id, ordinal: ordinal as u64 });
+    }
+    let expected = owned_event_batch(&reference, Some(batch.put_types().clone()), true, &memory).unwrap();
+    let ipc = |batch: &RecordBatch| rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(batch)).unwrap();
+    assert_eq!(ipc(batch.arrow()), ipc(expected.batch()));
 }
 
 #[cfg(test)]

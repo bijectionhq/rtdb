@@ -176,6 +176,7 @@ config {
 --   If a leaf has more rows than the page size: split by re-partitioning rows by IID.
 --     This recurses until each leaf fits within the page size limit.
 --   If a branch has fewer rows than the page size: coalesce all descendant leaves into a single page.
+--   A spill leaf that already fits the page size uses its decoded buffers with the declared output schema when IPC decoding only adapted field nullability.
 --
 -- A file whose data carries `_recency` is laid out as RecencyCellLayout sets out instead.
 -- In native compaction, one IID's history can occupy several historical files when its assertions have different recency partitions.
@@ -230,6 +231,7 @@ contract OutputSegmentLayout {
         -- Selected pieces of one accepted event retain its stable identity when compaction assigns new Arrow locations.
         -- Compaction copies compatible document cells from selected Arrow positions in both stages.
         -- It aligns evolving nested fields and union legs to the merged schema and writes typed nulls for absent fields.
+        -- A field whose stored union is wider than its output layout admits the selected legs and aligns the selected cells.
         -- Rebuilt pages use the event writer's encoding for undefined union padding under null containers and for bottom-typed fields widened to unions.
 
     @invariant DecimalFieldsCarryTheirLogicalParameters
@@ -239,7 +241,8 @@ contract OutputSegmentLayout {
 
     @invariant PageMetadataReadsArrowCells
         -- Page metadata derives numeric statistics and logical presence from Arrow cells.
-        -- Ordinary list presence counts valid parent rows independently of the selected child values.
+        -- List and set presence counts valid parent rows independently of the presence of their child values.
+        -- Dense union presence follows the selected tag and its child validity.
         -- Numeric list bounds read supported Arrow children at their physical width, including half-precision floats.
 
     @invariant MillisecondDateStatisticsUseEpochDays

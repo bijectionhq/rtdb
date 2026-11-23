@@ -1,4 +1,5 @@
 mod columns;
+mod selected;
 
 use rtdb_types::StructFields;
 use std::sync::Arc;
@@ -391,6 +392,13 @@ impl EventBatch {
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
     /// The page's events read in place, each reading its document's cells only as an event batch encodes them.
     pub fn page_events(&self) -> Result<Vec<PageEvent>> {
+        let mut events = Vec::with_capacity(self.len());
+        self.extend_page_events(&mut events)?;
+        Ok(events)
+    }
+
+    /// Appends event positions in page order and leaves earlier positions intact if decoding fails.
+    pub fn extend_page_events(&self, events: &mut Vec<PageEvent>) -> Result<()> {
         let union = self.operations()?;
         let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
         let put = match legs.iter().find(|(_, leg)| leg.name() == "put") {
@@ -412,16 +420,20 @@ impl EventBatch {
         let (system_from, valid_from, valid_to) = (times(self.system_from)?, times(self.valid_from)?, times(self.valid_to)?);
         let recency = self.recency.map(times).transpose()?;
         let positions = self.positions();
-        (0..self.len()).map(|row| {
+        let start = events.len();
+        let result = (0..self.len()).try_for_each(|row| {
             let op = usize::try_from(union.type_id(row)).ok().and_then(|id| ops[id]).ok_or_else(|| invalid("Event operation type ID has no leg"))?;
             let origin = self.origin(row)?;
             let valid_time = Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?;
             Self::require_redacted_position(op, origin, valid_time)?;
-            Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
+            events.push(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
                 position: self.event_position(row)?,
                 commit_position: positions.map_or(0, |positions| positions.value(row)),
-                valid_time, op, recency: recency.map(|recency| Timestamp(recency[row])), origin, bytes: std::sync::OnceLock::new() })
-        }).collect()
+                valid_time, op, recency: recency.map(|recency| Timestamp(recency[row])), origin, bytes: std::sync::OnceLock::new() });
+            Ok(())
+        });
+        if result.is_err() { events.truncate(start); }
+        result
     }
     /// The dense union of each row's operation, whose put leg holds its document.
     pub fn operations(&self) -> Result<&UnionArray> {
@@ -996,6 +1008,11 @@ fn put_columns<E: EncodedEvent>(
             })?;
             builder.reserve_scratch(bytes)
         }).transpose()?;
+        if copy && let Some(column) = selected::column(documents, &field, &ty, builder.as_deref_mut())? {
+            schema.push(Arc::new(field));
+            columns.push(column);
+            continue;
+        }
         let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
             let values = cells.iter().map(|cell| cell.as_ref().clone()).collect::<Vec<_>>();

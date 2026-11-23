@@ -64,11 +64,15 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
         Some(count) => i64::try_from(count).map_err(invalid)?,
         None => {
             let reader = rtdb_columnar::ColumnPresence::new(field)?;
-            let mut count = 0i64;
-            for row in 0..array.len() {
-                if mask.includes(row) && reader.is_present(array, row)? { count += 1; }
+            if field.data_type() == array.data_type() && reader.uses_parent_validity() {
+                i64::try_from(validity_count(array, mask)).map_err(invalid)?
+            } else {
+                let mut count = 0i64;
+                for row in 0..array.len() {
+                    if mask.includes(row) && reader.is_present(array, row)? { count += 1; }
+                }
+                count
             }
-            count
         }
     };
     statistics.fields.insert("col-name".into(), Value::Utf8(field.name().clone()));
@@ -191,10 +195,14 @@ fn present_cells(field: &Field, array: &dyn Array, mask: &Mask) -> Option<usize>
     let flat = data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_));
     let list = matches!(data_type, DataType::List(_) | DataType::FixedSizeList(_, _));
     if !(flat || list) || field.data_type() != data_type || !field.metadata().is_empty() { return None; }
-    Some(match mask {
+    Some(validity_count(array, mask))
+}
+
+fn validity_count(array: &dyn Array, mask: &Mask) -> usize {
+    match mask {
         Mask::All => array.len() - array.null_count(),
         Mask::Selected(rows) => (0..array.len()).filter(|row| rows[*row] && array.is_valid(*row)).count(),
-    })
+    }
 }
 
 /// Reads numeric statistics in place, using signed execution widths and seconds for time values.
@@ -280,6 +288,47 @@ mod float_list_tests {
     use super::*;
     use arrow_array::{Float32Array, builder::{FixedSizeListBuilder, Float32Builder}};
     use std::sync::Arc;
+
+    #[test]
+    fn ambiguous_set_union_preserves_presence_and_bloom_metadata_bytes() {
+        use arrow_buffer::ScalarBuffer;
+        use arrow_schema::UnionFields;
+        use rtdb_types::{ListKind, ScalarType};
+        use crate::metadata::{LeafColumns, MetadataFile, MetadataNode};
+
+        let float = LogicalType::Scalar(ScalarType::F32);
+        let set = |element| LogicalType::List { kind: ListKind::Set, element: Box::new(element) };
+        let with_nulls = set(float.clone().maybe()).maybe();
+        let plain = set(float);
+        let first = rtdb_columnar::to_field("other", &with_nulls).unwrap();
+        let second = rtdb_columnar::to_field("set", &plain).unwrap();
+        let text = Field::new("text", DataType::Utf8, true);
+        assert!(rtdb_columnar::ColumnPresence::new(&first).unwrap().uses_parent_validity());
+        let union_fields = UnionFields::try_new([3, 5, 7], [first, second, text]).unwrap();
+        let sets = rtdb_columnar::copy_array(&with_nulls, &[Value::Set(vec![Value::Null, Value::F32(-0.0)]), Value::Null]).unwrap();
+        let more_sets = rtdb_columnar::copy_array(&plain, &[Value::Set(vec![Value::F32(3.0)])]).unwrap();
+        let texts = Arc::new(arrow_array::StringArray::from(vec![Some("word"), None]));
+        let union = UnionArray::try_new(union_fields, ScalarBuffer::from(vec![3, 7, 5, 3, 7]),
+            Some(ScalarBuffer::from(vec![0, 0, 0, 1, 1])), vec![sets, more_sets, texts]).unwrap();
+        let field = Field::new("payload", union.data_type().clone(), false);
+        let mut actual = Vec::new();
+        column_metadata(&field, &union, true, true, &mut actual).unwrap();
+        let scalar_count = (0..union.len()).filter(|&row| {
+            !matches!(rtdb_columnar::read_value(&field, &union, row).unwrap(), Value::Null | Value::Undefined)
+        }).count();
+        assert_eq!(scalar_count, 3);
+        let mut bloom = BloomFilter::default();
+        bloom.insert_value(&Value::Utf8("word".into())).unwrap();
+        bloom.insert_value(&Value::Null).unwrap();
+        let mut expected = actual.clone();
+        let Value::Struct(root) = expected.last_mut().unwrap() else { unreachable!() };
+        root.insert("count".into(), Value::I64(scalar_count as i64));
+        root.insert("bytes".into(), Value::Struct(StructFields::from([("bloom".into(), Value::Binary(bloom.to_bytes().unwrap()))])));
+        let ipc = |columns| MetadataFile::from_nodes(vec![
+            MetadataNode::Leaf { data_page_index: 0, columns: LeafColumns::new(columns) },
+        ], false).unwrap().write().unwrap();
+        assert_eq!(ipc(actual), ipc(expected));
+    }
 
     #[test]
     fn float_list_presence_uses_parent_validity_and_selection() {

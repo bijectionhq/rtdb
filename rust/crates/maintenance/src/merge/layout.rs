@@ -79,10 +79,17 @@ impl FinalWriter<'_> {
         if leaves.is_empty() { return self.metadata.write_nil(); }
         let total = leaves.iter().try_fold(0usize, |total, leaf| total.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Page tree row count overflow")))?;
         if let [leaf] = leaves && leaf.rows > 0 && leaf.rows <= page_size {
-            // Decoding can mark a struct's union field nullable when one of its legs can be null.
             let page = read_page(reader, leaf.page, self.memory)?;
             if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
             if page.batch().schema() == self.arrow_schema { return self.page(page.batch()); }
+            let _descriptors = self.memory.reserve(rtdb_format::ipc::schema_translation_bound(&self.arrow_schema)?)?;
+            if let Some(restored) = rtdb_format::ipc::restore_spill_page_schema(page.batch(), &self.arrow_schema)? {
+                return self.page(&restored);
+            }
+            drop(_descriptors);
+            let (events, _charge) = page_events(&page, leaf, self.memory)?;
+            drop(page);
+            return self.rows(&events, depth, page_size);
         }
         if (leaves.len() == 1 && leaves[0].path.len() == depth) || total <= page_size {
             let mut rows = Vec::new();
@@ -106,6 +113,10 @@ impl FinalWriter<'_> {
 
 fn read_events(reader: &mut ArrowFile, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Arc<MemoryReservation>)> {
     let batch = read_page(reader, leaf.page, memory)?;
+    page_events(&batch, leaf, memory)
+}
+
+fn page_events(batch: &rtdb_columnar::OwnedBatch, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Arc<MemoryReservation>)> {
     let charge = memory.reserve(super::decoded_bound(batch.batch())?)?;
     let events = EventBatch::new(batch.batch().clone())?.page_events()?;
     if events.len() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }

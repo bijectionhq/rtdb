@@ -237,6 +237,7 @@ entity StagedTxTable {
     -- Staging retains the completed rows and their schema.
     -- Ordinary document operations and SQL put mutations stage document vectors with the event headers for their selected positions.
     -- Staging copies compatible Arrow document columns from their input arrays when combining writes in transaction order.
+    -- Staging packs row-backed writes and collects their positions alongside the existing Arrow event positions in command order.
     -- Native SQL puts can stage scalar document columns directly from the mutation query batch.
     -- A create-only insert checks each requested interval against the transaction snapshot before staging that document from its Arrow vector.
     -- A governed Arrow event stages the full entity key and the assigned commit position with its document columns.

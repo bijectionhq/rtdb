@@ -21,11 +21,15 @@ pub(super) fn adapt(schema: &SchemaRef) -> Result<SchemaRef> {
 pub(super) fn adapt_batch(batch: &RecordBatch) -> Result<Option<RecordBatch>> {
     let schema = adapt(batch.schema_ref())?;
     if Arc::ptr_eq(&schema, batch.schema_ref()) { return Ok(None); }
+    with_schema(batch, schema).map(Some)
+}
+
+pub(super) fn with_schema(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let columns = schema.fields().iter().zip(batch.columns()).map(|(field, array)| {
         retype(array.to_data(), field.data_type()).map(make_array)
     }).collect::<Result<Vec<_>>>()?;
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(schema, columns, &options).map(Some).map_err(invalid)
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(invalid)
 }
 
 fn retype(data: ArrayData, target: &DataType) -> Result<ArrayData> {

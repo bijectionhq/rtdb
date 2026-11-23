@@ -20,11 +20,16 @@ impl BatchBuilder {
     }
 
     pub fn column(&mut self, temporary: usize, build: impl FnOnce() -> Result<ArrayRef>) -> Result<ArrayRef> {
+        self.try_column(temporary, || build().map(Some)).map(|array| array.expect("Column construction returned an array"))
+    }
+
+    pub fn try_column(&mut self, temporary: usize, build: impl FnOnce() -> Result<Option<ArrayRef>>) -> Result<Option<ArrayRef>> {
         let reservation = Arc::get_mut(&mut self.reservation).expect("batch construction owns its reservation");
         let retained = reservation.bytes();
         reservation.grow_to(retained.checked_add(temporary).ok_or_else(allocation_overflow)?)?;
         let array = build()?;
-        reservation.shrink_to(retained.checked_add(array.get_array_memory_size()).ok_or_else(allocation_overflow)?)?;
+        let added = array.as_ref().map_or(0, |array| array.get_array_memory_size());
+        reservation.shrink_to(retained.checked_add(added).ok_or_else(allocation_overflow)?)?;
         Ok(array)
     }
 
