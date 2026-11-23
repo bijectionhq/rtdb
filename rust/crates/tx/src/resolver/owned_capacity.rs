@@ -263,6 +263,68 @@ fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Item = Capacit
 }
 
 impl OpenTransaction<'_> {
+    pub(super) async fn hosted_capacity_writer(&self) -> Result<Timestamp> {
+        let unavailable = || Anomaly::new(
+            AnomalyCategory::Forbidden,
+            "rtdb.hosted/control-scope",
+            "Hosted capacity declarations require the installed placed writer",
+        );
+        if self.context.owned_witness_scope.is_none() || !self.options.user.as_deref()
+            .is_some_and(|user| self.context.authorization.is_hosted_control_owner(user))
+        {
+            return Err(unavailable());
+        }
+        if self.options.system_time.is_some() && !self.options.user_metadata.as_ref()
+            .is_some_and(UserMetadata::requires_ordered_system_time)
+        {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/ordered-system-time",
+                "Hosted capacity publication requires the ordered system clock",
+            ));
+        }
+        let context = self.context.query_context(
+            self.buffer.base_snapshot(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+        )?;
+        let point = rtdb_query::read_hosted_control_point(
+            context, TableRef::new("public", "bj_installation"), &EntityId::String("authority".into()), false,
+        ).await?;
+        point.row.map(|(_, at)| at).ok_or_else(unavailable)
+    }
+
+    pub(super) async fn stage_hosted_capacity_declarations(
+        &mut self, mut cursor: QueryCursor, writer: Timestamp,
+    ) -> Result<()> {
+        let mut remaining = MAX_RULES;
+        let ordered = self.tx_key().system_time;
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            remaining = remaining.checked_sub(batch.num_rows()).ok_or_else(invalid_rule)?;
+            let documents = super::mutation_column(batch, "doc")?;
+            let from = super::mutation_column(batch, "_valid_from")?;
+            let to = super::mutation_column(batch, "_valid_to")?;
+            for row in 0..batch.num_rows() {
+                self.context.check_cancelled()?;
+                let Value::Struct(document) = documents.read(row)? else { return Err(invalid_rule()); };
+                let (relation, column, cap, when, expected) = hosted_capacity_declaration(&document)?;
+                if from.time(row, ordered)? != ordered || to.time(row, Timestamp::MAX)? != Timestamp::MAX {
+                    return Err(invalid_rule());
+                }
+                if expected != writer {
+                    return Err(Anomaly::new(
+                        AnomalyCategory::Conflict,
+                        "rtdb.hosted/stale-control",
+                        "The observed installation writer changed before capacity publication",
+                    ));
+                }
+                self.declare_owned_capacity(&relation, column, 0, cap, when).await?;
+            }
+        }
+        if remaining == MAX_RULES {
+            return Err(invalid_rule());
+        }
+        Ok(())
+    }
+
     pub(super) async fn check_capacity_source(&self, operations: &[Operation]) -> Result<()> {
         let mut conditions = capacity_conditions(operations).peekable();
         if conditions.peek().is_none() {
@@ -921,6 +983,27 @@ impl OpenTransaction<'_> {
         self.read_occupancy_cell(cursor, id, column, uncovered)
             .await
     }
+}
+
+fn hosted_capacity_declaration(document: &StructFields<Value>) -> Result<(OwnedRelation, &str, i64, &[u8], Timestamp)> {
+    let (
+        Some(Value::Utf8(id)),
+        Some(Value::Utf8(relation)),
+        Some(Value::Utf8(column)),
+        Some(Value::I64(cap)),
+        Some(Value::Binary(when)),
+        Some(Value::I64(writer)),
+    ) = (
+        document.get("_id"), document.get("relation"), document.get("column"),
+        document.get("cap"), document.get("predicate"), document.get("writer_micros"),
+    ) else {
+        return Err(invalid_rule());
+    };
+    let relation = OwnedRelation::new(relation.as_str())?;
+    if document.len() != 6 || id != column || !relation.is_root_data() || *writer <= 0 {
+        return Err(invalid_rule());
+    }
+    Ok((relation, column, *cap, when, Timestamp(*writer)))
 }
 
 fn count_document(id: &EntityId, count: i64) -> StructFields<Value> {

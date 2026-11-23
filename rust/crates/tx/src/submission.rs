@@ -23,6 +23,21 @@ impl Catalog for SubmissionCatalog<'_> {
     fn transaction_scoped(&self) -> bool { true }
 }
 
+#[cfg(test)]
+#[test]
+fn hosted_capacity_sql_remains_an_ordered_operation() -> Result<()> {
+    let sql = r#"INSERT INTO xt.hosted_capacity_declarations
+        (_id, relation, "column", cap, predicate, writer_micros)
+        VALUES ('partition', 'facts', 'partition', 3, '', 100)"#;
+    let memory = MemoryBudget::new(1 << 24);
+    let request = prepare_submission(
+        vec![TxOp::Sql { sql: sql.into(), args: None }],
+        SubmitOptions::default(), "application", &memory,
+    )?;
+    assert!(matches!(&request.operations[..], [Operation::Public(TxOp::Sql { .. })]));
+    Ok(())
+}
+
 pub fn prepare_submission(operations: Vec<TxOp>, options: SubmitOptions, database: &str, memory: &Arc<MemoryBudget>) -> Result<SourceTransaction> {
     prepare_submission_with_sql_options(operations,options,database,memory,&rtdb_sql::PrepareOptions::default())
 }
@@ -50,6 +65,9 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     let _syntax = memory.reserve(rtdb_sql::statement_syntax_estimate(sql.len()).ok_or_else(overflow)?)?;
     let prepare = rtdb_sql::PrepareOptions { parameter_types: args.map(|args| args.execution_types().enumerate().collect()).unwrap_or_default(), default_timezone: options.default_tz.clone(), ..sql_options.clone() };
     let Some(plan) = rtdb_sql::prepare_static_in(sql, &SubmissionCatalog(database), &prepare, scope.memory_budget())? else { return Ok(None); };
+    if plan.table.table.schema == "xt" && plan.table.table.table == crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS {
+        return Ok(None);
+    }
     fn resolve_only(expr: &rtdb_plan::Expr) -> bool {
         let mut requires_clock = false;
         expr.visit(&mut |expr| if let rtdb_plan::Expr::Cast { expr, target } = expr { requires_clock |= target.requires_current_time(&expr.data_type()); });

@@ -75,6 +75,17 @@ The server read-only flag applies to DML; COPY independently enforces the connec
 CancelRequest uses the connection identifier and ignores the supplied secret; BackendKeyData sends zero as the secret.
 These protocol choices are compatibility behavior, and the read-only/COPY and cancellation policies are recorded as open questions in `dev/doc/tx.allium`.
 
+== Hosted capacity publication
+
+The configured writer on an ordered placement may include
+`INSERT INTO xt.hosted_capacity_declarations` in its catalog transaction.
+The typed fields are `_id`, `relation`, `column`, `cap`, `predicate`, and
+`writer_micros`. The ID equals the complete-key projection column. The
+predicate is the Binary equality encoding from DeclareCapacity.v2 and
+`writer_micros` is the observed revision of the installation's authority.
+The statement stages an engine effect and leaves no row in the reserved target.
+Capacity validation and the catalog writes share one ordered outcome.
+
 == COPY and memory
 
 COPY input is written into a bounded temporary file owned by the protocol state.

@@ -5,11 +5,27 @@ use rtdb_auth::{Authenticator, NativeHttp};
 use rtdb_columnar::MemoryBudget;
 use rtdb_metrics::Registry;
 use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock, TransactionClock};
+use rtdb_tx::TransactionAuthorization;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{config::NodeConfiguration, health::{HealthConfig, HealthDriver, HealthHandle}};
+
+struct HostedTransactionAuthority {
+    auth: Arc<Authenticator>,
+    owner: String,
+}
+
+impl TransactionAuthorization for HostedTransactionAuthority {
+    fn check_role_membership(&self, database: &str, principal: Option<&str>) -> Result<()> {
+        self.auth.check_role_membership(database, principal)
+    }
+
+    fn is_hosted_control_owner(&self, principal: &str) -> bool {
+        principal == self.owner
+    }
+}
 
 /// What a node placed by an outside authority needs beyond its configuration.
 pub struct PlacedOptions {
@@ -123,6 +139,14 @@ impl ServerDriver {
         let tracer = tracing.as_ref().map(|(handle, _)| handle.recorder().clone() as Arc<dyn rtdb_plan::Tracer>);
         let http = Arc::new(NativeHttp::new(Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024)?);
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
+        let authority: Arc<dyn TransactionAuthorization> = match config.flight_sql.as_ref()
+            .filter(|flight| flight.port >= 0 && flight.owned_native_actions)
+            .and_then(|flight| flight.hosted_controls.as_ref())
+            .filter(|policy| policy.relations.contains("bj_installation"))
+        {
+            Some(policy) => Arc::new(HostedTransactionAuthority { auth: auth.clone(), owner: policy.owner.clone() }),
+            None => auth.clone(),
+        };
         let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
         let mut resources = match transaction_clock {
             Some(clock) => resources.with_log_clock(clock),
@@ -140,7 +164,7 @@ impl ServerDriver {
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
         let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, read_fence, scan_fragmenter,
-            ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
+            ..NodeServices::local(authority, metrics.clone(), auth.clone(), metrics.clone()) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
         let cancellation = CancellationToken::new();

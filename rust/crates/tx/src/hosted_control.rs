@@ -9,6 +9,7 @@ pub(crate) use replay_worlds::ReplayWorlds;
 pub(crate) use world_readmission::{WorldReadmission, world_readmission_control};
 
 pub(crate) const CONTROL_TABLES: &str = "hosted_control_tables";
+pub(crate) const HOSTED_CAPACITY_DECLARATIONS: &str = "hosted_capacity_declarations";
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const NATIVE_FRONTIER: &str = "native-frontier.v1";
 const REPLAY_TRANSACTIONS: &str = "bj_rtdb_restore_transactions";

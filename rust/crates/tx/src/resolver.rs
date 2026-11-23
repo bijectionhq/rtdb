@@ -26,6 +26,7 @@ mod ordered_micros;
 mod replay_constraints;
 mod replay_worlds;
 mod owned_capacity;
+use crate::hosted_control::HOSTED_CAPACITY_DECLARATIONS;
 use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
@@ -35,6 +36,8 @@ pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 pub trait TransactionAuthorization: Send + Sync {
     /// Rejects an absent principal or a principal without the reference superuser authority.
     fn check_role_membership(&self, database: &str, principal: Option<&str>) -> Result<()>;
+    /// Identifies the configured principal entitled to order hosted control effects.
+    fn is_hosted_control_owner(&self, _principal: &str) -> bool { false }
 }
 
 pub struct ResolveContext {
@@ -286,7 +289,7 @@ impl TxResolver {
             if evaluated {
                 outcome = tx.finish_owned_unique().await;
             }
-            if has_owned_operations && outcome.is_ok() {
+            if outcome.is_ok() {
                 outcome = tx.finish_owned_capacity().await;
             }
             if outcome.is_ok() {
@@ -658,6 +661,13 @@ impl<'a> OpenTransaction<'a> {
         };
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
         if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "Mutation cannot write to another database")); }
+        if matches!(kind, MutationKind::Put)
+            && table.table.schema == "xt" && table.table.table == HOSTED_CAPACITY_DECLARATIONS
+        {
+            let writer = self.hosted_capacity_writer().await?;
+            let cursor = execute(input, context, arguments, syntax).await?;
+            return self.stage_hosted_capacity_declarations(cursor, writer).await;
+        }
         check_table(&table.table)?;
         let mut cursor = execute(input, context, arguments, syntax).await?;
         let system_time = self.tx_key().system_time;
@@ -2678,6 +2688,58 @@ mod tests {
         assert_eq!(error.message.as_deref(), Some("Cannot write to table: information_schema/columns"));
         assert_eq!(transit::from_json_value(&error.context["table"]).unwrap(), T::table_ref(&table));
         assert!(check_table(&TableRef::new("public", "columns")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn hosted_capacity_sql_stages_under_the_exact_installed_writer() -> Result<()> {
+        struct HostedWriter;
+        impl TransactionAuthorization for HostedWriter {
+            fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { panic!("unexpected role check") }
+            fn is_hosted_control_owner(&self, principal: &str) -> bool { principal == "owner" }
+        }
+
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-capacity", 1)?),
+            database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory),
+            query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(),
+            authorization: Arc::new(HostedWriter),
+            execution_observer: None,
+            tracer: None,
+        };
+        let state = rtdb_index::PartitionState::empty(Default::default())?;
+        let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
+        let mut installation = OpenTransaction::new(
+            state.value().snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) }, &options, &context,
+        )?;
+        installation.buffer.put(TableRef::new("public", "bj_installation"), StructFields::from([
+            ("_id".into(), Value::Utf8("authority".into())),
+            ("writer".into(), Value::Utf8("installed".into())),
+        ]), Interval::new(Timestamp(0), Timestamp::MAX)?)?;
+        let mut publication = OpenTransaction::new(
+            installation.snapshot()?, TransactionKey { tx_id: TxId(2), system_time: Timestamp(200) }, &options, &context,
+        )?;
+        let sql = r#"INSERT INTO xt.hosted_capacity_declarations
+            (_id, relation, "column", cap, predicate, writer_micros) VALUES (?, ?, ?, ?, ?, ?)"#;
+        let mut arguments = [
+            Value::Utf8("partition".into()), Value::Utf8("facts".into()), Value::Utf8("partition".into()),
+            Value::I64(3), Value::Binary(Vec::new()), Value::I64(99),
+        ];
+        let error = publication.execute_sql(sql, Some(&arguments)).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.hosted/stale-control");
+        arguments[5] = Value::I64(100);
+        publication.execute_sql(sql, Some(&arguments)).await?;
+        publication.finish_owned_capacity().await?;
+        let relation = rtdb_types::OwnedRelation::new("facts")?;
+        let applied = publication.snapshot()?;
+        assert!(applied.contains_table(&relation.capacity_table("owner")));
+        assert!(!applied.contains_table(&TableRef::new("xt", HOSTED_CAPACITY_DECLARATIONS)));
+        Ok(())
     }
 
     #[test]

@@ -115,6 +115,7 @@
 -- A prefix already above the proposed maximum aborts the declaration and the transaction's other writes.
 -- Redeclaration can change a projection's maximum while retaining its bucket identities and coverage. Tightening checks every bucket against the transaction's final state.
 -- A hosted Root commit can declare capacity alongside catalog effects, guarded by the checked installation authority.
+-- An admitted hosted PgWire catalog transaction can submit the same capacity effect against the installed writer's exact revision. Capacity validation and catalog writes share the final ordered outcome.
 -- The ordered resolver validates the final prefix memberships and commits covered counter deltas with the current-valid fact changes.
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
 -- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
