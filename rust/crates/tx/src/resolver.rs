@@ -1837,10 +1837,14 @@ impl<'a> OpenTransaction<'a> {
         }
         let declaration = self.read_owned_schema(owner, relation).await?;
         let filled = if uses_ordered_micros {
-            if declaration.is_none() {
-                return Err(ordered_micros::invalid());
-            }
-            Some(ordered_micros::fill(documents, self.tx_key().system_time, &self.context.memory)?)
+            let (schema, _) = declaration.as_ref().ok_or_else(ordered_micros::invalid)?;
+            Some(ordered_micros::fill(
+                documents,
+                self.tx_key().system_time,
+                |column| column.starts_with("p_")
+                    && schema.path_column_type(column) == Some(rtdb_types::ScalarType::Binary),
+                &self.context.memory,
+            )?)
         } else {
             None
         };

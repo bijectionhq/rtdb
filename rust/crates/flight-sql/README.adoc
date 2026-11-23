@@ -540,7 +540,10 @@ A placed write to a declared Root data relation can carry a Binary `_ordered_mic
 For each row with slots, its value starts with a big-endian u16 count in 1 through 1024.
 Each slot carries a u8 field-name length, the UTF-8 field name, a big-endian u32 byte offset in that Binary field, and a big-endian signed i64 offset in microseconds.
 Slots appear in field-name and byte-offset order. Each covers eight initially zero bytes and slots cannot overlap.
-The ordered resolver writes the checked sum of acceptance time and offset into the slot in big-endian order, then removes the descriptor before checking the relation schema and staging the row.
+The high bit of the byte offset selects a signed-order key slot in a declared Binary `p_` column. Hosted protocol 20 interprets the low 31 bits as the actual byte offset.
+The ordered resolver fills every slot from the same checked sum of acceptance time and offset.
+Payload slots take the big-endian signed sum and key slots take the big-endian sum with its sign bit flipped.
+The resolver removes the descriptor before checking the schema, updating occupancy and staging the row.
 World overlays and archive replay require their own images without this descriptor.
 
 A held retained parent point at its original archive basis also checks the live relation lifetime.
