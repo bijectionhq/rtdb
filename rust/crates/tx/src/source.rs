@@ -1819,7 +1819,7 @@ impl SourceOperationReader<'_> {
                 let (Value::Utf8(relation), Value::Utf8(column), Value::Binary(prefix), Value::I64(at_most)) =
                     (value("relation")?, value("column")?, value("prefix")?, value("at_most")?)
                 else { return Err(invalid("Owned capacity condition has invalid fields")); };
-                TxOp::OwnedCheckCapacity { relation: rtdb_types::OwnedRelation::new(relation)?, column, prefix, at_most }
+                TxOp::OwnedCheckCapacity { relation: rtdb_types::OwnedRelation::from_source(relation)?, column, prefix, at_most }
             }
             "rtdb-owned-capacity-v2" => {
                 let (Value::Utf8(relation), Value::Utf8(column), Value::I64(prefix_bytes), Value::I64(cap), Value::Binary(when)) =
