@@ -123,3 +123,27 @@ Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 == Deferred
 
 * Indexing the historical side, and search files spanning several partition groups.
+
+
+== Native Arrow boundaries
+
+Native public search carries a sorted Arrow IID selection from candidate discovery through scan pruning and verification.
+MATCH answers and verified point scores are selected by position, and unresolved text is tokenized as an Arrow list batch.
+Delegated scans receive bound search text and a prefix-local IID scope at the captured cut.
+The coordinator still applies the query's final sort and limit.
+
+The same text and list readers admit sliced Arrow values at the query, ingestion and replay boundaries.
+A null key or null dictionary entry contributes missing text, as does a selected null union cell.
+Collection views contribute their referenced child positions in logical order, including overlapping views.
+The set extension remains distinct from an ordinary list.
+Flight SQL, ADBC and Arrow COPY reuse exact output layouts and align compatible payload columns within Arrow.
+
+For range-capable remote storage, public and held search open the IPC footer and manifest and fetch the posting batches referenced by the query terms.
+Batch checksums and the format, analyzer and definition identities still gate use.
+Maintenance repair verifies the complete artefact.
+Held search requires complete coverage of the pinned cut.
+
+The native held corpus API exposes term and document-frequency columns through `search_corpus_batch`.
+Held ranks and pages use `ranked_search_batch`, with complete Arrow identities, exact score order and the total before slicing.
+The object-returning native APIs adapt those batches.
+The Flight action versions, PostgreSQL row frames, owned controls, artefact publication records and witness references retain their respective protocol boundaries.

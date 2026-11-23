@@ -17,6 +17,7 @@
 -- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
 -- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
 -- Held ranking publishes Arrow columns for complete identities, scores and partition ordinals.
+-- The held corpus publishes query terms and document frequencies in Arrow with exact document and token totals.
 -- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
 -- Public SQL search definitions remain scoped to the public catalog.
 --
@@ -218,13 +219,16 @@ rule RepairUnreadableSearchFile {
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
+--      A range-capable remote store supplies the validated manifest and the posting batches addressed by the requested terms.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
 --      A node keeps Arrow posting batches per live segment and column, extending them by the batches appended since.
+--      Live and persisted search builders tokenize selected Arrow text into list vectors in event order.
 --      The same Arrow token cells serve phrase checks and ranking while the segment remains cached.
 --      The primary live trie supplies the event headers used for temporal cuts.
 --      A document is cut by the events of its entity in the partition's other selected tries and live segments, as CutByLaterEvents says, and contributes only if a rectangle it keeps meets the bounds.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
---      The primary scan prunes and tests candidates against a sorted Arrow IID column.
+--      Discovery, intersection, scan pruning and verification carry a sorted Arrow IID selection.
+--      The file MATCH reader can restrict its answer to the same IID selection.
 --   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
 --
 -- Past max_candidates candidates, the scan runs unnarrowed instead.
@@ -287,6 +291,8 @@ rule MatchEvaluatedByTheScan {
     -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
     -- A row of a trie takes MATCH from its search file for a definition covering the column: true where the document matches, null where the column is null or absent, and false otherwise.
     -- A row in a trie with no readable recorded file takes it from the file the node builds, and a row in a live segment, or in a trie the node does not build, from its own value.
+    -- Cached answers are nullable Boolean vectors over the resolved positions, with an availability mask.
+    -- The scan gathers and tokenizes the unresolved text positions as a batch.
     -- A row answered by the search file does not require reading its stored text for the predicate.
     when: ScanWithMatch(scan, predicate)
 
@@ -390,6 +396,11 @@ surface FullTextSearch {
 
     @guarantee MatchAtAnyTime
         -- MATCH answers at any valid time and system time the scan accepts, the default as-of-now included.
+
+    @guarantee TextLayoutParity
+        -- UTF-8 text has the same tokens in ordinary, large-offset, view and dictionary storage, including within run-end and union vectors.
+        -- The selected cell's validity determines whether search sees missing text, including null dictionary entries and selected null union legs.
+        -- Corpus statistics and fingerprints read ordinary, large-offset, list-view and fixed-size list cells in their selected element order.
 
     @guarantee ScoresFromArguments
         -- The same document, query text and optional statistics produce the same score across scan plans, joins, time coordinates and artefact states.

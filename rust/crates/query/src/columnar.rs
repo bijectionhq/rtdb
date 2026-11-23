@@ -460,7 +460,6 @@ impl ColumnBatch {
         source: &rtdb_columnar::OwnedBatch, position: usize, row: usize,
         parameter_type: &LogicalType, memory: &Arc<MemoryBudget>,
     ) -> Result<Option<Self>> {
-        use arrow_array::cast::AsArray;
         let field = &source.batch().schema_ref().fields()[position];
         let mut reservation = memory.reserve(field.size().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?)?;
         if !stable_read_layout(parameter_type, field) || !readable_list_type(parameter_type, field) {
@@ -470,16 +469,14 @@ impl ColumnBatch {
         if array.is_null(row) || *parameter_type == LogicalType::Null {
             return Self::settled(vec![Column::Values(Vec::new())], 0, memory.reserve(256)?).map(Some);
         }
-        let (child, array) = match field.data_type() {
-            DataType::List(child) => (child, array.as_list::<i32>().value(row)),
-            DataType::FixedSizeList(child, _) => (child, array.as_fixed_size_list().value(row)),
-            _ => return Ok(None),
-        };
+        let Some((child, elements, positions)) = rtdb_columnar::list_span(field, array.as_ref(), row) else { return Ok(None); };
+        let child = Arc::new(child.clone());
+        let array = elements.slice(positions.start, positions.len());
         let len = array.len();
         if len == 0 {
             return Self::settled(vec![Column::Values(Vec::new())], 0, reservation).map(Some);
         }
-        let logical = rtdb_columnar::from_field(child)?;
+        let logical = rtdb_columnar::from_field(&child)?;
         let metadata = logical.retained_bytes()?.checked_add(512).ok_or_else(size_error)?;
         Arc::get_mut(&mut reservation).expect("The list slice owns its metadata").shrink_to(metadata)?;
         let bound = array.get_array_memory_size().checked_add(4096).ok_or_else(size_error)?;
@@ -487,12 +484,12 @@ impl ColumnBatch {
             array.get_buffer_memory_size() > visible.saturating_mul(2).saturating_add(4096)
         });
         let (array, custody) = if holds_unused_buffers || bound > memory.available_bytes() {
-            let Ok(compacted) = compact_arrow_rows(array.as_ref(), child, 0..len, memory) else { return Ok(None); };
+            let Ok(compacted) = compact_arrow_rows(array.as_ref(), &child, 0..len, memory) else { return Ok(None); };
             compacted
         } else {
             (array, Arc::clone(source.reservation()))
         };
-        let columns = vec![Column::Arrow { field: Arc::clone(child), array, logical: Some(logical) }];
+        let columns = vec![Column::Arrow { field: child, array, logical: Some(logical) }];
         Ok(Some(Self { columns, len, reservation, appended: vec![custody] }))
     }
 
@@ -1602,7 +1599,7 @@ pub(crate) fn fragment_column(array: ArrayRef, field: Arc<ArrowField>, logical: 
 }
 
 pub(crate) fn nested_layout(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(_, _)
+    matches!(data_type, DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_) | DataType::ListView(_) | DataType::LargeListView(_) | DataType::FixedSizeList(_, _)
         | DataType::Map(_, _) | DataType::Union(_, _) | DataType::RunEndEncoded(_, _))
 }
 
@@ -1710,7 +1707,8 @@ impl SelectedColumn {
 }
 
 fn stable_read_layout(logical: &LogicalType, field: &ArrowField) -> bool {
-    stable_values(logical) && rtdb_columnar::execution_type(logical) == *logical && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == *logical)
+    stable_values(logical) && rtdb_columnar::execution_type(logical) == *logical
+        && rtdb_columnar::from_field(field).is_ok_and(|ty| ty == *logical)
 }
 
 fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
@@ -1719,7 +1717,7 @@ fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
             DataType::Null => field.is_nullable(),
             DataType::Union(..) => false,
             DataType::Struct(fields) => fields.iter().all(|child| readable(child)),
-            DataType::List(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _) => readable(child),
+            DataType::List(child) | DataType::LargeList(child) | DataType::ListView(child) | DataType::LargeListView(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _) => readable(child),
             _ => true,
         }
     }
@@ -1727,7 +1725,7 @@ fn readable_list_type(logical: &LogicalType, field: &ArrowField) -> bool {
     match (logical, field.data_type()) {
         (LogicalType::Null, DataType::Null) => true,
         (LogicalType::List { kind: ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set, .. },
-         DataType::List(child) | DataType::FixedSizeList(child, _)) => readable(child),
+         DataType::List(child) | DataType::LargeList(child) | DataType::ListView(child) | DataType::LargeListView(child) | DataType::FixedSizeList(child, _)) => readable(child),
         _ => false,
     }
 }
@@ -1742,6 +1740,7 @@ fn stable_values(logical: &LogicalType) -> bool {
             **element != LogicalType::Nothing && stable_values(element)
         }
         LogicalType::Union(legs) => legs.iter().all(stable_values),
+        LogicalType::RunEndEncoded { value, .. } => stable_values(value),
         _ => false,
     }
 }
@@ -2883,6 +2882,8 @@ pub(crate) mod projection {
             Expr::Column { .. } | Expr::Parameter { .. } | Expr::RowCopy(_) => true,
             Expr::Literal(value) => literal(value),
             Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => shaped(left) && shaped(right),
+            Expr::Field { expr, .. } => shaped(expr),
+            Expr::List(items) => items.iter().all(shaped),
             Expr::Struct(fields) => fields.iter().all(|(_, field)| shaped(field)),
             Expr::Coalesce(args) => args.iter().all(shaped),
             Expr::Call { name, args, .. } if name == "coalesce" => args.iter().all(shaped),
@@ -2921,6 +2922,7 @@ pub(crate) mod projection {
                     .and_then(|bytes| bytes.checked_add(metadata.checked_mul(8)?))
                     .ok_or_else(super::size_error)?
             }
+            Expr::Field { expr, .. } => return bound(expr, schema, batch),
             Expr::Struct(fields) => {
                 let mut total = per_row(std::mem::size_of::<Value>().checked_add(256).ok_or_else(super::size_error)?)?;
                 for (name, field) in fields {
@@ -2994,6 +2996,16 @@ pub(crate) mod projection {
                 let array = Arc::new(ListArray::try_new(child, offsets, values, None).map_err(|error| crate::invalid("column-list", error))?);
                 let field = Arc::new(ArrowField::new("value", array.data_type().clone(), false));
                 Ok(Some(Column::Arrow { array, field, logical: Some(LogicalType::list(logical)) }))
+            }
+            Expr::Field { expr, name, .. } => {
+                use arrow_array::cast::AsArray;
+                let Some(Column::Arrow { array, .. }) = column(expr, schema, batch, parameters)? else { return Ok(None); };
+                let Some(record) = array.as_struct_opt() else { return Ok(None); };
+                if record.null_count() != 0 { return Ok(None); }
+                let Some(position) = record.fields().iter().position(|field| field.name() == name) else { return Ok(None); };
+                let field = Arc::clone(&record.fields()[position]);
+                let logical = rtdb_columnar::from_field(&field)?;
+                Ok(Some(Column::Arrow { array: Arc::clone(record.column(position)), field, logical: Some(logical) }))
             }
             Expr::Struct(fields) => {
                 let mut columns = Vec::with_capacity(fields.len());

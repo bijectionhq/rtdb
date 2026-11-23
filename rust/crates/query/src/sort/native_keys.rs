@@ -2,7 +2,7 @@
 use std::cmp::Ordering;
 
 use arrow_array::{
-    Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, TimeUnit as ArrowTime};
 use rtdb_plan::{Schema, SortExpr};
@@ -73,7 +73,7 @@ impl Kind {
                 Self::Integer,
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
             )
-            | (Self::Text, DataType::Utf8) | (Self::Float, DataType::Float64) => true,
+            | (Self::Text, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Dictionary(_, _)) | (Self::Float, DataType::Float64) => true,
             (Self::UtcMicros, DataType::Timestamp(ArrowTime::Microsecond, Some(zone))) => {
                 zone.as_ref() == "UTC"
             }
@@ -130,7 +130,10 @@ impl Kind {
             DataType::Int16 => Key::Number(i64::from(cell!(Int16Array))),
             DataType::Int32 => Key::Number(i64::from(cell!(Int32Array))),
             DataType::Int64 => Key::Number(cell!(Int64Array)),
-            DataType::Utf8 => Key::Text(cell!(StringArray).as_bytes()),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Dictionary(_, _) => {
+                rtdb_columnar::physical_text(array, row).expect("admitted text layout")
+                    .map_or(Key::Null, |text| Key::Text(text.as_bytes()))
+            }
             DataType::Float64 => Key::Float(cell!(Float64Array)),
             DataType::Timestamp(..) => Key::Number(cell!(TimestampMicrosecondArray)),
             _ => unreachable!("only admitted sort keys are read"),
@@ -218,6 +221,7 @@ impl NativeOrder {
 
 #[test]
 fn borrowed_sort_keys_follow_selected_arrow_positions_and_missing_sources() {
+    use arrow_array::StringArray;
     use crate::columnar::SelectedColumn;
     use std::sync::Arc;
 

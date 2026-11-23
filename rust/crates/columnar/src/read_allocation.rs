@@ -1,5 +1,5 @@
-use arrow_array::{Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, ListArray, MapArray, RunArray, StringArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
-use arrow_schema::{DataType, Field, UnionMode};
+use arrow_array::{Array, BinaryArray, FixedSizeBinaryArray, MapArray, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_schema::{DataType, Field};
 use rtdb_types::{Anomaly, Result, Value};
 
 use crate::interleave::Padding;
@@ -42,7 +42,7 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: Optio
         };
         return add(base, child);
     }
-    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+    if let DataType::Union(fields, _) = field.data_type() {
         let union = cast::<UnionArray>(array)?;
         let id = union.type_id(row);
         let field = fields.iter().find_map(|(candidate, field)| (candidate == id).then_some(field)).ok_or_else(layout)?;
@@ -52,7 +52,9 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: Optio
         return copy.map_or(Ok(base), |padding| null_copy_bytes(field, padding));
     }
     let value = match field.data_type() {
-        DataType::Utf8 => mul(cast::<StringArray>(array)?.value(row).len(), 2)?,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Dictionary(_, _) => {
+            mul(crate::text::physical_text(array, row)?.map_or(0, str::len), 2)?
+        }
         DataType::Binary => mul(cast::<BinaryArray>(array)?.value(row).len(), 2)?,
         DataType::FixedSizeBinary(_) => mul(cast::<FixedSizeBinaryArray>(array)?.value(row).len(), 2)?,
         DataType::Timestamp(_, timezone) => timezone.as_ref().map_or(0, |timezone| timezone.len()),
@@ -68,17 +70,9 @@ fn estimate_cell_bytes(field: &Field, array: &dyn Array, row: usize, copy: Optio
             }
             bytes
         }
-        DataType::List(child) => {
-            let values = cast::<ListArray>(array)?;
-            let start = usize::try_from(values.value_offsets()[row]).map_err(|_| layout())?;
-            let end = usize::try_from(values.value_offsets()[row + 1]).map_err(|_| layout())?;
-            range(child, values.values().as_ref(), start, end, copy)?
-        }
-        DataType::FixedSizeList(child, length) => {
-            let values = cast::<FixedSizeListArray>(array)?;
-            let length = usize::try_from(*length).map_err(|_| layout())?;
-            let start = mul(row, length)?;
-            range(child, values.values().as_ref(), start, add(start, length)?, copy)?
+        DataType::List(_) | DataType::LargeList(_) | DataType::ListView(_) | DataType::LargeListView(_) | DataType::FixedSizeList(_, _) => {
+            let (child, values, positions) = crate::list_span(field, array, row).ok_or_else(layout)?;
+            range(child, values, positions.start, positions.end, copy)?
         }
         DataType::Map(child, _) => {
             let values = cast::<MapArray>(array)?;
@@ -108,7 +102,7 @@ pub(crate) fn null_copy_bytes(field: &Field, padding: Padding) -> Result<usize> 
         DataType::FixedSizeList(child, count) => mul(usize::try_from(*count).map_err(|_| layout())?, null_copy_bytes(child, padding.under_null_parent())?)?,
         DataType::FixedSizeBinary(width) => mul(usize::try_from(*width).map_err(|_| layout())?, 2)?,
         DataType::RunEndEncoded(_, values) => null_copy_bytes(values, padding)?,
-        DataType::Union(fields, UnionMode::Dense) => {
+        DataType::Union(fields, _) => {
             let (_, field) = padding.union_leg(fields).ok_or_else(layout)?;
             null_copy_bytes(field, padding)?
         }
@@ -132,7 +126,7 @@ fn schema_bytes(field: &Field, in_union: bool) -> Result<(usize, usize)> {
             "uuid" => field.data_type() == &DataType::FixedSizeBinary(16),
             "xt/oid" | "xt/regclass" | "xt/regproc" => field.data_type() == &DataType::Int32,
             "xt/intervalDMMType" => field.data_type() == &DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
-            "set" => matches!(field.data_type(), DataType::List(_)),
+            "set" => matches!(field.data_type(), DataType::List(_) | DataType::LargeList(_) | DataType::ListView(_) | DataType::LargeListView(_)),
             "xt/tstz-range" => matches!(field.data_type(), DataType::FixedSizeList(_, 2)),
             _ => return Err(Anomaly::unsupported("rtdb/unknown-arrow-extension", "Unknown Arrow extension")),
         };
@@ -153,20 +147,21 @@ fn schema_bytes(field: &Field, in_union: bool) -> Result<(usize, usize)> {
                 child(field, in_union)?;
             }
         }
-        DataType::List(field) | DataType::FixedSizeList(field, _) => child(field, in_union)?,
+        DataType::List(field) | DataType::LargeList(field) | DataType::ListView(field) | DataType::LargeListView(field) | DataType::FixedSizeList(field, _) => child(field, in_union)?,
         DataType::Map(field, _) => {
             let DataType::Struct(fields) = field.data_type() else { return Err(layout()); };
             if field.is_nullable() || fields.len() != 2 || fields[0].name() != "key" || fields[0].is_nullable() || fields[1].name() != "value" { return Err(layout()); }
             child(field, in_union)?;
         }
-        DataType::Union(fields, UnionMode::Dense) => for (_, field) in fields.iter() { child(field, true)?; },
+        DataType::Union(fields, _) => for (_, field) in fields.iter() { child(field, true)?; },
         DataType::RunEndEncoded(ends, values) => {
             if in_union { return Err(Anomaly::unsupported("rtdb/encoded-union-leg", "Union legs must be plain at every depth")); }
             if field.is_nullable() || ends.is_nullable() || ends.name() != "run_ends" || values.name() != "values" || !matches!(ends.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) || matches!(values.data_type(), DataType::Null | DataType::RunEndEncoded(_, _)) { return Err(layout()); }
             child(ends, false)?; child(values, false)?;
         }
+        DataType::Dictionary(_, value) if matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {}
         DataType::Timestamp(_, timezone) => bytes = add(bytes, mul(timezone.as_ref().map_or(0, |timezone| timezone.len()), 4)?)?,
-        DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) | DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _) | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_) => {}
+        DataType::Null | DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 | DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Binary | DataType::FixedSizeBinary(_) | DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) | DataType::Decimal256(_, _) | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_) => {}
         _ => return Err(Anomaly::unsupported("rtdb/arrow-type", "Unsupported XTDB Arrow type")),
     }
     Ok((bytes, depth))
@@ -180,6 +175,7 @@ fn layout() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array an
 
 #[test]
 fn copying_a_null_fixed_list_skips_its_hidden_child_payload() {
+    use arrow_array::{FixedSizeListArray, StringArray};
     use std::sync::Arc;
 
     let item = Arc::new(Field::new("$data$", DataType::Utf8, false));

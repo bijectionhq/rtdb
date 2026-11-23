@@ -17,6 +17,7 @@ use crate::invalid;
 
 /// The deepest split: 4^4 = 256 fragments.
 const MAXIMUM_DEPTH: u8 = 4;
+const SEARCH_RESPONSE: &[u8] = b"RTDBFTS1";
 
 /// A run of base-four trie buckets from the root, naming the IIDs that share it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -109,12 +110,22 @@ impl ScanFragment {
     pub fn database(&self) -> &str { &self.scan.table.name.database }
     pub fn table(&self) -> &TableRef { &self.scan.table.name.table }
 
+    fn projects_search(&self) -> bool { !self.scan.matches.is_empty() || self.scan.top_k.is_some() }
+
+    pub(crate) fn decode_response(&self, bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Vec<ColumnBatch>> {
+        let bytes = if self.projects_search() {
+            bytes.strip_prefix(SEARCH_RESPONSE).ok_or_else(|| invalid("fragment-search-response", "Reader did not acknowledge search projection"))?
+        } else { bytes };
+        decode_batches(bytes, memory)
+    }
+
     /// The fragment of `scan` under `prefix`: its predicates and temporal filters stay with the coordinator, which filters
     /// the rows that come back, so the fragment carries only the projection and the bounds already evaluated.
     pub(crate) fn of(scan: &Scan, prefix: TriePrefix, basis: TransactionKey, residence: Option<FragmentResidence>, mut bounds: TemporalBounds, timezone: &str) -> Self {
         // The reader filters by the predicates it would evaluate as the coordinator does; the coordinator filters its rows by all of them again.
         let predicates = scan.predicates.iter().filter(|predicate| portable(predicate)).cloned().collect();
-        let scan = Scan { predicates, iids: None, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, ..scan.clone() };
+        let iids = scan.iids.as_ref().map(|iids| { let (lower, upper) = prefix.range(); iids.range(lower..=upper).copied().collect() });
+        let scan = Scan { predicates, iids, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default, ..scan.clone() };
         // The wire bounds are limited by the coordinator's admitted transaction head.
         let upper = Timestamp(basis.system_time.0.saturating_add(1));
         if bounds.system_time.upper() > upper {
@@ -161,6 +172,7 @@ async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanF
         batches = Box::new(crate::columnar::BatchFilter::new(batches, rtdb_plan::Schema::new(fragment.scan.columns.clone())?, predicate, execution));
     }
     let mut encoded = FragmentBytes::new(&memory)?;
+    if fragment.projects_search() { encoded.write_all(SEARCH_RESPONSE).map_err(fragment_io)?; }
     while let Some(batch) = batches.next_batch().await? { encode_batch(&batch, &memory, &mut encoded)?; }
     Ok(encoded)
 }

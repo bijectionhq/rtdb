@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn unsupported_parameter_type_releases_the_projection_charge() {
-        let schema = Arc::new(Schema::new(vec![Field::new("arg", DataType::LargeUtf8, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("arg", DataType::LargeBinary, true)]));
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
         let bound = schema_bound(&schema).unwrap();
         let memory = MemoryBudget::new(bound);

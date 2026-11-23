@@ -80,7 +80,17 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         }
         let target = from_field(field)?;
         let source_type = input.map(|(field, _)| from_field(field)).transpose()?.unwrap_or(L::Null);
-        if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
+        if input.is_none() {
+            if !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
+            let missing = arrow_schema::Field::new(field.name(), arrow_schema::DataType::Null, true);
+            let nulls = Arc::new(arrow_array::NullArray::new(batch.batch().num_rows())) as ArrayRef;
+            let _scratch = memory.reserve(arrow_relayout_bound(nulls.as_ref(), &missing, field)?)?;
+            let (physical, array) = physical::relayout(nulls, &missing, field, false)?;
+            output.grow_to(add(output.bytes(), array.get_array_memory_size())?)?;
+            fields.push(physical);
+            arrays.push(array);
+            continue;
+        }
         let ty = layout(&target, &source_type)?;
         if let Some((source_field, array)) = input {
             let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;

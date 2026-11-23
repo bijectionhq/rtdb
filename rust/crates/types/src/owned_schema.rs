@@ -223,6 +223,25 @@ impl OwnedSchema {
         self.0.fields.iter().find(|field| field.name == name)
     }
 
+    pub fn validate_cells<'a>(&self, names: impl IntoIterator<Item = &'a str>, mut cell_type: impl FnMut(&str) -> Result<LogicalType>) -> Result<()> {
+        for field in &self.0.fields {
+            let accepted = match cell_type(&field.name)? {
+                LogicalType::Nothing => field.optional,
+                LogicalType::Null => field.nullable,
+                LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_) }) if field.kind == (Kind::Instant {}) => true,
+                LogicalType::Scalar(actual) => actual == field.kind.scalar(),
+                _ => false,
+            };
+            if !accepted { return Err(nonconforming(&field.name)); }
+        }
+        for name in names {
+            if !matches!(name, "_id" | "_valid_from" | "_valid_to") && self.field(name).is_none() {
+                return Err(nonconforming(name));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
         for field in &self.0.fields {
             let accepts = match row.get(field.name.as_str()) {

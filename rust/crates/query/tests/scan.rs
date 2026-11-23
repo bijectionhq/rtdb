@@ -915,3 +915,75 @@ async fn a_nonmatching_page_overlapping_no_emitted_version_in_valid_time_is_prun
     assert_eq!(rows, [vec![Value::I64(1), timestamp(100), timestamp(200)], vec![Value::I64(1), timestamp(500), timestamp(600)]]);
     assert_eq!(pruned, 1);
 }
+
+#[tokio::test]
+async fn delegated_fragment_projects_match_and_score_at_selected_iids() {
+    use rtdb_plan::{ScanMatch, ScanTopK};
+    use rtdb_query::{FragmentDepth, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct LegacyReader(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ScanFragmenter for LegacyReader {
+        fn depth(&self, _: &str, _: &TableRef, _: u64) -> Option<FragmentDepth> { FragmentDepth::new(1).ok() }
+
+        async fn dispatch(&self, _: &ScanFragment) -> Result<Option<Vec<u8>>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(Vec::new()))
+        }
+    }
+
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut write = tx(&state, &budget, 0, 10);
+    for id in [1, 2] {
+        write.put(table(), document(id, Value::Utf8("overdue invoice".into())), Interval::ALL).unwrap();
+    }
+    state.apply(&write.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+    let snapshot = state.snapshot();
+    let basis = snapshot.tx_basis().unwrap();
+    let context = query_context(snapshot.clone(), Arc::clone(&store), true);
+    let relation = scan(&context, &["_id", "v"], TemporalFilter::All, at(10), None);
+    let rtdb_plan::RelationNode::Scan(scan) = relation.node() else { unreachable!() };
+    let mut scan = scan.clone();
+    let matching = Field {
+        id: ColumnId(20), name: "matching".into(), qualifier: None, qualified_only: false, unnamed: false,
+        data_type: LogicalType::Scalar(ScalarType::Bool).maybe(),
+    };
+    let score = Field { id: ColumnId(21), name: "score".into(), data_type: LogicalType::Scalar(ScalarType::F64).maybe(), ..matching.clone() };
+    let query = Expr::Literal(Value::Utf8("invoice".into()));
+    scan.matches.push(ScanMatch { id: matching.id, column: "v".into(), query: query.clone() });
+    scan.top_k = Some(ScanTopK { column: scan.columns[1].id, query, limit: Expr::Literal(Value::I64(1)), score: Some(score.id) });
+    scan.columns.extend([matching, score]);
+    scan.iids = Some(BTreeSet::from([EntityId::Integer(2).iid()]));
+    let fragment = ScanFragment {
+        scan, prefix: TriePrefix::new(Vec::new()).unwrap(), basis, residence: None,
+        bounds: rtdb_types::TemporalBounds { valid_time: Interval::at(Timestamp(0)).unwrap(), system_time: Interval::at(Timestamp(10)).unwrap() },
+        timezone: "UTC".into(),
+    };
+    let wire = evaluate_fragment(context, &fragment).await.unwrap();
+    let response = wire.strip_prefix(b"RTDBFTS1").unwrap();
+    let (_, bytes) = response.split_first_chunk::<8>().unwrap();
+    let mut reader = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let values = batch.schema_ref().fields().iter().zip(batch.columns()).map(|(field, array)| {
+        read_value(field, array.as_ref(), 0).unwrap()
+    }).collect::<Vec<_>>();
+    assert_eq!(values[0], Value::I64(2));
+    assert_eq!(values[2], Value::Bool(true));
+    let Value::F64(score) = values[3] else { panic!("missing score"); };
+    assert!(score > 0.0);
+
+    let legacy = Arc::new(LegacyReader::default());
+    let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap()
+        .with_fragmenter(Some(legacy.clone()), None);
+    let coordinator = QueryContext::new(catalog, budget, Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+    assert_eq!(collect(Arc::new(Relation::scan(fragment.scan).unwrap()), coordinator).await.unwrap(), [values]);
+    assert_eq!(legacy.0.load(Ordering::Relaxed), 1);
+}

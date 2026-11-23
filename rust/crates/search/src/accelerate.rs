@@ -4,14 +4,14 @@ pub mod experiment;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use arrow_array::{Array, Float64Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, Float64Array, builder::{FixedSizeBinaryBuilder, UInt32Builder}, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use rtdb_columnar::{EntityIdRef, OwnedBatch};
 use rtdb_format::{data::PutText, keys::ArtefactOwner};
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Catalog, Expr};
-use rtdb_query::{MatchAnswers, QueryContext, ScanAccelerator, ScanRequest, ScanSelection};
+use rtdb_query::{CandidateIids, MatchAnswers, QueryContext, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
@@ -63,14 +63,16 @@ fn optional_build_refused(error: &Anomaly) -> bool {
 #[async_trait]
 impl ScanAccelerator for SearchAccelerator {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        self.narrow(request, Narrowing::default(), &mut NarrowingWork::default()).await
+        Ok(self.select_candidates(request).await?.map(|selection| selection.iids.iter().collect()))
     }
 
     async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
         let mut work = NarrowingWork::default();
-        self.narrow(request, Narrowing::default(), &mut work).await?.map(|iids| {
-            Ok(ScanSelection { iids: rtdb_query::CandidateIids::from_set(iids, request.memory)?, scores: work.scores })
-        }).transpose()
+        let iids = match self.narrow(request, Narrowing::default(), &mut work).await {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+            result => result?,
+        };
+        Ok(iids.map(|iids| ScanSelection { iids, scores: work.scores }))
     }
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
@@ -79,13 +81,18 @@ impl ScanAccelerator for SearchAccelerator {
         let files = match self.trie_files(request, &definition, column, &[&query]).await? {
             TrieFiles::Complete(found) | TrieFiles::Partial(found) => found.files,
         };
+        let fallback_scope = if request.candidate_iids.is_none() {
+            request.scan.iids.as_ref().filter(|iids| iids.len() <= 128)
+                .map(|iids| CandidateIids::from_set(iids.clone(), request.memory)).transpose()?
+        } else { None };
+        let scope = request.candidate_iids.or(fallback_scope.as_ref());
         let mut answers = MatchAnswers::default();
         let mut sets = BTreeMap::new();
         for trie in &files {
             let set = match sets.entry(trie.identity.as_str()) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                    self.runtime.match_set_for_scan(request.database, trie, column, &query, request.scan.iids.as_ref())?,
+                    self.runtime.match_set_for_scan(request.database, trie, column, &query, scope)?,
                 ),
             };
             answers.insert(&trie.data, Arc::new(set.member(trie.member)?));
@@ -100,7 +107,7 @@ struct Narrowing<'a> {
     baseline: bool,
     skip_retry: bool,
     estimate_first: bool,
-    scope: Option<&'a BTreeSet<Iid>>,
+    scope: Option<&'a CandidateIids>,
 }
 
 #[derive(Default)]
@@ -127,7 +134,7 @@ impl NarrowingWork {
 }
 
 impl SearchAccelerator {
-    async fn narrow(&self, request: &ScanRequest<'_>, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+    async fn narrow(&self, request: &ScanRequest<'_>, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<CandidateIids>> {
         let scan = request.scan;
         let mut conjuncts = Vec::new();
         for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
@@ -137,18 +144,21 @@ impl SearchAccelerator {
             if let Some(definition) = self.definition(request, column).await? { chosen = Some((column, Query::parse(&text), definition)); break; }
         }
         let Some((column, query, definition)) = chosen else { return Ok(None) };
-        if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
+        if query.terms().is_empty() { return CandidateIids::from_set(BTreeSet::new(), request.memory).map(Some); }
         if options.is_oracle { return Ok(None); }
         if let Some(top_k) = &scan.top_k {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked {
                 work.tried_ranking = true;
-                let existing = if options.baseline { None } else { scan.iids.as_ref() };
+                let fallback_scope = if !options.baseline && request.candidate_iids.is_none() {
+                    scan.iids.as_ref().map(|iids| CandidateIids::from_set(iids.clone(), request.memory)).transpose()?
+                } else { None };
+                let existing = if options.baseline { None } else { request.candidate_iids.or(fallback_scope.as_ref()) };
                 let scope = options.scope.or(existing);
-                work.filter_scope = scope.map(BTreeSet::len);
-                if scope.is_some_and(BTreeSet::is_empty) {
+                work.filter_scope = scope.map(CandidateIids::len);
+                if scope.is_some_and(CandidateIids::is_empty) {
                     work.ranked = true;
-                    return Ok(Some(BTreeSet::new()));
+                    return CandidateIids::from_set(BTreeSet::new(), request.memory).map(Some);
                 }
                 let ranking = Narrowing { scope, ..options };
                 if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, ranking, work).await? {
@@ -169,11 +179,15 @@ impl SearchAccelerator {
             return Ok(None);
         };
         let cutter = Cutter::new(&files, &skipped, request);
-        let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates, &mut work.plain_events)? else {
+        let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates, &mut work.plain_events, request.memory)? else {
             work.plain_decline = Some("candidate-budget");
             return Ok(None);
         };
-        candidates.extend(self.live_candidates(request, column, &query)?);
+        let Some(live) = self.live_candidates(request, column, &query)? else {
+            work.plain_decline = Some("candidate-budget");
+            return Ok(None);
+        };
+        candidates = candidates.union(&live, request.memory)?;
         if candidates.len() > self.max_candidates { work.plain_decline = Some("candidate-budget"); return Ok(None); }
         Ok(Some(candidates))
     }
@@ -262,7 +276,7 @@ impl SearchAccelerator {
         let (table, artefact_id) = (&request.scan.table.name.table, definition.artefact_id());
         let entry = request.snapshot.table_entry(table).ok_or_else(|| uncovered_owned_search())?;
         let identity = crate::file::artefact_identity(entry.slug.as_str(), &recorded.owner, &artefact_id, definition.version);
-        let error = match self.runtime.file(request.database, request.storage, &recorded.key, &definition.columns).await {
+        let error = match self.runtime.file_with_terms(request.database, request.storage, &recorded.key, &definition.columns, column, queries, request.memory).await {
             Ok(file) if file.matches_artefact(&identity, definition.version) && file.check_terms(column, queries).is_ok() => {
                 return Ok(Some(file));
             }
@@ -332,17 +346,22 @@ impl SearchAccelerator {
         Ok(TrieFiles::Complete(Found { files, skipped }))
     }
 
-    fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<BTreeSet<Iid>> {
-        let mut candidates = BTreeSet::new();
+    fn live_candidates(&self, request: &ScanRequest<'_>, column: &str, query: &Query) -> Result<Option<CandidateIids>> {
+        let mut candidates = CandidateIids::from_set(BTreeSet::new(), request.memory)?;
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
             let selected = self.runtime.live_matches(request.database, segment, column, query, None, true)?;
+            let _scratch = request.memory.reserve(selected.rows.len().saturating_mul(32))?;
+            let mut iids = FixedSizeBinaryBuilder::with_capacity(selected.rows.len(), 16);
             for &row in selected.rows.values().iter() {
                 let header = segment.header(row)?;
                 if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
-                candidates.insert(header.iid);
+                iids.append_value(header.iid.0).map_err(candidate_error)?;
             }
+            let selected = CandidateIids::from_array(iids.finish(), request.memory)?;
+            candidates = candidates.union(&selected, request.memory)?;
+            if candidates.len() > self.max_candidates { return Ok(None); }
         }
-        Ok(candidates)
+        Ok(Some(candidates))
     }
 }
 
@@ -365,17 +384,51 @@ fn uncovered_owned_search() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/search-uncovered", "Published search artefacts do not cover the held cut")
 }
 
+/// The exact held corpus in query-term order.
+pub struct OwnedCorpusBatch {
+    pub terms: OwnedBatch,
+    pub documents: u64,
+    pub tokens: u64,
+}
+
+impl OwnedCorpusBatch {
+    pub fn into_corpus(self) -> rtdb_text::Corpus {
+        use arrow_array::cast::AsArray;
+        let batch = self.terms.batch();
+        let terms = batch.column(0).as_string::<i32>();
+        let counts = batch.column(1).as_primitive::<arrow_array::types::UInt64Type>();
+        rtdb_text::Corpus {
+            documents: self.documents,
+            tokens: self.tokens,
+            frequencies: terms.iter().flatten().zip(counts.values().iter().copied())
+                .map(|(term, count)| (term.to_owned(), count)).collect(),
+        }
+    }
+}
+
 /// Computes exact statistics for the admitted owned relation at the held point.
-/// Opens only artefacts recorded on that cut and never builds a replacement.
+pub async fn owned_corpus_batch(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
+) -> Result<OwnedCorpusBatch> {
+    let memory = Arc::clone(&context.memory);
+    let query = Query::parse(text);
+    let covered = covered_owned_corpus(context, owner, relation, path, &query, false).await?;
+    let bound = query.terms().iter().fold(4096usize, |bytes, term| bytes.saturating_add(32 + term.len()));
+    let charge = memory.reserve(bound)?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("term", DataType::Utf8, false),
+        Field::new("document_frequency", DataType::UInt64, false),
+    ]));
+    let terms = Arc::new(arrow_array::StringArray::from_iter_values(query.terms()));
+    let batch = RecordBatch::try_new(schema, vec![terms, Arc::new(covered.frequencies)])
+        .map_err(|error| Anomaly::fault("rtdb.search/corpus-output", error.to_string()))?;
+    Ok(OwnedCorpusBatch { terms: OwnedBatch::with_reservation(batch, charge)?, documents: covered.documents, tokens: covered.tokens })
+}
+
 pub async fn owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
 ) -> Result<rtdb_text::Corpus> {
-    let query = Query::parse(text);
-    let covered = covered_owned_corpus(context, owner, relation, path, &query, false).await?;
-    Ok(rtdb_text::Corpus {
-        documents: covered.documents, tokens: covered.tokens,
-        frequencies: query.terms().iter().cloned().zip(covered.frequencies.values().iter().copied()).collect(),
-    })
+    Ok(owned_corpus_batch(context, owner, relation, path, text).await?.into_corpus())
 }
 
 struct CoveredCorpus {
@@ -428,7 +481,7 @@ async fn covered_owned_corpus(
         let file = if let Some(file) = opened.get(&recorded.key) {
             Arc::clone(file)
         } else {
-            let file = runtime.file(database, &captured.storage, &recorded.key, &definition.columns).await
+            let file = runtime.file_with_terms(database, &captured.storage, &recorded.key, &definition.columns, column, &[query], &context.memory).await
                 .map_err(|_| uncovered_owned_search())?;
             let identity = crate::file::artefact_identity(entry.slug.as_str(), &recorded.owner, &artefact_id, definition.version);
             if !file.matches_artefact(&identity, definition.version) {
@@ -450,7 +503,7 @@ async fn covered_owned_corpus(
     let mut visible_runs = Vec::new();
     let mut scratch = context.memory.reserve(4096)?;
     for selected in by_file(&files) {
-        let mut visible = BTreeSet::new();
+        let mut visible = UInt32Builder::new();
         for (&member, &own) in &selected.members {
             for doc in selected.file.single_column_member_runs(member)? {
                 if doc.doc % 128 == 0 { context.check_cancelled()?; }
@@ -465,19 +518,26 @@ async fn covered_owned_corpus(
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
                         if !seen.insert(id) { return Err(uncovered_owned_search()); }
-                        visible.insert(doc.doc);
+                        visible.append_value(doc.doc);
                         documents += 1;
                         tokens += u64::from(selected.file.token_length(doc.doc)?);
                     }
                 }
             }
         }
+        let mut visible = visible.finish();
+        if visible.values().windows(2).any(|pair| pair[0] >= pair[1]) {
+            let mut sorted = visible.values().to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            visible = UInt32Array::from(sorted);
+        }
         for (term, frequency) in query.terms().iter().zip(&mut frequencies) {
             let Some(postings) = selected.file.postings(column, term).map_err(|_| uncovered_owned_search())? else { continue; };
-            *frequency += postings.documents().iter().filter(|doc| visible.contains(doc)).count() as u64;
+            *frequency += postings.documents().iter().filter(|doc| visible.values().binary_search(doc).is_ok()).count() as u64;
         }
         if retain_runs && !visible.is_empty() {
-            visible_runs.push((Arc::clone(selected.file), UInt32Array::from_iter_values(visible)));
+            visible_runs.push((Arc::clone(selected.file), visible));
         }
     }
     context.check_cancelled()?;
@@ -554,8 +614,8 @@ pub async fn owned_ranked_batch(
     }
     let scorer = rtdb_text::Scorer::from_frequencies(query.clone(), documents, tokens, &frequencies);
     let window = offset + limit;
-    let _scratch = context.memory.reserve(4096 + (window + 1) * size_of::<(usize, EntityIdRef<'_>, f64)>())?;
-    let mut hits = Vec::<(usize, EntityIdRef<'_>, f64)>::with_capacity(window + 1);
+    let _scratch = context.memory.reserve(4096 + (window + 1) * size_of::<HeldRankPosition<'_>>())?;
+    let mut hits = Vec::<HeldRankPosition<'_>>::with_capacity(window + 1);
     let mut candidates = 0;
     for (partition, (relation, covered)) in covered.iter().enumerate() {
         for (file, visible) in &covered.visible_runs {
@@ -600,12 +660,21 @@ pub async fn owned_ranked_batch(
                 }
 
                 let score = resolved_score.ok_or_else(uncovered_owned_search)?;
-                let at = hits.partition_point(|&(previous_partition, previous_id, previous_score)| {
-                    previous_score.total_cmp(&score).reverse().then_with(|| previous_id.cmp(&identity))
-                        .then_with(|| previous_partition.cmp(&partition)).is_lt()
-                });
-                if at < window {
-                    hits.insert(at, (partition, identity, score));
+                let mut first = 0;
+                let mut end = hits.len();
+                while first < end {
+                    let middle = first + (end - first) / 2;
+                    let previous = &hits[middle];
+                    let previous_id = previous.file.run_identity_key(previous.run)?;
+                    if previous.score.total_cmp(&score).reverse().then_with(|| previous_id.cmp(&identity))
+                        .then_with(|| previous.partition.cmp(&partition)).is_lt() {
+                        first = middle + 1;
+                    } else {
+                        end = middle;
+                    }
+                }
+                if first < window {
+                    hits.insert(first, HeldRankPosition { partition, file, run, score });
                     hits.truncate(window);
                 }
             }
@@ -613,7 +682,8 @@ pub async fn owned_ranked_batch(
     }
     context.check_cancelled()?;
     let hits = &hits[offset.min(hits.len())..];
-    let bound = hits.iter().try_fold(4096usize, |size, &(_, id, _)| {
+    let bound = hits.iter().try_fold(4096usize, |size, hit| {
+        let id = hit.file.run_identity_key(hit.run)?;
         size.checked_add(identity_bytes(id).saturating_mul(4).saturating_add(128)).ok_or_else(uncovered_owned_search)
     })?;
     let reservation = context.memory.reserve(bound)?;
@@ -622,30 +692,49 @@ pub async fn owned_ranked_batch(
         Field::new("score", DataType::Float64, false),
         Field::new("partition", DataType::UInt64, false),
     ]));
-    let ids = rtdb_columnar::entity_id_array(hits.iter().map(|&(_, id, _)| id))?;
-    let score = Arc::new(Float64Array::from_iter_values(hits.iter().map(|&(_, _, score)| score)));
-    let partition = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|&(partition, _, _)| partition as u64)));
+    let identities = hits.iter().map(|hit| hit.file.run_identity_key(hit.run)).collect::<Result<Vec<_>>>()?;
+    let ids = rtdb_columnar::entity_id_array(identities)?;
+    let score = Arc::new(Float64Array::from_iter_values(hits.iter().map(|hit| hit.score)));
+    let partition = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|hit| hit.partition as u64)));
     let output = RecordBatch::try_new(schema, vec![ids, score, partition])
         .map_err(|error| Anomaly::fault("rtdb.search/ranked-output", error.to_string()))?;
     Ok(OwnedSearchBatch { hits: OwnedBatch::with_reservation(output, reservation)?, total: candidates })
+}
+
+struct HeldRankPosition<'a> {
+    partition: usize,
+    file: &'a SearchFile,
+    run: crate::DocMatch,
+    score: f64,
 }
 
 fn identity_bytes(id: EntityIdRef<'_>) -> usize {
     match id { EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(), _ => 16 }
 }
 
-fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {
-    let mut candidates = BTreeSet::new();
+fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize,
+    memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Option<CandidateIids>> {
+    let mut candidates = CandidateIids::from_set(BTreeSet::new(), memory)?;
     for selected in by_file(cutter.files) {
         let docs = selected.file.matched_runs(column, query, cutter.bounds)?;
+        let _scratch = memory.reserve(docs.len().saturating_mul(32))?;
+        let mut iids = FixedSizeBinaryBuilder::with_capacity(docs.len(), 16);
         if cfg!(feature = "experiments") { *events = events.saturating_add(docs.len()); }
         for doc in docs.iter() {
             let Some(&own) = selected.members.get(&doc.member) else { continue };
-            if !matches!(cutter.judge(own, doc)?, Judged::Hidden) { candidates.insert(Iid(doc.iid)); }
+            if !matches!(cutter.judge(own, doc)?, Judged::Hidden) {
+                iids.append_value(doc.iid).map_err(candidate_error)?;
+            }
         }
+        let selected = CandidateIids::from_array(iids.finish(), memory)?;
+        candidates = candidates.union(&selected, memory)?;
         if candidates.len() > max_candidates { return Ok(None); }
     }
     Ok(Some(candidates))
+}
+
+fn candidate_error(error: arrow_schema::ArrowError) -> Anomaly {
+    Anomaly::fault("rtdb.search/candidate-iid", error.to_string())
 }
 
 /// A row's ranking key: its score, then its IID, so that ties sort deterministically.
@@ -695,7 +784,7 @@ impl Candidates<'_> {
         crate::rank_cutoff::can_stop(kth.to_bits(), pending, unread)
     }
     /// The next IID, best first, with its best event's score and whether that event is exactly visible.
-    fn next(&mut self, scope: Option<&BTreeSet<Iid>>, work: &mut NarrowingWork) -> Result<Option<(f64, Iid, bool)>> {
+    fn next(&mut self, scope: Option<&CandidateIids>, work: &mut NarrowingWork) -> Result<Option<(f64, Iid, bool)>> {
         loop {
             self.drop_seen();
             match (self.pending.peek().map(|top| top.0), self.best_file()) {
@@ -722,13 +811,13 @@ impl SearchAccelerator {
     /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     /// IIDs are verified best bound first, in batches, until `limit` verified rows outscore every bound still unverified; a search file's events are scored only as far as that takes.
-    async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+    async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<CandidateIids>> {
         let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
         let limit = match request.constants.constant(&top_k.limit).await.ok().flatten() {
             Some(Value::I64(limit)) => limit, Some(Value::I32(limit)) => i64::from(limit), Some(Value::I16(limit)) => i64::from(limit), _ => { work.decline = Some("unsupported-limit"); return Ok(None); },
         };
         let Ok(limit) = usize::try_from(limit) else { work.decline = Some("unsupported-limit"); return Ok(None) };
-        if limit == 0 { return Ok(Some(BTreeSet::new())); }
+        if limit == 0 { return CandidateIids::from_set(BTreeSet::new(), request.memory).map(Some); }
         let scoring_query = Query::parse(&text);
         let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition, column, &[matching, &scoring_query]).await? else {
             work.decline = Some("coverage");
@@ -766,7 +855,7 @@ impl SearchAccelerator {
             for (&row, &score) in selected.rows.values().iter().zip(scores.values().iter()) {
                 if cfg!(feature = "experiments") { work.postings_visited += 1; }
                 let header = segment.header(row)?;
-                if options.scope.is_some_and(|scope| !scope.contains(&header.iid)) { continue; }
+                if options.scope.is_some_and(|scope| !scope.contains(header.iid)) { continue; }
                 if !may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { continue; }
                 if cfg!(feature = "experiments") { work.score_evaluations += 1; }
                 candidates.push(header.iid, score, false);
@@ -780,14 +869,15 @@ impl SearchAccelerator {
                 verified.sort_by(descending);
                 if candidates.can_stop(verified[limit - 1].0) { break; }
             }
-            let mut iids = BTreeSet::new();
+            let _verification = request.memory.reserve(batch.saturating_mul(32))?;
+            let mut iids = FixedSizeBinaryBuilder::with_capacity(batch, 16);
             let mut handed = 0;
             while handed < batch {
                 let Some((score, iid, exact)) = candidates.next(options.scope, work)? else { break };
                 handed += 1;
                 if request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
                 // An exactly visible event's row is in the scan's output with its score, so it needs no verifying.
-                if exact && trusted { verified.push((score, iid)); } else { iids.insert(iid); }
+                if exact && trusted { verified.push((score, iid)); } else { iids.append_value(iid.0).map_err(candidate_error)?; }
             }
             if candidates.scored > self.max_candidates {
                 work.decline = Some("candidate-budget");
@@ -798,6 +888,7 @@ impl SearchAccelerator {
                 return Ok(None);
             }
             if handed == 0 { break; }
+            let iids = CandidateIids::from_array(iids.finish(), request.memory)?;
             if iids.is_empty() { continue; }
             if work.verification_rounds == 16 { work.decline = Some("verification-budget"); return Ok(None); }
             work.verification_rounds += 1;
@@ -807,7 +898,10 @@ impl SearchAccelerator {
         verified.sort_by(descending);
         let kth = verified.get(limit - 1).map_or(f64::NEG_INFINITY, |(score, _)| *score);
         verified.retain(|&(score, _)| score >= kth);
-        let iids = verified.iter().map(|&(_, iid)| iid).collect();
+        let _scratch = request.memory.reserve(verified.len().saturating_mul(32))?;
+        let mut iids = FixedSizeBinaryBuilder::with_capacity(verified.len(), 16);
+        for &(_, iid) in &verified { iids.append_value(iid.0).map_err(candidate_error)?; }
+        let iids = CandidateIids::from_array(iids.finish(), request.memory)?;
         if top_k.score.is_some() && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point() {
             work.scores = rtdb_query::CandidateScores::from_verified(verified.into_iter().map(|(score, iid)| (iid, score)).collect(), request.memory)?;
         }
@@ -862,8 +956,8 @@ mod tests {
         let query = Query::parse("overdue");
         let files = [trie(1)];
         let cutter = Cutter { files: &files, skipped: &[], segments: Vec::new(), bounds };
-        let iids = file_candidates(&cutter, "body", &query, 1, &mut 0).unwrap().unwrap();
-        assert_eq!(iids, BTreeSet::from([Iid([64; 16])]));
+        let iids = file_candidates(&cutter, "body", &query, 1, &mut 0, &rtdb_columnar::MemoryBudget::new(1 << 20)).unwrap().unwrap();
+        assert_eq!(iids.iter().collect::<Vec<_>>(), [Iid([64; 16])]);
         assert_eq!(by_file(&[trie(0), trie(1)]).count(), 1);
 
         let rank_scorer = Arc::new(rtdb_text::Scorer::new(query.clone(), None)).for_ranking().unwrap();
@@ -918,8 +1012,8 @@ mod tests {
                 files: &files, skipped: &[], segments: Vec::new(),
                 bounds: at(5, system),
             };
-            let candidates = file_candidates(&cutter, "body", &query, 1, &mut 0).unwrap().unwrap();
-            assert_eq!(candidates.contains(&Iid(iid)), expected, "at system time {system}");
+            let candidates = file_candidates(&cutter, "body", &query, 1, &mut 0, &rtdb_columnar::MemoryBudget::new(1 << 20)).unwrap().unwrap();
+            assert_eq!(candidates.contains(Iid(iid)), expected, "at system time {system}");
         }
     }
 

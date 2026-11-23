@@ -18,6 +18,9 @@ const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Public(TxOp),
+    OwnedArrowIids { create_only: bool, relation: rtdb_types::OwnedRelation, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    PatchArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
+    InsertArrowIids { table: TableRef, documents: ArrowDocuments, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     OwnedWriteIids { create_only: bool, relation: rtdb_types::OwnedRelation, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     InsertIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
     PutIids { table: TableRef, documents: Documents, iids: Vec<Iid>, valid_from: Option<Timestamp>, valid_to: Option<Timestamp> },
@@ -33,13 +36,13 @@ impl Operation {
                 | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckWorldPurge { relation, .. }
                 | TxOp::OwnedErase { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
-                | TxOp::OwnedReplaceDocs { relation, .. }) | Self::OwnedWriteIids { relation, .. } => Some(relation),
+                | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. }) | Self::OwnedWriteIids { relation, .. } | Self::OwnedArrowIids { relation, .. } => Some(relation),
             _ => None,
         }
     }
 
     pub(crate) fn is_owned(&self) -> bool {
-        match self { Self::Public(operation) => operation.is_owned(), Self::OwnedWriteIids { .. } => true, _ => false }
+        match self { Self::Public(operation) => operation.is_owned(), Self::OwnedWriteIids { .. } | Self::OwnedArrowIids { .. } => true, _ => false }
     }
 }
 
@@ -92,11 +95,11 @@ impl SourceTransaction {
                     (range_evidence_bytes(relation, fixed), None, 0),
                 Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
-                Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }) => (relation.name().len(), None, 0),
-                Operation::OwnedWriteIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. }) => (relation.name().len(), None, 0),
+                Operation::OwnedWriteIids { relation, iids, .. } | Operation::OwnedArrowIids { relation, iids, .. } => (relation.name().len(), None, iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => (sql.capacity(), None, 0),
                 Operation::Public(TxOp::InsertDocs { table, .. } | TxOp::PutDocs { table, .. } | TxOp::PutArrowDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. }) => (0, Some(table), 0),
-                Operation::InsertIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
+                Operation::InsertIids { table, iids, .. } | Operation::InsertArrowIids { table, iids, .. } | Operation::PatchArrowIids { table, iids, .. } | Operation::PutIids { table, iids, .. } | Operation::PutArrowIids { table, iids, .. } | Operation::PatchIids { table, iids, .. } => (0, Some(table), iids.capacity().checked_mul(16).ok_or_else(overflow)?),
                 Operation::Removed(name) => (name.capacity(), None, 0),
             };
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
@@ -294,8 +297,13 @@ impl SourceTransaction {
         let scratch = operations().try_fold(65_536usize, |bytes, operation| {
             let extra = match operation {
                 Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. } | TxOp::InsertDocs { documents, .. } | TxOp::PutDocs { documents, .. } | TxOp::PatchDocs { documents, .. }) | Operation::OwnedWriteIids { documents, .. } | Operation::InsertIids { documents, .. } | Operation::PutIids { documents, .. } | Operation::PatchIids { documents, .. } => documents.rows().iter().try_fold(0usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(overflow))?,
-                Operation::Public(TxOp::PutArrowDocs { documents, .. }) | Operation::PutArrowIids { documents, .. } => {
-                    documents.array().len().checked_mul(64).ok_or_else(overflow)?
+                Operation::Public(TxOp::OwnedArrowDocs { documents, .. } | TxOp::PutArrowDocs { documents, .. })
+                | Operation::PutArrowIids { documents, .. } | Operation::InsertArrowIids { documents, .. }
+                | Operation::OwnedArrowIids { documents, .. } | Operation::PatchArrowIids { documents, .. } => {
+                    let base = documents.len().checked_mul(64).ok_or_else(overflow)?;
+                    documents.presence().into_iter().flatten().flatten().try_fold(base, |bytes, name| {
+                        bytes.checked_add(name.len().saturating_add(128)).ok_or_else(overflow)
+                    })?
                 }
                 Operation::Public(TxOp::Sql { sql, args }) => {
                     let rows = args.as_ref().map(SqlArguments::value_bytes).transpose()?.unwrap_or(0);
@@ -552,6 +560,24 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
                 "rtdb-owned-replace-v1"
             }
         }
+        Operation::Public(TxOp::OwnedArrowDocs { relation, documents, create_only, valid_from, valid_to })
+        | Operation::OwnedArrowIids { relation, documents, create_only, valid_from, valid_to, .. } => {
+            let recorded = match operation { Operation::OwnedArrowIids { iids, .. } => Some(iids.as_slice()), _ => None };
+            let reader = if recorded.is_none() { documents.id_reader()? } else { None };
+            let iids = (0..documents.len()).map(|row| {
+                let iid = match recorded { Some(iids) => iids[row], None => documents.iid(row, reader.as_ref(), memory)? };
+                Ok(Value::FixedSizeBinary(iid.0.to_vec()))
+            }).collect::<Result<_>>()?;
+            body.insert("iids".into(), Value::List(iids));
+            if let Some(presence) = documents.presence() {
+                let rows = presence.iter().map(|names| Value::List(documents.columns().iter()
+                    .filter(|name| names.contains(*name)).cloned().map(Value::Utf8).collect())).collect();
+                body.insert("field_presence".into(), Value::List(rows));
+            }
+            time_fields(&mut body, *valid_from, *valid_to);
+            docs = Some((relation.name().to_owned(), SourceDocuments::Arrow(documents)));
+            if *create_only { "rtdb-owned-insert-v1" } else { "rtdb-owned-replace-v1" }
+        }
         Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             if documents.has_exact_presence() {
@@ -584,11 +610,17 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
             "put-docs"
         }
-        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to } => {
+        Operation::PutArrowIids { table, documents, iids, valid_from, valid_to }
+        | Operation::InsertArrowIids { table, documents, iids, valid_from, valid_to }
+        | Operation::PatchArrowIids { table, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
             time_fields(&mut body, *valid_from, *valid_to);
             docs = Some((table_name(table), SourceDocuments::Arrow(documents)));
-            "put-docs"
+            match operation {
+                Operation::InsertArrowIids { .. } => "insert-docs",
+                Operation::PatchArrowIids { .. } => "patch-docs",
+                _ => "put-docs",
+            }
         }
         Operation::InsertIids { table, documents, iids, valid_from, valid_to } | Operation::PutIids { table, documents, iids, valid_from, valid_to } | Operation::PatchIids { table, documents, iids, valid_from, valid_to } => {
             body.insert("iids".into(), Value::List(iids.iter().map(|iid| Value::FixedSizeBinary(iid.0.to_vec())).collect()));
@@ -763,7 +795,6 @@ fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) 
             }));
             ty = backfilled_nullability(ty, &cells);
         }
-        if !document_relayout_supported(&ty) { return Ok(None); }
         layout.push((to_field(name, &ty)?, ty));
     }
 
@@ -954,7 +985,6 @@ fn merge_document_fields(left: &Field, right: &Field) -> Result<Option<Field>> {
         return Ok(None);
     };
     let joint = left.join(&right_type);
-    if !document_relayout_supported(&joint) { return Ok(None); }
     to_field(right.name(), &joint).map(Some)
 }
 
@@ -970,20 +1000,7 @@ fn document_relayout_type(field: &Field) -> Result<Option<LogicalType>> {
         }
     }
     if !supported_field(field) { return Ok(None); }
-    let logical = from_field(field)?;
-    Ok(document_relayout_supported(&logical).then_some(logical))
-}
-
-fn document_relayout_supported(logical: &LogicalType) -> bool {
-    match logical {
-        LogicalType::Maybe(value) => document_relayout_supported(value),
-        LogicalType::Struct(fields) => fields.values().all(document_relayout_supported),
-        LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::FixedSizeList(_), element } =>
-            document_relayout_supported(element),
-        LogicalType::Union(legs) => legs.iter().all(document_relayout_supported),
-        LogicalType::Scalar(_) | LogicalType::Null | LogicalType::Nothing => true,
-        _ => false,
-    }
+    from_field(field).map(Some)
 }
 
 fn row_document_struct(lists: &[&Documents], length: usize, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
@@ -1327,19 +1344,39 @@ impl SourceOperationReader<'_> {
                     std::collections::btree_map::Entry::Occupied(layout) => Arc::clone(layout.get()),
                     std::collections::btree_map::Entry::Vacant(layout) => Arc::clone(layout.insert(DecodedDocumentLayout::new(structs.fields(), memory)?)),
                 };
-                if name == "put-docs" && iids.is_some()
+                if name == "put-docs"
                     && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
-                    return Ok(Operation::PutArrowIids { table: table.expect("plain put has a table"), documents, iids: iids.expect("put contains IIDs"), valid_from, valid_to });
+                    let derived = if iids.is_none() {
+                        let reader = documents.id_reader()?;
+                        (0..documents.len()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<Vec<_>>>().ok()
+                    } else { None };
+                    if let Some(iids) = iids.as_ref().or(derived.as_ref()) {
+                        return Ok(Operation::PutArrowIids { table: table.expect("plain put has a table"), documents, iids: iids.clone(), valid_from, valid_to });
+                    }
                 }
                 if let Some(relation) = owned {
                     let presence = body.column_by_name("field_presence")
                         .map(|_| value("field_presence").and_then(read_owned_field_presence)).transpose()?.flatten();
-                    let documents = Documents::read_arrow_with_presence(structs, layout, true, presence.as_deref(), memory)?;
                     let iids = iids.ok_or_else(|| invalid("Owned insert operation has no IIDs"))?;
-                    return Ok(Operation::OwnedWriteIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids, valid_from, valid_to });
+                    let create_only = name == "rtdb-owned-insert-v1";
+                    if !relation.is_world_catalog() && relation.world().is_none() && relation.name() != rtdb_types::OWNED_ATTEMPT_RELATION
+                        && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
+                        let documents = documents.with_presence(presence, memory)?;
+                        return Ok(Operation::OwnedArrowIids { create_only, relation, documents, iids, valid_from, valid_to });
+                    }
+                    let documents = Documents::read_arrow_with_presence(structs, layout, true, presence.as_deref(), memory)?;
+                    return Ok(Operation::OwnedWriteIids { create_only, relation, documents, iids, valid_from, valid_to });
+                }
+                let table = table.expect("ordinary document operation has a table");
+                if name == "insert-docs" && iids.is_some()
+                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
+                    return Ok(Operation::InsertArrowIids { table, documents, iids: iids.expect("insert has IIDs"), valid_from, valid_to });
+                }
+                if name == "patch-docs" && iids.is_some()
+                    && let Some(documents) = ArrowDocuments::from_source(structs, Arc::clone(&layout), source_bytes, memory)? {
+                    return Ok(Operation::PatchArrowIids { table, documents, iids: iids.expect("patch has IIDs"), valid_from, valid_to });
                 }
                 let documents = Documents::read_arrow(structs, layout, name != "patch-docs", memory)?;
-                let table = table.expect("ordinary document operation has a table");
                 if name == "insert-docs" {
                     let iids = iids.ok_or_else(|| invalid("Insert operation has no IIDs"))?;
                     return Ok(Operation::InsertIids { table, documents, iids, valid_from, valid_to });
@@ -1503,6 +1540,36 @@ fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/
 mod tests {
     use super::*;
     use rtdb_types::ListKind;
+
+    #[test]
+    fn owned_insert_and_replacement_replay_with_arrow_and_exact_presence() {
+        use arrow_array::{Int64Array, StringViewArray};
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("search-docs").unwrap();
+        let batch = |create_only: bool| {
+            let mut fields = vec![Field::new("_id", DataType::Int64, false), Field::new("body", DataType::Utf8View, true)];
+            let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringViewArray::from(vec![Some("invoice")]))];
+            if create_only {
+                fields.push(Field::new("note", DataType::Null, true));
+                arrays.push(Arc::new(arrow_array::NullArray::new(1)));
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+        };
+        let create = |create_only| TxOp::OwnedArrowDocs {
+            relation: relation.clone(), documents: ArrowDocuments::from_owned_record_batch(&batch(create_only), &memory).unwrap(),
+            create_only, valid_from: None, valid_to: None,
+        };
+        let source = SourceTransaction::new(vec![create(true), create(false)], SubmitOptions::default(), &memory).unwrap();
+        let replay = roundtrip(&source);
+        for (operation, expected) in replay.operations.iter().zip([true, false]) {
+            let Operation::OwnedArrowIids { documents, create_only, iids, .. } = operation else { panic!("expected Arrow replay"); };
+            assert_eq!(*create_only, expected);
+            assert_eq!(iids, &[EntityId::Integer(1).iid()]);
+            assert_eq!(documents.has_field(0, "note"), expected);
+            let body = documents.array().column_by_name("body").unwrap().as_string::<i32>();
+            assert_eq!(body.value(0), "invoice");
+        }
+    }
 
     fn budget() -> Arc<MemoryBudget> { MemoryBudget::new(128 * 1024 * 1024) }
     fn roundtrip(source: &SourceTransaction) -> SourceTransaction {
@@ -1796,15 +1863,17 @@ mod tests {
             ArrowDocuments::from_batch(&batch, &memory).unwrap()
         };
         let table = TableRef::new("public", "docs");
-        let documents = upload(vec![true, false]).unwrap();
-        let puts = SourceTransaction::new(vec![TxOp::PutArrowDocs { table: table.clone(), documents }], SubmitOptions::default(), &memory).unwrap();
-        let rows = vec![StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Uuid([3; 16]))]),
-            StructFields::from([("_id".into(), Value::I64(2)), ("v".into(), Value::Null)])];
-        let row_puts = SourceTransaction::new(vec![TxOp::PutDocs { table, documents: Documents::new(rows, &memory).unwrap(),
-            valid_from: None, valid_to: None }], SubmitOptions::default(), &memory).unwrap();
-
-        assert_eq!(puts.encode().unwrap().as_slice(), row_puts.encode().unwrap().as_slice());
-        assert!(upload(vec![false, true]).is_none());
+        for validity in [[true, false], [false, true]] {
+            let documents = upload(validity.to_vec()).unwrap();
+            let puts = SourceTransaction::new(vec![TxOp::PutArrowDocs { table: table.clone(), documents }], SubmitOptions::default(), &memory).unwrap();
+            let rows = validity.into_iter().zip([1, 2]).map(|(valid, id)| {
+                let value = if valid { Value::Uuid([3; 16]) } else { Value::Null };
+                StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), value)])
+            }).collect();
+            let row_puts = SourceTransaction::new(vec![TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, &memory).unwrap(),
+                valid_from: None, valid_to: None }], SubmitOptions::default(), &memory).unwrap();
+            assert_eq!(puts.encode().unwrap().as_slice(), row_puts.encode().unwrap().as_slice());
+        }
     }
 
     #[test]
@@ -2487,7 +2556,7 @@ mod tests {
         ], SubmitOptions::default(), &memory).unwrap();
         let decoded = roundtrip(&source);
         assert!(matches!(&decoded.operations[0], Operation::PutArrowIids { iids, valid_from: Some(Timestamp(10)), valid_to: Some(Timestamp(20)), .. } if iids == &vec![iid]));
-        assert!(matches!(&decoded.operations[1], Operation::PatchIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
+        assert!(matches!(&decoded.operations[1], Operation::PatchArrowIids { iids, valid_from: Some(Timestamp(30)), valid_to: None, .. } if iids == &vec![iid]));
     }
 
     #[test]

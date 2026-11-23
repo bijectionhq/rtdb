@@ -13,6 +13,6 @@ pub mod runtime;
 
 pub use file::{DocMatch, FORMAT_VERSION, MemberMatches, SearchFile, SearchRow, Source, build_search_file, write_group_search_file};
 pub use definitions::{SearchDefinition, definitions_in};
-pub use lane::{GROUP_BYTES, KIND, SearchArtefacts, SearchBuilder, search_pages};
-pub use accelerate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, SearchAccelerator, owned_corpus, owned_ranked, owned_ranked_batch};
+pub use lane::{GROUP_BYTES, KIND, SearchArtefacts, SearchBuilder, build_search_file_from_batches, search_pages};
+pub use accelerate::{OwnedCorpusBatch, OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, SearchAccelerator, owned_corpus, owned_corpus_batch, owned_ranked, owned_ranked_batch};
 pub use runtime::{SearchRuntime, Suspect};

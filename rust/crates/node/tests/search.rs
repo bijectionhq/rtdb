@@ -202,6 +202,13 @@ async fn owned_search_declaration_is_private_and_builds_real_search_artefacts() 
     assert_eq!(corpus.tokens, 39);
     assert_eq!(corpus.frequencies["invoice"], 19);
     assert_eq!(corpus.frequencies["paid"], 1);
+    let arrow_corpus = held.search_corpus_batch(&relation, &path, "paid invoice").await.unwrap();
+    let batch = arrow_corpus.terms.batch();
+    let terms = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+    let frequencies = batch.column(1).as_any().downcast_ref::<arrow_array::UInt64Array>().unwrap();
+    assert_eq!(terms.iter().collect::<Vec<_>>(), [Some("paid"), Some("invoice")]);
+    assert_eq!(frequencies.values().as_ref(), &[1, 19]);
+    assert_eq!(arrow_corpus.into_corpus(), corpus);
     let partitions = [(relation, path)];
     let (hits, _) = held.ranked_search(&partitions, "invoice", 2, false).await.unwrap();
     assert_eq!(hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
@@ -971,6 +978,58 @@ async fn same_transaction_writes_score_only_the_visible_document() {
     database.compaction().unwrap().compact_all().await.unwrap();
     database.build_artefacts().await.unwrap();
     assert_eq!(rows(session.query_sql(statement, vec![]).await.unwrap()).await, expected);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn alternate_ingest_and_bound_text_agree_before_and_after_search_artefact_build() {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let mut options = options();
+    options.file_size_target = 1;
+    options.automatic_artefacts = false;
+    let (node, driver) = Node::open(options, services()).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let table = TableRef::new("public", "docs");
+    let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false), Field::new("body", DataType::Utf8View, true)]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+        Arc::new(StringViewArray::from(vec![None, Some("invoice overdue"), Some("unrelated"), Some("invoice overdue")])),
+    ];
+    let batch = OwnedBatch::new(RecordBatch::try_new(schema, columns).unwrap(), node.memory()).unwrap();
+    let documents = rtdb_tx::ArrowDocuments::from_ingest_batch(&batch, node.memory()).unwrap().unwrap();
+    let inserted = session.state_mut().execute_tx(vec![
+        TxOp::PutArrowDocs { table: table.clone(), documents },
+        sql("CREATE SEARCH INDEX docs_body ON docs (body)"),
+    ], AutonomousTxOptions::default()).await.unwrap();
+    assert!(inserted.committed(), "{:?}", inserted.error());
+
+    let statement = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE MATCH(body, ?) ORDER BY score DESC, _id LIMIT 2";
+    for persisted in [false, true] {
+        if persisted {
+            let database = node.catalog().database("xtdb").unwrap();
+            database.flush().await.unwrap();
+            node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            database.compaction().unwrap().compact_all().await.unwrap();
+            database.build_artefacts().await.unwrap();
+        }
+        let context = session.query_context().await.unwrap();
+        let field = Field::new("q", DataType::Utf8View, false);
+        let params = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(StringViewArray::from(vec!["invoice"]))]).unwrap();
+        let params = OwnedBatch::new(params, &context.memory).unwrap();
+        let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Utf8);
+        let options = rtdb_sql::PrepareOptions { parameter_types: [(0, ty.clone())].into_iter().collect(), ..Default::default() };
+        let plan = rtdb_sql::prepare_in(statement, &context.catalog, &options, &context.memory).unwrap();
+        let prepared = rtdb_query::PreparedQuery::from_prepared(plan, &context.memory).unwrap();
+        let accelerated = rows(prepared.execute_arrow_columns(Arc::clone(&context), params.clone(), 0, std::slice::from_ref(&ty), None).await.unwrap()).await;
+        let scan_only = rows(prepared.execute_arrow_columns(context.with_accelerators(Arc::from([])), params, 0, &[ty], None).await.unwrap()).await;
+        assert_eq!(accelerated, scan_only);
+        assert_eq!(ids(accelerated), [2, 4]);
+    }
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

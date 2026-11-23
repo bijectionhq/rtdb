@@ -105,7 +105,7 @@ async fn build_batches_at(
             let child = runtime.child(0)?;
             let positions = expressions.iter().map(|named| match &named.expr { Expr::Column { id,.. } => child.schema().position(*id), _ => None }).collect::<Option<Vec<_>>>();
             let scalar_fallback = !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
-            if positions.is_none() && scalar_fallback && !allows_scalar_projection(&child, output) { return Ok(None); }
+            if positions.is_none() && scalar_fallback && !allows_scalar_projection(output) { return Ok(None); }
             let schema = child.schema().clone();
             let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
             let Some((batches,_)) = build_batch_input(child,execution.child(0),pushdowns,output).await? else { return Ok(None) };
@@ -119,7 +119,7 @@ async fn build_batches_at(
         RelationNode::Extend { expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
             let scalar_fallback = !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr));
-            if scalar_fallback && !allows_scalar_projection(&child, output) { return Ok(None); }
+            if scalar_fallback && !allows_scalar_projection(output) { return Ok(None); }
             let schema = child.schema().clone();
             let projections = schema.fields().iter().map(rtdb_plan::Field::expression)
                 .chain(expressions.iter().map(|named| named.expr.clone())).collect();
@@ -454,15 +454,13 @@ fn computed_batch_sort(schema: &Schema, order_by: &[rtdb_plan::SortExpr]) -> boo
 fn batch_ordered_type(ty: &LogicalType) -> bool {
     use rtdb_types::ScalarType::{I8, I16, I32, I64, U8, U16, U32, U64};
     match ty {
-        LogicalType::Scalar(I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64) => true,
+        LogicalType::Scalar(I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | rtdb_types::ScalarType::F64 | rtdb_types::ScalarType::Utf8) => true,
         LogicalType::Maybe(inner) => batch_ordered_type(inner),
         _ => false,
     }
 }
 
-fn allows_scalar_projection(child: &EmittedRelation, output: BatchOutput) -> bool {
-    output == BatchOutput::Arrow && matches!(child.relation().node(), RelationNode::Scan(_))
-}
+fn allows_scalar_projection(output: BatchOutput) -> bool { output == BatchOutput::Arrow }
 
 fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result<Option<bool>> {
     let relation = Arc::clone(runtime.relation());
@@ -480,13 +478,13 @@ fn batch_shape_at(runtime: &Arc<EmittedRelation>, output: BatchOutput) -> Result
         RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
             let child = runtime.child(0)?;
             let columns = expressions.iter().all(|named| matches!(&named.expr, Expr::Column { id,.. } if child.schema().position(*id).is_some()));
-            if !columns && !allows_scalar_projection(&child, output)
+            if !columns && !allows_scalar_projection(output)
                 && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
             batch_shape(&child, output)?.map(|_| true)
         }
         RelationNode::Extend { expressions, .. } if output == BatchOutput::Arrow => {
             let child = runtime.child(0)?;
-            if !allows_scalar_projection(&child, output)
+            if !allows_scalar_projection(output)
                 && !expressions.iter().all(|named| crate::columnar::projection::shaped(&named.expr)) { return Ok(None); }
             batch_shape(&child, output)?.map(|_| true)
         }

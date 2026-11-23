@@ -203,6 +203,7 @@ contract OutputSegmentLayout {
     @invariant OutputPagesShareTheMergedSchema
         -- Every page in an output data file uses the merged schema, including its field types and nullability.
         -- Compaction copies compatible document cells from selected Arrow positions in both stages.
+        -- Event page assembly aligns compatible text, list-view and union layouts in Arrow before combining columns.
         -- It aligns evolving nested fields and union legs to the merged schema and writes typed nulls for absent fields.
         -- Rebuilt pages use the event writer's encoding for undefined union padding under null containers and for bottom-typed fields widened to unions.
 

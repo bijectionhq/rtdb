@@ -38,9 +38,10 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedCheckCapacity { .. }
                         | TxOp::OwnedInsertDocs { .. }
                         | TxOp::OwnedReplaceDocs { .. }
+                        | TxOp::OwnedArrowDocs { .. }
                         | TxOp::OwnedDelete { .. }
                         | TxOp::HostedControl(_)
-                ) | Operation::OwnedWriteIids { .. }
+                ) | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
             )
         };
         if !operations
@@ -81,6 +82,7 @@ impl OpenTransaction<'_> {
                     | TxOp::OwnedReplaceDocs { documents, .. },
                 )
                 | Operation::OwnedWriteIids { documents, .. } => !documents.rows().is_empty(),
+                Operation::Public(TxOp::OwnedArrowDocs { documents, .. }) | Operation::OwnedArrowIids { documents, .. } => documents.len() != 0,
                 _ => false,
             };
         }

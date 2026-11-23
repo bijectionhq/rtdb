@@ -6,7 +6,7 @@ mod write;
 #[cfg(feature = "experiments")]
 pub(crate) mod experiment;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -53,22 +53,52 @@ pub(crate) struct IndexedRow<'a> {
     pub values: Vec<Option<StringArray>>,
 }
 
+pub(crate) struct TokenPage {
+    pub(crate) columns: Vec<arrow_array::LargeListArray>,
+    pub(crate) _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
+impl TokenPage {
+    pub(crate) fn row(&self, row: usize) -> Vec<Option<StringArray>> {
+        self.columns.iter().map(|column| rtdb_text::token_cell(column, row)).collect()
+    }
+}
+
 pub(crate) trait SearchPage {
     fn len(&self) -> usize;
-    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>>;
+    fn tokenize(&self, columns: &[String]) -> Result<TokenPage>;
+    fn row(&self, row: usize, tokens: &TokenPage) -> Result<IndexedRow<'_>>;
 }
 
 impl SearchPage for Vec<SearchRow> {
     fn len(&self) -> usize { Vec::len(self) }
 
-    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
-        let row = &self[row];
-        if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the definition's columns")); }
+    fn tokenize(&self, columns: &[String]) -> Result<TokenPage> {
+        use arrow_array::builder::{LargeListBuilder, StringBuilder};
+        if self.iter().any(|row| row.values.len() != columns.len()) {
+            return Err(fault("Search row values do not cover the definition's columns"));
+        }
+        let columns = (0..columns.len()).map(|index| {
+            let mut column = LargeListBuilder::new(StringBuilder::new());
+            for row in self {
+                let value = &row.values[index];
+                if let Some(terms) = value {
+                    for term in terms { column.values().append_value(term); }
+                }
+                column.append(value.is_some());
+            }
+            column.finish()
+        }).collect();
+        Ok(TokenPage { columns, _reservation: None })
+    }
+
+    fn row(&self, index: usize, tokens: &TokenPage) -> Result<IndexedRow<'_>> {
+        let row = &self[index];
         let header = EventHeader {
             iid: Iid(row.iid), system_from: Timestamp(row.system_from),
             valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op,
         };
-        let values = row.values.iter().map(|tokens| tokens.as_ref().map(StringArray::from_iter_values)).collect();
+        let values = tokens.row(index);
         Ok(IndexedRow { header, identity: row.identity.as_ref().map(rtdb_columnar::EntityIdRef::from), values })
     }
 }
@@ -202,6 +232,13 @@ pub(crate) fn write_query_pages<I: SearchPage>(
     write::write_group(columns, [pages], "built", None, ceiling, output, Some(reservation))
 }
 
+pub(crate) fn write_event_search_file<I: SearchPage>(
+    columns: &[String], pages: impl IntoIterator<Item = Result<I>>, identity: &str, output: impl Write,
+    reservation: Arc<rtdb_columnar::MemoryReservation>,
+) -> Result<Vec<Section>> {
+    write::write_group(columns, [pages], identity, None, None, output, Some(reservation))
+}
+
 /// Writes one Arrow search file over the members in bucket order with a shared recency ceiling.
 pub fn write_group_search_file<P>(columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, ceiling: Option<i64>, output: impl Write) -> Result<Vec<Section>>
 where P: IntoIterator<Item = Result<Vec<SearchRow>>>,
@@ -239,6 +276,45 @@ impl SearchFile {
         length: usize, read: impl Fn(Range<usize>) -> std::io::Result<Buffer> + Send + Sync + 'static, columns: &[String],
     ) -> Result<Self> {
         Self::open_reader(Reader::open(length, move |range| read(range).map_err(fault))?, columns)
+    }
+
+    pub(crate) async fn open_remote(
+        storage: &Arc<rtdb_storage::cache::BufferPool>, key: &rtdb_storage::ObjectKey, columns: &[String],
+        column: &str, queries: &[&Query], memory: &Arc<rtdb_columnar::MemoryBudget>,
+    ) -> std::result::Result<Self, crate::runtime::FileError> {
+        use crate::runtime::FileError;
+        let length = usize::try_from(storage.scan_length(key).await.map_err(FileError::from_storage)?)
+            .map_err(|error| FileError::Unavailable(fault(error)))?;
+        let trailer_start = length.checked_sub(10).ok_or_else(|| FileError::Corrupt(corrupt("Search file has no Arrow footer")))?;
+        let read = |range: Range<usize>| async move {
+            let lease = storage.scan_range(key, range.start as u64..range.end as u64, memory)
+                .await.map_err(FileError::from_storage)?;
+            Ok::<_, FileError>(if lease.is_partial_allocation() {
+                Buffer::from(lease.as_slice().to_vec())
+            } else {
+                Buffer::from(bytes::Bytes::from_owner(lease))
+            })
+        };
+        let trailer = read(trailer_start..length).await?;
+        let start = Reader::footer_start(length, trailer.as_slice()).map_err(FileError::Corrupt)?;
+        let header = read(0..6).await?;
+        let footer = read(start..trailer_start).await?;
+        let reader = Reader::from_footer(start, header.as_slice(), footer.as_slice()).map_err(FileError::Corrupt)?;
+        let first = reader.checked_page_range(0).map_err(FileError::Corrupt)?;
+        reader.load_page(0, read(first).await?).map_err(FileError::Corrupt)?;
+        let file = Self::open_reader(reader, columns).map_err(FileError::Corrupt)?;
+        if let Some(column) = file.column(column) {
+            let mut pages = queries.iter().flat_map(|query| query.terms()).filter_map(|term| {
+                file.manifest.term(column, term).map(|term| term.page)
+            }).collect::<Vec<_>>();
+            pages.sort_unstable();
+            pages.dedup();
+            for page in pages {
+                let range = file.reader.checked_page_range(page).map_err(FileError::Corrupt)?;
+                file.reader.load_page(page, read(range).await?).map_err(FileError::Corrupt)?;
+            }
+        }
+        Ok(file)
     }
 
     fn open_reader(reader: Reader, columns: &[String]) -> Result<Self> {
@@ -394,16 +470,18 @@ impl SearchFile {
         Ok(MatchSet { file: Arc::clone(self), column, matching: MatchingDocuments::All(BooleanArray::new(bits.finish(), None)) })
     }
 
-    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: &BTreeSet<Iid>) -> Result<MatchSet> {
+    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: impl ExactSizeIterator<Item = Iid>) -> Result<MatchSet> {
         let column = self.column(column);
-        let mut documents = BTreeSet::new();
+        let mut documents = Vec::new();
         let mut bits = BooleanBufferBuilder::new(iids.len());
         if let Some(column) = column {
             for iid in iids {
                 for row in self.manifest.rows_of(&iid.0) {
                     if let RowDoc::Run(doc) = self.manifest.row_doc(column, row) {
-                        documents.insert(doc);
-                        if documents.len() > 1024 { return self.match_set(&self.columns[column], query); }
+                        if let Err(position) = documents.binary_search(&doc) {
+                            if documents.len() == 1024 { return self.match_set(&self.columns[column], query); }
+                            documents.insert(position, doc);
+                        }
                     }
                 }
             }
@@ -583,7 +661,7 @@ impl Ranked {
         Ok(self.expand_in(None, &mut 0).map_or_else(Vec::new, |found| found.iter().collect()))
     }
 
-    pub(crate) fn expand_in(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Option<ScoredRuns> {
+    pub(crate) fn expand_in(&mut self, scope: Option<&rtdb_query::CandidateIids>, examined: &mut usize) -> Option<ScoredRuns> {
         self.0.as_mut().map(|windows| windows.expand(scope, examined))
     }
 
@@ -591,7 +669,7 @@ impl Ranked {
 }
 
 impl Windows {
-    fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> ScoredRuns {
+    fn expand(&mut self, scope: Option<&rtdb_query::CandidateIids>, examined: &mut usize) -> ScoredRuns {
         let end = self.next.saturating_add(4).min(self.windows.len());
         let mut found = Vec::new();
         let mut scores = Vec::new();
@@ -603,7 +681,7 @@ impl Windows {
             for &doc in &documents[first..last] {
                 *examined += 1;
                 if self.matching.includes(doc)
-                    && scope.is_none_or(|scope| scope.contains(&Iid(self.file.manifest.doc_iid(doc))))
+                    && scope.is_none_or(|scope| scope.contains(Iid(self.file.manifest.doc_iid(doc))))
                     && self.file.visible(doc, self.bounds)
                 {
                     found.push(doc);
@@ -622,6 +700,26 @@ mod tests {
     use rtdb_text::tokens;
     use rtdb_types::Interval;
     use crate::rank_windows::window_of;
+
+    #[tokio::test]
+    async fn remote_search_loads_only_posting_pages_for_requested_terms() {
+        use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, cache::BufferPool};
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 24));
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 24);
+        let columns = ["body".into()];
+        let text = (0..100).map(|term| format!("term{term:03}")).collect::<Vec<_>>().join(" ");
+        let row = SearchRow { identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
+            op: EventOp::Put, values: vec![Some(tokens(&text))] };
+        let key = ObjectKey::new("search.arrow").unwrap();
+        let bytes = build_search_file(&columns, &[row], "remote").unwrap();
+        store.put(&key, bytes.into()).await.unwrap();
+        let query = Query::parse("term099");
+        let file = SearchFile::open_remote(&storage, &key, &columns, "body", &[&query], &memory).await.unwrap();
+        assert_eq!(file.matches("body", &query, all()).unwrap().len(), 1);
+        assert!(file.postings("body", "term000").is_err());
+        assert!(!storage.holds(&key));
+    }
 
     fn all() -> TemporalBounds { TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL } }
     fn at(valid: i64, system: i64) -> TemporalBounds {
@@ -866,8 +964,8 @@ mod tests {
         rows[3].values[1] = None;
         let file = open(&rows);
         let query = Query::parse("\"overdue invoice\"");
-        let iids = BTreeSet::from([Iid(rows[0].iid), Iid(rows[1].iid), Iid(rows[3].iid)]);
-        let selected = file.match_selected_iids("body", &query, &iids).unwrap();
+        let iids = [Iid(rows[0].iid), Iid(rows[1].iid), Iid(rows[3].iid)];
+        let selected = file.match_selected_iids("body", &query, iids.into_iter()).unwrap();
         assert_eq!(selected.value(0, 0).unwrap(), Some(true));
         assert_eq!(selected.value(0, 1).unwrap(), Some(false));
         assert!(selected.value(0, 2).is_err());

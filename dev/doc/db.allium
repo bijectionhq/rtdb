@@ -375,10 +375,14 @@ variant TxMessage : SourceMessage {
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
     -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
-    -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit compatible document columns in Arrow.
+    -- Flight SQL ingest, embedded ADBC bulk ingest and pgwire Arrow COPY submit compatible document columns in Arrow.
+    -- Source replay retains Arrow document columns and the recorded IID vector for compatible document operations.
+    -- An owned fact write carries the exact field presence in its source operation.
     -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
-    -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
+    -- Compatible Arrow document vectors include nested lists, fixed-size lists, sets and structs.
+    -- Alternate text, offset, list-view and sparse union encodings are aligned to compatible Arrow layouts.
+    -- Null cells can occur before the first non-null cell of a document column.
     -- Compatible document vectors retain the UUID extension for their UUID values through source encoding and replay.
     -- When an upload adds fields inside a fixed-size list, layout alignment copies only the selected entries and required null padding.
     -- Struct fields added across compatible uploads join in Arrow with typed nulls for earlier documents, including structs inside lists.
@@ -1859,7 +1863,7 @@ surface QueryAccess {
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation within a columnar projection reads the cells referenced by the expression.
-        -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
+        -- A columnar projection retains its compatible input columns when other expressions use scalar evaluation.
         -- Its output is split to the transport row limit after each semantic page is evaluated.
         -- A list expression over inputs with a shared scalar layout interleaves the child values in Arrow.
         -- A projected field missing from some pages uses Arrow nulls when the available columns share a layout or form a scalar dense union.
@@ -1871,6 +1875,9 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
+        -- A delegated search scan carries the coordinator's bound query text, temporal bounds and prefix-local candidate scope.
+        -- The coordinator scans the prefix locally if the reader's response omits its search projection version.
+        -- It evaluates residual MATCH and score over the resolved positions and the coordinator applies the final order and limit.
 }
 
 ---- Deferred Specifications

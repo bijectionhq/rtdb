@@ -6,7 +6,7 @@ use arrow_array::{
     types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
 };
 use arrow_schema::{DataType as Type, Field};
-use rtdb_columnar::{TextCell, from_field, text_cell};
+use rtdb_columnar::{TextCell, from_field, list_span, text_cell};
 use rtdb_expr::Parameters;
 use rtdb_plan::{Expr, Schema};
 use rtdb_text::{Query, Scorer, analyze, stored_length};
@@ -19,6 +19,7 @@ use crate::QueryContext;
 enum Cell<'a> {
     Null,
     Literal(&'a Value),
+    List(&'a [Input<'a>], usize),
     Arrow(&'a dyn Array, &'a Field, Option<&'a LogicalType>, usize),
 }
 
@@ -38,7 +39,7 @@ impl<'a> Cell<'a> {
         Ok(match self {
             Self::Null | Self::Literal(Value::Null | Value::Undefined) => TextCell::Missing,
             Self::Literal(Value::Utf8(text)) => TextCell::Utf8(text),
-            Self::Literal(_) => TextCell::Other,
+            Self::Literal(_) | Self::List(..) => TextCell::Other,
             Self::Arrow(array, field, logical, row) => {
                 let inferred;
                 let logical = if let Some(ty) = logical { ty } else { inferred = from_field(field)?; &inferred };
@@ -60,19 +61,11 @@ impl<'a> Cell<'a> {
 
     fn list(self) -> Result<Option<List<'a>>> {
         Ok(match self.selected()? {
-            Self::Literal(Value::List(values)) => Some(List::Literal(values)),
-            Self::Arrow(array, field, _, row) if field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).is_none() => match field.data_type() {
-                Type::List(child) => {
-                    let list = array.as_list::<i32>();
-                    let offsets = list.value_offsets();
-                    Some(List::Arrow(list.values().as_ref(), child, offsets[row] as usize, (offsets[row + 1] - offsets[row]) as usize))
-                }
-                Type::FixedSizeList(child, _) => {
-                    let list = array.as_fixed_size_list();
-                    Some(List::Arrow(list.values().as_ref(), child, list.value_offset(row) as usize, list.value_length() as usize))
-                }
-                _ => None,
-            },
+            Self::Literal(Value::List(values) | Value::FixedSizeList(values)) => Some(List::Literal(values)),
+            Self::List(inputs, row) => Some(List::Inputs(inputs, row)),
+            Self::Arrow(array, field, _, row) if !field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) => {
+                list_span(field, array, row).map(|(child, values, span)| List::Arrow(values, child, span.start, span.len()))
+            }
             _ => None,
         })
     }
@@ -101,17 +94,19 @@ impl<'a> Cell<'a> {
 
 enum List<'a> {
     Literal(&'a [Value]),
+    Inputs(&'a [Input<'a>], usize),
     Arrow(&'a dyn Array, &'a Field, usize, usize),
 }
 
 impl<'a> List<'a> {
     fn len(&self) -> usize {
-        match self { Self::Literal(values) => values.len(), Self::Arrow(_, _, _, len) => *len }
+        match self { Self::Literal(values) => values.len(), Self::Inputs(values, _) => values.len(), Self::Arrow(_, _, _, len) => *len }
     }
 
     fn cell(&self, index: usize) -> Cell<'a> {
         match self {
             Self::Literal(values) => Cell::Literal(&values[index]),
+            Self::Inputs(values, row) => { let values = *values; values[index].row(*row) },
             Self::Arrow(array, field, offset, _) => Cell::Arrow(*array, field, None, *offset + index),
         }
     }
@@ -119,23 +114,33 @@ impl<'a> List<'a> {
 
 enum Input<'a> {
     Constant(Cell<'a>),
+    List(Vec<Input<'a>>),
     Column(&'a Column),
 }
 
 impl<'a> Input<'a> {
-    fn row(&self, row: usize) -> Cell<'a> {
+    fn row(&self, row: usize) -> Cell<'_> {
         match self {
             Self::Constant(cell) => *cell,
-            Self::Column(Column::Values(values)) => Cell::Literal(&values[row]),
-            Self::Column(column) => match column.arrow_cell(row).flatten() {
-                Some((array, field, logical, index)) => Cell::Arrow(array, field, logical, index),
-                None => Cell::Null,
-            },
+            Self::List(inputs) => Cell::List(inputs, row),
+            Self::Column(column) => column_cell(column, row),
         }
     }
 }
 
-pub(crate) fn text(column: &Column, row: usize) -> Result<TextCell<'_>> { Input::Column(column).row(row).text() }
+fn column_cell(column: &Column, row: usize) -> Cell<'_> {
+    match column {
+        Column::Values(values) => Cell::Literal(&values[row]),
+        column => match column.arrow_cell(row).flatten() {
+            Some((array, field, logical, index)) => Cell::Arrow(array, field, logical, index),
+            None => Cell::Null,
+        },
+    }
+}
+
+pub(crate) fn text(column: &Column, row: usize) -> Result<TextCell<'_>> {
+    column_cell(column, row).text()
+}
 
 #[derive(Clone, Copy)]
 enum Function {
@@ -173,6 +178,14 @@ fn operand(expr: &Expr) -> bool {
 
 pub(crate) fn score_key(expr: &Expr) -> bool { matches!(expr, Expr::Call { name, .. } if name == "search_score") && shaped(expr) }
 
+fn direct(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => true,
+        Expr::List(elements) => elements.iter().all(direct),
+        _ => false,
+    }
+}
+
 fn input<'a>(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, params: Parameters<'a>) -> Result<Option<Input<'a>>> {
     Ok(Some(match expr {
         Expr::Column { id, .. } => {
@@ -187,21 +200,27 @@ fn input<'a>(expr: &'a Expr, schema: &Schema, batch: &'a ColumnBatch, params: Pa
                 Input::Constant(Cell::Literal(value))
             } else { return Ok(None); }
         }
+        Expr::List(elements) => {
+            let mut inputs = Vec::with_capacity(elements.len());
+            for element in elements {
+                let Some(input) = input(element, schema, batch, params)? else { return Ok(None); };
+                inputs.push(input);
+            }
+            Input::List(inputs)
+        }
         _ => return Ok(None),
     }))
 }
 
-fn stats(query: &Query, documents: Cell<'_>, total: Cell<'_>, frequencies: Cell<'_>) -> Result<(u64, u64, Vec<u64>)> {
+fn scorer(query: Query, documents: Cell<'_>, total: Cell<'_>, frequencies: Cell<'_>) -> Result<Scorer> {
     let invalid = || Anomaly::incorrect("rtdb.expr/invalid-search-corpus",
         "Search statistics require nonnegative counts and one document frequency per search term");
     let documents = documents.count()?.ok_or_else(invalid)?;
     let tokens = total.count()?.ok_or_else(invalid)?;
     let frequencies = frequencies.list()?.filter(|list| list.len() == query.terms().len()).ok_or_else(invalid)?;
-    let frequencies = (0..query.terms().len()).map(|index| {
-        let count = frequencies.cell(index).count()?.filter(|count| *count <= documents && *count <= tokens).ok_or_else(invalid)?;
-        Ok(count)
-    }).collect::<Result<_>>()?;
-    Ok((documents, tokens, frequencies))
+    Scorer::try_from_frequencies(query, documents, tokens, |index| {
+        frequencies.cell(index).count()?.filter(|count| *count <= documents && *count <= tokens).ok_or_else(invalid)
+    })
 }
 
 fn fingerprint(left: Cell<'_>, right: Cell<'_>) -> Result<Option<[u8; 32]>> {
@@ -226,7 +245,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
     let mut retained = context.memory.reserve(4096usize.saturating_add(batch.len.saturating_mul(16)))?;
     let mut computed = Vec::with_capacity(args.len());
     for arg in args {
-        if matches!(arg, Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_)) {
+        if direct(arg) {
             computed.push(None);
             continue;
         }
@@ -266,8 +285,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
                         Function::Match => (query.matches_arrow(&document), 0.0),
                         Function::Score => {
                             let scorer = if inputs.len() == 5 {
-                                let (documents, tokens, frequencies) = stats(&query, cell(2), cell(3), cell(4))?;
-                                Scorer::from_frequencies(query, documents, tokens, &frequencies)
+                                scorer(query, cell(2), cell(3), cell(4))?
                             } else {
                                 Scorer::new(query, None)
                             };
@@ -318,6 +336,22 @@ mod tests {
     use super::*;
     use rtdb_types::{Instant, ScalarType, Timestamp};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn explicit_score_reads_frequency_positions_in_large_list_views() {
+        use arrow_array::{Int64Array, LargeListViewArray};
+        let item = Arc::new(Field::new("count", Type::Int64, false));
+        let counts = LargeListViewArray::new(item, vec![1, 0].into(), vec![2, 3].into(),
+            Arc::new(Int64Array::from(vec![99, 3, 2])), None);
+        let field = Field::new("counts", counts.data_type().clone(), false);
+        let query = Query::parse("invoice paid");
+        let left = Value::I64(10);
+        let right = Value::I64(30);
+        let score = scorer(query.clone(), Cell::Literal(&left), Cell::Literal(&right), Cell::Arrow(&counts, &field, None, 0)).unwrap();
+        let reference = Scorer::from_frequencies(query, 10, 30, &[3, 2]);
+        let text = analyze("invoice paid invoice");
+        assert_eq!(score.bm25_arrow(&text).to_bits(), reference.bm25_arrow(&text).to_bits());
+    }
 
     #[test]
     fn scoring_borrows_arrow_text_and_produces_a_nullable_arrow_score() {

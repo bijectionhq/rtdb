@@ -1,17 +1,15 @@
-use std::collections::BTreeSet;
-
-use rtdb_query::ScanRequest;
-use rtdb_types::{Iid, Result};
+use rtdb_query::{CandidateIids, ScanRequest, ScanSelection};
+use rtdb_types::Result;
 use serde_json::{Value as Json, json};
 
 use super::super::{Narrowing, NarrowingWork, SearchAccelerator};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub enum Policy<'a> {
     Current,
     Baseline,
     Exhaustive,
-    FilterFirst(&'a BTreeSet<Iid>),
+    FilterFirst(&'a CandidateIids),
     SkipRetry,
     Estimate,
 }
@@ -21,7 +19,7 @@ impl SearchAccelerator {
     /// FilterFirst requires the caller's exact matching filter IIDs at the request's two point instants and captured basis.
     pub async fn workload_candidates(
         &self, request: &ScanRequest<'_>, policy: Policy<'_>,
-    ) -> Result<(Option<BTreeSet<Iid>>, Json)> {
+    ) -> Result<(Option<ScanSelection>, Json)> {
         let options = match policy {
             Policy::Current => Narrowing::default(),
             Policy::Baseline => Narrowing { baseline: true, ..Default::default() },
@@ -44,9 +42,9 @@ impl SearchAccelerator {
             "match_decline": work.plain_decline, "score_evaluations": work.score_evaluations,
             "postings_visited": work.postings_visited, "verification_rounds": work.verification_rounds,
             "verifier_iids": work.verifier_rows, "unranked_events": work.plain_events,
-            "estimated_postings": work.estimated_postings, "candidate_iids": picked.as_ref().map(BTreeSet::len),
+            "estimated_postings": work.estimated_postings, "candidate_iids": picked.as_ref().map(CandidateIids::len),
             "filter_scope": work.filter_scope, "retry_redundant": work.retry_redundant,
         });
-        Ok((picked, report))
+        Ok((picked.map(|iids| ScanSelection { iids, scores: work.scores }), report))
     }
 }

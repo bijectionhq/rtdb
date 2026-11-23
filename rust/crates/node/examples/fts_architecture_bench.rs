@@ -2,7 +2,7 @@ use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rtdb_columnar::read_value;
+use rtdb_columnar::{OwnedBatch, read_value};
 use rtdb_maintenance::CollectionObserver;
 use rtdb_node::{
     AutonomousTxOptions, Clock, DatabaseAccess, NativeResources, Node, NodeOptions, NodeServices,
@@ -84,9 +84,21 @@ fn where_ids(ids: impl IntoIterator<Item = i64>) -> String {
 }
 
 async fn query(session: &mut NativeSession, statement: &str) -> Vec<Vec<Value>> {
+    read_rows(&query_batches(session, statement).await)
+}
+
+async fn query_batches(session: &mut NativeSession, statement: &str) -> Vec<OwnedBatch> {
     let mut cursor = session.query_sql(statement, vec![]).await.unwrap();
-    let mut rows = Vec::new();
+    let mut batches = Vec::new();
     while let Some(batch) = cursor.next_batch().await.unwrap() {
+        batches.push(batch);
+    }
+    batches
+}
+
+fn read_rows(batches: &[OwnedBatch]) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for batch in batches {
         let batch = batch.batch();
         for row in 0..batch.num_rows() {
             rows.push(batch.schema().fields().iter().enumerate()
@@ -248,15 +260,16 @@ async fn main() {
     }
 
     for case in &cases {
-        for _ in 0..4 { std::hint::black_box(query(&mut session, &case.statement).await); }
+        for _ in 0..4 { std::hint::black_box(query_batches(&mut session, &case.statement).await); }
     }
     for sample in 0..iterations {
         for index in 0..cases.len() {
             let position = (index + sample + trial) % cases.len();
             let case = &mut cases[position];
             let start = Instant::now();
-            let rows = query(&mut session, &case.statement).await;
-            case.observe(start.elapsed(), rows);
+            let batches = query_batches(&mut session, &case.statement).await;
+            let elapsed = start.elapsed();
+            case.observe(elapsed, read_rows(&batches));
         }
     }
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use arrow_array::{Array, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
-use arrow_schema::{DataType, Field, UnionMode};
+use arrow_schema::{DataType, Field};
 use rtdb_types::{Anomaly, LogicalType, Result, UriParts, Value};
 
 use crate::{EXTENSION_NAME_KEY, MemoryBudget, estimate_read_value_bytes, from_field, leg_name, read_value_as};
@@ -34,7 +34,7 @@ impl<'a> ColumnPresence<'a> {
 fn present(field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
     match field.data_type() {
         DataType::Null => Ok(false),
-        DataType::Union(fields, UnionMode::Dense) => {
+        DataType::Union(fields, _) => {
             let union = array.as_union();
             let id = union.type_id(row);
             let (_, child) = fields.iter().find(|(tag, _)| *tag == id).ok_or_else(layout)?;
@@ -54,6 +54,7 @@ fn present(field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
                 _ => Err(layout()),
             }
         }
+        DataType::Dictionary(_, _) => Ok(crate::text::physical_text(array, row)?.is_some()),
         _ => Ok(array.is_valid(row)),
     }
 }
@@ -87,7 +88,7 @@ pub fn validate_readable_cell(field: &Field, array: &dyn Array, logical: &Logica
 }
 
 fn ambiguous_union(field: &Field, logical: &LogicalType) -> Result<bool> {
-    if let DataType::Union(children, UnionMode::Dense) = field.data_type() {
+    if let DataType::Union(children, _) = field.data_type() {
         for (_, child) in children.iter() {
             let physical = from_field(child)?;
             if let LogicalType::Union(legs) = logical
@@ -108,7 +109,7 @@ fn ambiguous_union(field: &Field, logical: &LogicalType) -> Result<bool> {
             }
             Ok(false)
         }
-        (DataType::List(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _), LogicalType::List { element, .. }) =>
+        (DataType::List(child) | DataType::LargeList(child) | DataType::ListView(child) | DataType::LargeListView(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _), LogicalType::List { element, .. }) =>
             ambiguous_union(child, element),
         (DataType::RunEndEncoded(_, child), LogicalType::RunEndEncoded { value, .. }) => ambiguous_union(child, value),
         _ => Ok(false),
@@ -124,8 +125,8 @@ fn needs_check(field: &Field, under_struct: bool) -> bool {
     match field.data_type() {
         DataType::Null => !field.is_nullable() && !under_struct,
         DataType::Struct(fields) => fields.iter().any(|child| needs_check(child, true)),
-        DataType::Union(fields, UnionMode::Dense) => fields.iter().any(|(_, child)| needs_check(child, false)),
-        DataType::List(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _) | DataType::RunEndEncoded(_, child) => {
+        DataType::Union(fields, _) => fields.iter().any(|(_, child)| needs_check(child, false)),
+        DataType::List(child) | DataType::LargeList(child) | DataType::ListView(child) | DataType::LargeListView(child) | DataType::FixedSizeList(child, _) | DataType::Map(child, _) | DataType::RunEndEncoded(_, child) => {
             needs_check(child, false)
         }
         _ => false,
@@ -143,7 +144,7 @@ fn check_cell(field: &Field, array: &dyn Array, row: usize, under_struct: bool) 
         _ if array.is_null(row) => {}
         DataType::Timestamp(..) => return Ok(true),
         DataType::Utf8 if extension(field) == Some("uri") => { UriParts::parse(array.as_string::<i32>().value(row))?; }
-        DataType::Union(fields, UnionMode::Dense) => {
+        DataType::Union(fields, _) => {
             let union = array.as_union();
             let id = union.type_id(row);
             let (_, child) = fields.iter().find(|(tag, _)| *tag == id).ok_or_else(layout)?;
@@ -168,12 +169,9 @@ fn check_cell(field: &Field, array: &dyn Array, row: usize, under_struct: bool) 
                 check_cell(child, column.as_ref(), row, true)?;
             }
         }
-        DataType::List(child) => {
-            let list = array.as_list::<i32>();
-            let offsets = list.value_offsets();
-            for index in offsets[row]..offsets[row + 1] {
-                check_cell(child, list.values().as_ref(), index as usize, false)?;
-            }
+        DataType::List(_) | DataType::LargeList(_) | DataType::ListView(_) | DataType::LargeListView(_) => {
+            let (child, values, positions) = crate::list_span(field, array, row).ok_or_else(layout)?;
+            for index in positions { check_cell(child, values, index, false)?; }
         }
         DataType::FixedSizeList(child, width) => {
             let list = array.as_fixed_size_list();

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use arrow_buffer::Buffer;
 use rtdb_format::keys::TableSlug;
 use rtdb_node::{NativeSession, Node};
-use rtdb_search::{SearchFile, SearchRow, build_search_file};
+use rtdb_search::{SearchFile, build_search_file_from_batches};
 use rtdb_storage::{ObjectKey, ObjectStore, StoredObject};
-use rtdb_text::{Corpus, Query, tokens};
+use rtdb_text::{Corpus, Query};
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, EventOp, Interval, StructFields, TableRef, TemporalBounds, Timestamp, Value};
 use serde_json::{Value as Json, json};
@@ -33,20 +33,21 @@ struct Bundle {
 
 impl Bundle {
     fn write(directory: &Path, name: &str, rows: Vec<&Row>, basis: Timestamp) -> Self {
-        let mut rows: Vec<_> = rows.into_iter().map(|row| SearchRow {
-            identity: None, iid: EntityId::Integer(id(row)).iid().0,
-            system_from: basis.0,
-            valid_from: Timestamp::MIN.0,
-            valid_to: Timestamp::MAX.0,
-            op: EventOp::Put,
-            values: vec![match &row[1] {
-                Value::Utf8(value) => Some(tokens(value)),
-                Value::Null | Value::Undefined => None,
-                _ => Some(Vec::new()),
-            }],
-        }).collect();
-        rows.sort_unstable_by_key(|row| row.iid);
-        let bytes = build_search_file(&columns(), &rows, name).unwrap();
+        let mut rows: Vec<_> = rows.into_iter().map(|row| (EntityId::Integer(id(row)).iid(), row)).collect();
+        rows.sort_unstable_by_key(|(iid, _)| *iid);
+        let headers = rows.iter().map(|(iid, _)| rtdb_types::EventHeader {
+            iid: *iid, system_from: basis, valid_time: Interval::ALL, op: EventOp::Put,
+        }).collect::<Vec<_>>();
+        let values = arrow_array::StringArray::from_iter(rows.iter().map(|(_, row)| match &row[1] {
+            Value::Utf8(text) => Some(text.as_str()),
+            Value::Null | Value::Undefined => None,
+            _ => Some(""),
+        }));
+        let fields = vec![arrow_schema::Field::new("body", arrow_schema::DataType::Utf8, true)].into();
+        let documents = rtdb_columnar::build_struct_array(fields, &[Arc::new(values)], rows.len(), None).unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 30);
+        let batch = rtdb_format::data::owned_put_batch(documents, &headers, None, &memory).unwrap();
+        let bytes = build_search_file_from_batches(&columns(), [batch], name, &memory).unwrap();
         let path = directory.join(name);
         fs::write(&path, &bytes).unwrap();
         Self { path, bytes: bytes.len() }

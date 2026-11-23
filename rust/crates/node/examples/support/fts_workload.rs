@@ -4,9 +4,9 @@ use std::sync::{Arc, atomic::AtomicI64};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rtdb_columnar::read_value;
+use rtdb_columnar::{IidView, OwnedBatch, read_value};
 use rtdb_node::{NativeSession, Node};
-use rtdb_query::{MatchAnswers, PreparedQuery, QueryContext, ScanAccelerator, ScanRequest};
+use rtdb_query::{MatchAnswers, PreparedQuery, QueryContext, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_search::{SearchAccelerator, SearchRuntime, accelerate::experiment::workload::Policy};
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{Iid, Result, StructFields, TableRef, Timestamp, Value};
@@ -15,10 +15,10 @@ use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 
 use super::{Identity, TickClock, bench_options, bench_services, commit, flush, sql};
-use super::corpus_checkpoint::{as_of, id};
+use super::corpus_checkpoint::as_of;
 
-#[derive(Clone, Debug)]
-enum Mode { Current, Baseline, Exhaustive, FilterFirst(Arc<BTreeSet<Iid>>), SkipRetry, Estimate }
+#[derive(Clone)]
+enum Mode { Current, Baseline, Exhaustive, FilterFirst(Arc<rtdb_query::CandidateIids>), SkipRetry, Estimate }
 
 struct Observation {
     mode: Mode,
@@ -34,11 +34,15 @@ struct ObservedSearch(Arc<SearchAccelerator>);
 #[async_trait]
 impl ScanAccelerator for ObservedSearch {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
+        Ok(self.select_candidates(request).await?.map(|selected| selected.iids.iter().collect()))
+    }
+
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
         if request.scan.table.name.table.table != "docs" {
-            return self.0.candidate_iids(request).await;
+            return self.0.select_candidates(request).await;
         }
         let Ok(mode) = OBSERVATION.try_with(|observation| observation.mode.clone()) else {
-            return self.0.candidate_iids(request).await;
+            return self.0.select_candidates(request).await;
         };
         let policy = match &mode {
             Mode::Current => Policy::Current,
@@ -61,7 +65,7 @@ impl ScanAccelerator for ObservedSearch {
     }
 }
 
-type Rows = Vec<Vec<Value>>;
+type Rows = Vec<OwnedBatch>;
 
 async fn query(context: &Arc<QueryContext>, statement: &str, mode: Mode) -> (Rows, Vec<Json>) {
     let observation = Observation { mode, plans: RefCell::default() };
@@ -73,16 +77,20 @@ async fn query(context: &Arc<QueryContext>, statement: &str, mode: Mode) -> (Row
         let mut cursor = query.execute(Arc::clone(context), Vec::new()).await.unwrap();
         let mut rows = Vec::new();
         while let Some(batch) = cursor.next_batch().await.unwrap() {
-            let batch = batch.batch();
-            let schema = batch.schema();
-            for row in 0..batch.num_rows() {
-                rows.push(schema.fields().iter().enumerate().map(|(column, field)| {
-                    read_value(field, batch.column(column).as_ref(), row).unwrap()
-                }).collect());
-            }
+            rows.push(batch);
         }
         (rows, OBSERVATION.with(|observation| observation.plans.take()))
     }).await
+}
+
+fn compare(actual: &Rows, expected: &Rows, statement: &str) {
+    let values = |batches: &Rows| batches.iter().flat_map(|batch| {
+        let batch = batch.batch();
+        (0..batch.num_rows()).map(move |row| batch.schema_ref().fields().iter().zip(batch.columns()).map(|(field, column)| {
+            read_value(field, column.as_ref(), row).unwrap()
+        }).collect::<Vec<_>>()).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    assert_eq!(values(actual), values(expected), "{statement}");
 }
 
 fn millis(start: Instant) -> f64 { start.elapsed().as_secs_f64() * 1000.0 }
@@ -91,7 +99,7 @@ async fn sample(context: &Arc<QueryContext>, statement: &str, mode: Mode, expect
     let start = Instant::now();
     let (rows, plans) = query(context, statement, mode).await;
     let ms = millis(start);
-    assert_eq!(&rows, expected, "{statement}");
+    compare(&rows, expected, statement);
     assert_eq!(plans.len(), 1, "{statement}");
     json!({"ms": ms, "plans": plans})
 }
@@ -148,13 +156,16 @@ async fn flush_and_index(node: &Node) {
     database.build_artefacts().await.unwrap();
 }
 
-async fn mask(context: &Arc<QueryContext>, at: &str, structured: &str) -> Arc<BTreeSet<Iid>> {
+async fn mask(context: &Arc<QueryContext>, at: &str, structured: &str) -> Arc<rtdb_query::CandidateIids> {
     let (rows, plans) = query(context, &format!("SELECT _iid FROM docs {at} WHERE {structured}"), Mode::Exhaustive).await;
     assert!(plans.iter().all(|plan| plan["route"] == "scan"));
-    Arc::new(rows.into_iter().map(|row| {
-        let Value::FixedSizeBinary(bytes) = &row[0] else { panic!("Expected an IID"); };
-        Iid::from_slice(bytes).unwrap()
-    }).collect())
+    let mut iids = arrow_array::builder::FixedSizeBinaryBuilder::new(16);
+    for batch in rows {
+        let batch = batch.batch();
+        let view = IidView::new(batch.column(0).as_ref()).unwrap();
+        for row in 0..batch.num_rows() { iids.append_value(view.get(row).unwrap().0).unwrap(); }
+    }
+    Arc::new(rtdb_query::CandidateIids::from_array(iids.finish(), &context.memory).unwrap())
 }
 
 async fn filter_first(context: &Arc<QueryContext>, current: Timestamp, iterations: usize) -> Vec<Json> {
@@ -184,7 +195,7 @@ async fn filter_first(context: &Arc<QueryContext>, current: Timestamp, iteration
             }
         }
         let [current, prepared, materialized] = samples;
-        out.push(json!({"cohort_lt": ceiling, "scope_iids": scope.len(), "result_rows": expected.len(),
+        out.push(json!({"cohort_lt": ceiling, "scope_iids": scope.len(), "result_rows": expected.iter().map(|batch| batch.batch().num_rows()).sum::<usize>(),
             "current": current, "prepared": prepared, "materialized": materialized}));
     }
     out
@@ -242,7 +253,13 @@ async fn version_canary(
             let scope = mask(&exhaustive, &at, structured).await;
             let statement = ranked(&at, &format!("MATCH(body, 'forensiconly') AND {structured}"), "forensiconly", 20);
             let expected = query(&exhaustive, &statement, Mode::Exhaustive).await.0;
-            assert_eq!(expected.iter().map(|row| id(row)).collect::<Vec<_>>(), [-2]);
+            let ids = expected.iter().flat_map(|batch| {
+                let batch = batch.batch();
+                (0..batch.num_rows()).map(move |row| {
+                    rtdb_columnar::read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row).unwrap()
+                })
+            }).collect::<Vec<_>>();
+            assert_eq!(ids, [rtdb_columnar::EntityIdRef::Integer(-2)]);
             let current = sample(&context, &statement, Mode::Current, &expected).await;
             if ordered && compacted {
                 assert!(current["plans"][0]["filter_scope"].as_u64().is_some(), "{statement}");
@@ -297,7 +314,7 @@ async fn replay(node: &Node, read: &mut NativeSession, old: Timestamp, waves: us
         for reader in readers {
             let (name, statement, actual, plans, began, ended) = reader.await.unwrap();
             let expected = query(&context, &statement, Mode::Exhaustive).await.0;
-            assert_eq!(actual, expected, "replay wave {wave} {statement}");
+            compare(&actual, &expected, &statement);
             assert_eq!(plans.len(), 1, "{statement}");
             out.push(json!({"case": name, "wave": wave, "ms": (ended - began).as_secs_f64()*1000.0,
                 "write_overlap": began < writer_end && writer_start < ended, "plans": plans}));

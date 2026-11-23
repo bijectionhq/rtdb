@@ -1,7 +1,7 @@
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 use arrow_schema::{DataType, Field, Fields, UnionMode};
 use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, ListKind, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
@@ -471,7 +471,7 @@ fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> 
             _ => Err(layout_error()),
         };
     }
-    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+    if let DataType::Union(fields, _) = field.data_type() {
         let union = downcast::<UnionArray>(array)?;
         let id = union.type_id(row);
         let child = fields.iter().find_map(|(child_id, field)| (child_id == id).then_some(field)).ok_or_else(layout_error)?;
@@ -519,7 +519,7 @@ fn read_scalar(scalar: &ScalarType, array: &dyn Array, row: usize) -> Result<Val
         F32 => cell!(array, row, Float32Array, F32), F64 => cell!(array, row, Float64Array, F64),
         DateDay => cell!(array, row, Date32Array, DateDay), DateMilli => cell!(array, row, Date64Array, DateMilli),
         Oid => cell!(array, row, Int32Array, Oid), RegClass => cell!(array, row, Int32Array, RegClass), RegProc => cell!(array, row, Int32Array, RegProc),
-        Utf8 => Ok(Value::Utf8(downcast::<StringArray>(array)?.value(row).to_owned())),
+        Utf8 => Ok(crate::text::physical_text(array, row)?.map_or(Value::Null, |text| Value::Utf8(text.to_owned()))),
         Keyword => Ok(Value::Keyword(rtdb_types::Keyword::from_name(downcast::<StringArray>(array)?.value(row)))),
         Uri => { let text = downcast::<StringArray>(array)?.value(row); rtdb_types::UriParts::parse(text)?; Ok(Value::Uri(text.to_owned())) },
         Binary => Ok(Value::Binary(downcast::<BinaryArray>(array)?.value(row).to_vec())),
@@ -583,13 +583,14 @@ fn read_scalar(scalar: &ScalarType, array: &dyn Array, row: usize) -> Result<Val
 }
 
 fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
-    let (child_field, values) = match field.data_type() {
-        DataType::List(child) => (child, downcast::<ListArray>(array)?.value(row)),
-        DataType::FixedSizeList(child, _) => (child, downcast::<FixedSizeListArray>(array)?.value(row)),
-        DataType::Map(child, _) => (child, Arc::new(downcast::<MapArray>(array)?.value(row)) as ArrayRef),
-        _ => return Err(layout_error()),
+    let (child, values, positions) = if let DataType::Map(child, _) = field.data_type() {
+        let map = downcast::<MapArray>(array)?;
+        let offsets = map.value_offsets();
+        (child.as_ref(), map.entries() as &dyn Array, offsets[row] as usize..offsets[row + 1] as usize)
+    } else {
+        crate::list_span(field, array, row).ok_or_else(layout_error)?
     };
-    let values = (0..values.len()).map(|index| read_typed(element, child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
+    let values = positions.map(|index| read_typed(element, child, values, index)).collect::<Result<Vec<_>>>()?;
     match kind {
         ListKind::List => Ok(Value::List(values)),
         ListKind::Set => Ok(Value::Set(values)),

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use arrow_array::{Array, StringArray, builder::StringBuilder};
+use arrow_array::{Array, LargeListArray, StringArray, builder::{LargeListBuilder, StringBuilder}, cast::AsArray};
 
 pub const SIMPLE_ANALYZER: &str = "simple";
 
@@ -37,6 +37,25 @@ pub fn analyze(text: &str) -> StringArray {
     let mut tokens = StringBuilder::new();
     visit_tokens(text, |word| tokens.append_value(word));
     tokens.finish()
+}
+
+pub fn analyze_batch<'a, E>(cells: impl IntoIterator<Item = Result<Option<&'a str>, E>>) -> Result<LargeListArray, E> {
+    let mut tokens = LargeListBuilder::new(StringBuilder::new());
+    for text in cells {
+        let text = text?;
+        if let Some(text) = text {
+            visit_tokens(text, |word| tokens.values().append_value(word));
+        }
+        tokens.append(text.is_some());
+    }
+    Ok(tokens.finish())
+}
+
+pub fn token_cell(tokens: &LargeListArray, row: usize) -> Option<StringArray> {
+    if tokens.is_null(row) { return None; }
+    let offsets = tokens.value_offsets();
+    let start = offsets[row] as usize;
+    Some(tokens.values().as_string::<i32>().slice(start, offsets[row + 1] as usize - start))
 }
 
 /// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
@@ -155,6 +174,14 @@ impl Scorer {
         Self { query, average, idfs }
     }
 
+    pub fn try_from_frequencies<E>(query: Query, documents: u64, tokens: u64, frequency: impl FnMut(usize) -> Result<u64, E>) -> Result<Self, E> {
+        let average = (documents > 0 && tokens > 0).then(|| tokens as f64 / documents as f64);
+        let idfs = (0..query.terms.len()).map(frequency).map(|count| {
+            count.map(|count| inverse_frequency(documents, count))
+        }).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { query, average, idfs })
+    }
+
     pub fn query(&self) -> &Query { &self.query }
 
     /// The document's score from its stored length and frequencies in query-term order.
@@ -176,10 +203,11 @@ impl Scorer {
 
     /// Scores an analyzer's Arrow token vector with the same term order and length normalization as the index.
     pub fn bm25_arrow(&self, document: &StringArray) -> f64 {
-        let frequencies: Vec<u32> = self.query.terms.iter().map(|term| {
-            document.iter().filter(|&token| token == Some(term.as_str())).count() as u32
-        }).collect();
-        self.score(&frequencies, stored_length(document.len()))
+        let length = stored_length(document.len());
+        self.query.terms.iter().enumerate().map(|(index, term)| {
+            let frequency = document.iter().filter(|&token| token == Some(term.as_str())).count() as u32;
+            self.term_score(index, frequency, length)
+        }).fold(-0.0, |total, term| total + term)
     }
 
     pub fn for_ranking(self: &Arc<Self>) -> Option<RankScorer> {

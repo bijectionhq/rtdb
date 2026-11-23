@@ -126,3 +126,31 @@ See [FTS behavior](fts.allium) and [implementation notes](fts-implementation.ado
   [XTDB output parity](high-level-tour.adoc#L293)
 - Finish the full implementation, regression coverage, and applicable specification updates before the first compilation or qualification run.
   Run qualification at the end under the repository's `AGENTS.md` and testing skill, and record the outcome against every inventory item.
+
+## Implementation coverage
+
+| Item | Data path and boundary |
+| --- | --- |
+| 1 | Shared logical admission, borrowed UTF-8 access and Arrow relayout cover large offsets, views, text dictionaries, sparse unions and run ends. |
+| 2 | List element spans serve corpus and fingerprint kernels, and document ingestion retains the set extension. |
+| 3 | Arrow ingestion admits nullable and attributed fields, and ADBC submits a bound stream's pages as one operation. |
+| 4 | Fact payloads and compatible document replay retain Arrow arrays. Field presence travels with owned operations and world controls retain their native validation. |
+| 5 | Event assembly and result conformance align compatible Arrow cells and their extension metadata. |
+| 6 | Live and immutable search construction tokenize event pages into list vectors before positional posting assembly. |
+| 7 | Candidate discovery, handoff, pruning, MATCH lookup and verification use sorted Arrow IIDs. |
+| 8 | MATCH caches supply selected Boolean cells, and fallback and verification tokenize resolved positions in batches. |
+| 9 | FTS operands and supported composition execute over Arrow, columnar operators retain payloads across expression evaluation, and sort spill frames carry Arrow IPC. |
+| 10 | Held corpus and ranks expose Arrow batches, with legacy native APIs adapting the results. |
+| 11 | Existing Flight action versions and PostgreSQL row protocols retain their framing and schema requirements. |
+| 12 | Searches load validated posting ranges from range-capable stores. Delegated search scans carry the bound query and IID scope, and fall back locally for readers without search projection. |
+| 13 | Publication, validation, capabilities, and witnesses remain typed control fields. |
+| 14 | Benchmark paths retain Arrow query results and construct search files from event batches, and checkpoint replay references retained Arrow positions. |
+
+## Qualification
+
+The locked Rust workspace suite passed all targets with the FTS experiments feature enabled.
+The result includes 5,671 passing tests, zero failures and 15 tests marked ignored.
+The Gradle `test`, `integration-test`, and `property-test` tasks passed with the rebuilt native library and one Gradle worker.
+The result includes 12,175 passing tests and one skipped PostgreSQL source test, with no reflection or boxed-math warnings.
+The Arrow diagnostic smoke runs passed for corpus checkpoint replay, file generations, same-file ranking, and the 20,000-document architecture fixture.
+The architecture fixture agreed with its reference results in all six query cases.

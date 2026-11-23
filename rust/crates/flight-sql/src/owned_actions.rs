@@ -16,7 +16,7 @@ use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldPointWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
-use rtdb_tx::{Documents, TxOp};
+use rtdb_tx::TxOp;
 use rtdb_types::{EntityId, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
@@ -533,9 +533,18 @@ impl Service {
         if batch.num_rows() != 1 || batch.num_columns() != 3 {
             return Err(invalid("Owned search path requires one row with relation, _id and column"));
         }
-        let relation = OwnedRelation::new(owned_text(batch, "relation", 0)?).map_err(status)?;
-        let name = OwnedRelation::new(owned_text(batch, "_id", 0)?).map_err(status)?;
-        let column = owned_text(batch, "column", 0)?.to_owned();
+        let text = |name| {
+            let strings = search_array::<StringArray>(batch, name)?;
+            if batch.schema_ref().field_with_name(name).map_err(|error| invalid(error.to_string()))?.metadata()
+                .contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
+                return Err(invalid("Owned search path fields require plain Utf8"));
+            }
+            if strings.is_null(0) { return Err(invalid("Owned search path fields cannot be null")); }
+            Ok(strings.value(0))
+        };
+        let relation = OwnedRelation::new(text("relation")?).map_err(status)?;
+        let name = OwnedRelation::new(text("_id")?).map_err(status)?;
+        let column = text("column")?.to_owned();
         self.owned_write_reply(call, vec![TxOp::OwnedDeclareSearchPath { relation, name, column }]).await
     }
 
@@ -543,13 +552,25 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, arrow)?;
-        let (mut rows, _decoded) = upload::owned_documents(batch.batch(), self)?;
-        for row in &mut rows { strip_owned_absence(row)?; }
-        let operation = TxOp::OwnedInsertDocs {
-            relation, documents: Documents::new(rows, self.memory()).map_err(status)?,
-            valid_from: None, valid_to: None,
-        };
-        self.owned_write_reply(call, vec![operation]).await
+        let batch = batch.batch();
+        if batch.num_rows() == 0 {
+            let documents = rtdb_tx::Documents::new(Vec::new(), self.memory()).map_err(status)?;
+            return self.owned_write_reply(call, vec![TxOp::OwnedInsertDocs { relation, documents, valid_from: None, valid_to: None }]).await;
+        }
+        if batch.column_by_name("_absent").is_none() {
+            let documents = rtdb_tx::ArrowDocuments::from_owned_record_batch(batch, self.memory()).map_err(status)?;
+            return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs { relation, documents, create_only: true, valid_from: None, valid_to: None }]).await;
+        }
+        let _operations = call.reserve(wire::mul(batch.num_rows(), std::mem::size_of::<TxOp>() + 512)?)?;
+        let mut operations = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let (payload, _framing) = owned_payload(call, batch, row, &[])?;
+            operations.push(TxOp::OwnedArrowDocs {
+                relation: relation.clone(), documents: rtdb_tx::ArrowDocuments::from_owned_record_batch(&payload, self.memory()).map_err(status)?,
+                create_only: true, valid_from: None, valid_to: None,
+            });
+        }
+        self.owned_write_reply(call, operations).await
     }
 
     pub(crate) async fn commit_owned_action(&self, call: &Call, body: &[u8], format: CommitFormat) -> Result<ActionResult, Status> {
@@ -698,7 +719,7 @@ impl Service {
     fn decode_owned_commit_groups(
         &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, writes: &mut Vec<TxOp>,
         rows_left: &mut usize, erase_allowed: bool,
-    ) -> Result<Vec<(Arc<MemoryReservation>, Arc<MemoryReservation>)>, Status> {
+    ) -> Result<Vec<Arc<MemoryReservation>>, Status> {
         let mut retained = Vec::with_capacity(groups.len());
         for (relation, arrow) in groups {
             let batch = request_batch(call, arrow)?;
@@ -709,54 +730,62 @@ impl Service {
             let operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
-            let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
-            self.append_owned_commit_group(writes, &relation, rows, erase_allowed)?;
-            retained.push((operations_charge, documents_charge));
+            self.append_owned_commit_group(call, writes, &relation, batch.batch(), erase_allowed)?;
+            retained.push(operations_charge);
         }
         Ok(retained)
     }
 
     fn append_owned_commit_group(
-        &self,
-        writes: &mut Vec<TxOp>,
-        relation: &OwnedRelation,
-        rows: Vec<rtdb_types::StructFields<Value>>,
-        erase_allowed: bool,
+        &self, call: &Call, writes: &mut Vec<TxOp>, relation: &OwnedRelation,
+        batch: &RecordBatch, erase_allowed: bool,
     ) -> Result<(), Status> {
-        for mut row in rows {
-            strip_owned_absence(&mut row)?;
-            let id = row.get("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?.entity_id().map_err(status)?;
-            let Value::Utf8(operation) = row.remove("_op").ok_or_else(|| invalid("Owned commit row has no _op"))? else {
-                return Err(invalid("Owned commit _op must be Utf8"));
+        let controls = ["_op", "_read_valid_micros", "_read_system_micros", "_valid_from", "_valid_to"];
+        for row in 0..batch.num_rows() {
+            let (payload, _framing) = owned_payload(call, batch, row, &controls)?;
+            let (id_column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?;
+            let id_array = batch.column(id_column);
+            let _identity = call.reserve(rtdb_columnar::estimate_read_cell_bytes(field, id_array.as_ref(), row).map_err(status)?)?;
+            let id = match rtdb_columnar::read_entity_id(field, id_array.as_ref(), row) {
+                Ok(id) => id.into_owned(),
+                Err(_) => rtdb_columnar::read_value(field, id_array.as_ref(), row).and_then(|id| id.entity_id()).map_err(status)?,
             };
-            let valid_at = optional_micros(row.remove("_read_valid_micros"))?;
-            let expected = optional_micros(row.remove("_read_system_micros"))?;
+            let operation = owned_text(batch, "_op", row)?;
+            let valid_at = optional_micros(owned_control_cell(batch, "_read_valid_micros", row)?)?;
+            let expected = optional_micros(owned_control_cell(batch, "_read_system_micros", row)?)?;
             match valid_at {
                 Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at, expected }),
                 None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
                 None => (),
             }
-            let valid_from = valid_endpoint(row.remove("_valid_from"))?;
-            let valid_to = valid_endpoint(row.remove("_valid_to"))?;
+            let valid_from = valid_endpoint(owned_control_cell(batch, "_valid_from", row)?)?;
+            let valid_to = valid_endpoint(owned_control_cell(batch, "_valid_to", row)?)?;
+            let has_payload = || -> Result<bool, Status> {
+                for (field, column) in payload.schema_ref().fields().iter().zip(payload.columns()) {
+                    if field.name() != "_id" && rtdb_columnar::selected_cell(field, column.as_ref(), 0).map_err(status)?.is_some() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
             if operation == "check" {
-                if valid_at.is_none() || valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
+                if valid_at.is_none() || valid_from.is_some() || valid_to.is_some() || has_payload()? {
                     return Err(invalid("Owned check requires one observation and no mutation fields"));
                 }
                 continue;
             }
-            let operation = match operation.as_str() {
-                "create" => TxOp::OwnedInsertDocs {
-                    relation: relation.clone(), documents: Documents::new(vec![row], self.memory()).map_err(status)?, valid_from, valid_to,
-                },
-                "replace" => TxOp::OwnedReplaceDocs {
-                    relation: relation.clone(), documents: Documents::new(vec![row], self.memory()).map_err(status)?, valid_from, valid_to,
+            let operation = match operation {
+                "create" | "replace" => TxOp::OwnedArrowDocs {
+                    relation: relation.clone(),
+                    documents: rtdb_tx::ArrowDocuments::from_owned_record_batch(&payload, self.memory()).map_err(status)?,
+                    create_only: operation == "create", valid_from, valid_to,
                 },
                 "delete" => {
-                    if has_payload(&row) { return Err(invalid("Owned delete carries document values")); }
+                    if has_payload()? { return Err(invalid("Owned delete carries document values")); }
                     TxOp::OwnedDelete { relation: relation.clone(), id, valid_from, valid_to }
                 }
                 "erase" if erase_allowed => {
-                    if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
+                    if valid_from.is_some() || valid_to.is_some() || has_payload()? {
                         return Err(invalid("Owned erase requires only a typed identity and optional observation"));
                     }
                     TxOp::OwnedErase { relation: relation.clone(), id }
@@ -2147,8 +2176,43 @@ fn valid_endpoint(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
     }
 }
 
-fn has_payload(row: &rtdb_types::StructFields<Value>) -> bool {
-    row.iter().any(|(name, value)| name != "_id" && !matches!(value, Value::Null | Value::Undefined))
+fn owned_control_cell(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<Value>, Status> {
+    let Some((index, field)) = batch.schema_ref().column_with_name(name) else { return Ok(None); };
+    let array = batch.column(index);
+    let Some((field, array, row)) = rtdb_columnar::selected_cell(field, array.as_ref(), row).map_err(status)? else { return Ok(None); };
+    match field.data_type() {
+        DataType::Int64 | DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)) => {
+            rtdb_columnar::read_value(field, array, row).map(Some).map_err(status)
+        }
+        _ => Err(invalid(format!("Owned control field {name} has an invalid Arrow type"))),
+    }
+}
+
+fn owned_payload(call: &Call, batch: &RecordBatch, row: usize, controls: &[&str]) -> Result<(RecordBatch, Arc<MemoryReservation>), Status> {
+    let charge = call.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref()).map_err(status)?)?;
+    let mut absent = BTreeSet::new();
+    if let Some((index, field)) = batch.schema_ref().column_with_name("_absent") {
+        let fields = rtdb_columnar::utf8_list(field, batch.column(index).as_ref(), row)
+            .map_err(|_| invalid("Owned _absent must be a list of at most 128 field names"))?;
+        if let Some(fields) = fields {
+            for name in fields {
+                let name = name.map_err(|_| invalid("Owned _absent field must be text"))?;
+                if absent.len() == 128 { return Err(invalid("Owned _absent must be a list of at most 128 field names")); }
+                let (index, field) = batch.schema_ref().column_with_name(name)
+                    .ok_or_else(|| invalid("Owned _absent may name only distinct null payload cells"))?;
+                if name.starts_with('_') || !absent.insert(name)
+                    || rtdb_columnar::selected_cell(field, batch.column(index).as_ref(), row).map_err(status)?.is_some() {
+                    return Err(invalid("Owned _absent may name only distinct null payload cells"));
+                }
+            }
+        }
+    }
+    let positions = batch.schema_ref().fields().iter().enumerate().filter_map(|(index, field)| {
+        let name = field.name().as_str();
+        (name != "_absent" && !controls.contains(&name) && !absent.contains(name)).then_some(index)
+    }).collect::<Vec<_>>();
+    let payload = batch.slice(row, 1).project(&positions).map_err(|error| invalid(error.to_string()))?;
+    Ok((payload, charge))
 }
 
 #[cfg(test)]

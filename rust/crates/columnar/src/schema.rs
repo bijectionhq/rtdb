@@ -182,7 +182,7 @@ pub fn from_field(field: &Field) -> Result<LogicalType> {
             "xt/regproc" => LogicalType::Scalar(ScalarType::RegProc),
             "xt/intervalDMMType" => LogicalType::Scalar(ScalarType::IntervalMonthDayMicro),
             "set" => match field.data_type() {
-                DataType::List(child) => LogicalType::List { kind: ListKind::Set, element: Box::new(from_field(child)?) },
+                DataType::List(child) | DataType::LargeList(child) | DataType::ListView(child) | DataType::LargeListView(child) => LogicalType::List { kind: ListKind::Set, element: Box::new(from_field(child)?) },
                 _ => return Err(extension_layout_error(extension)),
             },
             "xt/tstz-range" => match field.data_type() {
@@ -215,7 +215,12 @@ fn plain_field_type(field: &Field) -> Result<LogicalType> {
         Int8 => ScalarType::I8, Int16 => ScalarType::I16, Int32 => ScalarType::I32, Int64 => ScalarType::I64,
         UInt8 => ScalarType::U8, UInt16 => ScalarType::U16, UInt32 => ScalarType::U32, UInt64 => ScalarType::U64,
         Float16 => ScalarType::F16, Float32 => ScalarType::F32, Float64 => ScalarType::F64,
-        Utf8 => ScalarType::Utf8, Binary => ScalarType::Binary, FixedSizeBinary(n) => ScalarType::FixedSizeBinary(*n),
+        Utf8 | LargeUtf8 | Utf8View => ScalarType::Utf8,
+        Dictionary(key, value) if matches!(key.as_ref(), Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+            && matches!(value.as_ref(), Utf8 | LargeUtf8 | Utf8View) => {
+            return Ok(LogicalType::Scalar(ScalarType::Utf8).maybe());
+        }
+        Binary => ScalarType::Binary, FixedSizeBinary(n) => ScalarType::FixedSizeBinary(*n),
         Decimal32(_, _) | Decimal64(_, _) | Decimal128(_, _) | Decimal256(_, _) => {
             let parameters = crate::decimal_field_parameters(field)?.expect("decimal field");
             ScalarType::Decimal { precision: parameters.precision, scale: parameters.scale, bit_width: parameters.bit_width }
@@ -239,13 +244,13 @@ fn plain_field_type(field: &Field) -> Result<LogicalType> {
             }
             return Ok(LogicalType::Struct(fields));
         }
-        List(child) => return Ok(LogicalType::List { kind: ListKind::List, element: Box::new(from_field(child)?) }),
+        List(child) | LargeList(child) | ListView(child) | LargeListView(child) => return Ok(LogicalType::List { kind: ListKind::List, element: Box::new(from_field(child)?) }),
         FixedSizeList(child, size) => return Ok(LogicalType::List { kind: ListKind::FixedSizeList(*size), element: Box::new(from_field(child)?) }),
         Map(child, sorted) => {
             validate_map_entries(child)?;
             return Ok(LogicalType::List { kind: ListKind::Map { sorted: *sorted }, element: Box::new(from_field(child)?) });
         }
-        Union(children, UnionMode::Dense) => {
+        Union(children, _) => {
             let mut legs = OrderedSet::new();
             for (_, child) in children.iter() {
                 let leg = from_field(child)?;

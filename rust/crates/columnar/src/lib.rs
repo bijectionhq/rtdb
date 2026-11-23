@@ -26,7 +26,7 @@ pub use interleave::{copy_event_cells, copy_nullable_cells, copy_selected_cells,
 pub use hash::{decimal_cell_as_f64, hash_cell, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
 pub use memory::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn, Selection, retain_array, retain_buffer, retain_buffer_with_owner, shared_allocation_size};
 pub use schema::{EXTENSION_METADATA_KEY, EXTENSION_NAME_KEY, from_field, leg_name, to_field};
-pub use text::{TextCell, selected_cell, text_cell, utf8_list};
+pub use text::{TextCell, list_span, physical_text, selected_cell, text_cell, utf8_list};
 pub use values::{ColumnReader, build_array, build_struct_array, copy_array, read_value, read_value_as, struct_field_cell};
 
 use rtdb_types::Anomaly;

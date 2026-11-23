@@ -1,10 +1,10 @@
 //! A node's shared search state: what scans and the lane reuse across queries, jobs and databases.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, LargeListArray, StringArray, UInt32Array,
-    builder::{Float64Builder, LargeListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::UInt32Type};
+    builder::{Float64Builder, UInt32Builder}, cast::AsArray, types::UInt32Type};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field};
 use parking_lot::Mutex;
@@ -12,7 +12,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_format::data::PutText;
 use rtdb_index::Snapshot;
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Iid, Instant, Result};
+use rtdb_types::{Instant, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SearchAccelerator, SearchArtefacts, SearchDefinition, SearchFile, definitions_in};
@@ -55,28 +55,33 @@ struct LivePostingPage {
 
 impl LivePostingPage {
     fn from_rows(segment: &rtdb_index::LiveTable, column: &str, from: u32) -> Result<Self> {
-        let mut postings = BTreeMap::<String, Vec<u32>>::new();
-        let mut tokens = LargeListBuilder::new(StringBuilder::new());
-        for row in from..segment.row_count() {
-            let source = segment.row(row)?;
-            let event = source.batch.view().borrow_event(source.row)?;
-            if let PutText::Utf8(text) = event.put_text(column)? {
-                for token in rtdb_text::analyze(text).iter().flatten() {
-                    tokens.values().append_value(token);
-                    let rows = postings.entry(token.to_owned()).or_default();
-                    if rows.last() != Some(&row) { rows.push(row); }
+        let sources = segment.batches_from(from).flat_map(|(batch, start)| {
+            (start..batch.len()).map(move |row| {
+                Ok(match batch.view().borrow_event(row)?.put_text(column)? {
+                    PutText::Utf8(text) => Some(text),
+                    PutText::Missing | PutText::Other => None,
+                })
+            })
+        });
+        let tokens = rtdb_text::analyze_batch::<rtdb_types::Anomaly>(sources)?;
+        let mut postings = BTreeMap::<&str, UInt32Builder>::new();
+        let offsets = tokens.value_offsets();
+        let values = tokens.values().as_string::<i32>();
+        for row in 0..tokens.len() {
+            let source_row = from + row as u32;
+            for term in offsets[row]..offsets[row + 1] {
+                let posting = postings.entry(values.value(term as usize)).or_default();
+                if posting.values_slice().last() != Some(&source_row) {
+                    posting.append_value(source_row);
                 }
-                tokens.append(true);
-            } else {
-                tokens.append(false);
             }
         }
-        let (terms, postings): (Vec<_>, Vec<_>) = postings.into_iter().unzip();
-        let offsets = OffsetBuffer::from_lengths(postings.iter().map(Vec::len));
-        let rows = UInt32Array::from_iter_values(postings.into_iter().flatten());
+        let offsets = OffsetBuffer::from_lengths(postings.values().map(|rows| rows.values_slice().len()));
+        let terms = StringArray::from_iter_values(postings.keys().copied());
+        let rows = UInt32Array::from_iter_values(postings.values().flat_map(|rows| rows.values_slice().iter().copied()));
         let field = Arc::new(Field::new("item", DataType::UInt32, false));
-        Ok(Self { first_row: from, terms: StringArray::from(terms),
-            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens: tokens.finish() })
+        Ok(Self { first_row: from, terms,
+            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens })
     }
 
     fn postings(&self, term: &str) -> Option<&[u32]> {
@@ -94,9 +99,7 @@ impl LivePostingPage {
 
     fn tokens(&self, row: u32) -> StringArray {
         let row = (row - self.first_row) as usize;
-        let offsets = self.tokens.value_offsets();
-        let first = offsets[row] as usize;
-        self.tokens.values().as_string::<i32>().slice(first, offsets[row + 1] as usize - first)
+        rtdb_text::token_cell(&self.tokens, row).expect("live postings reference a text cell")
     }
 }
 
@@ -137,6 +140,14 @@ type LiveKey = (String, rtdb_types::TableRef, String, usize);
 pub enum FileError { Missing, Corrupt(rtdb_types::Anomaly), Unavailable(rtdb_types::Anomaly) }
 
 impl FileError {
+    pub(crate) fn from_storage(error: rtdb_storage::Error) -> Self {
+        match error {
+            rtdb_storage::Error::MissingObject(_) => Self::Missing,
+            error => Self::Unavailable(error.into()),
+        }
+    }
+
+
     pub fn needs_repair(&self) -> bool { !matches!(self, Self::Unavailable(_)) }
 }
 
@@ -181,6 +192,18 @@ impl SearchRuntime {
         Ok(definitions)
     }
 
+    pub(crate) async fn file_with_terms(
+        &self, database: &str, storage: &Arc<BufferPool>, key: &rtdb_storage::ObjectKey, columns: &[String],
+        column: &str, queries: &[&rtdb_text::Query], memory: &Arc<MemoryBudget>,
+    ) -> std::result::Result<Arc<SearchFile>, FileError> {
+        let store = storage.object_store();
+        if !store.supports_scan_ranges(key) || storage.holds(key)
+            || store.local_file(key).await.map_err(FileError::from_storage)?.is_some() {
+            return self.file(database, storage, key, columns).await;
+        }
+        SearchFile::open_remote(storage, key, columns, column, queries, memory).await.map(Arc::new)
+    }
+
     /// An opened search file, from this node's cache or freshly read; an object key names immutable bytes, so a cached file is never stale.
     /// A kept file is used only while the pool it was read through is the database's pool, so a database detached and attached anew starts afresh.
     pub async fn file(&self, database: &str, storage: &Arc<BufferPool>, key: &rtdb_storage::ObjectKey, columns: &[String]) -> std::result::Result<Arc<SearchFile>, FileError> {
@@ -217,13 +240,13 @@ impl SearchRuntime {
         self.match_set_for_scan(database, trie, column, query, None)
     }
 
-    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query, iids: Option<&BTreeSet<Iid>>) -> Result<Arc<crate::file::MatchSet>> {
+    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query, iids: Option<&rtdb_query::CandidateIids>) -> Result<Arc<crate::file::MatchSet>> {
         let cache_key = (database.to_string(), trie.identity.clone(), column.to_string(), query.clone());
         if let Some((opened, set)) = self.match_sets.lock().get(&cache_key) {
             if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, &trie.file)) { return Ok(set); }
         }
         if let Some(iids) = iids.filter(|iids| iids.len() <= 128) {
-            return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids)?));
+            return Ok(Arc::new(trie.file.match_selected_iids(column, query, iids.iter())?));
         }
         let set = Arc::new(trie.file.match_set(column, query)?);
         self.match_sets.lock().insert(cache_key, (Arc::downgrade(&trie.file), Arc::clone(&set)), set.bytes());

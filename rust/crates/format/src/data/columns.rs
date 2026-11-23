@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use arrow_array::{Array, ArrayRef, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
-use arrow_schema::{DataType, Field, UnionMode};
+use arrow_schema::{DataType, Field};
 use rtdb_columnar::{BatchBuilder, EXTENSION_NAME_KEY, copy_event_cells, copy_selected_cells, estimate_copy_cell_bytes,
     estimate_event_copy_cell_bytes, estimate_event_null_cell_bytes, event_relayout_bound, from_field, relayout_event_column};
 use rtdb_types::{LogicalType, Result, UriParts};
@@ -137,21 +137,20 @@ fn valid_cell(field: &Field, array: &dyn Array, row: usize, bottom: bool) -> boo
         DataType::Null => field.is_nullable() || bottom,
         _ if array.is_null(row) => true,
         DataType::Utf8 if extension == Some("uri") => UriParts::parse(array.as_string::<i32>().value(row)).is_ok(),
-        DataType::Union(fields, UnionMode::Dense) => {
+        DataType::Union(fields, _) => {
             let union = array.as_union();
             let tag = union.type_id(row);
             let Some((_, field)) = fields.iter().find(|(id, _)| *id == tag) else { return false };
             let child = union.child(tag).as_ref();
             let offset = union.value_offset(row);
             if field.data_type() == &DataType::Null { return field.is_nullable(); }
-            child.is_valid(offset) && valid_cell(field, child, offset, false)
+            valid_cell(field, child, offset, false)
         }
         DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
             .all(|(field, child)| valid_cell(field, child.as_ref(), row, true)),
-        DataType::List(field) => {
-            let list = array.as_list::<i32>();
-            let offsets = list.value_offsets();
-            (offsets[row]..offsets[row + 1]).all(|index| valid_cell(field, list.values().as_ref(), index as usize, false))
+        DataType::List(_) | DataType::LargeList(_) | DataType::ListView(_) | DataType::LargeListView(_) => {
+            rtdb_columnar::list_span(field, array, row)
+                .is_some_and(|(child, values, mut span)| span.all(|index| valid_cell(child, values, index, false)))
         }
         DataType::FixedSizeList(item, size) => {
             let list = array.as_fixed_size_list();

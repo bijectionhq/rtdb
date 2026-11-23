@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex, atomic::AtomicI64};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rtdb_columnar::read_value;
+use rtdb_columnar::{IidView, OwnedBatch, read_value};
 use rtdb_index::Snapshot;
 use rtdb_node::{Database, NativeSession, Node};
 use rtdb_plan::{Scan, TableBinding, QualifiedTable, Expr, TemporalFilter};
-use rtdb_query::{CandidateVerifier, ConstantEvaluator, MatchAnswers, ScanAccelerator, ScanRequest};
+use rtdb_query::{CandidateVerifier, ConstantEvaluator, MatchAnswers, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_search::{SearchAccelerator, SearchRuntime, accelerate::experiment::{Fallback, PointRanking, Ranking, Work}};
 use rtdb_text::Query;
 use rtdb_tx::{Documents, TxOp};
@@ -15,8 +15,8 @@ use rtdb_types::{Iid, Interval, Result, StructFields, TableRef, TemporalBounds, 
 use serde_json::{Value as Json, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{Identity, TickClock, bench_options, bench_services, commit, flush, query, sql, where_ids};
-use super::corpus_checkpoint::{as_of, id};
+use super::{Identity, TickClock, bench_options, bench_services, commit, flush, query_batches, read_rows, sql, where_ids};
+use super::corpus_checkpoint::as_of;
 
 struct Inspection {
     search: Arc<SearchAccelerator>,
@@ -26,9 +26,13 @@ struct Inspection {
 #[async_trait]
 impl ScanAccelerator for Inspection {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        let iids = self.search.candidate_iids(request).await?;
+        Ok(self.select_candidates(request).await?.map(|selected| selected.iids.iter().collect()))
+    }
+
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+        let iids = self.search.select_candidates(request).await?;
         if request.scan.top_k.is_some() {
-            *self.narrowed.lock().unwrap() = Some(iids.as_ref().map(BTreeSet::len));
+            *self.narrowed.lock().unwrap() = Some(iids.as_ref().map(|selected| selected.iids.len()));
         }
         Ok(iids)
     }
@@ -49,7 +53,7 @@ impl ConstantEvaluator for LiteralOnly {
 
 #[async_trait]
 impl CandidateVerifier for LiteralOnly {
-    async fn score_visible(&self, _: BTreeSet<Iid>, _: rtdb_plan::ColumnId, _: &rtdb_text::Scorer) -> Result<rtdb_query::CandidateScores> {
+    async fn score_visible(&self, _: rtdb_query::CandidateIids, _: rtdb_plan::ColumnId, _: &rtdb_text::Scorer) -> Result<rtdb_query::CandidateScores> {
         panic!("Point ranker must fall back before needing ordinary scan verification")
     }
 
@@ -106,13 +110,11 @@ async fn captured_ids(session: &mut NativeSession, basis: Timestamp) -> Vec<(Iid
     let mut ids = Vec::new();
     while let Some(batch) = cursor.next_batch().await.unwrap() {
         let batch = batch.batch();
-        let schema = batch.schema();
+        let view = IidView::new(batch.column(1).as_ref()).unwrap();
         for row in 0..batch.num_rows() {
-            let Value::I64(id) = read_value(schema.field(0), batch.column(0).as_ref(), row).unwrap()
-                else { panic!("Fixture ID must be an integer") };
-            let Value::FixedSizeBinary(iid) = read_value(schema.field(1), batch.column(1).as_ref(), row).unwrap()
-                else { panic!("Fixture IID must be binary") };
-            ids.push((Iid::from_slice(&iid).unwrap(), id));
+            let id = rtdb_columnar::read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row).unwrap();
+            let rtdb_columnar::EntityIdRef::Integer(id) = id else { panic!("Fixture ID must be an integer") };
+            ids.push((view.get(row).unwrap(), id));
         }
     }
     ids
@@ -138,12 +140,12 @@ impl Fixture<'_> {
     async fn ranked(
         &self, session: &mut NativeSession, ranker: &mut PointRanking, ranking: Ranking,
         snapshot: &Snapshot, points: (Timestamp, Timestamp), case: Case,
-    ) -> (Vec<Vec<Value>>, Work, Option<Fallback>) {
+    ) -> (Vec<OwnedBatch>, Work, Option<Fallback>) {
         let (valid, system) = points;
         let bounds = TemporalBounds { valid_time: Interval::at(valid).unwrap(), system_time: Interval::at(system).unwrap() };
         let scan = self.scan(snapshot);
         let memory = self.node.query_memory();
-        let request = ScanRequest { database: "xtdb", scan: &scan, snapshot, storage: self.database.storage(), bounds,
+        let request = ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot, storage: self.database.storage(), bounds,
             memory: &memory, current_time: self.node.query_instant(), cancellation: self.node.cancellation(),
             constants: &LiteralOnly, partitions: std::slice::from_ref(snapshot), verifier: &LiteralOnly };
         let (hits, work) = ranker.rank(&self.inspection.search, &request, "body", &Query::parse(case.matching),
@@ -151,22 +153,41 @@ impl Fixture<'_> {
         let hits = match hits {
             Ok(hits) => hits,
             Err(reason) => {
-                let rows = query(session, &format!("{} LIMIT {}", case.statement(valid, system), case.limit)).await;
+                let rows = query_batches(session, &format!("{} LIMIT {}", case.statement(valid, system), case.limit)).await;
                 return (rows, work, Some(reason));
             }
         };
         if hits.is_empty() { return (Vec::new(), work, None); }
         let selected = where_ids(hits.iter().map(|hit| hit.id));
-        let raw = query(session, &format!(
+        let raw = query_batches(session, &format!(
             "SELECT _id, _iid, department, _system_from FROM docs {}{selected}", as_of(valid, system),
         )).await;
-        assert_eq!(raw.len(), hits.len());
-        let mut by_id: BTreeMap<_, _> = raw.into_iter().map(|row| (id(&row), row)).collect();
-        let rows = hits.into_iter().map(|hit| {
-            let row = by_id.remove(&hit.id).unwrap();
-            assert_eq!(row[1], Value::FixedSizeBinary(hit.iid.0.to_vec()));
-            vec![row[0].clone(), Value::F64(hit.score), row[2].clone(), row[3].clone()]
-        }).collect();
+        assert_eq!(raw.iter().map(|batch| batch.batch().num_rows()).sum::<usize>(), hits.len());
+        let mut by_id = BTreeMap::new();
+        for (page, batch) in raw.iter().enumerate() {
+            let batch = batch.batch();
+            let iids = IidView::new(batch.column(1).as_ref()).unwrap();
+            for row in 0..batch.num_rows() {
+                let key = rtdb_columnar::read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row).unwrap();
+                let rtdb_columnar::EntityIdRef::Integer(id) = key else { panic!("Fixture ID must be an integer"); };
+                by_id.insert(id, (iids.get(row).unwrap(), page, row));
+            }
+        }
+        let selected = hits.iter().map(|hit| {
+            let (iid, page, row) = by_id.remove(&hit.id).unwrap();
+            assert_eq!(iid, hit.iid);
+            (page, row)
+        }).collect::<Vec<_>>();
+        let gather = |column| {
+            let arrays = raw.iter().map(|batch| batch.batch().column(column).as_ref()).collect::<Vec<_>>();
+            rtdb_columnar::copy_selected_cells(&arrays, &selected).unwrap()
+        };
+        let scores = arrow_array::Float64Array::from_iter_values(hits.into_iter().map(|hit| hit.score));
+        let batch = arrow_array::RecordBatch::try_from_iter([
+            ("_id", gather(0)), ("score", Arc::new(scores) as arrow_array::ArrayRef),
+            ("department", gather(2)), ("_system_from", gather(3)),
+        ]).unwrap();
+        let rows = vec![OwnedBatch::new(batch, &memory).unwrap()];
         (rows, work, None)
     }
 }
@@ -193,7 +214,7 @@ async fn stress_versions(fixture: &Fixture<'_>, session: &mut NativeSession, ran
     let snapshot = fixture.database.snapshot();
     let reference = oracle(session, &case.statement(new, new), case.limit).await;
     let (actual, _, fallback) = fixture.ranked(session, ranker, Ranking::ScoreAndId, &snapshot, (new, new), case).await;
-    assert_eq!(actual, reference);
+    assert_eq!(read_rows(&actual), reference);
     assert_eq!(fallback, Some(Fallback::Visibility));
 
     flush(fixture.node).await;
@@ -206,7 +227,7 @@ async fn stress_versions(fixture: &Fixture<'_>, session: &mut NativeSession, ran
         for case in [CASES[0], CASES[4]] {
             let expected = oracle(session, &case.statement(points.0, points.1), case.limit).await;
             let (rows, work, fallback) = fixture.ranked(session, ranker, Ranking::ScoreAndId, &snapshot, points, case).await;
-            assert_eq!(rows, expected, "{points:?} {}", case.name);
+            assert_eq!(read_rows(&rows), expected, "{points:?} {}", case.name);
             probes.push(sample(0.0, &work, fallback));
         }
     }
@@ -265,14 +286,14 @@ pub(super) async fn run(documents: i64, iterations: usize) {
         let (first, work, fallback) = fixture.ranked(&mut session, &mut ranker, Ranking::ScoreAndId,
             &snapshot, (basis, basis), case).await;
         let first_tie = sample(elapsed(cold), &work, fallback);
-        assert_eq!(first, expected, "{} first tie rank", case.name);
+        assert_eq!(read_rows(&first), expected, "{} first tie rank", case.name);
         let mut samples = [Vec::new(), Vec::new(), Vec::new()];
         for iteration in 0..iterations {
             for position in 0..3 {
                 let index = (iteration + position) % 3;
                 let start = Instant::now();
                 let (actual, timing) = if index == 0 {
-                    let rows = query(&mut session, &limited).await;
+                    let rows = query_batches(&mut session, &limited).await;
                     let elapsed = elapsed(start);
                     let narrowed = scan.narrowed.lock().unwrap().take().expect("optimizer reached ranked scan");
                     (rows, json!({"ms": elapsed, "candidate_iids": narrowed, "fallback": narrowed.is_none()}))
@@ -282,7 +303,7 @@ pub(super) async fn run(documents: i64, iterations: usize) {
                         &snapshot, (basis, basis), case).await;
                     (rows, sample(elapsed(start), &work, fallback))
                 };
-                assert_eq!(actual, expected, "{} variant {index}", case.name);
+                assert_eq!(read_rows(&actual), expected, "{} variant {index}", case.name);
                 samples[index].push(timing);
             }
         }

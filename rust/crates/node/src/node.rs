@@ -1212,8 +1212,16 @@ impl OwnedReadSession {
     pub async fn search_corpus(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation, query: &str,
     ) -> Result<rtdb_text::Corpus> {
+        Ok(self.search_corpus_batch(relation, path, query).await?.into_corpus())
+    }
+
+    /// Returns held corpus terms and document frequencies in Arrow.
+    #[cfg(feature = "search")]
+    pub async fn search_corpus_batch(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation, query: &str,
+    ) -> Result<rtdb_search::OwnedCorpusBatch> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_corpus(self.relation_context(relation)?, &self.owner, relation, path, query);
+        let work = rtdb_search::owned_corpus_batch(self.relation_context(relation)?, &self.owner, relation, path, query);
         let corpus = rtdb_storage::IoRegion::leased(self.context.catalog.read_lease(), work).await?;
         self.check_relation(relation)?;
         Ok(corpus)

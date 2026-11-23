@@ -206,7 +206,7 @@ impl AsRef<[u8]> for Source {
 }
 
 pub(super) struct Reader {
-    read: Box<dyn Fn(Range<usize>) -> Result<Buffer> + Send + Sync>,
+    read: Option<Box<dyn Fn(Range<usize>) -> Result<Buffer> + Send + Sync>>,
     decoder: FileDecoder,
     blocks: Vec<Block>,
     hashes: String,
@@ -221,13 +221,24 @@ impl Reader {
 
     pub(super) fn open(length: usize, read: impl Fn(Range<usize>) -> Result<Buffer> + Send + Sync + 'static) -> Result<Self> {
         let tail = length.checked_sub(10).ok_or_else(|| corrupt("Search file has no Arrow footer"))?;
-        let footer_length = read_footer_length(read(tail..length)?.as_slice().try_into().map_err(fault)?).map_err(fault)?;
-        let start = tail.checked_sub(footer_length).filter(|start| *start >= 8)
-            .ok_or_else(|| corrupt("Search file footer exceeds its bounds"))?;
+        let start = Self::footer_start(length, read(tail..length)?.as_slice())?;
         let head = read(0..6)?;
-        if head.as_slice() != b"ARROW1" { return Err(corrupt("Search file has no Arrow header")); }
-        let bytes = read(start..tail)?;
-        let footer = arrow_ipc::root_as_footer(bytes.as_slice()).map_err(fault)?;
+        let footer = read(start..tail)?;
+        let mut reader = Self::from_footer(start, head.as_slice(), footer.as_slice())?;
+        reader.read = Some(Box::new(read));
+        Ok(reader)
+    }
+
+    pub(super) fn footer_start(length: usize, trailer: &[u8]) -> Result<usize> {
+        let tail = length.checked_sub(10).ok_or_else(|| corrupt("Search file has no Arrow footer"))?;
+        let footer_length = read_footer_length(trailer.try_into().map_err(fault)?).map_err(fault)?;
+        tail.checked_sub(footer_length).filter(|start| *start >= 8)
+            .ok_or_else(|| corrupt("Search file footer exceeds its bounds"))
+    }
+
+    pub(super) fn from_footer(start: usize, header: &[u8], footer: &[u8]) -> Result<Self> {
+        if header != b"ARROW1" { return Err(corrupt("Search file has no Arrow header")); }
+        let footer = arrow_ipc::root_as_footer(footer).map_err(fault)?;
         let file_schema = footer.schema().ok_or_else(|| corrupt("Search file has no schema"))?;
         if !file_schema.endianness().equals_to_target_endianness() || fb_to_schema(file_schema) != **schema()
             || footer.dictionaries().is_some_and(|blocks| !blocks.is_empty())
@@ -247,7 +258,7 @@ impl Reader {
             .and_then(|metadata| metadata.value()).filter(|hashes| hashes.len() == blocks.len().saturating_mul(64) && hashes.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or_else(|| corrupt("Search file has missing or invalid batch checksums"))?.to_owned();
         let pages = (0..blocks.len()).map(|_| OnceLock::new()).collect();
-        Ok(Self { read: Box::new(read), decoder: FileDecoder::new(Arc::clone(schema()), footer.version()), blocks, hashes, pages })
+        Ok(Self { read: None, decoder: FileDecoder::new(Arc::clone(schema()), footer.version()), blocks, hashes, pages })
     }
 
     pub(super) fn len(&self) -> usize { self.blocks.len() }
@@ -262,12 +273,17 @@ impl Reader {
     }
 
     pub(super) fn page(&self, page: usize) -> Result<RecordBatch> {
+        let slot = self.pages.get(page).ok_or_else(|| corrupt("Search file has no such record batch"))?;
+        if let Some(batch) = slot.get() { return Ok(batch.clone()); }
+        let read = self.read.as_ref().ok_or_else(|| fault("Search record batch was not fetched"))?;
+        self.load_page(page, read(self.checked_page_range(page)?)?)
+    }
+
+    pub(super) fn load_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
         let block = self.blocks.get(page).ok_or_else(|| corrupt("Search file has no such record batch"))?;
         let slot = &self.pages[page];
         if let Some(batch) = slot.get() { return Ok(batch.clone()); }
-        let range = Self::range(block)?;
-        let length = range.len();
-        let bytes = (self.read)(range)?;
+        let length = Self::range(block)?.len();
         if bytes.len() != length || format!("{:x}", Sha256::digest(bytes.as_slice())) != self.hashes[page * 64..(page + 1) * 64] {
             return Err(corrupt("Search record batch fails its checksum"));
         }
@@ -279,6 +295,10 @@ impl Reader {
         Ok(slot.get_or_init(|| batch).clone())
     }
 
+    pub(super) fn checked_page_range(&self, page: usize) -> Result<Range<usize>> {
+        Self::range(self.blocks.get(page).ok_or_else(|| corrupt("Search file has no such record batch"))?)
+    }
+
     #[cfg(test)]
-    pub(super) fn page_range(&self, page: usize) -> Range<usize> { Self::range(&self.blocks[page]).unwrap() }
+    pub(super) fn page_range(&self, page: usize) -> Range<usize> { self.checked_page_range(page).unwrap() }
 }

@@ -165,7 +165,7 @@ impl Builder {
         };
         let row_bytes = row.values.iter().flatten().try_fold(
             256usize.saturating_add(identity_bytes).saturating_add(row.values.len().saturating_mul(16)),
-            |bytes, tokens| bytes.checked_add(tokens.value_data().len().saturating_mul(3))
+            |bytes, tokens| bytes.checked_add(((tokens.value_offsets()[tokens.len()] - tokens.value_offsets()[0]) as usize).saturating_mul(3))
                 .and_then(|bytes| bytes.checked_add(tokens.len().saturating_mul(56)))
                 .ok_or_else(|| fault("Search index allocation exceeds addressable memory")),
         )?;
@@ -370,8 +370,9 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         for page in pages {
             let page = page?;
             builder.pages.push(builder.rows);
+            let tokens = page.tokenize(columns)?;
             for index in 0..page.len() {
-                let row = page.row(index, columns)?;
+                let row = page.row(index, &tokens)?;
                 let iid = row.header.iid;
                 if entity.iid.is_none() && previous_member_iid.is_some_and(|previous| previous >= iid) {
                     return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));

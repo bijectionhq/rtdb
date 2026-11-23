@@ -11,7 +11,7 @@ use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_types::{Anomaly, EventOp, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchRow, file::{IndexedRow, SearchPage, artefact_identity, write_versioned_group}, definitions::SearchDefinition};
+use crate::{SearchRow, file::{IndexedRow, SearchPage, TokenPage, artefact_identity, write_versioned_group}, definitions::SearchDefinition};
 use rtdb_maintenance::input::{download, open_input, read_page};
 
 pub const KIND: &str = "search";
@@ -190,12 +190,7 @@ pub(crate) fn indexing_allowance(trie_size: i64) -> usize { usize::try_from(trie
 
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/build", error.to_string()) }
 
-fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool) -> Result<IndexedRow<'a>> {
-    let values = columns.iter().map(|column| Ok(match event.put_text(column)? {
-        PutText::Missing => None,
-        PutText::Utf8(text) => Some(rtdb_text::analyze(text)),
-        PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
-    })).collect::<Result<_>>()?;
+fn search_row(event: EventRef<'_>, values: Vec<Option<arrow_array::StringArray>>, with_identity: bool) -> Result<IndexedRow<'_>> {
     let header = event.header();
     let identity = if with_identity && header.op == EventOp::Put {
         Some(event.put_identity()?.ok_or_else(|| fault("Owned search put is missing its identity"))?)
@@ -217,20 +212,47 @@ fn test_row(row: IndexedRow<'_>) -> SearchRow {
 
 #[cfg(test)]
 fn search_batch(batch: &EventBatch, columns: &[String], owned: bool) -> Result<Vec<SearchRow>> {
-    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned).map(test_row)).collect()
+    let page = ArrowSearchPage { events: batch.clone(), _owned: None, with_identity: owned, memory: MemoryBudget::new(usize::MAX) };
+    let tokens = page.tokenize(columns)?;
+    (0..batch.len()).map(|row| page.row(row, &tokens).map(test_row)).collect()
 }
 
 pub(crate) struct ArrowSearchPage {
     events: EventBatch,
-    _owned: OwnedBatch,
+    _owned: Option<OwnedBatch>,
+    memory: Arc<MemoryBudget>,
     with_identity: bool,
 }
 
 impl SearchPage for ArrowSearchPage {
     fn len(&self) -> usize { self.events.len() }
 
-    fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
-        search_row(self.events.borrow_event(row)?, columns, self.with_identity)
+    fn tokenize(&self, columns: &[String]) -> Result<TokenPage> {
+        let mut bytes = 4096usize;
+        for column in columns {
+            for row in 0..self.len() {
+                let text = self.events.borrow_event(row)?.put_text(column)?;
+                let text_bytes = match text { PutText::Utf8(text) => text.len(), _ => 0 };
+                bytes = bytes.saturating_add(32).saturating_add(text_bytes.saturating_mul(64));
+            }
+        }
+        let charge = self.memory.reserve(bytes)?;
+        let columns = columns.iter().map(|column| {
+            let tokens = rtdb_text::analyze_batch((0..self.len()).map(|row| {
+                Ok::<_, Anomaly>(match self.events.borrow_event(row)?.put_text(column)? {
+                    PutText::Missing => None,
+                    PutText::Other => Some(""),
+                    PutText::Utf8(text) => Some(text),
+                })
+            }))?;
+            let tokens = rtdb_columnar::retain_array(Arc::new(tokens), &charge)?;
+            Ok(tokens.as_any().downcast_ref::<arrow_array::LargeListArray>().expect("retained token layout").clone())
+        }).collect::<Result<_>>()?;
+        Ok(TokenPage { columns, _reservation: Some(charge) })
+    }
+
+    fn row(&self, row: usize, tokens: &TokenPage) -> Result<IndexedRow<'_>> {
+        search_row(self.events.borrow_event(row)?, tokens.row(row), self.with_identity)
     }
 }
 
@@ -262,9 +284,23 @@ impl Iterator for PageRows {
         self.page += 1;
         Some(read_page(&mut self.reader, page, &self.memory).and_then(|owned| {
             let events = EventBatch::new(owned.batch().clone())?;
-            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity })
+            Ok(ArrowSearchPage { events, _owned: Some(owned), with_identity: self.with_identity, memory: Arc::clone(&self.memory) })
         }))
     }
+}
+
+/// Builds a format-11 search file from event batches in storage order.
+pub fn build_search_file_from_batches(
+    columns: &[String], batches: impl IntoIterator<Item = OwnedBatch>, identity: &str, memory: &Arc<MemoryBudget>,
+) -> Result<Vec<u8>> {
+    let pages = batches.into_iter().map(|owned| {
+        let events = EventBatch::new(owned.batch().clone())?;
+        Ok(ArrowSearchPage { events, _owned: Some(owned), with_identity: false, memory: Arc::clone(memory) })
+    });
+    let mut output = Vec::new();
+    let reservation = memory.reserve(4096)?;
+    crate::file::write_event_search_file(columns, pages, identity, &mut output, reservation)?;
+    Ok(output)
 }
 
 /// Reads a data file's indexed rows for diagnostics and fixtures.
@@ -272,7 +308,8 @@ pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &Cance
     let pages = search_pages_from_reader(std::io::Cursor::new(Arc::<[u8]>::from(data)), cancellation.clone(), MemoryBudget::new(usize::MAX))?;
     Ok(pages.map(move |page| {
         let page = page?;
-        (0..page.len()).map(|row| page.row(row, columns).map(test_row)).collect()
+        let tokens = page.tokenize(columns)?;
+        (0..page.len()).map(|row| page.row(row, &tokens).map(test_row)).collect()
     }))
 }
 

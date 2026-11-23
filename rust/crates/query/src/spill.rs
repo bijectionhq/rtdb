@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_schema::{DataType, Field, Schema};
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Result, Value};
@@ -51,10 +53,34 @@ impl SpillWriter {
         self.retained.reader(memory)
     }
     pub fn write(&mut self, values: &[Value], memory: &Arc<MemoryBudget>) -> Result<()> {
-        let retained = values.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(|| invalid("row-size", "Spill row size overflow")))?;
-        let _temporary = memory.reserve(retained.checked_mul(8).ok_or_else(|| invalid("row-size", "Encoded spill row size overflow"))?)?;
-        let bytes = serde_json::to_vec(values).map_err(io_error)?;
-        self.write_frame(&bytes)
+        let metadata = values.len().saturating_mul(1024).saturating_add(4096);
+        let mut builder = rtdb_columnar::BatchBuilder::new(metadata, memory)?;
+        let mut columns = Vec::with_capacity(values.len());
+        let mut fields = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let name = index.to_string();
+            let logical = value.logical_type();
+            let input = std::slice::from_ref(value);
+            let physical = if row_object(value) { None } else {
+                rtdb_columnar::to_field(&name, &logical).ok()
+            };
+            if let Some(field) = physical {
+                let estimate = rtdb_columnar::estimate_builder_bytes(&logical, input)?;
+                columns.push(builder.column(estimate, || rtdb_columnar::copy_array(&logical, input))?);
+                fields.push(field);
+            } else {
+                let bound = value.retained_bytes()?.saturating_mul(8).saturating_add(4096);
+                columns.push(builder.column(bound, || {
+                    let bytes = serde_json::to_vec(value).map_err(io_error)?;
+                    Ok(Arc::new(arrow_array::BinaryArray::from_vec(vec![bytes.as_slice()])) as ArrayRef)
+                })?);
+                let metadata = std::collections::HashMap::from([(ROW_OBJECT.into(), String::new())]);
+                fields.push(Field::new(name, DataType::Binary, false).with_metadata(metadata));
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new_with_options(schema, columns, &RecordBatchOptions::new().with_row_count(Some(1))).map_err(io_error)?;
+        self.write_arrow(&builder.finish(batch)?, metadata, memory, "sort-spill-row")
     }
 
     pub fn write_frame(&mut self, bytes: &[u8]) -> Result<()> {
@@ -95,12 +121,28 @@ impl SpillReader {
     }
     pub fn rewind(&mut self) -> Result<()> { self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; Ok(()) }
     pub fn next(&mut self) -> Result<Option<OwnedRow>> {
-        let Some((bytes, reservation)) = self.read_frame(64)? else { return Ok(None); };
-        let values = serde_json::from_slice::<Vec<Value>>(&bytes).map_err(io_error)?;
-        drop(bytes);
-        let row = OwnedRow::new(values, &self.memory)?;
-        drop(reservation);
-        Ok(Some(row))
+        let Some(batch) = self.read_arrow(false, "sort-spill-row")? else { return Ok(None); };
+        let batch = batch.batch();
+        if batch.num_rows() != 1 { return Err(invalid("invalid-spill", "Row spill frame has the wrong row count")); }
+        let bound = batch.schema_ref().fields().iter().zip(batch.columns()).try_fold(4096usize, |bytes, (field, column)| {
+            let size = if field.metadata().contains_key(ROW_OBJECT) { column.get_array_memory_size().saturating_mul(64) }
+                else if field.data_type() == &DataType::Null { 64 }
+                else { rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), 0)? };
+            bytes.checked_add(size).ok_or_else(|| invalid("row-size", "Spill row size overflow"))
+        })?;
+        let _scratch = self.memory.reserve(bound)?;
+        let values = batch.schema_ref().fields().iter().zip(batch.columns()).map(|(field, column)| {
+            if field.metadata().contains_key(ROW_OBJECT) {
+                let binary = column.as_any().downcast_ref::<arrow_array::BinaryArray>()
+                    .ok_or_else(|| invalid("invalid-spill", "Spill object has the wrong layout"))?;
+                serde_json::from_slice(binary.value(0)).map_err(io_error)
+            } else if field.data_type() == &DataType::Null && !field.is_nullable() {
+                Ok(Value::Undefined)
+            } else {
+                rtdb_columnar::read_value(field, column.as_ref(), 0)
+            }
+        }).collect::<Result<_>>()?;
+        OwnedRow::new(values, &self.memory).map(Some)
     }
 
     pub fn read_frame(&mut self, expansion: usize) -> Result<Option<(Vec<u8>, Arc<MemoryReservation>)>> {
@@ -130,6 +172,22 @@ impl SpillReader {
         let lease = Arc::get_mut(&mut reservation).expect("The spill decoder owns its reservation");
         if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
         OwnedBatch::with_reservation(batch, reservation).map(Some)
+    }
+}
+
+const ROW_OBJECT: &str = "rtdb.sort.row-object";
+
+fn row_object(value: &Value) -> bool {
+    match value {
+        Value::Date(_) => true,
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => {
+            values.iter().any(|value| matches!(value, Value::Undefined) || row_object(value))
+        }
+        Value::Struct(fields) => fields.values().any(row_object),
+        Value::Map { entries, .. } => entries.iter().any(|(key, value)| {
+            matches!(key, Value::Undefined) || matches!(value, Value::Undefined) || row_object(key) || row_object(value)
+        }),
+        _ => false,
     }
 }
 

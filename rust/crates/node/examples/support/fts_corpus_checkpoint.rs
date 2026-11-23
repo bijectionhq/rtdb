@@ -79,26 +79,95 @@ fn write_contributions<'a>(from: Option<Timestamp>, through: Timestamp, rows: im
     rtdb_format::ipc::write_arrow_stream(&schema, &[batch], arrow_ipc::writer::IpcWriteOptions::default()).unwrap()
 }
 
-fn read_contributions(bytes: &[u8]) -> (Option<Timestamp>, Timestamp, BTreeMap<i64, Option<Contribution>>) {
+fn read_contributions(bytes: &[u8]) -> (Option<Timestamp>, Timestamp, RecordBatch) {
     let mut stream = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
     let schema = stream.schema();
     let from = schema.metadata().get("from_micros").map(|time| Timestamp(time.parse().unwrap()));
     let through = Timestamp(schema.metadata()["through_micros"].parse().unwrap());
     let batch = stream.next().unwrap().unwrap();
     assert!(stream.next().is_none());
-    let ids = batch.column(0).as_primitive::<Int64Type>();
-    let lengths = batch.column(1).as_primitive::<UInt32Type>();
-    let terms = batch.column(2).as_list::<i32>();
-    let words = terms.values().as_any().downcast_ref::<StringArray>().unwrap();
-    let offsets = terms.value_offsets();
-    let rows = (0..batch.num_rows()).map(|row| {
-        let contribution = lengths.is_valid(row).then(|| Contribution {
-            length: lengths.value(row),
-            terms: (offsets[row]..offsets[row + 1]).map(|index| words.value(index as usize).to_owned()).collect(),
-        });
-        (ids.value(row), contribution)
-    }).collect();
-    (from, through, rows)
+    (from, through, batch)
+}
+
+struct ReplayCorpus {
+    basis: Timestamp,
+    pages: Vec<RecordBatch>,
+    visible: BTreeMap<i64, (usize, usize)>,
+    totals: Corpus,
+}
+
+impl ReplayCorpus {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let (from, basis, batch) = read_contributions(bytes);
+        assert!(from.is_none());
+        let mut corpus = Self { basis, pages: Vec::new(), visible: BTreeMap::new(), totals: Corpus::default() };
+        corpus.apply_batch(batch);
+        corpus
+    }
+
+    fn apply(&mut self, bytes: &[u8]) {
+        let (from, through, batch) = read_contributions(bytes);
+        assert_eq!(from, Some(self.basis));
+        assert!(through >= self.basis);
+        self.apply_batch(batch);
+        self.basis = through;
+    }
+
+    fn apply_batch(&mut self, batch: RecordBatch) {
+        let page = self.pages.len();
+        let ids = batch.column(0).as_primitive::<Int64Type>();
+        let lengths = batch.column(1).as_primitive::<UInt32Type>();
+        for (row, &id) in ids.values().iter().enumerate() {
+            if let Some((page, row)) = self.visible.remove(&id) {
+                Self::adjust(&mut self.totals, &self.pages[page], row, false);
+            }
+            if lengths.is_valid(row) {
+                Self::adjust(&mut self.totals, &batch, row, true);
+                self.visible.insert(id, (page, row));
+            }
+        }
+        self.pages.push(batch);
+    }
+
+    fn adjust(corpus: &mut Corpus, batch: &RecordBatch, row: usize, add: bool) {
+        let (length, terms) = Self::contribution(batch, row);
+        if add {
+            corpus.documents += 1;
+            corpus.tokens += u64::from(length);
+            for term in terms {
+                if let Some(count) = corpus.frequencies.get_mut(term) { *count += 1; }
+                else { corpus.frequencies.insert(term.to_owned(), 1); }
+            }
+        } else {
+            corpus.documents -= 1;
+            corpus.tokens -= u64::from(length);
+            for term in terms {
+                let count = corpus.frequencies.get_mut(term).unwrap();
+                *count -= 1;
+                if *count == 0 { corpus.frequencies.remove(term); }
+            }
+        }
+    }
+
+    fn contribution(batch: &RecordBatch, row: usize) -> (u32, impl Iterator<Item = &str>) {
+        let length = batch.column(1).as_primitive::<UInt32Type>().value(row);
+        let terms = batch.column(2).as_list::<i32>();
+        let words = terms.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let offsets = terms.value_offsets();
+        (length, (offsets[row]..offsets[row + 1]).map(move |index| words.value(index as usize)))
+    }
+
+    fn assert_matches(&self, checkpoint: &CorpusCheckpoint) {
+        assert_eq!(self.basis, checkpoint.basis);
+        assert_eq!(self.totals, checkpoint.totals);
+        assert_eq!(self.visible.len(), checkpoint.visible.len());
+        for (&id, &(page, row)) in &self.visible {
+            let expected = &checkpoint.visible[&id];
+            let (length, terms) = Self::contribution(&self.pages[page], row);
+            assert_eq!(length, expected.length);
+            assert!(terms.eq(expected.terms.iter().map(String::as_str)));
+        }
+    }
 }
 
 struct CorpusCheckpoint {
@@ -121,15 +190,6 @@ impl CorpusCheckpoint {
                 assert!(self.visible.insert(id(&row), contribution).is_none());
             }
         }
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let (from, basis, rows) = read_contributions(bytes);
-        assert!(from.is_none());
-        let visible: BTreeMap<_, _> = rows.into_iter().map(|(id, row)| (id, row.unwrap())).collect();
-        let mut totals = Corpus::default();
-        for contribution in visible.values() { contribution.add(&mut totals); }
-        Self { basis, totals, visible }
     }
 
     fn apply(&mut self, delta: &CorpusDelta) {
@@ -237,18 +297,14 @@ async fn observe(
     touched: BTreeSet<i64>,
     boundaries: &BTreeMap<Timestamp, BTreeSet<i64>>,
     history_at: Timestamp,
-    replay: &mut CorpusCheckpoint,
+    replay: &mut ReplayCorpus,
 ) -> Json {
     let start = Instant::now();
     let delta = checkpoint.advance(session, basis, touched, boundaries).await;
     let delta_us = start.elapsed().as_secs_f64() * 1e6;
     let encoded = write_contributions(Some(delta.from), delta.through, delta.replacements.iter().map(|(&id, row)| (id, row.as_ref())));
-    let (from, through, replacements) = read_contributions(&encoded);
-    let decoded = CorpusDelta { from: from.unwrap(), through, replacements };
-    replay.apply(&decoded);
-    assert_eq!(replay.totals, checkpoint.totals, "{label} replayed totals");
-    assert_eq!(replay.visible, checkpoint.visible, "{label} replayed contributions");
-    assert_eq!(replay.basis, basis);
+    replay.apply(&encoded);
+    replay.assert_matches(checkpoint);
     let start = Instant::now();
     let scan = visible(session, basis, basis, "").await;
     let exhaustive = exhaustive_corpus(&scan);
@@ -308,9 +364,8 @@ pub(super) async fn run(background_documents: i64) {
     let checkpoint_us = start.elapsed().as_secs_f64() * 1e6;
     assert_eq!(checkpoint.totals.documents, background_documents as u64 + 3);
     let bytes = write_contributions(None, checkpoint.basis, checkpoint.visible.iter().map(|(&id, row)| (id, Some(row))));
-    let mut replay = CorpusCheckpoint::from_bytes(&bytes);
-    assert_eq!(replay.totals, checkpoint.totals);
-    assert_eq!(replay.visible, checkpoint.visible);
+    let mut replay = ReplayCorpus::from_bytes(&bytes);
+    replay.assert_matches(&checkpoint);
     verify_ranking(&mut session, &checkpoint, past, past).await;
 
     clock.0.store(2_100_000, Ordering::Relaxed);

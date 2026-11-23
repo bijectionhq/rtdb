@@ -266,10 +266,6 @@ fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &
     }
 
     let schema = first.schema_ref();
-    if !schema.fields().iter().all(|field| plain_scalar_field(field)) {
-        return Ok(None);
-    }
-
     let projection = || expressions.iter().map(|expr| {
         let Expr::Column { id, .. } = expr.expr else { return None; };
         let Expr::Parameter { index, .. } = row.get(values.schema().position(id)?)? else { return None; };
@@ -515,8 +511,8 @@ mod tests {
             let encoded = source.encode().unwrap();
             let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
             let replay = SourceTransaction::decode(&message, &memory).unwrap();
-            let crate::source::Operation::PutIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
-            assert_eq!(documents.rows()[0]["v"], decimal(18, 32, i32::MAX));
+            let crate::source::Operation::PutArrowIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded Arrow documents") };
+            assert_eq!(documents.to_rows(true, &memory).unwrap().rows()[0]["v"], decimal(18, 32, i32::MAX));
         }
         let source = expanded(decimal(i128::MAX, -1, i32::MIN), &memory);
         let Value::Decimal(value) = &document(&source)["v"] else { panic!("Expected decimal") };

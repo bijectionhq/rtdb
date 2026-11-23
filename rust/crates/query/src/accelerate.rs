@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeBinaryArray, Float64Array, builder::FixedSizeBinaryBuilder};
+use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Float64Array, UInt32Array, builder::{BooleanBuilder, FixedSizeBinaryBuilder}};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_index::Snapshot;
@@ -22,6 +23,7 @@ pub trait ConstantEvaluator: Send + Sync {
 pub struct ScanRequest<'a> {
     pub database: &'a str,
     pub scan: &'a Scan,
+    pub candidate_iids: Option<&'a CandidateIids>,
     pub snapshot: &'a Snapshot,
     pub storage: &'a Arc<BufferPool>,
     pub bounds: TemporalBounds,
@@ -38,7 +40,7 @@ pub struct ScanRequest<'a> {
 #[async_trait]
 pub trait CandidateVerifier: Send + Sync {
     /// Resolves the scan, applies its predicates, and scores each surviving UTF-8 cell.
-    async fn score_visible(&self, iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId, scorer: &rtdb_text::Scorer) -> Result<CandidateScores>;
+    async fn score_visible(&self, iids: CandidateIids, column: rtdb_plan::ColumnId, scorer: &rtdb_text::Scorer) -> Result<CandidateScores>;
 }
 
 #[derive(Clone)]
@@ -102,6 +104,31 @@ impl CandidateIids {
         Self::build(iids.len(), iids, memory)
     }
 
+    pub fn from_array(values: FixedSizeBinaryArray, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if values.value_length() != 16 || values.null_count() != 0 {
+            return Err(crate::invalid("candidate-iid", "Candidate selections require non-null 16-byte IIDs"));
+        }
+        let _scratch = memory.reserve(values.len().saturating_mul(size_of::<usize>()))?;
+        let mut positions = (0..values.len()).collect::<Vec<_>>();
+        positions.sort_unstable_by(|&left, &right| values.value(left).cmp(values.value(right)));
+        positions.dedup_by(|left, right| values.value(*left) == values.value(*right));
+        Self::build(positions.len(), positions.into_iter().map(|row| {
+            Iid(values.value(row).try_into().expect("fixed width iid"))
+        }), memory)
+    }
+
+    pub fn union(&self, other: &Self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let mut left = self.iter().peekable();
+        let mut right = other.iter().peekable();
+        let merged = std::iter::from_fn(|| match (left.peek(), right.peek()) {
+            (Some(a), Some(b)) if a == b => { right.next(); left.next() }
+            (Some(a), Some(b)) if a < b => left.next(),
+            (_, Some(_)) => right.next(),
+            _ => left.next(),
+        });
+        Self::build(self.len().saturating_add(other.len()), merged, memory)
+    }
+
     fn build(capacity: usize, iids: impl IntoIterator<Item = Iid>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = memory.reserve(256usize.saturating_add(capacity.saturating_mul(16)))?;
         let mut values = FixedSizeBinaryBuilder::with_capacity(capacity, 16);
@@ -111,7 +138,7 @@ impl CandidateIids {
 
     pub fn len(&self) -> usize { self.values.len() }
     pub fn is_empty(&self) -> bool { self.values.is_empty() }
-    pub fn iter(&self) -> impl Iterator<Item = Iid> + '_ {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Iid> + '_ {
         (0..self.len()).map(|row| Iid(self.values.value(row).try_into().expect("fixed width iid")))
     }
 
@@ -125,6 +152,12 @@ impl CandidateIids {
     }
 
     pub fn contains(&self, iid: Iid) -> bool { self.intersects(iid, iid) }
+
+    pub(crate) fn between(&self, lower: Iid, upper: Iid) -> impl Iterator<Item = Iid> + '_ {
+        (self.lower_bound(lower)..self.len()).map(|row| {
+            Iid(self.values.value(row).try_into().expect("fixed width iid"))
+        }).take_while(move |iid| *iid <= upper)
+    }
 
     pub(crate) fn intersects(&self, lower: Iid, upper: Iid) -> bool {
         let row = self.lower_bound(lower);
@@ -179,10 +212,21 @@ pub trait ScanAccelerator: Send + Sync {
 /// MATCH on the rows of one data file, by page and row within the page: `None` where the column is null or absent, as MATCH is.
 pub trait FileMatches: Send + Sync {
     fn value(&self, page: usize, row: usize) -> Result<Option<bool>>;
+
+    fn select(&self, page: usize, rows: &UInt32Array) -> (BooleanArray, BooleanBuffer) {
+        let mut values = BooleanBuilder::with_capacity(rows.len());
+        let mut answered = BooleanBufferBuilder::new(rows.len());
+        for &row in rows.values() {
+            let value = self.value(page, row as usize);
+            answered.append(value.is_ok());
+            values.append_option(value.ok().flatten());
+        }
+        (values.finish(), answered.finish())
+    }
 }
 
 /// The values of a MATCH the scan evaluates, on every row of some of the data files it reads, by the file's object key.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MatchAnswers { files: std::collections::BTreeMap<String, Arc<dyn FileMatches>> }
 
 impl MatchAnswers {

@@ -71,7 +71,7 @@ impl Service {
                     let connection = self.tx_or_session(&call, command.transaction_id.as_ref()).await?;
                     let mut native = connection.borrow().await?;
                     while let Some(batch) = upload.next().await? {
-                        let operation = if let Some(documents) = ArrowDocuments::from_batch(&batch, self.memory()).map_err(status)? {
+                        let operation = if let Some(documents) = ArrowDocuments::from_ingest_batch(&batch, self.memory()).map_err(status)? {
                             TxOp::PutArrowDocs { table: table.clone(), documents }
                         } else {
                             let (rows, _scratch) = documents(batch.batch(), self)?;

@@ -46,7 +46,7 @@ impl<'a> From<&'a EntityId> for EntityIdRef<'a> {
 pub fn read_entity_id<'a>(field: &Field, array: &'a dyn Array, row: usize) -> Result<EntityIdRef<'a>> {
     if row >= array.len() || field.data_type() != array.data_type() { return Err(invalid()); }
     match field.data_type() {
-        DataType::Union(fields, UnionMode::Dense) => {
+        DataType::Union(fields, _) => {
             let union = array.as_union();
             let id = union.type_id(row);
             let (_, child) = fields.iter().find(|(tag, _)| *tag == id).ok_or_else(invalid)?;
@@ -71,7 +71,7 @@ pub fn read_entity_id<'a>(field: &Field, array: &'a dyn Array, row: usize) -> Re
             let logical = from_field(field)?;
             let logical = match &logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
             Ok(match logical {
-                LogicalType::Scalar(ScalarType::Utf8) => EntityIdRef::String(array.as_string::<i32>().value(row)),
+                LogicalType::Scalar(ScalarType::Utf8) => EntityIdRef::String(crate::text::physical_text(array, row)?.ok_or_else(invalid)?),
                 LogicalType::Scalar(ScalarType::Keyword) => EntityIdRef::Keyword(array.as_string::<i32>().value(row)),
                 LogicalType::Scalar(ScalarType::I8) => EntityIdRef::Integer(i64::from(array.as_primitive::<Int8Type>().value(row))),
                 LogicalType::Scalar(ScalarType::I16) => EntityIdRef::Integer(i64::from(array.as_primitive::<Int16Type>().value(row))),

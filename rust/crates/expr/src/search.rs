@@ -28,7 +28,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 let tokens = document_tokens(text, context)?;
                 Ok(Value::I64(i64::from(stored_length(tokens.len()))))
             }
-            ("search_corpus_fingerprint", [Value::List(ids), Value::List(bodies)]) => {
+            ("search_corpus_fingerprint", [Value::List(ids) | Value::FixedSizeList(ids), Value::List(bodies) | Value::FixedSizeList(bodies)]) => {
                 if ids.len() != bodies.len() {
                     return Err(invalid_documents());
                 }
@@ -99,7 +99,7 @@ fn explicit_corpus(
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(invalid)
     };
-    let Value::List(list) = list else {
+    let (Value::List(list) | Value::FixedSizeList(list)) = list else {
         return Err(invalid());
     };
     let documents = count(documents)?;
