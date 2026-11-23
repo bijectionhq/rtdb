@@ -396,6 +396,7 @@ mod tests {
     fn a_uuid_column_does_not_certify_a_mismatched_physical_iid() {
         let id = [1; 16];
         let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent {
+            commit_position: 0,
             iid, entity_key: None, system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Uuid(id))])),
         });

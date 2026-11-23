@@ -1224,7 +1224,7 @@ mod tests {
         for matching in ["invoice", "\"overdue invoice\"", "\"invoice overdue\"", "invoice missing"] {
             let matching = Query::parse(matching);
             let scoring = Arc::new(Scorer::new(Query::parse("paid overdue"), None)).for_ranking().unwrap();
-            let mut ranked = pages.ranked_for_query("body", &matching, &scoring, at(2, 2), TreeRankOrder::Integer).unwrap();
+            let mut ranked = pages.ranked_for_query("body", &matching, &scoring, at(2, 2), true).unwrap();
             let mut got = Vec::new();
             while ranked.bound().is_some() {
                 let batches = ranked.expand(None, &mut 0).await.unwrap();
