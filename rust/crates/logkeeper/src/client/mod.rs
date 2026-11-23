@@ -502,6 +502,10 @@ impl Shared {
 
 #[async_trait]
 impl Log for QuorumLog {
+    fn maximum_append_bytes(&self) -> Option<usize> {
+        matches!(&self.shared.role, Role::Writer(_)).then_some(self.shared.ensemble.config.maximum_message_bytes)
+    }
+
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
         if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }

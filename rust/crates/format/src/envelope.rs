@@ -140,9 +140,18 @@ impl ReplicaFrame {
 }
 
 impl ReplicaEnvelope {
+    /// Allows for both term fields at their largest wire widths, before the appender has assigned them.
+    pub fn maximum_encoded_len(message: &ReplicaBody) -> usize {
+        Self::framed_len(message, u64::MAX, Some(u64::MAX))
+    }
+
     pub fn encoded_len(&self) -> usize {
-        1 + self.message.encoded_len() + 1 + varint_length(self.term.0 as u64)
-            + self.term_sequence.map_or(0, |sequence| 1 + varint_length(sequence.0 as u64))
+        Self::framed_len(&self.message, self.term.0 as u64, self.term_sequence.map(|sequence| sequence.0 as u64))
+    }
+
+    fn framed_len(message: &ReplicaBody, term: u64, sequence: Option<u64>) -> usize {
+        1 + message.encoded_len() + 1 + varint_length(term)
+            + sequence.map_or(0, |sequence| 1 + varint_length(sequence))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {

@@ -9,7 +9,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, TrieCatalog};
 use rtdb_storage::{log::{LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
-use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver};
+use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -1156,10 +1156,12 @@ impl ReplicationDriver {
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
                 let clock = Arc::clone(&self.clock);
+                let maximum_inline_bytes = self.logs.replica_inline_limit();
                 leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
                     let _decoded_reservation = _decoded_reservation;
                     let result = match request {
-                        Some(request) => resolver.resolve_source_with_clock(durable, position, metadata.timestamp, request, &context, Some(clock.as_ref())).await,
+                        Some(request) => resolver.resolve_source_for_writer(durable, position, metadata.timestamp, request, &context,
+                            Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes })).await,
                         None => async {
                             let digits = position.0.to_string();
                             let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;

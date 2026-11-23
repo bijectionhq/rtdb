@@ -88,6 +88,8 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
 
 #[async_trait]
 impl Log for MemoryLog {
+    fn maximum_append_bytes(&self) -> Option<usize> { Some(self.shared.maximum_message_bytes) }
+
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         if payload.len() > self.shared.maximum_message_bytes {
             return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.shared.maximum_message_bytes });

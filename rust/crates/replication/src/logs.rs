@@ -132,15 +132,16 @@ impl PartitionLogs {
         self.source_position(metadata)
     }
     pub async fn enqueue_replica(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp) -> Result<ReplicaReceipt> {
-        self.enqueue_replica_with(envelope, block, now, |_| Ok(())).await
+        self.enqueue_replica_with(envelope, block, now, true, |_| Ok(())).await
     }
+    pub(crate) fn replica_inline_limit(&self) -> Option<usize> { self.replica.maximum_append_bytes() }
     pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp,
-        before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
+        allow_offload: bool, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
         let payload = EncodedPayload::encode(envelope.encoded_len(), &self.memory, || Ok(envelope.encode()))?;
         before_enqueue(&payload)?;
         let receipt = match self.replica.enqueue(payload.clone(), now).await {
             Ok(receipt) => receipt,
-            Err(StorageError::MessageTooLarge { .. }) => {
+            Err(StorageError::MessageTooLarge { .. }) if allow_offload => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
                 let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,

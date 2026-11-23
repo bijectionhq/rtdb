@@ -152,15 +152,21 @@ impl ReplicaAppender {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let resolved;
-                    let body = match &request.write.body {
-                        WriteBody::Resolved(tx) => match tx.to_replica_body(&self.memory) { Ok(body) => { resolved = body; resolved.body() }, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } },
-                        WriteBody::Message(body) => body,
+                    let (body, allow_offload) = match &request.write.body {
+                        WriteBody::Resolved(tx) => match tx.inline_replica_body() {
+                            Some(body) => (body, false),
+                            None => match tx.to_replica_body(&self.memory) {
+                                Ok(body) => { resolved = body; (resolved.body(), true) }
+                                Err(error) => { request.write.finish(Err(error.clone())); break Err(error); }
+                            },
+                        },
+                        WriteBody::Message(body) => (body, true),
                     };
                     let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
                     let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
                     let observation = self.durable_commit_observation(&request.write.body);
-                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, (self.clock)(),
+                    let enqueue = self.logs.enqueue_replica_with(&envelope, request.write.block, (self.clock)(), allow_offload,
                         |frame| request.write.stamp_append(sequence, frame));
                     match observe_enqueue(enqueue, &self.cancellation, &mut receipts).await {
                         Ok(Some(receipt)) => { receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable, observation)); timer.reset(); }

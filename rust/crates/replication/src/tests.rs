@@ -736,6 +736,10 @@ async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persis
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };
+    let Err(error) = fixture.logs.enqueue_replica_with(&envelope, BlockIndex(0), Timestamp(100), false, |_| Ok(())).await
+        else { panic!("an inline-only append must fail before emitting an oversized proxy"); };
+    assert_eq!(error.code, "rtdb.storage/message-too-large");
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
     fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
     let record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
     assert!(matches!(ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
