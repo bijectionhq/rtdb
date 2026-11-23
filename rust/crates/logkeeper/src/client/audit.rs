@@ -144,6 +144,67 @@ fn range_unavailable() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/retained-range-unavailable", "The exact committed interval is unavailable")
 }
 
+/// A bounded cursor through an immutable committed interval. Pages are
+/// provisional until the final raw history digest matches the certificate.
+pub struct CertifiedRangeReader {
+    ensemble: Ensemble,
+    certificate: JournalDigest,
+    chain: RetainedChain,
+    next: i64,
+    preferred: usize,
+}
+
+impl CertifiedRangeReader {
+    pub fn new(config: &StreamConfig, certificate: &JournalDigest) -> Result<Self> {
+        validate(config)?;
+        let [first, through] = certificate.interval;
+        if certificate.stream != config.stream || first < 0 || through < first
+            || through == i64::MAX || certificate.digest_bytes().is_none()
+        {
+            return Err(range_unavailable());
+        }
+        Ok(Self {
+            ensemble: Ensemble::new(config.clone()),
+            certificate: certificate.clone(),
+            chain: RetainedChain::new(&config.stream, first),
+            next: first,
+            preferred: 0,
+        })
+    }
+
+    /// Returns at most one bounded protocol page. Observe completion before
+    /// publishing anything that depends on the replayed records.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<crate::protocol::Entry>>> {
+        let through = self.certificate.interval[1];
+        if self.next > through {
+            if self.chain.digest() != self.certificate.digest { return Err(range_unavailable()); }
+            return Ok(None);
+        }
+        let max_entries = u32::try_from(through - self.next + 1).unwrap_or(u32::MAX)
+            .min(MAXIMUM_BATCH_ENTRIES);
+        for offset in 0..self.ensemble.len() {
+            let server = (self.preferred + offset) % self.ensemble.len();
+            let Ok(page) = self.ensemble.read(server, self.next, max_entries, Duration::ZERO).await else {
+                continue;
+            };
+            if page.trim_lsn >= self.next || page.commit_lsn < through || page.entries.is_empty()
+                || page.entries.len() > max_entries as usize
+                || page.entries.iter().enumerate().any(|(index, entry)| entry.lsn != self.next + index as i64)
+            {
+                continue;
+            }
+            for entry in &page.entries { self.chain.append(entry); }
+            self.next += page.entries.len() as i64;
+            self.preferred = server;
+            if self.next > through && self.chain.digest() != self.certificate.digest {
+                return Err(range_unavailable());
+            }
+            return Ok(Some(page.entries));
+        }
+        Err(range_unavailable())
+    }
+}
+
 /// Reads one complete retained copy whose raw bytes match the exact-range certificate.
 pub async fn copy_certified_range(
     config: &StreamConfig, certificate: &JournalDigest, maximum_bytes: usize, maximum_entries: usize,
