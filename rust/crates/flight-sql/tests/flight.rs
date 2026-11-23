@@ -861,8 +861,15 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
 }
 
 
-#[tokio::test]
-async fn owned_spatial_flight_pages_share_the_original_cut() {
+#[test]
+fn owned_spatial_flight_pages_share_the_original_cut() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(check_spatial_pages_at_the_original_cut());
+    }).unwrap().join().unwrap();
+}
+
+async fn check_spatial_pages_at_the_original_cut() {
     use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, UnionArray, builder::{BinaryBuilder, Int64Builder, ListBuilder, StringBuilder}};
     use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
     use rtdb_format::ipc::write_arrow_stream;

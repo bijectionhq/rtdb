@@ -2512,7 +2512,7 @@ impl Service {
         }
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         let mut charge = None;
-        let output = if let Some(rows) = page.rows() {
+        let output = if let Some(rows) = page.rows().filter(|rows| rows.batch().num_rows() != 0) {
             let batch = rows.batch();
             let (source, target) = (batch.schema_ref().field(0), schema.field(0));
             let array = batch.column(0);
