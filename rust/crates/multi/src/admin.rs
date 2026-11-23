@@ -595,6 +595,15 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory.as_ref(), &child, source.ensemble.len()).await?;
     let source_key = fork_key(keys, source).await?;
+    let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
+        .ok_or_else(|| fork_unavailable(&source.name))?;
+    crate::archive::require_plain_fork_cut(bucket.clone(), source, &source_key, selected).await?;
+    if tail.iter().any(|envelope| matches!(&envelope.message,
+        rtdb_format::envelope::ReplicaBody::ResolvedTx(tx)
+            if tx.table_data.keys().any(|name| rtdb_types::TableRef::is_owned_lifetime_replica_table(name))
+    )) {
+        return Err(fork_unavailable(&source.name));
+    }
     let child_stream = if tail.is_empty() {
         None
     } else {
@@ -620,12 +629,12 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             None => bucket,
         };
         let key = if same_organisation {
-            crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), at_block).await?;
+            crate::reference::fork(bucket.as_ref(), &source.storage_prefix(), &child.storage_prefix(), Some(selected)).await?;
             keys.install(&child.key_id(), source_key).await?;
             source_key
         } else {
             let key = keys.key(&child.key_id()).await?;
-            crate::archive::copy_fork_checkpoint(bucket.clone(), source, &source_key, &child, &key, at_block).await?;
+            crate::archive::copy_fork_checkpoint(bucket.clone(), source, &source_key, &child, &key, Some(selected)).await?;
             key
         };
         if let Some(stream) = &child_stream {

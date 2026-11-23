@@ -860,6 +860,31 @@ async fn plan_checkpoint_copy(
     Ok(sources)
 }
 
+/// Generic deployment forks have no authority over this deployment-scoped
+/// policy. The terminal transfer and hosted world owners retain exact custody.
+pub(crate) async fn require_plain_fork_cut(
+    bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, source_key: &[u8], selected: i64,
+) -> Result<()> {
+    let root = format!("{}/{}", source.storage_prefix(), checkpoint_storage_root()?);
+    let marker = bucket.get_fresh(&key(&format!("{root}/{ROOT_MARKER}"))?).await?;
+    if marker.as_ref() != source.id.as_bytes() {
+        return Err(inconsistent("The checkpoint belongs to another source"));
+    }
+    let store = open_deployment_store(bucket, &root, PackDiscovery::From(selected), wall_clock()).await?;
+    let plaintext = EncryptingStore::new(store, source_key)?;
+    let catalog = BlockCatalog::decode(&plaintext.get_fresh(&key(&block_key(BlockIndex(selected))?)?).await?)?;
+    if catalog.block_index().0 != selected || !catalog.secondary_databases().is_empty() {
+        return Err(inconsistent("The fork checkpoint has another catalog or secondary databases"));
+    }
+    if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
+        verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
+    }
+    if catalog.table_entries()?.iter().any(|entry| entry.table.owned_lifetime_relation().is_some()) {
+        return Err(unavailable("Generic deployment forks cannot carry placed lifetime replay authority"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn copy_fork_checkpoint(
     bucket: Arc<dyn ObjectStore>,
     source: &DeploymentRecord,
