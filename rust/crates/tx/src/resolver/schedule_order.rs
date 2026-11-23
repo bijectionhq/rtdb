@@ -63,6 +63,39 @@ fn action_command_matches(record: &Json) -> bool {
     ))
 }
 
+pub(super) fn clock_command_matches(record: &Json) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let Some(task) = record.get("task") else { return false };
+    let waiting = task.get("wait_for");
+    let Some(command) = task.get("command") else { return false };
+    if command.is_null() {
+        return waiting.is_none();
+    }
+    let Some(command) = command.as_str() else { return false };
+    let computed = format!("{:x}", Sha256::digest(command.as_bytes()));
+    if task["digest"].as_str() != Some(computed.as_str()) {
+        return false;
+    }
+    let Some(waiting) = waiting else {
+        return command.starts_with("[\"bijection.task.emit.v2\",");
+    };
+    let Ok(ordered) = serde_json::from_str::<Json>(command) else { return false };
+    let Some(original) = waiting["key"].as_str().filter(|key| key.strip_prefix("bj1-").is_some_and(digest))
+    else { return false };
+    let Some(name) = task.pointer("/continuation/name").and_then(Json::as_str)
+    else { return false };
+    let address = serde_json::json!(["bijection.native-clock-await.v1", original, name]).to_string();
+    let key = format!("bj1-{:x}", Sha256::digest(address.as_bytes()));
+    ordered[0].as_str() == Some("bijection.task.await-clock.v1")
+        && &ordered[1] == waiting
+        && waiting["digest"].as_str().is_some_and(digest)
+        && task["key"].as_str() == Some(key.as_str())
+        && ordered[2]["name"].as_str() == Some(name)
+        && ordered[2]["handler"] == task["continuation"]["handler"]
+        && ordered[2]["onFailure"] == task["continuation"]["on_failure"]
+}
+
 fn continuation_policy_matches(continuation: &Json) -> bool {
     let Some(record) = continuation.as_object() else { return false };
     let named = record.get("name").is_some_and(|name| {
@@ -152,6 +185,9 @@ pub(super) fn validate(operations: &[Operation]) -> Result<()> {
                 return Err(Anomaly::incorrect("rtdb.hosted/task-command", "The action carrier differs from its authored command"));
             }
             continue;
+        }
+        if !clock_command_matches(&data) {
+            return Err(Anomaly::incorrect("rtdb.hosted/task-command", "The clock carrier differs from its authored command"));
         }
         if data.pointer("/task/continuation/kind").and_then(Json::as_str) == Some("cron") {
             let task = data.pointer("/task/key").and_then(Json::as_str).ok_or_else(invalid)?;
