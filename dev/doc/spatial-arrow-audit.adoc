@@ -6,6 +6,11 @@ This inventory follows the native geospatial path from Bijection's clear Root in
 |===
 | Path | Avoidable conversion | Current path
 
+| Bijection spatial schema authoring
+| The current table builder could not declare a spatial path from the SDK.
+| The SDK exports the native geometry field validator independently of the `spatialIndex` recipe.
+Adding the recipe to an installed eligible table keeps the validator and the stored geometry carrier fixed, so Root publication can stage and backfill the new path.
+
 | Bijection write admission
 | The admission check serialized admitted geometry to WKB and discarded the bytes.
 | Admission checks the geometry model.
