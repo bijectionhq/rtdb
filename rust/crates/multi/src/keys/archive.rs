@@ -1,13 +1,13 @@
 //! Operation-only custody for a checkpoint archive and its dependent suffix.
 
-use std::{fs, io::ErrorKind, ops::Range, path::Path, sync::Arc, time::Instant};
+use std::{fs, io::ErrorKind, ops::Range, path::Path, sync::Arc, time::{Duration, Instant}};
 
 use bytes::Bytes;
 use ring::{
     digest::{SHA256, digest},
     hmac,
 };
-use rtdb_storage::{Error, IoRegion, ObjectKey};
+use rtdb_storage::{Error, IoRegion, ObjectKey, sealing::{ObjectCipher, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 use crate::cipher::Cipher;
@@ -19,7 +19,7 @@ use super::{
 };
 
 #[async_trait::async_trait]
-pub trait ArchiveKey: Send + Sync {
+pub trait ArchiveKey: ObjectCipher {
     async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes>;
     async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes>;
     async fn seal_object(&self, name: &ObjectKey, plaintext: Bytes) -> rtdb_storage::Result<Bytes>;
@@ -52,6 +52,16 @@ pub(crate) fn legacy_archive_key(key: &[u8; KEY_BYTES]) -> Result<Arc<dyn Archiv
         cipher: Cipher::new(key)?,
         comparison,
     }))
+}
+
+#[async_trait::async_trait]
+impl ObjectCipher for LegacyArchiveKey {
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        if matches!(operation, UnitOperation::Grant) {
+            return Err(Error::Closed("Raw archive material cannot confirm delivery".into()));
+        }
+        operation.apply(&self.cipher, name)
+    }
 }
 
 #[async_trait::async_trait]
@@ -234,6 +244,81 @@ pub(super) trait CaptureCryptography: Send + Sync {
         operation: UnitOperation,
     ) -> rtdb_storage::Result<UnitOutput>;
     async fn matches_authority_key(&self, candidate: [u8; KEY_BYTES]) -> Result<bool>;
+
+    async fn grant(&self, name: &ObjectKey) -> rtdb_storage::Result<UnitOutput> {
+        self.crypt(name.clone(), UnitOperation::Grant).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: CaptureCryptography> ObjectCipher for T {
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        match operation {
+            UnitOperation::Grant => self.grant(name).await,
+            operation => self.crypt(name.clone(), operation).await,
+        }
+    }
+}
+
+pub(super) fn tracked_archive_key(key: impl CaptureCryptography + 'static) -> Arc<dyn ArchiveKey> {
+    Arc::new(TrackedArchiveKey(Arc::new(key)))
+}
+
+struct TrackedArchiveKey(Arc<dyn ArchiveKey>);
+
+impl TrackedArchiveKey {
+    fn track(&self, name: &ObjectKey) -> rtdb_storage::Result<()> {
+        let owner: Arc<dyn ObjectCipher> = self.0.clone();
+        PlaintextView::track(&owner, name)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectCipher for TrackedArchiveKey {
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        self.0.operate(name, operation).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ArchiveKey for TrackedArchiveKey {
+    async fn seal(&self, associated: &str, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.0.seal(associated, plaintext).await
+    }
+
+    async fn open(&self, associated: &str, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
+        let plaintext = self.0.open(associated, ciphertext).await?;
+        self.track(&associated_unit(associated)?)?;
+        Ok(plaintext)
+    }
+
+    async fn seal_object(&self, name: &ObjectKey, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.0.seal_object(name, plaintext).await
+    }
+
+    async fn open_object(&self, name: &ObjectKey, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
+        let plaintext = self.0.open_object(name, ciphertext).await?;
+        self.track(name)?;
+        Ok(plaintext)
+    }
+
+    async fn open_frame_header(&self, name: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<FramedObject> {
+        let header = self.0.open_frame_header(name, sealed).await?;
+        self.track(name)?;
+        Ok(header)
+    }
+
+    async fn open_frames(
+        &self, name: &ObjectKey, layout: FramedObject, frames: Range<usize>, sealed: Bytes,
+    ) -> rtdb_storage::Result<Bytes> {
+        let plaintext = self.0.open_frames(name, layout, frames, sealed).await?;
+        self.track(name)?;
+        Ok(plaintext)
+    }
+
+    async fn matches(&self, candidate: [u8; KEY_BYTES]) -> Result<bool> {
+        self.0.matches(candidate).await
+    }
 }
 
 fn associated_unit(associated: &str) -> rtdb_storage::Result<ObjectKey> {
@@ -329,6 +414,29 @@ pub(super) fn matches_authority_key(key: &[u8; KEY_BYTES], candidate: [u8; KEY_B
 
 #[async_trait::async_trait]
 impl CaptureCryptography for LocalArchiveKey {
+    async fn grant(&self, name: &ObjectKey) -> rtdb_storage::Result<UnitOutput> {
+        let vault = self.vault.clone();
+        let unit_vault = self.unit_vault.clone();
+        let id = self.id.clone();
+        let slot = UnitScope::archive(&id).slot(name);
+        // A grant can be confirmed after the archive's object region has drained.
+        IoRegion::new().run_blocking(move || {
+            let map = super::journal::key_error;
+            let path = vault.path(&id).map_err(map)?;
+            let authority = vault.lock_key_shared(&path).map_err(map)?;
+            let mut secret = read_key(&path, fs::read(&path).map_err(io).map_err(map)?).map_err(map)?;
+            secret.fill(0);
+            let until = read_schedule(&path).map_err(map)?.map(|due| {
+                let remaining = u64::try_from(due.saturating_sub(rtdb_directory::now_ms())).unwrap_or_default();
+                if remaining == 0 { return Err(Error::ErasedUnderView); }
+                Instant::now().checked_add(Duration::from_millis(remaining)).ok_or_else(unit::expired)
+            }).transpose()?;
+            let unit = unit_vault.hold_local_unit_delivery(&slot)?;
+            let custody = Arc::new((authority, unit));
+            Ok(UnitOutput::HeldGrant { until, custody })
+        }).await
+    }
+
     async fn crypt(
         &self,
         name: ObjectKey,
@@ -374,6 +482,30 @@ mod tests {
     use crate::keys::KeyService;
     use rtdb_storage::ReadReservation;
     use rtdb_types::MemoryBudget;
+
+    #[tokio::test]
+    async fn archive_delivery_owns_the_capture_and_refuses_expired_plaintext() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = LocalKeyService::with_archive_broker(temp.path())?;
+        let io = IoRegion::new();
+        let id = "answer";
+        let key = vault.archive_key(id, true, io.clone()).await?;
+        let name = ObjectKey::new("tables/t/data/l00-rc-b00.arrow")?;
+        let sealed = key.seal_object(&name, Bytes::from_static(b"held answer")).await?;
+        let view = PlaintextView::new(MemoryBudget::new(64 << 10));
+        let retained = view.reading(key.open_object(&name, sealed)).await?;
+        io.close_and_wait().await;
+        assert_eq!(retained.as_ref(), b"held answer");
+
+        let broker = vault.archive_vault()?;
+        let lock = broker.open_key_lock(&broker.path(id)?)?;
+        let grant = view.grant().await?;
+        assert!(matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(grant);
+        assert!(vault.schedule_archive_key(id, rtdb_directory::now_ms() - 1).await?);
+        assert_eq!(view.grant().await.err().unwrap().code, "rtdb/erased-under-view");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cancelled_archive_frame_keeps_its_reservation_until_the_region_drains() -> Result<()> {

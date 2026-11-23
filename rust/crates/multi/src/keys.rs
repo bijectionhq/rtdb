@@ -241,7 +241,7 @@ impl LocalKeyService {
                 return Err(archive::revoked());
             }
             vault.read_or_create_key(&vault_path, provision)?;
-            return Ok(Arc::new(archive::LocalArchiveKey { unit_vault: vault.clone(), vault, id, region }));
+            return Ok(archive::tracked_archive_key(archive::LocalArchiveKey { unit_vault: vault.clone(), vault, id, region }));
         }
         if provision {
             drop(raw_lock);
@@ -249,20 +249,30 @@ impl LocalKeyService {
         } else {
             read_key(&path, fs::read(&path).map_err(io)?)?;
         }
-        Ok(Arc::new(archive::LocalArchiveKey { vault: self.clone(), unit_vault: self.archive_vault()?, id, region }))
+        Ok(archive::tracked_archive_key(archive::LocalArchiveKey { vault: self.clone(), unit_vault: self.archive_vault()?, id, region }))
     }
     fn region_path(&self, region: uuid::Uuid) -> PathBuf {
         self.directory.join(format!("{region}.storage-region"))
     }
 
-    fn lock_key(&self, path: &Path) -> Result<File> {
-        let lock = File::options()
+    fn open_key_lock(&self, path: &Path) -> Result<File> {
+        File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path.with_extension("lock"))
-            .map_err(io)?;
+            .map_err(io)
+    }
+
+    fn lock_key_shared(&self, path: &Path) -> Result<File> {
+        let lock = self.open_key_lock(path)?;
+        lock.lock_shared().map_err(io)?;
+        Ok(lock)
+    }
+
+    fn lock_key(&self, path: &Path) -> Result<File> {
+        let lock = self.open_key_lock(path)?;
         lock.lock().map_err(io)?;
         match fs::remove_file(path.with_extension("pending")) {
             Ok(()) => self.sync_directory()?,

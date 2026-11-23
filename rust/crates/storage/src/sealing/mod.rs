@@ -90,6 +90,7 @@ pub enum UnitOutput {
     Bytes(Bytes),
     Header(FramedObject),
     Granted,
+    HeldGrant { until: Option<std::time::Instant>, custody: Arc<dyn Send + Sync> },
 }
 
 impl UnitOutput {
@@ -100,9 +101,10 @@ impl UnitOutput {
         }
     }
 
-    fn granted(self) -> crate::Result<()> {
+    fn granted(self) -> crate::Result<(Option<std::time::Instant>, Option<Arc<dyn Send + Sync>>)> {
         match self {
-            Self::Granted => Ok(()),
+            Self::Granted => Ok((None, None)),
+            Self::HeldGrant { until, custody } => Ok((until, Some(custody))),
             _ => Err(Error::Task("Expected a key owner’s delivery grant".into())),
         }
     }

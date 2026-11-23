@@ -218,6 +218,19 @@ impl LocalKeyService {
         result
     }
 
+    pub(super) fn hold_local_unit_delivery(&self, slot: &UnitSlot) -> rtdb_storage::Result<(File, File)> {
+        let scope = self.path(&slot.scope.namespace()).map_err(key_error)?;
+        let scope_hold = self.lock_key_shared(&scope).map_err(key_error)?;
+        if local_scope_closed(&scope).map_err(key_error)? {
+            return Err(Error::ErasedUnderView);
+        }
+        let path = self.path(&slot.id()).map_err(key_error)?;
+        let slot_hold = self.lock_key_shared(&path).map_err(key_error)?;
+        let mut material = self.read_or_create_key(&path, false).map_err(key_error)?;
+        material.fill(0);
+        Ok((scope_hold, slot_hold))
+    }
+
     pub(super) fn with_local_slot<T>(
         &self,
         slot: &UnitSlot,

@@ -438,6 +438,31 @@ pub(crate) fn result_stream<T: Send + 'static>(call: Call, values: Vec<Result<T,
     let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
 }
 
+pub(crate) fn action_result_stream(
+    call: Call, values: Vec<Result<flight::Result, Status>>,
+    plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
+) -> Result<Response<Output<flight::Result>>, Status> {
+    let headers = call.response(())?.metadata().clone();
+    let stream: Output<flight::Result> = Box::pin(futures::stream::unfold(
+        (call, values.into_iter(), plaintext, false),
+        |(call, mut values, plaintext, stopped)| async move {
+            if stopped { return None; }
+            let value = values.next()?;
+            let result = call.cancellation.run_until_cancelled(async {
+                let value = value?;
+                let grant = plaintext.grant().await.map_err(status)?;
+                grant.check().map_err(status)?;
+                Ok(value)
+            }).await.unwrap_or_else(|| Err(cancelled()));
+            let stop = result.is_err();
+            Some((result, (call, values, plaintext, stop)))
+        },
+    ));
+    let mut response = Response::new(stream);
+    *response.metadata_mut() = headers;
+    Ok(response)
+}
+
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = Output<flight::HandshakeResponse>;

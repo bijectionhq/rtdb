@@ -6,7 +6,7 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
-use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
+use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
@@ -295,14 +295,16 @@ impl Service {
                 None => work.await,
             }
         };
-        let results = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
+        let plaintext = rtdb_storage::sealing::PlaintextView::new(Arc::clone(call.memory()));
+        let results = call.cancellation.run_until_cancelled(plaintext.reading(work)).await
+            .ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         if call.session.audience_source().is_some()
             && (results.len() > 1 || results.iter().any(|result| result.as_ref().is_ok_and(|reply|
                 reply.encoded_len() > AUDIENCE_REPLY_BYTES)))
         {
             return Err(call.error(Status::resource_exhausted("The audience reply exceeds its transport allowance")));
         }
-        self.publish(); result_stream(call, results)
+        self.publish(); action_result_stream(call, results, plaintext)
     }
     fn claim_transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {
         self.transaction(call, handle)?; found(self.0.transactions.take(handle), "transaction")

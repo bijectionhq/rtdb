@@ -251,7 +251,8 @@ where
         }
         Ok((capture, suffix))
     };
-    stage::with_region(
+    let plaintext = rtdb_storage::sealing::PlaintextView::new(Arc::clone(resources.memory));
+    let read = stage::with_region(
         directory,
         keys,
         &deployment,
@@ -397,8 +398,10 @@ where
                 run(context, basis, terminal_source).await
             })).await.ok_or_else(|| unavailable("The retained checkpoint read was cancelled"))?
         },
-    )
-    .await
+    );
+    let answer = plaintext.reading(read).await?;
+    plaintext.grant().await?;
+    Ok(answer)
 }
 
 /// The accepted inventory is the only source of bytes for a world read.

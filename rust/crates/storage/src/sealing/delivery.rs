@@ -73,7 +73,7 @@ impl PlaintextView {
         }
     }
 
-    pub(super) fn track(cipher: &Arc<dyn ObjectCipher>, name: &ObjectKey) -> Result<()> {
+    pub fn track(cipher: &Arc<dyn ObjectCipher>, name: &ObjectKey) -> Result<()> {
         let tracked = PLAINTEXT_VIEWS.try_with(|views| {
             for view in views.iter() {
                 let key = (Arc::as_ptr(cipher) as *const () as usize, name.clone());
@@ -101,15 +101,17 @@ impl PlaintextView {
     }
 
     pub async fn grant(&self) -> rtdb_types::Result<PlaintextDelivery> {
-        let (_allocation, units) = {
+        let (allocation, units) = {
             let units = self.units.lock();
-            let bytes = units.len().saturating_mul(std::mem::size_of::<Arc<Unit>>());
+            let element = std::mem::size_of::<Arc<Unit>>() + std::mem::size_of::<Arc<dyn Send + Sync>>();
+            let bytes = units.len().saturating_mul(element);
             (
                 self.memory.reserve(bytes)?,
                 units.values().cloned().collect::<Vec<_>>(),
             )
         };
         let mut deadline = None;
+        let mut custody = Vec::new();
         for unit in units {
             let now = Instant::now();
             let mut cutoff = now + GRANT_WINDOW;
@@ -136,8 +138,13 @@ impl PlaintextView {
                     let checked = tokio::time::timeout_at(cutoff.into(), check)
                         .await
                         .map_err(|_| expired())??;
-                    checked.granted()?;
-                    *unit.expires.lock() = Some(cutoff);
+                    let (until, held) = checked.granted()?;
+                    let cutoff = until.map_or(cutoff, |until| until.min(cutoff));
+                    if let Some(held) = held {
+                        custody.push(held);
+                    } else {
+                        *unit.expires.lock() = Some(cutoff);
+                    }
                     cutoff
                 }
             };
@@ -146,6 +153,8 @@ impl PlaintextView {
         let delivery = PlaintextDelivery {
             deadline,
             view: None,
+            _custody: custody,
+            _allocation: allocation,
         };
         delivery.check()?;
         Ok(delivery)
@@ -163,6 +172,8 @@ fn expired() -> rtdb_types::Anomaly {
 pub struct PlaintextDelivery {
     deadline: Option<Instant>,
     view: Option<(Arc<HeldView>, Option<Arc<ReadLease>>)>,
+    _custody: Vec<Arc<dyn Send + Sync>>,
+    _allocation: Arc<MemoryReservation>,
 }
 
 impl PlaintextDelivery {
