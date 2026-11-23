@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    ArchivedObject, CapturePoint, capture_receipt, checkpoint_storage_root, digest, encode,
+    ArchivedObject, CapturePoint, MAXIMUM_MANIFEST_BYTES, capture_receipt, checkpoint_storage_root, digest, encode,
     inconsistent, read_object, require_capture_open, unavailable, verified_archive,
 };
 use crate::{
@@ -434,7 +434,8 @@ async fn copy_checkpoint(
             "The staged installation must have its own media key",
         ));
     }
-    let target_cipher = Cipher::new(&media_key)?;
+    let stage_key = keys.staged_key(&target.key_id(), Arc::clone(&target_io)).await?;
+    let serving_cipher = Cipher::new(&media_key)?;
     let source = PrefixedStore::new(bucket, format!("{prefix}/objects"));
     let destination = PrefixedStore::new(
         storage.bucket(target_io).await?,
@@ -448,7 +449,11 @@ async fn copy_checkpoint(
         let name = key(&object.name)?;
         let ciphertext = read_object(&source, &name, object).await?;
         let plaintext = object.open(source_cipher.as_ref(), &name, ciphertext).await?;
-        let resealed = target_cipher.seal_object(&name, &plaintext)?;
+        let resealed = match capture.format {
+            CheckpointContents::Primary => stage_key.seal_object(&name, plaintext).await?,
+            // Transfer replay persists directly into its eventual serving namespace.
+            CheckpointContents::Replay => serving_cipher.seal_object(&name, &plaintext)?,
+        };
         let staged = ArchivedObject::from_sealed(&name, &resealed)?;
         put_exact(&destination, &name, resealed).await?;
         expected.insert(name);
@@ -460,8 +465,12 @@ async fn copy_checkpoint(
         CheckpointContents::Replay => StageInventory::Replay { objects },
     };
     let inventory = encode(&inventory)?;
+    if inventory.len() as u64 > MAXIMUM_MANIFEST_BYTES {
+        return Err(inconsistent("Staged checkpoint inventory exceeds its bound"));
+    }
     let digest = digest(&inventory);
-    put_exact(&destination, &manifest_name, inventory).await?;
+    let sealed = stage_key.seal_object(&manifest_name, inventory).await?;
+    put_exact(&destination, &manifest_name, sealed).await?;
     let observed = destination
         .list(None)
         .await?

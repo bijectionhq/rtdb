@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    CapturePoint, checkpoint_objects, checkpoint_storage_root, digest, encode,
-    inconsistent, read,
+    CapturePoint, MAXIMUM_MANIFEST_BYTES, checkpoint_objects, checkpoint_storage_root, digest,
+    inconsistent,
     read_world::CapturedObjects,
     stage::{STAGED_MANIFEST, StageInventory, with_region},
     unavailable,
@@ -328,15 +328,22 @@ async fn open_inventory(
         ));
     }
     let manifest_path = key(STAGED_MANIFEST)?;
-    let manifest = read::<StageInventory>(&files, &manifest_path)
-        .await?
-        .ok_or_else(|| unavailable("The staged checkpoint inventory is missing"))?;
-    let observed_digest = digest(&encode(&manifest)?);
-    if stage.staged_manifest_sha256.as_deref() != Some(observed_digest.as_str()) {
+    let media_id = record.key_id();
+    let stage_key = keys.staged_key(&media_id, Arc::clone(&region)).await?;
+    let maximum = crate::cipher::object::sealed_size(&manifest_path, MAXIMUM_MANIFEST_BYTES as usize)?;
+    let head = files.head_fresh(&manifest_path).await?;
+    let length = usize::try_from(head.size)
+        .ok().filter(|length| *length <= maximum)
+        .ok_or_else(|| inconsistent("Staged checkpoint inventory exceeds its bound"))?;
+    let sealed = files.get_fresh_exact(&manifest_path, length).await?;
+    let bytes = stage_key.open_object(&manifest_path, sealed).await?;
+    if stage.staged_manifest_sha256.as_deref() != Some(digest(&bytes).as_str()) {
         return Err(inconsistent(
             "The staged inventory differs from its accepted digest",
         ));
     }
+    let manifest: StageInventory = serde_json::from_slice(&bytes)
+        .map_err(|_| inconsistent("The staged checkpoint inventory is malformed"))?;
     let (contents, manifest) = manifest.into_contents();
     let root_marker = key(ROOT_MARKER)?;
     let mut objects = BTreeMap::new();
@@ -370,15 +377,22 @@ async fn open_inventory(
             "The staged storage root differs from its accepted inventory",
         ));
     }
-    let material = keys
-        .existing_key(&record.key_id())
-        .await?
-        .ok_or_else(|| unavailable("The staged checkpoint key is unavailable"))?;
+    let material = match contents {
+        CheckpointContents::Primary => None,
+        CheckpointContents::Replay => Some(keys.existing_key(&media_id).await?
+            .ok_or_else(|| unavailable("The staged checkpoint key is unavailable"))?),
+    };
     let legacy_trie_data = objects.iter().any(|(name, object)| object.is_legacy_trie(name));
-    let plaintext = Arc::new(CapturedObjects { files, objects, cipher: crate::keys::legacy_archive_key(&material)? });
+    let cipher = match &material {
+        None => stage_key,
+        Some(material) => crate::keys::legacy_archive_key(material)?,
+    };
+    let plaintext = Arc::new(CapturedObjects { files, objects, cipher });
     let extras = observed.difference(&expected).cloned().collect::<BTreeSet<_>>();
     if !extras.is_empty() {
-        let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(Arc::clone(&bucket), root)), &material)?;
+        let material = material.as_ref()
+            .ok_or_else(|| inconsistent("The primary stage contains unclaimed objects"))?;
+        let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(Arc::clone(&bucket), root)), material)?;
         Box::pin(owned_inventory::verify_seeded_payloads(bucket.as_ref(), &serving, plaintext.as_ref(), keys, record, stage, extras, region)).await?;
     }
     let point = CapturePoint {

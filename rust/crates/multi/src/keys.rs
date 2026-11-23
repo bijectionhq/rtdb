@@ -115,6 +115,11 @@ pub trait KeyService: Send + Sync {
         legacy_archive_key(&key)
     }
 
+    /// An independently withdrawable slot for each staged inventory member.
+    async fn staged_key(&self, _id: &str, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        Err(unit::unsupported())
+    }
+
     async fn archive_key_is_operation_only(&self, _id: &str) -> Result<bool> { Ok(false) }
 
     async fn schedule_archive_key(&self, _id: &str, _due_at_ms: i64) -> Result<bool> {
@@ -412,6 +417,10 @@ impl KeyService for LocalKeyService {
         let id = id.to_owned();
         let key_region = Arc::clone(&region);
         region.run_blocking(move || Ok(vault.open_archive_key(id, provision, key_region))).await?
+    }
+
+    async fn staged_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        self.archive_key(id, false, region).await
     }
 
     async fn archive_key_is_operation_only(&self, id: &str) -> Result<bool> {

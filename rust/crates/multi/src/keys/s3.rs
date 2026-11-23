@@ -226,6 +226,10 @@ impl KeyService for S3KeyService {
         self.open_capture(id, provision, region).await
     }
 
+    async fn staged_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        self.open_capture(id, false, region).await
+    }
+
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         self.destroy(id).await?;
         self.withdraw_registered_scope(UnitScope::archive(id)).await?;
