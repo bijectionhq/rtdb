@@ -286,7 +286,11 @@ pub(super) struct CapacityCondition<'a> {
 }
 
 pub(super) fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Item = CapacityCondition<'_>> {
-    operations.iter().filter_map(|operation| match operation {
+    operations.iter().filter_map(capacity_condition)
+}
+
+fn capacity_condition(operation: &Operation) -> Option<CapacityCondition<'_>> {
+    match operation {
         Operation::Public(TxOp::OwnedCheckCapacity {
             relation,
             column,
@@ -299,7 +303,7 @@ pub(super) fn capacity_conditions(operations: &[Operation]) -> impl Iterator<Ite
             at_most: *at_most,
         }),
         _ => None,
-    })
+    }
 }
 
 impl OpenTransaction<'_> {
@@ -404,21 +408,19 @@ impl OpenTransaction<'_> {
     }
 
     pub(super) async fn check_capacity_source(&self, operations: &[Operation]) -> Result<()> {
-        let mut conditions = capacity_conditions(operations).peekable();
-        if conditions.peek().is_none() {
+        if capacity_conditions(operations).next().is_none() {
             return Ok(());
         }
         let has_deadline = operations
             .iter()
             .any(|op| matches!(op, Operation::Public(TxOp::OwnedDeadline { .. })));
         let base = self.buffer.base_snapshot();
-        for CapacityCondition {
-            relation,
-            column,
-            prefix,
-            at_most,
-        } in conditions
-        {
+        for operation in operations {
+            let Some(CapacityCondition { relation, column, prefix, at_most }) =
+                capacity_condition(operation)
+            else {
+                continue;
+            };
             if at_most < 0
                 || relation.world().is_some()
                 || relation.is_world_catalog()
@@ -441,19 +443,17 @@ impl OpenTransaction<'_> {
         } else if capacity_conditions(operations).any(|condition| condition.relation.world().is_some()) {
             return Err(count_uncovered(uncovered()));
         }
-        let mut conditions = capacity_conditions(operations)
-            .filter(|condition| condition.relation.world().is_none()).peekable();
-        if conditions.peek().is_none() {
+        if !capacity_conditions(operations).any(|condition| condition.relation.world().is_none()) {
             return Ok(());
         }
         let snapshot = self.snapshot()?;
-        for CapacityCondition {
-            relation,
-            column,
-            prefix,
-            at_most,
-        } in conditions
-        {
+        for operation in operations {
+            let Some(CapacityCondition { relation, column, prefix, at_most }) =
+                capacity_condition(operation)
+            else {
+                continue;
+            };
+            if relation.world().is_some() { continue; }
             let count = self
                 .declared_prefix_count(snapshot.clone(), relation, column, prefix)
                 .await?;
