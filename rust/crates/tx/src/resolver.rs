@@ -1694,7 +1694,7 @@ impl<'a> OpenTransaction<'a> {
                 let floor = replay.lifetime(relation).ok_or_else(lifetime_uncovered)?;
                 floor.check(duration, replay.source_time())?;
                 let original = replay.take_expiry(relation, id)?;
-                Ok((duration, original))
+                Ok::<_, Anomaly>((duration, original))
             }).transpose()?
         } else { None };
         let snapshot = self.snapshot()?;
