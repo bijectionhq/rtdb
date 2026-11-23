@@ -61,6 +61,8 @@ message BlockUploaded {
     int64 latest_processed_msg_id = 4;
     repeated TrieDetails tries = 5;
     bytes external_source_token = 6;
+    // SHA-256 of the exact encoded block catalog selected by this upload.
+    bytes catalog_sha256 = 7;
 }
 
 message FlushBlock {

@@ -72,7 +72,7 @@ fn raw(position: i64, term: i64, sequence: i64, body: ReplicaBody) -> LogRecord 
 fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary(proto::BlockBoundary { block_index: Some(index), latest_processed_msg_id: Some(source), external_source_token: None }) }
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
 fn upload(index: i64, source: i64) -> ReplicaBody {
-    ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None })
+    ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None, catalog_sha256: None })
 }
 
 #[tokio::test]
@@ -1277,6 +1277,22 @@ async fn promotion_requires_the_recovered_checkpoint_to_still_be_stored() {
     restarted.try_promote().await.unwrap();
     assert!(restarted.leader.as_ref().unwrap().recovery_write.is_some(), "the restored root can be confirmed");
     restarted.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_chosen_upload_cannot_confirm_different_catalog_bytes() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (_, mut restarted) = reopen_memory_checkpoint(&fixture).await;
+    let mut root = restarted.recovered_confirmation.as_ref().unwrap().catalog.publication_sha256().unwrap();
+    root[0] ^= 1;
+    let ReplicaBody::BlockUploaded(upload) = upload(0, -1) else { unreachable!(); };
+    let envelope = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(2)),
+        message: ReplicaBody::BlockUploaded(proto::BlockUploaded { catalog_sha256: Some(root.to_vec()), ..upload }),
+    };
+    let error = restarted.consume(raw_with_envelope(2, &envelope)).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.replication/checkpoint-digest");
+    assert!(restarted.recovered_confirmation.is_some());
 }
 
 #[tokio::test]

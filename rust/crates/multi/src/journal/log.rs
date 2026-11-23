@@ -566,6 +566,10 @@ impl AsRef<[u8]> for Delivery {
 
 #[async_trait]
 impl Log for JournalLog {
+    fn requires_checkpoint_digest(&self) -> bool {
+        true
+    }
+
     fn retains_synced_history(&self) -> bool {
         true
     }

@@ -443,6 +443,7 @@ fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Res
 
 #[async_trait]
 impl Log for SealedLog {
+    fn requires_checkpoint_digest(&self) -> bool { self.inner.requires_checkpoint_digest() }
     fn maximum_append_bytes(&self) -> Option<usize> {
         self.inner.maximum_append_bytes()?.checked_sub(SEALED_OVERHEAD)
     }

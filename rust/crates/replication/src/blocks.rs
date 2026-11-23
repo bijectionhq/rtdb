@@ -111,15 +111,21 @@ impl RecoveredBlockConfirmation {
             storage_version: Some(storage_version.0), storage_epoch: Some(storage_epoch.0), block_index: Some(catalog.block_index().0),
             latest_processed_msg_id: catalog.as_proto().latest_processed_msg_id,
             external_source_token: catalog.external_source_token().map(<[u8]>::to_vec),
+            catalog_sha256: Some(checkpoint_digest(&catalog)?.to_vec()),
             tries: tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
         };
         Ok(Self { catalog, body: ReplicaBody::BlockUploaded(upload), _reservation: reservation })
     }
 
-    pub fn matches(&self, record: &ReplicaRecord) -> bool {
-        let (ReplicaBody::BlockUploaded(expected), ReplicaBody::BlockUploaded(observed)) = (&self.body, &record.envelope.message) else { return false; };
-        self.catalog.boundary_replica_position().is_some_and(|boundary| record.metadata.position > boundary)
-            && matches_confirmation(&self.catalog, observed, StorageVersion(expected.storage_version.unwrap_or_default()), StorageEpoch(expected.storage_epoch.unwrap_or_default()))
+    pub(crate) fn matches(&self, record: &ReplicaRecord, required: bool) -> Result<bool> {
+        let (ReplicaBody::BlockUploaded(expected), ReplicaBody::BlockUploaded(observed)) = (&self.body, &record.envelope.message) else { return Ok(false); };
+        let follows_boundary = self.catalog.boundary_replica_position().is_some_and(|boundary| record.metadata.position > boundary);
+        if !follows_boundary || !matches_confirmation(&self.catalog, observed,
+            StorageVersion(expected.storage_version.unwrap_or_default()), StorageEpoch(expected.storage_epoch.unwrap_or_default())) {
+            return Ok(false);
+        }
+        validate_uploaded_root(&self.catalog, observed, required)?;
+        Ok(true)
     }
 }
 
@@ -136,6 +142,18 @@ pub(crate) fn matches_confirmation(catalog: &BlockCatalog, upload: &proto::Block
         && upload.block_index == Some(catalog.block_index().0)
         && upload.latest_processed_msg_id == catalog.as_proto().latest_processed_msg_id
         && upload.external_source_token.as_deref() == catalog.external_source_token()
+}
+
+pub(crate) fn checkpoint_digest(catalog: &BlockCatalog) -> Result<[u8; 32]> {
+    catalog.publication_sha256().ok_or_else(|| invalid("The block catalog has no exact published encoding"))
+}
+
+pub(crate) fn validate_uploaded_root(catalog: &BlockCatalog, upload: &proto::BlockUploaded, required: bool) -> Result<()> {
+    match upload.catalog_sha256.as_deref() {
+        Some(chosen) if chosen == checkpoint_digest(catalog)?.as_slice() => Ok(()),
+        None if !required => Ok(()),
+        _ => Err(Anomaly::fault("rtdb.replication/checkpoint-digest", "The accepted upload does not certify the exact stored catalog")),
+    }
 }
 
 pub(crate) fn matches_catalog_boundary(catalog: &BlockCatalog, record: &ReplicaRecord) -> bool {
@@ -406,7 +424,8 @@ impl BlockStore {
         let ReplicaBody::BlockUploaded(upload) = &confirmation.body else { return Err(invalid("Recovered confirmation has no upload body")); };
         let written = upload.tries.iter().map(|detail| legacy_table_ref(detail.table_name.as_deref().unwrap_or_default())).collect::<Result<BTreeSet<_>>>()?;
         check_cancelled(cancellation)?;
-        self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await?;
+        let stored = self.load_fresh_catalog(index).await?;
+        validate_uploaded_root(&stored, upload, true)?;
         for entry in confirmation.catalog.table_entries()? {
             check_cancelled(cancellation)?;
             self.store.head_fresh(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;

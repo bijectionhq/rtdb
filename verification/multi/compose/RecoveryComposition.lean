@@ -48,6 +48,28 @@ theorem recovery_reissues_exact_chosen_append
   exact ⟨congrArg Protocol.Append.receipt agrees,
     OrderedJournal.repeated_payload_returns_exact_receipt retained⟩
 
+theorem recovery_reissues_append_after_cohort_repair
+    {oldLedger : Ledger OldVoter} {newLedger : Ledger NewVoter}
+    {before after : OrderedJournal.State} {position : Nat}
+    (oldVoters : Protocol.Evidence oldLedger) (newVoters : Protocol.Evidence newLedger)
+    (transfer : Protocol.Transfer oldLedger newLedger)
+    (initial : RecordedAppend oldLedger before position) (recovered : Protocol.Seal newLedger)
+    (beforeSeal : initial.seal.decisions.length ≤ transfer.finalSource.decisions.length)
+    (afterInstall : transfer.installedBase.decisions.length ≤ recovered.decisions.length)
+    (selected : recovered.decisions[position]? = some (.append result))
+    (path : OrderedJournal.Trace readers activations before after)
+    (live : after.observed < result.receipt.expiresAt.next) :
+    initial.record.receipt = result.receipt ∧
+      OrderedJournal.Reissue after (projectAttempt result.receipt) result.receipt.requestDigest =
+        some (projectReceipt result.receipt) := by
+  have agrees := Protocol.same_append_after_transfer oldVoters newVoters transfer initial.seal
+    recovered beforeSeal afterInstall initial.selected selected
+  have decoded := initial.decoded
+  rw [agrees] at decoded
+  have retained := OrderedJournal.live_receipt_survives_recovery decoded path live
+  exact ⟨congrArg Protocol.Append.receipt agrees,
+    OrderedJournal.repeated_payload_returns_exact_receipt retained⟩
+
 /-- All the native semantics live in this function. An applied position can
 justify readiness while fidelity still requires a value at the exact cut. -/
 structure ReadProjection (Meaning : Type) (state : OrderedJournal.State) where
@@ -83,6 +105,7 @@ theorem prepared_checkpoint_and_trim_need_no_writer
   exact ⟨trimmed, .cons publishStep (.cons trimStep (.nil trimmed)), rfl, rfl, rfl⟩
 
 #print axioms recovery_reissues_exact_chosen_append
+#print axioms recovery_reissues_append_after_cohort_repair
 #print axioms prepared_checkpoint_and_trim_need_no_writer
 
 end RTDB.Recovery.Composition

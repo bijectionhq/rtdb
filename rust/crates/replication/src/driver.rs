@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedReplayedPrimary, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
-use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
+use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catalog_boundary, matches_confirmation, validate_uploaded_root};
 use crate::logs::{APPEND_CAPACITY, DecodedReplica, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::matching_present_integer;
@@ -675,6 +675,7 @@ impl ReplicationDriver {
                         candidate.boundary < position
                             && matches_confirmation(&candidate.catalog, upload, self.logs.storage_version, self.logs.storage_epoch)
                     }) {
+                        validate_uploaded_root(&candidate.catalog, upload, self.logs.requires_checkpoint_digest())?;
                         candidate.confirmed = true;
                     }
                 }
@@ -947,8 +948,18 @@ impl ReplicationDriver {
     }
 
     async fn confirm_recovered_block(&mut self, record: &ReplicaRecord) -> Result<bool> {
-        let historical = self.historical_confirmations.iter().position(|checkpoint| checkpoint.matches(record));
-        let current = self.recovered_confirmation.as_ref().is_some_and(|checkpoint| checkpoint.matches(record));
+        let required = self.logs.requires_checkpoint_digest();
+        let mut historical = None;
+        for (index, checkpoint) in self.historical_confirmations.iter().enumerate() {
+            if checkpoint.matches(record, required)? {
+                historical = Some(index);
+                break;
+            }
+        }
+        let current = match &self.recovered_confirmation {
+            Some(checkpoint) => checkpoint.matches(record, required)?,
+            None => false,
+        };
         if historical.is_none() && !current { return Ok(false); }
 
         let own = if let Some(leader) = &self.leader {
@@ -1017,6 +1028,7 @@ impl ReplicationDriver {
                 let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Matching upload has no pending block"))?;
                 let (catalog, table_blocks) = self.blocks.load(pending.block_index()).await?;
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
+                validate_uploaded_root(&catalog, message, self.logs.requires_checkpoint_digest())?;
                 let tries = additions(&message.tries)?;
                 self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
                 self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
@@ -1037,6 +1049,12 @@ impl ReplicationDriver {
                 }
                 self.publish_status(self.role());
                 continue;
+            }
+            if let ReplicaBody::BlockUploaded(upload) = &record.envelope.message
+                && let Some(installed) = self.partition.value().table_catalog().block()
+                && matches_confirmation(installed, upload, self.logs.storage_version, self.logs.storage_epoch)
+            {
+                validate_uploaded_root(installed, upload, self.logs.requires_checkpoint_digest())?;
             }
             if self.pending_block.is_some() && self.upload_for_installed_block(&record) {
                 self.complete_control(&record);
@@ -1235,6 +1253,7 @@ impl ReplicationDriver {
                 let message = ReplicaBody::BlockUploaded(proto::BlockUploaded {
                     storage_version: Some(self.logs.storage_version.0), storage_epoch: Some(self.logs.storage_epoch.0), block_index: Some(pending.block_index().0),
                     latest_processed_msg_id: boundary.latest_processed_msg_id, external_source_token: boundary.external_source_token.clone(),
+                    catalog_sha256: Some(checkpoint_digest(&produced.catalog)?.to_vec()),
                     tries: produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
                 });
                 let write = PendingWrite::new(WriteBody::Message(message), pending.block_index(), None, &self.resolve.memory)?;
