@@ -352,6 +352,13 @@ enum HistoryCalculator {
     Admitted(AdmittedPolygonCalculator),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedImage {
+    Value,
+    Absent,
+    Erased,
+}
+
 pub struct HistoryResolver {
     calculator: HistoryCalculator,
     bounds: TemporalBounds,
@@ -391,23 +398,35 @@ impl HistoryResolver {
         Ok(result)
     }
 
-    /// Emits each visible value fragment in the order `resolve_in` would return it.
-    /// A selected redacted fragment produces an erasure refusal. Its original
-    /// extent still participates in the ceiling at its original system position.
+    /// Value-only projection for callers that cannot carry erased segments.
     pub fn resolve_fragments(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval, Interval) -> Result<()>) -> Result<()> {
+        self.visit_winners(header, |image, fragment| match image {
+            ResolvedImage::Value => emit(fragment.valid_time, fragment.system_time),
+            ResolvedImage::Absent => Ok(()),
+            ResolvedImage::Erased => Err(Anomaly::incorrect(
+                "rtdb.temporal/erased-assertion", "A selected assertion was erased",
+            )),
+        })
+    }
+
+    /// Emits the selected event's clipped rectangles with their disclosure state.
+    /// The caller retains the input event's identity for every emitted rectangle.
+    pub fn visit_winners(&mut self, header: &EventHeader, mut emit: impl FnMut(ResolvedImage, Rectangle) -> Result<()>) -> Result<()> {
         let bounds = self.bounds;
         let clamp_valid_time = self.clamp_valid_time;
         let mut emit_polygon = |polygon: PolygonView<'_>| {
-            if !matches!(header.op, EventOp::Put | EventOp::Redacted) { return Ok(()); }
+            let image = match header.op {
+                EventOp::Put => ResolvedImage::Value,
+                EventOp::Delete => ResolvedImage::Absent,
+                EventOp::Redacted => ResolvedImage::Erased,
+                EventOp::Erase => return Ok(()),
+            };
             for (valid_from, valid_to, system_to) in polygon.ranges() {
                 let valid_time = Interval::new(valid_from, valid_to)?;
                 if header.system_from >= system_to { continue; }
                 let system_time = Interval::new(header.system_from, system_to)?;
                 if let Some(fragment) = bounds.admit_fragment(TemporalBounds { valid_time, system_time }, clamp_valid_time) {
-                    if header.op == EventOp::Redacted {
-                        return Err(Anomaly::incorrect("rtdb.temporal/erased-assertion", "A selected assertion was erased"));
-                    }
-                    emit(fragment.valid_time, fragment.system_time)?;
+                    emit(image, Rectangle { valid_time: fragment.valid_time, system_time: fragment.system_time })?;
                 }
             }
             Ok(())

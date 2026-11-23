@@ -1,4 +1,4 @@
-use rtdb_temporal::{HistoryResolver, Rectangle, resolve_ordered, visibility};
+use rtdb_temporal::{HistoryResolver, Rectangle, ResolvedImage, resolve_ordered, visibility};
 use rtdb_types::{EventHeader, EventOp, Iid, Interval, MemoryBudget, TemporalBounds, Timestamp};
 use std::sync::Arc;
 
@@ -138,6 +138,40 @@ fn redaction_refuses_only_where_the_original_assertion_wins() {
                 None => assert_eq!(actual.unwrap_err().code, "rtdb.temporal/erased-assertion"),
             }
         }
+    }
+}
+
+#[test]
+fn window_keeps_erased_retracted_and_readable_winners_at_their_positions() {
+    let span = |from, to| Interval::from_micros(from, to).unwrap();
+    let old = EventHeader {
+        iid: Iid([1; 16]), system_from: Timestamp(10), commit_position: 1,
+        valid_time: span(0, 100), op: EventOp::Put,
+    };
+    let erased = EventHeader {
+        system_from: Timestamp(20), commit_position: 2,
+        valid_time: span(20, 80), op: EventOp::Redacted, ..old
+    };
+    let retraction = EventHeader {
+        commit_position: 3, valid_time: span(40, 60), op: EventOp::Delete, ..erased
+    };
+    let bounds = TemporalBounds { valid_time: span(10, 90), system_time: span(20, 21) };
+    let memory = MemoryBudget::new(1 << 20);
+    for mut resolver in [HistoryResolver::new(bounds, true), HistoryResolver::new_in(bounds, true, Arc::clone(&memory))] {
+        let mut actual = Vec::new();
+        for header in [retraction, erased, old] {
+            resolver.visit_winners(&header, |image, fragment| {
+                actual.push((header.commit_position, image, fragment.valid_time));
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(actual, [
+            (3, ResolvedImage::Absent, span(40, 60)),
+            (2, ResolvedImage::Erased, span(20, 40)),
+            (2, ResolvedImage::Erased, span(60, 80)),
+            (1, ResolvedImage::Value, span(10, 20)),
+            (1, ResolvedImage::Value, span(80, 90)),
+        ]);
     }
 }
 
