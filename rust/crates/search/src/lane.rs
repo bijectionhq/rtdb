@@ -16,6 +16,8 @@ use crate::{SearchRow, file::{IndexedRow, SearchPage, artefact_identity, write_v
 use rtdb_maintenance::input::{download, open_input, read_page};
 
 mod logical;
+mod forward;
+pub(crate) use forward::forward_id;
 pub(crate) use logical::{LogicalIndex, history_id, run_identity};
 
 pub const KIND: &str = "search";
@@ -35,9 +37,10 @@ impl SearchArtefacts {
 
 impl rtdb_maintenance::ArtefactKind for SearchArtefacts {
     fn name(&self) -> &str { KIND }
+    fn enables_event_history(&self) -> bool { self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION }
     fn builder(&self, database: rtdb_maintenance::ArtefactDatabase) -> Result<Arc<dyn ArtefactBuilder>> {
         let clock = Arc::clone(&database.clock);
-        Ok(Arc::new(SearchBuilder::new(database.name, database.store, database.storage, database.memory, Arc::new(move || clock().into()), Arc::clone(&self.runtime))))
+        Ok(Arc::new(SearchBuilder::new(database.name, database.store, database.storage, database.memory, Arc::new(move || clock().into()), Arc::clone(&self.runtime)).with_retained(database.retained)))
     }
 }
 
@@ -50,13 +53,19 @@ pub struct SearchBuilder {
     clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>,
     runtime: Arc<crate::SearchRuntime>,
     columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
+    retained: Option<Arc<dyn rtdb_maintenance::RetainedArtefactSource>>,
     scrubbed: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), [u8; 32]>>,
 }
 
 impl SearchBuilder {
     pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>, runtime: Arc<crate::SearchRuntime>) -> Self {
-        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), scrubbed: Mutex::new(BTreeMap::new()) }
+        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), retained: None, scrubbed: Mutex::new(BTreeMap::new()) }
     }
+    fn with_retained(mut self, retained: Option<Arc<dyn rtdb_maintenance::RetainedArtefactSource>>) -> Self {
+        self.retained = retained;
+        self
+    }
+
     async fn search_definitions(&self, partition: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<SearchDefinition>> {
         let now = (self.clock)();
         let snapshot = partition.snapshot();
@@ -106,7 +115,7 @@ impl ArtefactBuilder for SearchBuilder {
     }
 
     fn retire_with_owner(&self, record: &ArtefactRecord) -> bool {
-        record.definition_id().ends_with("f15") || record.definition_id().ends_with("f16h")
+        record.definition_id().ends_with("f15") || record.definition_id().ends_with("f16h") || record.definition_id().ends_with("f16w")
     }
 
     async fn prepare_serving_search(&self, snapshot: rtdb_index::Snapshot, cancellation: &CancellationToken)
@@ -141,7 +150,7 @@ impl ArtefactBuilder for SearchBuilder {
         };
         let mut records = Vec::new();
         for definition in definitions.into_iter().filter(|definition| &definition.table == table) {
-            if definition.id.ends_with("f16h") {
+            if definition.id.ends_with("f16w") {
                 let public = logical::LogicalIndex::from_history(&definition);
                 match self.seal_logical(&public, snapshot, trie, file, size, cancellation).await {
                     Ok(record) => records.push(record),
@@ -191,11 +200,13 @@ impl ArtefactBuilder for SearchBuilder {
         Ok(definitions.iter().map(|definition| {
             let logical = self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION && logical::LogicalIndex::supports(definition);
             let format = if logical { crate::file::LOGICAL_FORMAT_VERSION } else { self.runtime.write_format().min(crate::file::PACKED_FORMAT_VERSION) };
-            let id = if logical { logical::history_id(definition) } else { definition.artefact_id_for(format) };
+            let id = if logical { forward_id(definition) } else { definition.artefact_id_for(format) };
             for format in [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION] {
                 columns.insert((definition.table.clone(), definition.artefact_id_for(format), definition.version), definition.columns.clone());
             }
-            columns.insert((definition.table.clone(), logical::history_id(definition), definition.version), definition.columns.clone());
+            for id in [logical::history_id(definition), forward_id(definition)] {
+                columns.insert((definition.table.clone(), id, definition.version), definition.columns.clone());
+            }
             ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version,
                 historical: definition.history, group_bytes: (!logical).then(|| group_bytes(&self.memory)), packed: self.prepares_serving_search() }
         }).collect())
@@ -204,7 +215,7 @@ impl ArtefactBuilder for SearchBuilder {
     fn retained_definitions(&self, definitions: &[ArtefactDefinition]) -> Vec<ArtefactDefinition> {
         definitions.iter().flat_map(|definition| {
             let prefix = definition.id.rsplit_once('f').map_or(definition.id.as_str(), |(prefix, _)| prefix);
-            ["11", "12", "13", "14", "15", "16h"]
+            ["11", "12", "13", "14", "15", "16h", "16w"]
                 .map(|format| ArtefactDefinition { id: format!("{prefix}f{format}"), ..definition.clone() })
         }).collect()
     }
@@ -236,6 +247,7 @@ impl ArtefactBuilder for SearchBuilder {
 
     async fn build(&self, job: &ArtefactJob, source: rtdb_maintenance::ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let definition = &job.definition;
+        if definition.id.ends_with("f16w") { return self.build_forward(job, source, snapshot, cancellation).await; }
         let suspect = crate::runtime::Suspect { database: self.database.clone(), table: definition.table.clone(), owner: job.owner.clone(), artefact_id: definition.id.clone(), version: definition.version };
         let repairing = matches!(source, rtdb_maintenance::ArtefactSource::Stored) && self.runtime.is_suspect(&suspect);
         let history = definition.id.ends_with("f16h");
@@ -478,7 +490,12 @@ impl SearchPage for ArrowSearchPage {
         {
             proof.store(false, Ordering::Relaxed);
         }
-        search_row(event, columns, self.with_identity, self.seal.as_ref(), self.mode)
+        let origin = event.origin();
+        let mut indexed = search_row(event, columns, self.with_identity, self.seal.as_ref(), self.mode)?;
+        if self.mode == crate::file::BuildMode::Postings {
+            indexed.header.commit_position = logical::posting_position(indexed.header, origin, row)?;
+        }
+        Ok(indexed)
     }
 }
 
@@ -544,6 +561,7 @@ mod tests {
     fn a_uuid_column_does_not_certify_a_mismatched_physical_iid() {
         let id = [1; 16];
         let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent {
+            origin: None,
             commit_position: 0,
             iid, entity_key: None, system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Uuid(id))])),
@@ -582,6 +600,7 @@ mod tests {
             StoredOperation::Delete,
             StoredOperation::Erase,
         ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+            origin: None,
             commit_position: 0,
             entity_key: Some(Arc::from(identities[index].handle_bytes())),
             iid: Iid([index as u8; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation,

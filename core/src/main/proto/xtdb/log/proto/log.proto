@@ -171,17 +171,21 @@ message SearchRun {
     int64 rebuild = 8;
     int64 source_rows = 9;
     bool has_erases = 10;
+  bytes allocation = 11;
 }
 
 message SearchRunChange {
     SearchRun run = 1;
     repeated bytes replaces = 2;
     bool retire_only = 3;
+  bool abandon = 4;
 }
 
 message RetiredSearchRun {
     SearchRun run = 1;
     int64 superseded_at = 2;
+  bool abandoned = 3;
+  bool released = 4;
 }
 
 message ArtefactsAdded {

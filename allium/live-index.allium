@@ -533,6 +533,7 @@ rule ApplyRecord {
 }
 
 rule ApplyResolvedTx {
+    -- Native writes with table history retain an event's accepted origin in its Arrow batch through replay and block sealing.
     -- The leader reads its OWN staged transaction back at its own term and IMPORTS it.
     -- This is where a committed transaction becomes queryable: durably replicated AND confirmed unfenced.
     --

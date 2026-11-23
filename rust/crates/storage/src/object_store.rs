@@ -200,6 +200,9 @@ pub trait ObjectStore: Send + Sync {
     async fn retirement_version(&self, _key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
         Ok(None)
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        Ok(self.retirement_version(key).await?.map(rtdb_types::PhysicalObjectPublication::Version))
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
     /// Reads without creating or trusting a node-local durable cache copy.
     /// Store wrappers must forward this request across any cache boundary.

@@ -217,6 +217,7 @@ contract OutputSegmentLayout {
         -- Every page in an output data file uses the merged schema, including its field types and nullability.
         -- Normalization retains the complete entity-key column in governed event data.
         -- Temporal resolution tracks each complete governed key independently when several keys share an IID.
+        -- Selected pieces of one accepted event retain its stable identity when compaction assigns new Arrow locations.
         -- Compaction copies compatible document cells from selected Arrow positions in both stages.
         -- It aligns evolving nested fields and union legs to the merged schema and writes typed nulls for absent fields.
         -- Rebuilt pages use the event writer's encoding for undefined union padding under null containers and for bottom-typed fields widened to unions.

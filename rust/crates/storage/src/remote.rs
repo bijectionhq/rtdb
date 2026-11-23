@@ -174,6 +174,21 @@ impl ObjectStore for RemoteStore {
             Ok(physical_version(Some(namespace.as_ref()), &path, metadata.version))
         }).await
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> Result<Option<PhysicalObjectPublication>> {
+        let Some(allocation) = self.terminal_allocation else {
+            return Ok(self.retirement_version(key).await?.map(PhysicalObjectPublication::Version));
+        };
+        let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
+        let (objects, key) = (self.objects.clone(), key.clone());
+        self.io.run_async(async move {
+            let metadata = match objects.metadata(&key).await {
+                Ok(metadata) => metadata,
+                Err(Error::MissingObject(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            Ok(observed_terminal(&namespace, &objects.path(&key), allocation, metadata.version.as_deref(), metadata.e_tag))
+        }).await
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         let (objects, key) = (Arc::clone(&self.objects), key.clone());
         self.io.run_async(async move { objects.get(&key).await }).await
@@ -337,6 +352,15 @@ impl RemoteObjects {
         }
         Ok(())
     }
+}
+
+fn observed_terminal(namespace: &S3ObjectNamespace, path: &Path, allocation: uuid::Uuid,
+    version: Option<&str>, etag: Option<String>) -> Option<PhysicalObjectPublication> {
+    if version.is_some_and(|version| version != "null") { return None; }
+    let etag = etag.filter(|etag| strong_entity_tag(etag))?;
+    Some(PhysicalObjectPublication::Terminal(TerminalObjectPublication {
+        namespace: namespace.clone(), key: path.to_string(), allocation, etag,
+    }))
 }
 
 fn physical_version(namespace: Option<&S3ObjectNamespace>, path: &Path, version: Option<String>) -> Option<PhysicalObjectVersion> {
@@ -627,6 +651,22 @@ impl RemoteObjects {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_retirement_observes_only_unversioned_objects_with_a_strong_tag() {
+        let namespace = S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None };
+        let path = Path::from("partitions/docs/search-runs/file");
+        let allocation = uuid::Uuid::from_u128(4);
+        let tag = || Some(r#""etag""#.to_owned());
+        assert!(observed_terminal(&namespace, &path, allocation, Some("version"), tag()).is_none());
+        assert!(observed_terminal(&namespace, &path, allocation, None, Some(r#"W/"etag""#.into())).is_none());
+        let Some(PhysicalObjectPublication::Terminal(publication)) = observed_terminal(&namespace, &path, allocation, Some("null"), tag()) else {
+            panic!("expected terminal publication evidence");
+        };
+        assert_eq!(publication.allocation, allocation);
+        assert_eq!(publication.key, path.as_ref());
+        assert_eq!(publication.etag, r#""etag""#);
+    }
+
     use super::*;
 
     #[test]

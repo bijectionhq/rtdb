@@ -723,3 +723,65 @@ fn a_reader_lease_must_exceed_its_margin() {
         assert_eq!(built.is_ok(), valid, "lease {lease}s, margin {margin}s");
     }
 }
+
+#[tokio::test]
+async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
+    use rtdb_format::log::proto::{ArtefactsAdded, ArtefactsRemoved, SearchRun, SearchRunChange};
+    use rtdb_maintenance::ArtefactPublisher;
+    use rtdb_types::SourcePosition;
+
+    struct SearchPublisher { table: TableRef, state: Arc<PartitionState>, abandoned: AtomicBool }
+    #[async_trait]
+    impl ArtefactPublisher for SearchPublisher {
+        async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> {
+            let entries = message.entries.into_iter().map(|entry| {
+                let record = entry.record.unwrap();
+                assert!(SearchRunChange::from_artefact(&record).unwrap().abandon());
+                (entry.trie_key.unwrap().parse::<TrieKey>().unwrap(), record)
+            }).collect();
+            self.state.add_artefacts_at(&self.table, entries, Timestamp(100));
+            self.abandoned.store(true, Ordering::Relaxed);
+            Ok(SourcePosition(1))
+        }
+
+        async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> {
+            assert!(self.abandoned.load(Ordering::Relaxed));
+            let entries = message.entries.into_iter().map(|entry| {
+                (entry.trie_key.unwrap().parse::<TrieKey>().unwrap(), entry.record.unwrap())
+            }).collect();
+            self.state.remove_artefacts(&self.table, entries);
+            Ok(SourcePosition(2))
+        }
+    }
+
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::load(Some(block(0)), &BTreeMap::new()).unwrap().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let l0 = TrieKey::l0(BlockIndex(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(l0, 1, None).unwrap()], Timestamp(10)).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let store = Arc::new(MemoryStore::default());
+    let pending = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
+        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), allocation: Some(vec![16; 16]),
+        ..Default::default() };
+    let marker = ObjectKey::new(pending.pending_key(&entry.slug).unwrap()).unwrap();
+    let body = ObjectKey::new(pending.object_key(&entry.slug).unwrap()).unwrap();
+    store.put(&marker, pending.pending_bytes().unwrap().into()).await.unwrap();
+    let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), abandoned: AtomicBool::new(false) });
+    let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: Arc::clone(&store), commits: Mutex::default() });
+    let observer = Arc::new(Observer::default());
+    let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), unleased(), fixed_clock()).unwrap()
+        .with_search(retirement.clone(), StorageVersion(0), StorageEpoch(0));
+    let stop = CancellationToken::new();
+    collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
+    assert!(!retirement.abandoned.load(Ordering::Relaxed));
+    store.put(&body, Bytes::from_static(b"body")).await.unwrap();
+    collector.collect_as_of(Timestamp(100), &stop).await.unwrap();
+    assert!(retirement.abandoned.load(Ordering::Relaxed));
+    assert!(store.head(&body).await.is_ok());
+    collector.collect_as_of(Timestamp(101), &stop).await.unwrap();
+    assert!(store.head(&body).await.is_err());
+    assert!(store.head(&marker).await.is_err());
+    assert!(observer.0.lock().unwrap().is_empty());
+    assert!(state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().released());
+}

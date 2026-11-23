@@ -204,10 +204,10 @@ fn nested_column_types_keep_bottom_null_and_missing_distinct() {
 
 fn events() -> Vec<StoredEvent> {
     vec![
-        StoredEvent { commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(3), valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None },
-        StoredEvent { commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(2), valid_time: Interval::from_micros(10, 20).unwrap(), operation: StoredOperation::Delete, recency: None },
-        StoredEvent { commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(12))])), recency: None },
-        StoredEvent { commit_position: 0, entity_key: None, iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(7))])), recency: None },
+        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(3), valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None },
+        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(2), valid_time: Interval::from_micros(10, 20).unwrap(), operation: StoredOperation::Delete, recency: None },
+        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(12))])), recency: None },
+        StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([2; 16]), system_from: Timestamp(1), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(StructFields::from([("price".into(), Value::I64(7))])), recency: None },
     ]
 }
 
@@ -289,7 +289,7 @@ fn uuid_columns_round_trip_through_arrow_file_and_stream() {
 #[test]
 fn uuid_put_documents_are_read_back_through_the_event_schema() {
     let uuid = Value::Uuid(std::array::from_fn(|index| 0xa0 | index as u8));
-    let put = |iid: u8, id: Value| StoredEvent { commit_position: 0, entity_key: None, iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("ref".into(), id)])), recency: None };
+    let put = |iid: u8, id: Value| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(StructFields::from([("ref".into(), id)])), recency: None };
     let events = vec![put(1, uuid), put(2, Value::Null), put(3, Value::Uuid([0; 16]))];
     let fields = BTreeMap::from([("ref".into(), LogicalType::Scalar(ScalarType::Uuid).maybe())]);
     let batch = build_event_batch(&events, Some(fields.into()), None).unwrap();
@@ -326,7 +326,7 @@ fn live_pages_carry_the_put_leg_last_and_only_once_a_document_is_written() {
 #[test]
 fn put_columns_keep_the_order_their_fields_were_first_seen() {
     let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("system_time".into(), LogicalType::Scalar(ScalarType::I64)), ("committed".into(), LogicalType::Scalar(ScalarType::Bool))]);
-    let put = StoredEvent { commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
+    let put = StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
         operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1)), ("system_time".into(), Value::I64(2)), ("committed".into(), Value::Bool(true))])) };
     let batch = build_event_batch(&[put], Some(fields), None).unwrap();
     let arrow_schema::DataType::Union(legs, _) = batch.schema().field_with_name("op").unwrap().data_type().clone() else { panic!("op is a union") };

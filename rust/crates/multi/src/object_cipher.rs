@@ -17,7 +17,9 @@ const HEADER_BYTES: usize = 8 + 32;
 pub(crate) const SEALED_HEADER_BYTES: usize = HEADER_BYTES + SEALED_OVERHEAD;
 
 pub(crate) fn framed(key: &ObjectKey) -> bool {
-    key.as_str().starts_with("tables/") && key.as_str().contains("/data/") && key.as_str().ends_with(".arrow")
+    let key = key.as_str();
+    (key.starts_with("tables/") && key.contains("/data/") && key.ends_with(".arrow"))
+        || rtdb_format::entity_history::is_ranged_artefact(key) || rtdb_format::search_manifest::is_ranged_run(key)
 }
 
 fn invalid(key: &ObjectKey) -> Error { Error::ConflictingObject(key.to_string()) }
@@ -157,6 +159,20 @@ impl Cipher {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_history_and_allocated_search_runs_admit_framed_ranges() {
+        use super::framed;
+        use rtdb_storage::ObjectKey;
+
+        let key = |name: &str| ObjectKey::new(format!("tables/public$docs/{name}")).unwrap();
+        assert!(framed(&key("artefacts/l00-rc-b00/entity-history/headers-1-v1.bin")));
+        assert!(framed(&key("artefacts/l00-rc-b00/search/docs_body~a1f16w-v1.bin")));
+        let digest = "a".repeat(64);
+        assert!(framed(&key(&format!("search-runs/{digest}.f16.arrow"))));
+        assert!(!framed(&key(&format!("search-runs/{digest}.arrow"))));
+        assert!(!framed(&key(&format!("search-pending/{digest}.f16.arrow"))));
+    }
+
     use super::*;
 
     #[test]

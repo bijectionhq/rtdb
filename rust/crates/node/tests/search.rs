@@ -639,7 +639,7 @@ async fn a_search_file_a_scan_cannot_read_is_rebuilt_to_its_original_bytes() {
     database.compaction().unwrap().compact_all().await.unwrap();
     database.build_artefacts().await.unwrap();
     let store = Arc::clone(database.object_store());
-    let artefacts: Vec<_> = store.list(Some(&rtdb_storage::ObjectKey::new("tables").unwrap())).await.unwrap().into_iter().filter(|object| object.key.as_str().contains("/artefacts/")).collect();
+    let artefacts: Vec<_> = store.list(Some(&rtdb_storage::ObjectKey::new("tables").unwrap())).await.unwrap().into_iter().filter(|object| object.key.as_str().contains("/search/")).collect();
     assert!(!artefacts.is_empty());
     let key = artefacts[0].key.clone();
     let original = store.get(&key).await.unwrap();
@@ -672,7 +672,7 @@ async fn a_dropped_index_leaves_no_search_file_and_no_record_behind() {
     database.compaction().unwrap().compact_all().await.unwrap();
     database.build_artefacts().await.unwrap();
     let store = Arc::clone(database.object_store());
-    let artefacts = || async { store.list(Some(&rtdb_storage::ObjectKey::new("tables").unwrap())).await.unwrap().into_iter().map(|object| object.key).filter(|key| key.as_str().contains("/artefacts/")).collect::<Vec<_>>() };
+    let artefacts = || async { store.list(Some(&rtdb_storage::ObjectKey::new("tables").unwrap())).await.unwrap().into_iter().map(|object| object.key).filter(|key| key.as_str().contains("/search/")).collect::<Vec<_>>() };
     let recorded = artefacts().await;
     assert!(!recorded.is_empty());
     let format = format!("f{}-v", rtdb_search::FORMAT_VERSION);
@@ -684,7 +684,7 @@ async fn a_dropped_index_leaves_no_search_file_and_no_record_behind() {
     database.build_artefacts().await.unwrap();
     assert_eq!(artefacts().await, Vec::new(), "the recorded files and the one left unpublished are deleted");
     let docs = TableRef::new("public", "docs");
-    assert!(database.trie_catalog().current_tries(&docs).iter().all(|trie| trie.artefacts.is_empty()), "and no trie records them");
+    assert!(database.trie_catalog().current_tries(&docs).iter().all(|trie| trie.artefacts.iter().all(|record| record.kind() != "search")), "and no trie records them");
     assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'note')", vec![]).await.unwrap()).await), (0..10).collect::<Vec<_>>());
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
@@ -1615,6 +1615,7 @@ async fn logical_postings_survive_compaction_while_pinned_history_keeps_its_payl
         if !restart {
             for statement in [
                 "CREATE SEARCH INDEX docs_body ON docs (body)",
+                "INSERT INTO plain_docs RECORDS {_id: 7, body: 'ordinary entity point read'}",
                 "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report report', marks: 1}, {_id: 2, body: 'audit report'}, {_id: 3, body: 42}",
             ] {
                 assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
@@ -1627,8 +1628,23 @@ async fn logical_postings_survive_compaction_while_pinned_history_keeps_its_payl
             let pinned = session.query_sql(ranked, vec![]).await.unwrap();
             let old_catalog = database.trie_catalog();
             assert_eq!(old_catalog.search_runs(&table).count(), 1);
+            let plain = TableRef::new("public", "plain_docs");
+            let plain_tries = old_catalog.current_tries(&plain);
+            assert!(!plain_tries.is_empty());
+            assert!(plain_tries.iter().all(|trie| trie.artefact(rtdb_format::entity_history::KIND,
+                rtdb_format::entity_history::ID, rtdb_format::entity_history::VERSION).is_some()));
+            let plain_snapshot = database.snapshot();
+            let plain_entry = plain_snapshot.table_entry(&plain).unwrap();
+            let primary_meta = rtdb_storage::ObjectKey::new(plain_entry.slug.metadata_key(&plain_tries[0].key)).unwrap();
+            let store = database.object_store();
+            let metadata = store.get(&primary_meta).await.unwrap();
+            database.storage().invalidate(&primary_meta).await.unwrap();
+            store.delete(&primary_meta).await.unwrap();
+            assert_eq!(rows(session.query_sql("SELECT body FROM plain_docs WHERE _id = 7", vec![]).await.unwrap()).await,
+                [vec![Value::Utf8("ordinary entity point read".into())]]);
+            store.put(&primary_meta, metadata).await.unwrap();
             for statement in [
-                "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report report', marks: 2}",
+                "INSERT INTO docs RECORDS {_id: 1, body: 'AUDIT—report, report REPORT', marks: 2}",
                 "INSERT INTO docs RECORDS {_id: 1, body: 'corrected text', marks: 3}",
             ] {
                 assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
@@ -1676,4 +1692,95 @@ async fn logical_postings_survive_compaction_while_pinned_history_keeps_its_payl
         node.shutdown();
         tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn a_late_search_definition_recovers_a_compacted_span_from_the_retained_journal() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use rtdb_storage::ObjectKey;
+    use rtdb_types::BlockIndex;
+    use tokio_util::sync::CancellationToken;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut settings = options();
+    settings.automatic_artefacts = false;
+    settings.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: path("store"), epoch: Some(0) })),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let runtime = rtdb_search::SearchRuntime::with_logical_search(64 << 20);
+    let services = NodeServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()], ..services() };
+    let (node, driver) = Node::open(settings, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let stop = CancellationToken::new();
+    for statement in [
+        "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report'}",
+        "INSERT INTO docs RECORDS {_id: 2, body: 'audit report'}",
+    ] {
+        assert!(session.state_mut().execute_tx(vec![sql(statement)], AutonomousTxOptions::default()).await.unwrap().committed());
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+    }
+    database.compaction().unwrap().compact_all().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+    let table = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let entry = snapshot.table_entry(&table).unwrap();
+    let old = snapshot.trie_catalog().l0_source(&table, BlockIndex(-1), BlockIndex(i64::MAX)).next().unwrap();
+    assert!(matches!(old.state, rtdb_index::TrieState::Garbage { .. }));
+    database.object_store().delete(&ObjectKey::new(entry.slug.data_key(&old.key)).unwrap()).await.unwrap();
+    let removed = old.key.block_index();
+    drop(snapshot);
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")],
+        AutonomousTxOptions::default()).await.unwrap().committed());
+    let ranked = "SELECT _id FROM docs WHERE MATCH(body, '\"audit report\"') ORDER BY SEARCH_SCORE(body, 'report') DESC, _id ASC LIMIT 1";
+    assert_eq!(ids(rows(session.query_sql(ranked, vec![]).await.unwrap()).await), [1]);
+    database.build_artefacts().await.unwrap();
+    assert!(database.trie_catalog().search_runs(&table).any(|run| run.blocks().any(|block| block == removed)));
+    let reads = runtime.logical_run_reads();
+    assert_eq!(ids(rows(session.query_sql(ranked, vec![]).await.unwrap()).await), [1]);
+    assert!(runtime.logical_run_reads() > reads);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_same_commit_reinsert_keeps_only_the_post_erase_search_revision() {
+    let mut settings = options();
+    settings.automatic_artefacts = false;
+    let runtime = rtdb_search::SearchRuntime::with_logical_search(64 << 20);
+    let services = NodeServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()], ..services() };
+    let (node, driver) = Node::open(settings, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")],
+        AutonomousTxOptions::default()).await.unwrap().committed());
+    assert!(session.state_mut().execute_tx(vec![
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'oldrevision'}"),
+        sql("ERASE FROM docs WHERE _id = 1"),
+        sql("INSERT INTO docs RECORDS {_id: 1, body: 'newrevision'}"),
+    ], AutonomousTxOptions::default()).await.unwrap().committed());
+
+    let database = node.catalog().database("xtdb").unwrap();
+    database.flush().await.unwrap();
+    node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    let table = TableRef::new("public", "docs");
+    let catalog = database.trie_catalog();
+    let run = catalog.search_runs(&table).next().unwrap();
+    assert!(run.has_erases());
+    assert_eq!(run.source_rows(), 3);
+    let reads = runtime.logical_run_reads();
+    assert!(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'oldrevision')", vec![]).await.unwrap()).await.is_empty());
+    assert_eq!(runtime.logical_run_reads(), reads);
+    assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'newrevision')", vec![]).await.unwrap()).await), [1]);
+    assert!(runtime.logical_run_reads() > reads);
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }

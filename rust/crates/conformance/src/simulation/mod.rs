@@ -59,6 +59,7 @@ impl TransactionWriter for AuthoredWriter {
             for uuid in docs {
                 let id = *uuid.as_bytes();
                 tx.append(table.clone(), StoredEvent {
+                    origin: None,
                     commit_position: 0,
                     entity_key: None,
                     iid: EntityId::Uuid(id).iid(),
@@ -120,6 +121,7 @@ impl Trial {
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let node_cancellation = cancellation.child_token();
             let context = Arc::new(ResolveContext {
+                write_event_origins: false,
                 placed_receipt_retirement: false,
                 owned_witness_scope: None,
                 world_constraints: None,

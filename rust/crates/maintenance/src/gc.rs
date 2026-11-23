@@ -6,7 +6,7 @@ use futures::{StreamExt, stream};
 use rtdb_format::{
     catalog::{BlockCatalog, TableEntry},
     keys::{ArtefactOwner, PartGroup, TrieKey, block_index_from_key},
-    log::proto::{ArtefactEntry, ArtefactsRemoved, PublishedObjectVersion, SearchRunChange},
+    log::proto::{ArtefactEntry, ArtefactsAdded, ArtefactsRemoved, PublishedObjectVersion, SearchRunChange},
 };
 use rtdb_index::{PartitionState, TrieCatalog};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
@@ -70,6 +70,7 @@ pub struct TrieCollector {
     clock: CollectorClock,
     /// When this collector first saw each trie as eligible; a new collector starts empty and waits afresh.
     first_observed: Mutex<BTreeMap<(TableRef, TrieKey), i64>>,
+    first_pending_search: Mutex<BTreeMap<(TableRef, ObjectKey), i64>>,
     first_search_observed: Mutex<BTreeMap<(TableRef, [u8; 32]), i64>>,
     search: Option<(Arc<dyn ArtefactPublisher>, rtdb_types::StorageVersion, rtdb_types::StorageEpoch)>,
     store: Arc<dyn ObjectStore>,
@@ -83,7 +84,7 @@ impl TrieCollector {
     pub fn new(store: Arc<dyn ObjectStore>, partition: Arc<PartitionState>, publisher: Arc<dyn TrieDeletionPublisher>,
         observer: Arc<dyn CollectionObserver>, config: GarbageConfig, clock: CollectorClock) -> Result<Self> {
         config.validate()?;
-        Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), search: None,
+        Ok(Self { clock, first_observed: Mutex::default(), first_search_observed: Mutex::default(), first_pending_search: Mutex::default(), search: None,
             store, partition, publisher, observer, config })
     }
 
@@ -153,7 +154,8 @@ impl TrieCollector {
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection.clone(), async {
                     self.collect_table(&entry, &keys, &groups, cut, collection.current().trie_catalog(), &release).await?;
-                    self.collect_search_seals(&entry, &seals, cut, cancellation).await?;
+                    self.collect_search_seals(&entry, &seals, cut, collection.current().trie_catalog(), cancellation).await?;
+                    self.collect_pending_search(&entry, collection.current().trie_catalog(), collection.current().table_catalog().block_index(), cancellation).await?;
                     self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await
                 }).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
@@ -163,7 +165,8 @@ impl TrieCollector {
         if cancellation.is_cancelled() { Err(crate::closed()) } else { Ok(()) }
     }
 
-    async fn collect_search_seals(&self, entry: &TableEntry, seals: &[TrieKey], cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
+    async fn collect_search_seals(&self, entry: &TableEntry, seals: &[TrieKey], cut: Option<CatalogCut>, catalog: &TrieCatalog,
+        cancellation: &CancellationToken) -> Result<()> {
         if seals.is_empty() { return Ok(()); }
         if self.store.defers_trie_releases() {
             let Some(cut) = cut else { return Ok(()); };
@@ -173,10 +176,75 @@ impl TrieCollector {
         let seals: BTreeSet<_> = seals.iter().collect();
         for object in self.store.list(Some(&prefix)).await? {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let Some((ArtefactOwner::Trie(owner), kind, id, _)) = entry.slug.parse_artefact_key(object.key.as_str()) else { continue; };
-            if seals.contains(&owner) && kind == "search" && (id.ends_with("f15") || id.ends_with("f16h")) {
+            let Some((ArtefactOwner::Trie(owner), kind, id, generation)) = entry.slug.parse_artefact_key(object.key.as_str()) else { continue; };
+            if !seals.contains(&owner) { continue; }
+            if kind == rtdb_format::entity_history::KIND || (kind == "search" && id.ends_with("f16w")) {
+                if let Some(record) = catalog.trie(&entry.table, &owner).and_then(|trie| trie.artefact(&kind, &id, generation)) {
+                    self.store.release_search_run(&object.key, record.published_version.as_ref(), cut).await?;
+                }
+            } else if kind == "search" && (id.ends_with("f15") || id.ends_with("f16h")) {
                 self.store.delete(&object.key).await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn collect_pending_search(&self, entry: &TableEntry, catalog: &TrieCatalog, durable: Option<BlockIndex>,
+        cancellation: &CancellationToken) -> Result<()> {
+        use rtdb_format::{log::proto::SearchRun, search_manifest::{MAX_PENDING_BYTES, pending_prefix}};
+        let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
+        let prefix = ObjectKey::new(pending_prefix(&entry.slug))?;
+        let objects = self.store.list(Some(&prefix)).await?;
+        let now = (self.clock)();
+        let known = catalog.search_runs(&entry.table).chain(catalog.retired_search_runs(&entry.table).filter_map(|item| item.run.as_ref()))
+            .map(|run| ObjectKey::new(run.pending_key(&entry.slug)?).map_err(Anomaly::from)).collect::<Result<BTreeSet<_>>>()?;
+        let lease = self.config.reader_lease_micros()?;
+        let waiting = {
+            let mut observed = self.first_pending_search.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seen: BTreeSet<_> = objects.iter().map(|object| &object.key).collect();
+            observed.retain(|(table, key), _| table != &entry.table || (seen.contains(key) && !known.contains(key)));
+            drop(seen);
+            objects.into_iter().filter(|object| {
+                if known.contains(&object.key) { return true; }
+                let first = *observed.entry((entry.table.clone(), object.key.clone())).or_insert(now);
+                rtdb_storage::read_lease::collection_waited(first, lease, now)
+            }).collect::<Vec<_>>()
+        };
+        let mut abandoned = Vec::new();
+        for intent in waiting {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            if known.contains(&intent.key) {
+                self.store.delete(&intent.key).await?;
+                continue;
+            }
+            let Ok(size) = usize::try_from(intent.size) else { continue; };
+            if size > MAX_PENDING_BYTES { continue; }
+            let bytes = match self.store.get_fresh_exact(&intent.key, size).await {
+                Ok(bytes) => bytes,
+                Err(rtdb_storage::Error::MissingObject(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let Ok(mut run) = SearchRun::decode_pending(&bytes) else { continue; };
+            if run.pending_key(&entry.slug)? != intent.key.as_str()
+                || durable.is_none_or(|boundary| run.blocks.last().is_none_or(|last| *last > boundary.0)) {
+                continue;
+            }
+            let body = ObjectKey::new(run.object_key(&entry.slug)?)?;
+            match self.store.head_fresh(&body).await {
+                Ok(object) if object.size == run.file_size() as u64 => {}
+                Ok(_) | Err(rtdb_storage::Error::MissingObject(_)) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            run.publication = self.store.retirement_publication(&body).await?.map(Into::into);
+            if self.store.defers_trie_releases() && run.publication.is_none() { continue; }
+            let trie = TrieKey::l0(BlockIndex(run.blocks[0]))?.to_string();
+            let record = SearchRunChange { run: Some(run), retire_only: Some(true), abandon: Some(true), ..Default::default() }.to_artefact()?;
+            abandoned.push(ArtefactEntry { trie_key: Some(trie), record: Some(record) });
+            if abandoned.len() >= self.config.chunk_size { break; }
+        }
+        if !abandoned.is_empty() {
+            publisher.publish(ArtefactsAdded { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
+                table_name: Some(entry.table.schema_and_table()), entries: abandoned, source_msg_id: None }).await?;
         }
         Ok(())
     }

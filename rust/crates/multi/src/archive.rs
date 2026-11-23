@@ -595,6 +595,10 @@ impl ObjectStore for CheckpointStore {
         if self.archive.objects.contains_key(key) { return Ok(None); }
         self.serving.retirement_version(key).await
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        if self.archive.objects.contains_key(key) { return Ok(None); }
+        self.serving.retirement_publication(key).await
+    }
 
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         match self.archive.objects.get(key) {

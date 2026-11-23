@@ -80,10 +80,17 @@ value Rectangle {
 }
 
 value SearchRowVersion {
-    -- A logical event identity scoped to one table and database history.
+    -- The temporal order of an event within a captured table.
     iid: Bytes
     system_from: Instant
     commit_position: Integer
+}
+
+value AcceptedEventOrigin {
+    -- All fragments and relocations of one accepted event carry the same origin.
+    accepted_commit: Bytes
+    ordinal: Integer
+    original_block: Integer
 }
 
 ------------------------------------------------------------
@@ -169,12 +176,20 @@ rule SearchJobRuns {
     -- A job the memory budget cannot admit fails, and is eligible again at the next block.
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
     -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
-    -- A format 16 writer seals a posting run over the table's original block extent and a history file over the block's primary Arrow locations.
+    -- A format 16 writer seals a posting run over the table's accepted block extent and writes forward witnesses for the indexed fields.
+    -- The table owns one entity history for each primary trie, shared by ordinary point reads and searches.
+    -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
+    -- A resolved event must identify itself before a forward witness can certify its score.
+    -- A posting run records durable custody before uploading its immutable body.
+    -- A captured catalog routes each required term using the authenticated locator of each eligible run.
     -- A run nominates an entity and text revision for a field, with terms and positions established by that definition's analyzer.
     -- A primary rewrite replaces the corresponding history locations while preserving the text revision's posting coverage.
     -- Replacement posting runs cover the exact union of the active receipts they supersede.
     -- The lane removes postings whose contributing events all precede an erase and retains postings with surviving later events.
-    -- A scan admits logical negative evidence only with complete durable source coverage at its pinned basis.
+    -- A scan uses logical negative evidence within the source extents covered by admitted runs at its pinned basis.
+    -- A missing or corrupt run leaves its extent eligible for exact nomination from primary history.
+    -- A scan whose bounded gap read cannot establish a complete candidate union executes the ordinary scan.
+    -- A replay-backed repair verifies the checkpoint boundary, replay row count and selected extents, and applies the replayed erase frontier before publication.
     -- Ranked search and explicit entity point reads can resolve the same complete temporal history.
     when: job: SearchJob.created
 
@@ -195,6 +210,7 @@ rule RetireSearchFiles {
     -- A format 15 file and every superseded singleton stay available to pinned readers.
     -- Sealed level-0 search files retire once their trie is obsolete in the checkpoint and all reader holds have expired.
     -- A format 16 run retires on ordered replacement or when its definition leaves force.
+    -- An unadopted upload can also be abandoned through the ordered manifest after its durable source cut is installed.
     -- An ordered upload receipt for a rejected replacement is itself eligible for retirement.
     -- Collection waits for active catalog captures, the latest recovery checkpoint, and the reader lease before releasing a retired run.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
@@ -395,6 +411,9 @@ contract SearchCorrectness {
         -- Under a ranked LIMIT, the scan hands on every row in the prefix the SQL sort needs.
         -- The prefix includes the rows skipped by OFFSET and the rows requested by LIMIT.
         -- A tie at the cutoff remains eligible until the optimizer can prove its position.
+        -- Partitions at a shared basis can admit the highest announced bound first and share a cutoff supplied by verified winners.
+        -- Pending gap work has an unbounded score until it yields candidates for exact verification.
+        -- A partition prunes on the shared cutoff only when its remaining score bound is strictly lower.
         -- A bitemporal point scan on one partition may break score ties by ascending UUID _id when the captured table stores UUIDs as their canonical IIDs.
         -- The live sources attest this identity relationship, and publication records it only after checking every put in the ordered Arrow tree's input.
         -- The first document in an unread rank range supplies a lower UUID bound for the range because the tree assigns document ordinals in nondecreasing IID order.

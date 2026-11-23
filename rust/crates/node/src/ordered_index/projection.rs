@@ -424,6 +424,7 @@ mod tests {
 
     fn put(id: i64, system: i64, valid: Interval, key: i64) -> StoredEvent {
         StoredEvent {
+            origin: None,
             commit_position: 0,
             entity_key: None,
             iid: Value::I64(id).entity_id().unwrap().iid(),
@@ -547,6 +548,7 @@ mod tests {
         row.insert("_id".into(), peer_id.as_value());
         peer.entity_key = Some(peer_id.handle_bytes().into());
         let erase = StoredEvent {
+            origin: None,
             commit_position: 0,
             entity_key: first.entity_key.clone(), iid, system_from: Timestamp(1),
             valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None,
@@ -582,7 +584,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let erase = StoredEvent { commit_position: 0, entity_key: None,
+        let erase = StoredEvent { origin: None, commit_position: 0, entity_key: None,
             iid,
             system_from: Timestamp(1),
             valid_time: Interval::ALL,

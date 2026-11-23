@@ -396,6 +396,10 @@ rule DeleteAndCommitChunkRule {
     -- Any DELETE failure aborts the chunk before the publish happens.
     -- Followers must never drop catalog entries for files still on disk.
     --
+    -- A pending search allocation with a completed object may be abandoned after its source cut is installed and its observation lease has elapsed.
+    -- Ordered abandonment succeeds while the allocation is unadopted and fences later adoption at the same identity.
+    -- A hosted release uses the installed retirement, the catalog admission floor, and proof of the provider version or terminal publication.
+    -- Checkpoint recovery retains the abandonment after physical release.
     -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
     -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.
     -- A partition group's artefacts (trie-cat.allium: ArtefactScope) are derived from every member's data file, so they go once the cycle collects the last member the catalog holds, before any chunk.

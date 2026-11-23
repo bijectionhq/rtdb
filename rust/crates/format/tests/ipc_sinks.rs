@@ -63,6 +63,7 @@ fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
 
     let events = [Value::Null, Value::I64(7), Value::Utf8("mixed".into())].into_iter().enumerate()
         .map(|(index, value)| StoredEvent {
+            origin: None,
             commit_position: 0,
             entity_key: None,
             iid: EntityId::Integer(index as i64).iid(),

@@ -301,6 +301,14 @@ impl TreeLocator {
     }
 
     pub fn decode(value: &str) -> Option<Self> {
+        Self::decode_inner(value, true)
+    }
+
+    pub fn decode_route(value: &str) -> Option<Self> {
+        Self::decode_inner(value, false)
+    }
+
+    fn decode_inner(value: &str, load_inline: bool) -> Option<Self> {
         let (format, value) = if let Some(value) = value.strip_prefix("v16:") { (LOGICAL_FORMAT_VERSION, value) }
             else if let Some(value) = value.strip_prefix("v15:") { (PACKED_FORMAT_VERSION, value) }
             else { (TREE_FORMAT_VERSION, value) };
@@ -317,7 +325,7 @@ impl TreeLocator {
             .filter(|(bits, check)| synopsis_digest(&digest, bits) == *check).map(|(bits, _)| Arc::new(bits));
         let root = if format >= PACKED_FORMAT_VERSION { fields.next() } else { None };
         let expected = (range.end - range.start) as usize;
-        let inline_root = root.filter(|hex| hex.len() <= INLINE_ROOT_BYTES * 2).and_then(decode_bytes)
+        let inline_root = root.filter(|hex| load_inline && hex.len() <= INLINE_ROOT_BYTES * 2).and_then(decode_bytes)
             .and_then(|bytes| lz4_flex::block::decompress(&bytes, expected).ok())
             .filter(|bytes| bytes.len() == expected)
             .filter(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == digest).map(Arc::from);
@@ -676,10 +684,14 @@ impl TreeFile {
         Ok(documents)
     }
 
-    pub(crate) async fn erases(&self) -> Result<BTreeMap<Iid, (Timestamp, u32)>> {
+    pub(crate) async fn erases(&self, memory: &Arc<rtdb_types::MemoryBudget>) -> Result<(BTreeMap<Iid, (Timestamp, u32)>, Arc<rtdb_types::MemoryReservation>)> {
         let mut erases = BTreeMap::new();
+        let mut charge = memory.reserve(4096)?;
         for batch in self.all(ERASES).await? {
             let rows = table(&batch, Table::Erases);
+            let next = 4096usize.saturating_add(erases.len().saturating_add(rows.len()).saturating_mul(128));
+            let charge = Arc::get_mut(&mut charge).expect("unpublished erase witnesses own their charge");
+            charge.grow_to(next)?;
             let iids = rows.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("erase IID layout");
             let times = rows.column(1).as_primitive::<Int64Type>();
             let positions = rows.column(2).as_primitive::<UInt32Type>();
@@ -689,7 +701,7 @@ impl TreeFile {
                 }
             }
         }
-        Ok(erases)
+        Ok((erases, charge))
     }
 }
 

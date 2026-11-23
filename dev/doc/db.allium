@@ -514,6 +514,7 @@ entity ReplicaMessage {
 }
 
 variant ResolvedTxMessage : ReplicaMessage {
+    -- An event written with table history carries its accepted commit identity, within-commit ordinal, and original block.
     -- A resolved transaction: put, delete and erase events that require no database reads.
     -- An attach or detach result is carried as a database operation within it.
     -- For an external-source database it carries the resume token as at the transaction boundary.
@@ -1659,6 +1660,7 @@ rule CompactionJobWritesOutput {
 
     ensures:
         -- The data file is uploaded first; the meta file's presence is the completion marker.
+        -- A primary rewrite retains the accepted event identity and can publish replacement history and forward witnesses with its new locations.
         -- Each output trie carries the records of the artefacts built from its data file before the tries are appended (fts.allium: SearchJobRuns), so it becomes live with them.
         -- The tries go to the source log, and the leader forwards them to the replica log.
         TriesAddedMessage.created(tries: job.output_tries) appended to database.source_log

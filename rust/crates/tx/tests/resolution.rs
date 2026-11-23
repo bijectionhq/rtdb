@@ -15,7 +15,7 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
+    ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
@@ -154,6 +154,7 @@ async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
             assert_eq!(self.0.used_bytes(), baseline);
 
             transaction.append(table(), rtdb_format::data::StoredEvent {
+                origin: None,
                 commit_position: 0,
                 entity_key: None,
                 iid: Value::I64(1).entity_id()?.iid(), system_from: transaction.tx_key().system_time,
@@ -872,6 +873,7 @@ async fn external_event_writer_cannot_erase_private_replay_markers() {
     impl TransactionWriter for ExternalWriter {
         async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
             let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent {
+                origin: None,
                 commit_position: 0,
                 entity_key: None,
                 iid: Value::Utf8("00112233445566778899aabbccddeeff/0".into()).entity_id()?.iid(),

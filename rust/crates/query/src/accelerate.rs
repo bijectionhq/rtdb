@@ -8,7 +8,7 @@ use rtdb_format::keys::TrieKey;
 use rtdb_index::{RowSource, Snapshot};
 use rtdb_plan::{ColumnId, Expr, Scan, Schema};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{EventHeader, Iid, Result, RowVersion, TemporalBounds, Value};
+use rtdb_types::{EventHeader, EventOrigin, Iid, Result, RowVersion, TemporalBounds, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::context::Execution;
@@ -76,8 +76,15 @@ pub trait CandidateVerifier: Send + Sync {
 
 pub struct PartitionRanking {
     winners: parking_lot::Mutex<PartitionWinners>,
-    work: parking_lot::Mutex<BTreeMap<usize, f64>>,
+    work: parking_lot::Mutex<RankWorkState>,
+    ready: tokio::sync::Notify,
     memory: Arc<MemoryBudget>,
+}
+
+#[derive(Default)]
+struct RankWorkState {
+    waiting: BTreeMap<usize, f64>,
+    in_flight: BTreeSet<usize>,
 }
 
 pub struct PartitionRankWork<'a> {
@@ -86,16 +93,53 @@ pub struct PartitionRankWork<'a> {
     _charge: Arc<MemoryReservation>,
 }
 
+pub struct RankWorkPermit<'a> {
+    ranking: &'a PartitionRanking,
+    partition: usize,
+}
+
 impl PartitionRankWork<'_> {
-    pub fn report(&self, bound: f64) -> bool {
-        let mut work = self.ranking.work.lock();
-        work.insert(self.partition, bound);
-        work.values().any(|&other| other > bound)
+    pub async fn acquire(&self, bound: f64, cancellation: &CancellationToken) -> Result<RankWorkPermit<'_>> {
+        const MAX_IN_FLIGHT: usize = 4;
+        self.ranking.work.lock().waiting.insert(self.partition, bound);
+        loop {
+            if cancellation.is_cancelled() {
+                self.ranking.work.lock().waiting.remove(&self.partition);
+                self.ranking.ready.notify_waiters();
+                return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Interrupted,
+                    "rtdb.query/cancelled", "Ranked work cancelled during admission"));
+            }
+            let notified = self.ranking.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut work = self.ranking.work.lock();
+                let best = work.waiting.iter().max_by(|(a_id, a), (b_id, b)| a.total_cmp(b).then_with(|| b_id.cmp(a_id)));
+                if work.in_flight.len() < MAX_IN_FLIGHT && best.is_some_and(|(&partition, _)| partition == self.partition) {
+                    work.waiting.remove(&self.partition);
+                    work.in_flight.insert(self.partition);
+                    self.ranking.ready.notify_waiters();
+                    return Ok(RankWorkPermit { ranking: self.ranking, partition: self.partition });
+                }
+            }
+            cancellation.run_until_cancelled(notified).await;
+        }
+    }
+}
+
+impl Drop for RankWorkPermit<'_> {
+    fn drop(&mut self) {
+        self.ranking.work.lock().in_flight.remove(&self.partition);
+        self.ranking.ready.notify_waiters();
     }
 }
 
 impl Drop for PartitionRankWork<'_> {
-    fn drop(&mut self) { self.ranking.work.lock().remove(&self.partition); }
+    fn drop(&mut self) {
+        let mut work = self.ranking.work.lock();
+        work.waiting.remove(&self.partition);
+        self.ranking.ready.notify_waiters();
+    }
 }
 
 #[derive(Default)]
@@ -119,12 +163,11 @@ impl Ord for ScoredIid {
 }
 
 impl PartitionRanking {
-    pub(crate) fn new(memory: Arc<MemoryBudget>) -> Self { Self { winners: Default::default(), work: Default::default(), memory } }
+    pub(crate) fn new(memory: Arc<MemoryBudget>) -> Self { Self { winners: Default::default(), work: Default::default(), ready: Default::default(), memory } }
 
     pub fn register(&self, partition: &Snapshot) -> Option<PartitionRankWork<'_>> {
         let charge = self.memory.reserve(256).ok()?;
         let partition = std::ptr::from_ref(partition) as usize;
-        self.work.lock().insert(partition, f64::INFINITY);
         Some(PartitionRankWork { ranking: self, partition, _charge: charge })
     }
 
@@ -166,12 +209,14 @@ pub enum SearchRowLocation {
 #[derive(Clone)]
 pub struct ResolvedSearchRow {
     pub version: RowVersion,
+    pub origin: Option<EventOrigin>,
     pub location: SearchRowLocation,
     pub visibility: TemporalBounds,
 }
 
 pub struct LocatedHistoryEvent<W> {
     pub header: EventHeader,
+    pub origin: Option<EventOrigin>,
     pub location: SearchRowLocation,
     pub witness: Option<W>,
 }
@@ -182,13 +227,17 @@ pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHist
     let mut visible = Vec::new();
     let mut resolver = rtdb_temporal::HistoryResolver::new_in(bounds, clamp_valid_time, Arc::clone(memory));
     for events in history.values_mut() {
-        events.sort_unstable_by_key(|event| std::cmp::Reverse(event.header.system_position()));
-        if events.windows(2).any(|pair| pair[0].header.version() == pair[1].header.version()) { return Ok(None); }
+        events.sort_unstable_by_key(|event| (std::cmp::Reverse(event.header.system_position()), event.header.valid_time.lower()));
+        if events.windows(2).any(|pair| {
+            let (left, right) = (&pair[0], &pair[1]);
+            left.header.version() == right.header.version() && (left.origin.is_none() || left.origin != right.origin
+                || left.header.op != right.header.op || left.header.valid_time.intersects(right.header.valid_time))
+        }) { return Ok(None); }
         let first = visible.len();
         for event in events {
             rtdb_storage::audience_work::scan_items(1)?;
             resolver.resolve_fragments(&event.header, |valid_time, system_time| {
-                visible.push((ResolvedSearchRow { version: event.header.version(), location: event.location.clone(),
+                visible.push((ResolvedSearchRow { version: event.header.version(), origin: event.origin, location: event.location.clone(),
                     visibility: TemporalBounds { valid_time, system_time } }, event.witness));
                 Ok(())
             })?;
@@ -411,4 +460,36 @@ mod tests {
         ranking.add_verified(2, [(third, 5.0), (first, 2.0)]);
         assert_eq!(ranking.cutoff(2), Some(4.0));
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_free_rank_slot_admits_the_highest_waiting_bound_and_cancelled_work_releases_priority() {
+    use std::task::Poll;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let ranking = PartitionRanking::new(Arc::clone(&memory));
+    let workers: Vec<_> = (0..7).map(|partition| PartitionRankWork {
+        ranking: &ranking, partition, _charge: memory.reserve(256).unwrap(),
+    }).collect();
+    let stop = CancellationToken::new();
+    let mut permits = Vec::new();
+    for worker in &workers[..4] { permits.push(worker.acquire(1.0, &stop).await.unwrap()); }
+
+    let cancelled = CancellationToken::new();
+    let mut low = std::pin::pin!(workers[4].acquire(2.0, &stop));
+    let mut high = std::pin::pin!(workers[5].acquire(4.0, &stop));
+    let mut interrupted = std::pin::pin!(workers[6].acquire(f64::INFINITY, &cancelled));
+    assert!(futures::poll!(&mut low).is_pending());
+    assert!(futures::poll!(&mut high).is_pending());
+    assert!(futures::poll!(&mut interrupted).is_pending());
+    drop(permits.pop());
+    assert!(futures::poll!(&mut high).is_pending());
+    cancelled.cancel();
+    assert!(matches!(futures::poll!(&mut interrupted), Poll::Ready(Err(_))));
+    assert!(futures::poll!(&mut low).is_pending());
+    let permit = high.await.unwrap();
+    assert!(futures::poll!(&mut low).is_pending());
+    drop(permit);
+    assert!(low.await.is_ok());
 }

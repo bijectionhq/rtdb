@@ -37,7 +37,7 @@ impl PgIndexer for DirectMirror {
                 }
                 RowKind::Delete => (Interval::new(system_from, Timestamp::MAX)?, StoredOperation::Delete),
             };
-            target.append(operation.table.clone(), StoredEvent { commit_position: 0, entity_key: None, iid: id.iid(), system_from, valid_time, operation: operation_value, recency: None })?;
+            target.append(operation.table.clone(), StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from, valid_time, operation: operation_value, recency: None })?;
             if index % 64 == 63 { tokio::task::yield_now().await; }
         }
         Ok(())
@@ -82,6 +82,7 @@ impl PgIndexer for DirectMirror {
                         let iid = read_cell(batch, id, row, memory, |value| Ok(value.entity_id()?.iid()))?;
                         let valid_time = Interval::new(system_from, Timestamp::MAX)?;
                         target.append(operation.table.clone(), StoredEvent {
+                            origin: None,
                             commit_position: 0,
                             entity_key: None, iid, system_from, valid_time, operation: StoredOperation::Delete, recency: None,
                         })?;

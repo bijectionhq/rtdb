@@ -153,7 +153,7 @@ mod tests {
     fn accepted_delta_preserves_token_order_and_commit_row_coverage() {
         let memory = MemoryBudget::new(8 << 20);
         let table = TableRef::new("public", "docs");
-        let stored = |id, operation| StoredEvent { entity_key: None, iid: EntityId::Integer(id).iid(),
+        let stored = |id, operation| StoredEvent { origin: None, entity_key: None, iid: EntityId::Integer(id).iid(),
             system_from: Timestamp(2), commit_position: 0, valid_time: Interval::ALL, operation, recency: None };
         let events = [stored(1, StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8("Audit report audit".into()))]))),
             stored(2, StoredOperation::Delete)];

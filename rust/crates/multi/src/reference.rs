@@ -165,6 +165,9 @@ impl ObjectStore for PrefixedStore {
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.bucket.retirement_version(&self.full(key)?).await
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.bucket.retirement_publication(&self.full(key)?).await
+    }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get(&self.full(key)?).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.bucket.get_fresh_exact(&self.full(key)?, length).await }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
@@ -272,6 +275,10 @@ impl ObjectStore for ReferencingStore {
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         if self.base.objects.contains_key(key.as_str()) { return Ok(None); }
         self.own.retirement_version(key).await
+    }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        if self.base.objects.contains_key(key.as_str()) { return Ok(None); }
+        self.own.retirement_publication(key).await
     }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         self.read(key, |store, key| store.get(key)).await

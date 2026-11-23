@@ -41,7 +41,7 @@ fn replay_checkpoint_lists_active_search_roots_alongside_primary_closure() {
     let run = |id| SearchRun { definition_id: Some("examplef16".into()), definition_version: Some(3), blocks: vec![0],
         digest: Some(vec![id; 32]), file_size: Some(100), locator: Some(vec![1]), source_rows: Some(1), ..Default::default() };
     let active = run(5);
-    let retired = RetiredSearchRun { run: Some(run(6)), superseded_at: Some(8) };
+    let retired = RetiredSearchRun { run: Some(run(6)), superseded_at: Some(8), ..Default::default() };
     let block = TableBlock::from_parts(Default::default(), &Default::default(), 0, Vec::new()).unwrap()
         .with_search_runs(vec![active.clone()], vec![retired.clone()]);
     let block = TableBlock::decode(&block.encode()).unwrap();

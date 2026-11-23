@@ -516,9 +516,10 @@ impl BlockStore {
             let (metadata_file, summary) = metadata.finish()?;
             let bytes = metadata_file.write()?;
             self.store.put(&ObjectKey::new(entry.slug.metadata_key(&trie))?, Bytes::from(bytes)).await?;
-            let artefacts = match search {
-                Some(search) => search.seal(prepared.value(), table, &trie, temporary.path(), size as u64, cancellation).await?,
-                None => Vec::new(),
+            let artefacts = match (self.staged_table_artefacts(entry, index).await?, search) {
+                (Some(records), _) => records,
+                (None, Some(search)) => search.seal(prepared.value(), table, &trie, temporary.path(), size as u64, cancellation).await?,
+                (None, None) => Vec::new(),
             };
             let mut notification = CatalogTrie::notification(trie, size, Some(summary))?;
             notification.artefacts = artefacts;
@@ -549,6 +550,23 @@ impl BlockStore {
         self.store.put(&key, Bytes::from(catalog.encode_for_publication())).await?;
         Ok(ProducedBlock { catalog, tries })
     }
+    async fn staged_table_artefacts(&self, entry: &rtdb_format::catalog::TableEntry, index: BlockIndex)
+        -> Result<Option<Vec<rtdb_format::log::proto::ArtefactRecord>>> {
+        let key = ObjectKey::new(entry.slug.block_key(index)?)?;
+        let size = match self.store.head_fresh(&key).await {
+            Ok(object) => usize::try_from(object.size).map_err(|_| invalid("Staged table block size exceeds the allocation range"))?,
+            Err(rtdb_storage::Error::MissingObject(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let reservation = self.reserve_decode(size)?;
+        let bytes = self.store.get_fresh_exact(&key, size).await?;
+        let table = TableBlock::decode_reserved(&bytes, reservation)?;
+        let mut tries = l0_tries(index, &BTreeMap::from([(entry.table.clone(), table)]))?;
+        let staged = tries.remove(&entry.table).and_then(|mut tries| tries.pop())
+            .ok_or_else(|| invalid("Staged table block has no matching L0 notification"))?;
+        Ok(Some(staged.artefacts))
+    }
+
     fn reserve_decode(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.memory.reserve(bytes.checked_mul(16).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("Catalog allocation size overflow"))?)
     }

@@ -21,6 +21,7 @@ impl SearchRun {
             || self.blocks.is_empty() || self.blocks.len() > MAX_RUN_BLOCKS
             || self.blocks[0] < 0 || self.blocks.windows(2).any(|pair| pair[0] >= pair[1])
             || self.source_rows() <= 0 || self.file_size() <= 0 || self.rebuild() < 0
+            || self.allocation.as_ref().is_some_and(|value| value.len() != 16)
             || self.locator().is_empty() || self.locator().len() > 32 * 1024
         {
             return Err(invalid("Search run has an invalid definition, extent, or locator"));
@@ -32,22 +33,53 @@ impl SearchRun {
         self.blocks.iter().copied().map(BlockIndex)
     }
 
+    pub fn pending_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        if self.allocation.is_none() || self.publication.is_some() {
+            return Err(invalid("Search upload intent must name a fresh allocation"));
+        }
+        Ok(self.encode_to_vec())
+    }
+
+    pub fn decode_pending(bytes: &[u8]) -> Result<Self> {
+        let run = Self::decode(bytes).map_err(invalid)?;
+        run.pending_bytes()?;
+        Ok(run)
+    }
+
+    pub fn pending_key(&self, slug: &TableSlug) -> Result<String> {
+        let name = self.object_key(slug)?;
+        Ok(name.replace("/search-runs/", "/search-pending/"))
+    }
+
     pub fn object_key(&self, slug: &TableSlug) -> Result<String> {
         self.validate()?;
-        Ok(run_key(slug, self.identity()?))
+        let digest = self.identity()?;
+        Ok(run_key(slug, digest, self.allocation.is_some()))
     }
 }
 
+pub const MAX_PENDING_BYTES: usize = 40 * 1024;
+
+pub fn pending_prefix(slug: &TableSlug) -> String { format!("{}/search-pending", slug.table_prefix()) }
+
 pub fn run_prefix(slug: &TableSlug) -> String { format!("{}/search-runs", slug.table_prefix()) }
 
-pub fn run_key(slug: &TableSlug, digest: [u8; 32]) -> String {
+fn run_key(slug: &TableSlug, digest: [u8; 32], allocated: bool) -> String {
     let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("{}/{name}.arrow", run_prefix(slug))
+    let suffix = if allocated { ".f16.arrow" } else { ".arrow" };
+    format!("{}/{name}{suffix}", run_prefix(slug))
 }
 
 pub fn is_run_key(key: &str) -> bool {
+    run_key_has_suffix(key, ".f16.arrow") || run_key_has_suffix(key, ".arrow")
+}
+
+pub fn is_ranged_run(key: &str) -> bool { run_key_has_suffix(key, ".f16.arrow") }
+
+fn run_key_has_suffix(key: &str, suffix: &str) -> bool {
     key.strip_prefix("tables/").and_then(|tail| tail.split_once("/search-runs/"))
-        .and_then(|(slug, file)| Some((slug, file.strip_suffix(".arrow")?)))
+        .and_then(|(slug, file)| Some((slug, file.strip_suffix(suffix)?)))
         .is_some_and(|(slug, name)| TableSlug::recorded(slug).is_ok() && name.len() == 64
             && name.bytes().all(|ch| ch.is_ascii_digit() || (b'a'..=b'f').contains(&ch)))
 }
@@ -62,6 +94,7 @@ impl SearchRunChange {
             || decoded.replaces.iter().any(|digest| digest.len() != 32)
             || decoded.replaces.iter().collect::<BTreeSet<_>>().len() != decoded.replaces.len()
             || (decoded.retire_only() && !decoded.replaces.is_empty())
+            || (decoded.abandon() && (!decoded.retire_only() || run.allocation.is_none()))
         {
             return Err(invalid("Search publication has inconsistent receipts"));
         }

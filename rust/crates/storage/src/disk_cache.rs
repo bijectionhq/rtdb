@@ -350,6 +350,11 @@ impl ObjectStore for DiskCachedStore {
         let _operation = self.cache.begin_operation()?;
         self.cache.cancellation.run_until_cancelled(self.remote.retirement_version(key)).await.ok_or_else(cache_closed)?
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.cache.cancellation.run_until_cancelled(self.remote.retirement_publication(key)).await.ok_or_else(cache_closed)?
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.get_range(key, 0..self.head(key).await?.size).await
     }

@@ -247,7 +247,7 @@ impl TrieCatalog {
     pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
         let Ok(change) = log_pb::SearchRunChange::from_artefact(record) else { return false; };
         let Some(run) = &change.run else { return false; };
-        run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some()))
+        change.abandon() || run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some()))
     }
 
     pub fn with_tries(&self, table: TableRef, tries: impl IntoIterator<Item = CatalogTrie>, as_of: Timestamp) -> Result<Self> {

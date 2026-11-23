@@ -461,6 +461,10 @@ impl ObjectStore for PackingStore {
         if packed(key.as_str()) { return Ok(None); }
         self.inner.retirement_version(key).await
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        if packed(key.as_str()) { return Ok(None); }
+        self.inner.retirement_publication(key).await
+    }
     async fn get(&self, object: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         if IoRegion::requires_audience_transport() { return self.get_fresh(object).await; }
         if let Some(bytes) = self.held(object) { return Ok(bytes); }

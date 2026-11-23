@@ -326,7 +326,10 @@ impl DatabaseFactory {
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
+            let event_history = !read_only && self.options.artefact_threads != 0
+                && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
+                write_event_origins: event_history,
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {
                     crate::AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
@@ -346,16 +349,25 @@ impl DatabaseFactory {
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
-            let builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
+            let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
                 self.artefact_kinds.iter().map(|kind| {
                     let clock = Arc::clone(&self.clock);
-                    Ok((Arc::clone(kind), kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), clock: Arc::new(move || clock.now()) })?))
+                    Ok((Arc::clone(kind), kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
+                        retained: Some(Arc::new(RetainedArtefactJournal(Arc::clone(&logs)))), clock: Arc::new(move || clock.now()) })?))
                 }).collect::<Result<Vec<_>>>()?
             };
-            let replica_driver = match builders.iter().find(|(_, builder)| builder.prepares_serving_search()) {
-                Some((_, builder)) => replica_driver.with_serving_search(Arc::new(PrepareSearch(Arc::clone(builder)))),
-                None => replica_driver,
-            };
+            let history = if event_history {
+                let kind: Arc<dyn ArtefactKind> = Arc::new(rtdb_maintenance::EntityHistoryArtefacts);
+                let clock = Arc::clone(&self.clock);
+                let builder = kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store),
+                    storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), retained: None, clock: Arc::new(move || clock.now()) })?;
+                builders.push((kind, Arc::clone(&builder)));
+                Some(builder)
+            } else { None };
+            let search = builders.iter().find(|(_, builder)| builder.prepares_serving_search()).map(|(_, builder)| Arc::clone(builder));
+            let replica_driver = if history.is_some() || search.is_some() {
+                replica_driver.with_serving_search(Arc::new(PrepareSearch { search, history }))
+            } else { replica_driver };
             let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
                 _ if self.options.compaction_threads == 0 => None,
                 (_, false) => Some(Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() })),
@@ -378,7 +390,7 @@ impl DatabaseFactory {
                 if builder.builds_live_pages() && !builder.prepares_serving_search() { live_artefacts.push(Arc::clone(&builder)); }
                 let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
-                    self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
+                    self.options.artefact_threads.max(1), self.options.command_capacity, self.options.automatic_artefacts)?;
                 artefact_drivers.push(driver);
                 artefacts.push(handle);
             }
@@ -414,29 +426,48 @@ impl DatabaseFactory {
     }
 }
 
-struct PrepareSearch(Arc<dyn ArtefactBuilder>);
+struct RetainedArtefactJournal(Arc<PartitionLogs>);
+
+#[async_trait::async_trait]
+impl rtdb_maintenance::RetainedArtefactSource for RetainedArtefactJournal {
+    async fn replay_table(&self, target: &rtdb_format::catalog::BlockCatalog, table: &rtdb_types::TableRef,
+        visit: &mut rtdb_maintenance::ReplayVisitor<'_>, cancellation: &CancellationToken) -> Result<bool> {
+        let Some(mut replay) = rtdb_replication::RetainedTableReplay::open(&self.0, target, table).await? else { return Ok(false); };
+        while replay.next_block(cancellation, &mut *visit).await?.is_some() {}
+        Ok(true)
+    }
+}
+
+struct PrepareSearch { search: Option<Arc<dyn ArtefactBuilder>>, history: Option<Arc<dyn ArtefactBuilder>> }
 
 #[async_trait::async_trait]
 impl rtdb_replication::ServingSearchBuilder for PrepareSearch {
     async fn prepare(&self, snapshot: rtdb_index::Snapshot, cancellation: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> {
-        self.0.prepare_serving_search(snapshot, cancellation).await
+        let Some(search) = &self.search else { return Ok(None); };
+        search.prepare_serving_search(snapshot, cancellation).await
     }
 
-    fn journals_deltas(&self) -> bool { self.0.journals_search_deltas() }
+    fn journals_deltas(&self) -> bool { self.search.as_ref().is_some_and(|search| search.journals_search_deltas()) }
 
     async fn prepare_delta(&self, snapshot: rtdb_index::Snapshot, write: Arc<rtdb_index::StagedWrite>, cancellation: &CancellationToken)
         -> Result<Option<bytes::Bytes>> {
-        self.0.prepare_search_delta(snapshot, write, cancellation).await
+        let Some(search) = &self.search else { return Ok(None); };
+        search.prepare_search_delta(snapshot, write, cancellation).await
     }
 
     async fn install_delta(&self, snapshot: rtdb_index::Snapshot, write: &rtdb_index::StagedWrite, delta: Option<&[u8]>, cancellation: &CancellationToken)
         -> Result<Option<rtdb_index::ServingSearch>> {
-        self.0.install_search_delta(snapshot, write, delta, cancellation).await
+        let Some(search) = &self.search else { return Ok(None); };
+        search.install_search_delta(snapshot, write, delta, cancellation).await
     }
 
     async fn seal(&self, value: &Arc<rtdb_index::PartitionValue>, table: &rtdb_types::TableRef, trie: &TrieKey,
         file: &std::path::Path, size: u64, cancellation: &CancellationToken) -> Result<Vec<rtdb_format::log::proto::ArtefactRecord>> {
-        self.0.seal_serving_search(value, table, trie, file, size, cancellation).await
+        let mut records = Vec::new();
+        for builder in [&self.history, &self.search].into_iter().flatten() {
+            records.extend(builder.seal_serving_search(value, table, trie, file, size, cancellation).await?);
+        }
+        Ok(records)
     }
 }
 

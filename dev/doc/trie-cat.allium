@@ -458,6 +458,8 @@ rule FollowerRefreshes {
 ------------------------------------------------------------
 
 rule AddArtefact {
+    -- A recorded entity history authenticates event headers and their Arrow locations within its primary trie.
+    -- The history and its optional field witnesses are released with that trie's derived files.
     -- Records an artefact on its trie's entry, on applying an artefacts-added record (db.allium: LeaderAppliesOwnArtefactsAdded, HandleReplicaMessage).
     -- A trie keeps the first record for each (kind, definition id, definition version).
     -- A live trie can replace its group-scoped record with its own after an original member becomes obsolete.

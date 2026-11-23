@@ -55,6 +55,7 @@ enum Task {
     Open(usize),
     Expand(usize),
     OpenLogical(usize),
+    Gap,
     ExpandLogical(usize),
     Legacy(usize),
     Live(usize, Arc<crate::runtime::LivePostingPage>),
@@ -62,23 +63,47 @@ enum Task {
     VerifyBatch(BinaryHeap<Entry>),
 }
 
+pub(super) struct LogicalCoverage<'a> {
+    runs: Vec<&'a rtdb_format::log::proto::SearchRun>,
+    covered: BTreeSet<rtdb_types::BlockIndex>,
+    complete: bool,
+}
+
 pub(super) fn logical_runs<'a>(runtime: &SearchRuntime, request: &ScanRequest<'a>, definition: &SearchDefinition)
-    -> Option<Vec<&'a rtdb_format::log::proto::SearchRun>> {
+    -> Option<LogicalCoverage<'a>> {
     let format = crate::file::LOGICAL_FORMAT_VERSION;
     let id = definition.artefact_id_for(format);
     let runs: Vec<_> = request.snapshot.trie_catalog().search_runs(&definition.table)
         .filter(|run| run.definition_id() == id && run.definition_version() == definition.version).collect();
     if runs.is_empty() && runtime.write_format() != format { return None; }
     if !crate::lane::LogicalIndex::supports(definition) { return None; }
-    let covered = runs.iter().flat_map(|run| run.blocks()).collect::<BTreeSet<_>>();
-    if let Some(block) = request.snapshot.table_catalog().block_index() {
-        let extents = request.snapshot.trie_catalog().l0_source(&definition.table, rtdb_types::BlockIndex(-1), block);
-        if !extents.map(|trie| trie.key.block_index()).eq(covered) { return None; }
-        let source_rows = runs.iter().try_fold(0i64, |count, run| count.checked_add(run.source_rows()))?;
-        let durable = request.snapshot.table_catalog().metadata(&definition.table).map_or(0, |meta| meta.row_count);
-        if source_rows != durable { return None; }
+    let mut covered: BTreeSet<_> = runs.iter().flat_map(|run| run.blocks()).collect();
+    let source_rows = runs.iter().try_fold(0i64, |count, run| count.checked_add(run.source_rows()))?;
+    let durable = request.snapshot.table_catalog().metadata(&definition.table).map_or(0, |meta| meta.row_count);
+    let complete = request.snapshot.table_catalog().block_index().is_none_or(|block| {
+        request.snapshot.trie_catalog().l0_source(&definition.table, rtdb_types::BlockIndex(-1), block)
+            .map(|trie| trie.key.block_index()).eq(covered.iter().copied())
+    }) && source_rows == durable;
+    if source_rows > durable { covered.clear(); }
+    if !complete && !covered.is_empty() && request.snapshot.table_catalog().block_index().is_some_and(|block| {
+        request.snapshot.trie_catalog().l0_source(&definition.table, rtdb_types::BlockIndex(-1), block)
+            .map(|trie| trie.key.block_index()).eq(covered.iter().copied())
+    }) {
+        covered.clear();
     }
-    Some(runs)
+    Some(LogicalCoverage { runs, covered, complete })
+}
+
+fn gap_task(frontier: &mut Frontier) {
+    if !frontier.ready.iter().any(|entry| matches!(entry.task, Task::Gap)) {
+        frontier.push(RankKey::integer(f64::INFINITY, None), Task::Gap);
+    }
+}
+
+fn run_can_match(run: &rtdb_format::log::proto::SearchRun, field: usize, query: &Query) -> bool {
+    let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode_route)
+        .filter(|locator| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64);
+    locator.is_none_or(|locator| query.terms().iter().all(|term| locator.might_contain(field as u32, term)))
 }
 struct Entry { key: RankKey, sequence: u64, task: Task }
 
@@ -137,8 +162,10 @@ fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() ->
         TreeRankOrder::Uuid => RankKey::uuid(score, header.iid.0),
         TreeRankOrder::Score => RankKey::integer(score, None),
     };
+    let source = segment.row(row)?;
+    let origin = source.batch.view().origin(source.row)?;
     Ok(Some((key, Nomination {
-        iid: header.iid, source: None, witness: Some(SearchWitness::Live(header.version())), visibility: Vec::new(),
+        iid: header.iid, source: None, witness: Some(SearchWitness::Live(header.version(), origin)), visibility: Vec::new(),
     })))
 }
 
@@ -165,17 +192,16 @@ async fn visible(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, defi
 impl SearchAccelerator {
     pub(super) async fn logical_candidates(&self, request: &ScanRequest<'_>, definition: &SearchDefinition,
         column: &str, query: &Query, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
-        let Some(runs) = logical_runs(&self.runtime, request, definition) else { return Ok(None); };
+        let Some(mut coverage) = logical_runs(&self.runtime, request, definition) else { return Ok(None); };
         let Some(field) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
         let Some(scorer) = Arc::new(Scorer::new(query.clone(), None)).for_ranking() else { return Ok(None); };
         let mut results = BTreeSet::new();
         let mut charge = request.memory.reserve(4096)?;
         let mut examined = 0usize;
         if let Some(table) = request.snapshot.table_entry(&definition.table) {
-            for run in runs {
+            for run in &coverage.runs {
                 if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-                let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode);
-                if locator.is_some_and(|locator| query.terms().iter().any(|term| !locator.might_contain(field as u32, term))) { continue; }
+                if !run_can_match(run, field, query) { continue; }
                 work.logical_roots += 1;
                 let scanned = async {
                     let tree = self.runtime.logical_file(request.storage, &table.slug, run, &definition.columns).await?;
@@ -194,10 +220,18 @@ impl SearchAccelerator {
                     Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
                     Err(error) => {
                         self.runtime.report_run(request.database, &definition.table, run, &error);
-                        return Ok(None);
+                        coverage.complete = false;
+                        for block in run.blocks() { coverage.covered.remove(&block); }
                     }
                 }
             }
+        }
+        if !coverage.complete {
+            let available = self.max_candidates.saturating_sub(results.len());
+            let Some(gaps) = rtdb_query::uncovered_history_iids(request, &coverage.covered, request.scan.iids.as_ref(), available).await?
+                else { work.plain_decline = Some("logical-gap-budget"); return Ok(None); };
+            reserve_ranking(&mut charge, results.len().saturating_add(gaps.len()))?;
+            results.extend(gaps);
         }
         work.plain_events += examined;
         for segment in request.snapshot.iter_segments(&definition.table) {
@@ -264,14 +298,17 @@ impl SearchAccelerator {
                 frontier.push(RankKey::integer(f64::INFINITY, None), Task::Open(index));
             }
         }
-        let logical = logical.unwrap_or_default();
+        let (logical, mut covered, gaps) = match logical {
+            Some(coverage) => (coverage.runs, coverage.covered, !coverage.complete),
+            None => (Vec::new(), BTreeSet::new(), false),
+        };
         let mut logical_ranks = (0..logical.len()).map(|_| None).collect::<Vec<Option<TreeRanked>>>();
         for (index, run) in logical.iter().enumerate() {
-            let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode);
-            if locator.as_ref().is_none_or(|locator| matching.terms().iter().all(|term| locator.might_contain(column_index as u32, term))) {
+            if run_can_match(run, column_index, matching) {
                 frontier.push(RankKey::integer(f64::INFINITY, None), Task::OpenLogical(index));
             }
         }
+        if gaps { gap_task(&mut frontier); }
         let mut reservation = request.memory.reserve(4096)?;
         let mut nominated = 0;
         let segments: Vec<_> = request.snapshot.iter_segments(&definition.table).collect();
@@ -315,11 +352,6 @@ impl SearchAccelerator {
         let mut rounds = 0;
         loop {
             if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-            if let Some(shared_work) = &shared_work {
-                let upper = frontier.ready.peek().map_or(f64::NEG_INFINITY, |entry| entry.key.score);
-                let unverified = to_verify.values().map(|(key, _)| key.score).fold(upper, f64::max);
-                if shared_work.report(unverified) { tokio::task::yield_now().await; }
-            }
             if to_verify.is_empty() && verified.len() >= limit
                 && verified_cutoff(&mut verified, limit).is_some_and(|kth| frontier.ready.peek().is_none_or(|entry| kth.beats(entry.key))) { break; }
             if to_verify.is_empty() && let Some(cutoff) = shared_rank.and_then(|rank| rank.cutoff(limit))
@@ -328,6 +360,10 @@ impl SearchAccelerator {
                 break;
             }
             if !to_verify.is_empty() && (to_verify.len() >= batch_size || frontier.ready.is_empty()) {
+                let _permit = if let Some(shared_work) = &shared_work {
+                    let bound = to_verify.values().map(|(key, _)| key.score).fold(f64::NEG_INFINITY, f64::max);
+                    Some(shared_work.acquire(bound, request.cancellation).await?)
+                } else { None };
                 rounds += 1;
                 if rounds > 16 { work.tree_decline = Some("verification-budget"); return Ok(None); }
                 work.verification_rounds += 1;
@@ -343,6 +379,7 @@ impl SearchAccelerator {
                             let iid = version.row.version.iid;
                             let (key, witness) = pending[&iid];
                             if trusted && witness.is_some() && witness == version.witness {
+                                if let Some(rank) = shared_rank { rank.add_verified(limit, [(iid, key.score)]); }
                                 verified.push((key, iid));
                                 deferred.insert(iid, version.row);
                                 work.deferred_payloads += 1;
@@ -379,7 +416,20 @@ impl SearchAccelerator {
                 continue;
             }
             let Some(entry) = frontier.next() else { break; };
+            let _permit = if let Some(shared_work) = &shared_work {
+                Some(shared_work.acquire(entry.key.score, request.cancellation).await?)
+            } else { None };
             match entry.task {
+                Task::Gap => {
+                    let available = self.max_candidates.saturating_sub(nominated);
+                    let Some(iids) = rtdb_query::uncovered_history_iids(request, &covered, scope, available).await?
+                        else { work.tree_decline = Some("logical-gap-budget"); return Ok(None); };
+                    nominated += iids.len();
+                    reserve_ranking(&mut reservation, nominated)?;
+                    frontier.nominate_batch(iids.into_iter().filter(|iid| !visited.contains(iid)).map(|iid| {
+                        (RankKey::integer(f64::INFINITY, None), Nomination { iid, source: None, witness: None, visibility: Vec::new() })
+                    }));
+                }
                 Task::OpenLogical(index) => {
                     let table = request.snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
                     let opened = async {
@@ -391,8 +441,9 @@ impl SearchAccelerator {
                         Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
                         Err(error) => {
                             self.runtime.report_run(request.database, &definition.table, logical[index], &error);
-                            work.tree_decline = Some("logical-root");
-                            return Ok(None);
+                            for block in logical[index].blocks() { covered.remove(&block); }
+                            gap_task(&mut frontier);
+                            continue;
                         }
                     };
                     work.tree_roots += 1;
@@ -408,8 +459,9 @@ impl SearchAccelerator {
                         Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted => return Err(error),
                         Err(error) => {
                             self.runtime.report_run(request.database, &definition.table, logical[index], &error);
-                            work.tree_decline = Some("logical-page");
-                            return Ok(None);
+                            for block in logical[index].blocks() { covered.remove(&block); }
+                            gap_task(&mut frontier);
+                            continue;
                         }
                     };
                     work.tree_expansions += 1;
@@ -487,7 +539,7 @@ impl SearchAccelerator {
                 Task::Verify(mut nomination) => {
                     let iid = nomination.iid;
                     if visited.contains(&iid) || request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
-                    if visibility.covers(iid) {
+                    if visibility.can_resolve(iid) {
                         visited.insert(iid);
                         to_verify.insert(iid, (entry.key, nomination.witness));
                         continue;

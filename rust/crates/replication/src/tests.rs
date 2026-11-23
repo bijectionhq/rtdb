@@ -52,7 +52,7 @@ async fn fixture_with_replica(config: ReplicationConfig, replica_message_limit: 
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0), crate::BlockDiscovery::List).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
+    let resolve = Arc::new(ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
     let effects = Arc::new(NoEffects);
     let cancellation = CancellationToken::new();
     let (handle, driver) = match clock {
@@ -506,9 +506,27 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     fixture.handle.progress().applied(Some(SourcePosition(0)), Some(Arc::new(rtdb_tx::TransactionResult::Committed { tx_key: key }).into()), None).unwrap();
     fixture.driver.consume(raw(0, 1, 0, boundary(0, 0))).await.unwrap();
     let pending = fixture.driver.pending_block.as_ref().unwrap();
-    let first = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
-    let second = fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    #[derive(Default)]
+    struct Seal(AtomicI64);
+    #[async_trait]
+    impl ServingSearchBuilder for Seal {
+        async fn prepare(&self, _: rtdb_index::Snapshot, _: &CancellationToken) -> Result<Option<rtdb_index::ServingSearch>> { Ok(None) }
+        async fn seal(&self, _: &Arc<rtdb_index::PartitionValue>, _: &TableRef, _: &rtdb_format::keys::TrieKey,
+            _: &std::path::Path, _: u64, _: &CancellationToken) -> Result<Vec<proto::ArtefactRecord>> {
+            let generation = self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![proto::ArtefactRecord { kind: Some("test".into()), definition_id: Some("sealed".into()),
+                definition_version: Some(generation), ..Default::default() }])
+        }
+    }
+    let seal = Seal::default();
+    let stop = CancellationToken::new();
+    let first = fixture.blocks.produce_with_search(&pending.prepared, &pending.boundary, BTreeMap::new(), &stop, Some(&seal)).await.unwrap();
+    let root = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
+    fixture.store.delete(&root).await.unwrap();
+    let second = fixture.blocks.produce_with_search(&pending.prepared, &pending.boundary, BTreeMap::new(), &stop, None).await.unwrap();
+    assert_eq!(seal.0.load(Ordering::Relaxed), 1);
     assert_eq!(first.catalog, second.catalog);
+    assert_eq!(first.tries, second.tries);
     assert_eq!(fixture.driver.partition.value().live().block_row_count(), 8);
     assert_eq!(fixture.driver.partition.value().table_catalog().block_index(), None);
     let mut uploaded = match upload(0, 0) { ReplicaBody::BlockUploaded(message) => message, _ => unreachable!() };
@@ -1013,7 +1031,7 @@ async fn local_recovery_driver(
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
+    let resolve = Arc::new(ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
         scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
@@ -2508,7 +2526,7 @@ async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (R
     let progress = ProgressMonitor::new(recovered.progress.clone());
     let logs = PartitionLogs::new(Arc::new(MemoryLog::new(1 << 20)), replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
         store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
-    let resolve = Arc::new(ResolveContext { placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
+    let resolve = Arc::new(ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: cache, memory, query_options: Default::default(), scan_accelerators: Default::default(),
         cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
         execution_observer: None, tracer: None });
     ReplicationDriver::new(config, logs, blocks, recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap()

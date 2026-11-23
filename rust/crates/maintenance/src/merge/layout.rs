@@ -227,7 +227,7 @@ impl StreamingTrie {
 pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>,
     data_path: &Path, meta_path: &Path, cancellation: &CancellationToken) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
     let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
-    let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency, keyed: input.keyed };
+    let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency, keyed: input.keyed, include_origins: input.include_origins };
     let directory = data_path.parent().ok_or_else(|| crate::invalid("Output path has no parent"))?;
     let arrow_schema = schema.schema()?;
     let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, &arrow_schema, disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, arrow_schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };

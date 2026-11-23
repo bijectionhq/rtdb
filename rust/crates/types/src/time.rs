@@ -1,4 +1,4 @@
-use crate::{Anomaly, Iid, Result, Timestamp, interval_step};
+use crate::{Anomaly, BlockIndex, Iid, Result, Timestamp, interval_step};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -149,4 +149,29 @@ pub struct RowVersion {
     pub iid: Iid,
     pub system_from: Timestamp,
     pub commit_position: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct EventOrigin(pub [u8; 32]);
+
+impl EventOrigin {
+    pub fn new_commit() -> [u8; 16] { *uuid::Uuid::new_v4().as_bytes() }
+
+    pub const WIDTH: i32 = 32;
+
+    pub fn at(commit: [u8; 16], ordinal: u64, block: BlockIndex) -> Self {
+        let mut value = [0; 32];
+        value[..16].copy_from_slice(&commit);
+        value[16..24].copy_from_slice(&ordinal.to_be_bytes());
+        value[24..].copy_from_slice(&block.0.to_be_bytes());
+        Self(value)
+    }
+
+    pub fn ordinal(self) -> u64 {
+        u64::from_be_bytes(self.0[16..24].try_into().expect("event ordinal width"))
+    }
+
+    pub fn source_block(self) -> BlockIndex {
+        BlockIndex(i64::from_be_bytes(self.0[24..].try_into().expect("event block width")))
+    }
 }

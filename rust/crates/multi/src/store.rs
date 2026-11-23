@@ -967,6 +967,9 @@ impl ObjectStore for FencedStore {
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.inner.retirement_version(key).await
     }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.inner.retirement_publication(key).await
+    }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh(key).await }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh_exact(key, length).await }
@@ -1123,6 +1126,9 @@ impl ObjectStore for EncryptingStore {
     }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.inner.retirement_version(key).await
+    }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.inner.retirement_publication(key).await
     }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
@@ -1462,6 +1468,9 @@ impl ObjectStore for GarbageStore {
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
         self.inner.retirement_version(key).await
+    }
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.inner.retirement_publication(key).await
     }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get_fresh(key).await }

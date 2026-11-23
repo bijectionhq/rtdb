@@ -48,6 +48,7 @@ pub trait TransactionAuthorization: Send + Sync {
 }
 
 pub struct ResolveContext {
+    pub write_event_origins: bool,
     pub placed_receipt_retirement: bool,
     pub owned_witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     pub world_constraints: Option<Arc<dyn WorldConstraintArchive>>,
@@ -113,6 +114,7 @@ impl ResolvedTx {
     fn new(writes: StagedWrite, result: TransactionResult, input: ResolvedInput, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Self> {
         let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
         let reservation = context.memory.reserve(bound)?;
+        let writes = if context.write_event_origins && result.committed() && writes.row_count()? > 0 { writes.assign_event_origins(&context.memory)? } else { writes };
         Ok(Self { writes: Arc::new(writes), result, input, external_token: token, db_op, inline_replica: None, journal_before: None, _reservation: reservation })
     }
 
@@ -859,7 +861,7 @@ impl<'a> OpenTransaction<'a> {
                 let digest = hash.finalize();
                 let iid = Iid::from_slice(&digest[..16])?;
                 let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
-                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { commit_position: 0, entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
+                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { origin: None, commit_position: 0, entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
             }
         };
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
@@ -2094,6 +2096,7 @@ impl<'a> OpenTransaction<'a> {
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         self.record_owned_change(relation, id.clone(), kind, Interval::ALL)?;
         self.buffer.append(table, StoredEvent {
+            origin: None,
             commit_position: 0,
             entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: self.tx_key().system_time, valid_time: Interval::ALL,
@@ -2163,7 +2166,7 @@ impl<'a> OpenTransaction<'a> {
         self.track_unique_mutation(owner, relation, id, valid).await?;
         self.track_capacity_mutation(owner, relation, id, valid).await?;
         let system_from = self.tx_key().system_time;
-        self.buffer.append(relation.table(owner), StoredEvent { commit_position: 0, entity_key: Some(id.handle_bytes().into()),
+        self.buffer.append(relation.table(owner), StoredEvent { origin: None, commit_position: 0, entity_key: Some(id.handle_bytes().into()),
             iid: id.iid(), system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
         })?;
         self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Delete, valid)
@@ -2599,7 +2602,7 @@ impl<'a> OpenTransaction<'a> {
             };
             let entity_key = self.admit_owned_put(table, relation, owner, id, iid, valid_time, create_only, kind).await?;
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            self.buffer.append_to(table, StoredEvent { commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
+            self.buffer.append_to(table, StoredEvent { origin: None, commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
         }
         if let Some(types) = documents.declared_types().filter(|_| !documents.rows().is_empty()) {
             self.buffer.declare_document_types(table, types.iter().filter(|(name, _)| is_content(name)))?;
@@ -3051,7 +3054,7 @@ fn mutation_events(batch: &RecordBatch, kind: MutationKind, system_time: Timesta
             (None, MutationKind::Delete) => StoredOperation::Delete,
             (None, _) => StoredOperation::Erase,
         };
-        append(StoredEvent { commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
+        append(StoredEvent { origin: None, commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
     }
     Ok(())
 }
@@ -3180,6 +3183,7 @@ mod tests {
         state.publish_catalog_cut(CatalogCut { through: ReplicaPosition(0), ..writer.proposed_floor }).unwrap();
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
@@ -3216,6 +3220,7 @@ mod tests {
     async fn mutation_syntax_is_charged_until_the_plan_takes_ownership() {
         let memory = MemoryBudget::new(1 << 24);
         let resolve = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
@@ -3299,6 +3304,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-capacity", 1)?),
             world_constraints: None,
@@ -3349,6 +3355,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,
@@ -3434,6 +3441,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-capacity", 1)?),
             world_constraints: None,
@@ -3540,6 +3548,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("valid-unique", 1)?),
             world_constraints: None,
@@ -3637,7 +3646,7 @@ mod tests {
                 let Value::FixedSizeBinary(iid) = cell("_iid", row) else { panic!("an IID") };
                 let valid_time = match kind { MutationKind::Erase => Interval::ALL, _ => interval(timestamp(&cell("_valid_from", row), system_time).unwrap(), timestamp(&cell("_valid_to", row), Timestamp::MAX).unwrap()).unwrap() };
                 let operation = match kind { MutationKind::Put => { let Value::Struct(document) = cell("doc", row) else { panic!("a document") }; StoredOperation::Put(document) }, MutationKind::Delete => StoredOperation::Delete, MutationKind::Erase => StoredOperation::Erase };
-                events.push(StoredEvent { commit_position: 0, entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
+                events.push(StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
             }
         }
         events
@@ -3740,6 +3749,7 @@ mod tests {
     async fn a_mutation_read_a_column_at_a_time_writes_the_events_a_row_by_row_read_does() {
         let memory = MemoryBudget::new(1 << 26);
         let resolve = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: None,
             world_constraints: None,

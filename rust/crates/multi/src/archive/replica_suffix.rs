@@ -903,6 +903,7 @@ mod custody_tests {
             use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
             use rtdb_types::{EntityId, Interval, LogicalType, ScalarType, StructFields, Value};
             let row = StoredEvent {
+                origin: None,
                 entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(time),
                 commit_position: 0, valid_time: Interval::ALL, recency: None,
                 operation: StoredOperation::Put(StructFields::from([(

@@ -130,7 +130,7 @@ impl TrieCollection {
 
     pub fn eligible_search_runs(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &rtdb_format::log::proto::SearchRun> {
         self.current.trie_catalog().retired_search_runs(table).filter_map(move |retired| {
-            if retired.superseded_at() > as_of.0 { return None; }
+            if retired.released() || retired.superseded_at() > as_of.0 { return None; }
             let run = retired.run.as_ref()?;
             let id = run.identity().ok()?;
             let checkpoint = self.current.checkpoint_tries.as_ref().and_then(|checkpoint| checkpoint.search.get(table));

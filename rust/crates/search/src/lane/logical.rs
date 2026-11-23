@@ -32,10 +32,20 @@ fn scrub_documents(documents: &mut Vec<LogicalDocument>, erases: &Erases) -> boo
     documents.len() < before
 }
 
+fn needs_order_replay(run: &SearchRun) -> bool { run.allocation.is_none() && run.has_erases() }
+
 pub(crate) fn text_revision(value: &str) -> TextRevision {
+    revision_of(&rtdb_text::analyze(value))
+}
+
+pub(super) fn revision_of(tokens: &arrow_array::StringArray) -> TextRevision {
     let mut digest = Sha256::new();
+    digest.update(b"rtdb/search/token-revision");
     digest.update(rtdb_text::ANALYZER_VERSION.to_le_bytes());
-    digest.update(value.as_bytes());
+    for term in tokens.iter().flatten() {
+        digest.update((term.len() as u64).to_le_bytes());
+        digest.update(term.as_bytes());
+    }
     digest.finalize().into()
 }
 
@@ -43,8 +53,9 @@ pub(crate) fn history_id(definition: &SearchDefinition) -> String {
     format!("{}h", definition.artefact_id_for(LOGICAL_FORMAT_VERSION))
 }
 
-pub(crate) fn run_identity(slug: &TableSlug, definition: &str, version: i64, blocks: &[i64], rebuild: i64) -> String {
-    format!("logical-search/{slug}/{definition}/{version}/{blocks:?}/{rebuild}", slug = slug.as_str())
+pub(crate) fn run_identity(slug: &TableSlug, definition: &str, version: i64, blocks: &[i64], rebuild: i64, allocation: &[u8]) -> String {
+    let base = format!("logical-search/{slug}/{definition}/{version}/{blocks:?}/{rebuild}", slug = slug.as_str());
+    if allocation.is_empty() { base } else { format!("{base}/{allocation:02x?}") }
 }
 
 pub(crate) struct LogicalIndex {
@@ -63,7 +74,7 @@ impl LogicalIndex {
     }
 
     pub fn from_history(definition: &ArtefactDefinition) -> Self {
-        Self { table: definition.table.clone(), id: definition.id.trim_end_matches('h').to_owned(), version: definition.version }
+        Self { table: definition.table.clone(), id: definition.id.trim_end_matches('w').to_owned(), version: definition.version }
     }
 
     fn records<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a SearchRun> {
@@ -72,17 +83,88 @@ impl LogicalIndex {
     }
 }
 
+pub(super) fn posting_position(header: EventHeader, origin: Option<rtdb_types::EventOrigin>, page_row: usize) -> Result<u32> {
+    if header.commit_position != 0 { return Ok(header.commit_position); }
+    match origin {
+        Some(origin) => u32::try_from(origin.ordinal()).map_err(fault),
+        None => Ok(u32::MAX - u32::try_from(page_row).map_err(fault)?),
+    }
+}
+
+fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], include_documents: bool,
+    contents: &mut RunContents, charge: &mut Arc<rtdb_types::MemoryReservation>, cancellation: &CancellationToken) -> Result<bool> {
+    let mut has_erases = false;
+    for row in 0..batch.len() {
+        if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+        let mut header = batch.header(row)?;
+        header.commit_position = posting_position(header, batch.origin(row)?, row)?;
+        if header.op == EventOp::Erase {
+            let reservation = Arc::get_mut(charge).expect("Search repair owns its scratch");
+            reservation.grow_to(reservation.bytes().saturating_add(128))?;
+            contents.erases.entry(header.iid).and_modify(|old| *old = (*old).max(header.system_position())).or_insert(header.system_position());
+            has_erases = true;
+        }
+        if include_documents && header.op == EventOp::Put {
+            let event = batch.borrow_event(row)?;
+            let sql_id = super::integer_sql_id(&event);
+            for (field, column) in columns.iter().enumerate() {
+                if let rtdb_format::data::PutText::Utf8(text) = event.put_text(column)? {
+                    let reservation = Arc::get_mut(charge).expect("Search repair owns its scratch");
+                    let _scratch = reservation.budget().reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                    let tokens = rtdb_text::analyze(text);
+                    let retained = tokens.get_array_memory_size().saturating_add(256);
+                    reservation.grow_to(reservation.bytes().saturating_add(retained))?;
+                    contents.documents.push(LogicalDocument { iid: header.iid, field, revision: revision_of(&tokens),
+                        sql_id, tokens, position: header.system_position() });
+                }
+            }
+        }
+    }
+    Ok(has_erases)
+}
+
 impl SearchBuilder {
     pub(super) async fn seal_logical(&self, index: &LogicalIndex, snapshot: &Arc<PartitionValue>, trie: &TrieKey, path: &Path, size: u64,
         cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let view = snapshot.snapshot();
         let seal = view.iter_segments(&index.table).next().cloned().map(|segment| (view.clone(), segment));
-        let history_id = format!("{}h", index.id);
+        let history_id = format!("{}w", index.id);
         let columns = self.columns.lock().get(&(index.table.clone(), history_id, index.version)).cloned()
             .ok_or_else(|| fault("Logical search definition has no fields"))?;
         let run = self.build_logical(index, &columns, &view, trie.block_index(), File::open(path).map_err(fault)?,
             size.min(i64::MAX as u64) as i64, seal, cancellation).await?;
         SearchRunChange { run: Some(run), ..Default::default() }.to_artefact()
+    }
+
+    async fn recover_from_journal(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot,
+        blocks: &[i64], expected: Option<i64>, cancellation: &CancellationToken)
+        -> Result<Option<(RunContents, Arc<rtdb_types::MemoryReservation>, i64)>> {
+        let Some(source) = &self.retained else { return Ok(None); };
+        let Some(boundary) = snapshot.table_catalog().block() else { return Ok(None); };
+        let mut all_erases = RunContents::default();
+        let mut contents = RunContents::default();
+        let mut charge = self.memory.reserve(4096)?;
+        let mut total = 0i64;
+        let mut selected = 0i64;
+        let mut observed = std::collections::BTreeSet::new();
+        let complete = source.replay_table(boundary, &index.table, &mut |block, batch| {
+            let rows = i64::try_from(batch.len()).map_err(fault)?;
+            total = total.checked_add(rows).ok_or_else(|| fault("Search replay row count overflow"))?;
+            if blocks.binary_search(&block.0).is_ok() {
+                observed.insert(block.0);
+                selected = selected.checked_add(rows).ok_or_else(|| fault("Search extent row count overflow"))?;
+                record_source(batch, columns, true, &mut contents, &mut charge, cancellation)?;
+            } else {
+                record_source(batch, columns, false, &mut all_erases, &mut charge, cancellation)?;
+            }
+            Ok(())
+        }, cancellation).await?;
+        let durable = snapshot.table_catalog().metadata(&index.table).map_or(0, |meta| meta.row_count);
+        if !complete || total != durable || !observed.into_iter().eq(blocks.iter().copied())
+            || expected.is_some_and(|expected| expected != selected) { return Ok(None); }
+        scrub_documents(&mut contents.documents, &contents.erases);
+        scrub_documents(&mut contents.documents, &all_erases.erases);
+        Ok(Some((contents, charge, selected)))
     }
 
     async fn build_logical(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, block: BlockIndex, input: File,
@@ -92,7 +174,8 @@ impl SearchBuilder {
         let output = directory.path().join("postings.arrow");
         let file = output.clone();
         let blocks = vec![block.0];
-        let identity = run_identity(&entry.slug, &index.id, index.version, &blocks, 0);
+        let allocation = *uuid::Uuid::new_v4().as_bytes();
+        let identity = run_identity(&entry.slug, &index.id, index.version, &blocks, 0, &allocation);
         let (budget, token, columns, version) = (Arc::clone(&self.memory), cancellation.clone(), columns.to_vec(), index.version);
         let indexing = self.memory.reserve(indexing_allowance(size))?;
         let ((locator, digest), source_rows, has_erases) = tokio::task::spawn_blocking(move || {
@@ -116,18 +199,23 @@ impl SearchBuilder {
             write_group_as(&columns, [counted], &identity, Some(version), None, output, Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
             Ok::<_, rtdb_types::Anomaly>((read_locator(&file)?, source_rows, has_erases))
         }).await.map_err(fault)??;
-        self.publish_run(index, &entry.slug, &output, blocks, 0, source_rows, has_erases, locator, digest, cancellation).await
+        self.publish_run(index, &entry.slug, &output, blocks, 0, source_rows, has_erases, locator, digest, allocation, cancellation).await
     }
 
     async fn publish_run(&self, index: &LogicalIndex, slug: &TableSlug, output: &Path, blocks: Vec<i64>, rebuild: i64, source_rows: i64,
         has_erases: bool, locator: TreeLocator,
-        digest: [u8; 32], cancellation: &CancellationToken) -> Result<SearchRun> {
+        digest: [u8; 32], allocation: [u8; 16], cancellation: &CancellationToken) -> Result<SearchRun> {
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
-        let key = ObjectKey::new(rtdb_format::search_manifest::run_key(slug, digest))?;
-        let publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);
-        Ok(SearchRun { definition_id: Some(index.id.clone()), definition_version: Some(index.version), blocks,
-            digest: Some(digest.to_vec()), locator: Some(locator.encode().into_bytes()), file_size: Some(locator.length as i64), publication,
-            rebuild: (rebuild > 0).then_some(rebuild), source_rows: Some(source_rows), has_erases: has_erases.then_some(true) })
+        let mut run = SearchRun { definition_id: Some(index.id.clone()), definition_version: Some(index.version), blocks,
+            digest: Some(digest.to_vec()), locator: Some(locator.encode().into_bytes()), file_size: Some(locator.length as i64),
+            publication: None, rebuild: (rebuild > 0).then_some(rebuild), source_rows: Some(source_rows),
+            has_erases: has_erases.then_some(true), allocation: Some(allocation.to_vec()) };
+        let intent = ObjectKey::new(run.pending_key(slug)?)?;
+        self.store.put(&intent, run.pending_bytes()?.into()).await?;
+        if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+        let key = ObjectKey::new(run.object_key(slug)?)?;
+        run.publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);
+        Ok(run)
     }
 
     pub(super) async fn refresh_logical(&self, snapshots: &dyn SnapshotSource, publisher: &dyn ArtefactPublisher,
@@ -160,7 +248,19 @@ impl SearchBuilder {
                 let key = ObjectKey::new(entry.slug.data_key(&trie.key))?;
                 let input = match download(self.store.as_ref(), &self.memory, &key, &directory.path().join("source.arrow"), cancellation).await {
                     Ok(file) => file,
-                    Err(error) if error.code == "rtdb.storage/missing-object" => continue,
+                    Err(error) if error.code == "rtdb.storage/missing-object" => {
+                        let blocks = vec![trie.key.block_index().0];
+                        let recovered = self.recover_from_journal(&index, &definition.columns, &snapshot, &blocks, None, cancellation).await;
+                        let (contents, charge, rows) = match recovered {
+                            Ok(Some(recovered)) => recovered,
+                            Ok(None) => continue,
+                            Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); continue; }
+                            Err(error) => return Err(error),
+                        };
+                        let run = self.store_documents(&index, &definition.columns, &entry.slug, blocks, 0, rows, contents, charge, cancellation).await?;
+                        publish_change(publisher, storage, &index, SearchRunChange { run: Some(run), ..Default::default() }).await?;
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 };
                 let run = match self.build_logical(&index, &definition.columns, &snapshot, trie.key.block_index(), input,
@@ -178,6 +278,7 @@ impl SearchBuilder {
                 let limit = (self.memory.limit_bytes() / 8).min(128 << 20) as i64;
                 let Some(pair) = runs.windows(2).find(|pair| {
                     pair[0].blocks.len() == pair[1].blocks.len()
+                        && pair.iter().all(|run| !needs_order_replay(run))
                         && pair[0].blocks.len() * 2 <= rtdb_format::search_manifest::MAX_RUN_BLOCKS
                         && pair[0].file_size().saturating_add(pair[1].file_size()) <= limit
                 }) else { break; };
@@ -210,23 +311,25 @@ impl SearchBuilder {
         for run in &runs { digest.update(run.digest()); }
         let fingerprint = digest.finalize().into();
         if self.scrubbed.lock().get(&cache_key) == Some(&fingerprint) { return Ok(()); }
-        let bound = runs.iter().filter(|run| run.has_erases()).try_fold(4096usize, |bound, run| {
-            bound.checked_add(usize::try_from(run.source_rows()).ok()?.checked_mul(128)?)
-        }).ok_or_else(|| fault("Erase frontier exceeds addressable memory"))?;
-        let _frontier = self.memory.reserve(bound)?;
+        let mut frontier_charge = self.memory.reserve(4096)?;
         let mut erases = Erases::new();
         for run in runs.iter().filter(|run| run.has_erases()) {
             if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
             let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
-            extend_erases(&mut erases, file.erases().await?);
+            let (witnesses, _charge) = file.erases(&self.memory).await?;
+            let frontier = Arc::get_mut(&mut frontier_charge).expect("unpublished erase frontier owns its charge");
+            let need = 4096usize.saturating_add(erases.len().saturating_add(witnesses.len()).saturating_mul(128));
+            if need > frontier.bytes() { frontier.grow_to(need)?; }
+            extend_erases(&mut erases, witnesses);
         }
-        for run in runs {
+        for run in runs.into_iter().filter(|run| !needs_order_replay(run)) {
             if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
             let indexing = self.memory.reserve(indexing_allowance(run.file_size().saturating_mul(4)))?;
             let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
             let mut documents = file.documents().await?;
             if !scrub_documents(&mut documents, &erases) { continue; }
-            let local = if run.has_erases() { file.erases().await? } else { Erases::new() };
+            let (local, _erase_charge) = if run.has_erases() { file.erases(&self.memory).await? }
+                else { (Erases::new(), self.memory.reserve(0)?) };
             let rebuild = run.rebuild().checked_add(1).ok_or_else(|| fault("Search rebuild generation exhausted"))?;
             let replacement = self.store_documents(index, columns, &entry.slug, run.blocks.clone(), rebuild, run.source_rows(),
                 RunContents { documents, erases: local }, indexing, cancellation).await?;
@@ -240,9 +343,44 @@ impl SearchBuilder {
         Ok(())
     }
 
+    async fn read_l0_contents(&self, slug: &TableSlug, blocks: &[i64], columns: &[String], documents: bool,
+        cancellation: &CancellationToken) -> Result<(RunContents, Arc<rtdb_types::MemoryReservation>, i64)> {
+        let mut contents = RunContents::default();
+        let mut charge = self.memory.reserve(4096)?;
+        let mut count = 0i64;
+        for &block in blocks {
+            let trie = TrieKey::l0(BlockIndex(block))?;
+            let key = ObjectKey::new(slug.data_key(&trie))?;
+            let directory = tempfile::tempdir().map_err(fault)?;
+            let input = download(self.store.as_ref(), &self.memory, &key, &directory.path().join("repair.arrow"), cancellation).await?;
+            let memory = Arc::clone(&self.memory);
+            let columns = columns.to_vec();
+            let token = cancellation.clone();
+            (contents, charge, count) = tokio::task::spawn_blocking(move || {
+                let (mut reader, _opening) = open_input(input, &memory)?;
+                for page in 0..reader.page_count() {
+                    let batch = rtdb_maintenance::input::read_page(&mut reader, page, &memory)?;
+                    let batch = rtdb_format::data::EventBatch::new(batch.batch().clone())?;
+                    count = count.checked_add(batch.len() as i64).ok_or_else(|| fault("Search repair row count overflow"))?;
+                    record_source(&batch, &columns, documents, &mut contents, &mut charge, &token)?;
+                }
+                Ok::<_, rtdb_types::Anomaly>((contents, charge, count))
+            }).await.map_err(fault)??;
+        }
+        Ok((contents, charge, count))
+    }
+
     async fn repair_logical(&self, snapshots: &dyn SnapshotSource, publisher: &dyn ArtefactPublisher,
         storage: (StorageVersion, StorageEpoch), definitions: &[SearchDefinition], cancellation: &CancellationToken) -> Result<()> {
-        for (table, id) in self.runtime.suspect_runs(&self.database) {
+        let captured = snapshots.snapshot().snapshot();
+        let mut repairs: std::collections::BTreeSet<_> = self.runtime.suspect_runs(&self.database).into_iter().collect();
+        for table in captured.trie_catalog().tables() {
+            for run in captured.trie_catalog().search_runs(table).filter(|run| needs_order_replay(run)) {
+                repairs.insert((table.clone(), run.identity()?));
+            }
+        }
+        drop(captured);
+        for (table, id) in repairs {
             let snapshot = snapshots.snapshot().snapshot();
             let target = snapshot.trie_catalog().search_runs(&table).find(|run| run.identity().is_ok_and(|digest| digest == id));
             let Some(target) = target else { self.runtime.clear_run(&self.database, &table, id); continue; };
@@ -254,59 +392,57 @@ impl SearchBuilder {
             let index = LogicalIndex::of(definition);
             let attempt = async {
                 let entry = snapshot.table_entry(&table).ok_or_else(|| fault("Logical repair has no table slug"))?;
-                let checked = async {
-                    self.runtime.open_logical(&self.storage, &entry.slug, target, &definition.columns, true).await?.verify().await
-                }.await;
-                match checked {
-                    Ok(()) => return Ok(()),
-                    Err(error) if !crate::runtime::FileError::from_anomaly(error.clone()).needs_repair() => return Err(error),
-                    Err(_) => {}
+                if !needs_order_replay(target) {
+                    let checked = async {
+                        self.runtime.open_logical(&self.storage, &entry.slug, target, &definition.columns, true).await?.verify().await
+                    }.await;
+                    match checked {
+                        Ok(()) => return Ok(()),
+                        Err(error) if !crate::runtime::FileError::from_anomaly(error.clone()).needs_repair() => return Err(error),
+                        Err(_) => {}
+                    }
                 }
                 let rebuild = target.rebuild().checked_add(1).ok_or_else(|| fault("Search rebuild generation exhausted"))?;
                 let blocks = target.blocks.clone();
-                let mut contents = RunContents::default();
-                let mut charge = self.memory.reserve(4096)?;
-                let mut source_rows = 0i64;
-                for block in target.blocks() {
-                    let trie = TrieKey::l0(block)?;
-                    let key = ObjectKey::new(entry.slug.data_key(&trie))?;
-                    let directory = tempfile::tempdir().map_err(fault)?;
-                    let input = download(self.store.as_ref(), &self.memory, &key, &directory.path().join("repair.arrow"), cancellation).await?;
-                    let memory = Arc::clone(&self.memory);
-                    let columns = definition.columns.clone();
-                    let token = cancellation.clone();
-                    (contents, charge, source_rows) = tokio::task::spawn_blocking(move || {
-                        let (reader, opening) = open_input(input, &memory)?;
-                        let mut pages = PageRows::new(reader, opening, memory, token, false);
-                        pages.mode = BuildMode::Postings;
-                        for page in pages {
-                            let page = page?;
-                            source_rows += page.len() as i64;
-                            for row in 0..page.len() {
-                                let IndexedRow { header, sql_id, values, revisions, .. } = page.row(row, &columns)?;
-                                if header.op == EventOp::Erase {
-                                    contents.erases.entry(header.iid).and_modify(|old| *old = (*old).max(header.system_position()))
-                                        .or_insert_with(|| header.system_position());
-                                }
-                                for (field, (tokens, revision)) in values.into_iter().zip(revisions).enumerate() {
-                                    let (Some(tokens), Some(revision)) = (tokens, revision) else { continue; };
-                                    let retained = tokens.get_array_memory_size().saturating_add(256);
-                                    let reservation = Arc::get_mut(&mut charge).expect("Logical repair owns its scratch");
-                                    let bytes = reservation.bytes().checked_add(retained).ok_or_else(|| fault("Search repair exceeds addressable memory"))?;
-                                    reservation.grow_to(bytes)?;
-                                    contents.documents.push(LogicalDocument { iid: header.iid, field, revision, sql_id, tokens,
-                                        position: header.system_position() });
+                let l0 = self.read_l0_contents(&entry.slug, &blocks, &definition.columns, true, cancellation).await;
+                let (mut contents, charge, source_rows) = match l0 {
+                    Ok((mut contents, charge, source_rows)) if source_rows == target.source_rows() => {
+                        let frontier = async {
+                            for run in index.records(&snapshot).into_iter().filter(|run| run.has_erases() && run.digest() != target.digest()) {
+                                let erases = async {
+                                    let file = self.runtime.logical_file(&self.storage, &entry.slug, run, &definition.columns).await?;
+                                    file.erases(&self.memory).await
+                                }.await;
+                                match erases {
+                                    Ok((erases, _charge)) => { scrub_documents(&mut contents.documents, &erases); }
+                                    Err(error) if super::is_search_gap(&error, cancellation) => {
+                                        let (restored, _charge, rows) = self.read_l0_contents(&entry.slug, &run.blocks, &[], false, cancellation).await?;
+                                        if rows != run.source_rows() { return Err(fault("Search erase replay covers a different number of source events")); }
+                                        scrub_documents(&mut contents.documents, &restored.erases);
+                                    }
+                                    Err(error) => return Err(error),
                                 }
                             }
+                            Ok(())
+                        }.await;
+                        match frontier {
+                            Ok(()) => (contents, charge, source_rows),
+                            Err(error) if super::is_search_gap(&error, cancellation) => {
+                                drop((contents, charge));
+                                self.recover_from_journal(&index, &definition.columns, &snapshot, &blocks, Some(target.source_rows()), cancellation)
+                                    .await?.ok_or(error)?
+                            }
+                            Err(error) => return Err(error),
                         }
-                        Ok::<_, rtdb_types::Anomaly>((contents, charge, source_rows))
-                    }).await.map_err(fault)??;
-                }
-                if source_rows != target.source_rows() { return Err(fault("Search repair covers a different number of source events")); }
-                for run in index.records(&snapshot).into_iter().filter(|run| run.has_erases() && run.digest() != target.digest()) {
-                    let file = self.runtime.logical_file(&self.storage, &entry.slug, run, &definition.columns).await?;
-                    scrub_documents(&mut contents.documents, &file.erases().await?);
-                }
+                    }
+                    Ok(_) => return Err(fault("Search repair covers a different number of source events")),
+                    Err(error) if super::is_search_gap(&error, cancellation) => {
+                        self.recover_from_journal(&index, &definition.columns, &snapshot, &blocks, Some(target.source_rows()), cancellation)
+                            .await?.ok_or(error)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                scrub_documents(&mut contents.documents, &contents.erases);
                 let run = self.store_documents(&index, &definition.columns, &entry.slug, blocks, rebuild, source_rows, contents, charge, cancellation).await?;
                 publish_change(publisher, storage, &index, SearchRunChange {
                     run: Some(run), replaces: vec![id.to_vec()], ..Default::default()
@@ -332,7 +468,10 @@ impl SearchBuilder {
             if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
             let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
             contents.documents.extend(file.documents().await?);
-            if run.has_erases() { extend_erases(&mut contents.erases, file.erases().await?); }
+            if run.has_erases() {
+                let (erases, _charge) = file.erases(&self.memory).await?;
+                extend_erases(&mut contents.erases, erases);
+            }
             blocks.extend(run.blocks.iter().copied());
         }
         let source_rows = inputs.iter().try_fold(0i64, |count, run| count.checked_add(run.source_rows()))
@@ -360,14 +499,15 @@ impl SearchBuilder {
         let directory = tempfile::tempdir().map_err(fault)?;
         let output = directory.path().join("postings.arrow");
         let file = output.clone();
-        let (identity, columns, version) = (run_identity(slug, &index.id, index.version, &blocks, rebuild), columns.to_vec(), index.version);
+        let allocation = *uuid::Uuid::new_v4().as_bytes();
+        let (identity, columns, version) = (run_identity(slug, &index.id, index.version, &blocks, rebuild, &allocation), columns.to_vec(), index.version);
         let (locator, digest) = tokio::task::spawn_blocking(move || {
             let output = BufWriter::new(File::create(&file).map_err(fault)?);
             write_group_as(&columns, [[Ok(MergedRows(rows))]], &identity, Some(version), None, output,
                 Some(indexing), LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
             read_locator(&file)
         }).await.map_err(fault)??;
-        self.publish_run(index, slug, &output, blocks, rebuild, source_rows, has_erases, locator, digest, cancellation).await
+        self.publish_run(index, slug, &output, blocks, rebuild, source_rows, has_erases, locator, digest, allocation, cancellation).await
     }
 }
 
@@ -424,6 +564,27 @@ async fn publish_change(publisher: &dyn ArtefactPublisher, storage: (StorageVers
         Err(error) if error.category == AnomalyCategory::Interrupted => Err(crate::accelerate::search_cancelled()),
         result => result.map(|_| ()),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn an_intact_legacy_erase_run_requires_reconstruction() {
+    let mut run = SearchRun { has_erases: Some(true), ..Default::default() };
+    assert!(needs_order_replay(&run));
+    run.allocation = Some(vec![42; 16]);
+    assert!(!needs_order_replay(&run));
+    run.allocation = None;
+    run.has_erases = None;
+    assert!(!needs_order_replay(&run));
+}
+
+#[cfg(test)]
+#[test]
+fn normalized_revisions_preserve_order_and_frequency() {
+    assert_eq!(text_revision("Quarterly Audit—REPORT"), text_revision("quarterly audit report"));
+    assert_ne!(text_revision("report audit"), text_revision("audit report"));
+    assert_ne!(text_revision("audit report"), text_revision("audit audit report"));
+    assert_ne!(text_revision("a bc"), text_revision("ab c"));
 }
 
 #[cfg(test)]

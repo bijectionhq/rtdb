@@ -1,105 +1,116 @@
 # RTDB logical full-text postings
 
-Set `search: {writeFormat: 16}` on a native node to enable logical postings for public history-enabled search indexes.
-The durable index describes text revisions, and the primary catalog describes where each event lives in Arrow.
-Primary compaction can replace an event's locator while a logical posting run stays byte-for-byte identical.
+Set `search: {writeFormat: 16}` on a native node to enable logical postings for public, history-enabled search definitions.
+A native writer in this mode also records shared table history that ordinary point scans can use on tables without a search definition.
+The same pinned catalog determines which version is visible and where its payload lives.
 
 ## Data and ownership
 
 | Object | Role | Owns |
 | --- | --- | --- |
-| `SearchRun` and `SearchManifest` | Passive | Run identity, provider receipt, source extents, authenticated root locator, and replacement history. |
-| Primary history file | Passive | Sorted event headers, text-revision witnesses, and Arrow page and row coordinates for one primary trie. |
-| `PartitionValue` and `Snapshot` | Passive | One immutable cut of live Arrow, primary catalog, and posting manifest. |
-| `ReplicationDriver` | Active | The ordered publication and replay of transaction deltas, run replacements, and checkpoint adoption. |
-| `SearchBuilder` and the artefact driver | Passive builder and active driver | The artefact driver owns job scheduling and publication; the builder produces immutable receipts and files from captured inputs. |
-| `TrieCollector` | Active | Catalog-aware search retirement and acknowledgement after a provider release. |
-| `SearchRuntime` and `PartitionRanking` | Monitor | Charged caches, repair reports, admission telemetry, and query-scoped verified ranking bounds. |
+| `EventOrigin`, `RowVersion`, and `SearchRowLocation` | Passive values | Accepted event identity, temporal order, and a physical location at one captured cut. |
+| `EventBatch`, `OwnedBatch`, and `StagedWrite` | Passive values | Charged Arrow buffers and the write's events in commit order. |
+| `HistoryWriter`, `HistoryRoot`, `HistoryRange`, `HistoryPage`, and `ForwardPage` and `HistoryObject` | Passive objects | A single writer's authenticated directory and immutable header or revision pages. |
+| `EntityHistoryArtefacts`, `EntityHistoryBuilder`, and `SearchBuilder` | Passive builders | The build inputs and publication ports for table history and search. |
+| `SearchRun`, `SearchManifest`, and `LogicalCoverage` | Passive values | Source extents, authenticated routing, and active and retired run receipts. |
+| `RetainedArtefactJournal` and `PrepareSearch` | Passive adapters | Access to verified retained replay and to the file builders invoked by sealing. |
+| `ReplicationDriver` and the artefact driver | Active objects | Ordered adoption and replay, and selection and scheduling of independent build work. |
+| `TrieCollector` | Passive cycle worker | The eligibility observations and receipts used by a collection cycle. |
+| `PartitionRanking` | Monitor | Waiting partitions, ranked task admission, and the verified score cutoff for one compatible shared query basis. |
+| `PartitionRankWork` and `RankWorkPermit` | Passive guards | The lifetime of pending and admitted work in that query. |
 
-    RowVersion = (entity IID, system-from, commit position), scoped to a captured table lineage
-    TextRevision = SHA-256(analyzer version || exact UTF-8 bytes)
-    PostingDocument = (entity IID, indexed field, TextRevision)
-    ArrowLocation = (pinned primary trie, page, row)
+```rust
+struct EventOrigin {
+    accepted_commit: [u8; 16],
+    event_ordinal: u64,
+    original_block: i64,
+}
 
-Byte-identical text shares one posting document per entity and field within a run.
-The analyzer version domain-separates revisions.
-The event history records a separate revision witness for each indexed text field, including the distinction between a text value and an absent witness.
-An ambiguous legacy event order falls back to the authoritative scan.
+type TextRevision = [u8; 32];
+// Hash the analyzer generation and the ordered, length-prefixed token sequence.
+```
+
+An accepted commit assigns event IDs before journaling.
+Replay, forks that preserve accepted Arrow, L0 sealing, and primary compaction preserve those bytes.
+An event split into disjoint fragments can have several locations at a captured cut.
+Receipts from older data can still use the original temporal coordinates when they unambiguously identify events.
+
+A table history page stores event headers and physical row coordinates.
+A separate forward page stores each field's revision, keyed by the accepted event.
+Equivalent analyzed text shares a posting revision for the same field and entity.
+A forward witness must match the resolved event's identity before a posting can certify its score.
+Older revisions and absent witnesses can be checked by scoring the resolved primary row.
+Upgrade readers and compaction workers together with ingest writers when enabling this mode or upgrading an existing format 16 deployment.
+Older writers can discard the optional event identity and cannot reproduce the resulting compaction output at the same key.
 
 ```mermaid
 flowchart LR
-    Log["Accepted replica journal"]
-    Live["Live Arrow and token delta"]
-    Run["Immutable text posting runs"]
-    Hist["Primary history and locations"]
-    Primary["Primary Arrow data"]
-    Cut["Pinned database view"]
-    Log --> Live
+    Journal["Accepted replica journal"] --> Live["Live Arrow and token delta"]
+    Journal --> Repair["Boundary-verified replay"]
+    Repair --> Run["Independent posting runs"]
     Live --> Run
-    Live --> Hist
-    Live --> Primary
-    Run --> Cut
-    Hist --> Cut
+    Live --> Primary["Primary Arrow"]
+    Primary --> History["Table-owned entity history"]
+    Primary --> Forward["Per-definition forward witnesses"]
+    Run --> Cut["Pinned catalog"]
+    History --> Cut
+    Forward --> Cut
     Primary --> Cut
-    Live --> Cut
 ```
 
-## Publication and recovery
+## Publication, coverage, and recovery
 
-For admitted ordinary commits, the leader analyzes each indexed text cell and serializes a bounded Arrow token delta with the resolved transaction.
-Replay installs the accepted delta with the live Arrow events at the same basis, and advances each indexed column's contiguous prefix only when it can account for every new row.
-An absent optional delta leaves the prefix intact and the wider tail available through the exact scan.
-Guarded transaction acceptance retains its existing staging and inline payload path.
+Posting runs cover the table's accepted events in a set of blocks within one storage partition.
+Each receipt binds that extent, the definition and generation, the file length, the root locator, and a unique upload allocation.
+The checkpoint stores active and retired receipts with the table.
+A replacement can adopt the exact union of its still-active inputs in one ordered update.
 
-At seal, a run covers the table's extent in a specific L0 block, while a history file records the same block's event locations.
-The checkpoint serializes the run receipt with the table catalog, and the block notification carries the receipt for replay.
-For historical backfill the artefact lane reads retained L0, then merges comparable posting runs from their own Arrow token sequences.
-An ordered replacement compares the still-active inputs and must cover exactly their union.
-A rejected replacement with an ordered upload receipt enters the retirement inventory.
-A read requires all retained source extents, with a row-count check against the durable table metadata.
-Each receipt binds its table, definition, extent list, and rebuild number to a content-addressed file and authenticated Arrow root.
-The root carries a term synopsis and a page tree for selective lookup.
+The writer stores a bounded intent before it uploads the immutable run.
+Collection observes the intent and the completed object, obtains provider version evidence where required, and submits abandonment through the ordered catalog.
+Adoption and abandonment are mutually exclusive at that allocation.
+The retirement can release the body after reader and checkpoint protection drains.
+An abandoned allocation remains fenced through checkpoint recovery.
+Incomplete provider uploads are handled by the provider's publication journal where available.
+Hosted storage authenticates ranges of new logical runs and history sidecars with independently encrypted frames.
 
-A repair report for a missing or corrupt run triggers a fresh read.
-If the run needs replacement and its original L0 inputs are available, the lane publishes a new authenticated run over the same extents.
-The exact scan serves the query while coverage is missing.
-Posting runs retain erase witnesses and the latest contributing event order for each text revision.
-The lane scrubs revisions that precede an erase and preserves later writes of the same text.
-Reader holds, checkpoint coverage, and the collection lease protect superseded runs.
-Hosted reclamation carries provider evidence and advances the catalog admission floor before recording the release.
+The lane can reconstruct a run from retained L0 files.
+For supported native local journals, it can recover from the captured checkpoint's verified replica prefix when original primary files are missing.
+The repair checks the table's replayed event count and the requested extent before publication.
+Replay supplies the erase frontier, so recovery can discard pre-erase text and preserve later writes.
+Events in the same commit retain source order for erasure.
+Maintenance reconstructs older runs containing erase witnesses before adopting them into ordered replacements.
+A retry after a table checkpoint is staged reuses its receipts while publishing the root.
 
 ## Query execution
 
 ```mermaid
 flowchart TD
-    Sql["SQL MATCH, ranked MATCH, or entity point read"]
-    Shape{"Read shape"}
-    Terms["Route to runs with the required terms"]
-    Intersect["Intersect postings and verify positions"]
-    Rank["Advance the highest remaining score bounds"]
-    Resolve["Resolve exact bitemporal history in the pinned view"]
-    Gather["Gather and check Arrow rows"]
-    Result["Apply SQL predicates and projection"]
-    Sql --> Shape
-    Shape -->|MATCH or ranking| Terms
-    Shape -->|Explicit entity IDs| Resolve
-    Terms --> Intersect --> Rank --> Resolve
-    Resolve --> Gather --> Result
+    SQL["Pinned SQL scan"] --> Shape{"Query shape"}
+    Shape -->|Explicit entity keys| Resolve["Resolve table-owned event history"]
+    Shape -->|MATCH| Route["Select runs with authenticated required-term evidence"]
+    Route --> Postings["Intersect postings and check phrase positions"]
+    Route --> Gap["Nominate uncovered entities from primary history"]
+    Postings --> Frontier["Rank by remaining score bounds"]
+    Gap --> Frontier
+    Frontier --> Resolve
+    Resolve --> Witness["Check an indexed field's forward witness"]
+    Witness --> Arrow["Gather winning or unverified Arrow rows"]
+    Arrow --> SQLResult["Apply SQL predicates, sort, and project"]
 ```
 
-A sparse phrase read starts from the least frequent mandatory term and coalesces posting windows.
-Dense ranked reads use the block-max hierarchy.
-The scan resolves nominees with the same temporal resolver used for bounded entity point reads.
-Trusted witnesses can defer materializing the Arrow payload until after the ranked prefix is known, and the gather checks the row version.
-Query-wide verified scores can prune work across concurrent partitions at a common basis.
-An equal-score bound stays live when the SQL tie order is uncertified.
+Candidate selectors combine covered runs, uncovered history, and the live suffix.
+A failed run contributes a gap while healthy runs remain usable.
+If a bounded gap scan cannot account for all uncovered data, the query uses the authoritative scan.
+The synopsis can exclude a run for a required term at the captured manifest without opening the run.
+A phrase additionally checks positions in the candidate posting sequence.
+A ranked query prioritizes ready work across compatible partitions and shares a score cutoff derived from verified rows.
+Unknown and exact-gap work keeps an unbounded score until it can nominate candidates.
+SQL tie order remains authoritative at equal scores.
 
-## Scope
+```yaml
+search:
+  writeFormat: 16
+```
 
-Format 16 applies to public history-enabled definitions, with format 15 retained for protected and current-only definitions.
-An explicit entity point read can use the history access path on a covered table with a qualifying search definition.
-Historical backfills and repairs require accessible original L0 inputs.
-An upload whose process dies before any ordered receipt reaches the catalog can leave an untracked object.
-Coverage gaps, allocation refusal, and incompatible read shapes use the regular SQL path.
-
-The durable Arrow implementation is exercised by the `ranked-logical` mode of `fts_architecture_bench`, which interleaves formats 15 and 16 against the same primary files and verifies results against exhaustive SQL.
+Protection and governed ownership still follow the held-table authorization and corpus rules.
+Legacy file formats remain readable, and unsupported scan shapes can use the complete primary resolver.

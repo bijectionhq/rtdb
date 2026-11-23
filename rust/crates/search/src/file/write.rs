@@ -215,7 +215,10 @@ impl Builder {
         let mut visible: Vec<Vec<[i64; 4]>> = vec![Vec::new(); entity.rows.len()];
         if self.mode == BuildMode::Postings {
             for (index, (_, header, _)) in entity.rows.iter().enumerate() {
-                if header.op == rtdb_types::EventOp::Put { visible[index].push([i64::MIN, i64::MAX, i64::MIN, i64::MAX]); }
+                if header.op == rtdb_types::EventOp::Put
+                    && self.erases.get(&iid).is_none_or(|position| header.system_position() >= *position) {
+                    visible[index].push([i64::MIN, i64::MAX, i64::MIN, i64::MAX]);
+                }
             }
         } else {
             for (index, rectangle) in rtdb_temporal::visibility(entity.rows.iter().enumerate().map(|(index, (_, header, _))| (header, index)))? {

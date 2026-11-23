@@ -502,7 +502,7 @@ impl SearchRuntime {
         let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode)
             .filter(|locator| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64)
             .ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.search/corrupt-file", "Search run has no matching root locator"))?;
-        let identity = crate::lane::run_identity(slug, run.definition_id(), run.definition_version(), &run.blocks, run.rebuild());
+        let identity = crate::lane::run_identity(slug, run.definition_id(), run.definition_version(), &run.blocks, run.rebuild(), run.allocation());
         if fresh { storage.invalidate(&key).await?; }
         self.tree_file(storage, &key, &locator, columns, &identity, run.definition_version(), fresh).await.map_err(|error| match error {
             FileError::Missing => rtdb_types::Anomaly::fault("rtdb.storage/missing-object", key.as_str()),
@@ -866,7 +866,7 @@ mod tests {
         let (memory, cancellation) = (rtdb_columnar::MemoryBudget::new(1 << 30), CancellationToken::new());
         let data = ObjectKey::new("tables/docs/data/l00-rc-b00.arrow").unwrap();
         let data_file = || {
-            let event = rtdb_format::data::StoredEvent { commit_position: 0, entity_key: None, iid: rtdb_types::Iid([1; 16]), system_from: rtdb_types::Timestamp(1), valid_time: rtdb_types::Interval::new(rtdb_types::Timestamp(0), rtdb_types::Timestamp::MAX).unwrap(),
+            let event = rtdb_format::data::StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: rtdb_types::Iid([1; 16]), system_from: rtdb_types::Timestamp(1), valid_time: rtdb_types::Interval::new(rtdb_types::Timestamp(0), rtdb_types::Timestamp::MAX).unwrap(),
                 operation: rtdb_format::data::StoredOperation::Put(rtdb_types::StructFields::from([("body".into(), rtdb_types::Value::Utf8("an overdue invoice".into()))])), recency: None };
             let batch = rtdb_format::data::build_event_batch(&[event], Some(rtdb_types::StructFields::from([("body".into(), rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Utf8))])), None).unwrap();
             bytes::Bytes::from(rtdb_format::ipc::write_file(&batch.schema(), &[batch]).unwrap())
@@ -938,7 +938,7 @@ mod live_coverage_tests {
         let root = LiveTable::new(TableRef::new("public", "docs"), BlockIndex(0), Default::default());
         let append = |table: &LiveTable, id: i64, body: &str| {
             let identity = EntityId::Integer(id);
-            let event = StoredEvent { entity_key: None, iid: identity.iid(), system_from: Timestamp(id),
+            let event = StoredEvent { origin: None, entity_key: None, iid: identity.iid(), system_from: Timestamp(id),
                 commit_position: 0, valid_time: Interval::ALL, recency: None,
                 operation: StoredOperation::Put(StructFields::from([
                     ("_id".into(), Value::I64(id)), ("body".into(), Value::Utf8(body.into())),

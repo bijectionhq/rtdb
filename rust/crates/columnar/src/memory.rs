@@ -70,6 +70,21 @@ impl OwnedBatch {
     pub fn batch(&self) -> &RecordBatch { &self.batch }
     pub fn reservation(&self) -> &Arc<MemoryReservation> { &self.reservation }
 
+    pub fn with_appended_column(&self, field: arrow_schema::Field, column: arrow_array::ArrayRef,
+        reservation: Arc<MemoryReservation>) -> Result<Self> {
+        if column.get_array_memory_size() > reservation.bytes() {
+            return Err(Anomaly::incorrect("rtdb/undersized-reservation", "Appended column exceeds its reservation"));
+        }
+        let schema = self.batch.schema();
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(field));
+        let mut columns = self.batch.columns().to_vec();
+        columns.push(make_array(attach_data(column.to_data(), &reservation)?));
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let batch = RecordBatch::try_new(schema, columns).map_err(super::arrow_error)?;
+        Ok(Self { batch, reservation: Arc::clone(&self.reservation) })
+    }
+
     /// Copies distinct rows from batches with the same physical schema, in the specified order.
     pub fn interleave_distinct_rows(
         sources: &[&Self], rows: &[(usize, usize)], memory: &Arc<MemoryBudget>,

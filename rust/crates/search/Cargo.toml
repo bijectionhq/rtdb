@@ -25,6 +25,7 @@ async-trait.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-ipc.workspace = true

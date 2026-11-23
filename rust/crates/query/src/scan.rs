@@ -583,21 +583,29 @@ impl ScanCursor {
                     let request = crate::ScanRequest { database: name, scan, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
                         constants: &crate::accelerate::ExecutionConstants(execution), verifier: &verifier, partitions: database_partitions };
-                    for accelerator in execution.context.accelerators.iter() {
-                        let Some(rows) = accelerator.point_rows(&request, &iids).await? else { continue; };
+                    let mut resolved = crate::table_point_rows(&request, &iids).await?;
+                    if resolved.is_none() {
+                        for accelerator in execution.context.accelerators.iter() {
+                            resolved = accelerator.point_rows(&request, &iids).await?;
+                            if resolved.is_some() { break; }
+                        }
+                    }
+                    if let Some(rows) = resolved {
                         if rows.is_empty() { return Ok((parts, *verifier.counts.lock())); }
-                        let mut batch = match verifier.gather_search_rows(scan, rows).await {
-                            Ok(batch) => batch,
-                            Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => continue,
+                        let batch = match verifier.gather_search_rows(scan, rows).await {
+                            Ok(batch) => Some(batch),
+                            Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => None,
                             Err(error) => return Err(error),
                         };
-                        if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
-                            let schema = Schema::new(scan.columns.clone())?;
-                            let mask = crate::columnar::predicate_mask(&batch, &predicate, &schema, execution).await?;
-                            batch = batch.select(&mask, &execution.context.memory)?;
+                        if let Some(mut batch) = batch {
+                            if let Some(predicate) = scan.predicates.iter().cloned().reduce(|a, b| Expr::binary(rtdb_plan::BinaryOp::And, a, b)) {
+                                let schema = Schema::new(scan.columns.clone())?;
+                                let mask = crate::columnar::predicate_mask(&batch, &predicate, &schema, execution).await?;
+                                batch = batch.select(&mask, &execution.context.memory)?;
+                            }
+                            if batch.len != 0 { parts.push_back(Part::Resolved(Some(batch))); }
+                            return Ok((parts, *verifier.counts.lock()));
                         }
-                        if batch.len != 0 { parts.push_back(Part::Resolved(Some(batch))); }
-                        return Ok((parts, *verifier.counts.lock()));
                     }
                 }
                 for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids) {
@@ -1175,8 +1183,10 @@ impl ScanVerifier<'_> {
                     (batch, u32::try_from(source.row).map_err(|error| invalid("search-row", error))?)
                 }
             };
-            let header = sources[batch as usize].header(position as usize)?;
-            if header.version() != row.version || header.op != EventOp::Put {
+            let source = &sources[batch as usize];
+            let header = source.header(position as usize)?;
+            if header.version() != row.version || header.op != EventOp::Put
+                || (row.origin.is_some() && source.view().origin(position as usize)? != row.origin) {
                 return Err(invalid("search-row", "Resolved search location names a different version"));
             }
             resolved.push(ResolvedRow { source: (batch, position), valid_time: row.visibility.valid_time, system_time: row.visibility.system_time });
@@ -2021,6 +2031,7 @@ mod tests {
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
         let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
             StoredEvent {
+                origin: None,
                 commit_position: 0,
                 entity_key: None,
                 iid: Iid([prefix; 16]),
@@ -2074,6 +2085,7 @@ mod tests {
             if values.len() > 1 { write.retain_owned_positions().unwrap(); }
             for &value in values {
                 write.append(table.clone(), StoredEvent {
+                    origin: None,
                     commit_position: 0,
                     entity_key: Some(id.handle_bytes().into()),
                     iid: id.iid(),
@@ -3537,6 +3549,7 @@ mod tests {
         let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
         let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
         write.append(table.clone(), StoredEvent {
+            origin: None,
             commit_position: 0,
             entity_key: None,
             iid: Iid([0xc0; 16]),

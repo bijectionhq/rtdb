@@ -56,12 +56,12 @@ The node option `search: {enabled: false}` turns off the lane and acceleration.
 `search: {threads: N}` sizes the lane per database.
 `search: {writeFormat: 14}` enables authenticated Arrow search files for newly indexed tries.
 `search: {writeFormat: 15}` also enables snapshot-pinned serving postings and packed Arrow visibility for ranked SQL.
-`search: {writeFormat: 16}` enables independent Arrow text-revision posting runs, journaled token deltas when admitted, and snapshot-pinned history and payload locations for public history-enabled indexes.
+`search: {writeFormat: 16}` enables independent Arrow text-revision posting runs, journaled token deltas when admitted, and a table-owned event history for SQL point reads and public history-enabled search indexes.
 See link:rtdb-fts-logical-postings.md[RTDB logical full-text postings].
 The server defaults to format 11 for rolling upgrades.
 Upgrade all readers and maintenance lanes that share the database before enabling Arrow writes.
 Upgraded nodes can read and repair retained formats 11 through 15.
-Nodes configured for format 16 also repair logical runs whose original L0 inputs are available.
+Nodes configured for format 16 can repair logical runs from available original L0 inputs or a complete retained local journal.
 Accelerated queries score against the column values visible at the snapshot.
 The search accelerator can prune a ranked limit over the two-argument score and a `MATCH` on the same column.
 The five-argument score uses the ordinary SQL sort and limit.
