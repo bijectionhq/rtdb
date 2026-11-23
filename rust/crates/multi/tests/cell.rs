@@ -756,6 +756,10 @@ async fn the_hosted_source_barrier_refuses_a_missing_directory_checkpoint() {
     admin::install_deployment(directory, history, "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
     assert_eq!(values(&client, "SHOW rtdb_hosted_source_barrier").await, [history.to_string()]);
+    assert_eq!(values(&client, "SHOW rtdb_hosted_source_owner").await, [history.to_string()]);
+    client.batch_execute("BEGIN READ ONLY").await.unwrap();
+    assert_eq!(values(&client, "SHOW rtdb_hosted_source_owner").await, [history.to_string()]);
+    client.batch_execute("COMMIT").await.unwrap();
 
     let mut record = directory.deployment(&history.to_string()).await.unwrap().unwrap();
     let expected_version = record.version;
@@ -763,6 +767,8 @@ async fn the_hosted_source_barrier_refuses_a_missing_directory_checkpoint() {
     assert!(matches!(directory.replace_deployment(record, expected_version).await.unwrap(), rtdb_directory::Cas::Applied(_)));
 
     let refusal = client.simple_query("SHOW rtdb_hosted_source_barrier").await.unwrap_err();
+    assert!(refusal.as_db_error().unwrap().message().contains("has not recovered the directory's durable checkpoint"));
+    let refusal = client.simple_query("SHOW rtdb_hosted_source_owner").await.unwrap_err();
     assert!(refusal.as_db_error().unwrap().message().contains("has not recovered the directory's durable checkpoint"));
     drop(client);
     cell.stop().await;

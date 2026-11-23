@@ -103,3 +103,8 @@ Run `SHOW rtdb_source_barrier` outside a transaction before opening a read that 
 The command reads the current database's durable source position and waits for local apply through that position.
 Read on the same connection once the command returns `1`.
 The command returns an error on a node without an indexer or a database that ingests transactions through an external source.
+
+Use `SHOW rtdb_hosted_source_owner` in the read transaction used to verify known exact transaction coordinates.
+It returns the source history only when the attached hosted holder has recovered the directory's durable checkpoint and a quorum confirms its current epoch.
+The confirmation samples no source-log tip and makes no claim about whether a particular transaction is applied.
+The caller checks its exact coordinates inside the read snapshot and refuses when the snapshot does not contain them.

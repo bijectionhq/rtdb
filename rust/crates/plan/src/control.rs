@@ -150,7 +150,9 @@ impl ControlStatement {
         expressions.into_iter().map(Expr::parameter_count).max().unwrap_or(0)
     }
     pub fn requires_read_transaction(&self) -> bool {
-        matches!(self, Self::Show { name } if ["snapshot_token", "clock_time", "timezone", "transaction_isolation"].contains(&name.as_str()))
+        matches!(self, Self::Show { name } if [
+            "snapshot_token", "clock_time", "timezone", "transaction_isolation", "rtdb_hosted_source_owner",
+        ].contains(&name.as_str()))
     }
 }
 

@@ -2081,6 +2081,25 @@ rule ConfirmHostedSource {
             Replied(session, unavailable: true)
 }
 
+rule ConfirmHostedSourceOwner {
+    when: HostedSourceOwnerRequested(holding, session)
+
+    requires: session.deployment = holding.deployment.id
+    requires: holding.state = serving
+    requires: Directory.read(holding.deployment.id).holder = holding.member
+    requires: Directory.read(holding.deployment.id).epoch = holding.epoch
+    requires: Directory.read(holding.deployment.id).linearizable_reads
+    requires: Directory.read(holding.deployment.id).checkpoint = null
+              or holding.applied_lsn >= Directory.read(holding.deployment.id).checkpoint.lsn
+
+    ensures:
+        let round = NextRoundAcknowledged(holding)
+        if not SealedIn(round, holding.deployment):
+            HostedSourceOwnerConfirmed(session, history: holding.deployment.id)
+        else:
+            Replied(session, unavailable: true)
+}
+
 rule ServeOnSubscriber {
     when: QueryArrived(subscription, query, session)
 

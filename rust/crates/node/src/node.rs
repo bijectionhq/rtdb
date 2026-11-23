@@ -265,6 +265,25 @@ impl Node {
     fn ensure_indexing(&self) -> Result<()> {
         if self.factory.options.replication.enabled { Ok(()) } else { Err(Anomaly::fault("xtdb/log-processor-not-initialised", "log processor not initialised")) }
     }
+
+    async fn confirm_hosted_source_owner(
+        &self, database: &str, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken,
+    ) -> Result<String> {
+        self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
+        self.ensure_indexing()?;
+        let database = self.attached_database(database, placement)?;
+        let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
+        let confirmation = cancellation.run_until_cancelled(async {
+            let history = fence.confirm_hosted(&database).await?;
+            if !Arc::ptr_eq(&database, &self.catalog.database(database.name())?) {
+                return Err(hosted_source_unavailable());
+            }
+            Ok(history)
+        });
+        tokio::time::timeout(Duration::from_secs(60), confirmation)
+            .await.map_err(|_| timeout_error())?.ok_or_else(cancelled)?
+    }
+
     async fn await_durable_source(
         &self, database: &str, identity: &dyn SessionIdentity, hosted: bool, placement: Option<&Weak<Database>>, cancellation: &CancellationToken,
     ) -> Result<Option<String>> {
@@ -2726,6 +2745,10 @@ impl NativeSessionService {
 
     pub(crate) async fn await_durable_source(&self, database: &str, hosted: bool, cancellation: &CancellationToken) -> Result<Option<String>> {
         self.node.await_durable_source(database, self.identity.as_ref(), hosted, self.placement.as_ref(), cancellation).await
+    }
+
+    pub(crate) async fn confirm_hosted_source_owner(&self, database: &str, cancellation: &CancellationToken) -> Result<String> {
+        self.node.confirm_hosted_source_owner(database, self.identity.as_ref(), self.placement.as_ref(), cancellation).await
     }
 
     pub(crate) fn visible_databases(&self) -> Result<BTreeMap<String, Arc<Database>>> {
