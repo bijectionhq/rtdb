@@ -2680,12 +2680,14 @@ rule RefineKeyForLargeDeployments {
     -- The request identifies the coordinator's opened storage residence and replica epoch.
     -- The router and the executor each check that identity against their own authority.
     -- The executor holds the captured snapshot until admitted provider reads have completed.
-    -- A delegated request can carry numeric predicate constants in a bounded Arrow IPC frame.
-    -- Readers with predicate frame support restore those predicates in their original order.
+    -- The coordinator sends a bounded Arrow IPC literal page after the reader confirms support on the same connection.
+    -- The JSON request carries the expression shape.
+    -- The reader restores literal expressions in their original positions.
     -- The coordinator applies its original predicates to the returned rows.
     -- A reader sends length-framed Arrow IPC when the coordinator advertises binary reply support.
     -- Readers execute concurrently and the coordinator admits each binary reply against query memory before receiving its body in fragment order.
     -- A coordinator can read the earlier base64 reply during a rolling upgrade.
+    -- A reader answers an earlier coordinator in its advertised reply format.
     when: ScanPlanned(deployment, scan)
 
     requires: deployment.cache_bytes > PerMemberCacheShare()

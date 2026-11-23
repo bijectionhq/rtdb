@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_query::FragmentBytes;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,7 @@ impl std::fmt::Debug for ControlKey {
 const CONTROL_SCOPE: &str = "~control";
 
 /// The longest request a node reads.
+const FRAGMENT_LITERAL_VERSION: u8 = 1;
 const MAXIMUM_REQUEST_BYTES: u64 = 1 << 20;
 /// The longest response a caller reads: a fragment's rows, in base64, are the largest.
 pub const MAXIMUM_RESPONSE_BYTES: u64 = 96 << 20;
@@ -250,6 +251,8 @@ struct Envelope {
     fragment_ipc: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fragment_arguments: Option<FragmentArguments>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fragment_literal_bytes: Option<usize>,
     #[serde(flatten)]
     request: Request,
 }
@@ -264,6 +267,8 @@ struct FragmentArguments {
 struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_probe_overflows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fragment_literal_version: Option<u8>,
     #[serde(flatten)]
     response: Response,
 }
@@ -316,11 +321,11 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
         let (handler, key, pgwire) = (Arc::clone(&handler), key.clone(), pgwire.clone());
         let stop = cancellation.clone();
         tokio::spawn(async move {
-            let request = stop.run_until_cancelled(read_request(&mut stream, &key)).await;
+            let request = stop.run_until_cancelled(read_negotiated_request(&mut stream, &key)).await;
             let Some(request) = request else { return; };
             let mut startup_probe_overflows = None;
             let response = match request {
-                Ok((envelope, arguments)) => match envelope.request {
+                Ok((envelope, arguments, _literals)) => match envelope.request {
                         Request::OpenPgwire => {
                             if let Some(PgwireEndpoint { address, relay_slots: Some(slots), .. }) = pgwire.filter(|_| key.0.is_some()) {
                                 if let Ok(_slot) = slots.try_acquire_owned() {
@@ -337,21 +342,25 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
                             Response::Refused { code: "rtdb.multi/pgwire-relay-unavailable".into(), message: "This control endpoint cannot open a Pgwire connection".into() }
                         }
                         request => {
-                            if envelope.fragment_ipc == Some(true)
-                                && let Request::ScanFragment { name, fragment, grant } = &request
+                            if let Request::ScanFragment { name, fragment, grant } = &request
                                 && let Some(result) = handler.fragment_ipc(name, fragment, grant, arguments).await
                             {
                                 match result {
+                                    Ok(batches) if envelope.fragment_ipc != Some(true) => {
+                                        let response = Response::Fragment { batches: STANDARD.encode(batches.as_slice()) };
+                                        let _ = write_message(&mut stream, &Reply { startup_probe_overflows: None, fragment_literal_version: None, response }).await;
+                                        return;
+                                    }
                                     Ok(batches) => {
                                         let bytes = batches.as_slice();
-                                        let response = Reply { startup_probe_overflows: None, response: Response::FragmentIpc { bytes: bytes.len() as u64 } };
+                                        let response = Reply { startup_probe_overflows: None, fragment_literal_version: None, response: Response::FragmentIpc { bytes: bytes.len() as u64 } };
                                         if write_message(&mut stream, &response).await.is_ok() {
                                             let _ = stop.run_until_cancelled(stream.write_all(bytes)).await;
                                         }
                                         return;
                                     }
                                     Err(error) => {
-                                        let _ = write_message(&mut stream, &Reply { startup_probe_overflows: None, response: Response::refused(&error) }).await;
+                                        let _ = write_message(&mut stream, &Reply { startup_probe_overflows: None, fragment_literal_version: None, response: Response::refused(&error) }).await;
                                         return;
                                     }
                                 }
@@ -367,14 +376,26 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
                     },
                 Err(error) => Response::refused(&error),
             };
-            let _ = write_message(&mut stream, &Reply { startup_probe_overflows, response }).await;
+            let _ = write_message(&mut stream, &Reply { startup_probe_overflows, fragment_literal_version: None, response }).await;
         });
     }
 }
 
-async fn read_request(
-    stream: &mut TcpStream, key: &ControlKey,
-) -> Result<(Envelope, Option<rtdb_query::BoundParameters>)> {
+type ReceivedRequest = (Envelope, Option<rtdb_query::BoundParameters>, Option<Arc<MemoryReservation>>);
+
+async fn read_negotiated_request(stream: &mut TcpStream, key: &ControlKey) -> Result<ReceivedRequest> {
+    let request = read_request(stream, key, false).await?;
+    if request.0.request != Request::Ping || request.0.fragment_ipc != Some(true) {
+        return Ok(request);
+    }
+    // An older agent sees a normal Ping and closes its connection. A positive reply upgrades only this socket.
+    write_message(stream, &Reply { startup_probe_overflows: None,
+        fragment_literal_version: Some(FRAGMENT_LITERAL_VERSION), response: Response::Done }).await.map_err(io)?;
+    tokio::time::timeout(Duration::from_secs(5), read_request(stream, key, true)).await
+        .map_err(|_| Anomaly::incorrect("rtdb.multi/control-request", "Fragment request frame timed out"))?
+}
+
+async fn read_request(stream: &mut TcpStream, key: &ControlKey, literal_frames: bool) -> Result<ReceivedRequest> {
     let malformed = |message| Anomaly::incorrect("rtdb.multi/control-request", message);
     let mut reader = BufReader::new(stream.take(MAXIMUM_REQUEST_BYTES));
     let mut line = String::new();
@@ -383,7 +404,21 @@ async fn read_request(
     let mut envelope = serde_json::from_str::<Envelope>(&line)
         .map_err(|error| Anomaly::incorrect("rtdb.multi/control-request", error.to_string()))?;
     key.admit(envelope.control_grant.as_deref())?;
-    let Some(arguments) = envelope.fragment_arguments.take() else { return Ok((envelope, None)); };
+    if let Some(length) = envelope.fragment_literal_bytes.take() {
+        if !literal_frames || envelope.fragment_ipc != Some(true) || envelope.fragment_arguments.is_some()
+            || length as u64 > MAXIMUM_REQUEST_BYTES.saturating_sub(line.len() as u64)
+        {
+            return Err(malformed("Fragment arguments exceed their request frame"));
+        }
+        let Request::ScanFragment { fragment, .. } = &mut envelope.request else {
+            return Err(malformed("Unexpected fragment arguments"));
+        };
+        let memory = MemoryBudget::new(16 << 20);
+        let bytes = read_arguments(&mut reader, length, &memory).await?;
+        let reservation = fragment.bind_wire_literals(bytes.as_slice(), &memory)?;
+        return Ok((envelope, None, Some(reservation)));
+    }
+    let Some(arguments) = envelope.fragment_arguments.take() else { return Ok((envelope, None, None)); };
     let Request::ScanFragment { fragment, .. } = &mut envelope.request else {
         return Err(malformed("Unexpected fragment arguments"));
     };
@@ -393,16 +428,21 @@ async fn read_request(
         return Err(malformed("Fragment arguments exceed their request frame"));
     }
     let memory = MemoryBudget::new(16 << 20);
-    let bytes = tokio::time::timeout(Duration::from_secs(5), FragmentBytes::read_from(&mut reader, arguments.length, &memory))
-        .await.map_err(|_| malformed("Fragment argument frame timed out"))??;
+    let bytes = read_arguments(&mut reader, arguments.length, &memory).await?;
     let args = fragment.bind_wire_predicates(arguments.predicates, bytes.as_slice(), &memory)?;
-    Ok((envelope, Some(args)))
+    Ok((envelope, Some(args), None))
+}
+
+async fn read_arguments(reader: &mut (impl tokio::io::AsyncRead + Unpin), length: usize, memory: &Arc<MemoryBudget>)
+    -> Result<FragmentBytes> {
+    tokio::time::timeout(Duration::from_secs(5), FragmentBytes::read_from(reader, length, memory)).await
+        .map_err(|_| Anomaly::incorrect("rtdb.multi/control-request", "Fragment argument frame timed out"))?
 }
 
 async fn exchange(address: &str, request: Request, timeout: Duration, key: &ControlKey) -> Result<(TcpStream, Reply)> {
     let transfer = async {
         let mut stream = TcpStream::connect(address).await.map_err(io)?;
-        write_message(&mut stream, &Envelope { control_grant: key.grant(), fragment_ipc: None, fragment_arguments: None, request }).await.map_err(io)?;
+        write_message(&mut stream, &Envelope { control_grant: key.grant(), fragment_ipc: None, fragment_arguments: None, fragment_literal_bytes: None, request }).await.map_err(io)?;
         let response = read_reply(&mut BufReader::new(&mut stream), address).await?;
         Ok((stream, response))
     };
@@ -421,24 +461,33 @@ pub(crate) async fn start_fragment(
     address: &str, mut request: Request, deadline: tokio::time::Instant, key: &ControlKey, memory: &Arc<MemoryBudget>,
 ) -> Result<TcpStream> {
     let send = async {
+        let mut stream = TcpStream::connect(address).await.map_err(io)?;
         let mut arguments = None;
-        let mut fragment_arguments = None;
         if let Request::ScanFragment { fragment, .. } = &mut request {
-            let (encoded, predicates, bytes) = fragment.for_wire(memory)?;
-            if !predicates.is_empty() {
-                *fragment = encoded;
-                fragment_arguments = Some(FragmentArguments { length: bytes.as_slice().len(), predicates });
-                arguments = Some(bytes);
+            write_message(&mut stream, &Envelope { control_grant: key.grant(), fragment_ipc: Some(true),
+                fragment_arguments: None, fragment_literal_bytes: None, request: Request::Ping }).await.map_err(io)?;
+            let reply = read_reply(&mut BufReader::new(&mut stream), address).await?;
+            match reply {
+                Reply { response: Response::Done, fragment_literal_version: Some(FRAGMENT_LITERAL_VERSION), .. } => {
+                    let (encoded, bytes) = fragment.for_wire(memory)?;
+                    *fragment = encoded;
+                    arguments = Some(bytes);
+                }
+                Reply { response: Response::Done, .. } => stream = TcpStream::connect(address).await.map_err(io)?,
+                Reply { response: Response::Refused { code, message }, .. } => {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, code, message));
+                }
+                _ => return Err(Anomaly::fault("rtdb.multi/fragment-response", "A reader did not answer fragment negotiation")),
             }
         }
-        let mut header = serde_json::to_vec(&Envelope { control_grant: key.grant(), fragment_ipc: Some(true), fragment_arguments, request })
+        let mut header = serde_json::to_vec(&Envelope { control_grant: key.grant(), fragment_ipc: Some(true),
+            fragment_arguments: None, fragment_literal_bytes: arguments.as_ref().map(|bytes| bytes.as_slice().len()), request })
             .map_err(|error| Anomaly::fault("rtdb.multi/control-request", error.to_string()))?;
         header.push(b'\n');
         let payload = arguments.as_ref().map_or(&[][..], FragmentBytes::as_slice);
         if header.len().saturating_add(payload.len()) as u64 > MAXIMUM_REQUEST_BYTES {
             return Err(Anomaly::incorrect("rtdb.multi/control-request", "Control request exceeds its frame limit"));
         }
-        let mut stream = TcpStream::connect(address).await.map_err(io)?;
         stream.write_all(&header).await.map_err(io)?;
         if !payload.is_empty() { stream.write_all(payload).await.map_err(io)?; }
         Ok(stream)
@@ -573,7 +622,7 @@ mod tests {
                 BufReader::new(&mut stream).read_line(&mut request).await.unwrap();
                 assert_eq!(serde_json::from_str::<Envelope>(&request).unwrap().fragment_ipc, Some(true));
                 assert_eq!(serde_json::from_str::<LegacyEnvelope>(&request).unwrap().request, Request::Ping);
-                let reply = Reply { startup_probe_overflows: None, response };
+                let reply = Reply { startup_probe_overflows: None, fragment_literal_version: None, response };
                 let mut bytes = serde_json::to_vec(&reply).unwrap();
                 bytes.push(b'\n');
                 bytes.extend_from_slice(body);
@@ -592,6 +641,95 @@ mod tests {
         }
     }
 
+    fn literal_fragment() -> Request {
+        use rtdb_plan::{Expr, QualifiedTable, Scan, TableBinding, TemporalFilter};
+        use rtdb_types::{Interval, TableRef, TemporalBounds, Timestamp, TransactionKey, TxId, Value};
+
+        let fragment = rtdb_query::ScanFragment {
+            scan: Scan {
+                table: TableBinding { name: QualifiedTable { database: "db".into(), table: TableRef::new("public", "docs") },
+                    oid: None, columns: Default::default() },
+                columns: Vec::new(), valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+                clamp_valid_time: false, iids: None, predicates: vec![Expr::Literal(Value::Utf8("literal-on-arrow".into()))],
+                top_k: None, ordered_top_k: None, matches: Vec::new(),
+            },
+            prefix: rtdb_query::TriePrefix::new(Vec::new()).unwrap(),
+            basis: TransactionKey { tx_id: TxId(1), system_time: Timestamp(1) },
+            residence: None,
+            bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::from_micros(i64::MIN, 2).unwrap() },
+            timezone: "UTC".into(),
+        };
+        Request::ScanFragment { name: "db".into(), fragment, grant: "grant".into() }
+    }
+
+    struct FragmentAnswers;
+
+    #[async_trait]
+    impl Handler for FragmentAnswers {
+        async fn handle(&self, request: Request) -> Response {
+            assert_eq!(request, Request::Ping);
+            Response::Done
+        }
+
+        async fn fragment_ipc(&self, name: &str, fragment: &rtdb_query::ScanFragment, grant: &str,
+            arguments: Option<rtdb_query::BoundParameters>) -> Option<Result<FragmentBytes>> {
+            let Request::ScanFragment { fragment: expected, .. } = literal_fragment() else { unreachable!() };
+            assert_eq!(fragment, &expected);
+            assert_eq!((name, grant), ("db", "grant"));
+            assert!(arguments.is_none());
+            Some(FragmentBytes::from_vec(vec![0xff, b'\n', 1], &MemoryBudget::new(1024)))
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiated_fragments_use_one_socket_and_a_binary_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let stop = CancellationToken::new();
+        let server = tokio::spawn(serve(listener, Arc::new(FragmentAnswers), ControlKey::default(), stop.clone()));
+        let memory = MemoryBudget::new(1 << 20);
+        let answer = call_fragment(&address, literal_fragment(), Duration::from_secs(5), &ControlKey::default(), &memory).await.unwrap();
+        assert_eq!(answer.as_slice(), &[0xff, b'\n', 1]);
+
+        let old = call(&address, &literal_fragment(), Duration::from_secs(5), &ControlKey::default()).await.unwrap();
+        let Response::Fragment { batches } = old else { panic!("old coordinator's reply encoding") };
+        assert_eq!(STANDARD.decode(batches).unwrap(), answer.as_slice());
+
+        let mut socket = TcpStream::connect(&address).await.unwrap();
+        write_message(&mut socket, &Envelope { control_grant: None, fragment_ipc: Some(true),
+            fragment_arguments: None, fragment_literal_bytes: Some(0), request: literal_fragment() }).await.unwrap();
+        let refused = read_reply(&mut BufReader::new(socket), &address).await.unwrap();
+        assert!(matches!(refused.response, Response::Refused { code, .. } if code == "rtdb.multi/control-request"));
+        stop.cancel();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_agent_receives_only_the_original_request_form() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut probe, _) = listener.accept().await.unwrap();
+            let mut header = String::new();
+            BufReader::new(&mut probe).read_line(&mut header).await.unwrap();
+            assert_eq!(serde_json::from_str::<Envelope>(&header).unwrap().request, Request::Ping);
+            write_message(&mut probe, &Response::Done).await.unwrap();
+            drop(probe);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            header.clear();
+            BufReader::new(&mut stream).read_line(&mut header).await.unwrap();
+            let request = serde_json::from_str::<Envelope>(&header).unwrap();
+            assert_eq!(request.request, literal_fragment());
+            assert!(request.fragment_arguments.is_none() && request.fragment_literal_bytes.is_none());
+            write_message(&mut stream, &Response::Fragment { batches: STANDARD.encode([0xff, b'\n', 1]) }).await.unwrap();
+        });
+        let memory = MemoryBudget::new(1 << 20);
+        let answer = call_fragment(&address, literal_fragment(), Duration::from_secs(5), &ControlKey::default(), &memory).await.unwrap();
+        assert_eq!(answer.as_slice(), &[0xff, b'\n', 1]);
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn fragment_length_is_admitted_before_reading_its_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -600,7 +738,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = String::new();
             BufReader::new(&mut stream).read_line(&mut request).await.unwrap();
-            write_message(&mut stream, &Reply { startup_probe_overflows: None,
+            write_message(&mut stream, &Reply { startup_probe_overflows: None, fragment_literal_version: None,
                 response: Response::FragmentIpc { bytes: MAXIMUM_FRAGMENT_BYTES } }).await.unwrap();
         });
         let memory = MemoryBudget::new(1024);

@@ -2122,8 +2122,8 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         std::fs::rename(&required, &saved).unwrap();
         let refused = node.prepare_compactor_reset("xtdb", &cancellation).await.err().unwrap();
         assert_eq!(refused.code, "rtdb.compactor-reset/incomplete-inventory");
-        for compacted in initial.files_to_delete() { assert!(storage_root.join(compacted.as_str()).is_file()); }
         std::fs::rename(saved, required).unwrap();
+        for compacted in initial.files_to_delete() { assert!(storage_root.join(compacted.as_str()).is_file()); }
         drop(initial);
 
         let orphan = rtdb_format::keys::TrieKey::l0(rtdb_types::BlockIndex(256)).unwrap();
@@ -2180,21 +2180,29 @@ async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_aft
         }).await.unwrap();
         assert_eq!(database.status().adopted_block.as_ref().unwrap().block_index(), published);
         assert_eq!(database.object_store().retain_catalog(Some(cut)).await.err().unwrap().code, "rtdb.storage/catalog-not-current");
+        let data_directory = storage_root.join("tables").join(slug.as_str()).join("data");
+        let recovered: BTreeSet<_> = std::fs::read_dir(&data_directory).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect();
+        session.state_mut().execute_operation(put(&node, 2, 30)).await.unwrap();
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
         database.compaction().unwrap().compact_all().await.unwrap();
-        assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
+        let mut expected = before;
+        expected.push(vec![Value::I64(30)]);
+        assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, expected);
         let mut recompacted = Vec::new();
-        let mut pending = vec![store.join("v06")];
-        while let Some(directory) = pending.pop() {
-            for entry in std::fs::read_dir(&directory).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() { pending.push(path); continue; }
-                let relative = path.strip_prefix(store.join("v06")).unwrap().to_string_lossy().into_owned();
-                if relative.contains("/data/l") && !relative.contains("/data/l00-") { recompacted.push(relative); }
-            }
+        for entry in std::fs::read_dir(data_directory).unwrap() {
+            let name = entry.unwrap().file_name();
+            if recovered.contains(&name) { continue; }
+            let name = name.to_str().unwrap();
+            let Some(stem) = name.strip_suffix(".arrow") else { continue; };
+            let key: rtdb_format::keys::TrieKey = stem.parse().unwrap();
+            if key.level() != 0 { recompacted.push(key); }
         }
         assert!(!recompacted.is_empty(), "compaction ran again after the reset");
-        for name in &recompacted {
-            assert!(name.ends_with("-e01.arrow"), "{name} is named in the reset's epoch");
+        for key in &recompacted {
+            assert_eq!(key.epoch(), 1, "{key} is named in the reset's epoch");
+            let name = slug.data_key(key);
             assert!(compacted.iter().all(|old| old.as_str() != name), "{name} reuses a name published before the reset");
         }
         drop(session);

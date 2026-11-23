@@ -16,6 +16,8 @@ use crate::columnar::{Column, ColumnBatch, compact_arrow_rows, fragment_column, 
 use crate::context::{Execution, OuterRows, QueryContext, cancelled};
 use crate::invalid;
 
+mod literals;
+
 /// The deepest split: 4^4 = 256 fragments.
 const MAXIMUM_DEPTH: u8 = 4;
 
@@ -109,51 +111,6 @@ fn portable(predicate: &rtdb_plan::Expr) -> bool {
 impl ScanFragment {
     pub fn database(&self) -> &str { &self.scan.table.name.database }
     pub fn table(&self) -> &TableRef { &self.scan.table.name.table }
-
-    pub fn for_wire(&self, memory: &Arc<MemoryBudget>) -> Result<(Self, Vec<(usize, rtdb_plan::Expr)>, FragmentBytes)> {
-        use rtdb_plan::Expr;
-        let mut fragment = self.clone();
-        fragment.scan.predicates.clear();
-        let mut predicates = Vec::new();
-        let mut arguments = Vec::new();
-        for (position, predicate) in self.scan.predicates.iter().enumerate() {
-            let mut predicate = predicate.clone();
-            let start = arguments.len();
-            predicate.rewrite(&mut |expr| {
-                if let Some(value) = numeric_literal(expr) {
-                    let data_type = value.logical_type();
-                    let index = arguments.len();
-                    arguments.push(value);
-                    *expr = Expr::Parameter { index, data_type };
-                }
-            });
-            if arguments.len() == start { fragment.scan.predicates.push(predicate); }
-            else { predicates.push((position, predicate)); }
-        }
-        let mut bytes = FragmentBytes::new(memory)?;
-        if !arguments.is_empty() {
-            let mut builder = rtdb_columnar::BatchBuilder::new(4096, memory)?;
-            let mut fields = Vec::with_capacity(arguments.len());
-            let mut columns = Vec::with_capacity(arguments.len());
-            for (position, value) in arguments.iter().enumerate() {
-                let logical = value.logical_type();
-                let values = std::slice::from_ref(value);
-                let field = rtdb_columnar::to_field(&format!("?{position}"), &logical)?;
-                let bound = rtdb_columnar::estimate_builder_bytes(&logical, values)?;
-                columns.push(builder.column(bound, || rtdb_columnar::copy_array(&logical, values))?);
-                fields.push(field);
-            }
-            let batch = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
-                .map_err(|error| invalid("fragment-argument", error))?;
-            let batch = builder.finish(batch)?;
-            let scratch = rtdb_format::ipc::schema_translation_bound(batch.batch().schema_ref())?;
-            let payload = rtdb_columnar::shared_allocation_size(batch.batch())?;
-            let _scratch = memory.reserve(payload.checked_mul(4).and_then(|bytes| bytes.checked_add(scratch))
-                .ok_or_else(|| invalid("fragment-argument", "Argument encoding exceeds addressable memory"))?)?;
-            rtdb_format::ipc::write_stream_to(batch.batch().schema_ref(), [batch.batch()], &mut bytes)?;
-        }
-        Ok((fragment, predicates, bytes))
-    }
 
     /// Binds each predicate slot to a matching column in one uploaded IPC row.
     /// Predicate insertion is atomic and the returned bindings retain the Arrow data.
@@ -528,43 +485,110 @@ mod tests {
         assert!(FragmentDepth::new(0).is_err() && FragmentDepth::new(5).is_err() && TriePrefix::new(vec![4]).is_err());
     }
 
-    #[test]
-    fn delegated_vector_predicates_round_trip_through_arrow_arguments() {
-        use rtdb_plan::{BinaryOp, Expr, QualifiedTable, TableBinding};
-        let vector = Expr::Literal(Value::list(vec![Value::F32(0.5), Value::Null, Value::F64(-1.0)]));
-        let predicates = vec![
-            Expr::Literal(Value::Bool(true)),
-            Expr::binary(BinaryOp::Eq, vector.clone(), vector),
-            Expr::Literal(Value::Bool(false)),
-        ];
+    fn fragment(predicates: Vec<rtdb_plan::Expr>) -> ScanFragment {
+        use rtdb_plan::{QualifiedTable, TableBinding};
         let scan = Scan {
             table: TableBinding { name: QualifiedTable { database: "db".into(), table: TableRef::new("public", "docs") },
                 oid: None, columns: Default::default() },
             columns: Vec::new(), valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-            clamp_valid_time: false, iids: None, predicates: predicates.clone(), top_k: None,
+            clamp_valid_time: false, iids: None, predicates, top_k: None,
             ordered_top_k: None, matches: Vec::new(),
         };
-        let fragment = ScanFragment::of(
+        ScanFragment::of(
             &scan, TriePrefix::new(vec![]).unwrap(), TransactionKey { tx_id: rtdb_types::TxId(1), system_time: Timestamp(1) },
             None, TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, "UTC",
-        );
+        )
+    }
+
+    #[test]
+    fn fragment_argument_page_carries_typed_literals_outside_the_header() {
+        use arrow_array::{Array, Float64Array, ListArray, UnionArray};
+        use rtdb_plan::{BinaryOp, Expr};
+
+        let nan = f64::from_bits(0xfff8_0000_0000_1234);
+        let vector = Value::list(vec![Value::F32(-0.0), Value::Null, Value::F64(nan)]);
+        let text = Expr::Literal(Value::Utf8("2026-01-01".into()));
+        let timestamp = Expr::Literal(Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+        let original = fragment(vec![
+            Expr::binary(BinaryOp::Eq, timestamp, text.clone()),
+            Expr::Literal(Value::Bool(false)),
+            Expr::Literal(Value::Struct(rtdb_types::StructFields::from([
+                ("embedding".into(), vector),
+                ("omitted".into(), Value::Undefined),
+                ("empty".into(), Value::list(Vec::new())),
+                ("fixed_empty".into(), Value::FixedSizeList(Vec::new().into())),
+            ]))),
+            Expr::DurationLiteral((i64::MAX, 999).try_into().unwrap()),
+            Expr::regex_replace(text, rtdb_plan::RegexReplacement::default()),
+        ]);
         let memory = MemoryBudget::new(4 << 20);
-        let (mut wire, headers, bytes) = fragment.for_wire(&memory).unwrap();
-        assert_eq!(wire.scan.predicates, vec![predicates[0].clone(), predicates[2].clone()]);
-        assert_eq!(headers[0].0, 1);
-        assert_eq!(headers.len(), 1);
-        let args = wire.bind_wire_predicates(headers, bytes.as_slice(), &memory).unwrap();
-        assert_eq!(args.types().len(), 2);
-        assert!(args.arrow_input(0).is_some());
-        assert!(args.arrow_input(1).is_some());
-        for predicate in &mut wire.scan.predicates {
-            predicate.rewrite(&mut |expr| if let Expr::Parameter { index, .. } = expr {
-                *expr = Expr::Literal(args.get(*index).unwrap().unwrap().clone());
-            });
+        let (mut wire, bytes) = original.for_wire(&memory).unwrap();
+        for predicate in &wire.scan.predicates {
+            predicate.visit(&mut |expr| assert!(!matches!(expr, Expr::Literal(_) | Expr::DurationLiteral(_) | Expr::RegexReplace { .. })));
         }
-        assert_eq!(wire.scan.predicates, predicates);
-        drop((wire, bytes, args));
+        let header = serde_json::to_string(&wire).unwrap();
+        assert!(!header.contains("2026-01-01"));
+        let read = rtdb_format::ipc::OwnedStream::read(bytes.as_slice(), &memory).unwrap();
+        let page = read.pages()[0].batch();
+        assert_eq!(page.column(1).data_type(), &arrow_schema::DataType::Utf8);
+        assert_eq!(page.column(2).data_type(), &arrow_schema::DataType::Boolean);
+        let record = page.column(3).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        let vector = record.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let components = vector.values().as_any().downcast_ref::<UnionArray>().unwrap();
+        let position = components.value_offset(2);
+        let wide = components.child(components.type_id(2)).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(wide.value(position).to_bits(), nan.to_bits());
+        let charge = wire.bind_wire_literals(bytes.as_slice(), &memory).unwrap();
+        assert_eq!(serde_json::to_vec(&wire).unwrap(), serde_json::to_vec(&original).unwrap());
+        let Expr::Literal(value) = &wire.scan.predicates[2] else { panic!("record literal") };
+        assert!(value.field("embedding").unwrap().list_view().unwrap().is_float());
+        drop((wire, bytes, charge, read));
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_legacy_numeric_predicate_page_still_binds_at_its_original_position() {
+        use rtdb_plan::{BinaryOp, Expr};
+        let vector = Value::list(vec![Value::F32(0.5), Value::Null, Value::F64(-1.0)]);
+        let memory = MemoryBudget::new(4 << 20);
+        let logical = vector.logical_type();
+        let field = rtdb_columnar::to_field("?0", &logical).unwrap();
+        let column = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&vector)).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![column]).unwrap();
+        let bytes = rtdb_format::ipc::write_stream(batch.schema_ref(), &[batch.clone()]).unwrap();
+        let mut wire = fragment(vec![Expr::Literal(Value::Bool(true)), Expr::Literal(Value::Bool(false))]);
+        let predicate = Expr::binary(BinaryOp::Eq, Expr::Parameter { index: 0, data_type: logical }, Expr::Literal(vector.clone()));
+        let args = wire.bind_wire_predicates(vec![(1, predicate.clone())], &bytes, &memory).unwrap();
+        assert_eq!(wire.scan.predicates[1], predicate);
+        assert!(args.arrow_input(0).is_some());
+        assert_eq!(args.get(0).unwrap(), Some(&vector));
+    }
+
+    #[test]
+    fn a_fragment_packs_mixed_float_widths_and_nulls_in_one_fixed_list_frame() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array, UnionArray};
+        let memory = MemoryBudget::new(4 << 20);
+        let nan = f64::from_bits(0x7ff8_0000_0000_4321);
+        let mut unpacked = rtdb_types::ListValue::from(vec![Value::Bool(false), Value::Bool(true)]);
+        unpacked.values_mut().unwrap().splice(.., [Value::F32(11.0), Value::F64(-0.0)]);
+        let values = vec![
+            Value::FixedSizeList(rtdb_types::ListValue::from_f32(Float32Array::from(vec![Some(-0.0), None]))),
+            Value::Null,
+            Value::FixedSizeList(rtdb_types::ListValue::from_f64(Float64Array::from(vec![Some(nan), Some(7.5)]))),
+            Value::FixedSizeList(unpacked),
+        ];
+        let batch = ColumnBatch::settled(vec![Column::Values(values.clone())], 4, memory.reserve(4096).unwrap()).unwrap();
+        let mut bytes = FragmentBytes::new(&memory).unwrap();
+        encode_batch(&batch, &memory, &mut bytes).unwrap();
+        let batches = decode_batches(bytes.as_slice(), &memory).unwrap();
+        let [frame] = batches.as_slice() else { panic!("one fixed-width IPC frame") };
+        let Column::Arrow { array, .. } = &frame.columns[0] else { panic!("decoded physical IPC array") };
+        let array = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert!(array.is_null(1));
+        assert!(array.values().as_any().is::<UnionArray>());
+        for (row, expected) in values.iter().enumerate() {
+            assert_eq!(serde_json::to_vec(&frame.columns[0].value(row).unwrap()).unwrap(), serde_json::to_vec(expected).unwrap());
+        }
     }
 
     #[test]

@@ -4163,12 +4163,13 @@ async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
     rows
 }
 
-const FRAGMENT_QUERIES: [&str; 5] = [
+const FRAGMENT_QUERIES: [&str; 6] = [
     "SELECT * FROM orders",
     "SELECT _id, total FROM orders WHERE total > 2500",
     "SELECT count(*) AS n, sum(total) AS total, max(note) AS note FROM orders",
     "SELECT i._id, i.qty, o.note FROM items AS i JOIN orders AS o ON i.order_id = o._id",
     "SELECT _id, _system_from, _system_to, note FROM orders FOR ALL SYSTEM_TIME WHERE _id < 400",
+    "SELECT _id, note FROM orders WHERE note = 'tail' AND _system_from > '2000-01-01T00:00:00Z'",
 ];
 
 /// A deployment with three tables spanning many trie leaves, flushed to a block and then written past it.
@@ -4293,7 +4294,7 @@ async fn fragment_requires_the_opened_residence_and_replica_epoch() {
         timezone: "UTC".into(),
     };
     let matching = running.agent.scan_fragment("shop", &fragment).await.unwrap();
-    assert!(matches!(matching, Response::Fragment { batches } if !batches.is_empty()));
+    assert!(!matching.as_slice().is_empty());
 
     let mut different_storage = residence.clone();
     different_storage.storage = Arc::from("another physical residence");
@@ -4322,7 +4323,7 @@ async fn a_large_deployments_scans_read_as_fragments_on_the_nodes_their_slices_r
     let cell = Cell::start(3, None).await;
     let client = large_deployment(&cell, "big").await;
     let whole = fragment_answers(&client).await;
-    assert!(whole[0].len() > 2900 && !whole[3].is_empty() && whole[4].len() > 400);
+    assert!(whole[0].len() > 2900 && !whole[3].is_empty() && whole[4].len() > 400 && !whole[5].is_empty());
     assert!(fragments_read(&cell).iter().all(|read| read.is_empty()), "a deployment within one node's cache is scanned whole");
 
     split_above(&cell, 0);

@@ -439,7 +439,7 @@ The following paths still cross into scalar values inside the engine or its adap
 | Document operations | Mixed and unsupported owned-write layouts can decode documents or fields before coalescing, replay, and temporal patch. Receipt and argument handling still have row routes. | 11–15, 26 |
 | Frontend arguments | Pgwire Bind admits a positional Arrow argument batch, including decimal and standard array parameters. Native Transit decoding retains compatible columns through bind, COPY, and document writes. Document decoders with dynamic inference use the row model. | 15, 20, 21 |
 | Connectors and diagnostics | Dynamic PostgreSQL JSON, logical or complex Kafka values, and generic text encoders and inspection routes use value readers. | 21–23 |
-| Distributed fragments | Unsupported predicate values still travel in JSON. A fragment that uses one of the generic operators above can pack computed values for its Arrow reply. | 25 |
+| Distributed fragments | Negotiated requests carry literal values in an Arrow argument page. Legacy agents receive their original request shape during a rolling upgrade. | 25 |
 
 PostgreSQL DataRow framing, requested text and opaque terms, legacy compatibility formats, and durable log and archive envelopes retain their existing formats.
 Buffer copies for ownership and native sidecar or ANN state are covered separately in the inventory above.
@@ -501,13 +501,11 @@ Query-private spill paths write and replay Arrow batches.
 | 15 | Computed control expressions and row-facing APIs | `node/src/control.rs`, `ffi/src/statement.rs` | EXECUTE can retain a selected float list and compatible packed expression results. Time zone and token controls can borrow a bound string. SET renders supported lists directly and still produces the required session text. Other controls apply scalar option conversion or user metadata encoding. The compatibility row API consumes row bindings. |
 | 22 | Dynamic PostgreSQL JSON and row-facing extension hooks | `pg-codec/src/text.rs` `read_json`, `pg-source/src/indexer.rs` `PgIndexer` | JSON and JSONB infer arbitrary document shapes and JSON-LD extensions. Multidimensional and explicitly bounded float arrays retain their PostgreSQL text. Legacy indexers can opt into row maps through their existing public interface. |
 | 22 | Complex and logical Kafka values | `kafka/src/connect/converter.rs`, `kafka/src/connect/avro` | Logical elements retain their Connect value semantics. Avro reader unions with multiple value branches expose a Connect record for each non-null member. Avro schema migration can request JSON. |
-| 25 | Fragment predicate constants other than numeric lists, and the legacy base64 reply | `query/src/fragment.rs`, `multi/src/control.rs`, `multi/src/agent.rs` | Travel in JSON. |
 
 Some of these gaps need a decision before the engineering work.
 Decoding pgvector source columns into lists changes externally visible types.
 Supporting `float4[]` and `float8[]` Bind parameters changes externally visible types.
 
-Retiring JSON predicate constants and the base64 fragment reply changes a protocol that mixed-version deployments share.
 The native Transit readers retain the existing cache and tag semantics while packing numeric arrays.
 
 #### Qualification of the closure pass
@@ -614,7 +612,7 @@ Durable logs and external protocols still encode their prescribed formats.
 | 22 | PostgreSQL source and Kafka Connect | PostgreSQL snapshot and WAL decoding build bytea, UUID, date, timestamp, interval and exact decimal columns directly. The mirror uses typed lists for PostgreSQL float arrays, pgvector fields and their domains, and stages Arrow document batches. Kafka JSON and Avro decoders build primitive numeric children directly, including nullable children and schemaless mixed numeric JSON. Avro arrays stay packed through promotions and branch reordering when their reader item layout has one numeric member. Connect union records retain packed arrays inside their named branch fields. Avro integer narrowing operates on Arrow children with Connect's wrapping semantics. Document admission retains those buffers. |
 | 23 | Requested text and opaque values | The file inspector borrows packed float lists and emits their tagged JSON directly. List serialization and EXPLAIN render packed float components at their original width. JSON, EDN, EXPLAIN and opaque Transit values keep their requested representations. |
 | 24 | Flight tickets | Run tickets carry Arrow IPC bytes in a versioned binary frame. New readers also redeem legacy JSON tickets. In a mixed deployment, route a binary run ticket to a reader that supports its version. |
-| 25 | Distributed scans | Replies carry bounded binary Arrow IPC. Eligible numeric predicate constants travel in a typed frame and return to the same predicate positions. A coordinator can still consume a legacy reply and evaluates its original predicates. |
+| 25 | Distributed scans | Negotiated requests carry literals in an Arrow IPC page. The reader restores literal expressions and retains packed vector children from the page. Binary replies pack same-kind vectors of mixed float widths into a dense child union. During upgrades both peers support the original request form and the earlier reply formats. The coordinator evaluates its original predicates. |
 | 26 | Durable log envelopes | The encoder transfers uniquely held IPC buffers into protobuf fields with their reservations. Shared inputs may require a copy. The final protobuf frame retains the existing byte format. |
 | 27 | FTS and ordered sidecars | Postings, ordered keys and candidate IIDs serve their index algorithms. The embedding payload stays in primary Arrow data. |
 | 28 | Experimental ANN | Exact reranking binds a slice of the query fixture's Arrow buffer. HDF5 and NumPy remain fixture inputs. Centroids, heaps, range metadata and churn masks are algorithm state. |

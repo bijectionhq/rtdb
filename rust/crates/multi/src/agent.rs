@@ -1430,10 +1430,8 @@ impl NodeAgent {
     }
 
     /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
-    pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
-        use base64::Engine;
-        let batches = self.scan_fragment_payload(name, fragment, None).await?;
-        Ok(Response::Fragment { batches: base64::engine::general_purpose::STANDARD.encode(batches.as_slice()) })
+    pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<rtdb_query::FragmentBytes> {
+        self.scan_fragment_payload(name, fragment, None).await
     }
 
     async fn scan_fragment_payload(&self, name: &str, fragment: &rtdb_query::ScanFragment,
@@ -2013,7 +2011,7 @@ impl Handler for NodeAgent {
             Request::PinCheckpointSuffix { name, deployment, lease, capture, basis, expires_at_ms } =>
                 self.pin_checkpoint_suffix(&name, deployment, lease, capture, basis, expires_at_ms).await,
             Request::PublishCompaction { name, notification, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.publish_compaction(&name, &notification).await, Err(error) => Err(error) }
-            Request::ScanFragment { name, fragment, grant } => match self.check_node_grant(&grant, &name) { Ok(()) => self.scan_fragment(&name, &fragment).await, Err(error) => Err(error) }
+            Request::ScanFragment { .. } => Err(Anomaly::unsupported("rtdb.multi/control-request", "This fragment requires a control stream")),
         };
         result.unwrap_or_else(|error| Response::refused(&error))
     }

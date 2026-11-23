@@ -2062,7 +2062,8 @@ surface QueryAccess {
         -- COALESCE over compatible floating-point vector columns selects the first non-null vector in each row by Arrow position.
         -- It emits a null where every operand is null.
         -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
-        -- Evaluated vectors of one float width and list kind pack into a single Arrow column whatever their row and component nulls.
+        -- Evaluated vectors of one list kind pack into a single Arrow column across row and component nulls.
+        -- Mixed Float32 and Float64 components retain their respective widths in a dense Arrow union.
         -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
@@ -2132,7 +2133,8 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
-        -- The reader binds separately framed numeric predicate constants from an Arrow parameter row.
+        -- A delegated reader restores literal expressions from the fragment's Arrow argument page.
+        -- Packed vector literals borrow the page's typed child buffers.
 }
 
 ---- Deferred Specifications

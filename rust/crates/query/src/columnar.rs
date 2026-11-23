@@ -1,6 +1,7 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 pub(crate) mod float_vector;
+mod float_vectors;
 mod patch;
 pub(crate) mod search;
 
@@ -1042,7 +1043,11 @@ fn evaluated_vectors_with_absent_rows_and_components_pack_into_one_arrow_column(
     assert_eq!(column.value(3).unwrap().list_view().unwrap().len(), 0);
 
     let mixed = vec![vector(vec![Some(1.0)]), Value::List(rtdb_types::ListValue::from_f64(arrow_array::Float64Array::from(vec![2.0])))];
-    assert!(matches!(pack_evaluated_column(&mixed, &memory).unwrap().0, Column::Selected(_)));
+    let (Column::Arrow { array, .. }, _) = pack_evaluated_column(&mixed, &memory).unwrap() else {
+        panic!("mixed widths share one Arrow column")
+    };
+    let child = array.as_any().downcast_ref::<ListArray>().unwrap().values();
+    assert!(child.as_any().is::<UnionArray>());
 }
 
 #[test]
@@ -3446,18 +3451,26 @@ pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>
     let cell_type = |value: &Value| {
         if matches!(value, Value::Undefined) { LogicalType::Null } else { value.logical_type() }
     };
-    if let Some(ty) = float_vector_type(values) {
-        let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
-        let mut custody = memory.reserve(rtdb_columnar::estimate_builder_bytes(&ty, values)?)?;
-        let array = rtdb_columnar::copy_array(&ty, values)?;
-        let lease = Arc::get_mut(&mut custody).expect("The evaluated column owns its array");
-        let retained = array.get_array_memory_size().checked_add(field.size()).ok_or_else(size_error)?;
-        if retained > lease.bytes() { lease.grow_to(retained)?; } else { lease.shrink_to(retained)?; }
-        drop(inventory);
-        return Ok((Column::Arrow { array, field, logical: Some(ty) }, custody));
+    if let Some(kind) = values.iter().find(|value| !value.is_null()).and_then(float_vectors::kind)
+        && values.iter().all(|value| value.is_null() || float_vectors::kind(value) == Some(kind.clone()))
+        && let Some(packed) = float_vectors::pack(values, kind, memory)?
+    {
+        return Ok(packed);
     }
     let mut start = 0;
     while start < values.len() {
+        if let Some(kind) = float_vectors::kind(&values[start]) {
+            let end = start + values[start..].iter().take_while(|value| {
+                float_vectors::kind(value) == Some(kind.clone())
+            }).count();
+            if let Some((Column::Arrow { array, field, logical }, custody)) = float_vectors::pack(&values[start..end], kind, memory)? {
+                let source = sources.len();
+                cells.extend((0..end - start).map(|row| (source, row)));
+                sources.push(Some((array, field, logical, Some(custody))));
+                start = end;
+                continue;
+            }
+        }
         let ty = cell_type(&values[start]);
         let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
         let mut end = start + 1;
@@ -3485,32 +3498,6 @@ pub(crate) fn pack_evaluated_column(values: &[Value], memory: &Arc<MemoryBudget>
     let lease = Arc::get_mut(&mut inventory).expect("The evaluated column owns its selection");
     if bytes > lease.bytes() { lease.grow_to(bytes)?; } else { lease.shrink_to(bytes)?; }
     Ok((column, inventory))
-}
-
-/// The joined type of a column of packed vectors of one float width and list kind, and nulls,
-/// which pack into one Arrow column from their typed components rather than a run per nullability.
-fn float_vector_type(values: &[Value]) -> Option<LogicalType> {
-    let mut shape = None;
-    for value in values {
-        let (kind, view) = match value {
-            Value::Null => continue,
-            Value::List(list) => (ListKind::List, list.view()),
-            Value::FixedSizeList(list) => (ListKind::FixedSizeList(i32::try_from(list.len()).ok()?), list.view()),
-            _ => return None,
-        };
-        let width = match view {
-            rtdb_types::ListView::F32(_) => 32,
-            rtdb_types::ListView::F64(_) => 64,
-            _ => return None,
-        };
-        match &shape {
-            None => shape = Some((kind, width)),
-            Some(known) if *known == (kind, width) => {}
-            Some(_) => return None,
-        }
-    }
-    shape?;
-    Some(LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>()))
 }
 
 fn literal_cell(expression: &rtdb_plan::Expr) -> Option<&Value> {
