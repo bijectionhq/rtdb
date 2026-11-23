@@ -1531,14 +1531,15 @@ impl<'a> OpenTransaction<'a> {
         &mut self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         created: Timestamp, nominated_expiry: Timestamp,
     ) -> Result<()> {
-        use rtdb_types::OwnedChangeKind;
+        use rtdb_types::{OwnedChangeKind, OwnedLifetimeFloor};
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let ordered = self.tx_key().system_time;
         if !relation.is_root_data() { return Err(lifetime_uncovered()); }
         let lifetime = self.read_owned_schema(owner, relation).await?
             .and_then(|(schema, _)| schema.lifetime_micros()).ok_or_else(lifetime_uncovered)?;
         let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
-        if expires != nominated_expiry { return Err(lifetime_uncovered()); }
+        let cutoff = OwnedLifetimeFloor::expiry_replay_cutoff(ordered);
+        if expires != nominated_expiry || expires > cutoff { return Err(lifetime_uncovered()); }
         let snapshot = self.snapshot()?;
         if snapshot.contains_table(&relation.fixed_range_table(owner)) {
             return Err(purge_path_uncovered());
@@ -1546,9 +1547,6 @@ impl<'a> OpenTransaction<'a> {
         let context = self.context.query_context(snapshot, ordered, &self.options.default_tz, self.trace_parent)?;
         let mut floor = rtdb_query::read_owned_lifetime_floor(Arc::clone(&context), owner, relation).await?;
         floor.check(lifetime, ordered)?;
-        if floor.swept_present_through == Timestamp::MIN || expires > floor.swept_present_through {
-            return Err(lifetime_uncovered());
-        }
         if rtdb_query::owned_purge_floor(Arc::clone(&context), owner, relation, id).await?.is_some() {
             return Ok(());
         }
@@ -1557,7 +1555,8 @@ impl<'a> OpenTransaction<'a> {
         {
             return Err(lifetime_uncovered());
         }
-        floor.expired_created_through = rtdb_types::OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
+        floor.expired_created_through = OwnedLifetimeFloor::at(lifetime, ordered)?.expired_created_through;
+        floor.swept_present_through = floor.swept_present_through.max(cutoff);
         self.erase_owned(relation, id, OwnedChangeKind::Expired).await?;
         self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
         Ok(())

@@ -1612,6 +1612,10 @@ impl Service {
         let mut metadata = batch.schema().metadata().clone();
         metadata.insert("rtdb.owned.expiry_candidate_through".into(), page.through.0.to_string());
         metadata.insert("rtdb.owned.expiry_diagnostic_cutoff".into(), page.diagnostic_cutoff.0.to_string());
+        metadata.insert("rtdb.owned.expiry_candidate_state".into(), page.state.into());
+        if let Some(at) = page.next_eligible {
+            metadata.insert("rtdb.owned.expiry_next_eligible_micros".into(), at.0.to_string());
+        }
         let schema = batch.schema().as_ref().clone().with_metadata(metadata);
         let present = held.snapshot.present().system_time;
         let reply = self.owned_point_reply(&schema, Some(&batch), present, present, None)?;
