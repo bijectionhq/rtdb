@@ -94,8 +94,9 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         if let Operation::Public(TxOp::OwnedPublishWorld { world, advance_to: Some(at), .. }) = operation {
             readings.insert(*world, *at);
         }
-        if proposal_land.is_some_and(|landing| landing.effect != ProposalLandingEffect::Close)
-            && crate::hosted_control::proposal_landing_frontier_rows(operation).is_some()
+        if crate::hosted_control::root_partition_frontier_rows(operation).is_some()
+            || proposal_land.is_some_and(|landing| landing.effect != ProposalLandingEffect::Close)
+                && crate::hosted_control::proposal_landing_frontier_rows(operation).is_some()
         {
             continue;
         }

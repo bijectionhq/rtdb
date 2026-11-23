@@ -2812,7 +2812,7 @@ impl OwnedWorldFork {
         matches!(self.requested, WorldClockRequest::Proposal) && self.cut.is_renewal()
             && self.previous.is_some()
             && self.root.as_ref().and_then(|root| root.publication.as_ref())
-                .is_some_and(|publication| matches!(publication.writes.as_slice(), [TxOp::OwnedDelete { .. }]))
+                .is_some_and(|publication| publication.has_single_fact(|op| matches!(op, TxOp::OwnedDelete { .. })))
     }
 }
 
@@ -2837,6 +2837,13 @@ pub struct OwnedWorldObservations {
 pub struct OwnedRootPublication {
     pub attempt: String,
     pub writes: Vec<TxOp>,
+}
+
+impl OwnedRootPublication {
+    fn has_single_fact(&self, admit: impl FnOnce(&TxOp) -> bool) -> bool {
+        let mut facts = self.writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op));
+        facts.next().is_some_and(admit) && facts.next().is_none()
+    }
 }
 
 pub struct OwnedWorldSection {
@@ -2993,6 +3000,7 @@ impl NativeSession {
             })
             || fork.root.as_ref().and_then(|section| section.publication.as_ref()).is_some_and(|root| {
                 root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
+                    _ if rtdb_tx::is_root_partition_frontier(write) => false,
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                     | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                     _ => true,
@@ -3034,9 +3042,9 @@ impl NativeSession {
             && matches!(&section.effect, OwnedWorldEffect::Drop)
             && section.checks.is_empty() && section.expected_clock.is_none());
         let delete_root = !root.proposal_close && terminal.is_some_and(|(_, section)| root.publication.as_ref().is_some_and(|root| {
-            root.attempt == section.attempt && matches!(root.writes.as_slice(), [
-                TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. }
-            ] if relation.is_root_data())
+            root.attempt == section.attempt && root.has_single_fact(|op| matches!(op,
+                TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. } if relation.is_root_data()
+            ))
         })) && rtdb_tx::retained_delete_controls(&controls);
         let retained_release = delete_root || (terminal.is_some()
             && root.checks.is_empty() && root.publication.is_none()
@@ -3066,14 +3074,17 @@ impl NativeSession {
             || if proposal_close {
                 !sections[0].1.checks.is_empty()
                     || root.publication.as_ref().is_none_or(|root| root.attempt != sections[0].1.attempt
-                        || !matches!(&root.writes[..], [TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. }]
-                            if relation.is_root_data()))
+                        || !root.has_single_fact(|op| matches!(op,
+                            TxOp::OwnedDelete { relation, valid_from: None, valid_to: None, .. } if relation.is_root_data()
+                        )))
                     || !rtdb_tx::proposal_close_controls(&controls)
             } else {
                 sections[0].1.expected_clock.is_none()
                     || root.publication.as_ref().is_none_or(|root| {
                         if root.attempt != sections[0].1.attempt { return true; }
-                        let mut facts = root.writes.iter().filter(|op| !rtdb_tx::is_proposal_landing_frontier(op));
+                        let mut facts = root.writes.iter().filter(|op| {
+                            !rtdb_tx::is_proposal_landing_frontier(op) && !rtdb_tx::is_root_partition_frontier(op)
+                        });
                         let mut rows = 0usize;
                         facts.any(|op| {
                             let Some(count) = rtdb_tx::proposal_landing_write_rows(op) else { return true; };
@@ -3113,6 +3124,7 @@ impl NativeSession {
         let mut effects = controls.len().saturating_add(root.checks.len()).saturating_add(2 + usize::from(root.clock_slot.is_some()));
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
+                _ if rtdb_tx::is_root_partition_frontier(write) || proposal_land && rtdb_tx::is_proposal_landing_frontier(write) => false,
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                 | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                 _ => true,

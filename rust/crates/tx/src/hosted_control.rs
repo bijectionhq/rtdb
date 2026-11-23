@@ -605,7 +605,9 @@ pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) ->
     let mut delete = None;
     let mut root_checks = 0;
     let mut delete_root = false;
+    if !root_partition_frontiers_match(operations) { return None; }
     for op in operations {
+        if root_partition_frontier_rows(op).is_some() { continue; }
         match op {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (),
@@ -1043,6 +1045,27 @@ mod retained_release_tests {
     }
 
     #[test]
+    fn world_cut_partition_frontier_tracks_one_written_root_partition() -> Result<()> {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let publications = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+        let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let frontier = |id: &str| Ok::<_, Anomaly>(Operation::Public(TxOp::OwnedReplaceDocs {
+            relation: publications.clone(), documents: crate::Documents::new(vec![row(id)], &memory)?,
+            valid_from: Some(Timestamp::MIN), valid_to: None,
+        }));
+        let mut ops = vec![frontier("fact_partition_head:fact_row")?];
+        assert!(!root_partition_frontiers_match(&ops));
+        ops.push(Operation::Public(TxOp::OwnedInsertDocs {
+            relation: OwnedRelation::new("fact_row")?, documents: crate::Documents::new(vec![row("key")], &memory)?,
+            valid_from: None, valid_to: None,
+        }));
+        assert!(root_partition_frontiers_match(&ops));
+        ops.push(frontier("fact_partition_head:fact_row")?);
+        assert!(!root_partition_frontiers_match(&ops));
+        Ok(())
+    }
+
+    #[test]
     fn proposal_landing_orders_frontiers_with_the_fact_and_both_receipt_locators() -> Result<()> {
         let scope = PlacedAttemptScope::new("proposal-landing", 1)?;
         let world = Iid([1; 16]);
@@ -1469,6 +1492,59 @@ pub(crate) fn public_fact_frontier(id: &str) -> bool {
         && digits.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
 }
 
+fn root_partition_frontier(id: &str) -> Option<&str> {
+    let relation = id.strip_prefix("fact_partition_head:")?;
+    (relation.starts_with("fact_") && OwnedRelation::new(relation).is_ok_and(|relation| relation.is_root_data()))
+        .then_some(relation)
+}
+
+fn partition_frontier_rows(
+    relation: &OwnedRelation, documents: &crate::Documents, from: Option<Timestamp>, to: Option<Timestamp>,
+) -> bool {
+    relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+        && from == Some(Timestamp::MIN) && to.is_none_or(|to| to == Timestamp::MAX)
+        && documents.has_exact_presence() && !documents.rows().is_empty()
+        && documents.rows().iter().all(|row| {
+            row.len() == 1 && matches!(row.get("_id"), Some(Value::Utf8(id)) if root_partition_frontier(id).is_some())
+        })
+}
+
+pub fn is_root_partition_frontier(op: &crate::TxOp) -> bool {
+    matches!(op, crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
+        if partition_frontier_rows(relation, documents, *valid_from, *valid_to))
+}
+
+pub(crate) fn root_partition_frontier_rows(op: &crate::source::Operation) -> Option<&crate::Documents> {
+    use crate::{TxOp, source::Operation};
+    match op {
+        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
+        | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
+            if partition_frontier_rows(relation, documents, *valid_from, *valid_to) => Some(documents),
+        _ => None,
+    }
+}
+
+/// A world cut may advance each written Root relation's frontier once.
+pub(crate) fn root_partition_frontiers_match(operations: &[crate::source::Operation]) -> bool {
+    use crate::{TxOp, source::Operation};
+    let mut markers = operations.iter().filter_map(root_partition_frontier_rows).peekable();
+    if markers.peek().is_none() { return true; }
+    let written = operations.iter().filter_map(|op| {
+        if let Some((relation, rows)) = op.owned_documents() && rows != 0 && relation.is_root_data() {
+            return Some(relation.name());
+        }
+        match op {
+            Operation::Public(TxOp::OwnedDelete { relation, .. }) if relation.is_root_data() => Some(relation.name()),
+            _ => None,
+        }
+    }).collect::<std::collections::BTreeSet<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    markers.flat_map(crate::Documents::rows).all(|row| {
+        matches!(row.get("_id"), Some(Value::Utf8(id)) if root_partition_frontier(id)
+            .is_some_and(|relation| written.contains(relation) && seen.insert(relation)))
+    })
+}
+
 fn proposal_frontier_rows(
     relation: &OwnedRelation, documents: &crate::Documents, from: Option<Timestamp>, to: Option<Timestamp>,
 ) -> bool {
@@ -1552,7 +1628,9 @@ pub(crate) fn hosted_proposal_land(
     let mut close = false;
     let mut controls = Vec::new();
     let mut frontiers = std::collections::BTreeSet::new();
+    if !root_partition_frontiers_match(operations) { return None; }
     for op in operations {
+        if root_partition_frontier_rows(op).is_some() { continue; }
         if let Some(documents) = proposal_landing_frontier_rows(op) {
             for row in documents.rows() {
                 let Value::Utf8(id) = row.get("_id")? else { return None; };

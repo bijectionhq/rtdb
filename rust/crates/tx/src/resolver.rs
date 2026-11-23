@@ -1543,8 +1543,15 @@ impl<'a> OpenTransaction<'a> {
             let mut effects = 1usize + usize::from(publish_root); // Shared attempt and optional Root head.
             let mut expected_tip = None;
             let mut checked_tip = None;
+            if !crate::hosted_control::root_partition_frontiers_match(operations) {
+                return Err(unavailable());
+            }
             for operation in operations {
                 effects = effects.saturating_add(1);
+                if publish_root && let Some(markers) = crate::hosted_control::root_partition_frontier_rows(operation) {
+                    effects = effects.saturating_add(markers.rows().len() - 1);
+                    continue;
+                }
                 if let Some((relation, rows)) = operation.owned_documents()
                     && publish_root && !bounded_write && relation.is_root_data() && rows > 0
                 {
@@ -1776,8 +1783,14 @@ impl<'a> OpenTransaction<'a> {
             let mut hosted = false;
             let mut counts: BTreeMap<Iid, (usize, usize)> = publications.iter()
                 .map(|(world, ..)| (*world, (0, 0))).collect();
+            if !crate::hosted_control::root_partition_frontiers_match(operations) {
+                return Err(unavailable());
+            }
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
+                    _ if root_publication.is_some() && crate::hosted_control::root_partition_frontier_rows(operation).is_some() => {
+                        crate::hosted_control::root_partition_frontier_rows(operation).expect("matched frontier write").rows().len()
+                    }
                     _ if root_publication.is_some() && operation.owned_documents().is_some_and(|(relation, rows)| relation.is_root_data() && rows != 0) => {
                         let (_, count) = operation.owned_documents().expect("matched document write");
                         root_rows += count;
