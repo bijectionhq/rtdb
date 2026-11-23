@@ -299,6 +299,15 @@ pub struct SearchFile {
     _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
+struct TranscodedSearchMap {
+    map: memmap2::Mmap,
+    _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
+impl AsRef<[u8]> for TranscodedSearchMap {
+    fn as_ref(&self) -> &[u8] { &self.map }
+}
+
 impl SearchFile {
     pub fn open(bytes: impl Into<Source>, columns: &[String]) -> Result<Self> {
         let source = bytes.into();
@@ -330,9 +339,11 @@ impl SearchFile {
             conversion?;
             writer.flush().map_err(transcode_io)?;
             drop(writer);
+            let bytes = usize::try_from(output.metadata().map_err(transcode_io)?.len()).map_err(transcode_io)?;
+            let reservation = memory.is_prepaid().then(|| memory.reserve(bytes)).transpose()?;
             // SAFETY: the anonymous file has no other handle and all writes have finished.
-            let mapped = unsafe { memmap2::Mmap::map(&output) }.map_err(transcode_io)?;
-            let bytes = mapped.len();
+            let map = unsafe { memmap2::Mmap::map(&output) }.map_err(transcode_io)?;
+            let mapped = TranscodedSearchMap { map, _reservation: reservation };
             Self::open_located(bytes::Bytes::from_owner(mapped).into(), &columns, None).map(|file| (file, Some(bytes)))
         }).await.map_err(transcode_io)?
     }
@@ -847,6 +858,19 @@ mod tests {
     fn open(rows: &[SearchRow]) -> Arc<SearchFile> { Arc::new(SearchFile::open(build_search_file(&columns(), rows, "job").unwrap(), &columns()).unwrap()) }
     /// A row's run, by the rows' order in the file.
     fn run(file: &SearchFile, row: u32) -> Option<u32> { match file.manifest.row_doc(1, row) { RowDoc::Run(doc) => Some(doc), _ => None } }
+
+    #[tokio::test]
+    async fn scoped_tantivy_conversion_keeps_its_arrow_map_charged_until_drop() -> Result<()> {
+        let columns = columns();
+        let mut bundle = Vec::new();
+        write_versioned_group(&columns, [[Ok(rows())]], "legacy", 1, None, &mut bundle, None, TANTIVY_FORMAT_VERSION)?;
+        let memory = rtdb_columnar::MemoryBudget::new(8 << 20).prepay(4 << 20)?;
+        let (file, converted) = SearchFile::open_catalog(bundle.into(), &columns, None, &memory).await?;
+        assert_eq!(memory.used_bytes(), converted.unwrap());
+        drop(file);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[test]
     fn range_reads_preserve_ranked_results_without_requesting_the_entire_bundle() {
