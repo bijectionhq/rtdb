@@ -6,7 +6,7 @@
 //! The deployments table streams its new images, which the directory follows as its change feed.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -72,6 +72,7 @@ impl DynamoTables {
 
 pub struct DynamoDirectory {
     client: Client,
+    audience_reader: OnceLock<Client>,
     streams: StreamsClient,
     tables: DynamoTables,
     pack_parked_records: bool,
@@ -82,7 +83,7 @@ pub struct DynamoDirectory {
 
 impl DynamoDirectory {
     pub fn new(client: Client, streams: StreamsClient, tables: DynamoTables) -> Self {
-        Self { client, streams, tables, pack_parked_records: false, changes: Arc::new(ChangeFeed::new()), following: Mutex::new(false) }
+        Self { client, audience_reader: OnceLock::new(), streams, tables, pack_parked_records: false, changes: Arc::new(ChangeFeed::new()), following: Mutex::new(false) }
     }
 
     pub fn from_sdk_config(config: &aws_types::SdkConfig, tables: DynamoTables) -> Self { Self::new(Client::new(config), StreamsClient::new(config), tables) }
@@ -566,6 +567,29 @@ impl Directory for DynamoDirectory {
         Ok(string_attribute(&item, ID)? == task.task_arn()
             && string_attribute(&item, "cluster_arn")? == task.cluster_arn()
             && string_attribute(&item, "status")? == "STOPPED")
+    }
+
+    fn prepare_audience_reads(&self) -> Result<()> {
+        self.audience_reader.get_or_init(|| {
+            let mut config = self.client.config().to_builder();
+            // Keep the endpoint and credentials and let this client open its own connector.
+            config.set_http_client(None);
+            Client::from_conf(config.build())
+        });
+        Ok(())
+    }
+
+    async fn audience_authority(&self, id: &str, member: &MemberId) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
+        let reader = self.audience_reader.get().ok_or_else(|| Anomaly::unsupported(
+            "rtdb.directory/audience-transport", "The audience read transport was not installed",
+        ))?;
+        let (record, member) = tokio::try_join!(
+            get_item(reader, &self.tables.deployments, ID, id),
+            get_item(reader, &self.tables.members, ID, member.as_str()),
+        )?;
+        let record = record.as_ref().map(decode_deployment).transpose()?;
+        let member = member.as_ref().map(decode_member).transpose()?;
+        Ok(record.zip(member))
     }
 
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>> {

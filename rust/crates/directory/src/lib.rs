@@ -1060,6 +1060,15 @@ pub trait Directory: Send + Sync {
     async fn begin_reference_disposal(&self, id: &str, expected: Version) -> Result<ReferenceDisposal>;
     async fn settle_reference_disposal(&self, permit: &ReferenceDisposal, record: DeploymentRecord, expected: Version) -> Result<Cas<DeploymentRecord>>;
     async fn change_lineage(&self, lineage: &str, change: LineageChange) -> Result<LineageState>;
+    /// Opens the read transport required by an installed audience listener.
+    fn prepare_audience_reads(&self) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
+    }
+    /// Reads the current deployment and member over the audience transport.
+    /// These strongly consistent point reads leave the exact writer epoch check to the holder and journal.
+    async fn audience_authority(&self, _id: &str, _member: &MemberId) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
+        Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
+    }
     async fn deployment(&self, id: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployment_by_name(&self, name: &str) -> Result<Option<DeploymentRecord>>;
     async fn deployments(&self) -> Result<Vec<DeploymentRecord>>;

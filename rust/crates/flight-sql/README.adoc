@@ -270,7 +270,7 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v12` on the audience gateway during its handshake.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v13` on the audience gateway during its handshake.
 The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
 The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
@@ -286,7 +286,8 @@ Each audience session owns one retained-read slot. A new applied open must advan
 A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
 The audience handshake and subsequent actions use the reserved admission.
 The gateway resolves the placement at handshake, then forwards authenticated session actions to the sealed holder address.
-For each audience data action the holder checks the live member, current deployment and epoch, recovered checkpoint and exact attached database.
+For each audience data action the holder reads the live member and current deployment over its own DynamoDB client.
+It checks the writer epoch, recovered checkpoint and exact attached database. A holder whose directory cannot install an audience read transport refuses audience startup.
 Applied acquisition and confirmation also check journal leadership on the holder's configured `--audience-journal-port`.
 Each logkeeper serves this port with `--audience-authority UUID/TURNS` and `--audience-authority-listen ADDR`.
 The connection and frame sizes are bounded. Each success confirms the exact journal, replica stream, active ensemble and durable writer epoch.

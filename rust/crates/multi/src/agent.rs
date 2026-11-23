@@ -485,8 +485,7 @@ impl NodeAgent {
         let record = match check {
             HostedReadCheck::Ordinary => self.directory.deployment(&id).await?,
             HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceCapture => {
-                let (record, member) = tokio::try_join!(self.directory.deployment(&id), self.directory.member(&member_id))?;
-                record.zip(member).and_then(|(record, member)| {
+                self.directory.audience_authority(&id, &member_id).await?.and_then(|(record, member)| {
                     (member.id == member_id && record.may_hold_on(&member, now_ms())).then_some(record)
                 })
             }
