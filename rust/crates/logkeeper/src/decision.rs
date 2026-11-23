@@ -55,7 +55,7 @@ pub struct DecisionPrefix {
 
 impl DecisionPrefix {
     fn valid(&self) -> bool {
-        self.predecessor >= -1 && self.through > self.predecessor
+        self.predecessor >= -1 && self.through > self.predecessor && self.through < i64::MAX
             && self.digest.len() == 32 && self.predecessor_digest.len() == 32
             && (self.guarded || self.guarded_before.is_none())
             && self.guarded_before.is_none_or(|cutoff| cutoff > 0)

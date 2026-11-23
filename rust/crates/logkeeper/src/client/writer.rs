@@ -8,7 +8,7 @@ use super::guarded_recovery::{
     predecessor_commit_target, recover_guarded_tail, recovery_commit_quorum, sealed_journal_evidence, valid_guarded_source,
 };
 use super::recovery::{Holding, plan_repair, winner};
-use crate::decision::{DecisionPrefix, DecisionStatement, StableDecision};
+use crate::decision::{DecisionCertificate, DecisionPrefix, DecisionStatement, StableDecision};
 use crate::history::RetainedChain;
 use crate::protocol::{Accepted, Entry, RequestBody, Sealed};
 use bytes::Bytes;
@@ -352,6 +352,80 @@ struct SealedHistory {
     source: usize,
     history: Holding,
     guarded_commit: Option<i64>,
+    certified_through: Option<i64>,
+}
+
+fn sealed_certificate<'a>(ensemble: &Ensemble, replies: &'a [(usize, Sealed)]) -> Result<Option<&'a DecisionCertificate>> {
+    let mut selected: Option<&DecisionCertificate> = None;
+    for (_, reply) in replies {
+        let Some(candidate) = &reply.certificate else { continue; };
+        let statement = &candidate.statement;
+        if !candidate.authentic() || statement.scope.stream != ensemble.config.stream {
+            return Err(Error::ConflictingObject(ensemble.stream()));
+        }
+        if ensemble.decision_scope(statement.scope.epoch).as_ref() != Some(&statement.scope) {
+            if statement.scope.epoch < reply.synced { continue; }
+            return Err(Error::ConflictingObject(ensemble.stream()));
+        }
+        if let Some(current) = selected {
+            let old = current.statement.prefix.through;
+            let new = statement.prefix.through;
+            if old == new && current.statement != *statement {
+                return Err(Error::ConflictingObject(ensemble.stream()));
+            }
+            if old >= new { continue; }
+        }
+        selected = Some(candidate);
+    }
+    Ok(selected)
+}
+
+async fn proves_sealed_decision(
+    ensemble: &Ensemble, server: usize, sealed: &Sealed, certificate: &DecisionCertificate,
+) -> bool {
+    let cut = &certificate.statement.prefix;
+    if sealed.trim_lsn > cut.predecessor || sealed.last_lsn < cut.through { return false; }
+    let Ok(predecessor) = <[u8; 32]>::try_from(cut.predecessor_digest.as_ref()) else { return false; };
+    let mut chain = RetainedChain::from_bytes(predecessor);
+    let mut next = cut.predecessor + 1;
+    while next <= cut.through {
+        let Ok(fetched) = ensemble.fetch(server, next, cut.through.saturating_add(1), MAXIMUM_BATCH_ENTRIES).await else {
+            return false;
+        };
+        if fetched.entries.is_empty() { return false; }
+        for entry in fetched.entries {
+            if entry.lsn != next || entry.lsn > cut.through { return false; }
+            chain.append(&entry);
+            next += 1;
+        }
+    }
+    cut.digest.as_ref() == chain.bytes()
+}
+
+async fn verify_sealed_floor(
+    ensemble: &Ensemble, replies: &[(usize, Sealed)], source: usize, winning: &Sealed,
+) -> Result<Option<i64>> {
+    let Some(certified) = sealed_certificate(ensemble, replies)? else { return Ok(None); };
+    let through = certified.statement.prefix.through;
+    let unavailable = || Error::Remote {
+        key: ensemble.stream(), message: format!("the sealed recovery cannot verify its decision through {through}"),
+    };
+    if winning.last_lsn < through { return Err(unavailable()); }
+    if winning.trim_lsn >= through {
+        // Hosted trim already requires the checkpoint custody owner. The signed
+        // seal establishes the local trim and the stability proof retains its cut.
+        let stable = replies.iter().filter_map(|(_, reply)| reply.stability.as_ref()).any(|proof|
+            proof.certificate.statement == certified.statement && proof.authentic());
+        return if stable { Ok(Some(through)) } else { Err(unavailable()) };
+    }
+    if winning.trim_lsn > certified.statement.prefix.predecessor {
+        return Err(unavailable());
+    }
+    if proves_sealed_decision(ensemble, source, winning, certified).await {
+        Ok(Some(through))
+    } else {
+        Err(unavailable())
+    }
 }
 
 async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usize, Sealed)>) -> Result<SealedHistory> {
@@ -360,7 +434,8 @@ async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usiz
     loop {
         let (source, winning) = winning_seal(replies);
         let source = *source;
-        let mut sealed = SealedHistory { source, history: Holding::from(winning), guarded_commit: None };
+        let certified_through = verify_sealed_floor(ensemble, replies, source, winning).await?;
+        let mut sealed = SealedHistory { source, history: Holding::from(winning), guarded_commit: None, certified_through };
         if !winning.guarded_tail { return Ok(sealed); }
         let witness = covers_recovered_commit(winning.commit_lsn, sealed.history.last);
         let resolution = if witness {
@@ -479,13 +554,13 @@ impl Writer {
     /// copy to a different physical stream.
     async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
         let mut previous_replies = seal_quorum(previous, epoch).await?;
-        let SealedHistory { source, history, guarded_commit } =
+        let SealedHistory { source, history, guarded_commit, certified_through } =
             sealed_history(previous, epoch, &mut previous_replies).await?;
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
         let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
         // A move can stop before the destination is durable or recorded. The
         // predecessor quorum must already retain the guarded outcome.
-        let commit = predecessor_commit_target(guarded_commit, start - 1);
+        let commit = predecessor_commit_target(guarded_commit, start - 1).max(certified_through.unwrap_or(-1));
         sync_quorum(previous, epoch, &previous_replies, &in_place, commit).await?;
         Ok(Recovered { source: (previous, source), history, start })
     }
@@ -1004,6 +1079,9 @@ impl Writer {
                     let body = ensemble.repair_request(epoch, from, entries, inherited);
                     pipeline.replicas[server].link = Link::Live;
                     self.send(pipeline, server, body);
+                    if let Some(proof) = &pipeline.stability {
+                        ensemble.publish_proof(server, proof.clone(), Box::new(|_| {}));
+                    }
                     return Ok(());
                 }
                 let sources: Vec<usize> = (0..pipeline.replicas.len()).filter(|&peer| peer != server && matches!(pipeline.replicas[peer].link, Link::Live)).collect();

@@ -27,7 +27,7 @@ use super::payload::{Item, Source, Stored};
 #[cfg(not(verus_keep_ghost))]
 use super::state::{Decision, StreamState, Window, WriterAuthority};
 #[cfg(not(verus_keep_ghost))]
-use crate::decision::DecisionVoteRequest;
+use crate::decision::{DecisionCertificate, DecisionVoteRequest};
 #[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
 #[cfg(not(verus_keep_ghost))]
@@ -224,8 +224,8 @@ impl Store {
                     return Outcome::Now(failed("invalid quorum installation proof"));
                 }
                 let key = self.journal.signer.public_key();
-                // Only a voter has checked this exact prefix against local payloads.
-                let replay = proof.certificate.votes.iter().any(|vote| vote.key.as_ref() == key);
+                let replay = proof.certificate.votes.iter().any(|vote| vote.key.as_ref() == key)
+                    || self.holds_decision_payload(&proof.certificate).await;
                 (proof.certificate.statement.scope.stream.clone(), Box::new(move |state| state.expose_certificate(proof, replay)))
             }
             RequestBody::Seal(seal) => {
@@ -413,6 +413,37 @@ impl Store {
             Ok(Err(error)) => failed(format!("reading the segments failed: {error}")),
             Err(error) => failed(format!("reading the segments failed: {error}")),
         }
+    }
+
+    /// A repaired journal can establish replay from the exact digest. A copy
+    /// remains ineligible to supply an original vote for a timed decision.
+    async fn holds_decision_payload(&self, certificate: &DecisionCertificate) -> bool {
+        let Ok(_permit) = self.digest_pages.try_acquire() else { return false; };
+        let statement = &certificate.statement;
+        let cut = &statement.prefix;
+        let Some(slot) = self.existing(&statement.scope.stream) else { return false; };
+        let first = cut.predecessor + 1;
+        let selection = {
+            let state = slot.state.lock();
+            if !state.admits_decision(statement) || first <= state.trim || cut.through > state.last() {
+                return false;
+            }
+            self.select(&state, first, cut.through, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES)
+        };
+        let journal = Arc::clone(&self.journal);
+        let predecessor = <[u8; 32]>::try_from(cut.predecessor_digest.as_ref()).expect("validated decision digest");
+        let digest = cut.digest.clone();
+        let through = cut.through;
+        tokio::task::spawn_blocking(move || {
+            let Ok(entries) = journal.resolve(selection) else { return false; };
+            if entries.entries.len() as i64 != through - first + 1 { return false; }
+            let mut chain = RetainedChain::from_bytes(predecessor);
+            for (index, entry) in entries.entries.iter().enumerate() {
+                if entry.lsn != first + index as i64 { return false; }
+                chain.append(entry);
+            }
+            digest.as_ref() == chain.bytes()
+        }).await.unwrap_or(false)
     }
 
     pub async fn vote_decision(&self, request: DecisionVoteRequest) -> ResponseBody {

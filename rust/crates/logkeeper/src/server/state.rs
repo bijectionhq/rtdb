@@ -640,3 +640,50 @@ mod tests {
         assert_eq!(replayed, state);
     }
 }
+
+#[cfg(test)]
+mod certificates {
+    use super::*;
+    use crate::decision::{DecisionPrefix, DecisionScope};
+    use crate::attestation::journal_id;
+    use rtdb_storage::attestation::SigningKey;
+
+    #[test]
+    fn certificate_installation_needs_no_local_payload_and_rejects_substitution() {
+        let keys: Vec<_> = (0..3).map(|_| SigningKey::open(&SigningKey::generate().unwrap()).unwrap()).collect();
+        let mut journals: Vec<_> = keys.iter().map(|key| journal_id(&key.public_key()).to_string()).collect();
+        journals.sort_unstable();
+        let scope = DecisionScope { stream: "history".into(), epoch: 1, journals, quorum: 2 };
+        let prefix = DecisionPrefix {
+            predecessor: -1, predecessor_digest: Bytes::from_static(&[3; 32]),
+            through: 0, digest: Bytes::from_static(&[4; 32]), guarded: true, guarded_before: Some(100),
+        };
+        let statement = DecisionStatement { scope, prefix };
+        let timely = statement.vote(&keys[0], Some(99));
+        let other = statement.vote(&keys[1], Some(98));
+        let certificate = DecisionCertificate { statement: statement.clone(), votes: vec![timely.clone(), other] };
+        assert!(certificate.authentic());
+
+        let mut duplicate = certificate.clone();
+        duplicate.votes[1] = timely;
+        assert!(!duplicate.authentic());
+        let mut late = certificate.clone();
+        late.votes[1] = statement.vote(&keys[1], Some(100));
+        assert!(!late.authentic());
+        let mut foreign = certificate.clone();
+        foreign.statement.prefix.digest = Bytes::from_static(&[9; 32]);
+        assert!(!foreign.authentic());
+
+        let mut lagging = StreamState::<Bytes>::default();
+        let ensemble = statement.scope.ensemble().unwrap();
+        lagging.seal(1);
+        lagging.overwrite(1, 0, Vec::new(), true, -1);
+        lagging.activate(1, ensemble, true);
+        let installation = statement.installation(&keys[2]);
+        assert!(matches!(lagging.install_certificate(&certificate, installation.clone()).reply,
+            ResponseBody::DecisionInstallation(observed) if observed == installation));
+        let ResponseBody::Sealed(sealed) = lagging.sealed() else { panic!("expected durable seal"); };
+        assert_eq!(sealed.last_lsn, -1);
+        assert_eq!(sealed.certificate, Some(certificate));
+    }
+}
