@@ -577,6 +577,8 @@ The selected position must equal the child's retained Held overlay cut, and the 
 A winning Held tombstone leaves an absent slice.
 The existing exact-world preflight and path touch actions read from the same retained overlay for ordered history.
 They certify the exact local clock and path generation and resolve both sides against the child's pinned Root.
+Exact and as-of selection can also reopen an earlier Held publication on the same retained child.
+Point, valid interval, identity, range and rank requests use that overlay position together with the unchanged pinned Root.
 
 `rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
 It returns ordered local overlay groups after the supplied revision at or above the archived parent basis. The archived parent is fixed.

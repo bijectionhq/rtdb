@@ -842,6 +842,8 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.OpenWorldRead.v4", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
         "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",
+        "rtdb.owned.SelectHeldWorldAsOf.v1",
+        "rtdb.owned.ReadHeldWorldPointAt.v1",
         "rtdb.owned.ReadHeldWorldParentVersionsAt.v1",
         "rtdb.owned.ReadHeldWorldParentChangesAt.v1",
         "rtdb.owned.ReadHeldWorldAncestorChanges.v1",

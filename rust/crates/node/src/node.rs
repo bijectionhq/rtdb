@@ -1434,66 +1434,16 @@ impl OwnedReadSession {
     ) -> Result<Option<(Timestamp, Timestamp)>> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let context = self.admit_world_accepted_scope(world, relations, self.present.system_time).await?;
-        let Some((clock, publication)) = rtdb_query::read_owned_world_clock_revision(
-            Arc::clone(&context), &self.owner, world.id,
-        ).await? else {
-            self.admit_world_accepted_scope(world, relations, world.basis.system_time).await?;
-            return Ok(None);
-        };
-        if !(world.basis.system_time < publication && publication <= self.present.system_time
-            && world.initial_clock() < clock && clock <= publication)
-        {
-            return Err(unavailable());
-        }
-        if clock <= requested {
-            let confirmed = self.certify_world_accepted_scope(world, relations, publication).await?;
-            if confirmed != clock { return Err(unavailable()); }
-            return Ok(Some((publication, confirmed)));
-        }
-
-        // Clock records have all-time validity, can only increase in ordered
-        // publication/replay, and cannot be erased through the ordinary owner.
-        // A capped full-ID point read gives the predecessor at a physical cut.
-        let mut lo = i128::from(world.basis.system_time.0);
-        let mut hi = i128::from(publication.0);
-        let mut selected = None;
-        while hi - lo > 1 {
-            self.check()?;
-            let mid = Timestamp((lo + (hi - lo) / 2) as i64);
-            let probe = context.with_owned_system_cut(mid, &context.cancellation)?;
-            let predecessor = rtdb_query::read_owned_world_clock_revision(probe, &self.owner, world.id).await?;
-            match predecessor {
-                Some((reading, revision)) => {
-                    if !(world.basis.system_time < revision && revision <= mid
-                        && world.initial_clock() < reading && reading < clock && reading <= revision)
-                        || selected.is_some_and(|(prior, prior_reading)| {
-                            revision < prior || reading < prior_reading
-                                || (revision == prior) != (reading == prior_reading)
-                        })
-                    {
-                        return Err(unavailable());
-                    }
-                    if reading <= requested {
-                        selected = Some((revision, reading));
-                        lo = i128::from(mid.0);
-                    } else {
-                        let upper = i128::from(revision.0);
-                        if upper <= lo { return Err(unavailable()); }
-                        hi = upper;
-                    }
-                }
-                None if selected.is_none() => lo = i128::from(mid.0),
-                None => return Err(unavailable()),
-            }
-        }
+        let selected = rtdb_query::select_owned_world_clock(
+            &context, &self.owner, world.id, world.basis.system_time, world.initial_clock(), requested,
+        ).await?;
         if let Some((system, reading)) = selected {
             let confirmed = self.certify_world_accepted_scope(world, relations, system).await?;
             if confirmed != reading { return Err(unavailable()); }
-            Ok(Some((system, confirmed)))
         } else {
             self.admit_world_accepted_scope(world, relations, world.basis.system_time).await?;
-            Ok(None)
         }
+        Ok(selected)
     }
 
     async fn admit_world_accepted_scope(
