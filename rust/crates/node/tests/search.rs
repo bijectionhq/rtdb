@@ -1871,3 +1871,81 @@ async fn a_same_commit_reinsert_keeps_only_the_post_erase_search_revision() {
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use tokio_util::sync::CancellationToken;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut settings = options();
+    settings.automatic_artefacts = false;
+    settings.automatic_gc = false;
+    settings.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: path("store"), epoch: Some(0) })),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let template = services();
+    let runtime = rtdb_search::SearchRuntime::with_logical_search(64 << 20);
+    let services = NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(Arc::clone(&template.clock), false)),
+        artefact_kinds: vec![runtime.artefacts()],
+        scan_accelerators: vec![runtime.accelerator()],
+        ..template.clone()
+    };
+    let (node, driver) = Node::open(settings, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    let stop = CancellationToken::new();
+    let table = TableRef::new("public", "docs");
+    node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")], AutonomousTxOptions::default()).await.unwrap().committed());
+    for batch in [
+        "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report'}, {_id: 2, body: 'audit memo'}, {_id: 3, body: 'report'}",
+        "INSERT INTO docs RECORDS {_id: 4, body: 'audit report report report'}, {_id: 5, body: 'audit report'}, {_id: 2, body: 'audit report memo'}",
+    ] {
+        assert!(session.state_mut().execute_tx(vec![sql(batch)], AutonomousTxOptions::default()).await.unwrap().committed());
+        database.flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
+    }
+    let catalog = database.trie_catalog();
+    let runs: Vec<_> = catalog.search_runs(&table).cloned().collect();
+    assert_eq!(runs.len(), 2);
+    let slug = database.snapshot().table_entry(&table).unwrap().slug.clone();
+    let missing = rtdb_storage::ObjectKey::new(runs[0].object_key(&slug).unwrap()).unwrap();
+    database.storage().invalidate(&missing).await.unwrap();
+    database.object_store().delete(&missing).await.unwrap();
+
+    let queries = [
+        ("SELECT _id, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, 'audit report') ORDER BY score DESC, _id ASC LIMIT 2",
+         "SELECT _id, SEARCH_SCORE(body, 'report') AS score FROM docs WHERE MATCH(body, 'audit report') OR _id = -99 ORDER BY score DESC, _id ASC LIMIT 2"),
+        ("SELECT _id FROM docs WHERE MATCH(body, 'audit report') ORDER BY _id",
+         "SELECT _id FROM docs WHERE MATCH(body, 'audit report') OR _id = -99 ORDER BY _id"),
+    ];
+    for (accelerated, oracle) in queries {
+        let reads = runtime.logical_run_reads();
+        let expected = rows(session.query_sql(oracle, vec![]).await.unwrap()).await;
+        assert!(!expected.is_empty());
+        assert_eq!(rows(session.query_sql(accelerated, vec![]).await.unwrap()).await, expected, "{accelerated}");
+        assert!(runtime.logical_run_reads() > reads, "the healthy run still serves {accelerated}");
+    }
+
+    database.build_artefacts().await.unwrap();
+    let repaired = database.trie_catalog();
+    let active: Vec<_> = repaired.search_runs(&table).map(|run| (run.blocks.clone(), run.object_key(&slug).unwrap())).collect();
+    let replacement = repaired.search_runs(&table).find(|run| runs[0].blocks.iter().all(|block| run.blocks.contains(block)))
+        .unwrap_or_else(|| panic!("the damaged extent is covered again: {active:?}"));
+    assert_ne!(replacement.object_key(&slug).unwrap(), runs[0].object_key(&slug).unwrap());
+    assert!(database.object_store().head(&rtdb_storage::ObjectKey::new(replacement.object_key(&slug).unwrap()).unwrap()).await.is_ok());
+    for (accelerated, oracle) in queries {
+        assert_eq!(rows(session.query_sql(accelerated, vec![]).await.unwrap()).await, rows(session.query_sql(oracle, vec![]).await.unwrap()).await);
+    }
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
+}
