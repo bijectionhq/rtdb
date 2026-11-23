@@ -81,11 +81,6 @@ impl CatalogLedger {
         }).await
     }
 
-    pub async fn permits(&self, cut: CatalogCut) -> Result<bool> {
-        let (state, _) = self.read().await?;
-        Ok(state.floor.is_some_and(|floor| covers(floor, cut)))
-    }
-
     async fn read(&self) -> Result<(Ledger, PutMode)> {
         let response = match self.client.get(&self.path).await {
             Err(ProviderError::NotFound { .. }) => return Ok((Ledger::default(), PutMode::Create)),

@@ -9,7 +9,7 @@ After R4, a file is deleted only when the ledger proves no admitted reader, reco
 
 All three designers proposed the same mechanism; differences are noted inline.
 
-- **The ledger.** One record per database residence holding: the published catalog generation (head), the collection floor `F`, reader holds `(holder, generation, ticket, expiry)`, recovery roots (R5) and, later, the key catalog (R6).
+- **The ledger.** One record per database residence holding: the published catalog generation (head), the admission floor `F`, reader holds `(holder, generation, ticket, expiry)`, recovery roots (R5) and, later, the key catalog (R6).
   - Multi: the deployment's directory record, updated by compare-and-swap. The peer's `catalog_readers` map (below) is the start of it.
   - Classic: an object in the database's own store written with conditional writes (put-if-absent for a chain of `ledger/<seq>` objects, or If-Match on one head object), and an atomic link or rename on a local filesystem.
     Designers differed only in layout (one head object, a sequence chain, or a head object plus one hold object per follower); pick one and record why.
@@ -20,9 +20,11 @@ All three designers proposed the same mechanism; differences are noted inline.
   Before each provider request a reader checks its own monotonic deadline (last renewal start + `T` − margin); this reuses the shape of today's `ReadLease` check in `storage/src/io_region.rs`.
   Leader-local readers take the same holds through an in-process fast path.
 - **Expiry.** The collector drops a hold only after it has observed the same ticket unchanged across two sweeps a local monotonic `T` apart.
-- **Deletion rule (generation cutoff).** A retired object with retirement generation `r` is deletable iff `r ≤ min(head, every live hold's generation, every recovery root)` in a single ledger observation, and the collector advances `F` by CAS conditioned on that observation's version.
-  Generation cutoff was preferred over exact dependency tracking: it needs no inventory, and bounded handle lifetimes bound the extra retention.
-  `verification/lean/ResidenceReaderRetention.lean` already proves both policies safe and compares them.
+- **Deletion authority.** The storage owner mints a grant for an installed retirement and its immutable targets.
+  The conservative implementation can use the generation cutoff inside that owner.
+  The [Lean comparison](../lean/ResidenceReaderRetention.lean) proves that an older hold can delay retirement of a publication it never used.
+  Exact reachability from held manifests, recovery closures and forks is under review.
+  The collector submits the installed receipt and retries a pending decision.
 
 ## Invariants
 
@@ -34,7 +36,7 @@ All three designers proposed the same mechanism; differences are noted inline.
 - `GarbageConfig::garbage_lifetime` and the system-time arithmetic in `TrieCollector::default_garbage_as_of` (`maintenance/src/gc.rs`).
 - The fixed read lease and its tip-anchored currency: `storage/src/{read_lease,lease_decision}.rs`, `node/src/read_currency.rs`, `Database::read_lease`, and the collector's first-observed wait (`TrieCollector::leased_out`). Keep the per-request check in `IoRegion`, re-anchored on the hold.
 - The unbounded in-process registry in `index/src/partition.rs` (`Retention::readers`), or reduce it to a cache of ledger holds.
-- Multi's reaper grace and wall-clock release stamps (`multi/src/store.rs` releases, `multi/src/main.rs` `--grace` check), once releases are authorized by the floor.
+- Multi's reaper grace and wall-clock release stamps (`multi/src/store.rs` releases, `multi/src/main.rs` `--grace` check), once each release has deletion authority independent of its timestamp.
 
 ## State on main (2026-11-21)
 
@@ -82,7 +84,7 @@ A coordinated hold through hosted term placement and live-provider qualification
 
 1. Start by reading the peer's `CatalogReaders` and `ResidenceRetirement.tla`, and the last day of commits touching `multi/src`, `directory/src` and `maintenance/src/gc.rs`. If a peer session is mid-way, coordinate through the programme rather than branching the design.
 2. Define the ledger operations once, as a small trait both deployments implement (admit hold, renew, release, observe, advance floor), and implement it for Multi on the directory and for classic on conditional writes. Avoid making classic depend on the whole `Directory` trait.
-3. Move the trie collector to the floor rule; then delete the lease, the first-observed map and `garbage_lifetime` in the same change, so no two mechanisms coexist.
+3. Move physical retirement behind the grant owner, then remove each timer when the corresponding admission and recovery paths are covered.
 4. Thread the hold through `QueryContext` where the read lease is today (`CatalogSnapshot::read_lease`, cursor `IoRegion::leased`), and through served scan fragments (`Node::scan_fragment`).
 5. Classic conditional writes: check each provider adapter (`storage/src/remote.rs`, local store) supports the primitive you choose; record any provider without it as unsupported rather than emulating it.
 
@@ -122,7 +124,9 @@ An exclusive compactor reset resumes admission at the installed cut of its newly
 Classic S3, Azure and GCS use one conditional-write head under the classic storage root for reader registration, release and floor advancement.
 The head makes registration and floor advancement one decision and avoids deriving current admission from a possibly stale list of ticket objects.
 Every successful update advances the sequence, including a cancellation that fences a registration with a lost reply.
-The collector checks the stored receipt and the floor in the same residence before deleting immutable trie paths.
+The shared classic grant owner checks the stored receipt and orders its conservative eligibility decision against the same residence.
+A pending decision keeps the intent available for retry.
+Multi queues scoped releases and the provider consumes the existing exact lineage grant.
 A provider request retains its ticket through cancellation and releases it on drain.
 An abandoned ticket without drain evidence remains in the ledger.
 Independent maintenance and complete recovery-root retention still require custody and settlement integration.

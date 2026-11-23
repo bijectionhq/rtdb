@@ -21,7 +21,8 @@ Commit order uses the ordered transaction position.
 The exact append-clock reading is a separate observation.
 Temporal SQL uses a strictly increasing system-time projection, which can advance by one chronon when an append-clock reading ties or regresses.
 A client-supplied ordinary system time is bounded by the append-clock observation.
-Reclamation uses a monotone catalog generation recorded by the residence ledger.
+Catalog admission uses a monotone floor recorded by the residence ledger.
+Physical reclamation requires a grant from the storage owner.
 Node-local monotonic durations only expire the holds of readers that stop renewing them.
 Receipt expiry uses the highest append-clock observation installed in the current history.
 Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
@@ -70,7 +71,9 @@ Corpus-relative scores take the corpus statistics as arguments.
 |No reference authority
 |One linearizable residence ledger per database: the Multi directory record, or a conditional-write object in classic deployments.
 Readers hold a catalog generation by compare-and-swap before opening storage and renew while they read.
-The collector advances a floor below every live hold and recovery root and deletes only objects retired at or below it.
+The catalog floor controls new admissions.
+The storage owner grants deletion for the retired publications it can release.
+The conservative cutoff remains in use where the exact-reachability policy is pending.
 |`garbage_lifetime`, the fixed read lease and its collector wait, the reaper grace and wall-clock release stamps, the unbounded in-process registry.
 
 |Positional names
@@ -109,12 +112,13 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 |Landed; an input digest is unnecessary while an epoch separates every reset
 
 |4
-|Residence ledger with holds and collection floor; delete the timer stack.
+|Residence ledger with holds and an admission floor; delete the timer stack.
 |Multi, native local storage, and classic S3, Azure and GCS storage enforce a catalog admission floor and retry trie retirement from installed receipts.
 Classic remote holds use conditional writes and finish after admitted provider work drains.
 Compaction on coordinated storage holds its live inputs through provider drain.
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
+The coordinated collector submits the installed receipt to the storage owner, which owns the pending decision and the deletion grant.
 Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
 
 |5

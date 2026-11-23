@@ -171,23 +171,8 @@ impl ObjectStore for RemoteStore {
         self.io.run_async(async move { Ok(ledger.advance(cut).await) }).await?
     }
 
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
-        use rtdb_format::trie_retirement::InstalledRetirement;
-
-        let unavailable = || rtdb_types::Anomaly::incorrect("rtdb.storage/trie-release",
-            "The remote catalog floor does not authorize this installed trie release");
-        let ledger = self.catalog.clone().ok_or_else(unavailable)?;
-        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
-        let cut = installed.cut();
-        if self.get_fresh_exact(receipt, contents.len()).await? != contents
-            || !self.io.run_async(async move { Ok(ledger.permits(cut).await) }).await??
-        {
-            return Err(unavailable());
-        }
-        let mut files = installed.files().iter().collect::<Vec<_>>();
-        files.sort_by_key(|file| file.release_order());
-        for file in files { self.delete(&ObjectKey::new(&file.key)?).await?; }
-        Ok(())
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
+        crate::classic_retirement::retire(self, receipt, contents).await
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {

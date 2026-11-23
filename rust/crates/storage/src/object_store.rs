@@ -159,7 +159,7 @@ pub trait ObjectStore: Send + Sync {
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
     }
-    /// Whether physical trie retirement waits for an installed receipt and the catalog floor.
+    /// Whether physical trie retirement belongs to a coordinated storage authority.
     fn defers_trie_releases(&self) -> bool { false }
     /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.
     fn releases_receipt_l0(&self) -> bool { false }
@@ -168,8 +168,9 @@ pub trait ObjectStore: Send + Sync {
     async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         Ok(true)
     }
-    /// Releases the files selected by an installed trie-removal receipt.
-    async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<()> {
+    /// Submits the files selected by an installed trie-removal receipt to their storage authority.
+    /// Returns false while the authority retains the files and expects the caller to retry.
+    async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<bool> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
     }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
@@ -546,23 +547,8 @@ impl ObjectStore for LocalStore {
         self.io.run(move || Ok(ledger.advance(installed))).await?
     }
 
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<()> {
-        use rtdb_format::trie_retirement::InstalledRetirement;
-        let unavailable = || rtdb_types::Anomaly::incorrect("rtdb.storage/trie-release",
-            "The local catalog floor does not authorize this installed trie release");
-        let ledger = self.catalog.clone().ok_or_else(unavailable)?;
-        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
-        let cut = installed.cut();
-        if self.get_fresh_exact(receipt, contents.len()).await? != contents
-            || !self.io.run(move || Ok(ledger.permits_retirement(cut))).await??
-        {
-            return Err(unavailable());
-        }
-        let mut files = installed.files().iter().collect::<Vec<_>>();
-        files.sort_by_key(|file| file.release_order());
-        let files = files.into_iter().map(|file| ObjectKey::new(&file.key)).collect::<Result<Vec<_>>>()?;
-        for file in files { self.delete(&file).await?; }
-        Ok(())
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
+        crate::classic_retirement::retire(self, receipt, contents).await
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {

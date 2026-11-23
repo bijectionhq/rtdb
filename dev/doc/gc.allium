@@ -47,7 +47,9 @@
 -- Native nodes with a local journal and local storage share a catalog floor at the storage root.
 -- Catalog admission and floor advancement use the same filesystem lock.
 -- A reader's shared ticket lock retains its catalog until its last provider operation completes or its process exits.
--- The collector persists the floor before releasing files from the installed receipt.
+-- The collector submits an installed receipt to the storage owner.
+-- The classic grant binds that receipt's immutable file identities to the storage owner.
+-- The current conservative decision persists the admission floor before issuing the grant.
 -- A capture in the floor's journal must supply a cut at or above the durable floor.
 -- A successor journal can open from the latest durable checkpoint after offline replacement.
 -- Held catalogs from the predecessor and opaque captures delay the successor floor.

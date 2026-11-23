@@ -8,6 +8,7 @@ pub mod object_store;
 pub mod read_lease;
 mod lease_decision;
 mod local_catalog;
+mod classic_retirement;
 mod repair_anchor_decision;
 pub use local_catalog::LocalRepairAnchor;
 mod durability;

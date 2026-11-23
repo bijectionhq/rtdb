@@ -91,15 +91,6 @@ impl LocalCatalogLedger {
         Ok(true)
     }
 
-    pub(crate) fn permits_retirement(&self, cut: CatalogCut) -> Result<bool> {
-        let _gate = self.lock()?;
-        if cut.replica_epoch != self.replica_epoch || !self.floor()?.is_some_and(|floor| covers(floor, cut)) {
-            return Ok(false);
-        }
-        self.sync_ledger()?;
-        Ok(true)
-    }
-
     pub(crate) fn install_repair_anchor(&self, next: LocalRepairAnchor) -> Result<()> {
         let _gate = self.lock()?;
         if !next.well_formed() {

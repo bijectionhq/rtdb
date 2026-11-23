@@ -1142,7 +1142,7 @@ impl ObjectStore for EncryptingStore {
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         self.inner.advance_catalog_floor(installed).await
     }
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
         if contents.len() > MAXIMUM_RECEIPT_BYTES || self.get_fresh_exact(receipt, contents.len()).await? != contents {
             return Err(Anomaly::incorrect("rtdb.multi/trie-release-receipt", "The trie release does not match its stored installation receipt"));
         }
@@ -1504,25 +1504,24 @@ impl ObjectStore for GarbageStore {
         let Some(readers) = &self.catalog_readers else { return Ok(true); };
         readers.advance(installed).await
     }
-    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
         let readers = self.catalog_readers.as_ref().ok_or_else(|| Anomaly::unsupported(
             "rtdb.multi/trie-release", "This store has no coordinated catalog floor"))?;
         let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
-        let floor = readers.trie_release_floor(installed.cut()).await?;
+        let Some(floor) = readers.admit_trie_release(installed.cut()).await? else { return Ok(false); };
         let mut files: Vec<_> = installed.files().iter().collect();
         files.sort_by_key(|file| file.release_order());
         for file in files {
             let version = file.version.as_ref().filter(|_| file.matches_publication);
             self.write_release_record(&ObjectKey::new(&file.key)?, Some(floor.clone()), version, None, file.terminal_publication.as_ref()).await?;
         }
-        Ok(())
+        Ok(true)
     }
     async fn release_search_run(&self, key: &ObjectKey, published: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
         let Some(cut) = cut else { return Ok(false); };
-        if !readers.advance(cut).await? { return Ok(false); }
-        let floor = readers.trie_release_floor(cut).await?;
+        let Some(floor) = readers.admit_trie_release(cut).await? else { return Ok(false); };
         let terminal = published.and_then(rtdb_format::log::proto::PublishedObjectVersion::terminal_publication);
         let version = self.retirement_version(key).await?.filter(|version| published.is_some_and(|published| {
             *published == rtdb_format::log::proto::PublishedObjectVersion::from(version.clone())
@@ -2269,7 +2268,7 @@ mod tests {
         let receipt_bytes = Bytes::from([installed.0.to_be_bytes().as_slice(), &plan].concat());
         store.put(&receipt, receipt_bytes.clone()).await.unwrap();
         assert!(!store.advance_catalog_floor(floor).await.unwrap());
-        assert!(store.release_trie_files(&receipt, receipt_bytes.clone()).await.is_err());
+        assert!(!store.release_trie_files(&receipt, receipt_bytes.clone()).await.unwrap());
 
         let held = directory.deployment(&record.id).await.unwrap().unwrap();
         assert_eq!(held.catalog_readers.len(), 1);
@@ -2279,11 +2278,10 @@ mod tests {
         drop(hold);
         tasks.close();
         tasks.wait().await;
-        assert!(store.advance_catalog_floor(floor).await.unwrap());
         let mut forged = receipt_bytes.to_vec();
         forged[7] = 2;
         assert!(store.release_trie_files(&receipt, forged.into()).await.is_err());
-        store.release_trie_files(&receipt, receipt_bytes).await.unwrap();
+        assert!(store.release_trie_files(&receipt, receipt_bytes).await.unwrap());
         reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         assert!(bucket.head(&physical).await.is_ok());
         let mut current = directory.deployment(&record.id).await.unwrap().unwrap();

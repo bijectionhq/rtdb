@@ -812,8 +812,7 @@ mod tests {
         io.close_and_wait().await;
         tracker.close();
         tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await.unwrap();
-        assert!(serving.advance_catalog_floor(floor).await.unwrap());
-        serving.release_trie_files(&receipt, contents).await.unwrap();
+        assert!(serving.release_trie_files(&receipt, contents).await.unwrap());
         let markers = ObjectKey::new(format!("{scope}/{GARBAGE_DIRECTORY}")).unwrap();
         let queued = bucket.list(Some(&markers)).await.unwrap();
         assert_eq!(queued.len(), 1);
