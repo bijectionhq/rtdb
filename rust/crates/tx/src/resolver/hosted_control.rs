@@ -186,6 +186,10 @@ impl OpenTransaction<'_> {
         if let Some(replay) = &replay {
             self.restore_owned_lifetime_floors(replay, &context).await?;
             self.restore_owned_worlds(replay, &context).await?;
+            for (relation, rule) in replay.capacity_declarations() {
+                let relation = OwnedRelation::new(relation)?;
+                self.declare_owned_capacity(&relation, &rule.column, 0, rule.cap, &rule.when).await?;
+            }
         }
         if let Some(readmission) = readmission {
             self.readmit_replayed_world(&context, readmission, controls).await?;

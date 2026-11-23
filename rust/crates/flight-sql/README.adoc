@@ -668,6 +668,8 @@ An owned Root relation may declare up to 16 distinct projection and predicate co
 A populated relation can declare its first cap when its schema requires validity from acceptance with an open end and has no creation lifetime.
 The resolver initializes the new rule's covered counters from the final visible rows at the declaring revision.
 If a prefix already exceeds the proposed cap, the transaction aborts with `rtdb.owned/capacity-already-exceeded`.
+Held Original replay reinstalls complete-key capacity declarations at their recorded source transaction.
+The resolver checks that the replay reproduces the source relation's write frontier and exact counter effects before accepting the replay receipt.
 Successful declarations return the same transaction-key Arrow row as Create.
 Zero counts complete Binary keys. An empty complete key charges a single relation-wide bucket. Positive widths count prefixes of that length. Keys are limited to 4096 bytes.
 Each qualified projection and partition has its own counter. A row charges the rule only while all its predicates match. One shared relation frontier certifies all counters.

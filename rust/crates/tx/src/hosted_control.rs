@@ -32,7 +32,17 @@ struct ReplayConstraint {
     relation: String,
     kind: ReplayConstraintKind,
     writes: i64,
+    through: i64,
     members: [u8; 32],
+    capacity_declarations: Vec<ReplayCapacityDeclaration>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplayCapacityDeclaration {
+    pub(crate) column: String,
+    pub(crate) when: Vec<u8>,
+    pub(crate) cap: i64,
 }
 
 
@@ -222,7 +232,14 @@ pub fn hosted_replay_controls<'a>(
         }
         for proof in &replay.constraints {
             let relation = OwnedRelation::new(proof.relation.as_str()).map_err(|_| replay_invalid())?;
-            if !relation.is_root_data() || proof.writes <= 0 {
+            let declarations = &proof.capacity_declarations;
+            if !relation.is_root_data() || proof.writes < 0 || proof.through < proof.writes
+                || (proof.writes == 0 && declarations.is_empty())
+                || (!declarations.is_empty() && proof.kind != ReplayConstraintKind::Capacity)
+                || declarations.len() > 16
+                || !declarations.windows(2).all(|pair|
+                    (&pair[0].column, &pair[0].when) < (&pair[1].column, &pair[1].when))
+            {
                 return Err(replay_invalid());
             }
         }
@@ -415,14 +432,23 @@ impl HostedReplay {
         Ok(())
     }
 
+    pub(crate) fn capacity_declarations(&self) -> impl Iterator<Item = (&str, &ReplayCapacityDeclaration)> {
+        self.constraints.iter().flat_map(|proof| {
+            proof.capacity_declarations.iter().map(move |rule| (proof.relation.as_str(), rule))
+        })
+    }
+
     pub(crate) fn match_constraint(
-        &mut self, relation: &OwnedRelation, kind: ReplayConstraintKind, writes: i64, members: [u8; 32],
+        &mut self, relation: &OwnedRelation, kind: ReplayConstraintKind, writes: i64, through: i64,
+        members: [u8; 32], declarations: usize,
     ) -> Result<()> {
         let index = self.constraints.binary_search_by(|proof| {
             (proof.relation.as_str(), proof.kind).cmp(&(relation.name(), kind))
         }).map_err(|_| replay_constraint_mismatch())?;
         let proof = self.constraints.remove(index);
-        if proof.writes != writes || proof.members != members {
+        if proof.writes != writes || proof.through != through || proof.members != members
+            || proof.capacity_declarations.len() != declarations
+        {
             return Err(replay_constraint_mismatch());
         }
         Ok(())
@@ -817,6 +843,31 @@ mod replay_tests {
             .lifetime(&OwnedRelation::new("root_lifetime")?).unwrap();
         assert_eq!(archived.swept_present_through, Timestamp(3));
         *controls.last_mut().unwrap() = replace("native-lifetimes/3", None, lifetime(5).as_bytes())?;
+        assert!(hosted_replay_controls(controls.iter()).is_err());
+        controls.pop();
+        let members = [0u8; 32];
+        let proof = |kind, through| serde_json::json!([{
+            "relation": "root_capacity", "kind": kind, "writes": 0,
+            "through": through, "members": members,
+            "capacity_declarations": [{"column": "partition", "when": [], "cap": 2}],
+        }]).to_string();
+        let companion = |kind, through| {
+            replace("native-constraints/3", None, proof(kind, through).as_bytes())
+        };
+        controls.push(companion("capacity", 7)?);
+        let parsed = || hosted_replay_controls(controls.iter()).map(Option::unwrap);
+        let relation = OwnedRelation::new("root_capacity")?;
+        let mut replay = parsed()?;
+        let rules = replay.capacity_declarations().collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!((rules[0].0, rules[0].1.column.as_str(), rules[0].1.cap),
+            ("root_capacity", "partition", 2));
+        assert!(replay.require_constraints_matched().is_err());
+        replay.match_constraint(&relation, ReplayConstraintKind::Capacity, 0, 7, [0; 32], 1)?;
+        replay.require_constraints_matched()?;
+        assert!(parsed()?.match_constraint(&relation, ReplayConstraintKind::Capacity, 0, 6, [0; 32], 1).is_err());
+        assert!(parsed()?.match_constraint(&relation, ReplayConstraintKind::Capacity, 0, 7, [0; 32], 0).is_err());
+        *controls.last_mut().unwrap() = companion("unique", 7)?;
         assert!(hosted_replay_controls(controls.iter()).is_err());
         controls.pop();
         controls.pop();

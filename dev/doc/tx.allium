@@ -119,6 +119,7 @@
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
 -- An exceeded bound aborts the entire group, including the writes and counter deltas.
 -- World writes to a governed root refuse without inherited capacity accounting.
+-- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
 -- A fresh held read can derive a scoped read-only hold at the actual last visible publication marker.
 -- Each declared relation's retained floor covers both the requested and selected system coordinates.
 -- The derived hold shares the original generation and lease and admits point, valid-window, version, ordered page and count reads in its fixed root scope.

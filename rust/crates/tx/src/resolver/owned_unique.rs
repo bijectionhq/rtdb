@@ -228,7 +228,9 @@ impl OpenTransaction<'_> {
                 .await?;
             }
             if let (Some(replay), Some(proof)) = (&mut self.hosted_replay, proof) {
-                replay.match_constraint(&relation, ReplayConstraintKind::Unique, writes, proof.finish())?;
+                replay.match_constraint(
+                    &relation, ReplayConstraintKind::Unique, writes, through_events, proof.finish(), 0,
+                )?;
             }
             policy.through_events = through_events;
             self.buffer.put(

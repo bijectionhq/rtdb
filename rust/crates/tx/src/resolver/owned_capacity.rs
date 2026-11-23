@@ -573,15 +573,15 @@ impl OpenTransaction<'_> {
                 .memory
                 .reserve(64 + ids.len() * policy.rules.len() * 128)?;
             let mut locators = BTreeSet::from([EntityId::String(RULE.into()).iid()]);
-            let mut proof =
-                (writes > 0 && self.hosted_replay.is_some()).then(ConstraintMembers::default);
+            let mut proof = self.hosted_replay.as_ref().map(|_| ConstraintMembers::default());
             for rule in &policy.rules {
                 if added
                     .iter()
                     .any(|(column, when)| rule.identity() == (column.as_str(), when.as_slice()))
                 {
-                    self.bootstrap_capacity_rule(&owner, &relation, rule, &next, &mut locators)
-                        .await?;
+                    self.bootstrap_capacity_rule(
+                        &owner, &relation, rule, &next, &mut locators, proof.as_mut(),
+                    ).await?;
                 } else if writes != 0 {
                     self.apply_capacity_rule(
                         &owner,
@@ -601,7 +601,9 @@ impl OpenTransaction<'_> {
                     &relation,
                     ReplayConstraintKind::Capacity,
                     writes,
+                    through,
                     proof.finish(),
+                    added.len(),
                 )?;
             }
             policy.through_events = through;
@@ -621,6 +623,7 @@ impl OpenTransaction<'_> {
         rule: &CapacityRule,
         snapshot: &Snapshot,
         locators: &mut BTreeSet<Iid>,
+        mut proof: Option<&mut ConstraintMembers>,
     ) -> Result<()> {
         let qualifiers = predicates(&rule.when)?;
         let columns = rule.columns(&qualifiers);
@@ -677,6 +680,9 @@ impl OpenTransaction<'_> {
         }
         let storage = relation.capacity_table(owner);
         for (id, (count, _charge)) in counts {
+            if let Some(proof) = proof.as_deref_mut() {
+                proof.insert(&id, ConstraintMember::Count(count), &self.context.memory)?;
+            }
             self.buffer
                 .put(storage.clone(), count_document(&id, count), Interval::ALL)?;
         }
