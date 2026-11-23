@@ -401,7 +401,7 @@ pub(crate) async fn read_table_block(
     let path = super::key(&entry.slug.block_key(catalog.block_index())?)?;
     let size = usize::try_from(store.head_fresh(&path).await?.size).map_err(|_| unavailable())?;
     let charge = memory.reserve(size.saturating_mul(8).saturating_add(4096))?;
-    let bytes = IoRegion::retaining(Arc::clone(&charge), store.observe_fresh_exact(&path, size))
+    let bytes = IoRegion::retaining(Arc::clone(&charge) as Arc<dyn Send + Sync>, store.observe_fresh_exact(&path, size))
         .await?
         .value;
     if catalog.table_block_digest(entry.oid) != Some(publication_digest(&bytes).as_slice()) {

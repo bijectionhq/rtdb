@@ -226,7 +226,7 @@ impl PartitionState {
     /// Captures the current catalog and open read references under the same state lock as snapshot admission.
     pub fn trie_collection(&self) -> TrieCollection {
         let value = self.value.read();
-        let mut retention = self.retention.lock();
+        let retention = self.retention.lock();
         let readers = retention.readers.iter().filter_map(Weak::upgrade).collect();
         TrieCollection { current: Arc::clone(&value), readers }
     }

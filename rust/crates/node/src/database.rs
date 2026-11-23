@@ -787,7 +787,7 @@ impl MaintenanceSupervisor {
         let mut region: Option<TermRegion> = None;
         let mut adopted = None;
         let mut trie_retry = tokio::time::interval(self.options.garbage.reader_lease.clamp(
-            std::time::Duration::from_millis(100), std::time::Duration::from_secs(60),
+            Duration::from_millis(100), Duration::from_secs(60),
         ));
         trie_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result = loop {
@@ -856,7 +856,7 @@ fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/databa
 
 /// As the reference's election driver times assertions off the log: a remote log's append-to-visibility time
 /// needs ten times an in-process log's interval.
-fn assertion_interval(log: Option<&database_config::Log>, in_process: std::time::Duration) -> std::time::Duration {
+fn assertion_interval(log: Option<&database_config::Log>, in_process: Duration) -> Duration {
     match log {
         None | Some(database_config::Log::InMemoryLog(_) | database_config::Log::LocalLog(_)) => in_process,
         Some(_) => in_process.saturating_mul(10),

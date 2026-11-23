@@ -220,11 +220,6 @@ impl SearchAccelerator {
                     work.ranked = true;
                     return Ok(Some(BTreeSet::new()));
                 }
-                if !options.baseline && !options.omit_logical && let Some(scope) = scope.filter(|scope| scope.len() <= 128)
-                    && crate::lane::LogicalIndex::supports(&definition)
-                    && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point() {
-                    return self.rank_points(request, top_k, scope, work).await.map(Some);
-                }
                 let ranking = Narrowing { scope, ..options };
                 if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, ranking, work).await? {
                     work.ranked = true;
@@ -254,26 +249,6 @@ impl SearchAccelerator {
         candidates.extend(self.live_candidates(request, column, &query)?);
         if candidates.len() > self.max_candidates { work.plain_decline = Some("candidate-budget"); return Ok(None); }
         Ok(Some(candidates))
-    }
-
-    async fn rank_points(&self, request: &ScanRequest<'_>, top: &rtdb_plan::ScanTopK,
-        scope: &BTreeSet<Iid>, work: &mut NarrowingWork) -> Result<BTreeSet<Iid>> {
-        let result = async {
-            let Some(Value::Utf8(text)) = request.constants.constant(&top.query).await? else { return Ok(None); };
-            let Some(rows) = rtdb_query::table_point_rows(request, scope).await? else { return Ok(None); };
-            let scoring = rtdb_text::Scorer::new(Query::parse(&text), None);
-            request.verifier.score_resolved(rows, top.column, None, &scoring).await
-        }.await;
-        match result {
-            Ok(Some(scores)) => {
-                work.ranked = true;
-                let iids = scores.iter().map(|(iid, _)| iid).collect();
-                if top.score.is_some() { work.scores = Some(scores); }
-                Ok(iids)
-            }
-            Err(error) if error.category == AnomalyCategory::Interrupted => Err(error),
-            _ => Ok(scope.clone()),
-        }
     }
 }
 
@@ -616,7 +591,7 @@ async fn covered_owned_corpus(
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
                         if shadowed.is_some_and(|ids| ids.iter().any(|value| EntityIdRef::from(value) == id)) { continue; }
-                        if !seen.insert(key) { return Err(uncovered_owned_search()); }
+                        if !seen.insert(key.to_vec()) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         documents += 1;
                         tokens += u64::from(selected.file.token_length(doc.doc)?);
@@ -629,7 +604,7 @@ async fn covered_owned_corpus(
             *frequency += postings.documents().iter().filter(|doc| visible.contains(doc)).count() as u64;
         }
         if retain_runs && !visible.is_empty() {
-            visible_runs.push((Arc::clone(selected.file), UInt32Array::from_iter_values(visible)));
+            visible_runs.push((Arc::clone(&selected.file), UInt32Array::from_iter_values(visible)));
         }
     }
     context.check_cancelled()?;
@@ -1211,7 +1186,7 @@ mod tests {
             pending: Default::default(), seen: BTreeSet::new(), scored: 0, max_candidates: 10,
             scratch: rtdb_columnar::MemoryBudget::new(1 << 20).reserve(4096).unwrap(),
         };
-        assert_eq!(candidates.next(None, false, &mut NarrowingWork::default()).await.unwrap().map(|row| (row.iid, row.exact)), Some((Iid([64; 16]), true)));
+        assert_eq!(candidates.next(None, false, &mut NarrowingWork::default()).await.unwrap().map(|row| row.iid), Some(Iid([64; 16])));
         assert!(candidates.next(None, false, &mut NarrowingWork::default()).await.unwrap().is_none());
     }
 

@@ -3093,7 +3093,7 @@ mod tests {
         let snapshot = value.snapshot();
         let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
         let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot,
-            storage: &storage, canonical_entity_iids: false, shared_rank: None, counts: Default::default() };
+            storage: &storage, canonical_entity_iids: false, counts: Default::default() };
         let point = Interval::at(Timestamp(150)).unwrap();
         let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: point, system_time: point }, memory: &memory,
@@ -3119,7 +3119,7 @@ mod tests {
         let snapshot = value.snapshot();
         let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
         let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot,
-            storage: &storage, canonical_entity_iids: false, shared_rank: None, counts: Default::default() };
+            storage: &storage, canonical_entity_iids: false, counts: Default::default() };
         let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
             current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
