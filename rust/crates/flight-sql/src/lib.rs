@@ -19,6 +19,7 @@ pub use config::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW
 pub use server::{ServerDriver, ServerHandle, ServerStatus};
 
 mod owned_actions;
+mod owned_landing_wire;
 
 mod owned_world;
 pub use owned_world::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, PreparedWorldOverlay, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldParentVersion, WorldParentVersions, WorldPointResult, WorldPointRow};
