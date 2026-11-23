@@ -767,7 +767,7 @@ impl NodeAgent {
                 let block = flush_local(&database).await?;
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
-                placement.publish_checkpoint(self.keys.as_ref(), admission, Some(checkpoint),
+                placement.publish_checkpoint(self.keys.as_ref(), Some((admission, checkpoint)),
                     &self.options.storage).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
@@ -1576,42 +1576,26 @@ impl NodeAgent {
     }
 
     async fn reconcile_ordered(&self) {
-        let mut active = Vec::new();
-        for (name, holding) in self.holdings.lock().iter() {
-            if let HoldingAuthority::Journal(admission) = &holding.authority {
-                active.push((name.clone(), *admission, holding.database.clone()));
+        let active: Vec<_> = self.holdings.lock().iter().filter_map(|(name, holding)| {
+            match &holding.authority {
+                HoldingAuthority::Journal(admission) => Some((name.clone(), *admission, holding.database.clone())),
+                HoldingAuthority::Directory { .. } => None,
             }
-        }
+        }).collect();
+        let mut offered = BTreeMap::new();
         for (name, admission, database) in active {
             let Some(placement) = self.ordered.by_name(&name) else { continue; };
-            let route = match placement.worker.route().await {
-                Ok(route) => Some(route),
+            let grant = match placement.worker.route().await {
+                Ok(route) => route.writer.grant,
                 Err(error) if error.category == AnomalyCategory::Forbidden => None,
                 Err(_) => continue,
             };
             let running = database.upgrade().filter(|db| db.status().role != DriverRole::Stopped);
-            if let Some(route) = route
-                && route.writer.grant == Some(admission.grant)
-                && let Some(database) = running
-            {
-                let _ = placement.replenish(&route, admission.grant).await;
-                if placement.custodian.is_some() {
-                    let checkpoint = database.status().adopted_block
-                        .and_then(|block| checkpoint_for_block(&block, placement.worker.log_epoch()))
-                        .filter(|checkpoint| u64::try_from(checkpoint.boundary).is_ok_and(|boundary| boundary >= route.checkpoint.cut.next_lsn));
-                    let publish = placement.publish_checkpoint(self.keys.as_ref(), admission, checkpoint,
-                        &self.options.storage);
-                    let _ = tokio::time::timeout(self.options.activation_timeout, publish).await;
-                }
-                let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());
-                let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
-                let current = placement.worker.route().await.unwrap_or(route);
-                if current.writer.grant == Some(admission.grant)
-                    && current.floor.next_lsn < current.checkpoint.cut.next_lsn
-                    && placement.worker.trim(&current, admission.grant, current.checkpoint.cut).await.is_ok()
-                    && let Ok(trimmed) = placement.worker.route().await
+            if grant == Some(admission.grant) && let Some(database) = running {
+                if let Some(checkpoint) = database.status().adopted_block
+                    .and_then(|block| checkpoint_for_block(&block, placement.worker.log_epoch()))
                 {
-                    let _ = placement.replenish(&trimmed, admission.grant).await;
+                    offered.insert(name, (admission, checkpoint));
                 }
                 continue;
             }
@@ -1624,6 +1608,19 @@ impl NodeAgent {
                 self.stop_running(&name).await;
                 let _ = placement.worker.vacate(admission.grant).await;
             }
+        }
+
+        // The custodian owns publication and trim even when this node has no
+        // journal grant and no database is ready to serve.
+        for (name, placement) in self.ordered.custody_placements() {
+            let _ = placement.retain_selected().await;
+            let publish = placement.publish_checkpoint(self.keys.as_ref(), offered.remove(name),
+                &self.options.storage);
+            if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
+                let _ = placement.retain_selected().await;
+            }
+            let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());
+            let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
         }
     }
 

@@ -18,6 +18,7 @@ pub mod custody;
 pub mod hosted;
 mod log;
 pub(crate) use log::{Held, JournalLog};
+use ordered_logkeeper::ordered::TrimResult;
 use rtdb_directory::DeploymentRecord;
 use rtdb_storage::log::LogOffset;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
@@ -270,8 +271,8 @@ impl InstalledJournal {
         Ok(result)
     }
 
-    pub async fn checkpoint_cut(&self, grant: Grant, next: u64) -> Result<Cut> {
-        match self.call(Operation::CheckpointCut { grant, next }).await? {
+    pub async fn checkpoint_cut(&self, next: u64) -> Result<Cut> {
+        match self.call(Operation::CheckpointCut { next }).await? {
             Reply::CheckpointCut(cut) if cut.next_lsn == next => Ok(cut),
             _ => Err(mismatch("The peer selected a different checkpoint cut")),
         }
@@ -280,10 +281,9 @@ impl InstalledJournal {
     pub async fn prepare_checkpoint(
         &self,
         route: &Route,
-        grant: Grant,
         preparation: CheckpointPreparation,
     ) -> Result<()> {
-        let request = self.request(route, Command::PrepareCheckpoint { grant, preparation })?;
+        let request = self.request(route, Command::PrepareCheckpoint { preparation })?;
         let decision = self.execute(&request).await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::CheckpointPrepared(chosen) if chosen == preparation => Ok(()),
@@ -324,9 +324,9 @@ impl InstalledJournal {
         }
     }
 
-    pub async fn publish(&self, route: &Route, grant: Grant, checkpoint: Checkpoint) -> Result<()> {
+    pub async fn publish(&self, route: &Route, checkpoint: Checkpoint) -> Result<()> {
         let decision = self
-            .execute(&self.request(route, Command::Publish { grant, checkpoint })?)
+            .execute(&self.request(route, Command::Publish { checkpoint })?)
             .await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::Published(published) if published == checkpoint => Ok(()),
@@ -334,19 +334,21 @@ impl InstalledJournal {
         }
     }
 
-    pub async fn trim(&self, route: &Route, grant: Grant, through: Cut) -> Result<()> {
-        let decision = self
-            .execute(&self.request(route, Command::Trim { grant, through })?)
-            .await?;
+    pub async fn trim(&self, route: &Route, through: Cut) -> Result<TrimResult> {
+        let command = Command::Trim {
+            selected: route.checkpoint,
+            through,
+        };
+        let decision = self.execute(&self.request(route, command)?).await?;
         match decision.receipt.outcome.map_err(refused)? {
-            Outcome::Trimmed(trimmed) if trimmed == through => Ok(()),
+            Outcome::Trimmed(trimmed) if trimmed.through == through => Ok(trimmed),
             _ => Err(mismatch("The journal trimmed through a different cut")),
         }
     }
 
-    pub async fn fund(&self, route: &Route, grant: Grant, window: Window) -> Result<()> {
+    pub async fn fund(&self, route: &Route, window: Window) -> Result<()> {
         let decision = self
-            .execute(&self.request(route, Command::FundWindow { grant, window })?)
+            .execute(&self.request(route, Command::FundWindow { window })?)
             .await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::WindowFunded(funded) if funded == window => Ok(()),

@@ -143,8 +143,8 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
   | closeHold (s : State) (closing : Hold) (owner : Nat) (quorum : s.quorum = true)
       (matches : closing.enrollment = owner) (present : closing ∈ s.holdBook) :
       Step readerSlots activationSlots s {s with holdBook := s.holdBook.filter (fun entry => decide (entry ≠ closing))}
-  | prepare (s : State) (cohort writer custodian : Nat) (base target : Checkpoint)
-      (auth : Current s cohort writer) (authorized : custodian = s.custodian) (quorum : s.quorum = true)
+  | prepare (s : State) (custodian : Nat) (base target : Checkpoint)
+      (authorized : custodian = s.custodian) (quorum : s.quorum = true)
       (empty : s.preparing = none) (matches : s.chosen target.cut.next = some target.cut)
       (forward : s.published.cut.next < target.cut.next) (within : target.cut.next ≤ s.head.next)
       (baseOpen : base ∉ s.closed) (targetOpen : target ∉ s.closed) :
@@ -153,14 +153,15 @@ inductive Step (readerSlots activationSlots : Nat) : State → State → Prop wh
       (preparing : s.preparing = some ⟨base, target, false⟩)
       (evidence : CanMaterialize s target provider) :
       Step readerSlots activationSlots s {s with preparing := some ⟨base, target, true⟩}
-  | publish (s : State) (cohort writer custodian : Nat) (base target : Checkpoint)
-      (auth : Current s cohort writer) (authorized : custodian = s.custodian) (quorum : s.quorum = true)
+  | publish (s : State) (custodian : Nat) (base target : Checkpoint)
+      (authorized : custodian = s.custodian) (quorum : s.quorum = true)
       (ready : s.preparing = some ⟨base, target, true⟩)
       (matches : s.chosen target.cut.next = some target.cut)
       (forward : s.published.cut.next < target.cut.next) (within : target.cut.next ≤ s.head.next) :
       Step readerSlots activationSlots s {s with published := target, preparing := none}
-  | trim (s : State) (cohort writer : Nat) (through : Cut)
-      (auth : Current s cohort writer) (quorum : s.quorum = true)
+  | trim (s : State) (custodian : Nat) (selected : Checkpoint) (through : Cut)
+      (authorized : custodian = s.custodian) (quorum : s.quorum = true)
+      (selection : selected = s.published)
       (matches : s.chosen through.next = some through) (forward : s.floor ≤ through.next)
       (covered : through.next ≤ s.published.cut.next)
       (unheld : ∀ h ∈ s.holdBook, h.first = h.through.next ∨ through.next ≤ h.first) :
@@ -218,9 +219,9 @@ theorem step_preserves_checkpoint_and_holds (before : Invariant s)
     · exact held h old
   case closeHold =>
     exact ⟨covered, head, selected, fun h member => held h (List.mem_filter.mp member).1⟩
-  case publish cohort writer custodian base target auth authorized quorum ready matches forward within =>
+  case publish custodian base target authorized quorum ready matches forward within =>
     exact ⟨Nat.le_trans covered (Nat.le_of_lt forward), within, matches, held⟩
-  case trim cohort writer through auth quorum matches forward current pins =>
+  case trim custodian selectedRoot through authorized quorum selection matches forward current pins =>
     exact ⟨current, head, selected, pins⟩
 
 theorem protected_through_trace (before : Invariant s)

@@ -397,16 +397,13 @@ impl CheckpointCustody {
         &self,
         journal: &InstalledJournal,
         route: &Route,
-        grant: Grant,
         checkpoint: Checkpoint,
     ) -> Result<()> {
-        if route.placement != self.placement || route.writer.grant != Some(grant) {
-            return Err(invalid(
-                "The custodian does not hold the active checkpoint scope",
-            ));
+        if route.placement != self.placement {
+            return Err(invalid("The custodian does not own this checkpoint scope"));
         }
         self.open(checkpoint).await?;
-        journal.publish(route, grant, checkpoint).await
+        journal.publish(route, checkpoint).await
     }
 
     pub async fn open(&self, chosen: Checkpoint) -> Result<OpenedCheckpoint> {

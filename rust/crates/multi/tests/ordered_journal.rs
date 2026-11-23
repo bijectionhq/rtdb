@@ -26,7 +26,7 @@ use ordered_logkeeper::ordered::service::{
 use ordered_logkeeper::ordered::{
     APPEND_RECORD_CHARGE_BYTES, AppendClass, AppendResult, Checkpoint, CheckpointPreparation,
     Command, Custody, Enrollment, Fingerprint, Grant, Hold, Outcome, Placement, Principal, Refusal,
-    Request, RequestId, Window,
+    Request, RequestId, TrimResult, Window,
 };
 use ring::digest::{SHA256, digest};
 use ring::rand::SystemRandom;
@@ -632,10 +632,7 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
             request(
                 view,
                 Principal::Custodian,
-                Command::PrepareCheckpoint {
-                    grant: replacement,
-                    preparation
-                }
+                Command::PrepareCheckpoint { preparation }
             )
         )
         .await
@@ -649,10 +646,7 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
             request(
                 route(&custody).await,
                 Principal::Custodian,
-                Command::Publish {
-                    grant: replacement,
-                    checkpoint: exact
-                }
+                Command::Publish { checkpoint: exact }
             )
         )
         .await
@@ -664,15 +658,17 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
     release(&old, first_recovery).await;
     release(&next, second_recovery).await;
     let trim = Command::Trim {
-        grant: replacement,
+        selected: exact,
         through: exact.cut,
     };
-    let writer = Principal::Worker(replacement.enrollment);
     assert_eq!(
-        execute(&next, request(route(&next).await, writer, trim.clone()))
-            .await
-            .receipt
-            .outcome,
+        execute(
+            &custody,
+            request(route(&custody).await, Principal::Custodian, trim.clone())
+        )
+        .await
+        .receipt
+        .outcome,
         Err(Refusal::Unavailable),
         "the read that overlapped handoff still owns its replay interval"
     );
@@ -695,11 +691,19 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
         "a released marker cannot acquire a new proof"
     );
     assert_eq!(
-        execute(&next, request(route(&next).await, writer, trim))
-            .await
-            .receipt
-            .outcome,
-        Ok(Outcome::Trimmed(exact.cut))
+        execute(
+            &custody,
+            request(route(&custody).await, Principal::Custodian, trim)
+        )
+        .await
+        .receipt
+        .outcome,
+        Ok(Outcome::Trimmed(TrimResult {
+            from: view.floor,
+            through: exact.cut,
+            ordinary_bytes: appended.byte_end - appended.byte_start,
+            maintenance_bytes: maintained.byte_end - maintained.byte_start,
+        }))
     );
     assert_eq!(route(&next).await.maintenance_retained, 0);
     assert!(matches!(
@@ -743,10 +747,7 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
             request(
                 view,
                 Principal::Custodian,
-                Command::FundWindow {
-                    grant: replacement,
-                    window: funded
-                }
+                Command::FundWindow { window: funded }
             )
         )
         .await
@@ -1133,7 +1134,36 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
         .stop()
         .await;
     nodes[incumbent_index].take().unwrap().kill().await.unwrap();
+    let view = route(&routing).await;
+    if view.writer.grant == Some(incumbent) {
+        let old_writer = authority.workers[incumbent_index].client(&cohort.route);
+        assert_eq!(
+            execute(
+                &old_writer,
+                request(
+                    view,
+                    Principal::Worker(incumbent.enrollment),
+                    Command::Vacate { grant: incumbent }
+                )
+            )
+            .await
+            .receipt
+            .outcome,
+            Ok(Outcome::Vacated)
+        );
+    }
+    assert!(route(&routing).await.writer.grant.is_none());
     drop(blocker);
+
+    // The second node's custodian resumes the chosen copy before any client
+    // can promote it as a writer.
+    let published = eventually(async || {
+        let view = route(&routing).await;
+        (view.checkpoint.custody == pending.custody && view.floor == pending.checkpoint)
+            .then_some(view)
+    })
+    .await;
+    assert!(published.writer.grant.is_none());
     let replacement = common::connect(&sql_address.to_string(), "shop").await;
     assert_eq!(
         common::values(&replacement, "SELECT total FROM orders WHERE _id = 1").await,
@@ -1147,12 +1177,6 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
     assert!(elected.epoch > incumbent.epoch);
     assert!(directory.deployments().await.unwrap().is_empty());
 
-    let published = eventually(async || {
-        let view = route(&routing).await;
-        (view.checkpoint.custody == pending.custody && view.floor == pending.checkpoint)
-            .then_some(view)
-    })
-    .await;
     assert_eq!(published.checkpoint.cut, pending.checkpoint);
     assert_eq!(published.checkpoint.root, pending.root);
     assert!(published.preparing.is_none());
@@ -1220,6 +1244,17 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
         .flush("shop")
         .await
         .unwrap();
+    // The restored writer itself holds the old root until its attachment
+    // closes. Keep the separate provider reader alive across that release.
+    drop(new_flight);
+    drop(replacement);
+    nodes[1 - incumbent_index]
+        .as_ref()
+        .unwrap()
+        .agent
+        .park("shop")
+        .await
+        .unwrap();
     let custodian = authority.custodian.client(&cohort.route);
     eventually(async || {
         let view = route(&custodian).await;
@@ -1247,7 +1282,6 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
     })
     .await;
 
-    drop(replacement);
     serving.cancel();
     tokio::time::timeout(DEADLINE, sql)
         .await

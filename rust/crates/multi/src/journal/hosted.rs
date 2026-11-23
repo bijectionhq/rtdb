@@ -225,6 +225,15 @@ impl Routes {
         self.0.get(name)
     }
 
+    pub(crate) fn custody_placements(&self) -> impl Iterator<Item = (&str, &Placement)> {
+        self.0.iter().filter_map(|(name, placement)| {
+            placement
+                .custodian
+                .as_ref()
+                .map(|_| (name.as_str(), placement.as_ref()))
+        })
+    }
+
     fn resolve(&self, configuration: &Any) -> Result<(Arc<Placement>, Attachment)> {
         let attachment: Attachment = serde_json::from_slice(&configuration.value)
             .map_err(|error| invalid(&error.to_string()))?;
@@ -308,7 +317,7 @@ fn worker_endpoints(peers: Vec<WorkerEndpoint>) -> Result<BTreeMap<Enrollment, W
 impl Placement {
     /// Replenish only bytes the installed voters have already paid for. The
     /// ordered decision recomputes the limit against concurrent appends.
-    pub(crate) async fn replenish(&self, route: &Route, grant: Grant) -> Result<()> {
+    pub(crate) async fn replenish(&self, route: &Route) -> Result<()> {
         let Some(custodian) = &self.custodian else {
             return Ok(());
         };
@@ -333,14 +342,13 @@ impl Placement {
             serial,
             bytes: funded,
         };
-        custodian.fund(route, grant, window).await
+        custodian.fund(route, window).await
     }
 
     pub(crate) async fn publish_checkpoint(
         &self,
         keys: &dyn crate::keys::KeyService,
-        admission: WriterAdmission,
-        offered: Option<RtdbCheckpoint>,
+        offered: Option<(WriterAdmission, RtdbCheckpoint)>,
         serving: &crate::deployment::CellStorage,
     ) -> Result<Option<RtdbCheckpoint>> {
         let _publication = self.publication.lock().await;
@@ -348,11 +356,14 @@ impl Placement {
             .custodian
             .as_ref()
             .ok_or_else(|| invalid("This placement has no checkpoint custodian"))?;
+        if offered.is_none() && custodian.route().await?.preparing.is_none() {
+            return Ok(None);
+        }
         let material = material(keys, &self.record).await?;
         let io = IoRegion::new();
         let provider = self.checkpoint_custody(Arc::clone(&io), &material).await?;
         let requested = offered
-            .map(|checkpoint| {
+            .map(|(admission, checkpoint)| {
                 let next = checkpoint
                     .boundary
                     .checked_add(1)
@@ -360,18 +371,14 @@ impl Placement {
                     .ok_or_else(|| {
                         invalid("The adopted checkpoint has no ordered replica boundary")
                     })?;
-                Ok::<_, Anomaly>((checkpoint, next))
+                Ok::<_, Anomaly>((admission, checkpoint, next))
             })
             .transpose()?;
 
         loop {
             let current = custodian.route().await?;
-            let grant = admission.grant;
-            if current.writer.grant != Some(grant) {
-                return Err(invalid("The checkpoint writer grant has been replaced"));
-            }
             let published = current.checkpoint;
-            if let Some((checkpoint, next)) = requested {
+            if let Some((_, checkpoint, next)) = requested {
                 if published.cut.next_lsn > next {
                     return Ok(Some(provider.open(published).await?.checkpoint));
                 }
@@ -399,10 +406,10 @@ impl Placement {
             };
             let origin = match (current.preparing, requested) {
                 (Some(chosen), _) => Preparation::recover(chosen, reservation)?,
-                (None, Some((checkpoint, next))) => {
-                    let through = custodian.checkpoint_cut(grant, next).await?;
+                (None, Some((admission, checkpoint, next))) => {
+                    let through = custodian.checkpoint_cut(next).await?;
                     let origin = Preparation {
-                        writer: grant,
+                        writer: admission.grant,
                         base: admission.recovery.checkpoint,
                         through,
                         checkpoint,
@@ -414,7 +421,7 @@ impl Placement {
                         .preflight(&reservation, origin, source.as_ref())
                         .await?;
                     custodian
-                        .prepare_checkpoint(&current, grant, origin.ordered(reservation)?)
+                        .prepare_checkpoint(&current, origin.ordered(reservation)?)
                         .await?;
                     origin
                 }
@@ -433,13 +440,24 @@ impl Placement {
                 }
             };
             let authority = custodian.route().await?;
-            provider
-                .publish(custodian, &authority, grant, staged)
-                .await?;
-            if requested.is_none_or(|(_, next)| staged.cut.next_lsn >= next) {
+            provider.publish(custodian, &authority, staged).await?;
+            if requested.is_none_or(|(_, _, next)| staged.cut.next_lsn >= next) {
                 return Ok(Some(origin.checkpoint));
             }
         }
+    }
+
+    pub(crate) async fn retain_selected(&self) -> Result<()> {
+        let Some(custodian) = &self.custodian else {
+            return Ok(());
+        };
+        let mut route = custodian.route().await?;
+        if route.floor.next_lsn < route.checkpoint.cut.next_lsn
+            && custodian.trim(&route, route.checkpoint.cut).await.is_ok()
+        {
+            route = custodian.route().await?;
+        }
+        self.replenish(&route).await
     }
 
     pub(crate) async fn retire_unheld_checkpoint(
