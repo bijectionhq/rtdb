@@ -122,18 +122,11 @@ impl InstalledJournal {
                 "The route addresses a different journal placement",
             ));
         }
-        let expires_at = route
-            .position
-            .checked_add(route.retry_positions)
-            .filter(|end| end.saturating_sub(route.position) > 1)
-            .ok_or_else(|| mismatch("The ordered retry space is exhausted"))?;
+        let id = RequestId::fresh(route.position, route.retry_positions).map_err(refused)?;
         Ok(Request {
             placement: self.placement,
             principal: self.authority.principal(),
-            id: RequestId {
-                nonce: Uuid::new_v4(),
-                expires_at,
-            },
+            id,
             command,
         })
     }
