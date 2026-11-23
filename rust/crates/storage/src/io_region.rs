@@ -3,6 +3,9 @@ use parking_lot::Mutex;
 use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 use crate::{Error, ReadLease, Result};
 
+#[macro_use]
+mod provider_task;
+
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
     static READ_LEASE: Arc<ReadLease>;
@@ -42,11 +45,10 @@ impl IoRegion {
     pub async fn retaining<T>(
         owner: Arc<dyn Send + Sync>, work: impl std::future::Future<Output = T>,
     ) -> T {
-        let owner = match RETAINED_OWNER.try_with(Arc::clone) {
-            Ok(parent) if !Arc::ptr_eq(&parent, &owner) => Arc::new((parent, owner)),
-            _ => owner,
-        };
-        RETAINED_OWNER.scope(owner, work).await
+        macro_rules! combine { ($parent:ident, $owner:ident) => {{
+            if Arc::ptr_eq(&$parent, &$owner) { $owner } else { Arc::new(($parent, $owner)) }
+        }}; }
+        scope_io_owner!(RETAINED_OWNER, owner, work; combine).await
     }
     /// Checks the lease when each provider operation is admitted while polling the work.
     /// A nested lease narrows the one in scope where `leased` is called.
@@ -101,7 +103,7 @@ impl IoRegion {
         let lease = if self.parent.is_none() { READ_LEASE.try_with(Arc::clone).ok() } else { None };
         if let Some(lease) = &lease { lease.check()?; }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
-            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: RETAINED_OWNER.try_with(Arc::clone).into_iter().collect(), lease });
+            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: retain_admitted_owner!(RETAINED_OWNER).into_iter().collect(), lease });
         admission.tokens.push(self.tasks.token());
         admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)
@@ -150,15 +152,27 @@ impl IoRegion {
     async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let audience = Self::requires_audience_transport();
-        let budget = crate::audience_work::current();
-        tokio::spawn(async move {
-            let custody = (operation, budget.clone());
-            crate::audience_work::hold_provider_custody(custody, async move {
-                let work = crate::audience_work::inherit(budget, work);
-                let result = if audience { Self::audience_object_read(work).await } else { work.await };
-                drop(sender.send(result));
-            }).await;
-        }).await.map_err(|error| Error::Task(error.to_string()))?;
+        // Verus checks the shared captures with contract adapters for the coroutine blocks.
+        macro_rules! spawn {
+            ($worker:ident; $captures:tt => $body:block) => { tokio::spawn(async move $body) };
+        }
+        macro_rules! hold {
+            ($custody:ident, $body:block) => {
+                crate::audience_work::hold_provider_custody($custody, async move $body).await
+            };
+        }
+        macro_rules! inherit {
+            ($worker:ident, $budget:expr, $work:ident) => { crate::audience_work::inherit($budget, $work) };
+        }
+        macro_rules! deliver {
+            ($sender:ident, $audience:ident, $work:ident) => {{
+                let result = if $audience { Self::audience_object_read($work).await } else { $work.await };
+                drop($sender.send(result));
+            }};
+        }
+        spawn_provider_task!(operation, work, sender, audience;
+            crate::audience_work::current(), spawn, hold, inherit, deliver
+        ).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?
     }
 }

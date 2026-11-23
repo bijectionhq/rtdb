@@ -14,6 +14,9 @@ use uuid::Uuid;
 use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, SeatState, admit_audience_seat, occupied_seat_action};
 
+#[macro_use]
+mod audience_owner;
+
 pub(crate) const CLOSE_SESSION: &str = "CloseSession";
 
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -84,13 +87,7 @@ impl Drop for Call {
 }
 impl Call {
     pub(crate) fn audience_io_owner(&self) -> Option<Arc<dyn Send + Sync>> {
-        self.session.audience_source()?;
-        Some(Arc::new((
-            Arc::clone(&self.admission),
-            Arc::clone(&self.session),
-            self._active_call.clone(),
-            Arc::clone(&self._reservation),
-        )))
+        capture_audience_io_owner!(self)
     }
 
     pub fn response<T>(&self, value: T) -> Result<Response<T>, Status> {

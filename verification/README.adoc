@@ -366,6 +366,11 @@ It also exercises the Azure adapter against a loopback provider and separately m
 * `verus/original_sync_audit` checks the original Logkeeper sync bound and digest-bound lookup decisions in `client/audit.rs` and `server/store.rs`.
   Verus 0.2026.11.20.9da409b checked 11 items and all 17 negative controls failed at their expected laws on 2026-11-23.
   See link:../dev/doc/rtdb-multi-bijection.md[the strict acceptance audit] for the call-site inspection and premises.
+* `verus/audience_drain_wiring` checks the production-shared Flight owner capture, asynchronous storage spawn and poll, and task-local allowance wiring with RTDB-local runtime contracts.
+  Verus 0.2026.11.20.9da409b checked 39 items and all seven controls failed at their declared laws on 2026-11-23.
+  The runner records the named foreign contracts for the area in its evidence directory.
+  The conformance tests for those contracts were authored and remain unrun.
+  See link:../dev/doc/rtdb-multi-bijection.md#audience-action-work[the audience action evidence] for the checked laws and source correspondence.
 
 The run ledger identifies tool identities, positive cases, bounded negative traces and unresolved obligations.
 

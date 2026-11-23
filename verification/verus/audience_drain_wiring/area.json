@@ -1,0 +1,112 @@
+{
+  "summary": "Flight audience provider work retains the original resources through pending polls and caller cancellation, settles the final reference exactly once, and re-enters the original action and turn budget.",
+  "flags": ["--edition=2024", "--no-external-by-default"],
+  "min_verified_functions": 39,
+  "foreign_contracts": [
+    "tokio-task-local",
+    "tokio-detach",
+    "tokio-owned-permit",
+    "rust-pin-poll-fn",
+    "parking-lot-mutex"
+  ],
+  "controls": {
+    "release_on_first_poll": {
+      "defect": "The provider poll relinquishes its owner even when the provider returns Pending.",
+      "mutate": [{
+        "file": "rust/crates/storage/src/audience_work/drain.rs",
+        "find": "owner = retain_until_drained(owner.take(), result.is_ready());",
+        "replace": "owner = retain_until_drained(owner.take(), true);"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "w1_pending_preserves_custody",
+        "category": "invariant not satisfied at end of loop body"
+      }],
+      "min_verified_functions": 38
+    },
+    "drop_permit_before_spawn": {
+      "defect": "Admitted I/O discards its retained Flight owner before transferring custody to the worker.",
+      "mutate": [{
+        "file": "rust/crates/storage/src/io_region/provider_task.rs",
+        "find": "        let budget = $current;",
+        "replace": "        let budget = $current;\n        let mut $operation = $operation;\n        $operation.lifetimes.clear();"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "w2_caller_cancellation_keeps_flight_resources",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 38
+    },
+    "lose_enclosing_owner": {
+      "defect": "A nested I/O owner replaces the enclosing Flight owner and loses its charges.",
+      "mutate": [{
+        "file": "rust/crates/storage/src/io_region/provider_task.rs",
+        "find": "            Ok(parent) => $combine!(parent, supplied),",
+        "replace": "            Ok(_) => supplied,"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "scope_retained_owner",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 38
+    },
+    "double_release": {
+      "defect": "The release model returns the final permit twice when its last strong owner goes away.",
+      "mutate": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "find": "    if owner.is_some() { before } else { release_strong_reference(before) }",
+        "replace": "    if owner.is_some() { before } else {\n        let after = release_strong_reference(before);\n        PermitBalance { strong: after.strong, returned: if after.strong == 0 { 2 } else { after.returned } }\n    }"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "w3_completion_releases_one_reference",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 38
+    },
+    "lose_charge": {
+      "defect": "The shared budget wiring returns success without debiting the turn ledger.",
+      "mutate": [{
+        "file": "rust/crates/storage/src/audience_work/wiring.rs",
+        "find": "            $debit!(remaining, cost)?;",
+        "replace": "            let _ = remaining;"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "w3_work_debits_action_and_turn",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 38
+    },
+    "spawn_outside_budget_scope": {
+      "defect": "The worker is spawned into an empty task-local scope and polls provider work without entering the captured budget.",
+      "mutate": [{
+        "file": "rust/crates/storage/src/io_region/provider_task.rs",
+        "find": "let work = $inherit!(worker, budget, $work);",
+        "replace": "let work = $inherit!(worker, None, $work);"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "w4_detached_worker_observes_original_budget",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 38
+    },
+    "reset_nested_budget": {
+      "defect": "A nested scope installs a fresh action ledger instead of sharing its parent's budget.",
+      "mutate": [{
+        "file": "rust/crates/storage/src/audience_work/wiring.rs",
+        "find": "decision::new_action(existing.is_some(), $limits)",
+        "replace": "decision::new_action(false, $limits)"
+      }],
+      "expect": [{
+        "file": "verification/verus/audience_drain_wiring/laws.rs",
+        "function": "within_turn",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 38
+    }
+  }
+}

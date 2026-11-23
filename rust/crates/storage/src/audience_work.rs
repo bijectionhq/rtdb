@@ -8,8 +8,12 @@ use parking_lot::Mutex;
 use crate::{Error, Result};
 
 mod decision;
+#[macro_use]
+mod wiring;
 #[cfg(any(feature = "remote", test))]
 mod drain;
+#[cfg(test)]
+mod foreign_contract_tests;
 
 use decision::Work;
 pub use decision::{Limits, PROVIDER_METADATA_BYTES};
@@ -51,11 +55,7 @@ pub async fn within<T>(limits: Option<Limits>, work: impl Future<Output = T>) ->
 }
 
 pub async fn within_turn<T>(limits: Option<Limits>, turn: Option<TurnAllowance>, work: impl Future<Output = T>) -> T {
-    let existing = current();
-    let budget = match decision::new_action(existing.is_some(), limits) {
-        Some(limits) => Some(Budget { action: Arc::new(Mutex::new(Some(limits))), turn }),
-        None => existing,
-    };
+    let budget = select_audience_budget!(current(), limits, turn);
     inherit(budget, work).await
 }
 
@@ -65,28 +65,18 @@ pub fn current_turn() -> Option<TurnAllowance> {
 
 pub fn is_bounded() -> bool { CURRENT.try_with(|_| ()).is_ok() }
 
-pub(crate) fn current() -> Option<Budget> { CURRENT.try_with(Budget::clone).ok() }
+pub(crate) fn current() -> Option<Budget> { capture_current_budget!(CURRENT) }
 
 pub(crate) async fn inherit<T>(budget: Option<Budget>, work: impl Future<Output = T>) -> T {
-    match budget {
-        Some(budget) => CURRENT.scope(budget, work).await,
-        None => work.await,
-    }
+    macro_rules! await_work { ($scope:ident, $work:expr) => { $work.await }; }
+    inherit_audience_budget!(CURRENT, budget, work, await_work)
 }
 
 fn charge(work: Work) -> Result<()> {
     CURRENT.try_with(|budget| {
-        let cost = decision::cost(work);
-        let debit = |allowance: &Allowance| {
-            let mut available = allowance.lock();
-            *available = decision::debit(*available, cost);
-            available.as_ref().map(|_| ()).ok_or(Error::AudienceWorkLimit)
-        };
-        debit(&budget.action)?;
-        if let Some(turn) = &budget.turn {
-            debit(&turn.remaining)?;
-        }
-        Ok(())
+        charge_audience_budget!(
+            &budget.action, budget.turn.as_ref().map(|turn| &turn.remaining), work, debit_audience_allowance
+        )
     }).unwrap_or(Ok(()))
 }
 

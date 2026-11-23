@@ -1905,7 +1905,8 @@ rule BecomeIdle {
     -- The directory retains the published checkpoint and the time of the last activity.
     -- A move reservation takes precedence over the idle transition.
     -- A Flight SQL call keeps the placement active until its stream closes or the caller cancels.
-    -- An audience object read admitted before cancellation extends the placement pin and its original call reservation until the read drains.
+    -- An admitted audience object read retains the original call permit, session seat permit, any placement pin and the request memory reservation through provider drain.
+    -- Caller cancellation ends the wait while the admitted operation keeps those resources.
     when: ResidentIdleDeadlineReached(holding)
 
     requires: holding.residency = active
@@ -3322,6 +3323,8 @@ actor Gateway {
     -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
     -- A displaced session authorizes cleanup on its original holder.
     -- Every new data action checks current placement standing.
+    -- A detached audience operation polls with the same action and turn allowances as its admitting call.
+    -- Each provider attempt spends its work charge from the action allowance and from the shared turn allowance when present.
     -- An authenticated original audience bearer can close its own session or read after the writer attachment is gone.
     -- A handshake authenticated against the current local attachment can retire a displaced or expired session for that deployment.
     -- The writer authenticates the session with the peer in that proof.

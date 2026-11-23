@@ -109,6 +109,14 @@ def verify_verus(args, scratch):
         for path in list(paths):
             for included in re.findall(r'#\[path\s*=\s*"([^"]+)"\]', (ROOT / path).read_text()):
                 paths.add((ROOT / path.parent / included).resolve().relative_to(ROOT))
+        if config.get("foreign_contracts"):
+            registry = ROOT / "verification/verus/foreign_contracts/leaves.json"
+            leaves = json.loads(registry.read_text())
+            selected = {name: leaves[name] for name in config["foreign_contracts"]}
+            for name, leaf in selected.items():
+                if Path(leaf["model"]) not in paths:
+                    raise ValueError(f"{area.name}: foreign contract {name} is absent from the harness")
+            (args.evidence / f"{area.name}-foreign-contracts.json").write_text(json.dumps(selected, indent=2) + "\n")
         for name, control in {"baseline": None, **config["controls"]}.items():
             case = f"{area.name}-{name}"
             directory = scratch / case

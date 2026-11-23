@@ -1,0 +1,32 @@
+{
+  "tokio-task-local": {
+    "model": "verification/verus/foreign_contracts/async_io.rs",
+    "dependency": "tokio 1.54.1",
+    "contract": "A task-local scope installs the supplied value during each poll of its inner future and restores the previous value afterward. A read returns the installed value, or an access error when unbound.",
+    "conformance": "audience_work::foreign_contract_tests::task_local_is_installed_on_each_poll_and_spawn_starts_unbound"
+  },
+  "tokio-detach": {
+    "model": "verification/verus/foreign_contracts/async_io.rs",
+    "dependency": "tokio 1.54.1",
+    "contract": "Spawn moves the future into a separately scheduled task with no inherited task-local bindings. Dropping the JoinHandle detaches the task and leaves its captures with the task while the runtime remains alive.",
+    "conformance": "audience_work::foreign_contract_tests::detached_task_returns_its_permit_on_the_last_strong_drop"
+  },
+  "tokio-owned-permit": {
+    "model": "verification/verus/foreign_contracts/async_io.rs",
+    "dependency": "tokio 1.54.1 and Rust std::sync::Arc",
+    "contract": "Strong references preserve the allocation's identity. An ordinary drop of a strong reference destroys the owned value once, on the last reference. Dropping a live owned permit that was acquired for one unit returns one unit to its semaphore.",
+    "conformance": "audience_work::foreign_contract_tests::detached_task_returns_its_permit_on_the_last_strong_drop"
+  },
+  "rust-pin-poll-fn": {
+    "model": "verification/verus/foreign_contracts/async_io.rs",
+    "dependency": "Rust std::pin::Pin and std::future::poll_fn",
+    "contract": "Reborrowing a Pin polls the same future; each poll_fn poll invokes the retained closure with that poll's context and reports its result. Pending preserves captured state for another poll and Ready finishes the await.",
+    "conformance": "audience_work::foreign_contract_tests::pinned_poll_fn_keeps_the_owner_through_the_ready_poll"
+  },
+  "parking-lot-mutex": {
+    "model": "verification/verus/foreign_contracts/async_io.rs",
+    "dependency": "parking_lot 0.12.5",
+    "contract": "A lock guard grants exclusive access to the acquired value up to unlock. Reads and writes through the guard see and update that same value, and guard drop publishes the final value before the next acquire.",
+    "conformance": "audience_work::foreign_contract_tests::mutex_guard_serializes_updates_to_the_same_allowance"
+  }
+}

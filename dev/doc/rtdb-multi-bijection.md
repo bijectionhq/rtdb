@@ -196,11 +196,20 @@ An independently admitted Flight action starts its own action ledger and continu
 Cleanup closes use independent call capacity.
 
 On 2026-11-23, Verus 0.2026.11.20.9da409b checked 14 items and rejected all 11 controls in the [audience action ceilings area](../../verification/verus/audience_action_ceilings/area.json).
-It checked the shipped action limits, requested-work charges, closed-ledger and retry decisions, and the detached worker's retention of its original allowance and permit owner through its final poll.
-Source inspection traced the allowance through the task-local scope and the provider charge before object dispatch.
-The Flight request can finish before its admitted provider operation, so the worker holds the original call and seat permits, placement pin and request reservation until its result is handed off or disposed.
-The proof relies on Tokio's detached-task behavior, mutex and scope semantics, the bounded query paths applying the charge calls, and the dedicated provider transport keeping internal retries disabled.
-Provider completion time remains a premise.
+That area checked the shipped action limits, requested-work charges, closed-ledger and retry decisions, and the decision to relinquish custody on readiness.
+
+On 2026-11-23, the same Verus version checked 39 items and rejected all seven controls in the [audience drain wiring area](../../verification/verus/audience_drain_wiring/area.json).
+The harness loads the production expressions for Flight owner capture, I/O admission scope, worker spawn, budget entry and debit, and the `poll_fn` body, and instantiates them with [RTDB-local runtime contracts](../../verification/verus/foreign_contracts/leaves.json).
+It proves that any prefix of pending polls keeps the owner, that the ready poll relinquishes the worker's reference, and that dropping the caller's join handle preserves the original call permit, session seat permit, placement pin when present, and request memory reservation in the worker.
+The reference model checks one release at the last strong drop, and the debit proof checks the exact action and turn charges against their acquired values, including refusal and ledger exhaustion.
+The worker's poll observes the captured budget even when Tokio starts the spawned task with no task-local bindings.
+The controls release on a pending poll, clear retained owners before spawn, discard an enclosing Flight owner, return the same permit twice, skip the turn debit, omit scope installation for the worker, and reset a nested budget.
+
+Source inspection ties the shared expressions to the native Tokio and standard-library calls, the action wrapper, the I/O region's ancestor admission and task tracking, the Flight resource destructors, and result delivery or disposal before readiness.
+The local contracts assume task-local poll and restore semantics, detach, last-reference and semaphore drop semantics, pin and poll behavior, and exclusive locked updates.
+Their named conformance tests were authored and remain unrun.
+The checked laws apply to provider work whose runtime stays live through drain and whose completion covers its provider effects.
+Charge coverage before dispatch, retry-free audience transport, and provider completion time remain premises.
 
 ### Subscriptions, watches and exports
 
