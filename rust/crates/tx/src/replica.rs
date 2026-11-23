@@ -401,6 +401,46 @@ mod tests {
     use rtdb_types::{EntityId, Iid, OwnedRelation};
 
     #[test]
+    fn held_projection_preserves_the_exact_business_batch() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let state = PartitionState::empty(Default::default())?;
+        let previous = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(20) };
+        let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
+        let business = TableRef::new("public", "orders");
+        let receipt = TableRef::new("xt", "idempotency_receipts");
+        for (table, id) in [(&business, "order"), (&receipt, "retry")] {
+            transaction.put(table.clone(), StructFields::from([
+                ("_id".into(), Value::Utf8(id.into())),
+            ]), Interval::ALL)?;
+        }
+        let staged = transaction.stage()?;
+        let mut frame = ResolvedTx {
+            tx_id: Some(key.tx_id.0),
+            src_msg_id: Some(key.tx_id.0),
+            system_time_micros: Some(key.system_time.0),
+            committed: Some(true),
+            ..Default::default()
+        };
+        for (table, write) in staged.tables() {
+            let batch = write.batch().unwrap().arrow();
+            let bytes = crate::ipc::encode(batch.schema().as_ref(), [batch], &memory)?;
+            frame.table_data.insert(table.schema_and_table(), bytes.as_slice().to_vec());
+        }
+        let original = frame.table_data[&business.schema_and_table()].clone();
+        assert!(decode_held_replica(&frame, Some(previous), staged.block_index(), &memory).is_err());
+
+        project_held_replica(&mut frame, previous, staged.block_index(), &memory)?;
+        assert_eq!(frame.table_data.len(), 1);
+        assert_eq!(frame.table_data[&business.schema_and_table()], original);
+        let replayed = decode_held_replica(&frame, Some(previous), staged.block_index(), &memory)?;
+        assert_eq!(replayed.result.tx_key(), key);
+        assert!(replayed.writes.tables().contains_key(&business));
+        assert!(!replayed.writes.tables().contains_key(&receipt));
+        Ok(())
+    }
+
+    #[test]
     fn archive_replay_accounts_for_copied_and_omitted_world_ordinals() -> Result<()> {
         let memory = MemoryBudget::new(1 << 24);
         let state = PartitionState::empty(Default::default())?;

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{
     ArchiveKey, CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
-    unavailable, verified_held_archive, verify_cut,
+    unavailable, verified_archive, verified_held_archive, verify_cut,
 };
 use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, extend_payload, require_chain};
 use super::stage::{RegionPublication, with_region};
@@ -107,7 +107,18 @@ pub(super) async fn read_base_catalog(
     bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
     io: Arc<IoRegion>,
 ) -> Result<(BlockCatalog, Arc<dyn ArchiveKey>)> {
-    let (base, cipher) = verified_held_archive(bucket.clone(), point, manifest, keys, io).await?;
+    read_base_catalog_at_view(bucket, point, manifest, keys, io, true).await
+}
+
+async fn read_base_catalog_at_view(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
+    io: Arc<IoRegion>, held: bool,
+) -> Result<(BlockCatalog, Arc<dyn ArchiveKey>)> {
+    let (base, cipher) = if held {
+        verified_held_archive(Arc::clone(&bucket), point, manifest, keys, io).await?
+    } else {
+        verified_archive(Arc::clone(&bucket), point, manifest, keys, io).await?
+    };
     let root = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let root_object = base.objects.iter().find(|object| object.name == root.as_str())
         .ok_or_else(|| inconsistent("The suffix capture omitted its root catalog"))?;
@@ -184,7 +195,10 @@ pub(crate) async fn capture(
             async move {
                 let (point, pin) = admit(&record, archive, deployment, pin_id, selected)?;
                 let bucket = archive.bucket(Arc::clone(&io)).await?;
-                let (catalog, cipher) = read_base_catalog(Arc::clone(&bucket), &point, &pin.manifest_sha256, keys, Arc::clone(&io)).await?;
+                let held = pin.custody == CheckpointSuffixCustody::World;
+                let (catalog, cipher) = read_base_catalog_at_view(
+                    Arc::clone(&bucket), &point, &pin.manifest_sha256, keys, Arc::clone(&io), held,
+                ).await?;
                 let stream_name = record.stream("replica");
                 let artifact = suffix_artifact(bucket.as_ref(), cipher, deployment, pin_id, pin, &stream_name)?;
 
@@ -212,7 +226,6 @@ pub(crate) async fn capture(
                             let segment = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
                             rtdb_logkeeper::verify_certified_range(&segment, &entries)?;
                             cipher.open_page(&mut entries)?;
-                            let held = pin.custody == CheckpointSuffixCustody::World;
                             let mut detached = Vec::new();
                             for entry in &mut entries {
                                 let Some(envelope) = progress.admit(entry, pin)? else {
