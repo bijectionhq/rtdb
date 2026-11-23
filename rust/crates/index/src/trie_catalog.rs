@@ -4,6 +4,9 @@ use rtdb_types::CivilDate;
 use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::{BRANCH_FACTOR, PartGroup, TrieKey}, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
+#[path = "replayed_reset_epochs.rs"]
+mod reset_epochs;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrieState { Nascent, Live, Garbage { as_of: Timestamp } }
 
@@ -288,7 +291,7 @@ impl TrieCatalog {
     /// Rewinds every table to its surviving L0 tries and starts a new naming epoch, so outputs planned after the reset never reuse a name planned before it.
     pub fn reset_to_l0(&self, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>) -> Result<Self> {
         let mut next = self.clone();
-        next.naming_epoch = self.naming_epoch.checked_add(1).ok_or_else(|| invalid("Naming epoch exhausted"))?;
+        next.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
         for (table, tries) in replacements {
             let mut state = TableTries::default();
             let mut shard = ShardValue::default();
@@ -301,6 +304,40 @@ impl TrieCatalog {
             next.tables.insert(table, state);
         }
         Ok(next)
+    }
+
+    /// Selects new physical names for the recovered compacted pairs and keeps the original L0 identities needed by ordered replay.
+    pub fn reset_from_primary(&self, mut primary: Self, block: BlockIndex, as_of: Timestamp) -> Result<(Self, u64)> {
+        let files_epoch = reset_epochs::recovery_file_epoch(block.0).ok_or_else(|| invalid("Recovery file epoch exhausted"))?;
+        primary.naming_epoch = reset_epochs::next_compaction_epoch(self.naming_epoch).ok_or_else(|| invalid("Naming epoch exhausted"))?;
+        for table in primary.tables.values_mut() {
+            for (shard, value) in &mut table.shards {
+                for trie in value.tries.values_mut() {
+                    if matches!(trie.state, TrieState::Garbage { .. }) {
+                        return Err(invalid("Primary recovery contains a garbage trie"));
+                    }
+                    if shard.level > 0 {
+                        trie.key = trie.key.clone().with_epoch(files_epoch);
+                        trie.published_files = None;
+                    }
+                    trie.artefacts.clear();
+                }
+            }
+        }
+        for (table, old) in &self.tables {
+            for (shard, old) in old.shards.iter().filter(|(shard, _)| shard.level == 0) {
+                let new = primary.tables.entry(table.clone()).or_default().shards.entry(shard.clone()).or_default();
+                new.max_block_index = new.max_block_index.max(old.max_block_index);
+                for (block, previous) in &old.tries {
+                    new.tries.entry(*block).or_insert_with(|| {
+                        let mut source = previous.clone();
+                        source.garbage(as_of);
+                        source
+                    });
+                }
+            }
+        }
+        Ok((primary, files_epoch))
     }
     pub fn partitions(&self, table: &TableRef) -> Result<Vec<block_pb::Partition>> {
         self.tables.get(table).into_iter().flat_map(|table| table.shards.iter()).map(|(shard, state)| {

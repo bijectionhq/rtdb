@@ -111,7 +111,16 @@ The collector resumes those intents after restart regardless of the age threshol
 A repaired local store reopened with a fresh journal can publish a catalog cut after it adopts the first checkpoint in that journal.
 The native reset regression keeps the old files with a catalog reader held across restart, then settles the durable intent after that reader has drained without another block adoption.
 [Verus](../verus/reset_retirement/proof.rs) checks the production adoption predicate and [TLC](../tla/ResetRetirement.tla) checks the bounded restart and release protocol.
-Reset preparation and ordered-index replay still depend on the original L0 inputs, and those files stay outside automatic collection.
+The L0-inventory reset and ordered-index replay still depend on the original L0 inputs, and those files stay outside automatic collection.
+
+## Retained checkpoint reset
+
+Native local maintenance can replay from a detached retained anchor to its adopted checkpoint and install the resulting primary catalog in place.
+It uses the maintenance writer's existing journal authority and synchronizes its rebuilt file pairs before requesting the catalog replacement.
+The term refuses the replacement if the catalog or transaction head moved during preparation.
+Compacted pairs from the rebuilt base use a name derived from the successor block in a range reserved for recovery.
+The runtime preserves original L0 source descriptors for ordered replay and reconstructs absent pairs in the journal suffix.
+Automatic L0 reclamation still needs a replacement for the original event source used by ordered indexes and replay archives.
 
 ## Source retention through copy completion
 

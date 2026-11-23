@@ -1765,10 +1765,18 @@ contract CompactorReset {
         -- The maintenance node catches up through a completed block with indexing enabled and compaction and automatic garbage collection disabled.
 
     @invariant InstalledL0Inventory
-        -- The replacement catalog uses the L0 identities bound by the installed checkpoint and its table inventories.
-        -- Every recorded pair has data and metadata present before the maintenance node accepts the plan.
+        -- A reset without a retained export uses the L0 identities bound by the installed checkpoint and its table inventories.
+        -- That plan verifies the recorded data and metadata pairs before acceptance.
         -- The observed data length matches the checkpoint's recorded length where present.
         -- An incomplete inventory refuses preparation.
+
+    @invariant RetainedPrimaryReplay
+        -- A native local maintenance node can rebuild its adopted checkpoint using the detached export of its persisted repair anchor and the durable journal it holds.
+        -- The persisted anchor binds the export block, digest and journal boundary.
+        -- Replay verifies both endpoints and stops at the adopted transaction head and table registry.
+        -- Rebuilt pairs are synchronized before the successor is published.
+        -- Rebuilt compacted pairs use names disjoint from prior resets and normal compactor outputs.
+        -- Original L0 identities continue to supply consumers of source-order replay.
 
     @invariant PublicationPrecedesDeletion
         -- A reset with a completed transaction publishes the replacement catalog in a new block.
@@ -1779,10 +1787,11 @@ contract CompactorReset {
 
     @invariant CapturedCatalogIdentity
         -- A reset prepared from an earlier catalog or block is rejected if either changes before acceptance.
+        -- A replayed replacement also requires an empty live block and the same installed and live transaction head as the replay target.
 
     @invariant InterruptedResetRetainsRecovery
         -- A reset interrupted before its block is adopted retains all compacted files.
-        -- An interruption during retirement leaves the published L0 recovery catalog and a durable retirement intent for each unsettled batch on a coordinated store.
+        -- An interruption during retirement leaves the published replacement catalog and a durable retirement intent for each unsettled batch on a coordinated store.
         -- Collection can finish eligible reset retirements after restart and after earlier reader tickets drain.
 
     @invariant SuccessorJournalCatalogCut
@@ -1790,7 +1799,7 @@ contract CompactorReset {
         -- Discoverable recovery can publish a cut after adopting a checkpoint in the current journal whose boundary the installed replica prefix covers.
 
     @invariant DryRunPlan
-        -- A dry run performs the initial catch-up flush and reports the verified L0 catalog and proposed retirements.
+        -- A dry run performs the initial catch-up flush and reports the prospective primary catalog and retirements.
         -- Its plan leaves the catalog and files as they stood after that catch-up.
 }
 

@@ -7,6 +7,7 @@
 -- Tries are read by the scan operator for query execution.
 -- Tries are garbage-collected by gc.allium once superseded by compaction output.
 -- The native catalog retains adopted L0 identities and lengths for recovery and ordered-index replay after primary compaction supersedes them.
+-- A retained checkpoint reset installs rebuilt primary pairs while retaining older L0 source identities that the rebuild did not use.
 --
 -- See: trie/TrieCatalog.kt, log/proto/log.proto (TrieDetails, TrieState)
 

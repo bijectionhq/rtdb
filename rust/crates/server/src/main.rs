@@ -27,7 +27,7 @@ async fn run() -> Result<()> {
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
-        Command::CompactorReset { options, database, dry_run } => reset_compactor(options, database, dry_run).await,
+        Command::CompactorReset { options, database, dry_run, retained_base } => reset_compactor(options, database, dry_run, retained_base).await,
         Command::RetainRepairBase { request, memory_bytes } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
@@ -112,7 +112,7 @@ async fn export_snapshot(options: cli::StartOptions, database: String, dry_run: 
     write_report(std::io::stderr().lock(), |output| writeln!(output, "Export complete: copied {} files to {}", plan.files().len(), plan.directory()))
 }
 
-async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: bool) -> Result<()> {
+async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: bool, retained_base: Option<std::path::PathBuf>) -> Result<()> {
     let (mut config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
     config.compactor.threads = 0;
     config.indexer.enabled = true;
@@ -125,9 +125,13 @@ async fn reset_compactor(options: cli::StartOptions, database: String, dry_run: 
     let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "Compactor reset requires every other node, client and upstream writer to remain stopped until completion."));
     if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
     run_operation(&handle, driver, &cancellation, async {
-        let plan = handle.node().prepare_compactor_reset(&database, &cancellation).await?;
+        let plan = match retained_base.as_deref() {
+            Some(export) => handle.node().prepare_compactor_reset_from_retained_base(&database, export, &cancellation).await?,
+            None => handle.node().prepare_compactor_reset(&database, &cancellation).await?,
+        };
+        let kind = if retained_base.is_some() { "replayed primary" } else { "verified L0" };
         write_report(std::io::stdout().lock(), |output| {
-            for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} verified L0 tries", table.schema_and_table(), tries.len())?; }
+            for (table, tries) in plan.replacement_tries() { writeln!(output, "{}: {} {kind} tries", table.schema_and_table(), tries.len())?; }
             for key in plan.files_to_delete() { writeln!(output, "{} {key}", if dry_run { "WOULD RETIRE" } else { "RETIRE AFTER PUBLICATION" })?; }
             Ok(())
         })?;

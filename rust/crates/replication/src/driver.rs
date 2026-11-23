@@ -10,12 +10,12 @@ use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::Da
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, TrieCatalog};
 use rtdb_storage::{log::{LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TxId};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
+use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedReplayedPrimary, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
@@ -146,8 +146,21 @@ impl TermHandle {
     /// The caller must exclusively operate the database with compaction and GC disabled.
     /// A failed receipt never permits deletion of the old catalog's files.
     pub async fn reset_compactor(&self, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>) -> Result<BlockIndex> {
+        self.replace_primary(expected, expected_block, Replacement::L0(replacements), reservations).await
+    }
+    pub async fn reset_replayed_compactor(&self, published: PublishedReplayedPrimary, reservations: Arc<[Arc<MemoryReservation>]>,
+    ) -> Result<BlockIndex> {
+        if !Arc::ptr_eq(&self.handle.logs, &published.source) {
+            return Err(invalid("Replayed primary files belong to another journal"));
+        }
+        self.replace_primary(published.expected, published.block,
+            Replacement::Replayed { catalog: published.catalog, target: published.target }, reservations).await
+    }
+    async fn replace_primary(&self, expected: Arc<TrieCatalog>, expected_block: BlockIndex,
+        replacement: Replacement, reservations: Arc<[Arc<MemoryReservation>]>,
+    ) -> Result<BlockIndex> {
         let (completion, receiver) = oneshot::channel();
-        self.handle.commands.send(Command::ResetCompactor { term: self.term, expected, expected_block, replacements, reservations, completion }).await.map_err(|_| term_ended())?;
+        self.handle.commands.send(Command::ResetCompactor { term: self.term, expected, expected_block, replacement, reservations, completion }).await.map_err(|_| term_ended())?;
         receiver.await.map_err(|_| term_ended())?
     }
     pub async fn publish_deletions(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> {
@@ -179,8 +192,13 @@ impl ExternalReceipt {
 
 }
 
+enum Replacement {
+    L0(BTreeMap<TableRef, Vec<CatalogTrie>>),
+    Replayed { catalog: TrieCatalog, target: TransactionKey },
+}
+
 enum Command {
-    ResetCompactor { term: Term, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
+    ResetCompactor { term: Term, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacement: Replacement, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
     External { term: Term, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>, completion: oneshot::Sender<Result<Applied>> },
 }
@@ -1228,7 +1246,7 @@ impl ReplicationDriver {
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if !leader.accepting() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
-            Command::ResetCompactor { expected, expected_block, replacements, reservations, completion, .. } => {
+            Command::ResetCompactor { expected, expected_block, replacement, reservations, completion, .. } => {
                 let value = self.partition.value();
                 if !leader.confirmed || !leader.pending.is_empty() || self.pending_block.is_some() || leader.production.is_some() || leader.compactor_reset.is_some()
                     || value.live().block_index() != expected_block || !Arc::ptr_eq(value.trie_catalog(), &expected) {
@@ -1239,7 +1257,11 @@ impl ReplicationDriver {
                     let _ = completion.send(Err(Anomaly::incorrect("rtdb.compactor-reset/no-transactions", "Compactor reset requires a completed transaction")));
                     return Ok(());
                 }
-                if let Err(error) = self.partition.reset_to_l0(replacements) { let _ = completion.send(Err(error)); return Ok(()); }
+                let install = match replacement {
+                    Replacement::L0(tries) => self.partition.reset_to_l0(tries),
+                    Replacement::Replayed { catalog, target } => self.partition.reset_to_replayed_primary(catalog, target),
+                };
+                if let Err(error) = install { let _ = completion.send(Err(error)); return Ok(()); }
                 leader.compactor_reset = Some(CompactorReset { block: expected_block, completion: Some(completion), _reservations: reservations });
                 self.cut().await
             }

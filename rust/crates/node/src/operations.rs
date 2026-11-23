@@ -1,26 +1,34 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryReservation;
 use rtdb_format::{catalog::CheckpointContents, keys::{CURRENT_STORAGE_VERSION, StorageRoot, TrieKey, block_key, lex_hex}};
 use rtdb_index::{CatalogTrie, PartitionValue};
 use rtdb_maintenance::ResetRetirements;
+use rtdb_replication::ReplayedPrimary;
 use rtdb_storage::{ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, StorageEpoch, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{Node, database::PublishDeletions};
 
+enum ResetPrimary {
+    L0(BTreeMap<TableRef, Vec<CatalogTrie>>),
+    Replayed { recovery: ReplayedPrimary, preview: BTreeMap<TableRef, Vec<CatalogTrie>> },
+}
+
 pub struct CompactorReset {
     database: Arc<crate::Database>,
     term: rtdb_replication::TermHandle,
     expected: Arc<PartitionValue>,
-    replacements: BTreeMap<TableRef, Vec<CatalogTrie>>,
+    primary: ResetPrimary,
     files: Vec<ObjectKey>,
     reservations: Arc<[Arc<MemoryReservation>]>,
 }
 impl CompactorReset {
     pub fn files_to_delete(&self) -> &[ObjectKey] { &self.files }
-    pub fn replacement_tries(&self) -> &BTreeMap<TableRef, Vec<CatalogTrie>> { &self.replacements }
+    pub fn replacement_tries(&self) -> &BTreeMap<TableRef, Vec<CatalogTrie>> {
+        match &self.primary { ResetPrimary::L0(tries) | ResetPrimary::Replayed { preview: tries, .. } => tries }
+    }
 
-    /// Publishes the captured L0 catalog in a new block and submits the superseded files for retirement.
+    /// Publishes the replacement primary catalog in a new block and submits the superseded files for retirement.
     /// Every competing writer and maintenance worker must remain stopped until this finishes.
     /// A coordinated store can defer physical retirement while readers hold the previous catalog.
     /// An uncoordinated store requires exclusive access for both readers and writers.
@@ -32,9 +40,18 @@ impl CompactorReset {
             Some(ResetRetirements::stage(store.as_ref(), &self.expected, cancellation).await?)
         } else { None };
         let retained = self.reservations;
-        let block = cancellation.run_until_cancelled(self.term.reset_compactor(
-            Arc::clone(self.expected.trie_catalog()), self.expected.live().block_index(), self.replacements, Arc::clone(&retained),
-        )).await.ok_or_else(reset_cancelled)??;
+        let expected = Arc::clone(self.expected.trie_catalog());
+        let open_block = self.expected.live().block_index();
+        let publish = async {
+            match self.primary {
+                ResetPrimary::L0(tries) => self.term.reset_compactor(expected, open_block, tries, Arc::clone(&retained)).await,
+                ResetPrimary::Replayed { recovery, .. } => {
+                    let published = recovery.publish_files(expected, open_block, cancellation).await?;
+                    self.term.reset_replayed_compactor(published, Arc::clone(&retained)).await
+                }
+            }
+        };
+        let block = cancellation.run_until_cancelled(publish).await.ok_or_else(reset_cancelled)??;
         if let Some(retirements) = retirements {
             retirements.publish(store.as_ref(), &PublishDeletions(self.term), &self.database.partition.value(), block, cancellation).await?;
             return Ok(block);
@@ -93,6 +110,19 @@ impl Node {
     /// Indexing must be enabled, with compaction and automatic GC disabled; all other users of the database must be stopped.
     /// A plan alone performs no reset or deletion; its initial catch-up flush is durable even for a dry run.
     pub async fn prepare_compactor_reset(&self, database: &str, cancellation: &CancellationToken) -> Result<CompactorReset> {
+        self.prepare_reset(database, None, cancellation).await
+    }
+
+    /// Rebuilds the catch-up checkpoint from a detached retained export and the maintenance node's durable local journal.
+    /// Preparation reads from the detached export and stages only temporary replacement objects.
+    /// The initial catch-up flush is durable even for a dry run.
+    pub async fn prepare_compactor_reset_from_retained_base(&self, database: &str, export: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<CompactorReset> {
+        self.prepare_reset(database, Some(export), cancellation).await
+    }
+
+    async fn prepare_reset(&self, database: &str, export: Option<&Path>, cancellation: &CancellationToken) -> Result<CompactorReset> {
         self.require_compactor_reset()?;
         let database = self.catalog().database(database)?;
         database.require_writable()?;
@@ -119,6 +149,26 @@ impl Node {
                 files.push(ObjectKey::new(entry.slug.metadata_key(&trie.key))?);
                 files.push(ObjectKey::new(entry.slug.data_key(&trie.key))?);
             }
+        }
+        if let Some(export) = export {
+            let installed = value.table_catalog().block().ok_or_else(|| reset_inventory("Retained reset requires an adopted checkpoint"))?;
+            let recovery = ReplayedPrimary::prepare(Arc::clone(&database.logs), installed, export, expected.file_size_target(), cancellation).await?;
+            let replay = recovery.catalog();
+            let mut reserve = 4096usize;
+            for catalog in [&*expected, replay] {
+                for table in catalog.tables() {
+                    for trie in catalog.iter_tries(table) {
+                        let size = (trie.key.part().len() + 1024).checked_mul(8).ok_or_else(overflow)?;
+                        reserve = reserve.checked_add(size).ok_or_else(overflow)?;
+                    }
+                }
+            }
+            reservations.push(self.memory().reserve(reserve)?);
+            let preview = replay.tables().map(|table| {
+                (table.clone(), replay.live_and_nascent_tries(table).into_iter().cloned().collect())
+            }).collect();
+            let primary = ResetPrimary::Replayed { recovery, preview };
+            return Ok(CompactorReset { database, term, expected: value, primary, files, reservations: reservations.into() });
         }
         let mut replacements = BTreeMap::new();
         if let Some(installed) = value.table_catalog().block() {
@@ -163,7 +213,8 @@ impl Node {
                 replacements.insert(entry.table, tries.into_values().collect());
             }
         }
-        Ok(CompactorReset { database, term, expected: value, replacements, files, reservations: reservations.into() })
+        let primary = ResetPrimary::L0(replacements);
+        Ok(CompactorReset { database, term, expected: value, primary, files, reservations: reservations.into() })
     }
     /// Plans an offline export from the loaded block's immutable dependency closure.
     /// Indexing and compaction must be disabled on this node; source files must remain available until copying finishes.

@@ -105,6 +105,7 @@ pub trait IndexPageLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
     /// Published checkpoint files survive a process restart on the same storage.
     fn syncs_checkpoints(&self) -> bool { false }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
@@ -313,6 +314,7 @@ struct AdmittedFile {
 }
 
 impl LocalStore {
+    pub fn root(&self) -> &Path { &self.root }
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Self::open_in(root, IoRegion::new())
@@ -444,6 +446,7 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 
 #[async_trait]
 impl ObjectStore for LocalStore {
+    fn local_maintenance_store(&self) -> Option<&LocalStore> { Some(self) }
     fn syncs_checkpoints(&self) -> bool { true }
 
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {

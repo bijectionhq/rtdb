@@ -1602,7 +1602,7 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
     let (completion, mut receipt) = tokio::sync::oneshot::channel();
     fixture.driver.command(super::Command::ResetCompactor {
         term: Term(1), expected: Arc::clone(value.trie_catalog()), expected_block: value.live().block_index(),
-        replacements: BTreeMap::new(), reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
+        replacement: super::Replacement::L0(BTreeMap::new()), reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
     }).await.unwrap();
     assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
     assert!(fixture.driver.leader.as_ref().unwrap().compactor_reset.is_some());

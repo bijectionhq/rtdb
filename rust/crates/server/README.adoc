@@ -78,6 +78,12 @@ On coordinated stores, it records the superseded compacted pairs before publicat
 Physical removal can wait for readers to release their catalog and resumes during subsequent collection, including after a restart.
 On uncoordinated stores, the command removes the compacted pairs after adoption.
 `--dry-run` reports the replacement tries and prospective retirements after the catch-up flush.
+`reset-compactor DATABASE --retained-base EXPORTED_STORAGE` rebuilds primary storage from the persisted repair anchor and the journal suffix through the maintenance node's catch-up checkpoint.
+Use the detached export installed by `retain-repair-base` for the same local database and journal.
+The reset reconstructs missing L0 pairs in that suffix, publishes rebuilt compacted pairs under fresh names, and retires old compacted files through the coordinated catalog floor.
+If an original L0 pair still exists, the synchronized copy accepts identical bytes and refuses a conflicting file.
+The replay mode applies to epoch-zero local storage for one database without an external source or owned lifetime replay.
+Its dry run stages the rebuild temporarily and reports the prospective retirement without publishing replacement files.
 `rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256` rebuilds a stopped single local database in a separate directory.
 Supply the original storage parent containing `v06`, the file named `REPLICA_LOG`, an existing output parent outside `v06`, and decimal block numbers with the SHA-256 digests of their exact published block files.
 Stop the original database and keep its journal and storage stable for the duration of the command.

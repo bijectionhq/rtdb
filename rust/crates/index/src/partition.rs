@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogCut, CatalogTrie, LiveIndex, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
@@ -256,6 +256,20 @@ impl PartitionState {
         let mut value = self.value.write();
         let mut next = value.as_ref().clone();
         next.trie_catalog = Arc::new(value.trie_catalog.reset_to_l0(replacements)?);
+        next.catalog_publication = CatalogPublication::Suspended;
+        *value = Arc::new(next);
+        Ok(())
+    }
+    pub fn reset_to_replayed_primary(&self, catalog: TrieCatalog, target: TransactionKey) -> Result<()> {
+        let mut value = self.value.write();
+        if value.table_catalog.block().and_then(BlockCatalog::latest_completed_tx) != Some(target)
+            || value.live.latest_completed_tx() != Some(target) || value.live.block_row_count() != 0
+            || value.trie_catalog.naming_epoch().checked_add(1) != Some(catalog.naming_epoch())
+        {
+            return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.compactor-reset/catalog-moved", "The recovered primary no longer covers the installed reset cut"));
+        }
+        let mut next = value.as_ref().clone();
+        next.trie_catalog = Arc::new(catalog);
         next.catalog_publication = CatalogPublication::Suspended;
         *value = Arc::new(next);
         Ok(())

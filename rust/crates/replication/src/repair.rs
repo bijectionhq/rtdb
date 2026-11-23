@@ -13,6 +13,7 @@ use rtdb_format::{
     envelope::ReplicaBody,
     keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key},
 };
+use rtdb_index::{PartitionValue, TrieCatalog, TrieState};
 use rtdb_storage::{
     IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     cache::{BufferPool, CacheBudget},
@@ -166,6 +167,93 @@ impl RetainedLocalRepair {
     }
 }
 
+pub struct ReplayedPrimary {
+    source: Arc<PartitionLogs>,
+    staged: Arc<LocalStore>,
+    view: Arc<PartitionValue>,
+    target: TransactionKey,
+}
+
+pub struct PublishedReplayedPrimary {
+    pub(crate) source: Arc<PartitionLogs>,
+    pub(crate) expected: Arc<TrieCatalog>,
+    pub(crate) block: BlockIndex,
+    pub(crate) catalog: TrieCatalog,
+    pub(crate) target: TransactionKey,
+}
+
+impl ReplayedPrimary {
+    /// Rebuilds the adopted cut from a detached anchor and the journal held by this maintenance node.
+    pub async fn prepare(source: Arc<PartitionLogs>, installed: &BlockCatalog, export: &Path,
+        file_size_target: i64, cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        cancelled(cancellation)?;
+        let local = source.local_recovery_store().ok_or_else(|| invalid("Retained reset requires a durable local store and journal"))?;
+        if source.storage_version != CURRENT_STORAGE_VERSION || source.storage_epoch != StorageEpoch(0) || !local.defers_trie_releases() {
+            return Err(invalid("Retained reset requires coordinated epoch-zero local storage"));
+        }
+        let memory = source.memory();
+        let _cache_charge = memory.reserve(CACHE_BYTES)?;
+        let cache = CacheBudget::new(CACHE_BYTES);
+        let anchor = local.retained_repair_anchor().await?.ok_or_else(|| invalid("The source storage has no retained repair base"))?;
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
+        let export = fs::canonicalize(export.join(root)).map_err(io)?;
+        require_detached_base(local.root(), &export)?;
+        let base_receipt = RepairCheckpoint { block: anchor.block, sha256: anchor.sha256 };
+        let target_receipt = RepairCheckpoint { block: installed.block_index(), sha256: installed.publication_sha256()
+            .ok_or_else(|| invalid("The adopted checkpoint has no publication digest"))? };
+        require_advancing_cut(base_receipt, target_receipt)?;
+        let current = source.recovery_block_store(file_size_target)?;
+        let target = current.load_fresh_catalog(target_receipt.block).await?;
+        require_root(&target, target_receipt)?;
+        require_offline_lifetime_admission(&target)?;
+        let target_tx = target.latest_completed_tx().ok_or_else(|| invalid("The target has no completed transaction"))?;
+        let through = target.boundary_replica_position().ok_or_else(|| invalid("The target has no replica boundary"))?;
+        if through.epoch() != source.replica_epoch || !repair_decision::admits_repair_interval(anchor.boundary.0, through.0) {
+            return Err(invalid("The repair anchor and target must be in the held replica journal"));
+        }
+
+        let directory = Arc::new(tempfile::Builder::new().prefix("rtdb-reset-").tempdir().map_err(io)?);
+        let region = IoRegion::new().child_holding(Some(directory.clone()));
+        let archive = Arc::new(LocalStore::open_in(export, region.clone())?);
+        let base_blocks = BlockStore::new(archive.clone(), pool(archive.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
+        let (base, tables) = base_blocks.load(anchor.block).await?;
+        require_root(&base, base_receipt)?;
+        require_offline_lifetime_admission(&base)?;
+        if base.boundary_replica_position() != Some(anchor.boundary) {
+            return Err(invalid("The retained repair boundary differs from its exported checkpoint"));
+        }
+        let staged = Arc::new(LocalStore::open_in(directory.path(), region)?);
+        stage_primary_base(&archive, &staged, &base, tables, memory, cancellation).await?;
+        let staged_blocks = BlockStore::new(staged.clone(), pool(staged.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
+        let mut rebuilt = staged_blocks.recover(Default::default(), source.source_floor()?, Timestamp(0), BlockDiscovery::At(base.block_index())).await?;
+        replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation).await?;
+        Ok(Self { source, staged, view: rebuilt.partition.value(), target: target_tx })
+    }
+
+    pub fn catalog(&self) -> &TrieCatalog { self.view.trie_catalog() }
+
+    /// Synchronizes the reconstructed pairs before the leader can publish a catalog that names them.
+    pub async fn publish_files(self, expected: Arc<TrieCatalog>, block: BlockIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedReplayedPrimary> {
+        let destination = self.source.local_recovery_store().ok_or_else(|| invalid("The local recovery store is unavailable"))?;
+        let (catalog, files_epoch) = expected.reset_from_primary((**self.view.trie_catalog()).clone(), block, self.target.system_time)?;
+        for entry in self.view.table_catalog().entries() {
+            for trie in self.catalog().iter_tries(&entry.table).filter(|trie| !matches!(trie.state, TrieState::Garbage { .. })) {
+                cancelled(cancellation)?;
+                let relocated = if trie.key.level() > 0 { trie.key.clone().with_epoch(files_epoch) } else { trie.key.clone() };
+                let objects = [(entry.slug.data_key(&trie.key), entry.slug.data_key(&relocated)),
+                    (entry.slug.metadata_key(&trie.key), entry.slug.metadata_key(&relocated))];
+                for (from, to) in objects {
+                    self.staged.copy_to(&ObjectKey::new(from)?, destination, &ObjectKey::new(to)?).await?;
+                }
+            }
+        }
+        Ok(PublishedReplayedPrimary { source: self.source, expected, block, catalog, target: self.target })
+    }
+}
+
 struct RepairPaths {
     source_root: PathBuf,
     base_root: PathBuf,
@@ -258,29 +346,7 @@ impl RepairRange {
         let staged = directory.path().join(".staging");
         let stage_io = io_region.child_holding(Some(directory.clone()));
         let destination = Arc::new(LocalStore::open_in(staged.join(root), Arc::clone(&stage_io))?);
-        let mut base_wire = base.as_proto().clone();
-        let mut digests = BTreeMap::new();
-        for entry in base.table_entries()? {
-            cancelled(cancellation)?;
-            let table = tables.get(&entry.table).ok_or_else(|| invalid("The base has no bound table block"))?;
-            if base.table_block_digest(entry.oid).is_none() {
-                return Err(invalid("The repair base must bind every table block"));
-            }
-            let _scratch = memory.reserve(table_manifest_reservation(table.encoded_len())?)?;
-            for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Primary)? {
-                cancelled(cancellation)?;
-                let file = ObjectKey::new(file)?;
-                base_storage.copy_to(&file, &destination, &file).await?;
-            }
-            let primary = table.for_primary_repair();
-            let bytes = Bytes::from(primary.encode());
-            digests.insert(entry.oid, publication_digest(&bytes).to_vec());
-            destination.put(&ObjectKey::new(entry.slug.block_key(base_receipt.block)?)?, bytes).await?;
-        }
-        drop(tables);
-        base_wire.table_block_manifest = Some(rtdb_format::block::proto::TableBlockManifest { sha256_by_oid: digests });
-        let mut staged_base = BlockCatalog::from_proto(base_wire)?;
-        destination.put(&ObjectKey::new(block_key(base_receipt.block)?)?, Bytes::from(staged_base.encode_for_publication())).await?;
+        stage_primary_base(&base_storage, &destination, &base, tables, memory, cancellation).await?;
 
         let stage_blocks = BlockStore::new(destination.clone(), pool(destination.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut repaired = stage_blocks.recover(Default::default(), logs.source_floor()?, Timestamp(0), BlockDiscovery::At(base_receipt.block)).await?;
@@ -299,6 +365,40 @@ impl RepairRange {
         let path = directory.keep().join("storage");
         Ok(RepairedStore { path, checkpoint, latest_transaction, source_replica_epoch: epoch })
     }
+}
+
+async fn stage_primary_base(
+    base_storage: &LocalStore,
+    destination: &LocalStore,
+    base: &BlockCatalog,
+    tables: BTreeMap<rtdb_types::TableRef, rtdb_format::catalog::TableBlock>,
+    memory: &Arc<MemoryBudget>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut base_wire = base.as_proto().clone();
+    let mut digests = BTreeMap::new();
+    for entry in base.table_entries()? {
+        cancelled(cancellation)?;
+        let table = tables.get(&entry.table).ok_or_else(|| invalid("The base has no bound table block"))?;
+        if base.table_block_digest(entry.oid).is_none() {
+            return Err(invalid("The repair base must bind every table block"));
+        }
+        let _scratch = memory.reserve(table_manifest_reservation(table.encoded_len())?)?;
+        for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Primary)? {
+            cancelled(cancellation)?;
+            let file = ObjectKey::new(file)?;
+            base_storage.copy_to(&file, &destination, &file).await?;
+        }
+        let primary = table.for_primary_repair();
+        let bytes = Bytes::from(primary.encode());
+        digests.insert(entry.oid, publication_digest(&bytes).to_vec());
+        destination.put(&ObjectKey::new(entry.slug.block_key(base.block_index())?)?, bytes).await?;
+    }
+    base_wire.table_block_manifest = Some(rtdb_format::block::proto::TableBlockManifest { sha256_by_oid: digests });
+    let mut staged_base = BlockCatalog::from_proto(base_wire)?;
+    destination.put(&ObjectKey::new(block_key(base.block_index())?)?, Bytes::from(staged_base.encode_for_publication())).await?;
+
+    Ok(())
 }
 
 fn require_offline_lifetime_admission(catalog: &BlockCatalog) -> Result<()> {

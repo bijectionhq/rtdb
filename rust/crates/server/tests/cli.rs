@@ -106,12 +106,27 @@ fn snapshot_export_requires_database_and_preserves_dry_run_configuration() {
 
 #[test]
 fn compactor_reset_requires_database_and_preserves_dry_run_configuration() {
-    let Command::CompactorReset { options, database, dry_run } = parse(&["reset-compactor", "analytics", "--dry-run", "-f", "node.yaml"]) else { panic!("expected compactor reset") };
+    let Command::CompactorReset { options, database, dry_run, retained_base: None } = parse(&["reset-compactor", "analytics", "--dry-run", "-f", "node.yaml"]) else { panic!("expected compactor reset") };
     assert_eq!(database, "analytics");
     assert!(dry_run);
     assert_eq!(options.file.unwrap().to_str(), Some("node.yaml"));
     assert!(cli::parse(["reset-compactor".into()], &|_| None).is_err());
     assert!(cli::parse(["reset-compactor", "one", "two"].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn reset_compactor_accepts_a_retained_export_only_for_reset() {
+    let Command::CompactorReset { retained_base: Some(export), dry_run: true, .. } =
+        parse(&["reset-compactor", "xtdb", "--retained-base", "export", "--dry-run"])
+    else { panic!("expected retained reset") };
+    assert_eq!(export.to_str(), Some("export"));
+    for arguments in [
+        &["reset-compactor", "xtdb", "--retained-base", "--dry-run"][..],
+        &["export-snapshot", "xtdb", "--retained-base", "export"][..],
+        &["reset-compactor", "xtdb", "--retained-base", "first", "--retained-base", "second"][..],
+    ] {
+        assert!(cli::parse(arguments.iter().map(|arg| (*arg).to_owned()), &|_| None).is_err());
+    }
 }
 
 #[test]

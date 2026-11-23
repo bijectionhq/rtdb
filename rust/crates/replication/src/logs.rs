@@ -62,6 +62,12 @@ impl PartitionLogs {
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
+    pub(crate) fn local_recovery_store(&self) -> Option<&rtdb_storage::LocalStore> {
+        if self.retains_recovery_history() { self.store.local_maintenance_store() } else { None }
+    }
+    pub(crate) fn recovery_block_store(&self, file_size_target: i64) -> Result<Arc<crate::BlockStore>> {
+        crate::BlockStore::new(Arc::clone(&self.store), Arc::clone(&self.cache), Arc::clone(&self.memory), file_size_target)
+    }
     pub(crate) fn retains_recovery_history(&self) -> bool {
         self.source.retains_synced_history() && self.replica.retains_synced_history() && self.store.syncs_checkpoints()
     }

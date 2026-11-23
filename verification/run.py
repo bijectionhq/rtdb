@@ -2662,6 +2662,15 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "miss_deadline"'), "Safe"),
     ("RecoveryCustodyHandoff", "recovery-custody-completed-erasure-witness",
      ("INVARIANT Safe", "INVARIANT NeverFinishesWithIndependentCopy"), "NeverFinishesWithIndependentCopy"),
+    ("ReplayedReset", "replayed-reset", None, None),
+    ("ReplayedReset", "replayed-reset-unsynced",
+     ('Mutation = "none"', 'Mutation = "skip_sync"'), "Safe"),
+    ("ReplayedReset", "replayed-reset-stale-target",
+     ('Mutation = "none"', 'Mutation = "allow_stale"'), "Safe"),
+    ("ReplayedReset", "replayed-reset-early-reclaim",
+     ('Mutation = "none"', 'Mutation = "early_reclaim"'), "Safe"),
+    ("ReplayedReset", "replayed-reset-completes-witness",
+     ("INVARIANT Safe", "INVARIANT NeverCompletes"), "NeverCompletes"),
     ("ResetRetirement", "reset-retirement", None, None),
     ("ResetRetirement", "reset-retirement-early-receipt",
      ('Mutation = "none"', 'Mutation = "skip_adoption"'), "Safe"),
@@ -3610,6 +3619,30 @@ def verify_retained_repair(args, source):
         or "a retained base must bind the boundary of the detached export" not in weakened.stdout):
         raise ValueError("the retained repair replay accepted the weakened boundary check")
     print("rust-retained-repair: replay passed and bypassing the boundary check failed")
+
+
+def verify_replayed_reset(args, source):
+    env = os.environ | {
+        "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+    }
+    test = "retained_reset_recovers_compacted_base_and_missing_l0_suffix_in_place"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-node", "--test", "native", test, "--", "--exact"]
+    baseline = run_case(command, source / "rust", args.evidence, "rust-replayed-reset-baseline", env)
+    if baseline.returncode or f"{test} ... ok" not in baseline.stdout:
+        raise ValueError("the retained-base reset did not pass")
+    path = source / "rust/crates/replication/src/repair.rs"
+    original = path.read_bytes()
+    try:
+        replace_once(path, "for entry in self.view.table_catalog().entries() {",
+                     "for entry in self.view.table_catalog().entries().take(0) {")
+        weakened = run_case(command, source / "rust", args.evidence, "rust-replayed-reset-unpublished-files", env)
+    finally:
+        path.write_bytes(original)
+    if (weakened.returncode != 101 or f"{test} ... FAILED" not in weakened.stdout
+        or "assertion failed: missing_data.is_file()" not in weakened.stdout):
+        raise ValueError("the retained-base reset did not detect missing replacement files")
+    print("rust-replayed-reset: replay passed and missing replacement files failed")
 
 
 def verify_reset_retirement(args, source):
@@ -5525,6 +5558,7 @@ def main():
             replay_rust_trace(args)
             verify_checkpoint_replay(args, source)
             verify_retained_repair(args, source)
+            verify_replayed_reset(args, source)
             verify_reset_retirement(args, source)
             verify_published_checkpoint_replay(args, source)
             verify_checkpoint_table_manifest_replay(args, source)

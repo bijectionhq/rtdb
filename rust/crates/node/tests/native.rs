@@ -2410,6 +2410,124 @@ async fn an_installed_repair_base_keeps_older_targets_and_offloaded_replay_throu
 }
 
 #[tokio::test]
+async fn retained_reset_recovers_compacted_base_and_missing_l0_suffix_in_place() {
+    use rtdb_format::{catalog::BlockCatalog, keys::{TrieKey, block_key}};
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = directory.path().join("objects");
+    let objects = storage.join("v06");
+    let journal = directory.path().join("journal");
+    let primary = DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog { path: Some(journal.display().to_string()), epoch: Some(0) })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(storage.display().to_string()), epoch: Some(0) })),
+        ..Default::default()
+    };
+    let mut settings = options();
+    settings.membership = Membership::Durable { primary, skipped: BTreeSet::new() };
+    settings.automatic_gc = false;
+    let runtime = services();
+    let cancel = CancellationToken::new();
+    let flush = async |database: &Database| {
+        let mut status = database.watch_status();
+        let position = database.flush().await.unwrap();
+        let adopted = tokio::time::timeout(Duration::from_secs(10), status.wait_for(|status| {
+            status.adopted_block.as_ref().and_then(|block| block.latest_source_position()).is_some_and(|source| source >= position)
+        })).await.unwrap().unwrap();
+        adopted.adopted_block.clone().unwrap()
+    };
+    let table = TableRef::new("public", "docs");
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    session.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap();
+    flush(&database).await;
+    database.compaction().unwrap().compact_all().await.unwrap();
+    let base = flush(&database).await;
+    assert!(database.snapshot().trie_catalog().current_tries(&table).iter().all(|trie| trie.key.level() > 0));
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    let mut offline = settings.clone();
+    offline.replication.enabled = false;
+    offline.compaction_threads = 0;
+    let (node, driver) = running(offline, fresh_local_services(&runtime)).await;
+    let exported = node.snapshot_export("xtdb", Timestamp(0)).await.unwrap().unwrap();
+    exported.copy(&cancel).await.unwrap();
+    let detached = directory.path().join("detached");
+    std::fs::rename(objects.join(exported.directory().as_str()), &detached).unwrap();
+    drop(exported);
+    stop(&node, driver).await;
+    drop(node);
+
+    RetainRepairBase {
+        source_storage: storage, replica_log: journal.join("REPLICA_LOG"),
+        base_storage: detached.clone(),
+        base: RepairCheckpoint { block: base.block_index(), sha256: base.publication_sha256().unwrap() },
+    }.install(rtdb_columnar::MemoryBudget::new(512 << 20), &cancel).await.unwrap();
+
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    let database = node.catalog().database("xtdb").unwrap();
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    session.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap();
+    let suffix = flush(&database).await;
+    database.compaction().unwrap().compact_all().await.unwrap();
+    flush(&database).await;
+    let slug = database.snapshot().table_entry(&table).unwrap().slug.clone();
+    let sql = "SELECT value FROM docs FOR ALL SYSTEM_TIME ORDER BY value";
+    let expected = vec![vec![Value::I64(10)], vec![Value::I64(20)]];
+    assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, expected);
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    let missing = TrieKey::l0(suffix.block_index()).unwrap();
+    let missing_data = objects.join(slug.data_key(&missing));
+    std::fs::remove_file(&missing_data).unwrap();
+    std::fs::remove_file(objects.join(slug.metadata_key(&missing))).unwrap();
+
+    settings.compaction_threads = 0;
+    let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
+    assert_eq!(node.prepare_compactor_reset("xtdb", &cancel).await.err().unwrap().code, "rtdb.compactor-reset/incomplete-inventory");
+    let base_path = detached.join("v06").join(block_key(base.block_index()).unwrap());
+    let exact_base = std::fs::read(&base_path).unwrap();
+    let mut altered = BlockCatalog::decode(&exact_base).unwrap().as_proto().clone();
+    altered.naming_epoch = Some(5);
+    std::fs::write(&base_path, BlockCatalog::from_proto(altered).unwrap().encode()).unwrap();
+    assert_eq!(node.prepare_compactor_reset_from_retained_base("xtdb", &detached, &cancel).await.err().unwrap().code, "rtdb.repair/invalid-checkpoint");
+    std::fs::write(&base_path, exact_base).unwrap();
+
+    let plan = node.prepare_compactor_reset_from_retained_base("xtdb", &detached, &cancel).await.unwrap();
+    assert!(plan.replacement_tries()[&table].iter().any(|trie| trie.key.level() > 0));
+    assert!(plan.replacement_tries()[&table].iter().any(|trie| trie.key == missing));
+    assert!(!missing_data.exists());
+    let retired = plan.files_to_delete().to_vec();
+    let checkpoint = plan.apply(&cancel).await.unwrap();
+    let database = node.catalog().database("xtdb").unwrap();
+    assert_eq!(database.snapshot().table_catalog().block_index(), Some(checkpoint));
+    assert!(missing_data.is_file());
+    let replacement = database.snapshot().trie_catalog().current_tries(&table).into_iter()
+        .filter(|trie| trie.key.level() > 0).map(|trie| slug.data_key(&trie.key)).collect::<Vec<_>>();
+    assert!(!replacement.is_empty());
+    assert!(replacement.iter().all(|file| objects.join(file).is_file() && retired.iter().all(|old| old.as_str() != file)));
+    assert!(retired.iter().all(|file| !objects.join(file.as_str()).exists()));
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, expected);
+    drop((session, database));
+    stop(&node, driver).await;
+    drop(node);
+
+    let (node, driver) = running(settings, fresh_local_services(&runtime)).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, expected);
+    let tx = session.state_mut().execute_operation(put(&node, 2, 30)).await.unwrap().unwrap();
+    assert!(tx.committed());
+    assert_eq!(rows(session.query_sql("SELECT value FROM docs WHERE _id = 2", vec![]).await.unwrap()).await, vec![vec![Value::I64(30)]]);
+    drop(session);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn compactor_reset_requires_a_completed_transaction() {
     let mut settings = options();
     settings.compaction_threads = 0;
