@@ -178,6 +178,101 @@ async fn copy_fork_suffix(
     Ok((capture, Some(suffix)))
 }
 
+/// Retain the pre-replay base once, then independently archive one exact
+/// destination parent using the existing quorum-certified suffix owner.
+pub(crate) async fn prepare_checkpoint_replay_parent(
+    directory: Arc<dyn Directory>,
+    archive: &CellStorage,
+    storage: &CellStorage,
+    agent: &crate::agent::NodeAgent,
+    keys: &dyn KeyService,
+    hosted_task: Option<&HostedTask>,
+    session: &mut NativeSession,
+    deployment: Uuid,
+    binding: [u8; 32],
+    original: Option<TransactionKey>,
+    resources: CheckpointReadResources<'_>,
+) -> Result<Option<rtdb_flight_sql::PreparedReplayParent>> {
+    let owner = session.state().user().filter(|owner| !owner.is_empty())
+        .ok_or_else(OwnedWorld::unavailable)?.to_owned();
+    let source = directory.deployment(&deployment.to_string()).await?
+        .ok_or_else(OwnedWorld::unavailable)?;
+    admit_session(session, &source, &owner)?;
+    let held = session.open_owned_read().await?;
+    held.replay_parent_hold(binding, false).await?;
+
+    if original.is_none() {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(b"rtdb.replayed-world-archive-base.v1\0");
+        digest.update(deployment.as_bytes());
+        digest.update(&binding);
+        digest.update(archive_binding(archive)?.as_bytes());
+        let mut id = [0; 16];
+        id.copy_from_slice(&digest.finish().as_ref()[..16]);
+        let operation = Uuid::from_bytes(id);
+        if capture_receipt(&source, archive, deployment, operation)?.is_none() {
+            held.replay_parent_hold(binding, true).await?;
+            drop(held);
+            let flushed = if source.checkpoint_captures.contains_key(&operation) {
+                // The admission already fixed the checkpoint. Resume the same
+                // copy even if a later fact-free reservation has been flushed.
+                None
+            } else {
+                let crate::control::Response::Flushed { checkpoint } = agent.flush(&source.name).await?
+                else { return Err(OwnedWorld::unavailable()); };
+                let current = directory.deployment(&deployment.to_string()).await?
+                    .filter(|record| record.checkpoint == Some(checkpoint) && record.epoch == source.epoch)
+                    .ok_or_else(OwnedWorld::unavailable)?;
+                admit_session(session, &current, &owner)?;
+                Some(current)
+            };
+            session.open_owned_read().await?.replay_parent_hold(binding, true).await?;
+            super::capture(
+                Arc::clone(&directory), storage, archive, keys, deployment, operation,
+                hosted_task.cloned(), flushed.as_ref(),
+            ).await?;
+        }
+        return Ok(None);
+    }
+
+    let original = original.ok_or_else(OwnedWorld::unavailable)?;
+    let scope = session.placed_history()?.ok_or_else(OwnedWorld::unavailable)?;
+    let (cut, logical) = held.replayed_parent_cut(binding, original, scope).await?;
+    let (capture, suffix) = if let Some(capture) = select_held_archive(&source, archive, deployment, &cut)? {
+        capture
+    } else {
+        copy_fork_suffix(
+            Arc::clone(&directory), archive, keys, hosted_task, agent, deployment,
+            &source, &cut, cut.until(),
+        ).await?
+    };
+    let installed = directory.deployment(&deployment.to_string()).await?
+        .ok_or_else(OwnedWorld::unavailable)?;
+    admit_session(session, &installed, &owner)?;
+    let (_, manifest) = capture_receipt(&installed, archive, deployment, capture)?
+        .ok_or_else(OwnedWorld::unavailable)?;
+    let (basis, schema_digest) = with_registered_capture_context(
+        directory.as_ref(), archive, keys, hosted_task,
+        CaptureSelection { deployment, capture, manifest: &manifest, suffix, expected_basis: None },
+        resources, |context, basis| {
+            let owner = &owner;
+            async move {
+                let (schemas, _charge) = rtdb_query::read_owned_parent_schemas(context, owner).await?;
+                Ok((basis, schemas.digest()))
+            }
+        },
+    ).await?;
+    if !cut.matches_basis(basis) { return Err(OwnedWorld::unavailable()); }
+    let parent = CheckpointReadWorld { deployment, capture, manifest_sha256: manifest.clone(), suffix, basis };
+    admit_capture(&installed, archive, &parent)?;
+    session.open_owned_read().await?.replay_parent_hold(binding, false).await?;
+    Ok(Some(rtdb_flight_sql::PreparedReplayParent {
+        capture: *capture.as_bytes(),
+        suffix: suffix.map(|value| *value.as_bytes()),
+        manifest, basis, logical, schema_digest,
+    }))
+}
+
 fn world_record(
     pin: Uuid,
     retained: &CheckpointWorldRetention,

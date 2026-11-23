@@ -1051,6 +1051,68 @@ impl OwnedReadSession {
         self.historical.as_ref().map_or(self.present.system_time, |scope| scope.system_time)
     }
 
+    /// Admit a placed restore only while the original writer and replay
+    /// hold still own the destination and no release has sealed it.
+    pub async fn replay_parent_hold(&self, binding: [u8; 32], before_replay: bool) -> Result<Vec<u8>> {
+        self.admit_access().await?;
+        if self.historical.is_some() || self.witness_scope.is_none() || binding == [0; 32] {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        let (hold, _) = self.replay_parent_control("restore").await?
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        let (archive, _) = self.replay_parent_control("archive").await?
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        if hold != binding
+            || archive.len() != 40
+            || self.replay_parent_control("replayed").await?.is_some()
+            || self.replay_parent_control("released").await?.is_some()
+            || (before_replay && self.replay_parent_control("native-frontier.v1").await?.is_some())
+        {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        self.check()?;
+        Ok(archive)
+    }
+
+    /// A retained archive suffix is selected by the physical revision of
+    /// this receipt. Always rediscover the full destination transaction key
+    /// in the certified journal instead of trusting a caller timestamp.
+    pub async fn replayed_parent_cut(
+        &self, binding: [u8; 32], original: TransactionKey, scope: rtdb_types::PlacedAttemptScope,
+    ) -> Result<(OwnedForkCut, Timestamp)> {
+        let archive = self.replay_parent_hold(binding, false).await?;
+        let id = format!("native-transaction/{}", original.tx_id.0);
+        let (body, destination) = self.replay_parent_control(&id).await?
+            .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        let logical = rtdb_tx::replayed_parent_logical_time(&body, binding, &archive, original)?;
+        if destination <= original.system_time || destination >= self.present.system_time {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        let mut cut = self.fork_cut(scope).await?;
+        cut.basis = destination;
+        cut.live = None;
+        cut.publication = true;
+        Ok((cut, logical))
+    }
+
+    async fn replay_parent_control(&self, id: &str) -> Result<Option<(Vec<u8>, Timestamp)>> {
+        use arrow_array::{Array, BinaryArray};
+        use rtdb_types::{EntityId, TableRef};
+
+        let point = rtdb_query::read_hosted_control_point(
+            Arc::clone(&self.context), TableRef::new("public", "bj_rtdb_restore_hold"),
+            &EntityId::String(id.to_owned()), true,
+        ).await?;
+        self.check()?;
+        point.row.map(|(row, revision)| {
+            let bytes = row.batch().column_by_name("binding")
+                .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+                .filter(|bytes| bytes.is_valid(0) && bytes.value(0).len() <= 4096)
+                .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+            Ok((bytes.value(0).to_vec(), revision))
+        }).transpose()
+    }
+
     pub async fn world_registration(&self, world: rtdb_types::Iid) -> Result<Option<(rtdb_types::OwnedWorld, Arc<rtdb_columnar::MemoryReservation>)>> {
         self.admit_read().await?;
         let record = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;

@@ -2,13 +2,13 @@ use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
-use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
+use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
 use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey, WorldClockMode};
 use uuid::Uuid;
 
 use crate::{
-    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected},
+    archive::{CheckpointReadResources, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world, commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, prepare_checkpoint_replay_parent},
     capability::attachment_storage,
     deployment::CellStorage,
     keys::KeyService,
@@ -46,6 +46,25 @@ impl PlacedWorldHost {
 }
 
 impl OwnedWorldHost for PlacedWorldHost {
+    fn prepare_replay_parent<'a>(
+        &'a self, call: WorldCall<'a>, binding: [u8; 32], original: Option<TransactionKey>,
+    ) -> BoxFuture<'a, Result<Option<PreparedReplayParent>>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let source = self.capture_source.as_ref().ok_or_else(OwnedWorld::unavailable)?;
+            let agent = self.agent.0.get().and_then(std::sync::Weak::upgrade)
+                .ok_or_else(OwnedWorld::unavailable)?;
+            prepare_checkpoint_replay_parent(
+                Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
+                self.hosted_task.as_ref(), call.session, deployment, binding, original,
+                CheckpointReadResources {
+                    node: &self.options, memory: call.node.memory(),
+                    cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,
+                },
+            ).await
+        })
+    }
+
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;

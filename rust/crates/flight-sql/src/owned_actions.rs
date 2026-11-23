@@ -159,6 +159,7 @@ pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtecte
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
+pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
 pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
@@ -1806,6 +1807,32 @@ impl Service {
         let entry = found(self.0.owned_reads.take(&handle), "owned read")?;
         entry.close();
         Ok(())
+    }
+
+    pub(crate) async fn prepare_replay_parent_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        let (binding, rest) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Replay parent requires a hold binding"))?;
+        let original = match rest.len() {
+            0 => None,
+            16 => Some(rtdb_types::TransactionKey {
+                tx_id: rtdb_types::TxId(i64::from_be_bytes(rest[..8].try_into().expect("fixed length"))),
+                system_time: Timestamp(i64::from_be_bytes(rest[8..].try_into().expect("fixed length"))),
+            }),
+            _ => return Err(invalid("Replay parent requires its complete Original transaction")),
+        };
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let attachment = attachment.ok_or_else(unsupported)?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        let charge = call.reserve(4096)?;
+        let parent = host.prepare_replay_parent(
+            crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
+            *binding, original,
+        ).await.map_err(status)?;
+        let body = serde_json::to_vec(&parent).map_err(|_| Status::internal("Could not encode replay parent"))?;
+        Ok(ActionResult { body: wire::retain(body, charge) })
     }
 
     pub(crate) async fn open_world_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

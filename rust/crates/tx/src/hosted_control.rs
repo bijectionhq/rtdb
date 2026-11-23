@@ -243,6 +243,24 @@ fn original_prefix(event: rtdb_types::TransactionKey, captured: rtdb_types::Tran
             || (event.tx_id < captured.tx_id && event.system_time < captured.system_time))
 }
 
+/// Recognize an exact archived transaction through its accepted held receipt.
+pub fn replayed_parent_logical_time(
+    body: &[u8], binding: [u8; 32], archive_pin: &[u8], original: rtdb_types::TransactionKey,
+) -> Result<Timestamp> {
+    if body.len() > 4096 { return Err(replay_invalid()); }
+    let replay: HostedReplay = serde_json::from_slice(body).map_err(|_| replay_invalid())?;
+    let archive_matches = archive_pin.split_first_chunk::<32>().is_some_and(|(archive, cut)| {
+        archive == &replay.archive && cut == replay.through.to_be_bytes().as_slice()
+    });
+    if replay.binding != binding || !archive_matches || !replay.has_original_prefix()
+        || replay.source != original || replay.logical_at == 0 || replay.logical_at % 1_000 != 0
+        || replay.logical_time() > original.system_time
+    {
+        return Err(replay_invalid());
+    }
+    Ok(replay.logical_time())
+}
+
 fn replay_body(control: &HostedControlWrite) -> Option<&[u8]> {
     control_body(control, 4096)
 }

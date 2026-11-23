@@ -10,6 +10,10 @@ use uuid::Uuid;
 /// The placed host's closed checkpoint-world authority. Flight supplies the
 /// authenticated native session and its already admitted database attachment.
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
+    fn prepare_replay_parent<'a>(
+        &'a self, call: WorldCall<'a>, binding: [u8; 32], original: Option<TransactionKey>,
+    ) -> BoxFuture<'a, Result<Option<PreparedReplayParent>>>;
+
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>>;
     fn fork_world_checked<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>>;
     fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp) -> BoxFuture<'a, Result<TransactionKey>>;
@@ -18,6 +22,17 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
         root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
+}
+
+/// An independent destination archive at an Original replayed Root cut.
+#[derive(serde::Serialize)]
+pub struct PreparedReplayParent {
+    pub capture: [u8; 16],
+    pub suffix: Option<[u8; 16]>,
+    pub manifest: String,
+    pub basis: TransactionKey,
+    pub logical: Timestamp,
+    pub schema_digest: [u8; 32],
 }
 
 pub struct WorldCall<'a> {
