@@ -88,6 +88,12 @@ impl IidCandidates {
         let (iid, entries) = match (self, key) {
             (Self::Entity(EntityIdDomain::Integer, entries), ScalarKey::Signed(value)) => (EntityId::Integer(value).iid(), entries),
             (Self::Entity(EntityIdDomain::String, entries), ScalarKey::Text(value)) => (EntityId::string_iid(value), entries),
+            (Self::Entity(EntityIdDomain::Keyword, entries), ScalarKey::Keyword(value)) => (EntityId::keyword_iid(value), entries),
+            (Self::Entity(EntityIdDomain::Uuid, entries), ScalarKey::Uuid(value)) => (Iid(*value), entries),
+            (Self::Raw(entries), ScalarKey::FixedBytes(value)) => {
+                let Ok(bytes) = value.try_into() else { return Ok(false); };
+                (Iid(bytes), entries)
+            }
             _ => return Ok(false),
         };
         if !entries.contains_key(&iid) {
@@ -271,17 +277,16 @@ impl PushdownBuilder {
             };
             let column = schema.position(*id).and_then(|position| batch.columns.get(position))
                 .ok_or_else(|| invalid("pushdown-key", "Build key column is outside its batch"))?;
-            if let Some(value) = ScalarKey::read(column, row) {
-                key.add(rtdb_format::bloom::hashes(value.hash() as i32, value.murmur3() as i32));
-                if value != ScalarKey::Null && let Some(iids) = &mut key.filter.iids
-                    && !iids.insert_scalar(value, memory)? {
-                    key.filter.iids = None;
-                }
-                continue;
-            }
-            if let Some(((xxhash, murmur3), null)) = crate::set_keys::direct_bloom_hashes(column, row) {
+            if let Some(((xxhash, murmur3), scalar)) = crate::set_keys::direct_bloom_hashes(column, row) {
                 key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
-                if !null { key.filter.iids = None; }
+                if let Some(iids) = &mut key.filter.iids {
+                    let supported = match scalar {
+                        Some(ScalarKey::Null) => true,
+                        Some(scalar) => iids.insert_scalar(scalar, memory)?,
+                        None => false,
+                    };
+                    if !supported { key.filter.iids = None; }
+                }
                 continue;
             }
             let scope = rtdb_expr::EvaluationScope::new(memory)?;
@@ -339,6 +344,43 @@ mod tests {
     use super::*;
     use rtdb_format::metadata::LeafColumns;
     use rtdb_types::StructFields;
+
+    #[test]
+    fn arrow_keyword_bloom_retains_the_iid_candidate_without_owning_the_spelling() {
+        use arrow_array::{ArrayRef, StringArray};
+        use crate::columnar::Column;
+
+        let memory = MemoryBudget::new(16 * 1024);
+        let spelling = "key".repeat(32 * 1024);
+        let logical = LogicalType::Scalar(ScalarType::Keyword);
+        let array = Arc::new(StringArray::from(vec![spelling.as_str()])) as ArrayRef;
+        let arrow = Arc::new(rtdb_columnar::to_field("_id", &logical).unwrap());
+        let input = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: logical.clone() };
+        let schema = Schema::new(vec![input.clone()]).unwrap();
+        let custody = MemoryBudget::new(1 << 20).reserve(array.get_array_memory_size() + 4096).unwrap();
+        let batch = ColumnBatch::settled(vec![Column::Arrow { array, field: arrow, logical: Some(logical) }], 1, custody).unwrap();
+        assert!(batch.columns[0].bound(0).unwrap() > memory.limit_bytes());
+        let mut builder = PushdownBuilder {
+            keys: vec![Key {
+                expression: input.expression(),
+                probe: input.id,
+                filter: ColumnFilter {
+                    bloom: Some(BloomFilter::default()),
+                    iids: IidCandidates::for_probe(&input),
+                    _reservation: memory.reserve(1024).unwrap(),
+                },
+                pending: Pending::Sorted(Vec::new()),
+                seen: Default::default(),
+                seen_reservation: None,
+            }],
+            _reservation: memory.reserve(1024).unwrap(),
+        };
+
+        builder.insert_arrow(&schema, &batch, 0, &memory).unwrap();
+        let filters = builder.finish(&memory).unwrap().unwrap();
+        let candidates = filters.iid_filter(schema.fields(), true).unwrap();
+        assert_eq!(candidates.keys().copied().collect::<Vec<_>>(), [EntityId::keyword_iid(&spelling)]);
+    }
 
     #[test]
     fn byte_bloom_does_not_hide_a_date64_value_in_a_mixed_column() {

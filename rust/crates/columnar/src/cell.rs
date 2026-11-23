@@ -199,12 +199,47 @@ impl<'a> ArrowCell<'a> {
     }
 
     pub fn physical(mut self) -> Result<Self> {
-        loop {
-            let Self { field, array, row } = self;
-            if field.data_type() != array.data_type() || row >= array.len() {
-                return Err(layout());
+        while let Some(child) = self.selected_child()? {
+            self = child;
+        }
+        Ok(self)
+    }
+
+    pub fn logical_position(self, logical: Option<&LogicalType>) -> Result<(Self, LogicalType)> {
+        let derived;
+        let logical = match logical {
+            Some(logical) => logical,
+            None => {
+                derived = crate::from_field(self.field)?;
+                &derived
             }
-            self = match field.data_type() {
+        };
+        if *logical == LogicalType::Nothing {
+            return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read"));
+        }
+        let Some(child) = self.selected_child()? else {
+            return Ok((self, logical.clone()));
+        };
+        let selected = match (self.field.data_type(), logical) {
+            (DataType::RunEndEncoded(..), LogicalType::RunEndEncoded { value, .. }) => Some(value.as_ref()),
+            (DataType::Union(..), LogicalType::Union(legs)) => legs.iter().find(|leg| {
+                crate::leg_name(leg).is_ok_and(|name| &name == child.field.name())
+            }),
+            _ => None,
+        };
+        child.logical_position(selected)
+    }
+
+    pub fn has_scalar_storage(self, scalar: &rtdb_types::ScalarType) -> bool {
+        crate::schema::scalar_reader_accepts(scalar, self.field.data_type())
+    }
+
+    fn selected_child(self) -> Result<Option<Self>> {
+        let Self { field, array, row } = self;
+        if field.data_type() != array.data_type() || row >= array.len() {
+            return Err(layout());
+        }
+        Ok(Some(match field.data_type() {
                 DataType::Union(fields, UnionMode::Dense) => {
                     let union = array.as_union();
                     let id = union.type_id(row);
@@ -236,9 +271,8 @@ impl<'a> ArrowCell<'a> {
                         _ => return Err(layout()),
                     }
                 }
-                _ => return Ok(self),
-            };
-        }
+                _ => return Ok(None),
+        }))
     }
 
     pub fn logical_type(self) -> Result<LogicalType> {

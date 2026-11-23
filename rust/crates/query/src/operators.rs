@@ -1717,7 +1717,7 @@ impl BatchApplyPlan {
                 let (page, charge) = if let Some(physical) = projection.physical_record(&schema, memory)? {
                     physical
                 } else {
-                    let output = crate::cursor::apply_document_batch(&schema, memory, projection)?;
+                    let output = crate::cursor::column_batch(&schema, memory, projection)?;
                     (output.batch().clone(), Arc::clone(output.reservation()))
                 };
                 let record: ArrayRef = Arc::new(StructArray::try_new_with_length(page.schema_ref().fields().clone(),

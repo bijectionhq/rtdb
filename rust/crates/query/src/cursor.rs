@@ -857,15 +857,7 @@ impl QueryCursor {
 }
 
 /// Aligns a column page with the result schema, retaining matching Arrow arrays.
-fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
-    encode_column_batch(schema, memory, batch, true)
-}
-
-pub(crate) fn apply_document_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
-    encode_column_batch(schema, memory, batch, false)
-}
-
-fn encode_column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch, result_vectors: bool) -> Result<OwnedBatch> {
+pub(crate) fn column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate::columnar::ColumnBatch) -> Result<OwnedBatch> {
     let overflow = || invalid("batch-size", "Output batch allocation bound overflow");
     if batch.columns.len() != schema.len() { return Err(invalid("row-width", "Operator output differs from its declared schema")); }
     let fields = schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
@@ -881,7 +873,7 @@ fn encode_column_batch(schema: &Schema, memory: &Arc<MemoryBudget>, batch: crate
             arrays.push(array);
             continue;
         }
-        if result_vectors && let Some((array, mut charge)) = crate::columnar::float_vector::relayout(column, batch.len, arrow, memory)? {
+        if let Some((array, mut charge)) = crate::columnar::float_vector::relayout(column, batch.len, arrow, memory)? {
             let lease = Arc::get_mut(&mut reservation).expect("An output batch owns its reservation");
             lease.absorb(Arc::get_mut(&mut charge).expect("A gathered vector owns its reservation"))?;
             arrays.push(array);
@@ -1025,6 +1017,163 @@ mod slab_tests {
         assert_eq!(typed.data_type(), field.data_type());
         assert_eq!(typed.type_ids().as_ref(), &[1, 2, 0]);
         assert_eq!(typed.to_data(), copy_array(&target, &rows).unwrap().to_data());
+    }
+
+    #[test]
+    fn document_result_gathers_vectors_beside_a_selected_keyword_alias() {
+        use arrow_array::{Array, StringArray, UnionArray};
+        use arrow_schema::UnionFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let keyword = LogicalType::Scalar(ScalarType::Keyword);
+        let float = LogicalType::Scalar(ScalarType::F32);
+        let list = LogicalType::list(LogicalType::from_legs([float.clone(), LogicalType::Scalar(ScalarType::F64)]));
+        let target = LogicalType::from_legs([keyword.clone(), LogicalType::list(float)]);
+        let vector = Value::list(vec![Value::F32(-0.0), Value::F32(f32::from_bits(0x7fc0_1234))]);
+        let rows = [vector, Value::Keyword(rtdb_types::Keyword::from_name("doc/tag"))];
+        let fields = UnionFields::try_new([0, 1, 2], [
+            to_field("list", &list).unwrap(),
+            arrow_schema::Field::new("keyword", DataType::Utf8, false),
+            to_field("unused", &keyword).unwrap(),
+        ]).unwrap();
+        let array = Arc::new(UnionArray::try_new(fields, vec![0_i8, 1].into(), Some(vec![0_i32, 1].into()), vec![
+            copy_array(&list, &rows[..1]).unwrap(),
+            Arc::new(StringArray::from(vec!["unselected", "doc/tag"])),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ]).unwrap());
+        let field = Arc::new(arrow_schema::Field::new("v", array.data_type().clone(), false));
+        let logical = rtdb_columnar::from_field(&field).unwrap();
+        let array_bytes = array.get_array_memory_size();
+        let column = crate::columnar::Column::Arrow { array, field, logical: Some(logical) };
+        let declared = to_field("v", &target).unwrap();
+        let expected = copy_array(&target, &rows).unwrap();
+        let (typed, custody) = crate::columnar::float_vector::relayout(&column, rows.len(), &declared, &memory).unwrap().unwrap();
+        assert_eq!(typed.to_data(), expected.to_data());
+        assert_eq!(custody.bytes(), typed.get_array_memory_size());
+        drop((typed, custody));
+
+        let input = crate::columnar::ColumnBatch::settled(vec![column], 2, memory.reserve(array_bytes + 4096).unwrap()).unwrap();
+        let plain = crate::columnar::ColumnBatch::settled(vec![crate::columnar::Column::Arrow {
+            array: copy_array(&keyword, &rows[1..]).unwrap(),
+            field: Arc::new(to_field("v", &keyword).unwrap()),
+            logical: Some(keyword),
+        }], 1, memory.reserve(4096).unwrap()).unwrap();
+        let picked = crate::columnar::ColumnBatch::take_rows_with_custody(&[&input, &plain], &[(0, 0), (1, 0)], &[0], true, &memory).unwrap();
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: target,
+        }]).unwrap();
+        assert!(picked.physical_record(&schema, &memory).unwrap().is_none());
+        let output = column_batch(&schema, &memory, picked).unwrap();
+        assert_eq!(output.batch().column(0).to_data(), expected.to_data());
+        drop((input, plain, output));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn result_conformance_expands_only_selected_run_end_float_components() {
+        use arrow_array::{Array, RunArray, make_array, new_empty_array, types::Int16Type};
+        use arrow_buffer::ScalarBuffer;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let float = LogicalType::Scalar(ScalarType::F32);
+        let run_type = LogicalType::RunEndEncoded { width: rtdb_types::RunEndWidth::I16, value: Box::new(float.clone().maybe()) };
+        let runs = [Value::F32(-0.0), Value::F32(-0.0), Value::Null, Value::F32(f32::from_bits(0x7fc0_9552))];
+        let elements = copy_array(&run_type, &runs).unwrap();
+        assert_eq!(elements.as_any().downcast_ref::<RunArray<Int16Type>>().unwrap().values().len(), 3);
+        let items = Arc::new(to_field("item", &run_type).unwrap());
+        let array = make_array(new_empty_array(&DataType::List(items)).to_data().into_builder().len(2)
+            .buffers(vec![ScalarBuffer::from(vec![0_i32, 1, 4]).into_inner()])
+            .child_data(vec![elements.to_data()]).build().unwrap());
+        let field = Arc::new(arrow_schema::Field::new("v", array.data_type().clone(), false));
+        let column = crate::columnar::Column::Arrow { array, logical: Some(rtdb_columnar::from_field(&field).unwrap()), field };
+        let target = LogicalType::list(float.maybe());
+        let field = to_field("v", &target).unwrap();
+        let (output, _custody) = crate::columnar::float_vector::relayout(&column, 2, &field, &memory).unwrap().unwrap();
+        let expected = copy_array(&target, &[Value::list(runs[..1].to_vec()), Value::list(runs[1..].to_vec())]).unwrap();
+        assert_eq!(output.to_data(), expected.to_data());
+    }
+
+    #[test]
+    fn mixed_result_gathers_a_named_set_leg_and_float_components_without_scalar_rows() {
+        use arrow_array::{Array, UnionArray};
+        use arrow_schema::UnionFields;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let list = LogicalType::list(text.clone());
+        let set = LogicalType::List { kind: ListKind::Set, element: Box::new(text) };
+        let f32_list = LogicalType::list(LogicalType::Scalar(ScalarType::F32));
+        let fields = UnionFields::try_new([0, 1, 2], [
+            to_field("set", &list).unwrap(),
+            to_field("unused", &set).unwrap(),
+            to_field("floats", &f32_list).unwrap(),
+        ]).unwrap();
+        let elements = vec![Value::Utf8("zed".into()), Value::Utf8("a".into()), Value::Utf8("zed".into())];
+        let vector = Value::list(vec![Value::F32(-0.0)]);
+        let array = Arc::new(UnionArray::try_new(fields, vec![0_i8, 2].into(), Some(vec![0_i32, 0].into()), vec![
+            copy_array(&list, &[Value::list(elements.clone())]).unwrap(), copy_array(&set, &[]).unwrap(),
+            copy_array(&f32_list, std::slice::from_ref(&vector)).unwrap(),
+        ]).unwrap());
+        let field = Arc::new(arrow_schema::Field::new("v", array.data_type().clone(), false));
+        let column = crate::columnar::Column::Arrow { array, logical: Some(rtdb_columnar::from_field(&field).unwrap()), field };
+        let target = LogicalType::from_legs([f32_list, set]);
+        let field = to_field("v", &target).unwrap();
+        let (output, _custody) = crate::columnar::float_vector::relayout(&column, 2, &field, &memory).unwrap().unwrap();
+        assert_eq!(output.to_data(), copy_array(&target, &[Value::Set(elements), vector]).unwrap().to_data());
+    }
+
+    #[test]
+    fn incompatible_result_component_width_keeps_the_column_type_error() {
+        let input_type = LogicalType::list(LogicalType::Scalar(ScalarType::F64));
+        let result_type = LogicalType::list(LogicalType::Scalar(ScalarType::F32));
+        let memory = MemoryBudget::new(1 << 20);
+        let input = crate::columnar::ColumnBatch::settled(vec![crate::columnar::Column::Arrow {
+            array: copy_array(&input_type, &[Value::list(vec![Value::F64(3.25)])]).unwrap(),
+            field: Arc::new(to_field("v", &input_type).unwrap()),
+            logical: Some(input_type),
+        }], 1, memory.reserve(4096).unwrap()).unwrap();
+        let schema = Schema::new(vec![rtdb_plan::Field {
+            id: rtdb_plan::ColumnId(0), name: "v".into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: result_type,
+        }]).unwrap();
+        let Err(error) = column_batch(&schema, &memory, input) else { panic!("Conformance coerced the active width"); };
+        assert_eq!(error.code, "rtdb/column-type-mismatch");
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn typed_result_writes_a_packed_component_null_under_its_numeric_tag() {
+        use arrow_array::{Array, Float32Array, Float64Array, NullArray, UnionArray, make_array, new_empty_array};
+        use arrow_array::cast::AsArray;
+        use arrow_buffer::{NullBuffer, ScalarBuffer};
+
+        let float = LogicalType::Scalar(ScalarType::F32);
+        let double = LogicalType::Scalar(ScalarType::F64);
+        let ty = LogicalType::list(LogicalType::from_legs([float, double, LogicalType::Null]));
+        let field = Arc::new(to_field("v", &ty).unwrap());
+        let DataType::List(item) = field.data_type() else { unreachable!(); };
+        let DataType::Union(fields, _) = item.data_type() else { unreachable!(); };
+        let bits = 0x8000_0000;
+        let values = UnionArray::try_new(fields.clone(), vec![0_i8, 1].into(), Some(vec![0_i32, 0].into()), vec![
+            Arc::new(Float32Array::new(vec![f32::from_bits(bits)].into(), Some(NullBuffer::from(vec![false])))),
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(NullArray::new(0)),
+        ]).unwrap();
+        let array = make_array(new_empty_array(field.data_type()).to_data().into_builder().len(1)
+            .buffers(vec![ScalarBuffer::from(vec![0_i32, 2]).into_inner()])
+            .child_data(vec![values.to_data()]).build().unwrap());
+        let expected = copy_array(&ty, &[rtdb_columnar::read_value(&field, array.as_ref(), 0).unwrap()]).unwrap();
+        let column = crate::columnar::Column::Arrow { array, field: Arc::clone(&field), logical: Some(ty) };
+        let memory = MemoryBudget::new(1 << 20);
+        let (output, _custody) = crate::columnar::float_vector::relayout(&column, 1, &field, &memory).unwrap().unwrap();
+        let output = output.as_list::<i32>().values().as_union();
+        let expected = expected.as_list::<i32>().values().as_union();
+        assert_eq!(output.type_ids(), expected.type_ids());
+        assert_eq!(output.type_id(0), 0);
+        let values = output.child(0).as_primitive::<arrow_array::types::Float32Type>();
+        assert!(values.is_null(0));
+        assert_eq!(values.value(0).to_bits(), expected.child(0).as_primitive::<arrow_array::types::Float32Type>().value(0).to_bits());
     }
 
 }

@@ -9,8 +9,8 @@ use arrow_array::{
 use arrow_buffer::{NullBufferBuilder, ScalarBuffer};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_columnar::{
-    ArrowCell, MemoryBudget, MemoryReservation, copy_selected_cells, estimate_copy_cell_bytes,
-    from_field, leg_name,
+    ArrowCell, MemoryBudget, MemoryReservation, copy_nullable_cells, estimate_copy_cell_bytes,
+    estimate_null_copy_cell_bytes, from_field, leg_name,
 };
 use rtdb_types::{ListKind, ListValue, ListView, LogicalType, Result, ScalarType, Value};
 
@@ -19,8 +19,14 @@ use super::{Column, size_error};
 #[derive(Clone)]
 pub(crate) struct FloatVector<'a> {
     pub width: Option<i32>,
-    values: ListView<'a>,
+    values: FloatValues<'a>,
     pub range: Range<usize>,
+}
+
+#[derive(Clone)]
+enum FloatValues<'a> {
+    Packed(ListView<'a>),
+    Selected { field: &'a Field, array: &'a dyn Array, element: LogicalType },
 }
 
 #[derive(Clone, Copy)]
@@ -28,14 +34,39 @@ enum Component {
     F32(f32),
     F64(f64),
     Null,
+    MaskedF32(f32),
+    MaskedF64(f64),
     Padding,
 }
 
 impl<'a> FloatVector<'a> {
-    pub fn arrow(cell: ArrowCell<'a>) -> Option<Self> {
-        let width = vector_width(cell.field)?;
+    pub fn arrow(cell: ArrowCell<'a>, logical: &LogicalType) -> Option<Self> {
+        let LogicalType::List { kind, element } = nonnull(logical) else { return None; };
         let (child, array, range) = cell.sequence_range()?;
-        let values = match child.data_type() {
+        let width = match kind {
+            ListKind::List => None,
+            ListKind::FixedSizeList(_) => Some(i32::try_from(range.len()).ok()?),
+            _ => return None,
+        };
+        let packed = if vector_width(cell.field).is_some()
+            && from_field(child).is_ok_and(|physical| physical == **element)
+        {
+            Self::packed(child, array, &range)
+        } else {
+            None
+        };
+        let values = if let Some(packed) = packed {
+            FloatValues::Packed(packed)
+        } else if range.clone().all(|row| Self::selected_component(child, array, row, element).is_some()) {
+            FloatValues::Selected { field: child, array, element: *element.clone() }
+        } else {
+            return None;
+        };
+        Some(Self { width, values, range })
+    }
+
+    fn packed(child: &Field, array: &'a dyn Array, range: &Range<usize>) -> Option<ListView<'a>> {
+        Some(match child.data_type() {
             DataType::Float32 => ListView::F32(array.as_any().downcast_ref::<Float32Array>()?),
             DataType::Float64 => ListView::F64(array.as_any().downcast_ref::<Float64Array>()?),
             DataType::Null if child.is_nullable() || range.is_empty() => ListView::Values(&[]),
@@ -46,12 +77,21 @@ impl<'a> FloatVector<'a> {
                 ListView::Union(array.as_any().downcast_ref::<UnionArray>()?)
             }
             _ => return None,
-        };
-        Some(Self {
-            width,
-            values,
-            range,
         })
+    }
+
+    fn selected_component(field: &Field, array: &dyn Array, row: usize, element: &LogicalType) -> Option<Component> {
+        let (cell, logical) = (ArrowCell { field, array, row }).logical_position(Some(element)).ok()?;
+        if cell.array.is_null(cell.row) || logical == LogicalType::Null {
+            return Some(Component::Null);
+        }
+        match (nonnull(&logical), cell.field.data_type()) {
+            (LogicalType::Scalar(ScalarType::F32), DataType::Float32) =>
+                Some(Component::F32(cell.array.as_primitive::<arrow_array::types::Float32Type>().value(cell.row))),
+            (LogicalType::Scalar(ScalarType::F64), DataType::Float64) =>
+                Some(Component::F64(cell.array.as_primitive::<arrow_array::types::Float64Type>().value(cell.row))),
+            _ => None,
+        }
     }
 
     pub fn value(value: &'a Value) -> Option<Self> {
@@ -68,32 +108,36 @@ impl<'a> FloatVector<'a> {
         }
         Some(Self {
             width,
-            values,
+            values: FloatValues::Packed(values),
             range: 0..values.len(),
         })
     }
 
     fn components(&self) -> impl Iterator<Item = Component> + '_ {
-        self.range.clone().map(|row| match self.values {
+        self.range.clone().map(|row| self.component(row))
+    }
+
+    fn component(&self, row: usize) -> Component {
+        let values = match &self.values {
+            FloatValues::Packed(values) => *values,
+            FloatValues::Selected { field, array, element } =>
+                return Self::selected_component(field, *array, row, element).expect("Selected float components were checked"),
+        };
+        match values {
             ListView::F32(values) if values.is_valid(row) => Component::F32(values.value(row)),
             ListView::F64(values) if values.is_valid(row) => Component::F64(values.value(row)),
             ListView::Union(values) => {
                 let child = values.child(values.type_id(row)).as_ref();
                 let offset = values.value_offset(row);
-                if child.is_null(offset) {
-                    return Component::Null;
-                }
                 match child.data_type() {
-                    DataType::Float32 => Component::F32(
-                        child
-                            .as_primitive::<arrow_array::types::Float32Type>()
-                            .value(offset),
-                    ),
-                    DataType::Float64 => Component::F64(
-                        child
-                            .as_primitive::<arrow_array::types::Float64Type>()
-                            .value(offset),
-                    ),
+                    DataType::Float32 => {
+                        let value = child.as_primitive::<arrow_array::types::Float32Type>().value(offset);
+                        if child.is_null(offset) { Component::MaskedF32(value) } else { Component::F32(value) }
+                    }
+                    DataType::Float64 => {
+                        let value = child.as_primitive::<arrow_array::types::Float64Type>().value(offset);
+                        if child.is_null(offset) { Component::MaskedF64(value) } else { Component::F64(value) }
+                    }
                     _ => Component::Null,
                 }
             }
@@ -103,17 +147,14 @@ impl<'a> FloatVector<'a> {
                 _ => Component::Null,
             },
             _ => Component::Null,
-        })
+        }
     }
 
     pub fn float_component(&self, row: usize) -> Option<f64> {
-        match self.values {
-            ListView::Values(values) => match values.get(row) {
-                Some(Value::F32(value)) => Some(f64::from(*value)),
-                Some(Value::F64(value)) => Some(*value),
-                _ => None,
-            },
-            values => values.float_component(row),
+        match self.component(row) {
+            Component::F32(value) => Some(f64::from(value)),
+            Component::F64(value) => Some(value),
+            Component::Null | Component::MaskedF32(_) | Component::MaskedF64(_) | Component::Padding => None,
         }
     }
 }
@@ -135,12 +176,20 @@ pub(crate) fn logical_vector(ty: &LogicalType) -> bool {
 }
 
 fn vector_width(field: &Field) -> Option<Option<i32>> {
+    let width = list_width(field)?;
+    match field.data_type() {
+        DataType::List(child) | DataType::FixedSizeList(child, _) if float_elements(child) => Some(width),
+        _ => None,
+    }
+}
+
+fn list_width(field: &Field) -> Option<Option<i32>> {
     if field.extension_type_name().is_some() {
         return None;
     }
     match field.data_type() {
-        DataType::List(child) if float_elements(child) => Some(None),
-        DataType::FixedSizeList(child, width) if float_elements(child) => Some(Some(*width)),
+        DataType::List(_) => Some(None),
+        DataType::FixedSizeList(_, width) => Some(Some(*width)),
         _ => None,
     }
 }
@@ -182,53 +231,27 @@ fn named_leg<'a>(logical: &'a LogicalType, child: &Field) -> Option<&'a LogicalT
         .find(|leg| leg_name(leg).is_ok_and(|name| &name == child.name()))
 }
 
-pub(crate) fn read_position(column: &Column, row: usize) -> Option<Option<ArrowCell<'_>>> {
+pub(crate) fn read_position(column: &Column, row: usize) -> Option<Option<(ArrowCell<'_>, LogicalType)>> {
     let Some((array, field, logical, row)) = column.arrow_cell(row)? else {
         return Some(None);
     };
-    let mut position = ArrowCell { array, field, row };
-    let mut physical = match logical {
-        Some(ty) if matches!(field.data_type(), DataType::Union(_, UnionMode::Dense)) => ty.clone(),
-        logical => {
-            let physical = from_field(field).ok()?;
-            if logical.is_some_and(|ty| *ty != physical) {
-                return None;
-            }
-            physical
-        }
-    };
-    if physical == LogicalType::Nothing {
-        return None;
+    Some(Some(ArrowCell { array, field, row }.logical_position(logical).ok()?))
+}
+
+pub(crate) fn nonnull(logical: &LogicalType) -> &LogicalType {
+    match logical {
+        LogicalType::Maybe(inner) => inner,
+        logical => logical,
     }
-    while let DataType::Union(fields, UnionMode::Dense) = position.field.data_type() {
-        let union = position.array.as_union();
-        let id = union.type_id(position.row);
-        let (_, child) = fields.iter().find(|(tag, _)| *tag == id)?;
-        let child_type = from_field(child).ok()?;
-        if named_leg(&physical, child).is_some_and(|leg| *leg != child_type) {
-            return None;
-        }
-        position = ArrowCell {
-            array: union.child(id).as_ref(),
-            field: child,
-            row: union.value_offset(position.row),
-        };
-        physical = child_type;
-    }
-    if physical == LogicalType::Nothing
-        || matches!(position.field.data_type(),
-        DataType::RunEndEncoded(_, values) if matches!(values.data_type(), DataType::Union(..)))
-    {
-        return None;
-    }
-    Some(Some(position.physical().ok()?))
 }
 
 #[derive(Clone)]
 enum OutputRow<'a> {
     Null,
-    Vector(FloatVector<'a>),
-    Scalar(ArrowCell<'a>),
+    Padding,
+    Vector(FloatVector<'a>, Option<(ArrowCell<'a>, LogicalType)>),
+    Scalar(ArrowCell<'a>, ScalarType),
+    Nested(ArrowCell<'a>, LogicalType),
 }
 
 fn row(column: &Column, index: usize) -> Option<OutputRow<'_>> {
@@ -237,20 +260,38 @@ fn row(column: &Column, index: usize) -> Option<OutputRow<'_>> {
         return if matches!(value, Value::Null | Value::Undefined) {
             Some(OutputRow::Null)
         } else {
-            FloatVector::value(value).map(OutputRow::Vector)
+            FloatVector::value(value).map(|vector| OutputRow::Vector(vector, None))
         };
     }
-    let Some(cell) = read_position(column, index)? else {
+    let Some((cell, logical)) = read_position(column, index)? else {
         return Some(OutputRow::Null);
     };
-    if cell.is_null().ok()? {
+    output_row(cell, logical)
+}
+
+fn output_row(cell: ArrowCell<'_>, logical: LogicalType) -> Option<OutputRow<'_>> {
+    if logical == LogicalType::Null || cell.array.is_null(cell.row) {
         return Some(OutputRow::Null);
     }
-    if let Some(vector) = FloatVector::arrow(cell) {
-        return Some(OutputRow::Vector(vector));
+    if let Some(vector) = FloatVector::arrow(cell, &logical) {
+        return Some(OutputRow::Vector(vector, Some((cell, logical))));
     }
-    (cell.field.extension_type_name().is_none() && super::scalar_layout(cell.field.data_type()))
-        .then_some(OutputRow::Scalar(cell))
+    let scalar = match (nonnull(&logical), cell.field.data_type()) {
+        (LogicalType::Scalar(scalar), _) => scalar,
+        (LogicalType::Struct(_), DataType::Struct(_))
+        | (LogicalType::List { .. }, DataType::List(_) | DataType::FixedSizeList(_, _) | DataType::Map(_, _)) =>
+            return Some(OutputRow::Nested(cell, logical)),
+        _ => return None,
+    };
+    if !cell.has_scalar_storage(scalar) { return None; }
+    if *scalar == ScalarType::Uri {
+        rtdb_types::UriParts::parse(cell.array.as_string::<i32>().value(cell.row)).ok()?;
+    }
+    let LogicalType::Scalar(mut scalar) = rtdb_columnar::execution_type(nonnull(&logical)) else { return None; };
+    if let (ScalarType::FixedSizeBinary(width), DataType::FixedSizeBinary(actual)) = (&mut scalar, cell.field.data_type()) {
+        *width = *actual;
+    }
+    Some(OutputRow::Scalar(cell, scalar))
 }
 
 pub(crate) fn relayout(
@@ -259,9 +300,12 @@ pub(crate) fn relayout(
     field: &Field,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<(ArrayRef, Arc<MemoryReservation>)>> {
-    if vector_width(field).is_none()
-        && !matches!(field.data_type(), DataType::Union(fields, UnionMode::Dense)
-        if fields.iter().any(|(_, field)| vector_width(field).is_some()))
+    if !super::scalar_layout(field.data_type()) && !matches!(field.data_type(),
+        DataType::Union(_, UnionMode::Dense) | DataType::Struct(_) | DataType::List(_) | DataType::FixedSizeList(_, _) | DataType::Map(_, _)) {
+        return Ok(None);
+    }
+    if matches!(column, Column::Values(_)) && vector_width(field).is_none()
+        && !matches!(field.data_type(), DataType::Union(fields, UnionMode::Dense) if fields.iter().any(|(_, field)| vector_width(field).is_some()))
     {
         return Ok(None);
     }
@@ -270,35 +314,40 @@ pub(crate) fn relayout(
         .checked_mul(8)
         .and_then(|size| size.checked_add(4096))
         .ok_or_else(size_error)?;
-    let mut scratch = memory.reserve(bound)?;
+    let Ok(mut scratch) = memory.reserve(bound) else { return Ok(None); };
     let charge = Arc::get_mut(&mut scratch).expect("A vector gather owns its scratch");
     let row_bytes = len
         .checked_mul(4 * std::mem::size_of::<OutputRow<'_>>())
         .ok_or_else(size_error)?;
-    charge.grow_to(bound.checked_add(row_bytes).ok_or_else(size_error)?)?;
+    if charge.grow_to(bound.checked_add(row_bytes).ok_or_else(size_error)?).is_err() {
+        return Ok(None);
+    }
     let Some(rows) = (0..len)
         .map(|index| row(column, index))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
     };
+    let generic_sequence = has_generic_sequence(field);
+    let padding = estimate_null_copy_cell_bytes(field)?.checked_mul(4).ok_or_else(size_error)?;
     let buffers = rows.iter().try_fold(0usize, |size, row| {
         let bytes = match row {
-            OutputRow::Vector(vector) => {
-                vector.range.len().checked_mul(32).ok_or_else(size_error)?
+            OutputRow::Vector(vector, _) => {
+                let per_component = if generic_sequence { 512 } else { 32 };
+                vector.range.len().checked_mul(per_component).ok_or_else(size_error)?
             }
-            OutputRow::Null => vector_width(field)
-                .flatten()
-                .map_or(0, |width| width as usize)
-                .checked_mul(32)
-                .ok_or_else(size_error)?,
-            OutputRow::Scalar(cell) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
+            OutputRow::Null | OutputRow::Padding => padding,
+            OutputRow::Scalar(cell, _) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
                 .checked_mul(4)
                 .ok_or_else(size_error)?,
+            OutputRow::Nested(cell, _) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
+                .checked_mul(4).and_then(|bytes| bytes.checked_add(padding)).ok_or_else(size_error)?,
         };
         size.checked_add(bytes).ok_or_else(size_error)
     })?;
-    charge.grow_to(charge.bytes().checked_add(buffers).ok_or_else(size_error)?)?;
+    if charge.grow_to(charge.bytes().checked_add(buffers).ok_or_else(size_error)?).is_err() {
+        return Ok(None);
+    }
     let Some(array) = gather(field, &rows)? else {
         return Ok(None);
     };
@@ -311,6 +360,10 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
     if rows.is_empty() {
         return Ok(Some(new_empty_array(field.data_type())));
     }
+    if field.data_type() == &DataType::Null {
+        return Ok(rows.iter().all(|row| matches!(row, OutputRow::Padding) || field.is_nullable() && matches!(row, OutputRow::Null))
+            .then(|| Arc::new(NullArray::new(rows.len())) as ArrayRef));
+    }
     if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
         let mut ids = Vec::with_capacity(rows.len());
         let mut offsets = Vec::with_capacity(rows.len());
@@ -319,13 +372,17 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
             .map(|(_, field)| (field, Vec::new()))
             .collect::<Vec<_>>();
         for row in rows {
-            let leg = fields.iter().enumerate().find(|(_, (_, field))| match row {
-                OutputRow::Vector(vector) => vector_width(field) == Some(vector.width),
+            let leg = fields.iter().enumerate().find(|(position, (_, field))| match row {
+                OutputRow::Vector(vector, _) => list_width(field) == Some(vector.width),
                 OutputRow::Null => field.data_type() == &DataType::Null && field.is_nullable(),
-                OutputRow::Scalar(cell) => {
-                    field.data_type() == cell.field.data_type()
-                        && field.metadata() == cell.field.metadata()
-                }
+                OutputRow::Padding => *position == 0,
+                OutputRow::Scalar(_, scalar) => scalar_leg(field, scalar),
+                OutputRow::Nested(_, logical) => from_field(field).is_ok_and(|target|
+                    match (nonnull(logical), nonnull(&target)) {
+                        (LogicalType::Struct(_), LogicalType::Struct(_)) => true,
+                        (LogicalType::List { kind: source, .. }, LogicalType::List { kind: target, .. }) => source == target,
+                        _ => false,
+                    }),
             });
             let Some((index, (id, _))) = leg else {
                 return Ok(None);
@@ -354,37 +411,172 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
         );
     }
     if super::scalar_layout(field.data_type()) {
-        let mut arrays = Vec::with_capacity(rows.len());
+        let mut converted = Vec::with_capacity(rows.len());
         let mut positions = Vec::with_capacity(rows.len());
         for row in rows {
-            let OutputRow::Scalar(cell) = row else {
+            if matches!(row, OutputRow::Padding) || matches!(row, OutputRow::Null) && field.is_nullable() {
+                positions.push(None);
+                converted.push(None);
+                continue;
+            }
+            let OutputRow::Scalar(cell, scalar) = row else {
                 return Ok(None);
             };
-            if cell.field.data_type() != field.data_type() {
+            if !scalar_leg(field, scalar) {
                 return Ok(None);
             }
-            positions.push((arrays.len(), cell.row));
-            arrays.push(cell.array);
+            if cell.field.data_type() == field.data_type() {
+                positions.push(Some((converted.len(), cell.row)));
+                converted.push(None);
+                continue;
+            }
+            if matches!(field.data_type(), DataType::FixedSizeBinary(_)) { return Ok(None); }
+            let Ok(data) = cell.array.slice(cell.row, 1).to_data().into_builder()
+                .data_type(field.data_type().clone()).build() else { return Ok(None); };
+            positions.push(Some((converted.len(), 0)));
+            converted.push(Some(make_array(data)));
         }
-        return Ok(Some(copy_selected_cells(&arrays, &positions)?));
+        let empty = new_empty_array(field.data_type());
+        let arrays = rows.iter().zip(&converted).map(|(row, converted)| match (row, converted) {
+            (_, Some(converted)) => converted.as_ref(),
+            (OutputRow::Scalar(cell, _), None) => cell.array,
+            _ => empty.as_ref(),
+        }).collect::<Vec<_>>();
+        return Ok(copy_nullable_cells(&arrays, &positions).ok());
     }
+    if let DataType::Struct(fields) = field.data_type() {
+        return gather_struct(field, fields, rows);
+    }
+    if vector_width(field).is_none() || rows.iter().any(|row| matches!(row, OutputRow::Nested(..))) {
+        return gather_sequence(field, rows);
+    }
+    gather_vectors(field, rows)
+}
+
+fn gather_struct(field: &Field, fields: &arrow_schema::Fields, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
+    let mut valid = NullBufferBuilder::new(rows.len());
+    for row in rows {
+        match row {
+            OutputRow::Nested(cell, logical) if matches!(nonnull(logical), LogicalType::Struct(_)) => {
+                let DataType::Struct(source) = cell.field.data_type() else { return Ok(None); };
+                if source.iter().any(|child| fields.find(child.name()).is_none()) { return Ok(None); }
+                valid.append_non_null();
+            }
+            OutputRow::Padding => valid.append_null(),
+            OutputRow::Null if field.is_nullable() => valid.append_null(),
+            _ => return Ok(None),
+        }
+    }
+    let mut arrays = Vec::with_capacity(fields.len());
+    for field in fields {
+        let rows = rows.iter().map(|row| {
+            let OutputRow::Nested(cell, logical) = row else { return Some(OutputRow::Padding); };
+            let LogicalType::Struct(types) = nonnull(logical) else { return None; };
+            let DataType::Struct(source) = cell.field.data_type() else { return None; };
+            let Some((index, child)) = source.find(field.name()) else { return Some(OutputRow::Null); };
+            let child = ArrowCell { field: child, array: cell.array.as_struct().column(index).as_ref(), row: cell.row };
+            child_row(child, types.get(field.name())?)
+        }).collect::<Option<Vec<_>>>();
+        let Some(rows) = rows else { return Ok(None); };
+        let Some(array) = gather(field, &rows)? else { return Ok(None); };
+        arrays.push(array);
+    }
+    Ok(rtdb_columnar::build_struct_array(fields.clone(), &arrays, rows.len(), valid.finish()).ok())
+}
+
+fn child_row<'a>(cell: ArrowCell<'a>, logical: &LogicalType) -> Option<OutputRow<'a>> {
+    if *logical == LogicalType::Nothing { return Some(OutputRow::Padding); }
+    let (cell, logical) = cell.logical_position(Some(logical)).ok()?;
+    output_row(cell, logical)
+}
+
+fn gather_sequence(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
+    let (child, width) = match field.data_type() {
+        DataType::List(child) | DataType::Map(child, _) => (child, None),
+        DataType::FixedSizeList(child, width) => (child, Some(*width as usize)),
+        _ => return Ok(None),
+    };
+    let Ok(logical) = from_field(field) else { return Ok(None); };
+    let LogicalType::List { kind, .. } = nonnull(&logical) else { return Ok(None); };
+    let mut valid = NullBufferBuilder::new(rows.len());
+    let mut selections = Vec::new();
+    let mut offsets = vec![0_i32];
+    for row in rows {
+        match row {
+            OutputRow::Nested(cell, logical) | OutputRow::Vector(_, Some((cell, logical))) => {
+                let LogicalType::List { kind: source, element } = nonnull(logical) else { return Ok(None); };
+                let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
+                if source != kind || width.is_some_and(|width| width != range.len()) { return Ok(None); }
+                for row in range {
+                    if **element == LogicalType::Nothing { return Ok(None); }
+                    let Some(mut row) = child_row(ArrowCell { field, array, row }, element) else { return Ok(None); };
+                    if *kind == ListKind::TimestampTzRange {
+                        let OutputRow::Scalar(_, scalar @ ScalarType::Timestamp { .. }) = &mut row else { return Ok(None); };
+                        *scalar = ScalarType::Timestamp {
+                            unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()),
+                        };
+                    }
+                    selections.push(row);
+                }
+                valid.append_non_null();
+            }
+            row if matches!(row, OutputRow::Padding) || matches!(row, OutputRow::Null) && field.is_nullable() => {
+                selections.extend(std::iter::repeat_n(OutputRow::Padding, width.unwrap_or(0)));
+                valid.append_null();
+            }
+            _ => return Ok(None),
+        }
+        if width.is_none() {
+            let Ok(offset) = i32::try_from(selections.len()) else { return Ok(None); };
+            offsets.push(offset);
+        }
+    }
+    let Some(values) = gather(child, &selections)? else { return Ok(None); };
+    if matches!(field.data_type(), DataType::Map(_, _))
+        && (values.null_count() != 0 || values.as_struct().column(0).logical_null_count() != 0)
+    {
+        return Ok(None);
+    }
+    let mut data = new_empty_array(field.data_type()).to_data().into_builder()
+        .len(rows.len()).nulls(valid.finish()).child_data(vec![values.to_data()]);
+    if width.is_none() {
+        data = data.buffers(vec![ScalarBuffer::from(offsets).into_inner()]);
+    }
+    Ok(data.build().ok().map(make_array))
+}
+
+fn gather_vectors(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
     let (child, width) = match field.data_type() {
         DataType::List(child) => (child, None),
         DataType::FixedSizeList(child, width) => (child, Some(*width)),
         _ => return Ok(None),
     };
+    let has_masks = matches!(child.data_type(), DataType::Union(_, UnionMode::Dense))
+        && rows.iter().any(|row| matches!(row, OutputRow::Vector(vector, _)
+            if matches!(&vector.values, FloatValues::Packed(ListView::Union(_)))
+                && vector.components().any(|value| matches!(value, Component::MaskedF32(_) | Component::MaskedF64(_)))));
+    // A packed union can keep a numeric tag even when its selected child is null.
+    if has_masks && rows.iter().any(|row| matches!(row, OutputRow::Vector(vector, _)
+        if !matches!(&vector.values, FloatValues::Packed(ListView::Union(array))
+            if array.data_type() == child.data_type()
+                && matches!(child.data_type(), DataType::Union(fields, _) if fields.iter()
+                    .all(|(_, field)| field.data_type() == &DataType::Null || !field.is_nullable())))))
+    {
+        return Ok(None);
+    }
+
     let mut validity = NullBufferBuilder::new(rows.len());
     let mut offsets = vec![0_i32];
     let mut count = 0usize;
     for row in rows {
         match row {
-            OutputRow::Vector(vector) if vector.width == width => {
+            OutputRow::Vector(vector, _) if vector.width == width => {
                 count = count
                     .checked_add(vector.range.len())
                     .ok_or_else(size_error)?;
                 validity.append_non_null();
             }
-            OutputRow::Null if field.is_nullable() => {
+            row if matches!(row, OutputRow::Padding) || matches!(row, OutputRow::Null) && field.is_nullable() => {
                 count = count
                     .checked_add(width.unwrap_or(0) as usize)
                     .ok_or_else(size_error)?;
@@ -398,7 +590,7 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
     }
     let components = rows.iter().flat_map(|row| {
         let vector = match row {
-            OutputRow::Vector(vector) => Some(vector),
+            OutputRow::Vector(vector, _) => Some(vector),
             _ => None,
         };
         let padding = if vector.is_none() {
@@ -410,6 +602,9 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
             .into_iter()
             .flat_map(FloatVector::components)
             .chain(std::iter::repeat_n(Component::Padding, padding))
+    }).map(|value| match value {
+        Component::MaskedF32(_) | Component::MaskedF64(_) if !has_masks => Component::Null,
+        value => value,
     });
     let Some(values) = gather_components(child, count, components)? else {
         return Ok(None);
@@ -426,6 +621,17 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
         data
     };
     Ok(data.build().ok().map(make_array))
+}
+
+fn scalar_leg(field: &Field, scalar: &ScalarType) -> bool {
+    from_field(field).is_ok_and(|logical| nonnull(&logical) == &LogicalType::Scalar(scalar.clone()))
+}
+
+fn has_generic_sequence(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().any(|(_, field)| has_generic_sequence(field)),
+        _ => list_width(field).is_some() && vector_width(field).is_none(),
+    }
 }
 
 fn gather_components(
@@ -482,6 +688,16 @@ fn gather_components(
                     Component::F64(value) => {
                         let offset = f64s.len();
                         f64s.append_value(value);
+                        (f64_id, offset)
+                    }
+                    Component::MaskedF32(value) => {
+                        let offset = f32s.len();
+                        f32s.append_values(&[value], &[false]);
+                        (f32_id, offset)
+                    }
+                    Component::MaskedF64(value) => {
+                        let offset = f64s.len();
+                        f64s.append_values(&[value], &[false]);
                         (f64_id, offset)
                     }
                     Component::Padding if padding_id == f32_id => {

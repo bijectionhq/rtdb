@@ -160,6 +160,21 @@ fn scalar_layout(scalar: &ScalarType) -> Result<(DataType, Option<&'static str>)
     })
 }
 
+pub(crate) fn scalar_reader_accepts(scalar: &ScalarType, data_type: &DataType) -> bool {
+    use DataType as D;
+    use ScalarType as S;
+    match (scalar, data_type) {
+        (S::FixedSizeBinary(_), D::FixedSizeBinary(_)) => true,
+        (S::Timestamp { unit, .. }, D::Timestamp(actual, _)) => arrow_unit(*unit) == *actual,
+        (S::Time { unit, .. }, D::Time32(actual) | D::Time64(actual)) => arrow_unit(*unit) == *actual,
+        (S::Decimal { bit_width: 32, .. }, D::Decimal32(..))
+        | (S::Decimal { bit_width: 64, .. }, D::Decimal64(..))
+        | (S::Decimal { bit_width: 128, .. }, D::Decimal128(..))
+        | (S::Decimal { bit_width: 256, .. }, D::Decimal256(..)) => true,
+        _ => scalar_layout(scalar).is_ok_and(|(expected, _)| expected == *data_type),
+    }
+}
+
 fn validate_map_entries(field: &Field) -> Result<()> {
     match field.data_type() {
         DataType::Struct(children) if !field.is_nullable() && children.len() == 2 && children[0].name() == "key" && children[1].name() == "value" && !children[0].is_nullable() => Ok(()),

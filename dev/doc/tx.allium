@@ -27,6 +27,7 @@
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- An Arrow client result union of one data leg and nullable null legs conforms to that leg's declared plain field by Arrow position.
 -- A fixed-size vector result column already in its declared layout keeps its component buffer.
+-- Query output aligns selected floating-point components and compatible scalar aliases with the declared Arrow field.
 -- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
 -- A pgwire portal can encode numeric coefficients, standard PostgreSQL arrays, and structured JSON, JSON-LD, and Transit results from their Arrow cells.
@@ -88,6 +89,7 @@
 -- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
 -- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
+-- Apply document fields retain compatible dependent Arrow selections through result conformance.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.
 -- A partitioned window over compatible Arrow keys assigns partition identifiers in first-seen order and keeps shifts within those partitions.

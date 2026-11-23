@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use arrow_array::{Array, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
-use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, ScalarType, UriParts, Value};
+use rtdb_types::{Anomaly, ListKind, ListValue, LogicalType, Result, ScalarType, UriParts};
 
-use crate::{EXTENSION_NAME_KEY, MemoryBudget, estimate_read_value_bytes, from_field, leg_name, read_value_as};
+use crate::{EXTENSION_NAME_KEY, MemoryBudget, from_field, leg_name, schema::scalar_reader_accepts};
 
 pub struct ColumnPresence<'a> {
     field: &'a Field,
@@ -131,7 +131,6 @@ enum ReadPlan {
     Run(Box<ReadPlan>),
     Struct { children: Vec<Option<ReadPlan>>, kind: ReadKind },
     Sequence { child: Box<ReadPlan>, kind: ListKind },
-    Scalar(LogicalType),
     Invalid(Anomaly),
 }
 
@@ -184,13 +183,13 @@ impl ReadPlan {
                 }
             }
             (LogicalType::Scalar(ScalarType::Uri), DataType::Utf8) => Self::Uri,
-            (LogicalType::Scalar(scalar), _) => match from_field(field) {
-                Ok(physical) if physical == *logical || physical == logical.clone().maybe() => match scalar {
-                    ScalarType::Timestamp { .. } => Self::Plain(ReadKind::Timestamp),
-                    _ => Self::Plain(ReadKind::Present),
-                },
-                _ => Self::Scalar(logical.clone()),
+            (LogicalType::Scalar(scalar), data_type) if scalar_reader_accepts(scalar, data_type) => match scalar {
+                ScalarType::Timestamp { .. } => Self::Plain(ReadKind::Timestamp),
+                _ => Self::Plain(ReadKind::Present),
             },
+            (LogicalType::Scalar(ScalarType::Decimal { bit_width, .. }), _)
+                if !matches!(bit_width, 32 | 64 | 128 | 256) =>
+                Self::Invalid(Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width")),
             _ => Self::Invalid(layout()),
         }
     }
@@ -274,14 +273,6 @@ impl ReadPlan {
                     _ => {}
                 }
                 Present
-            }
-            Self::Scalar(logical) => {
-                let _cell = memory.map(|memory| memory.reserve(estimate_read_value_bytes(field, array, row)?)).transpose()?;
-                match read_value_as(logical, field, array, row)? {
-                    Value::Null | Value::Undefined => Absent,
-                    Value::Timestamp { .. } => Timestamp,
-                    _ => Present,
-                }
             }
             Self::Invalid(error) => return Err(error.clone()),
             Self::Bottom | Self::Union(_) | Self::Run(_) => unreachable!(),
@@ -432,6 +423,28 @@ mod tests {
     }
 
     #[test]
+    fn keyword_alias_admission_does_not_reserve_a_copy_of_the_spelling() {
+        let fields = UnionFields::try_new([0, 1], [
+            Field::new("keyword", DataType::Utf8, false),
+            crate::to_field("other", &LogicalType::Scalar(ScalarType::Keyword)).unwrap(),
+        ]).unwrap();
+        let spelling = "k".repeat(64 * 1024);
+        let array = UnionArray::try_new(fields, vec![0_i8].into(), Some(vec![0_i32].into()), vec![
+            Arc::new(StringArray::from(vec![spelling.as_str()])),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ]).unwrap();
+        let field = Field::new("arg", array.data_type().clone(), false);
+        let logical = from_field(&field).unwrap();
+        let memory = MemoryBudget::new(16 * 1024);
+        assert!(ambiguous_union(&field, &logical).unwrap());
+        assert!(crate::estimate_read_value_bytes(&field, &array, 0).unwrap() > memory.limit_bytes());
+        validate_readable_column(&field, &array, &logical, &memory).unwrap();
+        validate_readable_cell(&field, &array, &logical, 0, &memory).unwrap();
+        assert!(ColumnPresence::new(&field).unwrap().is_present(&array, 0).unwrap());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn ambiguous_union_checks_selected_offsets_without_vector_decode_scratch() {
         use arrow_array::{Float32Array, ListArray, NullArray, types::Float32Type};
 
@@ -456,7 +469,7 @@ mod tests {
         let logical = from_field(&field).unwrap();
         assert!(ambiguous_union(&field, &logical).unwrap());
         let memory = MemoryBudget::new(32 * 1024);
-        assert!(estimate_read_value_bytes(&field, &array, 0).unwrap() > memory.limit_bytes());
+        assert!(crate::estimate_read_value_bytes(&field, &array, 0).unwrap() > memory.limit_bytes());
 
         validate_readable_column(&field, &array, &logical, &memory).unwrap();
         let presence = ColumnPresence::new(&field).unwrap();

@@ -450,6 +450,7 @@ variant TxMessage : SourceMessage {
     -- The slot's reading binds the Root writes, ordered predicates and landing outcome.
     -- A fixed period's entity-window witness covers its full half-open validity at the original Root cut.
     -- Dense union admission resolves the logical reader for each physical leg and checks the child offsets selected by the input cells.
+    -- Selected scalar aliases are admitted from their Arrow storage, including spelling validation for URIs.
     -- Nested uploads compact child positions and align child fields to the canonical source layout in Arrow.
     -- These uploads normalize Boolean padding and nullable cells to preserve the source representation.
     -- Compatible Arrow document vectors include nested lists, fixed-size lists and structs.
@@ -2031,6 +2032,9 @@ surface QueryAccess {
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
         -- Their key index retains Arrow batches and hashes and compares compatible scalar and floating-point vector cells at their indexed positions.
+        -- Key readers follow logical union leg names and run ends to borrow the selected scalar or vector values.
+        -- URI keys retain the raw hash check and the SQL comparison of their spellings.
+        -- Arrow join pushdown retains the IID candidates of supported identity cells alongside their Bloom positions.
         -- A composite set key reads an owned scalar cell for each column that requires scalar hashing or equality.
         -- Compatible global counts and floating-point sums and averages reduce Arrow columns and emit scalar result vectors.
         -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
@@ -2049,6 +2053,7 @@ surface QueryAccess {
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
         -- Outer joins track unmatched build positions through partition replay.
         -- A correlated query retains its outer Arrow row position and gathers its output from the selected dependent positions.
+        -- Apply gathers compatible dependent Arrow fields into its document layout.
         -- Short-circuiting correlated queries observe the dependent plan's semantic pages.
         -- UNNEST over compatible Arrow list columns expands the selected child positions and gathers their parent payloads by position.
         -- A column table over a compatible Arrow list parameter reads the bound row's child slice as one semantic page.
@@ -2082,7 +2087,10 @@ surface QueryAccess {
         -- When selected cells need layout alignment before they can share one array, the scan retains their source vectors and positions.
         -- Reading a selected struct during evaluation preserves which keys its source has.
         -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
-        -- Cursor output gathers selected floating-point list rows and components directly into their declared fields and union legs.
+        -- Cursor output gathers selected floating-point components and compatible interpreted fields into their declared Arrow layouts.
+        -- Struct and collection output align selected child fields by position and preserve their validity.
+        -- Compatible packed component unions retain the numeric tags and stored bits of selected masked children.
+        -- A selected vector component must belong to an admitted width in the declared output field.
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
