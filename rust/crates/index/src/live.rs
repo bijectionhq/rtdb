@@ -338,22 +338,37 @@ impl BlockPages<'_> {
                 Err(error) => return Err(error),
             }
         }
-        let mut bound = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Page row allocation overflow"))?;
-        let mut schema_charged = Vec::new();
-        for &row in rows {
-            let source = self.table.row(row)?;
-            let schema = source.batch.arrow().schema();
+        let selection_bytes = rows.len().checked_mul(256).and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| invalid("Page row allocation overflow"))?;
+        let _selection = self.memory.reserve(selection_bytes)?;
+        let mut bound = 0usize;
+        let mut selections = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+        for (position, &row) in rows.iter().enumerate() {
+            let chunk = self.table.chunks.partition_point(|(start, _)| *start <= row)
+                .checked_sub(1).ok_or_else(|| invalid("Live table row has no owning batch"))?;
+            let (start, source) = &self.table.chunks[chunk];
+            let offset = (row - start) as usize;
+            if offset >= source.len() { return Err(invalid("Live table row exceeds its batch")); }
+            let selected = selections.entry(chunk).or_default();
+            let schema = source.arrow().schema();
             let index = schema.index_of("op").map_err(invalid)?;
-            let (field, column) = (schema.field(index), source.batch.arrow().column(index).as_ref());
-            // Each batch derives its put type once, so only its first row is charged the schema.
-            let first = !schema_charged.iter().any(|batch| Arc::ptr_eq(batch, &source.batch));
-            let cell = if first { schema_charged.push(Arc::clone(&source.batch)); estimate_read_value_bytes(field, column, source.row)? }
-                else { rtdb_columnar::estimate_read_cell_bytes(field, column, source.row)? };
+            let (field, column) = (schema.field(index), source.arrow().column(index).as_ref());
+            let cell = if selected.is_empty() { estimate_read_value_bytes(field, column, offset)? }
+                else { rtdb_columnar::estimate_read_cell_bytes(field, column, offset)? };
             bound = bound.checked_add(cell).ok_or_else(|| invalid("Page allocation size overflow"))?;
+            selected.push((position, offset));
         }
         let _scratch = self.memory.reserve(bound)?;
-        let events = rows.iter().map(|&row| self.table.row(row)?.event()).collect::<Result<Vec<_>>>()?;
-        Ok(IndexBatch::copy_events_with_put_schema(&events, &self.table.column_types, &self.memory)?.owned.clone())
+        let mut events = vec![None; rows.len()];
+        for (chunk, positions) in selections {
+            let batch = &self.table.chunks[chunk].1;
+            let selected = batch.view().page_events_at(positions.iter().map(|(_, row)| *row))?;
+            for ((position, _), event) in positions.into_iter().zip(selected) {
+                events[position] = Some(event);
+            }
+        }
+        let events = events.into_iter().map(|event| event.ok_or_else(|| invalid("Page row selection lost an event"))).collect::<Result<Vec<_>>>()?;
+        owned_event_batch(&events, Some(self.table.column_types.clone()), true, &self.memory)
     }
 }
 
@@ -617,6 +632,7 @@ fn block_pages_preserve_order_and_layout_across_live_batches() {
         operation: StoredOperation::Put(StructFields::from([
             ("_id".into(), Value::I64(id)),
             ("value".into(), if text { Value::Utf8(id.to_string()) } else { Value::I64(id) }),
+            ("embedding".into(), Value::FixedSizeList(vec![Value::F32(id as f32), Value::F32(0.25)])),
         ])),
         recency: None,
     }).collect::<Vec<_>>();

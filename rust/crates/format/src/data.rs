@@ -196,6 +196,10 @@ impl EventBatch {
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
     /// The page's events read in place, each reading its document's cells only as an event batch encodes them.
     pub fn page_events(&self) -> Result<Vec<PageEvent>> {
+        self.page_events_at(0..self.len())
+    }
+
+    pub fn page_events_at(&self, rows: impl IntoIterator<Item = usize>) -> Result<Vec<PageEvent>> {
         let union = self.operations()?;
         let DataType::Union(legs, _) = union.data_type() else { return Err(invalid("Missing operation union fields")); };
         let put = match legs.iter().find(|(_, leg)| leg.name() == "put") {
@@ -217,7 +221,8 @@ impl EventBatch {
         let times = |index: usize| self.batch.column(index).as_any().downcast_ref::<TimestampMicrosecondArray>().map(|array| array.values()).ok_or_else(|| invalid("Event timestamp array type changed"));
         let (system_from, valid_from, valid_to) = (times(self.system_from)?, times(self.valid_from)?, times(self.valid_to)?);
         let recency = self.recency.map(times).transpose()?;
-        (0..self.len()).map(|row| {
+        rows.into_iter().map(|row| {
+            if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
             let op = usize::try_from(union.type_id(row)).ok().and_then(|id| ops[id]).ok_or_else(|| invalid("Event operation type ID has no leg"))?;
             Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
                 valid_time: Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?, op,
