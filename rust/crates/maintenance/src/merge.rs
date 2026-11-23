@@ -247,30 +247,29 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
             calculator: AdmittedPolygonCalculator::new(None, Arc::clone(memory)),
             system_from: None, seen_erase: false, erased: false,
         })?;
+        if state.erased { continue; }
         if state.system_from != Some(event.system_from) {
             state.calculator.reset();
             state.system_from = Some(event.system_from);
             state.seen_erase = false;
         }
         let header = event.header();
-        let resolved = if state.erased { None } else {
-            state.calculator.visit(&header, |polygon| {
-                if header.commit_position != 0 {
+        let resolved = state.calculator.visit(&header, |polygon| {
+            if header.commit_position != 0 {
+                charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                result.push(event.clone());
+                return Ok(());
+            }
+            for (valid_from, valid_to, system_to) in polygon.ranges() {
+                if system_to > event.system_from {
                     charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                    result.push(event.clone());
-                    return Ok(());
+                    let mut event = event.clone();
+                    event.valid_time = Interval::new(valid_from, valid_to)?;
+                    result.push(event);
                 }
-                for (valid_from, valid_to, system_to) in polygon.ranges() {
-                    if system_to > event.system_from {
-                        charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                        let mut event = event.clone();
-                        event.valid_time = Interval::new(valid_from, valid_to)?;
-                        result.push(event);
-                    }
-                }
-                Ok(())
-            })?
-        };
+            }
+            Ok(())
+        })?;
         if header.op == EventOp::Erase { state.erased = true; }
         if resolved.is_none() {
             if !state.seen_erase {
@@ -475,7 +474,11 @@ mod tests {
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
-            operation: StoredOperation::Delete,
+            operation: if commit_position == 2 {
+                StoredOperation::Put(StructFields::from([("payload".into(), rtdb_types::Value::Utf8("erase me".into()))]))
+            } else {
+                StoredOperation::Delete
+            },
             recency: None,
         });
         let (surviving, _charges) = resolve_same_time(&page(&assertions), &memory).unwrap();
@@ -587,7 +590,7 @@ mod tests {
         for [later, earlier] in [[&events[1], &events[0]], [&events[2], &events[0]]] {
             let unsorted = [page(&[later.clone(), earlier.clone()])];
             let error = planner::RowHeap::new(&unsorted).err().unwrap();
-            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-time descending"));
+            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-position descending"));
         }
     }
 
