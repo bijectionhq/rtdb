@@ -66,6 +66,13 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    if settings.agent.installed_journal_manifest.is_some() && settings.capabilities.is_none() {
+        return Err(Anomaly::incorrect("rtdb.multi/ordered-worker", "Installed journal workers require a cell route credential"));
+    }
+    let ordered = Arc::new(match &settings.agent.installed_journal_manifest {
+        Some(path) => crate::journal::hosted::Routes::read(path)?,
+        None => crate::journal::hosted::Routes::default(),
+    });
     let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
     if audience.is_some() != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
         return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
@@ -148,8 +155,20 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         local_witnesses,
     });
     let placed = PlacedOptions {
-        log_factories: vec![(LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&writers), holds))],
-        storage_factories: vec![(crate::store::CELL_STORAGE_TYPE.into(), storage)],
+        log_factories: vec![
+            (LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&writers), holds)),
+            (crate::journal::hosted::LOG_TYPE.into(), Arc::new(crate::journal::hosted::Logs {
+                routes: Arc::clone(&ordered), keys: Arc::clone(&settings.keys), releases: storage_regions.clone(),
+            })),
+        ],
+        storage_factories: vec![
+            (crate::store::CELL_STORAGE_TYPE.into(), storage),
+            (crate::journal::hosted::STORE_TYPE.into(), Arc::new(crate::journal::hosted::StoreFactory {
+                routes: Arc::clone(&ordered), storage: settings.agent.storage.clone(),
+                keys: Arc::clone(&settings.keys), scoped_writes: scoped_writes.clone(),
+                releases: storage_regions.clone(),
+            })),
+        ],
         claim_wait: settings.claim_wait,
         capabilities: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_pgwire::CapabilityVerifier>),
         flight_peer: settings.capabilities.clone().map(|secret| secret as Arc<dyn rtdb_flight_sql::FlightPeerVerifier>),
@@ -182,7 +201,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     }, settings.lease).await?;
     if let Some(writes) = scoped_writes { writes.set_member(lease.id()); }
     fragmenter.set_member(lease.id());
-    let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoints, settings.agent, storage_namespaces, writers, settings.capabilities.clone());
+    let agent = NodeAgent::new(directory, Arc::clone(&settings.keys), server.node().clone(), Arc::clone(&lease), pgwire_endpoint, flight_endpoints, settings.agent, storage_namespaces, writers, ordered, storage_regions.clone(), settings.capabilities.clone());
     let _ = fence.0.set(Arc::downgrade(&agent));
     let cancellation = CancellationToken::new();
     let lease_cancellation = CancellationToken::new();

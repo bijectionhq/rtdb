@@ -42,6 +42,7 @@ pub(crate) fn database_selector(selector: &str) -> Result<(&str, Option<Uuid>)> 
 pub struct GatewayOptions {
     /// The cell map and this gateway's cell, so a connection for a deployment living elsewhere is forwarded there.
     pub cells: Option<(Arc<dyn crate::cells::CellMap>, String)>,
+    pub installed_journals: Option<Arc<crate::journal::hosted::GatewayRoutes>>,
     pub control_timeout: Duration,
     /// When set, every frontend must negotiate TLS before startup.
     pub tls: Option<Arc<rustls::ServerConfig>>,
@@ -58,7 +59,7 @@ pub struct GatewayOptions {
 impl Default for GatewayOptions {
     fn default() -> Self {
         Self {
-            cells: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
+            cells: None, installed_journals: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
             control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
             maximum_connections: 4096, maximum_connections_per_deployment: 256,
             maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None,
@@ -177,7 +178,10 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     let Some(_deployment_connection) = deployments.admit(&name) else {
         return refuse(&mut client, "53300", "This deployment has reached its gateway connection limit").await;
     };
-    let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, elsewhere(&directory, &name, &options)).await else {
+    let ordered = options.installed_journals.as_ref().and_then(|routes| routes.by_name(&name)).is_some();
+    let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, async {
+        if ordered { None } else { elsewhere(&directory, &name, &options).await }
+    }).await else {
         return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
     };
     if let Some(gateway) = remote_gateway {
@@ -221,9 +225,11 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     let router = Arc::new(router);
     let grants = options.capabilities.clone().map(|secret| crate::session::Grants { secret, parameters: startup.parameters.clone(), read_only: startup.read_only() });
     let keyed = !startup.read_only();
-    let session = crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed)
-        .with_frame_memory(frame_memory)
-        .with_installation(expected);
+    let session = if ordered {
+        crate::session::Session::new_ordered(Bytes::from(startup.bytes), router, grants, keyed)
+    } else {
+        crate::session::Session::new(Bytes::from(startup.bytes), router, directory, deployment, grants, keyed)
+    }.with_frame_memory(frame_memory).with_installation(expected);
     tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
         outcome = session.run_before(client, server, control, epoch, startup_deadline) => outcome,
@@ -330,6 +336,16 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     let directory = &router.directory;
     let name = router.name.as_str();
     let options = &router.options;
+    if let Some(installed) = options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+        if router.snapshot {
+            return Err(Anomaly::unsupported("rtdb.multi/ordered-snapshot", "The installed route serves fresh reads at its writer"));
+        }
+        if router.deployment.as_deref().is_some_and(|id| Uuid::parse_str(id).ok() != Some(installed.deployment)) {
+            return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
+        }
+        let (server, address, epoch) = route_ordered(name, installed, options).await?;
+        return Ok((server, Some(address), epoch, installed.deployment.to_string()));
+    }
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;
     if router.deployment.as_deref().is_some_and(|id| id != record.id.as_str()) {
@@ -399,6 +415,52 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
         }
     }
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
+}
+
+pub(crate) async fn route_ordered(
+    name: &str, installed: &crate::journal::hosted::GatewayPlacement, options: &GatewayOptions,
+) -> Result<(TcpStream, String, u64)> {
+    let view = installed.journal.route().await?;
+    let incumbent = view.writer.grant.map(|grant| grant.enrollment);
+    let predecessor = control::OrderedPredecessor { epoch: view.writer.epoch, enrollment: incumbent };
+    let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect(
+        "rtdb.multi/ordered-gateway", "The installed gateway needs a cell route credential"))?;
+    let key = control::ControlKey(options.capabilities.clone());
+    if let Some(worker) = incumbent.and_then(|worker| installed.endpoints.get(&worker)) {
+        let activation = control::OrderedActivation::issue(secret, name, view.placement, predecessor, worker.enrollment, false);
+        let request = Request::ActivateOrdered { name: name.to_owned(), activation };
+        if let Ok((Response::OrderedHeld { address, epoch, proof }, probe)) = control::call_with_pgwire_probe(
+            &worker.control, request, options.control_timeout.min(WRITER_DIAL_TIMEOUT), &key,
+        ).await
+            && epoch == view.writer.epoch && address == worker.pgwire
+            && secret.verify_route(&activation.reply_binding(view.placement, epoch, &address), &proof)
+            && let Ok(stream) = connect_serving(&worker.pgwire, &worker.control, probe, options).await
+        {
+            return Ok((stream, worker.control.clone(), epoch));
+        }
+    }
+    let mut refused = None;
+    for worker in installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent) {
+        let activation = control::OrderedActivation::issue(secret, name, view.placement, predecessor, worker.enrollment, true);
+        let request = Request::ActivateOrdered { name: name.to_owned(), activation };
+        match control::call_with_pgwire_probe(&worker.control, request, options.control_timeout, &key).await {
+            Ok((Response::OrderedHeld { address, epoch, proof }, probe)) if address == worker.pgwire
+                && secret.verify_route(&activation.reply_binding(view.placement, epoch, &address), &proof) => {
+                let current = installed.journal.route().await?;
+                if current.writer.grant.is_none_or(|grant| grant.epoch != epoch || grant.enrollment != worker.enrollment) {
+                    return Err(Anomaly::new(AnomalyCategory::Conflict, control::CLAIM_CONTENDED, "The installed journal selected a different replacement worker"));
+                }
+                let stream = connect_serving(&worker.pgwire, &worker.control, probe, options).await?;
+                return Ok((stream, worker.control.clone(), epoch));
+            }
+            Ok((Response::Refused { code, message }, _)) => {
+                refused = Some(Anomaly::new(AnomalyCategory::Unavailable, code, message));
+            }
+            _ => {}
+        }
+    }
+    Err(refused.unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable,
+        control::WRITER_CONTROL_UNREACHABLE, "No exact enrolled worker could take the journal grant")))
 }
 
 async fn confirm_writer(directory: &dyn Directory, record: &DeploymentRecord, control_address: &str, options: &GatewayOptions) -> Result<(Response, String, Option<u64>)> {

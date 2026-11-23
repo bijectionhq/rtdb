@@ -15,12 +15,13 @@ use ordered_logkeeper::ordered::{
 };
 
 pub mod custody;
+pub mod hosted;
 mod log;
-pub(crate) use log::JournalLog;
+pub(crate) use log::{Held, JournalLog};
 use rtdb_directory::DeploymentRecord;
 use rtdb_storage::log::LogOffset;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -60,7 +61,7 @@ pub struct InstalledJournal {
     authority: Authority,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct WriterAdmission {
     pub grant: Grant,
     pub recovery: Hold,
@@ -88,6 +89,12 @@ impl InstalledJournal {
 
     pub fn deployment(&self) -> Uuid {
         self.placement.deployment
+    }
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+    pub fn authority(&self) -> Authority {
+        self.authority
     }
     pub fn log_epoch(&self) -> StorageEpoch {
         self.log_epoch
@@ -244,6 +251,23 @@ impl InstalledJournal {
         }
     }
 
+    pub async fn vacate(&self, grant: Grant) -> Result<()> {
+        let route = self.route().await?;
+        if route.writer.grant != Some(grant) {
+            return Ok(());
+        }
+        let decision = self
+            .execute(&self.request(&route, Command::Vacate { grant })?)
+            .await?;
+        match decision.receipt.outcome {
+            Ok(Outcome::Vacated) | Err(Refusal::Stale) => Ok(()),
+            Err(reason) => Err(refused(reason)),
+            Ok(_) => Err(mismatch(
+                "The peer returned a different writer release result",
+            )),
+        }
+    }
+
     pub async fn append(&self, request: &Request) -> Result<AppendResult> {
         let decision = self.execute(request).await?;
         let Outcome::Appended(result) = decision.receipt.outcome.map_err(refused)? else {
@@ -266,6 +290,16 @@ impl InstalledJournal {
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::Published(published) if published == checkpoint => Ok(()),
             _ => Err(mismatch("The journal published a different checkpoint")),
+        }
+    }
+
+    pub async fn trim(&self, route: &Route, grant: Grant, through: Cut) -> Result<()> {
+        let decision = self
+            .execute(&self.request(route, Command::Trim { grant, through })?)
+            .await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::Trimmed(trimmed) if trimmed == through => Ok(()),
+            _ => Err(mismatch("The journal trimmed through a different cut")),
         }
     }
 

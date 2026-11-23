@@ -402,8 +402,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     .ok_or_else(|| usage("--flight-audience requires a Flight SQL configuration".into()))?.audience = Some(audience);
             }
             let audience = configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
-            let directory = open_directory(arguments.required("directory")?, audience).await?;
+            let installed_journals = arguments.optional("installed-journals").map(PathBuf::from);
+            let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
+                Some(directory) => open_directory(directory, audience).await?,
+                None if installed_journals.is_some() && !audience => rtdb_directory::MemoryDirectory::new(),
+                None => return Err(usage("--directory is required without an installed journal manifest".into())),
+            };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
+            agent.installed_journal_manifest = installed_journals;
             if audience {
                 agent.audience_journal_port = Some(arguments.required("audience-journal-port")?.parse::<u16>().ok()
                     .filter(|port| *port != 0).ok_or_else(|| usage("--audience-journal-port must be a positive port".into()))?);
@@ -457,7 +463,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             Ok(())
         }
         "gateway" => {
-            let directory = directory(arguments.required("directory")?).await?;
+            let installed_journals = arguments.optional("installed-journals")
+                .map(|path| rtdb_multi::journal::hosted::GatewayRoutes::read(std::path::Path::new(path))).transpose()?.map(Arc::new);
+            let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
+                Some(address) => directory(address).await?,
+                None if installed_journals.is_some() => rtdb_directory::MemoryDirectory::new(),
+                None => return Err(usage("--directory is required without an installed journal manifest".into())),
+            };
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
             eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
             let tls = if let Some(path) = arguments.optional("config") {
@@ -468,7 +480,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             } else {
                 None
             };
-            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), ..Default::default() };
+            let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), installed_journals, ..Default::default() };
             options.maximum_connections = arguments.number("max-connections", options.maximum_connections)?;
             options.maximum_connections_per_deployment = arguments.number("max-connections-per-deployment", options.maximum_connections_per_deployment)?;
             options.maximum_buffered_bytes = arguments.number("max-buffered-bytes", options.maximum_buffered_bytes)?;

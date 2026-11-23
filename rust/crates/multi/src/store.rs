@@ -154,6 +154,18 @@ pub(crate) struct ScopedCellWrites {
 impl ScopedCellWrites {
     pub fn new(issuer: rtdb_s3::ScopedS3Writes) -> Self { Self { issuer, member: OnceLock::new() } }
     pub fn set_member(&self, member: MemberId) { self.member.set(member).expect("a storage factory has one member"); }
+
+    pub(crate) async fn ordered_writer(
+        &self,
+        storage: &rtdb_s3::S3Config,
+        prefix: &str,
+        authorization: Arc<dyn rtdb_s3::WriteAuthorization>,
+        io: Arc<IoRegion>,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        let cell = storage.cell_root()?;
+        let root = ObjectKey::new(format!("{cell}/{prefix}"))?;
+        self.issuer.open(storage, &cell, &root, authorization, io).await
+    }
 }
 
 struct ScopedWriter {

@@ -249,6 +249,14 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
+        Self::with_authority(startup, router, record, grants, keyed)
+    }
+
+    pub(crate) fn new_ordered(startup: Bytes, router: Arc<dyn Router>, grants: Option<Grants>, keyed: bool) -> Self {
+        Self::with_authority(startup, router, watch::channel(None).1, grants, keyed)
+    }
+
+    fn with_authority(startup: Bytes, router: Arc<dyn Router>, record: watch::Receiver<Option<DeploymentRecord>>, grants: Option<Grants>, keyed: bool) -> Self {
         Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), replay_window: RECONNECT_WITHIN, command_key_age: COMMAND_KEY_AGE, expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, prefer_holder: false, keyed, key: None }
     }
 

@@ -90,18 +90,19 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
-    pub(crate) async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
+    pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
         let Some(read_index) = &self.replica_read_index else { return Ok(()); };
         let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
             format!("This replica of {} could not establish a fresh snapshot", self.name));
         let confirm = async {
-            let offset = read_index.confirm().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
-            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, offset.0)?;
+            let barrier = read_index.protect().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
+            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
             let mut status = self.watch_status();
             let applied = status.wait_for(|status| status.role == Role::Stopped
                 || status.installed.is_some_and(|prefix| prefix.replica >= position));
-            let status = tokio::time::timeout(Duration::from_millis(20), applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
+            let status = tokio::time::timeout(barrier.wait, applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
             if status.role == Role::Stopped { return Err(behind()); }
+            drop(barrier);
             Ok(())
         };
         tokio::select! {

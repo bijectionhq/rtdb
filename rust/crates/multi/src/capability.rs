@@ -47,6 +47,14 @@ impl CellSecret {
         crate::cipher::Cipher::new(hmac::sign(&self.key, b"rtdb.multi/flight-sql/session-route/v1").as_ref())
     }
 
+    pub(crate) fn sign_route(&self, binding: &[u8]) -> [u8; 32] {
+        hmac::sign(&self.key, binding).as_ref().try_into().expect("a SHA-256 MAC is 32 bytes")
+    }
+
+    pub(crate) fn verify_route(&self, binding: &[u8], proof: &[u8; 32]) -> bool {
+        hmac::verify(&self.key, binding, proof).is_ok()
+    }
+
     pub(crate) fn flight_peer(&self, deployment: &str, epoch: u64, peer: IpAddr) -> String {
         self.mint(&flight_peer_scope(deployment, epoch), &peer.to_string(), true, Duration::from_secs(60))
     }
@@ -73,7 +81,7 @@ impl CapabilityVerifier for CellSecret {
     }
 
     fn require_installation(&self, installation: &str, database: &rtdb_node::Database) -> Result<()> {
-        if attachment_storage(database)?.deployment == installation { Ok(()) }
+        if attachment_identity(database)?.0 == installation { Ok(()) }
         else { Err(refused("The attachment belongs to another installation")) }
     }
 }
@@ -84,11 +92,23 @@ impl std::fmt::Debug for CellSecret {
 
 impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
     fn verify(&self, proof: &str, attachment: &rtdb_node::Database) -> Result<IpAddr> {
-        let config = attachment_storage(attachment)?;
-        let epoch = config.writer_epoch.ok_or_else(|| refused("The Flight SQL route requires a writer attachment"))?;
-        let peer = <Self as CapabilityVerifier>::verify(self, proof, &flight_peer_scope(&config.deployment, epoch))?;
+        let (deployment, epoch) = attachment_identity(attachment)?;
+        let epoch = epoch.ok_or_else(|| refused("The Flight SQL route requires a writer attachment"))?;
+        let peer = <Self as CapabilityVerifier>::verify(self, proof, &flight_peer_scope(&deployment, epoch))?;
         peer.principal.parse().map_err(|_| refused("The Flight SQL peer address is invalid"))
     }
+}
+
+fn attachment_identity(attachment: &rtdb_node::Database) -> Result<(String, Option<u64>)> {
+    if let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage
+        && let Some(value) = remote.object_store.as_ref().filter(|value|
+            value.type_url.rsplit('/').next() == Some(crate::journal::hosted::STORE_TYPE))
+    {
+        let (deployment, epoch) = crate::journal::hosted::attachment_identity(value)?;
+        return Ok((deployment, Some(epoch)));
+    }
+    let config = attachment_storage(attachment)?;
+    Ok((config.deployment, config.writer_epoch))
 }
 
 pub(crate) fn attachment_storage(attachment: &rtdb_node::Database) -> Result<crate::store::CellStoreConfig> {

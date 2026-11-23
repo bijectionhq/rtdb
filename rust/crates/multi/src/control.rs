@@ -50,6 +50,7 @@ pub(crate) async fn retry_activation<T, F: Future<Output = Result<T>>>(window: D
 pub enum Request {
     /// Become the deployment's holder, or name who is.
     Activate { name: String },
+    ActivateOrdered { name: String, activation: OrderedActivation },
     ActivateForMove { name: String, ticket: MoveTicket },
     /// Flush, release the placement, and stop running the deployment.
     Park { name: String },
@@ -86,6 +87,50 @@ pub enum Request {
     ScanFragment { name: String, fragment: rtdb_query::ScanFragment, grant: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedPredecessor {
+    pub epoch: u64,
+    pub enrollment: Option<ordered_logkeeper::ordered::Enrollment>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedActivation {
+    pub predecessor: OrderedPredecessor,
+    pub target: ordered_logkeeper::ordered::Enrollment,
+    pub takeover: bool,
+    nonce: uuid::Uuid,
+    proof: [u8; 32],
+}
+
+impl OrderedActivation {
+    pub(crate) fn issue(
+        secret: &crate::capability::CellSecret, name: &str, placement: ordered_logkeeper::ordered::Placement,
+        predecessor: OrderedPredecessor, target: ordered_logkeeper::ordered::Enrollment, takeover: bool,
+    ) -> Self {
+        let mut activation = Self { predecessor, target, takeover, nonce: uuid::Uuid::new_v4(), proof: [0; 32] };
+        activation.proof = secret.sign_route(&activation.forward(name, placement));
+        activation
+    }
+
+    pub(crate) fn authentic(
+        &self, secret: &crate::capability::CellSecret, name: &str, placement: ordered_logkeeper::ordered::Placement,
+    ) -> bool {
+        !self.nonce.is_nil() && secret.verify_route(&self.forward(name, placement), &self.proof)
+    }
+
+    fn forward(&self, name: &str, placement: ordered_logkeeper::ordered::Placement) -> Vec<u8> {
+        serde_json::to_vec(&("rtdb.multi/ordered-activation/v1", name, placement,
+            self.predecessor, self.target, self.takeover, self.nonce)).expect("ordered activation serializes")
+    }
+
+    pub(crate) fn reply_binding(
+        &self, placement: ordered_logkeeper::ordered::Placement, epoch: u64, address: &str,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&("rtdb.multi/ordered-ready/v1", placement, self.target, self.nonce,
+            epoch, address)).expect("ordered readiness serializes")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveTicket {
     pub deployment: String,
@@ -97,6 +142,7 @@ pub struct MoveTicket {
 pub enum Response {
     /// This member holds the deployment under `epoch`; clients reach it at `address`.
     Held { epoch: u64, address: String },
+    OrderedHeld { epoch: u64, address: String, proof: [u8; 32] },
     /// Another live member holds it; clients reach that one at `address`.
     Redirect { holder: String, address: String },
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.

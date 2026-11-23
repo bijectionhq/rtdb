@@ -128,6 +128,58 @@ pub(crate) fn frozen_checkpoint(
         await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
 }
 
+pub(crate) async fn ordered_opened(
+    ordered: Arc<crate::journal::JournalLog>,
+    key: &[u8],
+    record: &rtdb_directory::DeploymentRecord,
+    admission: crate::journal::WriterAdmission,
+    checkpoint: Option<rtdb_directory::Checkpoint>,
+    maximum_message_bytes: usize,
+    cancellation: CancellationToken,
+) -> Result<OpenedLogs> {
+    let epoch = StorageEpoch(record.log_epoch);
+    let opened = ordered.latest()?;
+    let scope = PlacedAttemptScope::new(&record.stream("replica"), admission.grant.epoch)?;
+    let replica: Arc<dyn Log> = Arc::new(SealedLog::new(ordered.clone(), key, &record.replica_seal_scope())?);
+    let intake_cut = checkpoint.map(|block| crate::deployment::TransferIntakeCut {
+        replica_through: block.boundary, source_through: block.source,
+    });
+    let next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
+    let intake = Arc::new(IntakeLog {
+        log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(next)),
+        consumed: Arc::new(AtomicI64::new(next - 1)), start: next,
+    });
+    let trimming = {
+        let intake = Arc::clone(&intake);
+        async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => intake.trim(),
+                }
+            }
+        }.boxed()
+    };
+    Ok(OpenedLogs {
+        source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
+        replica_read_index: Some(Box::new(OrderedReadIndex(ordered))),
+        await_authority: AwaitAuthority::Live {
+            codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
+            recovery: ClosedEpochRecovery::Opened(opened),
+            placed_receipt_retirement: record.placed_receipt_retirement,
+        },
+        drivers: vec![trimming],
+    })
+}
+
+struct OrderedReadIndex(Arc<crate::journal::JournalLog>);
+
+#[async_trait]
+impl ReplicaReadIndex for OrderedReadIndex {
+    async fn confirm(&self) -> Result<LogOffset> { self.0.confirm().await }
+    async fn protect(&self) -> Result<rtdb_node::ProtectedReadIndex> { self.0.protect().await }
+}
+
 #[async_trait]
 impl LogFactory for LogkeeperLogFactory {
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs> {

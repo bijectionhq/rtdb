@@ -4,7 +4,10 @@
 use super::{InstalledJournal, WriterAdmission, latest};
 use async_trait::async_trait;
 use bytes::Bytes;
-use ordered_logkeeper::ordered::{Command, Cut, Grant, Hold, Request, service::Route};
+use ordered_logkeeper::ordered::{
+    Command, Cut, Grant, Hold, Outcome, Refusal, Request, service::Route,
+};
+use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
 use rtdb_storage::{
     Error, Result,
     log::{
@@ -14,7 +17,7 @@ use rtdb_storage::{
     object_store::ReadReservation,
 };
 use rtdb_types::{Anomaly, Timestamp};
-use std::path::PathBuf;
+use std::num::NonZeroU64;
 use std::sync::{
     Arc,
     atomic::{AtomicI64, Ordering},
@@ -31,7 +34,7 @@ const MAX_RANGE_BYTES: usize = 32 << 20;
 
 pub(crate) struct JournalLog {
     reads: Arc<Reads>,
-    writer: Option<Mutex<Writer>>,
+    writer: Mutex<Writer>,
     recovery: Mutex<Option<Arc<Held>>>,
 }
 
@@ -39,6 +42,8 @@ struct Writer {
     grant: Grant,
     head: Cut,
     pending: Option<Request>,
+    pending_read: Option<Request>,
+    next_read: Option<NonZeroU64>,
 }
 
 struct Reads {
@@ -48,23 +53,81 @@ struct Reads {
     maximum: usize,
 }
 
-struct Held {
+pub(crate) struct Held {
     hold: Hold,
     _release: oneshot::Sender<()>,
+}
+
+impl Held {
+    pub(crate) fn scope(&self) -> Hold {
+        self.hold
+    }
+    pub(crate) async fn acquire(
+        journal: &Arc<InstalledJournal>,
+        request: Request,
+        tasks: &TaskTracker,
+    ) -> rtdb_types::Result<Arc<Self>> {
+        let (send, receive) = oneshot::channel();
+        let journal = Arc::clone(journal);
+        let worker = tasks.clone();
+        tasks.spawn(async move {
+            let admitted = loop {
+                match journal.hold(&request).await {
+                    Err(error) if error.code == "rtdb.multi/ordered-journal" => {
+                        tokio::time::sleep(RELEASE_RETRY).await
+                    }
+                    result => break result,
+                }
+            };
+            let result = admitted.map(|hold| Self::pin(journal, hold, &worker));
+            let _ = send.send(result);
+        });
+        receive.await.map_err(|_| {
+            Anomaly::fault(
+                "rtdb.multi/ordered-hold-ended",
+                "Ordered replay admission ended",
+            )
+        })?
+    }
+
+    pub(crate) fn pin(
+        journal: Arc<InstalledJournal>,
+        hold: Hold,
+        tasks: &TaskTracker,
+    ) -> Arc<Self> {
+        let (release, closed) = oneshot::channel();
+        tasks.spawn(async move {
+            let _ = closed.await;
+            loop {
+                match journal.release(hold).await {
+                    Ok(()) => break,
+                    Err(error) => eprintln!(
+                        "Ordered replay release {} remains pending: {}",
+                        hold.id.nonce, error.code
+                    ),
+                }
+                tokio::time::sleep(RELEASE_RETRY).await;
+            }
+        });
+        Arc::new(Self {
+            hold,
+            _release: release,
+        })
+    }
 }
 
 impl JournalLog {
     pub async fn open(
         journal: Arc<InstalledJournal>,
-        admission: Option<WriterAdmission>,
+        admission: WriterAdmission,
+        recovery: Arc<Held>,
         maximum_message_bytes: usize,
         tasks: TaskTracker,
     ) -> Result<Arc<Self>> {
         let current = journal.route().await.map_err(storage)?;
-        if let Some(admission) = admission
-            && (current.writer.grant != Some(admission.grant)
-                || current.head != admission.recovery.through
-                || current.position < admission.position)
+        if current.writer.grant != Some(admission.grant)
+            || current.head != admission.recovery.through
+            || current.position < admission.position
         {
             return Err(deposed(admission.grant, &current));
         }
@@ -74,18 +137,17 @@ impl JournalLog {
             tasks,
             maximum: maximum_message_bytes,
         });
-        let recovery = admission.map(|admission| reads.retain(admission.recovery));
-        let writer = admission.map(|admission| {
-            Mutex::new(Writer {
-                grant: admission.grant,
-                head: admission.recovery.through,
-                pending: None,
-            })
+        let writer = Mutex::new(Writer {
+            grant: admission.grant,
+            head: admission.recovery.through,
+            pending: None,
+            pending_read: None,
+            next_read: Some(NonZeroU64::MIN),
         });
         Ok(Arc::new(Self {
             reads,
             writer,
-            recovery: Mutex::new(recovery),
+            recovery: Mutex::new(Some(recovery)),
         }))
     }
 
@@ -100,11 +162,7 @@ impl JournalLog {
                 maximum: self.reads.maximum,
             });
         }
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| Error::ReadOnlyLog(PathBuf::from("installed journal")))?;
-        let mut writer = writer.lock().await;
+        let mut writer = self.writer.lock().await;
         if writer.pending.is_some() {
             self.finish_append(&mut writer).await?;
         }
@@ -184,6 +242,93 @@ impl JournalLog {
         cursor.bind(current).await?;
         Ok(cursor)
     }
+
+    async fn resolve_old_read(&self, writer: &mut Writer) -> rtdb_types::Result<()> {
+        let Some(request) = writer.pending_read.as_ref() else {
+            return Ok(());
+        };
+        match self.reads.journal.barrier(request).await {
+            Ok(proof) => drop(self.reads.retain(proof.claim.read())),
+            Err(error)
+                if matches!(
+                    error.code.as_ref(),
+                    "rtdb.multi/ordered-capacity"
+                        | "rtdb.multi/ordered-expired"
+                        | "rtdb.multi/ordered-read-closed"
+                        | "rtdb.multi/ordered-stale-grant"
+                ) =>
+            {
+                let route = self.reads.journal.route().await?;
+                if route.writer.grant != Some(writer.grant) {
+                    return Err(deposed(writer.grant, &route).into());
+                }
+                let nonce = writer.next_read.ok_or_else(read_exhausted)?;
+                let abandon = self.reads.journal.request(
+                    &route,
+                    Command::AbandonRead {
+                        grant: writer.grant,
+                        nonce,
+                    },
+                )?;
+                let decision = self.reads.journal.execute(&abandon).await?;
+                match decision.receipt.outcome {
+                    Ok(Outcome::ReadAbandoned) => {}
+                    Err(Refusal::Stale)
+                        if self.reads.journal.route().await?.writer.grant == Some(writer.grant) => {
+                    }
+                    Err(reason) => return Err(super::refused(reason)),
+                    Ok(_) => return Err(read_exhausted()),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        writer.read_finished();
+        Ok(())
+    }
+}
+
+impl Writer {
+    fn read_finished(&mut self) {
+        self.next_read = self
+            .next_read
+            .and_then(|nonce| nonce.get().checked_add(1))
+            .and_then(NonZeroU64::new);
+        self.pending_read = None;
+    }
+}
+
+#[async_trait]
+impl ReplicaReadIndex for JournalLog {
+    async fn confirm(&self) -> rtdb_types::Result<LogOffset> {
+        Ok(self.protect().await?.offset)
+    }
+
+    async fn protect(&self) -> rtdb_types::Result<ProtectedReadIndex> {
+        let mut writer = self.writer.lock().await;
+        self.resolve_old_read(&mut writer).await?;
+        let current = self.reads.journal.route().await?;
+        if current.writer.grant != Some(writer.grant) {
+            return Err(deposed(writer.grant, &current).into());
+        }
+        let nonce = writer.next_read.ok_or_else(read_exhausted)?;
+        let invocation = self.reads.journal.request(
+            &current,
+            Command::Barrier {
+                grant: writer.grant,
+                nonce,
+            },
+        )?;
+        writer.pending_read = Some(invocation.clone());
+        let proof = self.reads.journal.barrier(&invocation).await?;
+        let hold = proof.claim.read();
+        let retention = self.reads.retain(hold);
+        writer.read_finished();
+        Ok(ProtectedReadIndex {
+            offset: latest(hold.through)?,
+            wait: Duration::from_secs(2),
+            retention: Some(retention),
+        })
+    }
 }
 
 impl Reads {
@@ -195,16 +340,7 @@ impl Reads {
     }
 
     fn retain(self: &Arc<Self>, hold: Hold) -> Arc<Held> {
-        let (release, closed) = oneshot::channel();
-        let reads = Arc::clone(self);
-        self.tasks.spawn(async move {
-            let _ = closed.await;
-            reads.release(hold).await;
-        });
-        Arc::new(Held {
-            hold,
-            _release: release,
-        })
+        Held::pin(Arc::clone(&self.journal), hold, &self.tasks)
     }
 
     async fn acquire(self: &Arc<Self>, view: &Route, from: u64, through: u64) -> Result<Arc<Held>> {
@@ -218,37 +354,9 @@ impl Reads {
             through,
         };
         let request = self.journal.request(view, command).map_err(storage)?;
-        let (send, receive) = oneshot::channel();
-        let reads = Arc::clone(self);
-        self.tasks.spawn(async move {
-            let admitted = loop {
-                match reads.journal.hold(&request).await {
-                    Err(error) if error.code == "rtdb.multi/ordered-journal" => {
-                        tokio::time::sleep(RELEASE_RETRY).await
-                    }
-                    result => break result,
-                }
-            };
-            let result = admitted.map(|hold| reads.retain(hold)).map_err(storage);
-            let _ = send.send(result);
-        });
-        receive
+        Held::acquire(&self.journal, request, &self.tasks)
             .await
-            .map_err(|_| Error::Closed("Ordered replay admission ended".into()))?
-    }
-
-    async fn release(&self, hold: Hold) {
-        loop {
-            if let Err(error) = self.journal.release(hold).await {
-                eprintln!(
-                    "Ordered replay release {} remains pending: {}",
-                    hold.id.nonce, error.code
-                );
-                tokio::time::sleep(RELEASE_RETRY).await;
-            } else {
-                break;
-            }
-        }
+            .map_err(storage)
     }
 }
 
@@ -436,7 +544,7 @@ impl Log for JournalLog {
         true
     }
     fn maximum_append_bytes(&self) -> Option<usize> {
-        self.writer.as_ref().map(|_| self.reads.maximum)
+        Some(self.reads.maximum)
     }
     fn maximum_guarded_append_bytes(&self) -> Option<usize> {
         self.maximum_append_bytes()
@@ -573,4 +681,12 @@ fn deposed(grant: Grant, current: &Route) -> Error {
         epoch: grant.epoch,
         promised: current.writer.epoch,
     }
+}
+
+fn read_exhausted() -> Anomaly {
+    Anomaly::new(
+        rtdb_types::AnomalyCategory::Unavailable,
+        "rtdb.multi/ordered-read-sequence",
+        "The installed writer cannot issue another read nonce",
+    )
 }

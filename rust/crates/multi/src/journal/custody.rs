@@ -30,6 +30,8 @@ pub struct CheckpointCustody {
 }
 
 /// Exact space reserved by the custodian before staging any checkpoint copy.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Reservation {
     pub custody: Custody,
     pub usable_bytes: u64,

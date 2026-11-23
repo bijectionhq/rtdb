@@ -572,6 +572,13 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    Assignment spreads an ensemble across distinct declared zones where possible.
    A replacement holder opens the installed journals and must reach their original quorum.
    A separate durability placement operation changes which journals hold the deployment.
+
+   An installed ordered journal route supplies the node's exact worker enrollment and the gateway's read-only journal identity.
+   On that route the journal owns nominations, the writer fence, append reconciliation, fresh read markers and checkpoint publication.
+   The node attaches the checkpoint and suffix named by its chosen grant before reporting readiness.
+   The gateway checks the readiness proof for its current challenge and verifies the result against the journal.
+   Provider checkpoint copies belong to preinstalled custody reservations, and trim waits for their ordered publication and any competing replay holds.
+   The node and gateway read their installed route manifests with `--installed-journals`.
 4. **Deployment of the logkeepers.**
    The logkeeper is the first production loglet (decision 2, settled).
    Logkeepers run on EC2 instances with instance-store NVMe, at least one per availability zone per ensemble, with ensembles spread so that losing a host re-replicates its streams to the rest of the cell.

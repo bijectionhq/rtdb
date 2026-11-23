@@ -19,6 +19,21 @@ pub type TransactionClock = dyn Fn() -> Result<Timestamp> + Send + Sync;
 pub trait ReplicaReadIndex: Send + Sync {
     /// Bounds writes completed before the call on the replica log opened with this capability.
     async fn confirm(&self) -> Result<rtdb_storage::log::LogOffset>;
+
+    /// Keeps the protected source basis alive until the database applies it.
+    async fn protect(&self) -> Result<ProtectedReadIndex> {
+        Ok(ProtectedReadIndex {
+            offset: self.confirm().await?,
+            wait: std::time::Duration::from_millis(20),
+            retention: None,
+        })
+    }
+}
+
+pub struct ProtectedReadIndex {
+    pub offset: rtdb_storage::log::LogOffset,
+    pub wait: std::time::Duration,
+    pub retention: Option<Arc<dyn Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

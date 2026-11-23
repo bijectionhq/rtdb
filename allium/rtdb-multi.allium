@@ -459,6 +459,21 @@ contract LogService {
         -- A worker opening an installed deployment uses its installed journal ensemble.
         -- A separate durability-placement decision authorises a change of journals.
 
+    @invariant InstalledJournalOwnsWriterAndRecovery
+        -- The installed journal chooses a replacement grant against its exact observed predecessor and the candidate's current enrollment.
+        -- The chosen result binds the original paid append window and a protected recovery cut.
+        -- A worker reports readiness only after materialising that exact checkpoint and applying the chosen suffix through the grant cut.
+        -- A gateway authenticates readiness against its invocation and the current installed journal grant.
+
+    @invariant InstalledCheckpointPrecedesTrim
+        -- A checkpoint custodian supplies the exact immutable provider manifest for one reconstructable RTDB checkpoint and journal cut.
+        -- The journal orders publication against the current grant before accepting trim through that cut.
+        -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
+
+    @invariant FreshJournalReadConsumesAnInvocation
+        -- The chosen read result authenticates the exact placement, writer grant, invocation and applied cut.
+        -- The receiving database applies the protected cut before the fresh read can proceed.
+
     @invariant QuorumsCountDistinctJournals
         -- Each loglet slot names a distinct durable journal.
         -- The client verifies the journal on each session before sending a journal operation.

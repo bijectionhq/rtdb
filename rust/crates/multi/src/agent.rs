@@ -50,6 +50,7 @@ impl SuffixCut<'_> {
 pub struct AgentOptions {
     pub audience_journal_port: Option<u16>,
     pub storage: CellStorage,
+    pub installed_journal_manifest: Option<std::path::PathBuf>,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
     pub replica_payload_reclamation: bool,
@@ -86,7 +87,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { audience_journal_port: None, storage, world_archive: None, s3_write_role: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { audience_journal_port: None, storage, installed_journal_manifest: None, world_archive: None, s3_write_role: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
@@ -145,8 +146,15 @@ struct LocalHolding {
     linearizable: bool,
     trimmed_through: Option<i64>,
     database: std::sync::Weak<Database>,
-    claimed_version: Version,
-    placement: tokio::sync::watch::Receiver<Option<DeploymentRecord>>,
+    authority: HoldingAuthority,
+}
+
+enum HoldingAuthority {
+    Directory {
+        claimed_version: Version,
+        placement: tokio::sync::watch::Receiver<Option<DeploymentRecord>>,
+    },
+    Journal(crate::journal::WriterAdmission),
 }
 
 struct HoldingCall {
@@ -246,6 +254,8 @@ pub struct NodeAgent {
     /// The cell's secret, which the requests that read a deployment's data or publish for it must carry a grant under.
     secret: Option<Arc<crate::capability::CellSecret>>,
     writers: crate::logs::Writers,
+    ordered: Arc<crate::journal::hosted::Routes>,
+    ordered_releases: tokio_util::task::TaskTracker,
     subscriptions: Mutex<BTreeMap<String, LocalSubscription>>,
     /// One activation, subscription or park at a time per deployment name.
     turns: Turns,
@@ -268,8 +278,8 @@ impl FlightEndpoints {
 }
 
 impl NodeAgent {
-    pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoints: FlightEndpoints, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
-        Arc::new(Self { directory, keys, node, lease, address, flight_endpoints, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
+    pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoints: FlightEndpoints, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, ordered: Arc<crate::journal::hosted::Routes>, ordered_releases: tokio_util::task::TaskTracker, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
+        Arc::new(Self { directory, keys, node, lease, address, flight_endpoints, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, ordered, ordered_releases, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
 
     pub fn member(&self) -> MemberId { self.lease.id() }
@@ -292,12 +302,15 @@ impl NodeAgent {
         use crate::read_width::{ReadLoad, ReadPlacement};
         let mut loads: Vec<_> = self.holdings.lock().values().filter_map(|holding| {
             let database = holding.database.upgrade()?;
-            let placement = holding.placement.borrow();
-            let record = placement.as_ref().filter(|record| record.id == holding.id && record.epoch == holding.epoch)?;
+            let width = match &holding.authority {
+                HoldingAuthority::Directory { placement, .. } => placement.borrow().as_ref()
+                    .filter(|record| record.id == holding.id && record.epoch == holding.epoch)?.read_width,
+                HoldingAuthority::Journal(_) => 1,
+            };
             Some(ReadLoad {
                 deployment: holding.id.clone(),
                 sessions: database.replica_read_sessions() as u64,
-                placement: ReadPlacement::Writer { epoch: holding.epoch, width: record.read_width },
+                placement: ReadPlacement::Writer { epoch: holding.epoch, width },
             })
         }).collect();
         let writer_ids: BTreeSet<_> = loads.iter().map(|load| load.deployment.clone()).collect();
@@ -334,6 +347,12 @@ impl NodeAgent {
     pub async fn activate(&self, name: &str) -> Result<Response> { self.activate_holding(name, None).await }
 
     async fn activate_holding(&self, name: &str, moving: Option<&MoveTicket>) -> Result<Response> {
+        if let Some(placement) = self.ordered.by_name(name) {
+            if moving.is_some() {
+                return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An installed journal uses its own placement decisions"));
+            }
+            return self.activate_ordered(name, placement, None).await;
+        }
         let turn = self.turn(name);
         let me = self.member();
         let mut attempted_relief = false;
@@ -410,6 +429,119 @@ impl NodeAgent {
         Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, format!("{name} kept changing while being claimed")))
     }
 
+    async fn activate_ordered(
+        &self,
+        name: &str,
+        placement: &crate::journal::hosted::Placement,
+        predecessor: Option<crate::control::OrderedPredecessor>,
+    ) -> Result<Response> {
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let route = placement.worker.route().await?;
+        let observed = crate::control::OrderedPredecessor {
+            epoch: route.writer.epoch,
+            enrollment: route.writer.grant.map(|grant| grant.enrollment),
+        };
+        let crate::journal::Authority::Worker { enrollment } = placement.worker.authority() else {
+            return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "This node has no ordered worker credential"));
+        };
+        if let Some(grant) = route.writer.grant {
+            if grant.enrollment == enrollment {
+                let mut holdings = self.holdings.lock();
+                if let Some(current) = holdings.get_mut(name).filter(|holding| {
+                    matches!(&holding.authority, HoldingAuthority::Journal(admission) if admission.grant == grant)
+                    && holding.database.upgrade().is_some_and(|database| matches!(database.status().role, DriverRole::Leading(_)))
+                }) {
+                    current.last_touch = Instant::now();
+                    return Ok(Response::Held { epoch: grant.epoch, address: self.address.clone() });
+                }
+            } else if predecessor.is_none() {
+                let endpoint = placement.endpoint(grant.enrollment).ok_or_else(|| Anomaly::incorrect(
+                    "rtdb.multi/ordered-route", "The installed writer has no authenticated worker route",
+                ))?;
+                return Ok(Response::Redirect { holder: grant.enrollment.worker.to_string(), address: endpoint.pgwire.clone() });
+            }
+        }
+        if predecessor.is_some_and(|expected| expected != observed) {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, CLAIM_CONTENDED, "The installed journal chose another writer"));
+        }
+        if self.execution_memory_pressured() {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, NODE_UNDER_PRESSURE, "The node has no execution-memory headroom for another deployment"));
+        }
+        if !self.activations.lock().admit(Instant::now(), self.options.activations_per_second) {
+            return Err(Anomaly::new(AnomalyCategory::Busy, ACTIVATION_RATE_LIMITED, "The node has reached its deployment activation rate"));
+        }
+        self.stop_running(name).await;
+        let admission = placement.nominate(&route).await?;
+        let opened = async {
+            let config = placement.configuration(admission, self.keys.as_ref()).await?;
+            let database = self.node.database_or_attach(name.to_owned(), config).await?
+                .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined the ordered database attachment"))?;
+            self.await_leadership(name, &database).await?;
+            self.await_ordered_cut(&database, placement.worker.log_epoch(), admission.recovery.through).await?;
+            if placement.worker.route().await?.writer.grant != Some(admission.grant) {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The installed journal already advanced the writer grant"));
+            }
+            Ok::<_, Anomaly>(database)
+        }.await;
+        match opened {
+            Ok(database) => {
+                let opened = Instant::now();
+                self.holdings.lock().insert(name.to_owned(), LocalHolding {
+                    id: placement.record.id.clone(), epoch: admission.grant.epoch,
+                    active_calls: 0, last_touch: opened, opened,
+                    linearizable: true, trimmed_through: None, database: Arc::downgrade(&database),
+                    authority: HoldingAuthority::Journal(admission),
+                });
+                Ok(Response::Held { epoch: admission.grant.epoch, address: self.address.clone() })
+            }
+            Err(error) => {
+                self.stop_running(name).await;
+                let _ = placement.worker.release(admission.recovery).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn authenticated_ordered_activation(&self, name: &str, activation: crate::control::OrderedActivation) -> Result<Response> {
+        let unavailable = || Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/ordered-route", "The request has no exact authenticated ordered worker route");
+        let placement = self.ordered.by_name(name).ok_or_else(unavailable)?;
+        let secret = self.secret.as_ref().ok_or_else(unavailable)?;
+        let scope = placement.worker.placement();
+        if !activation.authentic(secret, name, scope)
+            || !matches!(placement.worker.authority(), crate::journal::Authority::Worker { enrollment } if enrollment == activation.target)
+        {
+            return Err(unavailable());
+        }
+        if !activation.takeover && activation.predecessor.enrollment != Some(activation.target) {
+            return Err(unavailable());
+        }
+        let response = self.activate_ordered(name, placement, Some(activation.predecessor)).await?;
+        if let Response::Held { epoch, address } = response {
+            let proof = secret.sign_route(&activation.reply_binding(scope, epoch, &address));
+            Ok(Response::OrderedHeld { epoch, address, proof })
+        } else {
+            Ok(response)
+        }
+    }
+
+    async fn await_ordered_cut(
+        &self, database: &Database, epoch: StorageEpoch, cut: ordered_logkeeper::ordered::Cut,
+    ) -> Result<()> {
+        if cut.next_lsn == 0 { return Ok(()); }
+        let boundary = rtdb_types::ReplicaPosition::from_epoch_offset(epoch, crate::journal::latest(cut)?.0)?;
+        let mut status = database.watch_status();
+        let watch = status.wait_for(|status| status.role == DriverRole::Stopped
+            || status.installed.is_some_and(|prefix| prefix.replica >= boundary));
+        let reached = tokio::time::timeout(self.options.activation_timeout, watch).await
+            .ok().and_then(std::result::Result::ok)
+            .is_some_and(|status| status.role != DriverRole::Stopped);
+        if !reached {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/ordered-cut-not-applied", "The database did not materialize the protected journal cut"));
+        }
+        Ok(())
+    }
+
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
@@ -430,7 +562,7 @@ impl NodeAgent {
                 self.holdings.lock().insert(record.name.clone(), LocalHolding {
                     id: record.id.clone(), epoch: record.epoch, active_calls: 0, last_touch: opened, opened,
                     linearizable: record.linearizable_reads, trimmed_through: None, database: Arc::downgrade(&database),
-                    claimed_version: record.version, placement,
+                    authority: HoldingAuthority::Directory { claimed_version: record.version, placement },
                 });
                 Ok(Response::Held { epoch: record.epoch, address: self.address.clone() })
             }
@@ -463,10 +595,15 @@ impl NodeAgent {
         let unavailable = || Anomaly::new(
             AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node does not hold a linearizable database for {name}"),
         );
-        let (id, epoch) = self.holdings.lock().get(name)
+        let (id, epoch, ordered) = self.holdings.lock().get(name)
             .filter(|holding| holding.linearizable && std::ptr::eq(holding.database.as_ptr(), database))
-            .map(|holding| (holding.id.clone(), holding.epoch))
+            .map(|holding| (holding.id.clone(), holding.epoch, matches!(&holding.authority, HoldingAuthority::Journal(_))))
             .ok_or_else(unavailable)?;
+        if ordered {
+            if !matches!(check, HostedReadCheck::Ordinary) { return Err(unavailable()); }
+            database.confirm_replica_snapshot(&CancellationToken::new()).await?;
+            return Ok(id);
+        }
         let member_id = self.member();
         let record = match check {
             HostedReadCheck::Ordinary => self.directory.deployment(&id).await?,
@@ -498,6 +635,15 @@ impl NodeAgent {
     }
 
     async fn confirm_holder(&self, name: &str, id: &str, authority_port: Option<u16>) -> Result<()> {
+        let ordered = self.holdings.lock().get(name).filter(|holding| holding.id == id)
+            .filter(|holding| matches!(&holding.authority, HoldingAuthority::Journal(_)))
+            .and_then(|holding| holding.database.upgrade());
+        if let Some(database) = ordered {
+            if authority_port.is_some() {
+                return Err(Anomaly::incorrect("rtdb.multi/ordered-audience", "An ordered holder uses its protected read receipt"));
+            }
+            return database.confirm_replica_snapshot(&CancellationToken::new()).await;
+        }
         let writer = self.writers.lock().get(id).and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, format!("This node no longer holds {name}")))?;
         let confirmation = async {
@@ -568,36 +714,14 @@ impl NodeAgent {
 
     /// Flushes through the source position observed when this request starts.
     async fn flush_and_adopt(&self, database: &Arc<Database>, id: &str, epoch: u64, wait: Duration) -> Result<Arc<BlockCatalog>> {
-        let required = database.latest_submitted_position()?;
         let member = self.member();
         let mut watched = rtdb_directory::watch_deployment(self.directory.clone(), id.to_owned(), Duration::from_millis(100));
         let deposed = watched.wait_for(|snapshot| snapshot.as_ref().is_some_and(|record| {
             record.epoch > epoch || record.epoch == epoch && record.holder.as_ref() != Some(&member)
         }));
-        let flush = async {
-            let mut changes = database.watch_status();
-            loop {
-                let open = changes.borrow().open_block;
-                database.flush().await?;
-                let adopted = |status: &rtdb_replication::DriverStatus| {
-                    status.adopted_block.as_ref().is_some_and(|block| block.block_index() >= open)
-                };
-                if let Ok(status) = changes.wait_for(|status| adopted(status) || matches!(status.role, DriverRole::Stopped)).await {
-                    if let Some(block) = status.adopted_block.as_ref().filter(|_| adopted(&status))
-                        && (required.0 < 0 || block.latest_source_position().is_some_and(|position| position >= required))
-                    {
-                        return Ok(Arc::clone(block));
-                    }
-                    if !matches!(status.role, DriverRole::Stopped) { continue; }
-                }
-                return Err(database.progress().fault().unwrap_or_else(|| Anomaly::new(
-                    AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder stopped before adopting its flush",
-                )));
-            }
-        };
         tokio::select! {
             _ = deposed => Err(Anomaly::new(AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder was deposed while waiting for its flush")),
-            flushed = tokio::time::timeout(wait, flush) => flushed.unwrap_or_else(|_| {
+            flushed = tokio::time::timeout(wait, flush_local(database)) => flushed.unwrap_or_else(|_| {
                 Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/flush-timeout", "The flush did not complete in time"))
             }),
         }
@@ -606,6 +730,22 @@ impl NodeAgent {
     pub async fn flush(&self, name: &str) -> Result<Response> {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
+        if let Some(placement) = self.ordered.by_name(name) {
+            let admission = self.holdings.lock().get(name).and_then(|holding| match &holding.authority {
+                HoldingAuthority::Journal(admission) => Some(*admission),
+                HoldingAuthority::Directory { .. } => None,
+            }).ok_or_else(|| Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}")))?;
+            let database = self.node.catalog().database(name)?;
+            let checkpoint = tokio::time::timeout(self.options.activation_timeout, async {
+                let block = flush_local(&database).await?;
+                let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
+                    .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
+                placement.publish_checkpoint(self.keys.as_ref(), admission.grant, checkpoint,
+                    database.object_store().as_ref(), &self.ordered_releases).await?;
+                Ok::<_, Anomaly>(checkpoint)
+            }).await.map_err(|_| checkpoint_timeout(name))??;
+            return Ok(Response::Flushed { checkpoint });
+        }
         let (id, epoch) = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch))
             .ok_or_else(|| Anomaly::incorrect("rtdb.multi/not-held", format!("This node does not hold {name}")))?;
         let database = self.node.catalog().database(name)?;
@@ -826,6 +966,18 @@ impl NodeAgent {
     }
 
     async fn park_with_turn(&self, name: &str, moving: Option<(u64, &MoveTicket)>, flush_wait: Duration) -> Result<Response> {
+        if let Some(placement) = self.ordered.by_name(name) {
+            if moving.is_some() {
+                return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An ordered holder uses its installed journal to vacate"));
+            }
+            let admission = self.holdings.lock().get(name).and_then(|holding| match holding.authority {
+                HoldingAuthority::Journal(admission) => Some(admission),
+                HoldingAuthority::Directory { .. } => None,
+            });
+            self.stop_running(name).await;
+            if let Some(admission) = admission { placement.worker.vacate(admission.grant).await?; }
+            return Ok(Response::Done);
+        }
         let local = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch));
         let Some((id, epoch)) = local else { return self.park_resident(name, moving, None).await; };
         let is_requested = |record: &DeploymentRecord| moving.is_none_or(|(epoch, ticket)| {
@@ -1276,6 +1428,7 @@ impl NodeAgent {
 
     /// Reconciles holdings and replicas with the directory, handing off recently used holdings when draining.
     pub async fn reconcile(&self) {
+        self.reconcile_ordered().await;
         self.relieve_execution_memory(None).await;
         let local_member = self.lease.record();
         let draining = local_member.state == MemberState::Draining;
@@ -1297,8 +1450,9 @@ impl NodeAgent {
         let mut handoffs = Vec::new();
         let mut idle_flushes = 0;
         let mut suspended = 0;
-        let mut held: Vec<_> = self.holdings.lock().iter().map(|(name, holding)| {
-            (name.clone(), holding.id.clone(), holding.epoch, holding.last_touch, holding.claimed_version, holding.placement.clone(), holding.opened, holding.active_calls)
+        let mut held: Vec<_> = self.holdings.lock().iter().filter_map(|(name, holding)| {
+            let HoldingAuthority::Directory { claimed_version, placement } = &holding.authority else { return None };
+            Some((name.clone(), holding.id.clone(), holding.epoch, holding.last_touch, *claimed_version, placement.clone(), holding.opened, holding.active_calls))
         }).collect();
         held.sort_by_key(|(_, _, _, touched, _, _, _, _)| std::cmp::Reverse(*touched));
         for (rank, (name, id, epoch, last_touch, claimed_version, placement, opened, active_calls)) in held.into_iter().enumerate() {
@@ -1394,22 +1548,93 @@ impl NodeAgent {
         }
     }
 
+    async fn reconcile_ordered(&self) {
+        let mut active = Vec::new();
+        for (name, holding) in self.holdings.lock().iter() {
+            if let HoldingAuthority::Journal(admission) = &holding.authority {
+                active.push((name.clone(), *admission, holding.database.clone()));
+            }
+        }
+        for (name, admission, database) in active {
+            let Some(placement) = self.ordered.by_name(&name) else { continue; };
+            let Ok(route) = placement.worker.route().await else { continue; };
+            let running = database.upgrade().filter(|db| db.status().role != DriverRole::Stopped);
+            if route.writer.grant == Some(admission.grant) && let Some(database) = running {
+                if placement.custodian.is_some() {
+                    if let Some(block) = database.status().adopted_block
+                        && let Some(checkpoint) = checkpoint_for_block(&block, placement.worker.log_epoch())
+                        && u64::try_from(checkpoint.boundary).is_ok_and(|boundary| boundary >= route.checkpoint.cut.next_lsn)
+                    {
+                        let source = database.object_store();
+                        let publish = placement.publish_checkpoint(self.keys.as_ref(), admission.grant, checkpoint,
+                            source.as_ref(), &self.ordered_releases);
+                        let _ = tokio::time::timeout(self.options.activation_timeout, publish).await;
+                    }
+                    let current = placement.worker.route().await.unwrap_or(route);
+                    if current.writer.grant == Some(admission.grant)
+                        && current.floor.next_lsn < current.checkpoint.cut.next_lsn
+                    {
+                        let _ = placement.worker.trim(&current, admission.grant, current.checkpoint.cut).await;
+                    }
+                }
+                continue;
+            }
+            let turn = self.turn(&name);
+            let _turn = turn.lock().await;
+            let same = self.holdings.lock().get(&name).is_some_and(|holding|
+                matches!(&holding.authority, HoldingAuthority::Journal(current) if current.grant == admission.grant)
+            );
+            if same {
+                self.stop_running(&name).await;
+                let _ = placement.worker.vacate(admission.grant).await;
+            }
+        }
+    }
+
     pub async fn run(self: Arc<Self>, cancellation: CancellationToken) {
         let lost = self.lease.lost();
+        let mut directory_lease = true;
         let mut ticker = tokio::time::interval(self.options.watch_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => return,
-                _ = lost.cancelled() => {
-                    // Without a lease this node cannot know it still holds anything, so it stops serving all of it.
-                    let names: Vec<String> = self.holdings.lock().keys().chain(self.subscriptions.lock().keys()).cloned().collect();
+                _ = lost.cancelled(), if directory_lease => {
+                    directory_lease = false;
+                    let names: Vec<String> = self.holdings.lock().iter()
+                        .filter(|(_, holding)| matches!(&holding.authority, HoldingAuthority::Directory { .. }))
+                        .map(|(name, _)| name).chain(self.subscriptions.lock().keys()).cloned().collect();
                     for name in names { self.stop_running(&name).await; }
-                    return;
                 }
-                _ = ticker.tick() => self.reconcile().await,
+                _ = ticker.tick() => {
+                    if directory_lease { self.reconcile().await; }
+                    else { self.reconcile_ordered().await; }
+                },
             }
         }
+    }
+}
+
+async fn flush_local(database: &Database) -> Result<Arc<BlockCatalog>> {
+    let required = database.latest_submitted_position()?;
+    let mut changes = database.watch_status();
+    loop {
+        let open = changes.borrow().open_block;
+        database.flush().await?;
+        let adopted = |status: &rtdb_replication::DriverStatus| {
+            status.adopted_block.as_ref().is_some_and(|block| block.block_index() >= open)
+        };
+        if let Ok(status) = changes.wait_for(|status| adopted(status) || matches!(status.role, DriverRole::Stopped)).await {
+            if let Some(block) = status.adopted_block.as_ref().filter(|_| adopted(&status))
+                && (required.0 < 0 || block.latest_source_position().is_some_and(|position| position >= required))
+            {
+                return Ok(Arc::clone(block));
+            }
+            if !matches!(status.role, DriverRole::Stopped) { continue; }
+        }
+        return Err(database.progress().fault().unwrap_or_else(|| Anomaly::new(
+            AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder stopped before adopting its flush",
+        )));
     }
 }
 
@@ -1455,6 +1680,7 @@ impl Handler for NodeAgent {
     async fn handle(&self, request: Request) -> Response {
         let result = match request {
             Request::Activate { name } => self.activate(&name).await,
+            Request::ActivateOrdered { name, activation } => self.authenticated_ordered_activation(&name, activation).await,
             Request::ActivateForMove { name, ticket } => self.activate_holding(&name, Some(&ticket)).await,
             Request::Park { name } => self.park(&name).await,
             Request::ParkForMove { name, epoch, ticket } => self.park_holding(&name, Some((epoch, &ticket))).await,
