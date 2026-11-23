@@ -182,7 +182,7 @@ async fn copy_fork_suffix(
             let (point, manifest) = capture_receipt(&current, archive, deployment, capture)?
                 .ok_or_else(OwnedWorld::unavailable)?;
             let (base, _) = replica_suffix::read_base_catalog(
-                archive.bucket(Arc::clone(&io)).await?, &point, &manifest, keys,
+                archive.bucket(Arc::clone(&io)).await?, &point, &manifest, keys, Arc::clone(&io),
             ).await?;
             agent.pin_held_fork_suffix(
                 &source.name, deployment, capture, cut, keys, &base, io, expires_at_ms,

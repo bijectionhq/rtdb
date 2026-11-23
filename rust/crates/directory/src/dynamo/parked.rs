@@ -6,6 +6,7 @@ use crate::{CatalogAdmissionFloor, Checkpoint, DeploymentRecord, JournalAnchor, 
 
 const WIRE_VERSION: u8 = 1;
 const BOUND_JOURNAL_VERSION: u8 = 2;
+const PLACED_RECEIPT_VERSION: u8 = 3;
 
 #[derive(Clone, PartialEq, Message)]
 struct ParkedDeployment {
@@ -41,6 +42,8 @@ struct ParkedDeployment {
     s3_write_lease_until_ms: Option<i64>,
     #[prost(string, optional, tag = "16")]
     engine_pin: Option<String>,
+    #[prost(bool, tag = "22")]
+    placed_receipt_retirement: bool,
     #[prost(string, repeated, tag = "17")]
     replica_journals: Vec<String>,
     #[prost(sint64, optional, tag = "18")]
@@ -110,8 +113,8 @@ struct PackedJournalAnchor {
 pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
     let DeploymentRecord {
         id, name: _, org, lineage, incarnation, lifecycle, epoch: _, holder, resident_idle: _, ensemble, created_at_ms, read_width,
-        activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, recovery_manifest_sha256, replica_anchor, storage_generation,
-        storage_namespaces, s3_write_lease_until_ms, engine_pin, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
+        activation_crashes, log_epoch, parent, linearizable_reads, checkpoint, recovery_manifest_sha256, replica_anchor, replica_payload_trim, storage_generation,
+        storage_namespaces, s3_write_lease_until_ms, engine_pin, placed_receipt_retirement, deletion_observation, move_intent, placement_move, move_from, log_copy_servers, cell_move, moved_at_ms,
         source_cleanup, deletion_record, replica_journals, storage_regions, catalog_readers, catalog_admission_floors, ordered_indexes, ordered_index_catalogs,
         cell_transfer, disposal, checkpoint_recovery, serving_replay_capture,
         checkpoint_stage, checkpoint_transfer_fence, checkpoint_transfer_terminal, checkpoint_transfer_bootstrap, checkpoint_transfer_replica, checkpoint_transfer_activation, hosted_fork_stage, checkpoint_repair_receipts, checkpoint_captures, checkpoint_worlds, checkpoint_suffix_pins, checkpoint_capture_retirements,
@@ -121,7 +124,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         || move_intent.is_some() || placement_move.is_some() || move_from.is_some() || cell_move.is_some()
         || moved_at_ms.is_some() || source_cleanup.is_some() || deletion_observation.is_some() || deletion_record.is_some() || !log_copy_servers.is_empty()
         || !storage_regions.is_empty() || !catalog_readers.is_empty() || cell_transfer.is_some() || disposal.is_some() || checkpoint_recovery.is_some() || serving_replay_capture.is_some()
-        || !ordered_indexes.is_empty() || !ordered_index_catalogs.is_empty()
+        || !ordered_indexes.is_empty() || !ordered_index_catalogs.is_empty() || replica_payload_trim.is_some()
         || checkpoint_stage.is_some() || checkpoint_transfer_fence.is_some() || checkpoint_transfer_terminal.is_some() || checkpoint_transfer_bootstrap.is_some() || checkpoint_transfer_replica.is_some() || checkpoint_transfer_activation.is_some() || hosted_fork_stage.is_some() || !checkpoint_repair_receipts.is_empty() || !checkpoint_capture_retirements.is_empty()
         || !retired_residences.is_empty() || !checkpoint_captures.is_empty() || !checkpoint_worlds.is_empty() || !checkpoint_suffix_pins.is_empty() || archive_retirement.is_some()
     {
@@ -152,7 +155,13 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
             JournalEndpoint::Address(address) => unbound_journals.push(address.clone()),
         }
     }
-    let wire_version = if bound_journals.is_empty() { WIRE_VERSION } else { BOUND_JOURNAL_VERSION };
+    let wire_version = if *placed_receipt_retirement {
+        PLACED_RECEIPT_VERSION
+    } else if bound_journals.is_empty() {
+        WIRE_VERSION
+    } else {
+        BOUND_JOURNAL_VERSION
+    };
     let packed = ParkedDeployment {
         org: org.clone(),
         lineage: (lineage != id).then(|| lineage.clone()),
@@ -188,6 +197,7 @@ pub(super) fn encode(record: &DeploymentRecord) -> Option<Vec<u8>> {
         compaction_replay_cutoff: *compaction_replay_cutoff,
         s3_write_lease_until_ms: *s3_write_lease_until_ms,
         engine_pin: engine_pin.clone(),
+        placed_receipt_retirement: *placed_receipt_retirement,
     };
     let mut encoded = Vec::with_capacity(1 + packed.encoded_len());
     encoded.push(wire_version);
@@ -200,10 +210,13 @@ fn invalid(message: impl Into<String>) -> Anomaly {
 }
 
 pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Version) -> Result<DeploymentRecord> {
-    let Some((&wire_version @ (WIRE_VERSION | BOUND_JOURNAL_VERSION), body)) = bytes.split_first() else {
+    let Some((&wire_version @ (WIRE_VERSION | BOUND_JOURNAL_VERSION | PLACED_RECEIPT_VERSION), body)) = bytes.split_first() else {
         return Err(invalid("Unknown parked record version"));
     };
     let packed = ParkedDeployment::decode(body).map_err(|error| invalid(error.to_string()))?;
+    if packed.placed_receipt_retirement != (wire_version == PLACED_RECEIPT_VERSION) {
+        return Err(invalid("Placed receipt retirement requires parked record version 3"));
+    }
     if wire_version == WIRE_VERSION && !packed.bound_journals.is_empty() {
         return Err(invalid("Bound journals require parked record version 2"));
     }
@@ -283,6 +296,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         checkpoint,
         recovery_manifest_sha256,
         replica_anchor,
+        replica_payload_trim: None,
         moved_at_ms: None,
         source_cleanup: None,
         cell_move: None,
@@ -291,6 +305,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         s3_write_lease_until_ms: packed.s3_write_lease_until_ms,
         deletion_observation: None,
         engine_pin: packed.engine_pin,
+        placed_receipt_retirement: packed.placed_receipt_retirement,
         deletion_record: None,
         replica_journals,
         storage_regions: Default::default(),
@@ -361,10 +376,14 @@ mod tests {
     }
 
     #[test]
-    fn parking_preserves_the_engine_pin() {
+    fn parking_preserves_the_engine_pin_and_placed_receipt_format() {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 1_000);
         record.engine_pin = Some("rtdb-2026.11.2".into());
-        let bytes = encode(&record).unwrap();
+        record.placed_receipt_retirement = true;
+        let mut bytes = encode(&record).unwrap();
+        assert_eq!(bytes[0], PLACED_RECEIPT_VERSION);
         assert_eq!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).unwrap(), record);
+        bytes[0] = BOUND_JOURNAL_VERSION;
+        assert!(decode(&bytes, &record.id, &record.name, record.epoch, record.version).is_err());
     }
 }

@@ -83,11 +83,11 @@ impl LivePostingPage {
                 for (term, frequency) in frequencies {
                     let score = rtdb_text::unit_term_score(frequency);
                     let (rows, peak) = postings.entry(term.to_owned()).or_insert_with(|| {
-                        (Vec::new(), crate::rank_cutoff::RankKey { score, id })
+                        (Vec::new(), crate::rank_cutoff::RankKey::integer(score, id))
                     });
                     rows.push(row);
                     if score > peak.score {
-                        *peak = crate::rank_cutoff::RankKey { score, id };
+                        *peak = crate::rank_cutoff::RankKey::integer(score, id);
                     } else if score == peak.score {
                         peak.id = peak.id.zip(id).map(|(left, right)| left.min(right));
                     }
@@ -136,7 +136,7 @@ impl LivePostingPage {
                 _ => self.minimum_id,
             }
         } else { None };
-        Some(crate::rank_cutoff::RankKey { score, id })
+        Some(crate::rank_cutoff::RankKey::integer(score, id))
     }
 
     pub(crate) fn visit(&self, query: &rtdb_text::Query, phrases: bool,

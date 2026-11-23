@@ -42,6 +42,7 @@ impl NodeConfiguration {
         options.compaction.page_size = self.indexer.page_limit;
         options.compaction.run_end_encoded_iids = self.compactor.run_end_encoded_iids;
         options.compaction.within_file_recency_branching = self.compactor.within_file_recency_branching;
+        options.compaction.scan_tie_order_from_naming_epoch = self.compactor.scan_tie_order_from_naming_epoch;
         options.compaction_threads = if self.fixed_databases.is_some() { 0 } else { self.compactor.threads };
         options.garbage.blocks_to_keep = self.garbage.blocks_to_keep;
         options.garbage.garbage_lifetime = self.garbage.garbage_lifetime;

@@ -8,7 +8,7 @@ use rtdb_text::Scorer;
 use tokio::sync::OnceCell;
 
 use super::*;
-use crate::file::{TREE_FORMAT_VERSION, TreeFile, TreeLocator, TreeRanked};
+use crate::file::{TREE_FORMAT_VERSION, TreeFile, TreeLocator, TreeRankOrder, TreeRanked};
 
 struct RecordedTree {
     key: ObjectKey,
@@ -121,16 +121,21 @@ impl Frontier {
 }
 
 fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() -> arrow_array::StringArray,
-    request: &ScanRequest<'_>, scorer: &Scorer, ordered_ids: bool, scope: Option<&BTreeSet<Iid>>) -> Result<Option<(RankKey, Nomination)>> {
+    request: &ScanRequest<'_>, scorer: &Scorer, order: TreeRankOrder, scope: Option<&BTreeSet<Iid>>) -> Result<Option<(RankKey, Nomination)>> {
     if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
     let header = segment.header(row)?;
     if scope.is_some_and(|scope| !scope.contains(&header.iid)) || !may_be_visible(header.valid_time.lower().0,
         header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { return Ok(None); }
-    let id = if ordered_ids {
-        let source = segment.row(row)?;
-        crate::lane::integer_sql_id(&source.batch.view().borrow_event(source.row)?)
-    } else { None };
-    Ok(Some((RankKey { score: scorer.bm25_arrow(&tokens()), id }, Nomination {
+    let score = scorer.bm25_arrow(&tokens());
+    let key = match order {
+        TreeRankOrder::Integer => {
+            let source = segment.row(row)?;
+            RankKey::integer(score, crate::lane::integer_sql_id(&source.batch.view().borrow_event(source.row)?))
+        }
+        TreeRankOrder::Uuid => RankKey::uuid(score, header.iid.0),
+        TreeRankOrder::Score => RankKey::integer(score, None),
+    };
+    Ok(Some((key, Nomination {
         iid: header.iid, source: None, visibility: Vec::new(),
     })))
 }
@@ -158,7 +163,7 @@ async fn visible(runtime: &crate::SearchRuntime, request: &ScanRequest<'_>, defi
 impl SearchAccelerator {
     pub(super) async fn tree_top_k(&self, request: &ScanRequest<'_>, definition: &SearchDefinition, column: &str,
         column_id: ColumnId, matching: &Query, scoring_query: Query, ascending_id: Option<ColumnId>,
-        limit: usize, scope: Option<&BTreeSet<Iid>>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        permit_uuid_order: bool, limit: usize, scope: Option<&BTreeSet<Iid>>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         if request.partitions.len() != 1 || !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point() {
             work.tree_decline = Some("unsupported-snapshot");
             return Ok(None);
@@ -181,6 +186,13 @@ impl SearchAccelerator {
         let TrieFiles::Complete(Found { files, .. }) = self.trie_files(request, definition, column, &[matching, scorer.query()],
             LoadSearch::Rank, Some(&tree_tries)).await? else { work.tree_decline = Some("coverage"); return Ok(None); };
         let keep_ids = ascending_id.is_some();
+        let order = if keep_ids {
+            TreeRankOrder::Integer
+        } else if permit_uuid_order && files.is_empty() && sources.iter().all(|source| source.locator.has_canonical_uuid_iids()) {
+            TreeRankOrder::Uuid
+        } else {
+            TreeRankOrder::Score
+        };
         let mut legacy = by_file(&files).map(|selected| {
             let rank = selected.file.ranked_for_query(column, matching, &ranking, request.bounds, keep_ids)?;
             Ok((selected, rank))
@@ -192,7 +204,7 @@ impl SearchAccelerator {
         let mut ranks = (0..sources.len()).map(|_| OnceLock::new()).collect::<Vec<OnceLock<TreeRanked>>>();
         for (index, source) in sources.iter().enumerate() {
             if source.discovery && matching.terms().iter().all(|term| source.locator.might_contain(column_index as u32, term)) {
-                frontier.push(RankKey { score: f64::INFINITY, id: None }, Task::Open(index));
+                frontier.push(RankKey::integer(f64::INFINITY, None), Task::Open(index));
             }
         }
         let mut reservation = request.memory.reserve(4096)?;
@@ -201,13 +213,13 @@ impl SearchAccelerator {
         for (index, segment) in segments.iter().enumerate() {
             let (pages, covered) = self.runtime.live_pages(request.database, segment, column);
             for page in pages {
-                if let Some(bound) = page.bound(matching, scorer.query(), ascending_id.is_some()) {
+                if let Some(bound) = page.bound(matching, scorer.query(), keep_ids) {
                     frontier.push(bound, Task::Live(index, page));
                 }
             }
             work.uncovered_live_rows += (segment.row_count() - covered) as usize;
             let complete = crate::SearchRuntime::visit_live_suffix(segment, column, matching, true, covered, request.cancellation, |row, tokens| {
-                if let Some((key, nomination)) = nominate_live(segment, row, tokens, request, &scorer, ascending_id.is_some(), scope)? {
+                if let Some((key, nomination)) = nominate_live(segment, row, tokens, request, &scorer, order, scope)? {
                     nominated += 1;
                     if nominated % 128 == 1 { reserve_ranking(&mut reservation, nominated + 128)?; }
                     frontier.push(key, Task::Verify(nomination));
@@ -234,11 +246,12 @@ impl SearchAccelerator {
                 work.verifier_rows += to_verify.len();
                 let scores = request.verifier.score_visible(std::mem::take(&mut to_verify), column_id, ascending_id, &scorer).await?;
                 for (iid, score, id) in scores.ranked() {
-                    verified.push((RankKey { score, id }, iid));
+                    let key = if order == TreeRankOrder::Uuid { RankKey::uuid(score, iid.0) } else { RankKey::integer(score, id) };
+                    verified.push((key, iid));
                     if let Some(row) = scores.row(iid) { rows.insert(iid, row); }
                 }
                 if let Some(kth) = verified_cutoff(&mut verified, limit) {
-                    if kth.id.is_some() { verified.truncate(limit); }
+                    if kth.has_id() { verified.truncate(limit); }
                     else { verified.retain(|(key, _)| !key.score_order(kth).is_lt()); }
                     let winners: BTreeSet<_> = verified.iter().map(|(_, iid)| *iid).collect();
                     rows.retain(|iid, _| winners.contains(iid));
@@ -252,7 +265,7 @@ impl SearchAccelerator {
                     let source = &sources[index];
                     let opened = async {
                         let file = source.open(&self.runtime, request, definition).await?;
-                        TreeRanked::open(file, column_index, matching, &ranking, request.bounds, ascending_id.is_some()).await
+                        TreeRanked::open(file, column_index, matching, &ranking, request.bounds, order).await
                     }.await;
                     let rank = match opened { Ok(rank) => rank, Err(error) => {
                         source.report(&self.runtime, request, definition, &error); work.tree_decline = Some("recorded-root"); return Ok(None);
@@ -274,7 +287,7 @@ impl SearchAccelerator {
                     if let Some(bound) = rank.bound() { frontier.push(bound, Task::Expand(index)); }
                     frontier.nominate_batch(candidates.into_iter().filter(|candidate| sources[index].members.contains_key(&candidate.member))
                         .map(|candidate| {
-                            let key = RankKey { id: if keep_ids { candidate.key.id } else { None }, ..candidate.key };
+                            let key = candidate.key;
                             (key, Nomination { iid: candidate.iid, source: Some(index), visibility: candidate.rectangles })
                         }));
                 }
@@ -292,14 +305,14 @@ impl SearchAccelerator {
                     for (run, score) in hits.iter() {
                         if !selected.members.contains_key(&run.member) { continue; }
                         let id = keep_ids.then(|| selected.file.integer_id(run)).flatten();
-                        frontier.push(RankKey { score, id }, Task::Verify(Nomination {
+                        frontier.push(RankKey::integer(score, id), Task::Verify(Nomination {
                             iid: Iid(run.iid), source: None, visibility: Vec::new(),
                         }));
                     }
                 }
                 Task::Live(index, page) => {
                     let complete = page.visit(matching, true, |row, tokens| {
-                        if let Some((key, nomination)) = nominate_live(segments[index], row, tokens, request, &scorer, ascending_id.is_some(), scope)? {
+                        if let Some((key, nomination)) = nominate_live(segments[index], row, tokens, request, &scorer, order, scope)? {
                             nominated += 1;
                             if nominated % 128 == 1 { reserve_ranking(&mut reservation, nominated + 128)?; }
                             frontier.push(key, Task::Verify(nomination));

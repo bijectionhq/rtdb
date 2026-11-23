@@ -225,6 +225,10 @@ pub trait ObjectStore: Send + Sync {
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
+    async fn put_replica_payload(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        self.put(key, bytes).await?;
+        Ok(None)
+    }
     /// Returns the identity from the successful write or from the read that verified an identical existing object.
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.put(key, bytes).await?;

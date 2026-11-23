@@ -10,6 +10,7 @@ pub enum AwaitAuthority {
     Live {
         codec: Box<dyn PlacedReceiptCodec>,
         recovery: ClosedEpochRecovery,
+        placed_receipt_retirement: bool,
     },
     Checkpoint {
         codec: Box<dyn PlacedReceiptCodec>,

@@ -17,10 +17,13 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Coordinates
 
-History uses transaction system time, bounded by the log clock, and drives no physical decision.
+Commit order uses the ordered transaction position.
+The exact append-clock reading is a separate observation.
+Temporal SQL uses a strictly increasing system-time projection, which can advance by one chronon when an append-clock reading ties or regresses.
+A client-supplied ordinary system time is bounded by the append-clock observation.
 Reclamation uses a monotone catalog generation recorded by the residence ledger.
 Node-local monotonic durations only expire the holds of readers that stop renewing them.
-Receipt expiry uses the record's log time.
+Receipt expiry uses the highest append-clock observation installed in the current history.
 Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
 
 == Mechanisms
@@ -30,7 +33,8 @@ Erasure starts at publication of the erasing generation and uses the custody aut
 |Tension |Replacement |Deleted
 
 |System time as a physical clock
-|A client time is admitted only when it advances the head and does not exceed the log append time.
+|An ordinary client time is admitted only when it advances the head and does not exceed the log append time.
+An owned append witness compares against the exact log observation and uses the ordered system-time projection.
 An external source's commit time is clamped to the node clock.
 |Unbounded future client times and the resulting overflow cliff.
 
@@ -116,6 +120,9 @@ Pending archive captures protect their journal interval until archive publicatio
 Recovery can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
 Enrolled terminal storage can retire loose files with a write witness and an installed release.
+Opted-in versioned S3 deployments retire exact oversized replica payloads after a certified directory cut and fsync-backed trim from every known physical journal.
+Normal readers hold those payloads through provider drain.
+Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 Full recovery closures, compactor reset, terminal pack coverage and live provider qualification remain open.
 
 |6
@@ -124,11 +131,13 @@ Full recovery closures, compactor reset, terminal pack coverage and live provide
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
-|Modeled after the second review
+|The operation-only local archive broker persists scheduled capture-key revocation and attests physical settlement on the original media.
+The live serving and replay paths still require bounded key grants and readable successor roots to make a deadline commitment for SQL erasure.
 
 |8
 |Transaction metadata retention.
-|Planned
+|Ordered receipt expiry, historical transaction projection and native logical collection.
+Physical copy closure remains open.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
@@ -144,6 +153,14 @@ The checkpoint carries that witness into recovery.
 The SQL connection issues a provisional receipt for asynchronous submission and exchanges it for a causal token after verifying the installed outcome.
 Synchronous commits issue the causal token alongside the verified outcome.
 A frozen attachment can confirm a token from the verified checkpoint it loaded.
+A receipt stops redeeming when the installed source-log clock reaches its cutoff.
+The applied prefix continues to serve as a causal token.
+For a parked deployment, an operator who has qualified every eligible serving and recovery image can pin a compatible engine and run `rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME`.
+The engine reports support as `placed_receipt_retirement: true` in `rtdb-multi --build-info`.
+The next activation writes the versioned outcome format, including ordered collection of expired outcome rows.
+The deployment remains pinned to a compatible release.
+Later logical erasure leaves physical copies subject to the exact custody of their source logs, replica logs, checkpoints and archives.
+See link:../../verification/redesign/R8-metadata-retention.md[receipt retention and custody].
 Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
 An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
 The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.

@@ -120,6 +120,7 @@ impl Trial {
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let node_cancellation = cancellation.child_token();
             let context = Arc::new(ResolveContext {
+                placed_receipt_retirement: false,
                 owned_witness_scope: None,
                 world_constraints: None,
                 database: "test-db".into(), memory: memory.scope(), storage: cache,

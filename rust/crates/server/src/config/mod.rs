@@ -41,7 +41,12 @@ pub struct DiskCacheSettings { pub path: PathBuf, pub maximum_bytes: Option<u64>
 #[derive(Clone, Debug)]
 pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub rows_per_block: u64, pub flush_duration: Duration, pub skip_transactions: BTreeSet<SourcePosition>, pub enabled: bool }
 #[derive(Clone, Debug)]
-pub struct CompactorSettings { pub threads: usize, pub run_end_encoded_iids: bool, pub within_file_recency_branching: bool }
+pub struct CompactorSettings {
+    pub threads: usize,
+    pub run_end_encoded_iids: bool,
+    pub within_file_recency_branching: bool,
+    pub scan_tie_order_from_naming_epoch: Option<std::num::NonZeroU64>,
+}
 /// Full-text search's index lane; with it off, `MATCH` is still answered, by scanning.
 #[derive(Clone, Debug)]
 pub struct SearchSettings { pub enabled: bool, pub threads: usize, pub write_format: rtdb_node::SearchFileFormat }
@@ -231,8 +236,11 @@ fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>)
     let threads = fields.integer("threads")?.unwrap_or(default_threads).max(0) as usize;
     let run_end_encoded_iids = fields.boolean("reeIids")?.unwrap_or_else(|| env_boolean(environment, "XTDB_REE_IIDS"));
     let within_file_recency_branching = fields.boolean("withinFileRecencyBranching")?.unwrap_or_else(|| env_boolean(environment, "XTDB_WITHIN_FILE_RECENCY_BRANCHING"));
+    let scan_tie_order_from_naming_epoch = fields.integer("scanTieOrderFromNamingEpoch")?
+        .map(|epoch| u64::try_from(epoch).ok().and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| invalid("compactor.scanTieOrderFromNamingEpoch must be positive"))).transpose()?;
     fields.finish()?;
-    Ok(CompactorSettings { threads, run_end_encoded_iids, within_file_recency_branching })
+    Ok(CompactorSettings { threads, run_end_encoded_iids, within_file_recency_branching, scan_tie_order_from_naming_epoch })
 }
 fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;

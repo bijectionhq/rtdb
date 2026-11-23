@@ -3,13 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{data::StoredOperation, generated::xtdb::log::proto::ResolvedTx};
+use rtdb_format::{data::StoredOperation, envelope::decode_replica_outcome_attempt, generated::xtdb::log::proto::ResolvedTx};
 use rtdb_index::{IndexBatch, StagedWrite, TableWrite};
 use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 use crate::{RetainedAnomaly, TransactionResult};
 
 pub(crate) mod worlds;
+
+const MAX_RETIRED_OUTCOMES: usize = 128;
 
 pub struct ReplayedTransaction {
     pub writes: StagedWrite,
@@ -19,16 +21,21 @@ pub struct ReplayedTransaction {
 
 /// Decodes the complete transaction for atomic application by the caller.
 pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
-    let placed_attempt = if let Some(placed) = message.placed_attempt.as_deref() {
-        let attempt = PlacedAttempt::decode(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
+    let placed = if let Some(placed) = message.placed_attempt.as_deref() {
+        let (attempt, retirement) = decode_replica_outcome_attempt(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
         let position = Some(attempt.position().0);
         if message.src_msg_id != position || message.tx_id != position
             || !message.table_data.contains_key(&format!("xt/{PLACED_ATTEMPT_OUTCOME_TABLE}"))
         {
             return Err(invalid("Placed attempt and transaction outcome disagree"));
         }
-        Some(attempt)
-    } else { None };
+        Some((attempt, retirement))
+    } else {
+        if message.table_data.contains_key(&format!("xt/{PLACED_ATTEMPT_OUTCOME_TABLE}")) {
+            return Err(invalid("Outcome table has no placed attempt authority"));
+        }
+        None
+    };
     let key = TransactionKey { tx_id: TxId(message.tx_id.unwrap_or_default()), system_time: Timestamp(message.system_time_micros.unwrap_or_default()) };
     let result = if message.committed.unwrap_or_default() {
         TransactionResult::Committed { tx_key: key }
@@ -73,7 +80,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
         }
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
     }
-    let outcome = placed_attempt.map(|attempt| read_placed_outcome(&tables, attempt, key, memory)).transpose()?;
+    let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, key, memory)).transpose()?;
     let proof = outcome.as_ref().map(|(proof, _)| proof);
     let world_effects = proof.and_then(|proof| proof.get(worlds::WORLD_EFFECTS));
     if owned_owner.is_some() {
@@ -142,18 +149,18 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
     } else if matches!(world_effects, Some(value) if !matches!(value, Value::Undefined | Value::Null)) {
         return Err(invalid("Placed world inventory has no owned effects"));
     }
-    Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt })
+    Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: placed.map(|(attempt, _)| attempt) })
 }
 
 fn read_placed_outcome(
-    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, key: TransactionKey,
+    tables: &BTreeMap<TableRef, TableWrite>, attempt: PlacedAttempt, retirement: bool, key: TransactionKey,
     memory: &Arc<MemoryBudget>,
 ) -> Result<(StructFields<Value>, Arc<rtdb_columnar::MemoryReservation>)> {
     let mismatch = || invalid("Resolved owned effects differ from their ordered placed attempt");
     let outcome = tables
         .get(&TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE))
         .and_then(TableWrite::batch)
-        .filter(|batch| batch.len() == 1)
+        .filter(|batch| if retirement { (1..=MAX_RETIRED_OUTCOMES + 1).contains(&batch.len()) } else { batch.len() == 1 })
         .ok_or_else(mismatch)?;
     let decode = memory.reserve(
         outcome
@@ -163,12 +170,24 @@ fn read_placed_outcome(
             .and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(mismatch)?,
     )?;
-    let event = outcome.view().read_event(0)?;
-    let StoredOperation::Put(proof) = event.operation else {
-        return Err(mismatch());
-    };
-    if event.system_from != key.system_time
-        || !matches!(proof.get("_id"), Some(Value::Utf8(id)) if id == &attempt.outcome_key())
+    let mut proof = None;
+    let mut retired = BTreeSet::new();
+    let expected = Value::Utf8(attempt.outcome_key()).entity_id()?.iid();
+    for row in 0..outcome.len() {
+        let header = outcome.header(row)?;
+        if header.system_from != key.system_time || header.commit_position != 0 { return Err(mismatch()); }
+        if retirement && header.op == EventOp::Erase
+            && header.valid_time == Interval::ALL && header.iid != expected && retired.insert(header.iid)
+        {
+            continue;
+        }
+        if header.op != EventOp::Put || header.iid != expected || proof.is_some() { return Err(mismatch()); }
+        let event = outcome.view().read_event(row)?;
+        let StoredOperation::Put(row) = event.operation else { return Err(mismatch()); };
+        proof = Some(row);
+    }
+    let proof = proof.ok_or_else(mismatch)?;
+    if !matches!(proof.get("_id"), Some(Value::Utf8(id)) if id == &attempt.outcome_key())
         || proof.get("tx_id") != Some(&Value::I64(key.tx_id.0))
         || !matches!(proof.get("tx_system_time"), Some(Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, .. }) if *value == key.system_time.0)
     {

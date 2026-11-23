@@ -187,7 +187,7 @@ Sources include [trie GC](gc.allium), [block GC](block-gc.allium), [offline main
 - **GC03 · Trie deletion order.** Trie cleanup follows its prescribed order of physical deletion and replica-log publication, preserving live file references for the covered readers.
 - **GC04 · Trie cleanup convergence.** Retrying an interrupted trie cleanup is safe, and followers applying its admitted record reach equivalent catalogs.
 - **GC05 · Block retention.** Block GC preserves the current database and per-table checkpoint files and the retained startup or catch-up set required by policy.
-- **GC06 · Referenced replica payloads.** Offloaded payloads remain readable for the supported lag window, and an unavailable required payload prevents silent advancement.
+- **GC06 · Referenced replica payloads.** Offloaded payloads remain readable for retained replica records and admitted replay, and an unavailable required payload prevents silent advancement.
 - **GC07 · Snapshot export.** A completed export identifies the selected recoverable block and copies its required objects consistently across retries.
 - **GC08 · Compactor reset.** Given the required exclusive window, reset adopts the selected replacement catalog before deletion and preserves recoverability at interruption points covered by the contract.
 - **GC09 · Logical erase and physical disposal.** The erase visibility guarantee and the separate physical deletion or key-destruction guarantees hold at their documented completion points.

@@ -502,8 +502,12 @@ contract LogService {
         -- Before writing, the holder activates a durable write quorum for the epoch, the member identities and the configured quorum size.
         -- A journal acknowledges activation only at its promised and synced epoch and records at most one ensemble for that epoch.
         -- A higher promise revokes the activation.
-        -- A positive read-index reply requires that activation and reports the last held position after preceding journal work is durable.
-        -- A read index takes the maximum last held position from an intersecting write quorum of positive replies.
+        -- A positive read-index reply requires that activation and reports the last held and published positions after preceding journal work is durable.
+        -- A read index requires an intersecting write quorum of positive replies.
+        -- Its upper bound includes every position that could have been held by a write quorum before the read began.
+        -- Unobserved journal slots count as possible holders, so each additional positive reply can rule out a minority tail.
+        -- A published position or a position held by a full observed quorum can discharge that uncertainty.
+        -- If the round cannot settle the uncertainty within its confirmation grace, it returns the conservative bound.
         -- A subscriber waits for committed application through the result before taking its query snapshot.
 
     @invariant TrimFollowsPublication
@@ -1336,6 +1340,9 @@ rule ConsumeIntake {
 --
 -- A flush writes one pack and one manifest under the holder's epoch, commits BlockUploaded, then publishes the checkpoint.
 -- The log record is the commit point for readers; the directory checkpoint is the commit point for trimming and cold start.
+-- A timestamp fork admits the checkpoint and takes an active-loglet read bound under the same replay hold.
+-- It applies the source term fence and waits for contiguous committed delivery up to the bound or an admitted transaction later than the requested time.
+-- The fork validates the source frame before removing source-scoped placed outcome and strict acceptance evidence from its new log.
 --
 -- An owned-point checkpoint world reads one exact transaction from an accepted independent capture.
 -- Its locator binds the deployment, capture, manifest digest and complete transaction key.
@@ -1535,6 +1542,11 @@ rule TrimCertifiedReplicaPrefix {
     -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
     -- Archive certification covers every replica offset and replay applies only the messages admitted by the checkpoint's term fence.
     -- Fenced, discarded and voided records survive a transfer at their original offsets and require no offloaded payload.
+    -- Terminal certification and bootstrap preparation hold the same exact source replay interval through their provider reads.
+    -- An admitted offloaded body supplies replay bytes after its digest matches the certified outer frame.
+    -- The target holds each independently authenticated detached body under its own key before committing the page that names it.
+    -- In-flight bootstraps issued in the inline format remain readable under their original ordered receipt.
+    -- After transfer, a holder starts intake beyond the exact terminal source position and any possible source positions consumed after its paired replica offset.
     when: ReplicaPrefixCertified(holding, through, digest)
 
     requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
@@ -1577,6 +1589,15 @@ rule ReleaseReplicaReplay {
             replica_replays: record.replica_replays - {replay}
         })
 }
+
+-- A serving cursor admits an offloaded delivery before exposing its pointer.
+-- Startup and ordinary delivery use the same directory trim frontier.
+-- The delivered pointer retains the replay hold until its provider read drains or the pointer is discarded.
+-- An inline delivery after startup consumes no replay hold.
+-- A replica payload release identifies the exact publication carried by a certified replica entry.
+-- Provider deletion requires the directory to record trim completion for every journal in the authorized inventory.
+-- A provider retry names the same publication until settlement is recorded.
+-- A checkpoint fork references checkpoint objects and gives any replayed payload its own journal custody.
 
 ------------------------------------------------------------
 -- Rules: compaction
@@ -2694,6 +2715,11 @@ rule HostedCheckpointCapture {
     -- A new hold may cover the published checkpoint or inherit uninterrupted coverage from an older admission.
     -- The hold persists until its provider work drains. A verified existing archive can be returned after the source hold ends.
     -- The source plan is checked against the full exact body observation before resealing each member.
+    -- Discovery runs under a lineage preparation.
+    -- A complete versioned plan registers its exact publications with their physical owners before releasing the lineage preparation.
+    -- Those holds last through provider drain.
+    -- A plan without complete version evidence retains the lineage preparation.
+    -- Unrelated provider versions remain eligible for retirement during the copy.
     -- A serving read supplied by an archive carries the archive's physical identity.
     -- The capture region retains its destination and its serving archive source independently.
     -- A local source copy holds the cell maintenance witness through admitted I/O.
@@ -2709,8 +2735,66 @@ rule HostedCheckpointCapture {
             ReturnOriginalCaptureReceipt(authority, capture_id)
         else:
             RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+            BindOriginalArchiveKeyAuthority(authority, capture_id)
             SealArchiveWithCaptureKey(authority, capture_id)
             RetainAndReturnExactCheckpointAndManifestDigest(authority, capture_id)
+}
+
+rule PrepareCheckpointCaptureDiscard {
+    -- A preparation names one capture in its original archive authority.
+    -- It closes further admission while admitted storage regions retain provider access through drain.
+    -- The capture and its dependent suffixes share one archived media key.
+    when: AuthenticatedCaptureDiscard(operator, authority, capture)
+
+    requires: OriginalArchiveAuthority(authority, capture)
+              and NoRetainedWorldOrRepairDependsOn(capture)
+              and NoLiveSuffixPinDependsOn(capture)
+
+    ensures:
+        CommitCaptureAdmissionFence(capture)
+        RetainCaptureDiscardPreparation(capture)
+}
+
+rule ScheduleCheckpointCaptureRevocation {
+    -- The original operation authority preserves the due time across restart.
+    -- A due schedule closes further cryptographic operations, including through already issued handles.
+    when: AuthenticatedCaptureRevocationScheduled(operator, authority, capture, due_at)
+
+    requires: ExactOriginalOperationOnlyKeyAuthority(authority, capture)
+              and NoRetainedWorldOrRepairDependsOn(capture)
+              and NoLiveSuffixPinDependsOn(capture)
+
+    ensures:
+        CommitCaptureAdmissionFence(capture)
+        RecordExactAuthorityRevocationSchedule(capture, due_at)
+}
+
+rule CommitCheckpointCaptureRevocation {
+    -- A brokered handle invokes the original authority every time it opens or seals protected bytes.
+    -- Revocation serializes with broker operations and fences later calls through already issued handles.
+    -- The directory can publish the observation after the authority durably closes the key.
+    when: AuthenticatedCaptureRevocationContinued(operator, authority, capture)
+
+    requires: CaptureAdmissionFenced(capture)
+              and AdmittedCaptureRegionsDrained(capture)
+              and ExactOriginalOperationOnlyKeyAuthority(authority, capture)
+
+    ensures:
+        IrrevocablyCloseCaptureKey(capture)
+        ObserveCaptureOperationRevocation(capture)
+}
+
+rule SettleCheckpointCaptureDiscard {
+    when: CheckpointCaptureDiscardContinued(capture)
+
+    requires: CaptureAdmissionFenced(capture)
+              and AdmittedCaptureRegionsDrained(capture)
+              and OriginalCaptureKeyVaultAvailable(capture)
+
+    ensures:
+        ObserveCaptureKeyVaultWithdrawal(capture)
+        if OriginalCaptureMediaWitnessMatches(capture) and ArchiveProviderInventoryEmpty(capture):
+            RetainCaptureDiscardCompletion(capture)
 }
 
 rule HostedCheckpointRecovery {
@@ -3045,6 +3129,10 @@ invariant ObjectsStayInTheirLineage {
 
 invariant OneDatabasePerSession {
     -- A session's catalog contains exactly its capability's deployment; the planner cannot name another.
+    -- A parked deployment with a pinned compatible engine can opt into the versioned placed outcome format.
+    -- The directory preserves this setting through placement changes and parking.
+    -- The pinned engine must support the format on every attachment that replays the deployment.
+    -- Original-format readers refuse the versioned attempt identity before installing that record.
     -- Placed session transaction inspection reports only the deployment's progress.
     -- A node session is bound to the placement it opened against.
     -- A replacement with the same name requires a new backend session.
@@ -3258,6 +3346,19 @@ surface StorageAccess {
 
     @guarantee ZombiesCannotDamageStorage
         -- A deposed holder can create only orphans under its own epoch's prefix until its credential expires, and can delete nothing.
+}
+
+surface CheckpointArchiveDisposal {
+    facing operator: Operator
+
+    provides:
+        AuthenticatedCaptureDiscard(operator, authority, capture)
+        AuthenticatedCaptureRevocationContinued(operator, authority, capture)
+        AuthenticatedCaptureRevocationScheduled(operator, authority, capture, due_at)
+        CheckpointCaptureDiscardContinued(capture)
+
+    contracts:
+        demands Directory
 }
 
 surface TerminalStorageEnrollment {

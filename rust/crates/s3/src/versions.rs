@@ -82,6 +82,10 @@ impl VersionedInventory {
         Ok(self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::WouldExposeOlderData)
     }
 
+    pub fn owns_publication(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> bool {
+        self.observed_path(key, observed).is_ok()
+    }
+
     /// Checks for durable absence of one version, even if the path has a newer publication.
     pub async fn exact_retirement_absent(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<bool> {
         let path = self.observed_path(key, observed)?;

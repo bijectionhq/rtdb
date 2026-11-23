@@ -135,6 +135,7 @@ config {
 -- Their order holds only within their page, and the recency split separates them into different files.
 -- Within one IID and system time, a put or delete contributes only valid-time points outside all higher-priority command intervals.
 -- The resulting fragments are disjoint and preserve the winning command at every valid-time point.
+-- An erase marker excludes every older put or delete for the same entity from the resulting fragments.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.
 -- The merge heap admits pages ordered by ascending IID and descending system time.
 -- It holds one cursor per nonempty page and advances the page that supplied the minimum key.
@@ -199,6 +200,12 @@ contract OutputSegmentLayout {
     @invariant HistoricalPartitionCalendar
         -- Every finite signed 64-bit microsecond recency has a partition ceiling in the ISO proleptic Gregorian calendar.
         -- Weekly ceilings fall on Monday at 0000Z; a recency exactly on a ceiling belongs to that partition.
+
+    @invariant MergePreservesInputScanPrecedence
+        -- The naming epoch selects the tie policy for each native compaction job.
+        -- At or above a configured cutover epoch, the native merge orders equal IID, system time and assertion position by persisted scan precedence, followed by original row ordinal and metadata leaf visitation order.
+        -- Splitting or filtering an input event retains its original row ordinal.
+        -- A job below the cutover uses the legacy policy and can share existing output names with legacy workers.
 
     @invariant OutputPagesShareTheMergedSchema
         -- Every page in an output data file uses the merged schema, including its field types and nullability.

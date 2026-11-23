@@ -1,8 +1,35 @@
 {
-  "summary": "Ranked search stops only when the kth verified score strictly exceeds both frontier bounds.",
+  "summary": "Ranked search stops only when the kth verified key strictly beats both frontier bounds.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 8,
+  "min_verified_functions": 13,
   "controls": {
+    "unknown_uuid_is_later": {
+      "mutate": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": "Some(first) => iid < first,\n                None => false,",
+        "replace": "Some(first) => iid < first,\n                None => true,"
+      }],
+      "expect": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "function": "worse_than_uuid",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 11
+    },
+    "equal_uuid_is_later": {
+      "defect": "An unread range beginning at the chosen UUID is treated as strictly later.",
+      "mutate": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "find": "Some(first) => iid < first,\n                None => false,",
+        "replace": "Some(first) => iid <= first,\n                None => false,"
+      }],
+      "expect": [{
+        "file": "rust/crates/search/src/rank_cutoff.rs",
+        "function": "worse_than_uuid",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 12
+    },
     "allows_rank_ties": {
       "defect": "An equal score is treated as a lower bound.",
       "mutate": [{
