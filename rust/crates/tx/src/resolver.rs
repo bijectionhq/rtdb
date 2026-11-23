@@ -3537,6 +3537,7 @@ mod tests {
 
         let memory = MemoryBudget::new(1 << 24);
         let context = ResolveContext {
+            write_event_origins: false,
             placed_receipt_retirement: false,
             owned_witness_scope: Some(rtdb_types::PlacedAttemptScope::new("native-world-unique", 1)?),
             world_constraints: None,

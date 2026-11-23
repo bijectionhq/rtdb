@@ -106,7 +106,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     let mut pending_bounds = (None, None);
     let mut pending = Vec::with_capacity(128);
     let mut pending_charge = memory.reserve(4096)?;
-    let mut flush = |bounds, pending: &mut Vec<_>, pending_charge: &mut Arc<rtdb_columnar::MemoryReservation>| -> Result<()> {
+    let mut flush = |bounds, pending: &mut Vec<StructFields<Value>>, pending_charge: &mut Arc<rtdb_columnar::MemoryReservation>| -> Result<()> {
         if pending.is_empty() { return Ok(()); }
         let mut rows = std::mem::replace(pending, Vec::with_capacity(128));
         let mut page_columns = columns.clone();
