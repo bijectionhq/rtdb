@@ -1,3 +1,4 @@
+mod guarded_sample;
 mod local;
 mod memory;
 mod read_only;
@@ -37,13 +38,14 @@ impl<'a> GuardedAppend<'a> {
 
     pub fn sample(self) -> Result<Timestamp> {
         let now = (self.clock)();
-        let upper = now.0.checked_add(1).map(Timestamp);
-        if self.journal_before.is_some_and(|before| before.before() < self.cutoff)
-            || upper.is_none_or(|upper| upper.0 <= 0 || upper < self.staged_upper || upper >= self.cutoff)
-        {
-            return Err(Error::GuardedAppendCutoff);
-        }
-        Ok(now)
+        guarded_sample::guarded_sample(
+            now.0,
+            self.staged_upper.0,
+            self.cutoff.0,
+            self.journal_before.map(|cutoff| cutoff.before().0),
+        )
+        .map(Timestamp)
+        .ok_or(Error::GuardedAppendCutoff)
     }
 }
 

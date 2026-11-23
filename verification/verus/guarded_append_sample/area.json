@@ -1,0 +1,173 @@
+{
+  "summary": "The writer's live sample passes exactly the rounded staging and exclusive cutoff bounds.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production"
+  ],
+  "min_verified_functions": 1,
+  "controls": {
+    "inclusive_cutoff": {
+      "defect": "A rounded sample equal to the guarded cutoff passes.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "upper >= cutoff",
+          "replace": "upper > cutoff"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "missing_staged_check": {
+      "defect": "A rounded sample older than the retained staging sample passes.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": " || upper < staged_upper",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "earlier_journal_cutoff": {
+      "defect": "A journal cutoff earlier than the guarded cutoff passes.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "Some(before) => before >= cutoff,",
+          "replace": "Some(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "nonpositive_upper": {
+      "defect": "A rounded sample of zero passes.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "upper <= 0",
+          "replace": "upper < 0"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "unrounded_clock": {
+      "defect": "The decision uses the raw clock for its bounds.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "clock.checked_add(1)",
+          "replace": "clock.checked_add(0)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "overflowing_upper": {
+      "defect": "An unrepresentable successor passes.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "None => return None,",
+          "replace": "None => return Some(clock),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "publish_rounded_stamp": {
+      "defect": "The append receives the upper bound in place of the sampled clock.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "\n        Some(clock)\n",
+          "replace": "\n        Some(upper)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "exclusive_staged_bound": {
+      "defect": "A rounded sample equal to the staging sample refuses.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "upper < staged_upper",
+          "replace": "upper <= staged_upper"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    },
+    "exclusive_journal_bound": {
+      "defect": "A journal cutoff equal to the guarded cutoff refuses.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "find": "Some(before) => before >= cutoff,",
+          "replace": "Some(before) => before > cutoff,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/log/guarded_sample.rs",
+          "function": "guarded_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 0
+    }
+  }
+}

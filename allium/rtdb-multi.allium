@@ -508,6 +508,12 @@ contract LogService {
         -- A record is committed when write_quorum of its loglet's ensemble have made it durable.
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
 
+    @invariant GuardedAppendRequiresALiveUpperSample
+        -- Before a guarded append takes a log position or dispatches a record, the writer samples its live clock in append order.
+        -- The upper sample is one microsecond above the sampled clock and must be representable, positive, at least the retained staging sample, and strictly before the guarded cutoff.
+        -- A supplied journal cutoff must be at least the guarded cutoff.
+        -- The writer records its sampled clock as the append timestamp.
+
     @invariant GuardedSyncObservationsFollowTheOriginalAppend
         -- A guarded record's durable frame records whether it was originally appended here or copied.
         -- A journal samples its clock after the durable sync containing an original guarded append.

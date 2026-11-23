@@ -303,6 +303,12 @@ It also exercises the Azure adapter against a loopback provider and separately m
   It distinguishes a successful withdrawal from a conditional conflict and separately checks the provider's no-historical-version premise.
 * `verus/key_enrollment` checks the production decision to enroll a missing key under current writer authority in a pristine original residence.
   Its single and joint controls cover authority, residence identity, and durable history.
+* `verus/guarded_append_sample` checks the production function called by `GuardedAppend::sample` over all signed 64-bit inputs, with or without a journal cutoff.
+  The exact acceptance postcondition covers the checked one-microsecond rounding, positivity, the inclusive staging bound, the exclusive guarded cutoff, the optional journal bound, and the returned clock reading.
+  On 2026-11-23, Verus `0.2026.11.20.9da409b` with Rust `1.100.0` and Z3 `4.16.0` verified one item.
+  All nine production mutations failed only the sample decision's postcondition.
+  The clock reading, retained staging sample, and supplied cutoffs are inputs to the proof.
+  The link:../dev/doc/rtdb-multi-bijection.md[writer call sites and Bijection model correspondence] were reviewed by source inspection.
 * `verus/catalog_reader_admission` checks the Rust directory's serving-owner, residence and journal predicates.
   Each guard has a production-only and a jointly weakened contract control.
 * `tla/FragmentResidence.tla` checks routing and recipient admission when a database moves or opens a new replica journal.

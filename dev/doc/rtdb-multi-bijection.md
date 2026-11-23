@@ -55,7 +55,18 @@ The writer seals the cutoff and digest in the record's acceptance stage and deri
 The timed acceptance audit requires the frame to repeat the sealed pair and returns the envelope digest with the original voter evidence.
 Archive capture records the original stream's digest of each timed entry before opening its payload, so a resealed checkpoint transfer still names the entry its original voters hold.
 `verification/multi/lean/TimedEvidenceAudit.lean` proves both rules: the audit reports only the sealed clock evidence, and a resealed copy names its exact original voters while an original append cannot carry a digest.
-The provider samples under the journal writer lock after encryption and payload copying, before assigning the offset or sending a replica request.
+Source inspection places the Logkeeper sample under the writer lock after encryption and payload copying, before advancing the log position or sending a replica request.
+The ordered journal and memory log use the same check under their append locks and support only guards without a journal cutoff.
+The live upper sample is the clock reading plus one microsecond.
+It must be representable, positive, at least the retained staging sample, and strictly below the guarded cutoff.
+A supplied journal cutoff must be at or after the guarded cutoff.
+The append timestamp is the clock reading itself.
+
+When the optional journal condition holds, the decision on nonnegative inputs agrees with Bijection's `guardedReplicaAppend` in `PhysicalTiming.lean` for a supported provider.
+Bijection's `exclusive_wire_cutoff` Verus law establishes that comparing an integral microsecond sample strictly against the ceiling-converted cutoff preserves the strict comparison in nanoseconds.
+The RTDB check takes both cutoffs in microseconds.
+Physical acceptance still depends on the installed clock bounds and timely original-quorum durability.
+
 For a strict placed acceptance, `rtdb-multi audit-acceptance` reads one replica offset for the exact installation, incarnation and log epoch.
 It requires a matching write quorum, checks the sealed record against that quorum's digest, and exports the original staging sample, cutoff and append timestamp.
 Each journal records its own upper clock sample after syncing the original guarded append.
