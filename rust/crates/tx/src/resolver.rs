@@ -463,6 +463,9 @@ impl TxResolver {
             if has_owned_operations && outcome.is_ok() {
                 outcome = tx.check_final_constraints(primary).await;
             }
+            if has_owned_operations && outcome.is_ok() {
+                outcome = tx.check_spatial_readiness(primary).await;
+            }
             constraint_failed = evaluated && outcome.as_ref().err().is_some_and(constraint_receipt::may_settle);
             if outcome.is_ok() {
                 outcome = tx.write_owned_changes().await;
@@ -1427,7 +1430,31 @@ impl<'a> OpenTransaction<'a> {
         }
         self.finish_owned_unique().await?;
         self.finish_owned_capacity().await?;
+        self.check_spatial_readiness(operations).await?;
         self.write_owned_changes().await
+    }
+
+    async fn check_spatial_readiness(&self, operations: &[Operation]) -> Result<()> {
+        let mut context = None;
+        for operation in operations {
+            let Operation::Public(TxOp::OwnedRequireSpatialPath { relation, name, columns, encoding }) = operation
+            else { continue; };
+            let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
+            let context = match &context {
+                Some(context) => Arc::clone(context),
+                None => {
+                    let final_context = self.context.query_context(
+                        self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
+                    )?;
+                    context = Some(Arc::clone(&final_context));
+                    final_context
+                }
+            };
+            let lease = context.catalog.read_lease();
+            let check = rtdb_spatial::require_path_ready(Arc::clone(&context), owner, relation, name, columns, *encoding);
+            rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, check)).await?;
+        }
+        Ok(())
     }
 
     async fn check_owned_preconditions(
@@ -1997,23 +2024,14 @@ impl<'a> OpenTransaction<'a> {
         self.check_hosted_controls(operations, source_scope, replay).await?;
         self.check_capacity_source(operations).await?;
         let publishes_catalog = operations.iter().any(|operation| matches!(operation,
-            Operation::Public(TxOp::HostedControl(control))
-                if control.name() == "bj_fact_root_owner" && control.expected().is_some() && !control.is_check()
-                    && matches!(control.id(), EntityId::String(id) if id == "root")
+            Operation::Public(TxOp::HostedControl(control)) if control.replaces_root_catalog()
         ));
         for operation in operations {
-            if let Operation::Public(TxOp::OwnedRequireSpatialPath { relation, name, columns, encoding }) = operation {
-                if !relation.is_root_data() || !publishes_catalog || source_scope.is_none()
-                    || source_scope != self.context.owned_witness_scope
-                {
-                    return Err(unavailable());
-                }
-                let context = self.context.query_context(
-                    self.buffer.base_snapshot(), self.tx_key().system_time, &self.options.default_tz, self.trace_parent,
-                )?;
-                let lease = context.catalog.read_lease();
-                let check = rtdb_spatial::require_path_ready(Arc::clone(&context), owner, relation, name, columns, *encoding);
-                rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, check)).await?;
+            if let Operation::Public(TxOp::OwnedRequireSpatialPath { relation, .. }) = operation
+                && (!relation.is_root_data() || !publishes_catalog || source_scope.is_none()
+                    || source_scope != self.context.owned_witness_scope)
+            {
+                return Err(unavailable());
             }
         }
         for operation in operations {
@@ -3728,6 +3746,13 @@ mod tests {
         let mut resolver = TxResolver::new(durable.tx_basis(), SourcePosition(1), None, &memory)?;
         let encoding = SpatialGeometryEncoding::BijectionGeometry;
         let columns = vec!["location".into()];
+        let hook_id = EntityId::String("hook".into());
+        let hook = RecordBatch::try_from_iter([
+            ("_id", Arc::new(arrow_array::StringArray::from(vec!["hook"])) as arrow_array::ArrayRef),
+            ("location", Arc::new(arrow_array::BinaryArray::from(vec![b"\x0dcoordinates\0\x01\x0c\x05\x80\0\0\0\0\0\0\0\x05\x80\0\0\0\0\0\0\0\0\0type\0\x01\x09Point\0\x01\0\0".as_slice()]))),
+        ]).unwrap();
+        let hook = rtdb_columnar::OwnedBatch::new(hook, &memory)?;
+        let hook = crate::ArrowDocuments::from_batch(&hook, &memory)?.unwrap();
         let publication = |encoding| -> Result<SourceTransaction> {
             let control = crate::HostedControlWrite::new(
                 catalog.clone(), scope, Some(installed_at.system_time), catalog_row(2),
@@ -3738,6 +3763,7 @@ mod tests {
             let operations = vec![
                 TxOp::OwnedDeadline { until: Timestamp(1000), recheck_at_staging: false, journal_before: None },
                 TxOp::OwnedReplaceDocs { relation: marker.clone(), documents, valid_from: Some(Timestamp::MIN), valid_to: None },
+                TxOp::OwnedArrowDocs { relation: relation.clone(), documents: hook.clone(), create_only: true, valid_from: None, valid_to: None },
                 TxOp::OwnedRequireSpatialPath { relation: relation.clone(), name: path.clone(), columns: columns.clone(), encoding },
                 TxOp::HostedControl(control),
             ];
@@ -3767,9 +3793,13 @@ mod tests {
         assert!(ordered.result().committed(), "{:?}", ordered.result().error());
         let published = context.query_context(resolver.resolving_snapshot(durable)?, Timestamp(500), "UTC", None)?;
         let observed = rtdb_query::read_hosted_control_point(
-            published, TableRef::new("public", catalog.name()), &EntityId::String("root".into()), false,
+            Arc::clone(&published), TableRef::new("public", catalog.name()), &EntityId::String("root".into()), false,
+        ).await?;
+        let hook_revision = rtdb_query::read_owned_point_revision(
+            published, "owner", &relation, &hook_id, Interval::new(Timestamp(500), Timestamp(501))?,
         ).await?;
         assert_eq!(observed.row.map(|(_, revision)| revision), Some(ordered.result().tx_key().system_time));
+        assert_eq!(hook_revision, Some(ordered.result().tx_key().system_time));
         Ok(())
     }
 

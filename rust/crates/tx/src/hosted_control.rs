@@ -549,6 +549,8 @@ pub(crate) fn hosted_root_world_reads(operations: &[crate::source::Operation]) -
                 None
             },
             Operation::Public(TxOp::OwnedDeadline { .. }) => None,
+            Operation::Public(TxOp::OwnedRequireSpatialPath { relation, .. })
+                if relation.is_root_data() => None,
             Operation::Public(TxOp::OwnedCheck { relation, .. }) if relation.world().is_some() => {
                 if preceding_guard != Some(relation) {
                     return false;
@@ -704,6 +706,12 @@ impl HostedControlWrite {
 
     pub fn is_check(&self) -> bool {
         self.check_only
+    }
+
+    pub fn replaces_root_catalog(&self) -> bool {
+        !self.is_check() && self.expected.is_some()
+            && self.name() == "bj_fact_root_owner"
+            && matches!(&self.id, EntityId::String(id) if id == "root")
     }
 
     pub(crate) fn name(&self) -> &str {

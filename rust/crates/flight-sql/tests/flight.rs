@@ -26,6 +26,50 @@ struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
 struct ManualClock(AtomicI64);
 impl Clock for ManualClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
+struct HostedFixtureResources(rtdb_node::NativeResources);
+struct HostedFixtureReceipts(rtdb_types::PlacedAttemptScope);
+
+impl rtdb_node::PlacedReceiptCodec for HostedFixtureReceipts {
+    fn scope(&self) -> rtdb_types::PlacedAttemptScope { self.0 }
+
+    fn seal(&self, value: &[u8]) -> Result<String> {
+        use base64::Engine;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value))
+    }
+
+    fn open(&self, token: &str) -> Result<Vec<u8>> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)
+            .map_err(|_| Anomaly::incorrect("test/placed-receipt", "Invalid fixture receipt"))
+    }
+}
+
+#[async_trait]
+impl rtdb_node::ResourceFactory for HostedFixtureResources {
+    fn validate(&self, name: &str, config: &rtdb_format::database::proto::DatabaseConfig) -> Result<()> {
+        self.0.validate(name, config)
+    }
+
+    async fn open_storage(&self, name: &str, config: &rtdb_format::database::proto::DatabaseConfig) -> Result<rtdb_node::DatabaseStorage> {
+        self.0.open_storage(name, config).await
+    }
+
+    async fn open_logs(
+        &self, name: &str, config: &rtdb_format::database::proto::DatabaseConfig,
+        access: rtdb_node::LogAccess, cancellation: tokio_util::sync::CancellationToken, storage: &rtdb_node::DatabaseStorage,
+    ) -> Result<rtdb_node::OpenedLogs> {
+        let mut logs = self.0.open_logs(name, config, access, cancellation, storage).await?;
+        logs.await_authority = rtdb_node::AwaitAuthority::Live {
+            codec: Box::new(HostedFixtureReceipts(rtdb_types::PlacedAttemptScope::new(name, 1)?)),
+            recovery: rtdb_node::ClosedEpochRecovery::Opened(rtdb_storage::log::LogOffset(-1)),
+            placed_receipt_retirement: false,
+        };
+        Ok(logs)
+    }
+
+    async fn close(&self) -> Result<()> { self.0.close().await }
+}
+
 struct Running { node: Node, node_task: tokio::task::JoinHandle<Result<()>>, server: ServerHandle, server_task: tokio::task::JoinHandle<Result<()>>, clock: Arc<ManualClock> }
 impl Running {
     async fn start(password: Option<&str>, config: FlightConfig) -> Self { Self::start_with_placements(password, config, &[]).await }
@@ -35,7 +79,10 @@ impl Running {
     async fn start_with_tracer(password: Option<&str>, mut config: FlightConfig, placements: &[&str], tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
         let node_clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(AuthConfig::SingleRootUser { password: password.map(Secret::new) }, MemoryBudget::new(64 << 20), node_clock.clone(), Arc::new(NoHttp)).await.unwrap();
-        let services = NodeServices { clock: node_clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        let mut services = NodeServices { clock: node_clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        if config.hosted_controls.is_some() {
+            services.resources = Arc::new(HostedFixtureResources(rtdb_node::NativeResources::default()));
+        }
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false; options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         options.owned_relations = config.owned_native_actions;
         if !placements.is_empty() { options.membership = Membership::Placed; }
@@ -1158,6 +1205,123 @@ async fn check_spatial_pages_at_the_original_cut() {
         assert_eq!(client.action(projected, request).await.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
     client.action("rtdb.owned.CloseRead.v1", Bytes::copy_from_slice(hold)).await.unwrap();
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_flight_publishes_spatial_readiness_with_release_writes_and_a_count() {
+    use arrow_array::{ArrayRef, BinaryArray, TimestampMicrosecondArray, builder::{ListBuilder, StringBuilder}};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+
+    fn frame(body: &mut Vec<u8>, bytes: &[u8]) {
+        body.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(bytes);
+    }
+
+    fn ipc(columns: impl IntoIterator<Item = (&'static str, ArrayRef)>) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap()
+    }
+
+    fn groups(groups: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut body = u16::try_from(groups.len()).unwrap().to_be_bytes().to_vec();
+        for (relation, bytes) in groups {
+            frame(&mut body, relation.as_bytes());
+            body.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(bytes);
+        }
+        body
+    }
+
+    let running = Running::start_with_placements(Some("secret"), FlightConfig {
+        owned_native_actions: true,
+        hosted_controls: Some(rtdb_flight_sql::HostedControlConfig {
+            owner: "xtdb".into(),
+            relations: ["bj_fact_root_owner".to_owned()].into(),
+        }),
+        ..FlightConfig::default()
+    }, &["application"]).await;
+    let mut client = Client::connect_with_database(&running.server, Some("xtdb:secret"), Some("application")).await;
+    client.update("INSERT INTO bj_fact_root_owner RECORDS {_id: 'root', revision: 1, _valid_from: TIMESTAMP '1970-01-01 00:00:00+00:00'}", None).await;
+    let owner = client.query("SELECT _system_from FROM bj_fact_root_owner WHERE _id = 'root'").await;
+    let expected = owner[0].column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
+
+    let mut relation = Vec::new();
+    frame(&mut relation, b"places");
+    let mut schema = relation.clone();
+    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
+    struct FrameOwner;
+    #[async_trait]
+    impl rtdb_node::SessionIdentity for FrameOwner {
+        fn user(&self) -> Option<&str> { Some("xtdb") }
+        async fn revalidate(&self, _: Timestamp) -> Result<()> { Ok(()) }
+        fn authorize_database(&self, _: &str, _: rtdb_node::DatabaseAccess) -> Result<()> { Ok(()) }
+    }
+    let mut installation = running.node.session("application", Arc::new(FrameOwner)).unwrap();
+    let capacity = installation.state_mut().execute_tx(vec![rtdb_tx::TxOp::OwnedDeclareCapacity {
+        relation: rtdb_types::OwnedRelation::new("places").unwrap(),
+        column: "location".into(),
+        prefix_bytes: 0,
+        cap: 2,
+        when: Vec::new(),
+    }], Default::default()).await.unwrap();
+    assert!(capacity.committed(), "{:?}", capacity.error());
+    drop(installation);
+
+    let mut geometry = vec![0, 1];
+    geometry.extend(1u32.to_le_bytes());
+    geometry.extend(0.0f64.to_le_bytes());
+    geometry.extend(0.0f64.to_le_bytes());
+    let mut columns = ListBuilder::new(StringBuilder::new());
+    columns.values().append_value("location");
+    columns.append(true);
+    let columns: ArrayRef = Arc::new(columns.finish());
+    let declaration = ipc([
+        ("_id", Arc::new(StringArray::from(vec!["nearby"])) as ArrayRef),
+        ("columns", Arc::clone(&columns)),
+    ]);
+    let requirement = ipc([
+        ("_id", Arc::new(StringArray::from(vec!["nearby"])) as ArrayRef),
+        ("_op", Arc::new(StringArray::from(vec!["require-spatial-path"]))),
+        ("columns", columns),
+        ("geometry_encoding", Arc::new(StringArray::from(vec!["tagged-wkb-v1"]))),
+    ]);
+    let hook = ipc([
+        ("_id", Arc::new(StringArray::from(vec!["hook"])) as ArrayRef),
+        ("_op", Arc::new(StringArray::from(vec!["create"]))),
+        ("location", Arc::new(BinaryArray::from_vec(vec![geometry.as_slice()]))),
+    ]);
+    let owner = ipc([
+        ("_id", Arc::new(StringArray::from(vec!["root"])) as ArrayRef),
+        ("_expected_micros", Arc::new(Int64Array::from(vec![expected]))),
+        ("revision", Arc::new(Int64Array::from(vec![2]))),
+    ]);
+
+    let facts = groups(&[("places", &hook), ("places", &requirement)]);
+    let mut body = vec![1];
+    body.extend_from_slice(&1u16.to_be_bytes());
+    frame(&mut body, b"places");
+    body.push(0);
+    frame(&mut body, b"location");
+    frame(&mut body, &geometry);
+    body.extend_from_slice(&1i64.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&i64::MAX.to_be_bytes());
+    body.extend_from_slice(&u32::try_from(facts.len()).unwrap().to_be_bytes());
+    body.extend(facts);
+    body.extend(groups(&[("bj_fact_root_owner", &owner)]));
+    let body = Bytes::from(body);
+
+    let refused = client.action("rtdb.owned.DecideHosted.v1", body.clone()).await.unwrap_err();
+    assert!(refused.message().contains("lacks coverage"), "{refused}");
+    assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 1);
+
+    relation.extend(declaration);
+    client.action("rtdb.owned.DeclareSpatialPath.v1", relation.into()).await.unwrap();
+    client.action("rtdb.owned.DecideHosted.v1", body).await.unwrap();
+    assert_eq!(integer(&client.query("SELECT revision FROM bj_fact_root_owner").await[0], 0, 0), 2);
     running.stop().await;
 }
 

@@ -90,7 +90,26 @@ pub(crate) enum CommitFormat {
 enum CommitEffects {
     Facts,
     HostedRoot,
+    HostedCatalog,
     Replay,
+}
+
+impl CommitEffects {
+    fn hosted(replay: bool, conditional: bool, controls: &[rtdb_tx::HostedControlWrite]) -> Self {
+        if replay {
+            Self::Replay
+        } else if !conditional && !controls.is_empty() {
+            Self::HostedRoot
+        } else if controls.iter().any(rtdb_tx::HostedControlWrite::replaces_root_catalog) {
+            Self::HostedCatalog
+        } else {
+            Self::Facts
+        }
+    }
+
+    fn allows_spatial_requirement(self) -> bool {
+        matches!(self, Self::HostedRoot | Self::HostedCatalog)
+    }
 }
 
 struct CommitRequest<'a> {
@@ -1138,13 +1157,7 @@ impl Service {
         if replay && (counted || !worlds.is_empty()) {
             return Err(invalid("Native replay admits an original effect batch"));
         }
-        let effects = if replay {
-            CommitEffects::Replay
-        } else if !counted && worlds.is_empty() && !controls.is_empty() {
-            CommitEffects::HostedRoot
-        } else {
-            CommitEffects::Facts
-        };
+        let effects = CommitEffects::hosted(replay, counted || !worlds.is_empty(), &controls);
         let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         let _refusal = if let Some(refusal) = refusal {
@@ -1310,7 +1323,7 @@ impl Service {
             Ok(id.into_owned())
         };
         let operation = cell("_op").and_then(ArrowCell::utf8).ok_or_else(|| invalid("Owned commit _op must be Utf8"))?;
-        if operation == "require-spatial-path" && matches!(effects, CommitEffects::HostedRoot) {
+        if operation == "require-spatial-path" && effects.allows_spatial_requirement() {
             let EntityIdRef::String(name) = id else { return Err(invalid("Spatial readiness needs a path name")); };
             if source.num_columns() != 4 { return Err(invalid("Invalid spatial readiness condition")); }
             let columns = cell("columns").and_then(ArrowCell::list)

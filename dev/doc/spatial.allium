@@ -25,7 +25,8 @@ entity SpatialPostings {
 -- Readiness at a held cut requires current-generation postings on the durable sources scheduled for spatial indexing.
 -- The live tail and unscheduled durable sources must fit the fallback scan limits at that cut.
 -- An ordered Root catalog publication can require the exact staged path definition and check its coverage at the ordered cut.
--- A spatial index addition orders its readiness conditions with the Root catalog and publication markers.
+-- A spatial index addition orders its readiness conditions with the Root catalog, publication markers, and deploy-hook writes.
+-- The readiness check includes any events staged by the catalog publication.
 -- A failed readiness condition prevents publication of the revised catalog.
 -- A posting file is a deterministic function of the trie data and the declared geometry and partition columns.
 -- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.

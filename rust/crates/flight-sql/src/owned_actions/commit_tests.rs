@@ -80,3 +80,19 @@ fn capacity_declaration_decodes_one_exact_root_projection() {
     fields.insert("cap".into(), Value::Utf8("3".into()));
     assert!(owned_capacity_declaration(root, &fields).is_err());
 }
+
+#[test]
+fn conditional_hosted_spatial_readiness_requires_a_root_catalog_replacement() {
+    let scope = rtdb_types::PlacedAttemptScope::new("spatial-with-conditions", 1).unwrap();
+    let root = OwnedRelation::new("bj_fact_root_owner").unwrap();
+    let row = || StructFields::from([("_id".into(), Value::Utf8("root".into()))]);
+    let write = rtdb_tx::HostedControlWrite::new(root.clone(), scope, Some(Timestamp(1)), row()).unwrap();
+    let check = rtdb_tx::HostedControlWrite::check(root.clone(), scope, Some(Timestamp(1)), row()).unwrap();
+    let fresh = rtdb_tx::HostedControlWrite::new(root, scope, None, row()).unwrap();
+
+    let effects = CommitEffects::hosted(false, true, &[write.clone()]);
+    assert!(matches!(effects, CommitEffects::HostedCatalog));
+    assert!(effects.allows_spatial_requirement());
+    assert!(!CommitEffects::hosted(false, true, &[check, fresh]).allows_spatial_requirement());
+    assert!(!CommitEffects::hosted(true, true, &[write]).allows_spatial_requirement());
+}
