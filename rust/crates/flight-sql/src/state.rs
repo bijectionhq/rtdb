@@ -127,6 +127,9 @@ impl Session {
     pub fn memory(&self) -> &Arc<MemoryBudget> { self._reservation.budget() }
     pub fn closed(&self) -> bool { matches!(*self.state.lock().expect("session lock"), SessionState::Closed) }
     pub fn placed_database(&self) -> Option<&str> { self.placement.as_ref().map(|placement| placement.name.as_str()) }
+    pub fn holds_attachment(&self, database: &Database) -> bool {
+        self.placement.as_ref().is_some_and(|placement| std::ptr::eq(placement.attachment.as_ptr(), database))
+    }
     pub fn owner(&self) -> ResourceOwner {
         ResourceOwner { principal: self.caller.owner, placement: self.placement.as_ref().map(|placement| placement.attachment.clone()) }
     }
@@ -139,7 +142,7 @@ impl Session {
                 return Err(Status::permission_denied("This Flight SQL session belongs to another deployment"));
             }
             let current = node.catalog().database(database).map_err(|_| placement_changed())?;
-            if !std::ptr::eq(placement.attachment.as_ptr(), Arc::as_ptr(&current)) { return Err(placement_changed()); }
+            if !self.holds_attachment(&current) { return Err(placement_changed()); }
             return Ok(Some(current));
         }
         Ok(None)

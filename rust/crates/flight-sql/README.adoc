@@ -276,6 +276,8 @@ The gateway and holder acknowledge the exact reservation and mint attempt. Ordin
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session seats.
 Each turn has two seats. An exact retry under the same credential can recover the live session in that seat.
 Another mint cannot take the seat until the original session and its retained I/O release it, including when a close reply is lost.
+The original audience bearer can close its own session or held read after the writer attachment is displaced.
+A handshake authenticated against the current local attachment can start retirement of a prior attachment's session in its own seat. It waits for the same original resource ownership to drain before it can mint.
 The connection and call limits set aside two permits per turn plus two for preparation and cleanup.
 Before serving, the holder reserves 16 MiB of execution memory and 16 MiB of cache memory per permit. Both reservations are deducted before the ordinary allocation splits between cache and execution. It refuses startup if the node cannot fund both pools.
 Each session uses its own buffer pool on the audience cache budget from initial preparation through applied confirmation.

@@ -13,6 +13,8 @@ use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 
+pub(crate) const CLOSE_SESSION: &str = "CloseSession";
+
 pub(crate) type Output<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 #[derive(Clone)]
 pub(crate) struct Service(pub Arc<Inner>);
@@ -46,7 +48,17 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup }
+
+impl CallKind {
+    fn action(audience: bool, name: &str) -> Self {
+        if audience && matches!(name, CLOSE_SESSION | crate::owned_actions::CLOSE_OWNED_READ_V1) {
+            Self::AudienceCleanup
+        } else {
+            Self::Action
+        }
+    }
+}
 pub(crate) struct Call {
     service: Service,
     pub session: Arc<Session>,
@@ -94,8 +106,7 @@ impl Call {
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
     pub fn close_session(&self) {
-        let sessions = self.service.sessions(self.session.audience_source().is_some());
-        if let Lookup::Found(session) = sessions.take(&self.session.id) { session.close(); }
+        self.service.retire_session(&self.session);
     }
     pub fn error(&self, mut error: Status) -> Status {
         if let Ok(response) = self.response(()) { for key in ["set-cookie", "authorization"] { if let Some(value) = response.metadata().get(key) { error.metadata_mut().insert(key, value.clone()); } } }
@@ -126,6 +137,11 @@ impl Service {
             &self.0.audience.as_ref().expect("reserved session has an installed audience").sessions
         } else {
             &self.0.sessions
+        }
+    }
+    fn retire_session(&self, session: &Session) {
+        if let Lookup::Found(registered) = self.sessions(session.audience_source().is_some()).take(&session.id) {
+            registered.close();
         }
     }
     pub fn sweep(&self) {
@@ -212,14 +228,19 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.audience_source() != audience_source || audience_source.is_some() && !matches!(kind, CallKind::Action) {
+            if session.audience_source() != audience_source
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::AudienceCleanup)
+            {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
             if let Some(raw) = credentials.raw() {
                 if session.caller.mac.is_none_or(|mac| !auth::equal(&mac, &self.0.auth.mac(raw))) { return Err(auth::unauthenticated("these credentials aren't the ones the session was authenticated with")); }
             }
             let verified = self.0.cancellation.run_until_cancelled(session.caller.principal.revalidate(self.0.node.now())).await.ok_or_else(cancelled)?;
-            if let Err(error) = verified { if let Lookup::Found(removed) = sessions.take(&session.id) { removed.close(); } return Err(auth::auth_error(error)); }
+            if let Err(error) = verified {
+                self.retire_session(&session);
+                return Err(auth::auth_error(error));
+            }
             (session, false, lease)
         } else {
             if audience_source.is_some() && (!matches!(kind, CallKind::Handshake) || forwarded_peer.is_none()) {
@@ -267,7 +288,22 @@ impl Service {
                 let slot = &audience.seats[requested.index()];
                 let mut original = slot.original.lock().expect("audience session seat lock");
                 let occupied = || Status::resource_exhausted("The audience reader seat still owns a session");
-                if let Some(session) = original.upgrade() {
+                let displaced = || Status::unavailable("The audience Flight writer attachment changed during handshake");
+                let authenticated = placement.as_ref().ok_or_else(displaced)?;
+                let current = catalog.database(authenticated.name()).map_err(|_| displaced())?;
+                if !Arc::ptr_eq(authenticated, &current) { return Err(displaced()); }
+                let existing = match original.upgrade() {
+                    Some(session) if session.placed_database() != Some(current.name()) => return Err(occupied()),
+                    Some(session) if session.holds_attachment(&current) && session.audience_remaining_micros().is_some() => Some(session),
+                    Some(session) => {
+                        // A newly authenticated attachment can retire its detached or expired predecessor.
+                        // The seat permit still travels with any outstanding original I/O.
+                        self.retire_session(&session);
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(session) = existing {
                     let same_credential = session.caller.mac.as_ref().zip(caller.mac.as_ref())
                         .is_some_and(|(left, right)| auth::equal(left, right));
                     if session.audience_seat() != Some(requested) || !same_credential
@@ -292,7 +328,23 @@ impl Service {
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };
-        let (database, attachment) = session.resolve_database(requested_database, &self.0.node)?;
+        let (database, attachment) = if matches!(kind, CallKind::AudienceCleanup) {
+            let original = session.placed_database().ok_or_else(unsupported)?;
+            if requested_database.is_some_and(|requested| requested != original) {
+                return Err(Status::permission_denied("The audience cleanup belongs to another deployment"));
+            }
+            // Close is scoped to the authenticated original carrier. It
+            // opens no native connection and cannot prolong writer residency.
+            (original.to_owned(), None)
+        } else {
+            match session.resolve_database(requested_database, &self.0.node) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    if minted && audience_source.is_some() { self.retire_session(&session); }
+                    return Err(error);
+                }
+            }
+        };
         let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment));
         let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
@@ -392,7 +444,8 @@ impl FlightService for Service {
         self.upload(call, request.into_inner()).await
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::Action).await?;
+        let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
+        let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
         self.action(call, request.into_inner()).await
     }
 }
@@ -400,4 +453,26 @@ impl FlightService for Service {
 pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
     let charge = memory.reserve(wire::add(wire::mul(ticket.len(), 3)?, 1024)?).map_err(status)?;
     Ok(wire::retain(TicketStatementQuery { statement_handle: ticket }.as_any().encode_to_vec(), charge))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CLOSE_SESSION, CallKind};
+    use crate::owned_actions::CLOSE_OWNED_READ_V1;
+
+    #[test]
+    fn only_audience_closes_can_dispatch_without_a_current_attachment() {
+        for action in [CLOSE_SESSION, CLOSE_OWNED_READ_V1] {
+            assert!(matches!(CallKind::action(true, action), CallKind::AudienceCleanup));
+            assert!(matches!(CallKind::action(false, action), CallKind::Action));
+        }
+        for action in [
+            crate::owned_actions::PREPARE_APPLIED_READ_V2,
+            crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4,
+            crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5,
+            "closesession",
+        ] {
+            assert!(matches!(CallKind::action(true, action), CallKind::Action));
+        }
+    }
 }

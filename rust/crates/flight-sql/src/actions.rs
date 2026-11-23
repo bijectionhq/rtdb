@@ -6,7 +6,7 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
-use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{Call, Output, Service, found, result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
+use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
@@ -23,7 +23,7 @@ impl Service {
                         self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
                     }
                     // These actions only relinquish resources under the authenticated local session.
-                    CLOSE_OWNED_READ_V1 | "CloseSession" => {}
+                    CLOSE_OWNED_READ_V1 | CLOSE_SESSION => {}
                     _ => return Err(Status::permission_denied("The reserved Flight session only admits audience observations")),
                 }
             }
@@ -242,7 +242,7 @@ impl Service {
                     }
                     Ok(vec![Ok(raw(&protocol::SetOptionsResult { errors }, self)?)])
                 }
-                "CloseSession" => {
+                CLOSE_SESSION => {
                     protocol::Empty::decode(action.body.as_ref()).map_err(arrow)?;
                     call.close_session();
                     if call.minted { return Err(Status::not_found("No session to close")); }
