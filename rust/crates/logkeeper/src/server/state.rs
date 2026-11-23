@@ -232,6 +232,13 @@ impl<P: Payload> StreamState<P> {
         self.persist(events, Self::accepted)
     }
 
+    pub(super) fn append_observed(&mut self, epoch: u64, first: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32]) -> Decision {
+        if !self.writer_authority().confirms(epoch, ensemble) {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        self.append(epoch, first, entries, commit)
+    }
+
     pub fn overwrite(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, complete: bool, commit: i64) -> Decision {
         if epoch == 0 { return invalid("epochs start at 1"); }
         if self.promised > epoch { return Decision { events: Vec::new(), reply: self.refused() }; }
@@ -393,6 +400,19 @@ mod tests {
         assert_eq!(reply(state.append(1, 0, vec![entry(0, 1), entry(1, 1)], -1)), ResponseBody::Accepted(Accepted { last_lsn: 1, commit_lsn: -1 }));
         assert_eq!(reply(state.append(1, 3, vec![entry(3, 1)], -1)), ResponseBody::Refused(Refused { promised: 1, last_lsn: 1 }), "a gap");
         assert_eq!(reply(state.append(1, 1, vec![entry(1, 1)], -1)), ResponseBody::Refused(Refused { promised: 1, last_lsn: 1 }), "a repeat");
+    }
+
+    #[test]
+    fn an_observed_append_requires_this_ensemble_at_the_current_activation() {
+        let mut state = synced(1);
+        let guarded = Entry { guarded: true, ..entry(0, 1) };
+        assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [1; 32])), ResponseBody::Refused(_)));
+        state.activate(1, [1; 32]);
+        assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [2; 32])), ResponseBody::Refused(_)));
+        assert!(matches!(reply(state.append_observed(1, 0, vec![guarded.clone()], -1, [1; 32])), ResponseBody::Accepted(_)));
+        state.seal(2);
+        let next = Entry { lsn: 1, ..guarded };
+        assert!(matches!(reply(state.append_observed(1, 1, vec![next], 0, [1; 32])), ResponseBody::Refused(Refused { promised: 2, .. })));
     }
 
     #[test]

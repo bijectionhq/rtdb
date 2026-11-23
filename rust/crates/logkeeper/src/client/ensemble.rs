@@ -2,7 +2,7 @@
 
 use super::connection::{Binding, Callback, Connection, connection, remote};
 use super::{JournalEndpoint, StreamConfig};
-use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
+use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
@@ -194,6 +194,15 @@ impl Ensemble {
     pub async fn read_index(&self, server: usize, epoch: u64) -> Result<Ack> {
         let reply = self.links[server].call(RequestBody::ReadIndex(self.loglet_check(epoch))).await;
         self.ack(server, reply)
+    }
+
+    pub fn append_request(&self, epoch: u64, entry: Entry, commit_lsn: i64) -> RequestBody {
+        let guarded = entry.guarded;
+        let append = Append {
+            stream: self.stream(), epoch, first_lsn: entry.lsn, entries: vec![entry], commit_lsn,
+            guarded_ensemble: if guarded { self.identity.clone() } else { Bytes::new() },
+        };
+        if guarded { RequestBody::AppendObserved(append) } else { RequestBody::Append(append) }
     }
 
     pub fn repair_request(&self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64) -> RequestBody {

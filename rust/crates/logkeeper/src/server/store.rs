@@ -117,8 +117,8 @@ impl Store {
                 }
                 Some(append.first_lsn)
             }
-            RequestBody::Append(append) if append.entries.iter().any(|entry| entry.guarded) => {
-                return Outcome::Now(failed("a guarded entry requires the observed append request"));
+            RequestBody::Append(append) if !append.guarded_ensemble.is_empty() || append.entries.iter().any(|entry| entry.guarded) => {
+                return Outcome::Now(failed("guarded metadata requires the observed append request"));
             }
             _ => None,
         };
@@ -128,9 +128,17 @@ impl Store {
         };
         if self.queue.is_closed() { return Outcome::Now(failed("the journal has stopped")); }
         let (stream, decide): (String, Box<dyn FnOnce(&mut StreamState<Stored>) -> Decision>) = match body {
-            RequestBody::Append(append) | RequestBody::AppendObserved(append) => (append.stream, Box::new(move |state| {
+            RequestBody::Append(append) => (append.stream, Box::new(move |state| {
                 state.append(append.epoch, append.first_lsn, append.entries, append.commit_lsn)
             })),
+            RequestBody::AppendObserved(append) => {
+                let Ok(ensemble) = append.guarded_ensemble.as_ref().try_into() else {
+                    return Outcome::Now(failed("invalid guarded ensemble identity"));
+                };
+                (append.stream, Box::new(move |state| {
+                    state.append_observed(append.epoch, append.first_lsn, append.entries, append.commit_lsn, ensemble)
+                }))
+            }
             RequestBody::Overwrite(overwrite) if overwrite.activate_ensemble.is_empty() => (overwrite.stream, Box::new(move |state| {
                 state.overwrite(overwrite.epoch, overwrite.from_lsn, overwrite.entries, overwrite.complete, overwrite.commit_lsn)
             })),

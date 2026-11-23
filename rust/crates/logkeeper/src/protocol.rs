@@ -45,6 +45,9 @@ pub(crate) struct Append {
     pub entries: Vec<Entry>,
     #[prost(sint64, tag = "5")]
     pub commit_lsn: i64,
+    /// The exact ensemble whose activation authorizes an observed append.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub guarded_ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]

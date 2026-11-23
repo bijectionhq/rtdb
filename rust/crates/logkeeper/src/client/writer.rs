@@ -4,7 +4,7 @@ use super::connection::CALL_TIMEOUT;
 use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::CopyFrom;
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Append, Commit, Entry, PageDigest, RequestBody, Sealed};
+use crate::protocol::{Accepted, Commit, Entry, PageDigest, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -528,23 +528,24 @@ impl Writer {
         let last = recovered.history.last;
         let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
         // Predecessor recovery also syncs replicas at this epoch. Only the writer's own ensemble activates.
-        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| ensemble.activate(server, epoch)).collect();
-        let mut activated = 0;
-        while let Some(reply) = activating.next().await {
+        let ensemble_ref = &ensemble;
+        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| async move { (server, ensemble_ref.activate(server, epoch).await) }).collect();
+        let mut active = Vec::new();
+        while let Some((server, reply)) = activating.next().await {
             match reply {
-                Ok(Ack::Accepted(_)) => activated += 1,
+                Ok(Ack::Accepted(_)) => active.push(server),
                 Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
                 _ => (),
             }
-            if activated >= ensemble.config.write_quorum { break; }
+            if active.len() >= ensemble.config.write_quorum { break; }
         }
         drop(activating);
-        if activated < ensemble.config.write_quorum {
+        if active.len() < ensemble.config.write_quorum {
             return Err(Error::Remote { key: ensemble.config.stream.clone(), message: format!(
-                "activated {activated} journals, a write quorum is {}", ensemble.config.write_quorum) });
+                "activated {} journals, a write quorum is {}", active.len(), ensemble.config.write_quorum) });
         }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
-        let replicas = (0..ensemble.len()).map(|server| if synced.contains(&server) {
+        let replicas = (0..ensemble.len()).map(|server| if active.contains(&server) {
             Replica { acked: last, link: Link::Live }
         } else {
             Replica { acked: -1, link: Link::Down(long_ago) }
@@ -608,9 +609,7 @@ impl Writer {
                 |flight| flight.originals[server] == Mark::Pending,
             );
             if eligible {
-                let append = Append { stream: self.ensemble.stream(), epoch: self.epoch,
-                    first_lsn: lsn, entries: vec![entry.clone()], commit_lsn: pipeline.commit };
-                let body = if pipeline.guarded.is_some() { RequestBody::AppendObserved(append) } else { RequestBody::Append(append) };
+                let body = self.ensemble.append_request(self.epoch, entry.clone(), pipeline.commit);
                 self.send(pipeline, server, body);
             }
         }
@@ -1008,11 +1007,10 @@ mod tests {
             let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true };
             for server in 0..3 {
                 deposed_by(1, ensemble.overwrite(server, 1, 0, Vec::new(), true).await.unwrap()).unwrap();
+                deposed_by(1, ensemble.activate(server, 1).await.unwrap()).unwrap();
                 if server < originals {
                     let (done, durable) = oneshot::channel();
-                    let request = RequestBody::AppendObserved(Append {
-                        stream: stream.to_owned(), epoch: 1, first_lsn: 0, entries: vec![entry.clone()], commit_lsn: -1,
-                    });
+                    let request = ensemble.append_request(1, entry.clone(), -1);
                     ensemble.links[server].send(request, Box::new(move |reply| { let _ = done.send(reply); }));
                     let reply = tokio::time::timeout(CALL_TIMEOUT, durable).await.unwrap().unwrap();
                     deposed_by(1, ensemble.ack(server, reply).unwrap()).unwrap();

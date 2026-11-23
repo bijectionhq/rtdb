@@ -480,6 +480,7 @@ contract LogService {
 
     @invariant GuardedTailRequiresOriginalQuorum
         -- A guarded append owns the pending tip in an identified, intersecting ensemble.
+        -- Each original append requires this ensemble's activation in the same journal decision as the epoch and position checks.
         -- The owner first attests an exact quorum of original appends, then durably records its decision on a write quorum before release.
         -- Copies preserve the admission kind but supply no original reply or observation.
         -- A sealed tip can be recovered from a durable commit witness or original observations for the exact record on a write quorum.
