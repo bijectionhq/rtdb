@@ -354,6 +354,8 @@ surface TargetIngestion {
         -- Multidimensional arrays and explicitly bounded arrays retain their PostgreSQL text.
         -- The pgvector vector and halfvec types use Float32 children, with fixed-size lists for declared dimensions and variable-size lists for unconstrained dimensions.
         -- Snapshot type metadata and WAL relation and type messages identify pgvector fields.
+        -- Domains over float arrays or pgvector use the Arrow layout of their PostgreSQL base type.
+        -- The upstream type catalog supplies the effective dimension for pgvector domains in logical replication.
         -- Ordinary homogeneous floating-point arrays in JSON and JSONB build packed Float64 children.
         -- It stages Arrow document vectors with separately resolved event headers.
 

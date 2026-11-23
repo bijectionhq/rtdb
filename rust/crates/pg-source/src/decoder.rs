@@ -4,7 +4,7 @@ use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
-use crate::{Lsn, read_text, vector_types::VectorTypes, wire::{Column, Input, protocol}};
+use crate::{Lsn, read_text, vector_types::{VectorType, VectorTypes}, wire::{Column, Input, protocol}};
 
 pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +89,7 @@ impl Decoder {
             }
             b'Y' => {
                 let oid = input.u32()?; let schema = input.string()?; let name = input.string()?; input.end()?;
-                if self.vector_types.as_ref().is_some_and(|types| types.matches(oid, Some((schema, name)))) {
+                if self.vector_types.as_ref().is_some_and(|types| types.get(oid, Some((schema, name))).is_some()) {
                     self.wal_vectors.insert(oid);
                 } else {
                     self.wal_vectors.remove(&oid);
@@ -120,7 +120,9 @@ impl Decoder {
                 input.end()?;
                 if self.ignored.contains(&relation.table) { return Ok(None); }
                 let width = values.len().min(relation.columns.len());
-                let rows = decode_columns(&relation.columns[..width], 1, &self.memory, |oid| self.wal_vectors.contains(&oid), |_, index| {
+                let rows = decode_columns(&relation.columns[..width], 1, &self.memory, |oid| {
+                    self.vector_types.as_ref().filter(|_| self.wal_vectors.contains(&oid))?.get(oid, None)
+                }, |_, index| {
                     let name = &relation.columns[index].name;
                     recover(values[index], old.as_deref(), index, name, &relation.table)
                 })?;
@@ -151,12 +153,12 @@ pub(crate) fn text_bound(oid: u32, text: &str) -> Result<usize> {
 pub(crate) fn snapshot_rows(
     table: &TableRef, columns: &[Column], rows: &[crate::wire::Row], memory: &Arc<MemoryBudget>, vectors: &VectorTypes,
 ) -> Result<ArrowChanges> {
-    let batch = decode_columns(columns, rows.len(), memory, |oid| vectors.matches(oid, None), |row, column| rows[row].cell(column))?;
+    let batch = decode_columns(columns, rows.len(), memory, |oid| vectors.get(oid, None), |row, column| rows[row].cell(column))?;
     Ok(ArrowChanges { kind: RowKind::Put, table: table.clone(), rows: batch })
 }
 
 fn decode_columns<'a>(
-    columns: &[Column], count: usize, memory: &Arc<MemoryBudget>, vector: impl Fn(u32) -> bool,
+    columns: &[Column], count: usize, memory: &Arc<MemoryBudget>, vector: impl Fn(u32) -> Option<VectorType>,
     cell: impl Fn(usize, usize) -> Result<Option<&'a str>>,
 ) -> Result<OwnedBatch> {
     let overflow = || protocol("PostgreSQL Arrow batch allocation overflow");
@@ -169,24 +171,29 @@ fn decode_columns<'a>(
     let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
     for (index, Column { name, oid, typmod }) in columns.iter().enumerate() {
         let vector = vector(*oid);
+        let oid = match vector {
+            Some(VectorType::FloatArray(base)) => base,
+            _ => *oid,
+        };
+        let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
         let temporary = (0..count).try_fold(base, |bytes, row| {
-            let size = cell(row, index)?.map(|text| text_bound(if vector { 700 } else { *oid }, text)).transpose()?.unwrap_or_default();
+            let size = cell(row, index)?.map(|text| text_bound(bound_oid, text)).transpose()?.unwrap_or_default();
             bytes.checked_add(size).ok_or_else(overflow)
         })?;
         let _values = memory.reserve(temporary)?;
-        if vector {
-            let (field, array) = rtdb_pg_codec::read_vector_column(name, *typmod, count, |row| cell(row, index), &mut output)?;
+        if let Some(VectorType::Pgvector(domain_typmod)) = vector {
+            let (field, array) = rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), count, |row| cell(row, index), &mut output)?;
             arrays.push(array);
             fields.push(field);
             continue;
         }
-        if let Some((field, array)) = rtdb_pg_codec::read_source_text_column(name, *oid, count, |row| cell(row, index), &mut output)? {
+        if let Some((field, array)) = rtdb_pg_codec::read_source_text_column(name, oid, count, |row| cell(row, index), &mut output)? {
             arrays.push(array);
             fields.push(field);
             continue;
         }
         let values = (0..count).map(|row| {
-            cell(row, index)?.map_or(Ok(Value::Null), |text| read_text(*oid, text))
+            cell(row, index)?.map_or(Ok(Value::Null), |text| read_text(oid, text))
         }).collect::<Result<Vec<_>>>()?;
         let types = values.iter().map(Value::logical_type).collect::<Vec<_>>();
         let logical = LogicalType::join_all(&types);
@@ -206,7 +213,7 @@ fn snapshot_columns_keep_postgres_types_nulls_and_tuple_order() {
     let memory = MemoryBudget::new(1 << 20);
     let columns = [column("_id", 20), column("note", 25)];
     let tuples = [[Some("2"), None], [Some("1"), Some("a")]];
-    let batch = decode_columns(&columns, tuples.len(), &memory, |_| false, |row, column| Ok(tuples[row][column])).unwrap();
+    let batch = decode_columns(&columns, tuples.len(), &memory, |_| None, |row, column| Ok(tuples[row][column])).unwrap();
     let batch = batch.batch();
     assert_eq!(batch.num_rows(), 2);
     assert_eq!(batch.schema_ref().field(0).data_type(), &arrow_schema::DataType::Int64);
@@ -225,7 +232,7 @@ fn snapshot_array_columns_match_the_text_reader_for_nulls_and_escaped_values() {
         [Some("{}"), Some("{}"), None],
         [None, Some("{NULL}"), None],
     ];
-    let batch = decode_columns(&columns, tuples.len(), &memory, |_| false, |row, column| Ok(tuples[row][column])).unwrap();
+    let batch = decode_columns(&columns, tuples.len(), &memory, |_| None, |row, column| Ok(tuples[row][column])).unwrap();
     for (position, Column { oid, .. }) in columns.iter().enumerate() {
         for (row, tuple) in tuples.iter().enumerate() {
             let expected = tuple[position].map(|text| read_text(*oid, text).unwrap()).unwrap_or(Value::Null);
@@ -265,7 +272,7 @@ fn source_scalar_columns_match_legacy_arrays_metadata_and_errors() {
             assert_eq!(array.to_data(), expected_array.to_data(), "OID {oid}");
         }
         let expected = read_text(oid, invalid).unwrap_err();
-        let actual = decode_columns(&[column("scalar", oid)], 1, &memory, |_| false, |_, _| Ok(Some(invalid))).unwrap_err();
+        let actual = decode_columns(&[column("scalar", oid)], 1, &memory, |_| None, |_, _| Ok(Some(invalid))).unwrap_err();
         assert_eq!((actual.category, actual.code, actual.message), (expected.category, expected.code, expected.message), "OID {oid}");
     }
 }
@@ -282,7 +289,7 @@ fn floating_arrays_and_pgvector_build_typed_children_with_nulls() {
     let types = VectorTypes::fixture();
     let columns = [column("reals", 1021), column("doubles", 1022), Column { typmod: 2, ..column("embedding", 20345) }];
     let tuples = [[Some("{-0,NaN,NULL}"), Some("{-0,Infinity,NULL}"), Some("[-0,1.5]")], [None; 3], [Some("{}"), Some("{NULL}"), Some("[1,2]")]];
-    let batch = decode_columns(&columns, tuples.len(), &memory, |oid| types.matches(oid, None), |row, column| Ok(tuples[row][column])).unwrap();
+    let batch = decode_columns(&columns, tuples.len(), &memory, |oid| types.get(oid, None), |row, column| Ok(tuples[row][column])).unwrap();
     let batch = batch.batch();
     let reals = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
     let children = reals.values().as_any().downcast_ref::<Float32Array>().unwrap();
@@ -306,21 +313,25 @@ fn floating_arrays_and_pgvector_build_typed_children_with_nulls() {
 }
 
 #[test]
-fn wal_uses_the_declared_dimension_for_the_named_extension_type() {
+fn wal_uses_base_layouts_and_declared_dimensions_for_vector_types_and_domains() {
     use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray, StringArray};
     let mut decoder = Decoder::new(BTreeSet::new(), MemoryBudget::new(1 << 20)).with_vector_types(VectorTypes::fixture());
-    for (oid, name) in [(20345_u32, "vector"), (20346, "halfvec"), (20347, "vector")] {
+    for (oid, schema, name) in [
+        (20345_u32, "embeddings", "vector"), (20346, "embeddings", "halfvec"),
+        (20347, "embeddings", "vector"), (20348, "embeddings", "vector"), (20349, "", "_float4"),
+    ] {
         let mut message = vec![b'Y'];
         message.extend_from_slice(&oid.to_be_bytes());
-        message.extend_from_slice(b"embeddings\0");
+        message.extend_from_slice(schema.as_bytes());
+        message.push(0);
         message.extend_from_slice(name.as_bytes());
         message.push(0);
         decoder.receive_arrow(&message).unwrap();
     }
     let mut relation = vec![b'R'];
     relation.extend_from_slice(&1_u32.to_be_bytes());
-    relation.extend_from_slice(b"public\0docs\0f\0\x03");
-    for (name, oid, typmod) in [("fixed", 20345_u32, 2_i32), ("any", 20346, -1), ("unrelated", 20347, 2)] {
+    relation.extend_from_slice(b"public\0docs\0f\0\x05");
+    for (name, oid, typmod) in [("fixed", 20345_u32, 2_i32), ("any", 20346, -1), ("unrelated", 20347, 2), ("domain", 20348, -1), ("array_domain", 20349, -1)] {
         relation.push(0);
         relation.extend_from_slice(name.as_bytes());
         relation.push(0);
@@ -330,8 +341,8 @@ fn wal_uses_the_declared_dimension_for_the_named_extension_type() {
     decoder.receive_arrow(&relation).unwrap();
     let mut begin = vec![b'B']; begin.extend([0; 20]);
     decoder.receive_arrow(&begin).unwrap();
-    let mut row = vec![b'I', 0, 0, 0, 1, b'N', 0, 3];
-    for text in [b"[-0,1.5]".as_slice(), b"[1,2,3]", b"[4,5]"] {
+    let mut row = vec![b'I', 0, 0, 0, 1, b'N', 0, 5];
+    for text in [b"[-0,1.5]".as_slice(), b"[1,2,3]", b"[4,5]", b"[-0,1.5]", b"{-0,NULL}"] {
         row.push(b't');
         row.extend_from_slice(&(text.len() as i32).to_be_bytes());
         row.extend_from_slice(text);
@@ -349,6 +360,11 @@ fn wal_uses_the_declared_dimension_for_the_named_extension_type() {
     assert!(variable.values().as_any().is::<Float32Array>());
     assert_eq!(batch.column(2).as_any().downcast_ref::<StringArray>().unwrap().value(0), "[4,5]");
     assert!(!fixed.is_null(0));
+    assert_eq!(batch.column(3).to_data(), fixed.to_data());
+    let array_domain = batch.column(4).as_any().downcast_ref::<ListArray>().unwrap();
+    let child = array_domain.values().as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(child.value(0).to_bits(), (-0.0_f32).to_bits());
+    assert!(child.is_null(1));
 }
 
 #[test]
@@ -371,7 +387,7 @@ fn float_arrays_keep_multidimensional_and_explicitly_bounded_cells_as_text() {
 
     let memory = MemoryBudget::new(1 << 20);
     let texts = [Some("{-0,NULL}"), Some("[0:1]={2,3}"), Some("{{1,2},{3,4}}"), None];
-    let batch = decode_columns(&[column("array", 1021)], texts.len(), &memory, |_| false, |row, _| Ok(texts[row])).unwrap();
+    let batch = decode_columns(&[column("array", 1021)], texts.len(), &memory, |_| None, |row, _| Ok(texts[row])).unwrap();
     let column = batch.batch().column(0).as_any().downcast_ref::<UnionArray>().unwrap();
     let child = column.child(column.type_id(0)).as_any().downcast_ref::<ListArray>().unwrap();
     assert!(child.values().as_any().is::<Float32Array>());

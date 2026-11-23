@@ -164,4 +164,5 @@ No configuration properties are provided.
 The mirror preserves SQL nulls and null elements in PostgreSQL arrays.
 Multidimensional arrays and arrays with non-default lower bounds retain their PostgreSQL text representation.
 It recognizes the pgvector extension's types in its installed schema.
-The pgvector type catalog is read when snapshotting starts and when opening the replication stream.
+Domains over these types use the layout of their base type, including the declared dimension inherited through nested domains.
+The type catalog is read when snapshotting starts and when opening the replication stream.

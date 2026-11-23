@@ -216,7 +216,7 @@ async fn native_source_recovers_confirmed_local_journal_transactions_before_the_
 
 #[tokio::test]
 #[ignore = "requires a PostgreSQL 17+ server with pgvector, wal_level=logical and replication credentials"]
-async fn vector_types_have_the_same_arrow_layout_in_snapshot_and_wal() {
+async fn vector_types_and_domains_have_the_same_arrow_layout_in_snapshot_and_wal() {
     use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array, ListArray};
     use arrow_schema::DataType;
 
@@ -230,12 +230,23 @@ async fn vector_types_have_the_same_arrow_layout_in_snapshot_and_wal() {
     remote.ssl = SslMode::Disable;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let table = format!("rtdb_vector_{suffix}");
+    let fixed_domain = format!("rtdb_fixed_{suffix}");
+    let nested_domain = format!("rtdb_nested_{suffix}");
+    let variable_domain = format!("rtdb_variable_{suffix}");
+    let reals_domain = format!("rtdb_reals_{suffix}");
+    let doubles_domain = format!("rtdb_doubles_{suffix}");
     let publication = format!("rtdb_pub_{suffix}");
     let slot = format!("rtdb_slot_{suffix}");
     let memory = MemoryBudget::new(256 << 20);
     let mut control = Connection::open(&remote, false, Arc::clone(&memory)).await.unwrap();
-    control.query(&format!("CREATE TABLE {table} (_id integer PRIMARY KEY, embedding vector(2), half halfvec, reals real[], doubles double precision[])")).await.unwrap();
-    control.query(&format!("INSERT INTO {table} VALUES (1, '[-0,1.5]', '[1,2,3]', '{{-0,NULL}}', '{{5.25,NULL}}')")).await.unwrap();
+    for (domain, base) in [
+        (&fixed_domain, "vector(2)"), (&nested_domain, fixed_domain.as_str()),
+        (&variable_domain, "halfvec"), (&reals_domain, "real[]"), (&doubles_domain, "double precision[]"),
+    ] {
+        control.query(&format!("CREATE DOMAIN {domain} AS {base}")).await.unwrap();
+    }
+    control.query(&format!("CREATE TABLE {table} (_id integer PRIMARY KEY, embedding vector(2), half halfvec, reals real[], doubles double precision[], domain_fixed {nested_domain}, domain_variable {variable_domain}, domain_reals {reals_domain}, domain_doubles {doubles_domain})")).await.unwrap();
+    control.query(&format!("INSERT INTO {table} VALUES (1, '[-0,1.5]', '[1,2,3]', '{{-0,NULL}}', '{{5.25,NULL}}', '[-0,1.5]', '[1,2,3]', '{{-0,NULL}}', '{{5.25,NULL}}')")).await.unwrap();
     control.query(&format!("CREATE PUBLICATION {publication} FOR TABLE {table}")).await.unwrap();
     let config = SourceConfig { remote: "test".into(), slot_name: slot.clone(), publication_name: publication.clone(), indexer: None, ignore_tables: BTreeSet::new() };
     let mut snapshot = SnapshotReader::open(&remote, &config, Arc::clone(&memory)).await.unwrap();
@@ -255,11 +266,18 @@ async fn vector_types_have_the_same_arrow_layout_in_snapshot_and_wal() {
     control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap();
     control.query(&format!("DROP TABLE {table}")).await.unwrap();
 
+    for domain in [nested_domain, fixed_domain, variable_domain, reals_domain, doubles_domain] {
+        control.query(&format!("DROP DOMAIN {domain}")).await.unwrap();
+    }
+
     let snapshot = snapshot_tx.batches[0].rows.batch();
     let wal = wal_tx.batches[0].rows.batch();
     assert_eq!(snapshot.schema(), wal.schema());
-    for column in 1..5 {
+    for column in 1..9 {
         assert_eq!(snapshot.column(column).to_data(), wal.column(column).to_data());
+    }
+    for column in 1..5 {
+        assert_eq!(wal.column(column).to_data(), wal.column(column + 4).to_data());
     }
     let vector = wal.column(1).as_any().downcast_ref::<FixedSizeListArray>().unwrap();
     assert_eq!(vector.value_length(), 2);
