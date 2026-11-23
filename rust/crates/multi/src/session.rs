@@ -226,7 +226,7 @@ pub struct Session {
     /// What the first backend's greeting has reported so far: its authentication, the session's user, and whether that user may be vouched for.
     greeting: Greeting,
     router: Arc<dyn Router>,
-    record: watch::Receiver<Option<DeploymentRecord>>,
+    record: Option<watch::Receiver<Option<DeploymentRecord>>>,
     prepared: BTreeMap<String, RememberedStatement>,
     next_statement_order: u64,
     await_token: Option<Frame>,
@@ -249,14 +249,14 @@ pub struct Session {
 impl Session {
     pub fn new(startup: Bytes, router: Arc<dyn Router>, directory: Arc<dyn Directory>, deployment: String, grants: Option<Grants>, keyed: bool) -> Self {
         let record = rtdb_directory::watch_deployment(directory, deployment, RECONNECT_RETRY_DELAY);
-        Self::with_authority(startup, router, record, grants, keyed)
+        Self::with_authority(startup, router, Some(record), grants, keyed)
     }
 
     pub(crate) fn new_ordered(startup: Bytes, router: Arc<dyn Router>, grants: Option<Grants>, keyed: bool) -> Self {
-        Self::with_authority(startup, router, watch::channel(None).1, grants, keyed)
+        Self::with_authority(startup, router, None, grants, keyed)
     }
 
-    fn with_authority(startup: Bytes, router: Arc<dyn Router>, record: watch::Receiver<Option<DeploymentRecord>>, grants: Option<Grants>, keyed: bool) -> Self {
+    fn with_authority(startup: Bytes, router: Arc<dyn Router>, record: Option<watch::Receiver<Option<DeploymentRecord>>>, grants: Option<Grants>, keyed: bool) -> Self {
         Self { startup, frame_memory: MemoryBudget::new(DEFAULT_GATEWAY_FRAME_BYTES), replay_window: RECONNECT_WITHIN, command_key_age: COMMAND_KEY_AGE, expected_installation: None, grants, authenticated: None, greeting: Greeting::default(), router, record, prepared: BTreeMap::new(), next_statement_order: 0, await_token: None, settings: None, status: Status::Busy, pending: Vec::new(), prepared_responses: 0, answered: false, lost_unanswered: false, prefer_holder: false, keyed, key: None }
     }
 
@@ -274,7 +274,7 @@ impl Session {
     async fn connect(&mut self, supersede: Option<u64>, restore_key: RestoreKey) -> Result<Backend> {
         let result = tokio::time::timeout(RECONNECT_WITHIN, async {
             loop {
-                let previous = placement(&self.record.borrow());
+                let previous = self.record.as_ref().and_then(|record| placement(&record.borrow()));
                 let attempt = async {
                     let mut backend = self.connect_once(supersede).await?;
                     if !matches!(restore_key, RestoreKey::None) && let Some(key) = &self.key {
@@ -288,7 +288,7 @@ impl Session {
                 match attempt {
                     Ok(backend) => return Ok(backend),
                     Err(error) if !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Conflict) => return Err(error),
-                    Err(_) => wait_for_placement(&mut self.record, previous, RECONNECT_RETRY_DELAY).await,
+                    Err(_) => wait_for_placement(self.record.as_mut(), previous, RECONNECT_RETRY_DELAY).await,
                 }
             }
         }).await.unwrap_or_else(|_| Err(lost("timed out reconnecting to the holder")));
@@ -353,7 +353,7 @@ impl Session {
     }
 
     fn stale(&self, backend: &Backend) -> bool {
-        self.record.borrow().as_ref().is_some_and(|record| record.epoch > backend.epoch)
+        self.record.as_ref().is_some_and(|watch| watch.borrow().as_ref().is_some_and(|record| record.epoch > backend.epoch))
     }
 
     /// Runs the session over an already-routed first backend whose greeting the client has not yet seen.
@@ -386,10 +386,7 @@ impl Session {
                     let waiting_for_ready = self.keyed && !copying_in && self.pending.last().is_some_and(|frame| matches!(frame.tag, b'Q' | b'S'));
                     tokio::select! {
                         biased;
-                        _ = self.record.wait_for(|record| record.as_ref().is_some_and(|record| {
-                            matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Restoring)
-                                || record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_none()
-                        })) => Event::Retired,
+                        _ = wait_for_retirement(self.record.as_mut()) => Event::Retired,
                         _ = tokio::time::sleep_until(startup_deadline), if !self.greeting.done => return Err(startup_timeout()),
                         _ = wait_until(replay_deadline) => return Err(replay_timeout()),
                         event = async {
@@ -750,7 +747,16 @@ fn placement(record: &Option<DeploymentRecord>) -> Option<(u64, Lifecycle)> {
     record.as_ref().map(|record| (record.epoch, record.lifecycle))
 }
 
-async fn wait_for_placement(record: &mut watch::Receiver<Option<DeploymentRecord>>, before: Option<(u64, Lifecycle)>, delay: Duration) {
+async fn wait_for_retirement(record: Option<&mut watch::Receiver<Option<DeploymentRecord>>>) {
+    let Some(record) = record else { return std::future::pending().await; };
+    let _ = record.wait_for(|record| record.as_ref().is_some_and(|record| {
+        matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Restoring)
+            || record.lifecycle == Lifecycle::Deleted && record.moved_at_ms.is_none()
+    })).await;
+}
+
+async fn wait_for_placement(record: Option<&mut watch::Receiver<Option<DeploymentRecord>>>, before: Option<(u64, Lifecycle)>, delay: Duration) {
+    let Some(record) = record else { return tokio::time::sleep(delay).await; };
     let retry_at = tokio::time::Instant::now() + delay;
     let watch_closed = tokio::time::timeout_at(retry_at, record.wait_for(|current| placement(current) != before)).await
         .is_ok_and(|update| update.is_err());
@@ -841,6 +847,11 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn an_installed_route_has_no_directory_retirement_signal() {
+        assert!(tokio::time::timeout(Duration::from_millis(5), wait_for_retirement(None)).await.is_err());
+    }
 
     async fn send(stream: &mut TcpStream, tag: u8, body: &[u8]) { stream.write_all(&Frame { tag, body: Bytes::copy_from_slice(body) }.encode()).await.unwrap(); }
 
@@ -1038,7 +1049,7 @@ mod tests {
         let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
         let (changes, mut watched) = watch::channel(Some(record.clone()));
         let original = placement(&watched.borrow());
-        let retry = tokio::spawn(async move { wait_for_placement(&mut watched, original, Duration::from_secs(30)).await });
+        let retry = tokio::spawn(async move { wait_for_placement(Some(&mut watched), original, Duration::from_secs(30)).await });
         record.version += 1;
         changes.send_replace(Some(record.clone()));
         tokio::task::yield_now().await;

@@ -194,6 +194,8 @@ impl Authority {
         let custodian = Identity::new(path, "custodian", &issuer);
         let router = Identity::new(path, "router", &issuer);
         let workers = [0, 1].map(|index| Identity::new(path, &format!("worker-{index}"), &issuer));
+        let initial_history = [7_u8; 32];
+        let empty_digest = [0_u8; 32];
         let group_spec = json!({
             "placement": placement,
             "limits": {
@@ -204,10 +206,10 @@ impl Authority {
                 "maintenance_bytes": maintenance,
             },
             "initial_checkpoint": {
-                "cut": {"next_lsn": 0, "history": [7_u8; 32]},
-                "root": [0_u8; 32],
-                "manifest": [0_u8; 32],
-                "custody": {"allocation": Uuid::new_v4(), "revision": 1, "provider": [0_u8; 32]},
+                "cut": {"next_lsn": 0, "history": initial_history},
+                "root": empty_digest,
+                "manifest": empty_digest,
+                "custody": {"allocation": Uuid::new_v4(), "revision": 1, "provider": empty_digest},
             },
             "initial_window": {"allocation": Uuid::new_v4(), "serial": 1, "bytes": ordinary},
             "maximum_prefix_bytes": ordinary + maintenance + (1 << 20),
