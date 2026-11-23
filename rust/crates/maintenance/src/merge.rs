@@ -15,7 +15,8 @@ use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_schema, copy_compaction_batch}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
-use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
+use rtdb_index::{PartitionValue, TrieState};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -322,8 +323,27 @@ pub fn recency_partition(recency: Timestamp, partition: RecencyPartition) -> Res
 #[async_trait]
 impl CompactionExecutor for SegmentCompactor {
     async fn execute(&self, job: &CompactionJob, cancellation: &CancellationToken) -> Result<TriesAdded> {
-        let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
         let snapshot = self.snapshots.snapshot();
+        let permit = if self.store.defers_trie_releases() {
+            if job.inputs.iter().any(|key| !snapshot.trie_catalog().trie(&job.table, key).is_some_and(|trie| trie.state == TrieState::Live)) {
+                return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.maintenance/compaction-input-retired",
+                    "The compaction selection no longer names live inputs"));
+            }
+            let hold = self.store.retain_catalog(snapshot.snapshot().catalog_cut()).await?
+                .ok_or_else(|| crate::invalid("Coordinated storage returned no compaction hold"))?;
+            Some(hold)
+        } else { None };
+        let work = self.execute_job(job, snapshot, cancellation);
+        match permit {
+            Some(permit) => IoRegion::retaining(permit, work).await,
+            None => work.await,
+        }
+    }
+}
+
+impl SegmentCompactor {
+    async fn execute_job(&self, job: &CompactionJob, snapshot: Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<TriesAdded> {
+        let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
         let entry = snapshot.table_catalog().entry(&job.table).cloned().ok_or_else(|| crate::invalid("Compaction table has no recorded slug"))?;
         let mut inputs = Vec::new();
         for (index, key) in job.inputs.iter().enumerate() {

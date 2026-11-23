@@ -40,6 +40,10 @@ impl ReleaseWitness {
         }
     }
 
+    fn ready_by(&self, threshold: i64) -> bool {
+        self.record.trie_floor.is_some() || self.replica.is_some() || self.record.released_at_ms <= threshold
+    }
+
     fn permits(&self, owner: &DeploymentRecord, store: &str) -> bool {
         if let Some(replica) = &self.replica {
             return self.version.as_ref().is_some_and(|version| replica.permits(owner, store, version));
@@ -142,7 +146,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
         for marker in bucket.list(Some(&markers)).await? {
             let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
             let Some(relative) = witness.target_name().filter(|_| witness.release_version.is_some() || witness.terminal.is_some()) else { continue; };
-            if witness.record.released_at_ms > threshold || !witness.permits(candidate, &store) { continue; }
+            if !witness.ready_by(threshold) || !witness.permits(candidate, &store) { continue; }
             let target = ObjectKey::new(format!("{store}/{relative}"))?;
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
             eligible.push((marker.key, target, witness));
@@ -365,7 +369,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     if !release.is_under(&markers) { return Err(changed()); }
     let Some(witness) = read_release(bucket, release).await? else { return Ok(None); };
     if witness.target_name() != Some(relative) { return Err(changed()); }
-    if witness.record.released_at_ms > threshold { return Ok(None); }
+    if !witness.ready_by(threshold) { return Ok(None); }
     let (deployment, retires_release) = match &retirement.work {
         RetirementWork::S3 { deployment, version, release_version, legacy_receipt, .. } => {
             if release_version.as_ref().is_some_and(|expected| witness.release_version.as_ref() != Some(expected)) {
@@ -1395,7 +1399,7 @@ mod tests {
         };
         let bucket = MemoryStore::default();
         let witness = StoredRelease::Terminal {
-            record: super::super::GarbageRecord { key: logical.into(), released_at_ms: 0, trie_floor: Some(floor) },
+            record: super::super::GarbageRecord { key: logical.into(), released_at_ms: 1000, trie_floor: Some(floor) },
             terminal: publication,
             pack: None,
         };
