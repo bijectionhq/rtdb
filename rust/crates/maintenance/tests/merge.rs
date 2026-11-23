@@ -214,7 +214,7 @@ async fn same_time_clipping_and_erase_preserve_the_surrounding_history() {
                 return match &row.operation {
                     StoredOperation::Put(document) => document.get("value").cloned(),
                     StoredOperation::Delete => None,
-                    StoredOperation::Erase => unreachable!(),
+                    StoredOperation::Erase | StoredOperation::Redacted => unreachable!(),
                 };
             }
         }

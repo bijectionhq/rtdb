@@ -96,6 +96,52 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
 }
 
 #[test]
+fn redaction_refuses_only_where_the_original_assertion_wins() {
+    let span = |from, to| Interval::from_micros(from, to).unwrap();
+    let old = EventHeader {
+        iid: Iid([1; 16]),
+        system_from: Timestamp(10),
+        commit_position: 1,
+        valid_time: span(0, 100),
+        op: EventOp::Put,
+    };
+    let redacted = EventHeader {
+        system_from: Timestamp(20),
+        valid_time: span(20, 80),
+        op: EventOp::Redacted,
+        ..old
+    };
+    let newer = EventHeader {
+        system_from: Timestamp(30),
+        valid_time: span(40, 60),
+        ..old
+    };
+    let memory = MemoryBudget::new(1 << 20);
+    for (valid, system, expected) in [
+        (40, 19, Some(10)),
+        (19, 20, Some(10)),
+        (20, 20, None),
+        (50, 29, None),
+        (50, 30, Some(30)),
+        (59, 30, Some(30)),
+        (60, 30, None),
+        (80, 30, Some(10)),
+    ] {
+        let bounds = TemporalBounds { valid_time: span(valid, valid + 1), system_time: span(system, system + 1) };
+        for mut resolver in [HistoryResolver::new(bounds, true), HistoryResolver::new_in(bounds, true, Arc::clone(&memory))] {
+            let actual = [&newer, &redacted, &old].into_iter().try_fold(Vec::new(), |mut visible, header| {
+                visible.extend(resolver.resolve(header, header.system_from.0)?.into_iter().map(|row| row.source));
+                Ok::<_, rtdb_types::Anomaly>(visible)
+            });
+            match expected {
+                Some(value) => assert_eq!(actual.unwrap(), [value]),
+                None => assert_eq!(actual.unwrap_err().code, "rtdb.temporal/erased-assertion"),
+            }
+        }
+    }
+}
+
+#[test]
 fn a_scan_at_any_bounds_sees_exactly_the_events_whose_rectangles_meet_them() {
     let mut random = Seeded(17);
     for case in 0..3_000 {

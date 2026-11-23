@@ -333,7 +333,7 @@ impl OwnedSchema {
         let from = valid.lower();
         let to = valid.upper();
         let accepted = !valid.is_empty() && match (self.0.validity, self.0.lifetime_micros, operation) {
-            (_, _, EventOp::Erase) => false,
+            (_, _, EventOp::Erase | EventOp::Redacted) => false,
             (Validity::Explicit, _, _) => true,
             (Validity::BoundedPeriod, _, _) => from > Timestamp::MIN && to < Timestamp::MAX,
             (Validity::Acceptance, None, _) => from > Timestamp::MIN && from <= source && to == Timestamp::MAX,

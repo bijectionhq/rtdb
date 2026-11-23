@@ -130,10 +130,11 @@ value Row {
 
 value Op {
     -- Exactly one leg is populated per row.
-    -- Modelled as three optionals rather than a sum type only because of what this file's language version can express; "exactly one populated" is the rule.
+    -- The optional legs form a sum type.
     put: Put?
     delete: Delete?
     erase: Erase?
+    redacted: Redacted?
 }
 
 value Put {
@@ -142,6 +143,7 @@ value Put {
 
 value Delete { }   -- null marker in the "delete" leg
 value Erase { }    -- null marker in the "erase" leg
+value Redacted { } -- null marker at the original owned event's origin and extent
 
 ------------------------------------------------------------
 -- Entities

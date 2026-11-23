@@ -139,7 +139,9 @@ config {
 -- Their order holds only within their page, and the recency split separates them into different files.
 -- Within one IID and system time, an ordinary put or delete contributes only valid-time points outside all higher-priority command intervals.
 -- These fragments are disjoint and preserve the winning command at every valid-time point.
--- Owned landing assertions retain their valid-time intervals and commit positions until erased.
+-- Owned landing assertions retain their valid-time intervals and commit positions.
+-- A redacted owned event retains its original origin, system position and full valid-time interval.
+-- The redacted event participates in the ceiling at that position and preserves older history outside its effect.
 -- L0 normalization retains the latest erase marker and excludes every older event for the same entity.
 -- Other exact entity keys in the same IID bucket remain eligible for normalization.
 -- For each merge task, we merge-sort the input pages by IID and system-time, applying bitemporal resolution.

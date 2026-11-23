@@ -168,7 +168,7 @@ impl HistoryPage {
         let origins = self.0.column(6).as_any().downcast_ref::<FixedSizeBinaryArray>().expect("history origin layout");
         let origin = origins.is_valid(row).then(|| EventOrigin(origins.value(row).try_into().expect("history origin width")));
         let op = match self.0.column(4).as_primitive::<UInt8Type>().value(row) {
-            0 => EventOp::Put, 1 => EventOp::Delete, 2 => EventOp::Erase,
+            0 => EventOp::Put, 1 => EventOp::Delete, 2 => EventOp::Erase, 3 => EventOp::Redacted,
             _ => return Err(invalid("Entity history contains an unknown operation")),
         };
         Ok((EventHeader { iid: self.iid(row), system_from: time(1), valid_time: Interval::new(time(2), time(3))?,
@@ -251,7 +251,7 @@ impl<W: Write> HistoryWriter<W> {
                 Arc::new(Int64Array::from_iter_values(headers.iter().map(|header| header.valid_time.lower().0))),
                 Arc::new(Int64Array::from_iter_values(headers.iter().map(|header| header.valid_time.upper().0))),
                 Arc::new(UInt8Array::from_iter_values(headers.iter().map(|header| match header.op {
-                    EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2,
+                    EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2, EventOp::Redacted => 3,
                 }))),
                 Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))),
                 Arc::new(origin_array(origins)?),

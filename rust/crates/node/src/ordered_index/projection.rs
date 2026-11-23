@@ -7,7 +7,7 @@ use std::{
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PutColumn};
 use rtdb_temporal::HistoryResolver;
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, Value, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -329,6 +329,9 @@ impl Changes {
                     None
                 };
                 if !retain(header, address) { continue; }
+                if header.op == EventOp::Redacted {
+                    return Err(Anomaly::unsupported("rtdb.owned/redaction-uncovered", "Ordered indexes require coverage for redacted assertions"));
+                }
                 if header.op == EventOp::Put {
                     if let Some(id) = id {
                         let Some(PutColumn::Stored(field, array, row)) = event.put_column("_id") else {

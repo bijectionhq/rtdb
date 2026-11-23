@@ -97,6 +97,9 @@ fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], incl
     for row in 0..batch.len() {
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
         let mut header = batch.header(row)?;
+        if header.op == EventOp::Redacted {
+            return Err(fault("Search repair requires assertion-level redaction coverage"));
+        }
         header.commit_position = posting_position(header, batch.origin(row)?, row)?;
         if header.op == EventOp::Erase {
             let reservation = Arc::get_mut(charge).expect("Search repair owns its scratch");

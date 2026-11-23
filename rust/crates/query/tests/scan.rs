@@ -844,6 +844,7 @@ async fn is_not_null_keeps_zero_count_pages_that_correct_delete_or_erase_matchin
             EventOp::Put => second.put(table(), document(1, Value::Null), corrected),
             EventOp::Delete => second.delete(table(), &target, corrected),
             EventOp::Erase => second.erase(table(), &target),
+            EventOp::Redacted => unreachable!(),
         }.unwrap();
         second.put(table(), document(3, Value::Null), corrected).unwrap();
         state.apply(&second.stage().unwrap()).unwrap();
@@ -859,6 +860,7 @@ async fn is_not_null_keeps_zero_count_pages_that_correct_delete_or_erase_matchin
                     to: Expr::Literal(timestamp(150)),
                 })],
                 EventOp::Put | EventOp::Delete => vec![(50, at(200)), (10, at(200))],
+                EventOp::Redacted => unreachable!(),
             };
             for (valid, system) in points {
                 let source = scan(&context, &["v", "_valid_from", "_valid_to", "_system_from", "_system_to"], at(valid), system, None);

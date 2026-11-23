@@ -178,6 +178,9 @@ impl Builder {
     }
 
     fn put(&mut self, entities: &mut BTreeMap<Vec<u8>, Entity>, row: IndexedRow<'_>) -> Result<()> {
+        if row.header.op == rtdb_types::EventOp::Redacted {
+            return Err(fault("Search files require assertion-level redaction coverage"));
+        }
         self.reserve_row(&row)?;
         if self.mode == BuildMode::Postings && row.header.op == rtdb_types::EventOp::Erase {
             self.erases.entry(row.header.iid).and_modify(|position| *position = (*position).max(row.header.system_position()))

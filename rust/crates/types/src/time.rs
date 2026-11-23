@@ -141,7 +141,13 @@ impl TemporalBounds {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum EventOp { Put, Delete, Erase }
+pub enum EventOp {
+    Put,
+    Delete,
+    Erase,
+    /// The payload-free image of one original owned assertion.
+    Redacted,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHeader {

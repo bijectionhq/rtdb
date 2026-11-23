@@ -20,6 +20,7 @@ pub enum StoredOperation {
     Put(StructFields<Value>),
     Delete,
     Erase,
+    Redacted,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +41,7 @@ impl StoredEvent {
     pub fn header(&self) -> EventHeader {
         EventHeader { commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: match &self.operation {
             StoredOperation::Put(_) => EventOp::Put, StoredOperation::Delete => EventOp::Delete, StoredOperation::Erase => EventOp::Erase,
+            StoredOperation::Redacted => EventOp::Redacted,
         } }
     }
 }
@@ -304,6 +306,8 @@ impl EventBatch {
             if !seen.insert(field.name()) { return Err(invalid("Event operation names must be unique")); }
             match (field.name().as_str(), field.data_type()) {
                 ("put", DataType::Struct(_)) | ("delete" | "erase", DataType::Null) => {}
+                ("redacted", DataType::Null) if entity_keys.is_some() && origins.is_some() => {}
+                ("redacted", _) => return Err(invalid("Redacted operations require an owned identity and a null payload")),
                 ("put", _) => return Err(invalid("Put operations must contain document structs")),
                 ("delete" | "erase", _) => return Err(invalid("Delete and erase operations must contain null values")),
                 (name, _) => return Err(invalid(format!("Unknown event operation: {name}"))),
@@ -328,7 +332,7 @@ impl EventBatch {
         let page = Arc::new(EventPage { put, keys: self.keys().cloned() });
         let mut ops = [None; 128];
         for (id, leg) in legs.iter() {
-            let op = match leg.name().as_str() { "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase, name => return Err(invalid(format!("Unknown event operation: {name}"))) };
+            let op = match leg.name().as_str() { "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase, "redacted" => EventOp::Redacted, name => return Err(invalid(format!("Unknown event operation: {name}"))) };
             if let Ok(id) = usize::try_from(id) { ops[id] = Some(op); }
         }
         let iids = IidView::new(self.batch.column(self.iid).as_ref())?;
@@ -338,10 +342,12 @@ impl EventBatch {
         let positions = self.positions();
         (0..self.len()).map(|row| {
             let op = usize::try_from(union.type_id(row)).ok().and_then(|id| ops[id]).ok_or_else(|| invalid("Event operation type ID has no leg"))?;
+            let origin = self.origin(row)?;
+            let valid_time = Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?;
+            Self::require_redacted_position(op, origin, valid_time)?;
             Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
                 commit_position: positions.map_or(0, |positions| positions.value(row)),
-                valid_time: Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?, op,
-                recency: recency.map(|recency| Timestamp(recency[row])), origin: self.origin(row)?, bytes: std::sync::OnceLock::new() })
+                valid_time, op, recency: recency.map(|recency| Timestamp(recency[row])), origin, bytes: std::sync::OnceLock::new() })
         }).collect()
     }
     /// The dense union of each row's operation, whose put leg holds its document.
@@ -382,16 +388,27 @@ impl EventBatch {
     pub fn header(&self, row: usize) -> Result<EventHeader> {
         if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
         let op = match self.operation(row)?.0.name().as_str() {
-            "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase,
+            "put" => EventOp::Put, "delete" => EventOp::Delete, "erase" => EventOp::Erase, "redacted" => EventOp::Redacted,
             name => return Err(invalid(format!("Unknown event operation: {name}"))),
         };
+        let valid_time = Interval::new(self.timestamp(self.valid_from, row)?, self.timestamp(self.valid_to, row)?)?;
+        if op == EventOp::Redacted {
+            Self::require_redacted_position(op, self.origin(row)?, valid_time)?;
+        }
         Ok(EventHeader {
             commit_position: self.positions().map_or(0, |positions| positions.value(row)),
             iid: self.iid(row)?,
             system_from: self.timestamp(self.system_from, row)?,
-            valid_time: Interval::new(self.timestamp(self.valid_from, row)?, self.timestamp(self.valid_to, row)?)?,
+            valid_time,
             op,
         })
+    }
+
+    fn require_redacted_position(op: EventOp, origin: Option<EventOrigin>, valid: Interval) -> Result<()> {
+        if op == EventOp::Redacted && (origin.is_none() || valid.is_empty()) {
+            return Err(invalid("A redacted assertion requires its original event origin and nonempty extent"));
+        }
+        Ok(())
     }
 
     /// Borrows a row and the logical types of its batch's put fields.
@@ -445,6 +462,7 @@ impl EventBatch {
             }
             EventOp::Delete => StoredOperation::Delete,
             EventOp::Erase => StoredOperation::Erase,
+            EventOp::Redacted => StoredOperation::Redacted,
         };
         Ok(StoredEvent { origin: self.origin(row)?, commit_position: header.commit_position, entity_key: self.entity_key(row)?.map(Arc::from), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time, operation,
             recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
@@ -466,7 +484,7 @@ impl EventBatch {
 
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
 pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
-    event_batch(events, put_fields, iid_encoding, false, None, PutLeg::First)
+    event_batch(events, put_fields, iid_encoding, false, None, PutLeg::First, false)
 }
 
 #[test]
@@ -548,7 +566,7 @@ fn borrowed_events_validate_the_put_layout_when_a_put_is_read() {
 /// Every value must belong to that schema; no decimal parameter or coefficient is converted.
 /// The caller admits column construction and event-array overhead before calling.
 pub fn copy_event_batch(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
-    event_batch(events, put_fields, iid_encoding, true, None, PutLeg::First)
+    event_batch(events, put_fields, iid_encoding, true, None, PutLeg::First, false)
 }
 
 /// Where the `put` leg sits in the operation union.
@@ -560,7 +578,7 @@ enum PutLeg { First, Last }
 /// `copy` selects the stored-cell writer, which preserves existing decimal coefficients.
 pub fn owned_event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, copy: bool, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
-    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last)?;
+    let batch = event_batch(events, put_fields, None, copy, Some(&mut builder), PutLeg::Last, false)?;
     builder.finish_with_metadata(batch, metadata)
 }
 
@@ -649,15 +667,17 @@ fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryAr
 }
 
 /// A batch has a `put` leg when it holds a put or declares document columns, as the reference's relation gains one.
-fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, mut builder: Option<&mut BatchBuilder>, put_leg: PutLeg) -> Result<RecordBatch> {
+fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool, mut builder: Option<&mut BatchBuilder>, put_leg: PutLeg, redacted_leg: bool) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
+    let mut redacted = 0usize;
     let mut ids = Vec::with_capacity(events.len());
     let mut offsets = Vec::with_capacity(events.len());
     let put_fields = put_fields.filter(|fields| !fields.is_empty() || events.iter().any(|event| event.header().op == EventOp::Put));
     let has_put = put_fields.is_some();
     let (put_id, delete_id, erase_id) = match (has_put, put_leg) { (true, PutLeg::First) => (0, 1, 2), (true, PutLeg::Last) => (2, 0, 1), (false, _) => (0, 0, 1) };
+    let redacted_id = if has_put { 3 } else { 2 };
     let headers: Vec<EventHeader> = events.iter().map(EncodedEvent::header).collect();
     for (event, header) in events.iter().zip(&headers) {
         let (id, offset) = match header.op {
@@ -669,6 +689,15 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
             }
             EventOp::Delete => { let offset = deletes; deletes += 1; (delete_id, offset) }
             EventOp::Erase => { let offset = erases; erases += 1; (erase_id, offset) }
+            EventOp::Redacted => {
+                if event.entity_key().is_none() {
+                    return Err(invalid("A redacted assertion requires a complete owned identity"));
+                }
+                EventBatch::require_redacted_position(header.op, event.origin(), header.valid_time)?;
+                let offset = redacted;
+                redacted += 1;
+                (redacted_id, offset)
+            }
         };
         ids.push(id);
         offsets.push(i32::try_from(offset).map_err(invalid)?);
@@ -680,6 +709,10 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
         let index = usize::try_from(put_id).map_err(invalid)?;
         op_fields.insert(index, Arc::new(Field::new("put", documents.data_type().clone(), false)));
         children.insert(index, documents);
+    }
+    if redacted > 0 || redacted_leg {
+        op_fields.push(Arc::new(Field::new("redacted", DataType::Null, true)));
+        children.push(Arc::new(NullArray::new(redacted)));
     }
     let op_fields = UnionFields::new(0..op_fields.len() as i8, op_fields);
     let op: ArrayRef = Arc::new(UnionArray::try_new(op_fields, ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
@@ -823,31 +856,39 @@ fn put_columns<E: EncodedEvent>(
 
 /// Keeps the declared recency column even when a page is empty.
 pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, false, None)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, false, None, false)
 }
 
 /// Copies stored cells with the same ownership obligations as `copy_event_batch`, retaining empty-page recency metadata.
 pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None, false)
 }
 
 /// As `copy_event_batch_with_recency`, for events of any kind that encode their own cells.
 pub fn copy_encoded_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
-    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None)
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true, None, false)
 }
 
-/// Copies a compaction page and retains its output arrays under the caller's memory budget.
-pub fn owned_encoded_batch_with_recency<E: EncodedEvent>(
-    events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, memory: &Arc<MemoryBudget>,
+/// Describes a compaction output's operation and recency layout before its first page.
+pub fn compacted_event_schema(
+    put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, redacted_leg: bool,
+) -> Result<arrow_schema::SchemaRef> {
+    Ok(event_batch_with_recency::<StoredEvent>(&[], put_fields, iid_encoding, recency, false, None, redacted_leg)?.schema())
+}
+
+/// Copies a compaction page under the declared operation layout and memory budget.
+pub fn copy_compaction_batch<E: EncodedEvent>(
+    events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool,
+    redacted_leg: bool, memory: &Arc<MemoryBudget>,
 ) -> Result<OwnedBatch> {
     let (mut builder, metadata) = event_builder(events.len(), put_fields.as_ref(), memory)?;
-    let batch = event_batch_with_recency(events, put_fields, iid_encoding, recency, true, Some(&mut builder))?;
+    let batch = event_batch_with_recency(events, put_fields, iid_encoding, recency, true, Some(&mut builder), redacted_leg)?;
     builder.finish_with_metadata(batch, metadata)
 }
 
-fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool, builder: Option<&mut BatchBuilder>) -> Result<RecordBatch> {
+fn event_batch_with_recency<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool, builder: Option<&mut BatchBuilder>, redacted_leg: bool) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency().is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
-    let batch = event_batch(events, put_fields, iid_encoding, copy, builder, PutLeg::First)?;
+    let batch = event_batch(events, put_fields, iid_encoding, copy, builder, PutLeg::First, redacted_leg)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));

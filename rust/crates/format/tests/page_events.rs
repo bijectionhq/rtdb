@@ -1,6 +1,6 @@
 use rtdb_types::{EntityId, EventHeader, Interval, ListKind, LogicalType, ScalarType, StructFields, Timestamp, Value};
 use rtdb_format::data::{EncodedEvent, EventBatch, PageEvent, PutColumn, StoredEvent, StoredOperation, build_event_batch_with_recency,
-    copy_encoded_batch_with_recency, copy_event_batch_with_recency, owned_encoded_batch_with_recency};
+    copy_encoded_batch_with_recency, copy_event_batch_with_recency, copy_compaction_batch};
 use rtdb_format::ipc::write_file;
 
 #[test]
@@ -141,7 +141,7 @@ fn compaction_copies_evolving_nested_layouts_from_selected_arrow_positions() {
     let output = fields(Some(left.join(&right).maybe()));
     let memory = rtdb_columnar::MemoryBudget::new(1 << 18);
 
-    let actual = owned_encoded_batch_with_recency(&events, Some(output.clone()), None, true, &memory).unwrap();
+    let actual = copy_compaction_batch(&events, Some(output.clone()), None, true, false, &memory).unwrap();
 
     let expected = copy_event_batch_with_recency(&[right_rows[0].clone(), absent[0].clone(), left_rows[1].clone()],
         Some(output), None, true).unwrap();
@@ -162,7 +162,7 @@ fn compaction_admits_typed_null_padding_before_allocating_it() {
     let output = StructFields::from([("v".into(), LogicalType::Scalar(ScalarType::FixedSizeBinary(1 << 20)).maybe())]);
     let memory = rtdb_columnar::MemoryBudget::new(1 << 18);
 
-    let error = owned_encoded_batch_with_recency(&[ArrowEvent(page[0].clone())], Some(output), None, false, &memory).unwrap_err();
+    let error = copy_compaction_batch(&[ArrowEvent(page[0].clone())], Some(output), None, false, false, &memory).unwrap_err();
 
     assert_eq!(error.code, "rtdb/memory-budget-exceeded");
     assert_eq!(memory.used_bytes(), 0);
@@ -196,7 +196,7 @@ fn compaction_preserves_ipc_bytes_of_unions_below_null_parents() {
     let selection = [ArrowEvent(input[2].clone()), ArrowEvent(input[1].clone()), ArrowEvent(input[0].clone())];
     let memory = rtdb_columnar::MemoryBudget::new(1 << 18);
 
-    let actual = owned_encoded_batch_with_recency(&selection, Some(fields.clone()), None, false, &memory).unwrap();
+    let actual = copy_compaction_batch(&selection, Some(fields.clone()), None, false, false, &memory).unwrap();
     let expected = copy_event_batch_with_recency(&[events[2].clone(), events[1].clone(), events[0].clone()], Some(fields), None, false).unwrap();
 
     assert_eq!(write_file(actual.batch().schema().as_ref(), std::slice::from_ref(actual.batch())).unwrap(),
@@ -226,7 +226,7 @@ fn compaction_preserves_bottom_fields_when_widening_a_visible_struct_to_a_union(
     let selection = [ArrowEvent(bottom[0].clone()), ArrowEvent(defined[0].clone()), ArrowEvent(defined[1].clone())];
     let memory = rtdb_columnar::MemoryBudget::new(1 << 19);
 
-    let actual = owned_encoded_batch_with_recency(&selection, Some(target.clone()), None, false, &memory).unwrap();
+    let actual = copy_compaction_batch(&selection, Some(target.clone()), None, false, false, &memory).unwrap();
     let expected = copy_event_batch_with_recency(&events, Some(target), None, false).unwrap();
 
     assert_eq!(write_file(actual.batch().schema_ref(), std::slice::from_ref(actual.batch())).unwrap(),

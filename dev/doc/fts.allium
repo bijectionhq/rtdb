@@ -65,6 +65,7 @@ value SearchIndexDefinition {
 value SearchDoc {
     -- One document per text run of a column: an entity's versions in the data file whose value in that column has the same tokens, a value that is not text having none.
     -- A version visible nowhere within the file, a delete, an erase, and a version whose column is null or absent belong to no run of the column.
+    -- The builder refuses assertion-redacted source events until it can apply exact-origin scrub coverage.
     doc_id: Integer
     iid: Bytes
     member: Integer

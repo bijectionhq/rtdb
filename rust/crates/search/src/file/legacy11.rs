@@ -120,8 +120,8 @@ fn schema(columns: &[String]) -> (Schema, Vec<Field>) {
 fn fault(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.search/file", error.to_string()) }
 fn corrupt(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/corrupt-file", message.to_string()) }
 
-fn op_code(op: EventOp) -> u8 { match op { EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2 } }
-fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 => Ok(EventOp::Delete), 2 => Ok(EventOp::Erase), _ => Err(corrupt("Search file key has no such operation")) } }
+fn op_code(op: EventOp) -> u8 { match op { EventOp::Put => 0, EventOp::Delete => 1, EventOp::Erase => 2, EventOp::Redacted => 3 } }
+fn op_of(code: u8) -> Result<EventOp> { match code { 0 => Ok(EventOp::Put), 1 => Ok(EventOp::Delete), 2 => Ok(EventOp::Erase), 3 => Ok(EventOp::Redacted), _ => Err(corrupt("Search file key has no such operation")) } }
 
 struct Accumulated { ceiling: i64, member_starts: Vec<MemberStart>, page_starts: Vec<u32>, row_docs: Vec<Vec<u32>>, column_docs: Vec<u32>, keys: Vec<u8>, row_identity_starts: Vec<u32>, row_identities: Vec<u8>, doc_iids: Vec<[u8; 16]>, token_lengths: Vec<u32>, identity_starts: Vec<u32>, identities: Vec<u8>, doc_classes: Vec<u8>, sections: BTreeMap<u8, Section>, rectangle_starts: Vec<u32>, rectangles: Vec<[i64; 4]> }
 

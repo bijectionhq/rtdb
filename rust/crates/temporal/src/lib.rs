@@ -391,17 +391,22 @@ impl HistoryResolver {
         Ok(result)
     }
 
-    /// Emits each visible fragment of the event's history, in the order `resolve_in` would return them.
+    /// Emits each visible value fragment in the order `resolve_in` would return it.
+    /// A selected redacted fragment produces an erasure refusal. Its original
+    /// extent still participates in the ceiling at its original system position.
     pub fn resolve_fragments(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval, Interval) -> Result<()>) -> Result<()> {
         let bounds = self.bounds;
         let clamp_valid_time = self.clamp_valid_time;
         let mut emit_polygon = |polygon: PolygonView<'_>| {
-            if header.op != EventOp::Put { return Ok(()); }
+            if !matches!(header.op, EventOp::Put | EventOp::Redacted) { return Ok(()); }
             for (valid_from, valid_to, system_to) in polygon.ranges() {
                 let valid_time = Interval::new(valid_from, valid_to)?;
                 if header.system_from >= system_to { continue; }
                 let system_time = Interval::new(header.system_from, system_to)?;
                 if let Some(fragment) = bounds.admit_fragment(TemporalBounds { valid_time, system_time }, clamp_valid_time) {
+                    if header.op == EventOp::Redacted {
+                        return Err(Anomaly::incorrect("rtdb.temporal/erased-assertion", "A selected assertion was erased"));
+                    }
                     emit(fragment.valid_time, fragment.system_time)?;
                 }
             }
