@@ -1,7 +1,5 @@
 //! The protected decision reads only installed scoped membership metadata.
 
-use sha2::{Digest, Sha256};
-
 use super::*;
 
 pub(super) const PROTECTED_MEMBERSHIP: &str = "protected_membership";
@@ -53,8 +51,7 @@ impl<'a> ProtectedProjection<'a> {
                             context.check_cancelled_at(row)?;
                             let EntityId::String(id) = occupancy_value_at(&context.memory, rows, row, "_id", uncovered)?
                                 .entity_id()? else { return Err(uncovered()); };
-                            if !id.starts_with(&id_prefix) { return Err(uncovered()); }
-                            let position = format!("row-position/{table}/{:x}", Sha256::digest(id.as_bytes()));
+                            let position = row_membership_id(&id_prefix, &id)?;
                             if !point_exists(&context, owner, &fences, &EntityId::String(id), ordered).await?
                                 && position_survives(&context, owner, journal, &EntityId::String(position), ordered).await?
                             {
@@ -81,6 +78,13 @@ impl<'a> ProtectedProjection<'a> {
             }
         }
     }
+}
+
+fn row_membership_id(table_prefix: &str, carrier: &str) -> Result<String> {
+    if !carrier.starts_with(table_prefix) {
+        return Err(uncovered());
+    }
+    Ok(format!("row-position/{carrier}"))
 }
 
 async fn point_exists(
@@ -114,4 +118,18 @@ async fn position_survives(
         }
     }
     membership.ok_or_else(uncovered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealed_membership_names_the_same_incarnation_as_the_carrier() -> Result<()> {
+        let prefix = "row/0b11111111111111111111111111111111";
+        let carrier = format!("{prefix}cafe");
+        assert_eq!(row_membership_id(prefix, &carrier)?, format!("row-position/{carrier}"));
+        assert!(row_membership_id("row/0b22222222222222222222222222222222", &carrier).is_err());
+        Ok(())
+    }
 }
