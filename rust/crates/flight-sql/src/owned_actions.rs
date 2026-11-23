@@ -237,7 +237,7 @@ pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V2: &str = "rtdb.owned.PublishHeldWorldRetention.v2";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
-pub(crate) const COMMIT_HELD_WORLDS_V5: &str = "rtdb.owned.CommitHeldWorlds.v5";
+pub(crate) const COMMIT_HELD_WORLDS_V6: &str = "rtdb.owned.CommitHeldWorlds.v6";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -3340,8 +3340,10 @@ impl Service {
             proposal_eligible &= mode == rtdb_types::WorldClockMode::Proposal
                 && ((*kind == 0 && count != 0) || *kind == 3);
             terminal_proposal |= *kind == 3;
-            if count == 0 && !release_eligible && !close_eligible && !(proposal_eligible && terminal_proposal) {
-                return Err(invalid("Ordinary world effects require original witnesses"));
+            if count == 0 && !matches!(*kind, 0 | 1)
+                && !release_eligible && !close_eligible && !(proposal_eligible && terminal_proposal)
+            {
+                return Err(invalid("This world effect requires original witnesses"));
             }
             if (*kind == 0 && !mode.is_writable())
                 || (*kind == 1 && !matches!(mode, rtdb_types::WorldClockMode::Held { .. }))

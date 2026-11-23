@@ -1182,7 +1182,7 @@ pub enum TxOp {
         attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot,
     },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
-    OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<rtdb_types::Iid>, land_root: Option<rtdb_types::Iid>, delete_root: Option<rtdb_types::Iid> },
+    OwnedPublishWorld { world: rtdb_types::Iid, parent_pin: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<rtdb_types::Iid>, land_root: Option<rtdb_types::Iid>, delete_root: Option<rtdb_types::Iid> },
     OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64, local_frontier: Option<i64> },
     OwnedCheckRange {
         relation: rtdb_types::OwnedRelation, basis: rtdb_types::TransactionKey,

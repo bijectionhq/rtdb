@@ -935,7 +935,7 @@ mod retained_release_tests {
         let check = HostedControlWrite::check(relation.clone(), scope, Some(Timestamp(1)), control("installed"))?;
         let replacement = |expected| HostedControlWrite::new(relation.clone(), scope, expected, control("holder"));
         let drop = |world| TxOp::OwnedPublishWorld {
-            world,
+            world, parent_pin: world,
             attempt: "0000000000000000000000".into(),
             fingerprint: [1; 32],
             expected: None,
@@ -976,7 +976,7 @@ mod retained_release_tests {
             TxOp::HostedControl(HostedControlWrite::check(control_relation.clone(), scope, Some(Timestamp(1)), control("installed"))?),
             TxOp::HostedControl(HostedControlWrite::new(control_relation, scope, Some(Timestamp(2)), control("owner"))?),
             TxOp::OwnedPublishWorld {
-                world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                world, parent_pin: world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: None, advance_to: None, drop_world: false, settlement_pin: None,
                 delete_root: None, land_root: None,
             },
@@ -1020,7 +1020,7 @@ mod retained_release_tests {
             TxOp::HostedControl(HostedControlWrite::check(control.clone(), scope, Some(Timestamp(1)), row("installed"))?),
             TxOp::HostedControl(HostedControlWrite::new(control, scope, Some(Timestamp(2)), row("owner"))?),
             TxOp::OwnedPublishWorld {
-                world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                world, parent_pin: world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(Timestamp(3)), advance_to: None, drop_world: false, settlement_pin: None,
                 delete_root: None, land_root: None,
             },
@@ -1073,7 +1073,7 @@ mod retained_release_tests {
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
             TxOp::OwnedCheck { relation: local.clone(), id, valid_at: Timestamp(4), expected: Some(Timestamp(3)) },
             TxOp::OwnedPublishWorld {
-                world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(Timestamp(3)), advance_to: None, drop_world: true,
                 settlement_pin: None, delete_root: None, land_root: Some(pin),
             },
@@ -1165,7 +1165,7 @@ mod retained_release_tests {
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
             TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(Timestamp(2)) },
             TxOp::OwnedPublishWorld {
-                world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(generation), advance_to: None, drop_world: true,
                 settlement_pin: None, delete_root: None, land_root: Some(pin),
             },
