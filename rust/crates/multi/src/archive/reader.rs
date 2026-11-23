@@ -332,7 +332,9 @@ async fn open_inventory(
         .await?
         .ok_or_else(|| unavailable("The staged checkpoint inventory is missing"))?;
     let observed_digest = digest(&encode(&manifest)?);
-    if stage.staged_manifest_sha256.as_deref() != Some(observed_digest.as_str()) {
+    if !stage.staged_manifest_sha256.as_deref().is_some_and(|expected|
+        super::inventory_identity::matches_bytes(observed_digest.as_bytes(), expected.as_bytes()))
+    {
         return Err(inconsistent(
             "The staged inventory differs from its accepted digest",
         ));
