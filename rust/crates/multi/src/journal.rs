@@ -200,7 +200,7 @@ impl InstalledJournal {
         &self,
         invocation: &Request,
     ) -> std::result::Result<SignedBarrier, ReadFailure> {
-        if !matches!(&invocation.command, Command::Barrier { .. }) {
+        if !matches!(&invocation.command, Command::Barrier) {
             return Err(ReadFailure::Refused(mismatch(
                 "The request is not a fresh read invocation",
             )));

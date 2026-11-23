@@ -61,7 +61,7 @@ rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
 rtdb-logkeeper = { path = "crates/logkeeper" }
-ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "11caa64b52d77ab741553aa0e0599f85e68961d0", features = ["ordered-daemon"] }
+ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "818f38415f65a704949cf20240e2f2e2512cb89b", features = ["ordered-daemon"] }
 rtdb-multi = { path = "crates/multi" }
 rtdb-simulation = { path = "crates/simulation" }
 rtdb-text = { path = "crates/text" }

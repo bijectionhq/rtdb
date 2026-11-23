@@ -529,7 +529,7 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
     };
     let read = execute(
         &worker,
-        request(route(&worker).await, principal, Command::Barrier { grant }),
+        request(route(&worker).await, principal, Command::Barrier),
     )
     .await;
     let Outcome::Barrier { read, .. } = read.receipt.outcome.unwrap() else {
@@ -769,7 +769,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
     let lost_request = request(
         route(&old).await,
         Principal::Worker(incumbent.enrollment),
-        Command::Barrier { grant: incumbent },
+        Command::Barrier,
     );
     discard_reply(&authority.workers[0], &installed, lost_request.clone()).await;
     let resent = execute(&old, lost_request.clone()).await;
@@ -790,7 +790,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
     let read_request = request(
         route(&old).await,
         Principal::Worker(incumbent.enrollment),
-        Command::Barrier { grant: incumbent },
+        Command::Barrier,
     );
     let admitted = execute(&old, read_request.clone()).await;
     let Outcome::Barrier { read, .. } = admitted.receipt.outcome.unwrap() else {

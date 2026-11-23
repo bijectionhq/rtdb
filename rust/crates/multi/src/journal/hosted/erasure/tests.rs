@@ -154,7 +154,7 @@ impl Fixture {
             ));
         }
         let Ok(Outcome::Barrier { read: view, .. }) = journal
-            .apply(worker, Command::Barrier { grant: incumbent })
+            .apply(worker, Command::Barrier)
             .outcome
         else {
             panic!("view admission failed");

@@ -46,8 +46,6 @@ struct Writer {
     grant: Grant,
     head: Cut,
     pending: Option<Request>,
-    /// Each read is a fresh admission; an uncertain one is released by its identity.
-    unsettled_reads: Vec<RequestId>,
 }
 
 struct Reads {
@@ -57,6 +55,7 @@ struct Reads {
     tip: AtomicI64,
     tasks: TaskTracker,
     maximum: usize,
+    unsettled: Mutex<Vec<RequestId>>,
 }
 
 pub(crate) struct Held {
@@ -154,12 +153,12 @@ impl JournalLog {
             tip: AtomicI64::new(latest(current.head).map_err(storage)?.0),
             tasks,
             maximum: maximum_message_bytes,
+            unsettled: Mutex::new(Vec::new()),
         });
         let writer = Mutex::new(Writer {
             grant: admission.grant,
             head: admission.recovery.through,
             pending: None,
-            unsettled_reads: Vec::new(),
         });
         Ok(Arc::new(Self {
             reads,
@@ -284,15 +283,15 @@ impl JournalLog {
     /// Releases reads whose outcome was lost. A release settles a read once it is
     /// decided at or after the read's retry horizon, after which a delayed copy of
     /// that barrier can only expire. Failures keep the identity for a later attempt.
-    async fn settle_reads(&self, writer: &mut Writer) {
-        let mut unsettled = Vec::with_capacity(writer.unsettled_reads.len());
-        for read in writer.unsettled_reads.drain(..) {
+    async fn settle_reads(&self, reads: &mut Vec<RequestId>) {
+        let mut unsettled = Vec::with_capacity(reads.len());
+        for read in reads.drain(..) {
             match self.reads.journal.release_read(read).await {
                 Ok(position) if position >= read.expires_at => {}
                 Ok(_) | Err(_) => unsettled.push(read),
             }
         }
-        writer.unsettled_reads = unsettled;
+        *reads = unsettled;
     }
 }
 
@@ -303,35 +302,27 @@ impl ReplicaReadIndex for JournalLog {
     }
 
     async fn protect(&self, _applied: LogOffset) -> rtdb_types::Result<ProtectedReadIndex> {
-        let mut writer = self.writer.lock().await;
+        let mut reads = self.reads.unsettled.lock().await;
         let mut retried = false;
         loop {
-            self.settle_reads(&mut writer).await;
-            if writer.unsettled_reads.len() >= MAX_UNSETTLED_READS {
+            self.settle_reads(&mut reads).await;
+            if reads.len() >= MAX_UNSETTLED_READS {
                 return Err(reads_unsettled());
             }
             let current = self.reads.journal.route().await?;
-            if current.writer.grant != Some(writer.grant) {
-                return Err(deposed(writer.grant, &current).into());
-            }
-            let invocation = self.reads.journal.request(
-                &current,
-                Command::Barrier {
-                    grant: writer.grant,
-                },
-            )?;
+            let invocation = self.reads.journal.request(&current, Command::Barrier)?;
             // Record the identity first so a cancelled read is still released later.
-            writer.unsettled_reads.push(invocation.id);
+            reads.push(invocation.id);
             match self.reads.journal.barrier(&invocation).await {
                 Ok(proof) => {
-                    writer.unsettled_reads.retain(|read| *read != invocation.id);
+                    reads.retain(|read| *read != invocation.id);
                     let hold = proof.claim.read();
                     let retention = self.reads.retain(hold);
                     let offset = latest(hold.through)?;
                     crate::residence_trace::record("ordered-read-index", || serde_json::json!({
                         "deployment": current.placement.deployment, "incarnation": current.placement.incarnation,
                         "group": current.placement.group, "generation": current.placement.generation,
-                        "epoch": writer.grant.epoch, "invocation": hold.id.nonce, "through": offset.0,
+                        "epoch": current.writer.epoch, "invocation": hold.id.nonce, "through": offset.0,
                     }));
                     return Ok(ProtectedReadIndex {
                         offset,
@@ -340,11 +331,11 @@ impl ReplicaReadIndex for JournalLog {
                     });
                 }
                 Err(ReadFailure::Refused(error)) => {
-                    writer.unsettled_reads.retain(|read| *read != invocation.id);
+                    reads.retain(|read| *read != invocation.id);
                     return Err(error);
                 }
                 Err(ReadFailure::Uncertain(error)) if retried => {
-                    self.settle_reads(&mut writer).await;
+                    self.settle_reads(&mut reads).await;
                     return Err(error);
                 }
                 Err(ReadFailure::Uncertain(_)) => retried = true,
@@ -366,15 +357,7 @@ impl Reads {
     }
 
     async fn acquire(self: &Arc<Self>, view: &Route, from: u64, through: u64) -> Result<Arc<Held>> {
-        let grant = view
-            .writer
-            .grant
-            .ok_or_else(|| Error::Closed("There is no installed journal writer".into()))?;
-        let command = Command::ProtectRange {
-            grant,
-            from,
-            through,
-        };
+        let command = Command::ProtectRange { from, through };
         let request = self.journal.request(view, command).map_err(storage)?;
         Held::acquire(&self.journal, request, &self.tasks)
             .await
