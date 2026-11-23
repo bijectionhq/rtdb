@@ -248,6 +248,13 @@ fn portable_parameter(name: &str) -> bool {
         .iter().any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
+fn world_clock(value: &str) -> Result<Instant> {
+    let micros = value.parse::<i64>().map(Timestamp)
+        .map_err(|_| Anomaly::incorrect("rtdb/invalid-world-clock", "Invalid bijection.at microsecond timestamp"))?;
+    micros.next()?;
+    Ok(micros.into())
+}
+
 pub struct Session {
     service: Arc<dyn SessionService>,
     database: RetainedText,
@@ -347,6 +354,12 @@ impl Session {
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Option<String>) -> Result<()> {
         self.ensure_open()?;
         let name = name.into();
+        if name == "bijection.at" {
+            if self.transaction().is_some() {
+                return Err(Anomaly::incorrect("rtdb/world-setting-in-transaction", "SET bijection.at requires an idle session"));
+            }
+            if let Some(value) = value.as_deref() { world_clock(value)?; }
+        }
         let value = value.map(|value| RetainedText::new(value, self.service.memory())).transpose()?;
         let entry = self.service.memory().reserve(name.capacity().checked_add(256).ok_or_else(allocation_overflow)?)?;
         if portable_parameter(&name) {
@@ -394,6 +407,7 @@ impl Session {
             if !portable_parameter(&name) {
                 return Err(Anomaly::incorrect("rtdb.node/gateway-settings", "Gateway settings contain a reserved parameter"));
             }
+            if name == "bijection.at" && let Some(value) = value.as_deref() { world_clock(value)?; }
             let value = value.map(|value| RetainedText::new(value, memory)).transpose()?;
             let entry = memory.reserve(name.capacity().checked_add(256).ok_or_else(allocation_overflow)?)?;
             restored.insert(name, Parameter { value, _entry: entry });
@@ -415,10 +429,10 @@ impl Session {
     }
     pub fn begin(&mut self) -> Result<()> {
         self.check_begin()?;
-        let phase = match self.default_access_mode {
-            Some(AccessMode::ReadOnly) => Phase::Pending(Some(ReadOptions::default())),
-            Some(AccessMode::ReadWrite) => Phase::Writing { buffer: DmlBuffer::default(), options: WriteOptions::default() },
-            None => Phase::Pending(None),
+        let phase = match (self.parameter("bijection.at").is_some(), self.default_access_mode) {
+            (true, _) | (_, Some(AccessMode::ReadOnly)) => Phase::Pending(Some(ReadOptions::default())),
+            (_, Some(AccessMode::ReadWrite)) => Phase::Writing { buffer: DmlBuffer::default(), options: WriteOptions::default() },
+            (_, None) => Phase::Pending(None),
         };
         self.lifecycle = Lifecycle::Open(Some(Transaction::new(phase, &self.timezone)));
         Ok(())
@@ -435,6 +449,7 @@ impl Session {
     }
     pub fn set_transaction(&mut self, settings: TransactionSettings) -> Result<()> {
         self.ensure_open()?;
+        if matches!(&settings.access, Some(AccessSettings::ReadWrite(_))) { self.require_open_world()?; }
         if settings.access.is_none() && settings.timezone.is_unchanged() { return Ok(()); }
         if self.transaction().is_none() && self.auto_commit { return Err(Anomaly::incorrect("xtdb/set-transaction-outside-tx", "SET TRANSACTION can only be used in a transaction")); }
         if self.transaction().is_some_and(|tx| !tx.can_shape()) { return Err(Anomaly::incorrect("xtdb/set-transaction-after-first-statement", "SET TRANSACTION must be called before any query or write")); }
@@ -513,7 +528,9 @@ impl Session {
             Some(token) => decode_time_basis(token)?,
             None => self.service.fresh_snapshot_basis(&self.cancellation).await?,
         };
-        Ok((QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() }, applied))
+        let world_time = self.parameter("bijection.at").map(world_clock).transpose()?;
+        let current_time = world_time.or(options.clock_time).unwrap_or_else(|| self.service.query_instant());
+        Ok((QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time, timezone: self.effective_timezone().to_owned() }, applied))
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
         self.revalidate().await?;
@@ -570,11 +587,20 @@ impl Session {
             basis.timezone = self.effective_timezone().to_owned();
             return Ok(basis);
         }
-        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, snapshot_time: None, current_time: self.service.query_instant(), timezone: self.effective_timezone().to_owned() })
+        let current_time = self.parameter("bijection.at").map(world_clock).transpose()?
+            .unwrap_or_else(|| self.service.query_instant());
+        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, snapshot_time: None, current_time, timezone: self.effective_timezone().to_owned() })
+    }
+    pub(crate) fn require_open_world(&self) -> Result<()> {
+        if self.parameter("bijection.at").is_some() {
+            return Err(Anomaly::incorrect("xtdb/read-only-tx", "Cannot write with a fixed bijection.at"));
+        }
+        Ok(())
     }
     pub async fn execute_operation(&mut self, operation: TxOp) -> Result<Option<TransactionResult>> {
         self.revalidate().await?;
         self.require_usable_transaction()?;
+        self.require_open_world()?;
         if self.auto_commit && self.transaction().is_none() {
             let options = SubmitOptions { default_tz: self.timezone.to_string(), ..SubmitOptions::default() };
             let result = self.submit_operations(vec![operation], options, CommitMode::Sync).await?;
@@ -600,6 +626,7 @@ impl Session {
         let _sample = rtdb_plan::ExecutionSample::new(observer.clone(), match mode { CommitMode::Async => rtdb_plan::ExecutionTimer::TxSubmit, CommitMode::Sync => rtdb_plan::ExecutionTimer::TxExecute });
         self.revalidate().await?;
         self.ensure_open()?;
+        self.require_open_world()?;
         if self.default_access_mode == Some(AccessMode::ReadOnly)
             && operations.iter().any(TxOp::is_owned)
         {

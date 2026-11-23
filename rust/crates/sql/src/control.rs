@@ -102,6 +102,7 @@ impl<'input> ParsedControl<'input> {
     pub fn starts_implicit_transaction(&self) -> bool {
         !matches!(self.syntax, ControlStatement::Begin(_) | ControlStatement::Discard(_)
             | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })
+            && !matches!(&self.syntax, ControlStatement::SetParameter { name, .. } if name == "bijection.at")
     }
 
     /// Compiles the control expressions using their original source and raw metadata budget.
@@ -335,6 +336,10 @@ impl ControlParser<'_> {
                 return Ok(ControlStatement::SetSessionCharacteristics(access));
             }
             let mut name = self.identifier()?.normalized();
+            if name == "bijection" && self.token(Token::Period) {
+                self.expect("AT")?;
+                name = "bijection.at".into();
+            }
             if name == "time" { self.expect("ZONE")?; name = "timezone".into(); }
             let separator = self.token(Token::Eq) || self.eat("TO");
             if name != "timezone" && !separator { return Err(self.error("SET requires TO or =")); }

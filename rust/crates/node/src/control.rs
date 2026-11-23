@@ -200,6 +200,14 @@ impl NativeSession {
                 self.state.set_await_token(string(value, "AWAIT_TOKEN")?)?; Ok(command("SET AWAIT_TOKEN", allocation))
             }
             ControlStatement::SetParameter { name, value } => {
+                if name == "bijection.at" {
+                    let value = self.control_value(value, arguments, &allocation, catalog).await?;
+                    let time = if matches!(value, Value::Null | Value::Undefined) { None } else {
+                        Some(rtdb_expr::timestamp_micros(&value, self.state.effective_timezone())?.0.to_string())
+                    };
+                    self.state.set_parameter(name.clone(), time)?;
+                    return Ok(command("SET", allocation));
+                }
                 let value = match value {
                     Expr::DurationLiteral(value) => {
                         allocation.reserve(rtdb_types::DurationLiteral::MAX_TEXT_LEN)?;
@@ -287,6 +295,7 @@ impl NativeSession {
     }
 
     fn check_database_control(&self, action: &str, name: &str, options: ControlExecutionOptions) -> Result<()> {
+        self.state.require_open_world()?;
         if self.state.database() != "xtdb" { return Err(Anomaly::incorrect(format!("xtdb.pgwire/{action}-db-on-secondary"), format!("Can only {action} databases when connected to the primary 'xtdb' database.")).with_context("db", self.state.database().into())); }
         if self.state.status() != TransactionStatus::Idle && !options.implicit_transaction { return Err(Anomaly::incorrect(format!("xtdb.pgwire/{action}-db-in-tx"), format!("Cannot {action} a database in a transaction.")).with_context("db-name", name.into())); }
         Ok(())

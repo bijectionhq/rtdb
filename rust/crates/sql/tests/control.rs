@@ -18,6 +18,13 @@ fn sql_parser_begin_with_preserves_defaults_parameters_and_access_specific_optio
 }
 
 #[test]
+fn bijection_at_is_a_session_control() {
+    let ControlStatement::SetParameter { name, .. } = parse("SET bijection.at = TIMESTAMP '2027-01-15T00:00:00Z'") else { panic!() };
+    assert_eq!(name, "bijection.at");
+    assert_eq!(parse("SET bijection.at = NULL"), ControlStatement::SetParameter { name, value: Expr::Literal(Value::Null) });
+}
+
+#[test]
 fn sql_parser_start_transaction_and_set_transaction_share_characteristics() {
     let ControlStatement::Begin(begin) = parse("START TRANSACTION SYSTEM_TIME ?, READ WRITE, ASYNC TRUE, TIMEZONE DEFAULT") else { panic!() };
     let ControlStatement::SetTransaction(set) = parse("SET TRANSACTION SYSTEM_TIME ?, READ WRITE, ASYNC TRUE, TIMEZONE DEFAULT") else { panic!() };

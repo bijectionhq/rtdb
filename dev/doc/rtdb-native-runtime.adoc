@@ -27,6 +27,10 @@ The assertion uses the assigned system time, including any increase required to 
 The transaction aborts when the assertion fails.
 In the same transaction, an expression such as `CURRENT_TIMESTAMP + INTERVAL '1' SECOND` can supply a value, part of an encoded key, or a validity endpoint.
 
+`SET bijection.at = TIMESTAMP '2027-01-15T00:00:00Z'` selects a fixed valid instant and query clock for subsequent reads in the current database.
+Set it while the session is idle.
+The session is read-only until `SET bijection.at = NULL` restores the live clock.
+
 The embedded library exposes a versioned C ABI with Arrow C Data and C Stream ownership.
 The Java foreign-memory adapter implements ADBC and the existing Clojure connection protocols over that library.
 Applications depending on concrete JVM `Xtdb.Connection` or `RelationReader` classes need the migration described in link:../../rust/crates/ffi/README.adoc[the embedded binding reference].

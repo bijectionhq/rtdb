@@ -3608,6 +3608,29 @@ async fn clock_time_is_shown_in_the_session_zone_and_database_controls_report_th
 }
 
 #[tokio::test]
+async fn bijection_at_selects_read_validity_and_refuses_writes_until_cleared() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    index_sql(&mut session, "INSERT INTO docs (_id, value, _valid_from, _valid_to)
+        VALUES (1, 10, TIMESTAMP '2027-01-01T00:00:00Z', TIMESTAMP '2027-02-01T00:00:00Z')").await;
+    let token = session.state().cancellation().child_token();
+    let parse = |sql| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+    session.execute_control(&parse("SET bijection.at = TIMESTAMP '2027-01-15T00:00:00Z'"), &[], &token).await.unwrap();
+    let result = rows(session.query_sql("SELECT value, CURRENT_TIMESTAMP FROM docs", vec![]).await.unwrap()).await;
+    assert_eq!(result[0][0], Value::I64(10));
+    let fixed = rtdb_types::parse_sql_timestamp_instant("2027-01-15T00:00:00Z", "UTC").unwrap().as_micros().unwrap();
+    assert_eq!(rtdb_expr::timestamp_micros(&result[0][1], "UTC").unwrap(), fixed);
+    assert!(session.execute_control(&parse("BEGIN READ WRITE"), &[], &token).await.is_err());
+    let refused = session.state_mut().execute_tx(vec![put(&node, 2, 20)], AutonomousTxOptions::default()).await.unwrap_err();
+    assert_eq!(refused.code, "xtdb/read-only-tx");
+
+    session.execute_control(&parse("SET bijection.at = NULL"), &[], &token).await.unwrap();
+    assert!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await.is_empty());
+    assert!(session.state_mut().execute_tx(vec![put(&node, 2, 20)], AutonomousTxOptions::default()).await.unwrap().committed());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn txs_table_lists_every_submitted_transaction() {
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
