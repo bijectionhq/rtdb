@@ -46,6 +46,16 @@ A usable checkpoint references durable, readable objects and represents the comm
 Keep the boundary record required by the current implementation to resume source numbering.
 A fork checkpoint from the parent's stream grants no permission to trim the child's stream.
 
+For a table using semantic history, the checkpoint also binds the entity directory root, its erase frontier, and every reachable directory page.
+Its recovery inventory holds current primary payload files so stable event origins still resolve after compaction removes the source tries.
+The holder verifies this inventory and the completeness of the directory roots before authorizing trim.
+Existing reader and archive suffix holds still constrain the first retained replica position.
+
+Search repair reads the published checkpoint and authenticates the committed suffix through the pinned block boundary.
+It checks the admitted term, source order, and transaction basis before using the target directory to identify surviving events.
+The replacement receipt binds the lineage, table, full shard range, exact block extents and row count to that cut and its erase frontier.
+The search catalog checks the replacement against the active inputs and the installed directory before adopting it.
+
 **S4 · Repair preserves the committed prefix.** The winning history contains all committed records above the checkpoint.
 A partial copy cannot advertise the target epoch as fully synced.
 A delayed overwrite cannot drop records that the current writer already placed at that epoch.

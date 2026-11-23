@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
-use crate::hosted_recovery::{ReplicaTrimPlan, advance_body_fence, capture_replay_start};
+use crate::hosted_recovery::{ReplicaTrimPlan, ReplicaTrimWitness, advance_body_fence, capture_replay_start};
 use crate::directory_bypass::{directory_move_park_allowed, directory_route_allowed, pressure_candidate};
 use crate::journal::hosted::{checkpoint_for_block, custodian};
 
@@ -1570,6 +1570,8 @@ impl NodeAgent {
             || (published.block == checkpoint.block && current.recovery_manifest_sha256.is_none()));
         if !needs_publication && !needs_trim { return; }
         let Ok(Some((record, _))) = self.publish_checkpoint(&current.id, epoch, &database, &block).await else { return; };
+        let Ok(witness) = ReplicaTrimWitness::read(&record, database.object_store().as_ref(), database.writes_event_history(), self.node.memory()).await
+            else { return; };
         let Ok(members) = self.members().await else { return };
         let detached = matches!(self.options.storage, CellStorage::S3 { .. }) && self.replay_broker().is_some();
         let record = if detached {
@@ -1580,7 +1582,7 @@ impl NodeAgent {
         } else {
             record
         };
-        let Some(plan) = ReplicaTrimPlan::new(record, checkpoint.boundary, trimmed_through, now_ms()) else { return; };
+        let Some(plan) = ReplicaTrimPlan::new(record, witness, checkpoint.boundary, trimmed_through, now_ms()) else { return; };
         let Ok(Some(grant)) = Box::pin(plan.authorize(self.directory.as_ref(), &members, self.keys.as_ref(), detached)).await else { return; };
         if let Ok(through) = grant.apply(self.directory.as_ref(), self.keys.as_ref()).await
             && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)

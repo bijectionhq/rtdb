@@ -3,10 +3,36 @@ use std::collections::BTreeSet;
 use prost::Message;
 use rtdb_types::{Anomaly, BlockIndex, Result};
 
-use crate::{keys::TableSlug, log::proto::{ArtefactRecord, SearchRun, SearchRunChange}};
+use crate::{keys::TableSlug, log::proto::{ArtefactRecord, SearchRun, SearchRunChange, SourceReceipt}};
 
 pub const RECORD_KIND: &str = "logical-search";
 pub const MAX_RUN_BLOCKS: usize = 256;
+/// The half-open shard interval [0, 256), encoded as two big-endian u16 endpoints.
+pub const FULL_SHARD_RANGE: [u8; 4] = [0, 0, 1, 0];
+
+impl SourceReceipt {
+    fn validates_run(&self, run: &SearchRun) -> bool {
+        !self.lineage().is_empty() && self.lineage().len() <= 512
+            && crate::catalog::legacy_table_ref(self.table()).is_ok_and(|table| table.schema_and_table() == self.table())
+            && self.table().len() <= 4096 && self.shard_range() == FULL_SHARD_RANGE
+            && self.source_rows == run.source_rows && self.blocks == run.blocks
+            && self.erase_frontier_digest().len() == 32
+            && self.suffix_through.is_some_and(|end| end >= 0)
+            && match self.directory_root.as_deref() {
+                None => self.checkpoint_boundary == Some(-1) && self.checkpoint_catalog_sha256.is_none(),
+                Some(root) => !root.is_empty() && root.len() <= 1024
+                    && self.checkpoint_boundary.is_some_and(|base| base >= 0 && base <= self.suffix_through())
+                    && self.checkpoint_catalog_sha256().len() == 32,
+            }
+    }
+
+    pub fn extends(&self, previous: &Self) -> bool {
+        self.lineage == previous.lineage && self.table == previous.table && self.shard_range == previous.shard_range
+            && self.suffix_through() >= previous.suffix_through()
+            && (self.suffix_through() > previous.suffix_through()
+                || (self.directory_root == previous.directory_root && self.erase_frontier_digest == previous.erase_frontier_digest))
+    }
+}
 
 impl SearchRun {
     pub fn encoded_size(&self) -> usize { self.encoded_len() }
@@ -23,6 +49,7 @@ impl SearchRun {
             || self.source_rows() <= 0 || self.file_size() <= 0 || self.rebuild() < 0
             || self.allocation.as_ref().is_some_and(|value| value.len() != 16)
             || self.locator().is_empty() || self.locator().len() > 32 * 1024
+            || self.source_receipt.as_ref().is_some_and(|receipt| !receipt.validates_run(self))
         {
             return Err(invalid("Search run has an invalid definition, extent, or locator"));
         }

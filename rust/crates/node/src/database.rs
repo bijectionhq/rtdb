@@ -32,6 +32,7 @@ impl Drop for ReplicaReadSession {
 }
 
 pub struct Database {
+    writes_event_history: bool,
     pub(crate) protected_equality_epoch: uuid::Uuid,
     name: String,
     configuration: DatabaseConfig,
@@ -307,6 +308,7 @@ impl Database {
         self.replication.publish_compaction(notification, cancellation).await
     }
     pub fn trie_catalog(&self) -> Arc<rtdb_index::TrieCatalog> { Arc::clone(self.partition.value().trie_catalog()) }
+    pub fn writes_event_history(&self) -> bool { self.writes_event_history }
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { self.storage.object_store() }
     /// The database's latest applied state, read with no basis or system-time cap.
     pub fn snapshot(&self) -> rtdb_index::Snapshot { self.partition.snapshot() }
@@ -467,17 +469,21 @@ impl DatabaseFactory {
             let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
+                let history = match self.resources.table_history(&configuration)? {
+                    Some(hosted) => Some(hosted),
+                    None => NativeTableReplay::for_database(Arc::clone(&logs), &configuration),
+                };
                 self.artefact_kinds.iter().map(|kind| {
                     let clock = Arc::clone(&self.clock);
                     Ok((Arc::clone(kind), kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
-                        retained: Some(Arc::new(RetainedArtefactJournal(Arc::clone(&logs)))), clock: Arc::new(move || clock.now()) })?))
+                        history: history.clone(), clock: Arc::new(move || clock.now()) })?))
                 }).collect::<Result<Vec<_>>>()?
             };
             let history = if event_history {
                 let kind: Arc<dyn ArtefactKind> = Arc::new(rtdb_maintenance::EntityHistoryArtefacts);
                 let clock = Arc::clone(&self.clock);
                 let builder = kind.builder(ArtefactDatabase { name: name.clone(), store: Arc::clone(&resources.store),
-                    storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), retained: None, clock: Arc::new(move || clock.now()) })?;
+                    storage: Arc::clone(&storage), memory: Arc::clone(&self.memory), history: None, clock: Arc::new(move || clock.now()) })?;
                 builders.push((kind, Arc::clone(&builder)));
                 Some(builder)
             } else { None };
@@ -525,7 +531,7 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
+            let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
@@ -550,15 +556,35 @@ impl DatabaseFactory {
     }
 }
 
-struct RetainedArtefactJournal(Arc<PartitionLogs>);
+struct NativeTableReplay {
+    logs: Arc<PartitionLogs>,
+    lineage: String,
+}
+
+impl NativeTableReplay {
+    fn for_database(logs: Arc<PartitionLogs>, configuration: &DatabaseConfig) -> Option<Arc<dyn rtdb_maintenance::TableHistorySource>> {
+        let Some(database_config::Log::LocalLog(log)) = &configuration.log else { return None; };
+        let path = std::path::Path::new(log.path.as_deref()?).canonicalize().ok()?;
+        let digest = rtdb_format::catalog::publication_digest(path.as_os_str().as_encoded_bytes());
+        let id: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Some(Arc::new(Self { logs, lineage: format!("native/{id}") }))
+    }
+}
 
 #[async_trait::async_trait]
-impl rtdb_maintenance::RetainedArtefactSource for RetainedArtefactJournal {
-    async fn replay_table(&self, target: &rtdb_format::catalog::BlockCatalog, table: &rtdb_types::TableRef,
-        visit: &mut rtdb_maintenance::ReplayVisitor<'_>, cancellation: &CancellationToken) -> Result<bool> {
-        let Some(mut replay) = rtdb_replication::RetainedTableReplay::open(&self.0, target, table).await? else { return Ok(false); };
-        while replay.next_block(cancellation, &mut *visit).await?.is_some() {}
-        Ok(true)
+impl rtdb_maintenance::TableHistorySource for NativeTableReplay {
+    async fn visit_table(&self, read: rtdb_maintenance::HistoryRead<'_>, visit: &mut rtdb_maintenance::HistoryVisitor<'_>)
+        -> Result<Option<rtdb_maintenance::HistoryCoverage>> {
+        use rtdb_maintenance::{HistoryCoverage, HistoryRow};
+
+        let Some(target) = read.snapshot.table_catalog().block() else { return Ok(None); };
+        let Some(through) = target.boundary_replica_position() else { return Ok(None); };
+        let Some(mut replay) = rtdb_replication::RetainedTableReplay::open(&self.logs, target, read.table).await? else { return Ok(None); };
+        while replay.next_block(read.cancellation, |block, batch| {
+            for row in 0..batch.len() { visit(block, HistoryRow::Stored { batch, row })?; }
+            Ok(())
+        }).await?.is_some() {}
+        Ok(Some(HistoryCoverage::Native { lineage: self.lineage.clone(), through }))
     }
 }
 

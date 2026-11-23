@@ -1818,6 +1818,8 @@ rule TrimCertifiedReplicaPrefix {
     -- A world-parent suffix protects its capture for the duration of its preparation lease, held restore, and retained world references.
     -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
     -- Archive certification covers every replica offset and replay applies only the messages admitted by the checkpoint's term fence.
+    -- A semantic history checkpoint retains the authenticated directory pages and the primary payload closure that its events can resolve by origin.
+    -- The trim witness binds complete table directory roots to the exact published checkpoint inventory for tables requiring semantic history.
     -- Fenced, discarded and voided records survive a transfer at their original offsets and require no offloaded payload.
     -- Terminal certification and bootstrap preparation hold the same exact source replay interval through their provider reads.
     -- An admitted offloaded body supplies replay bytes after its digest matches the certified outer frame.
@@ -1827,6 +1829,7 @@ rule TrimCertifiedReplicaPrefix {
     when: ReplicaPrefixCertified(holding, through, digest)
 
     requires: Directory.read(holding.deployment.id).checkpoint.recovery_manifest_digest != null
+    requires: CheckpointHasRequiredSemanticHistory(holding.deployment)
     requires: through < Directory.read(holding.deployment.id).checkpoint.lsn
     requires: not exists replay in Directory.read(holding.deployment.id).replica_replays: replay.first_required <= through
     requires: ArchivedAndPendingSuffixesCoverTrim(holding.deployment, through)

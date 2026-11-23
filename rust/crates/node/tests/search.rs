@@ -1817,7 +1817,7 @@ async fn logical_postings_survive_compaction_while_pinned_history_keeps_its_payl
 }
 
 #[tokio::test]
-async fn a_late_search_definition_recovers_a_compacted_span_from_the_retained_journal() {
+async fn native_search_rebuilds_from_the_retained_journal_after_loss_of_postings_and_source_tries() {
     use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
     use rtdb_storage::ObjectKey;
     use rtdb_types::BlockIndex;
@@ -1842,6 +1842,8 @@ async fn a_late_search_definition_recovers_a_compacted_span_from_the_retained_jo
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let database = node.catalog().database("xtdb").unwrap();
     let stop = CancellationToken::new();
+    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")],
+        AutonomousTxOptions::default()).await.unwrap().committed());
     for statement in [
         "INSERT INTO docs RECORDS {_id: 1, body: 'audit report report'}",
         "INSERT INTO docs RECORDS {_id: 2, body: 'audit report'}",
@@ -1855,17 +1857,35 @@ async fn a_late_search_definition_recovers_a_compacted_span_from_the_retained_jo
     let table = TableRef::new("public", "docs");
     let snapshot = database.snapshot();
     let entry = snapshot.table_entry(&table).unwrap();
-    let old = snapshot.trie_catalog().l0_source(&table, BlockIndex(-1), BlockIndex(i64::MAX)).next().unwrap();
-    assert!(matches!(old.state, rtdb_index::TrieState::Garbage { .. }));
-    database.object_store().delete(&ObjectKey::new(entry.slug.data_key(&old.key)).unwrap()).await.unwrap();
-    let removed = old.key.block_index();
+    let removed = snapshot.trie_catalog().l0_source(&table, BlockIndex(-1), BlockIndex(i64::MAX))
+        .map(|trie| {
+            assert!(matches!(trie.state, rtdb_index::TrieState::Garbage { .. }));
+            trie.key.clone()
+        }).collect::<Vec<_>>();
+    assert!(!removed.is_empty());
+    for trie in &removed {
+        for path in [entry.slug.data_key(trie), entry.slug.metadata_key(trie)] {
+            let key = ObjectKey::new(path).unwrap();
+            database.storage().invalidate(&key).await.unwrap();
+            database.object_store().delete(&key).await.unwrap();
+        }
+    }
+    let runs = snapshot.trie_catalog().search_runs(&table).collect::<Vec<_>>();
+    assert!(!runs.is_empty());
+    for run in runs {
+        let key = ObjectKey::new(run.object_key(&entry.slug).unwrap()).unwrap();
+        database.storage().invalidate(&key).await.unwrap();
+        database.object_store().delete(&key).await.unwrap();
+    }
     drop(snapshot);
-    assert!(session.state_mut().execute_tx(vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")],
-        AutonomousTxOptions::default()).await.unwrap().committed());
     let ranked = "SELECT _id FROM docs WHERE MATCH(body, '\"audit report\"') ORDER BY SEARCH_SCORE(body, 'report') DESC, _id ASC LIMIT 1";
     assert_eq!(ids(rows(session.query_sql(ranked, vec![]).await.unwrap()).await), [1]);
     database.build_artefacts().await.unwrap();
-    assert!(database.trie_catalog().search_runs(&table).any(|run| run.blocks().any(|block| block == removed)));
+    let catalog = database.trie_catalog();
+    for trie in &removed {
+        assert!(catalog.search_runs(&table).any(|run| run.source_receipt.as_ref().is_some_and(|receipt|
+            receipt.checkpoint_boundary() == -1 && receipt.blocks.contains(&trie.block_index().0))));
+    }
     let reads = runtime.logical_run_reads();
     assert_eq!(ids(rows(session.query_sql(ranked, vec![]).await.unwrap()).await), [1]);
     assert!(runtime.logical_run_reads() > reads);

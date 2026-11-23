@@ -146,6 +146,12 @@ impl SearchManifest {
         let mut has_erases = false;
         for key in &replaces {
             let Some(input) = self.active.get(key).filter(|input| owns(input)) else { return false; };
+            if let Some(previous) = &input.source_receipt {
+                match &run.source_receipt {
+                    Some(receipt) if receipt.extends(previous) => (),
+                    _ => return false,
+                }
+            }
             covered.extend(input.blocks.iter().copied());
             let Some(rows) = source_rows.checked_add(input.source_rows()) else { return false; };
             source_rows = rows;
@@ -241,6 +247,34 @@ mod tests {
         assert_eq!(reopened.term_directory("searchf16", 20), Some(&empty_root(1)));
         assert!(reopened.publish(SearchRunChange { run: Some(run(4, &[2])), ..Default::default() }, Timestamp(5)));
         assert!(reopened.term_directory("searchf16", 20).is_none());
+    }
+
+    #[test]
+    fn replacement_receipts_bind_lineage_table_frontier_and_extents() {
+        use rtdb_format::{log::proto::SourceReceipt, search_manifest::FULL_SHARD_RANGE};
+
+        let mut active = run(1, &[0]);
+        active.source_receipt = Some(SourceReceipt {
+            lineage: Some("installation".into()), checkpoint_boundary: Some(1), suffix_through: Some(7),
+            table: Some("public/docs".into()), shard_range: Some(FULL_SHARD_RANGE.to_vec()), source_rows: Some(1),
+            erase_frontier_digest: Some(vec![4; 32]), directory_root: Some(vec![5; 32]), blocks: vec![0],
+            checkpoint_catalog_sha256: Some(vec![6; 32]),
+        });
+        let mut search = SearchManifest::default();
+        assert!(search.publish(SearchRunChange { run: Some(active.clone()), ..Default::default() }, Timestamp(1)));
+        let replacement = |mutate: fn(&mut SourceReceipt)| {
+            let mut rebuilt = run(2, &[0]);
+            rebuilt.rebuild = Some(1);
+            let mut receipt = active.source_receipt.clone().unwrap();
+            mutate(&mut receipt);
+            rebuilt.source_receipt = Some(receipt);
+            SearchRunChange { run: Some(rebuilt), replaces: vec![active.digest().to_vec()], ..Default::default() }
+        };
+        assert!(!search.publish(replacement(|receipt| receipt.lineage = Some("other".into())), Timestamp(2)));
+        assert!(!search.publish(replacement(|receipt| receipt.table = Some("public/other".into())), Timestamp(2)));
+        assert!(!search.publish(replacement(|receipt| receipt.erase_frontier_digest = Some(vec![7; 32])), Timestamp(2)));
+        assert!(!search.publish(replacement(|receipt| receipt.blocks = vec![1]), Timestamp(2)));
+        assert!(search.publish(replacement(|_| {}), Timestamp(2)));
     }
 
     #[test]

@@ -40,7 +40,7 @@ impl rtdb_maintenance::ArtefactKind for SearchArtefacts {
     fn enables_event_history(&self) -> bool { self.runtime.write_format() == crate::file::LOGICAL_FORMAT_VERSION }
     fn builder(&self, database: rtdb_maintenance::ArtefactDatabase) -> Result<Arc<dyn ArtefactBuilder>> {
         let clock = Arc::clone(&database.clock);
-        Ok(Arc::new(SearchBuilder::new(database.name, database.store, database.storage, database.memory, Arc::new(move || clock().into()), Arc::clone(&self.runtime)).with_retained(database.retained)))
+        Ok(Arc::new(SearchBuilder::new(database.name, database.store, database.storage, database.memory, Arc::new(move || clock().into()), Arc::clone(&self.runtime)).with_history(database.history)))
     }
 }
 
@@ -53,16 +53,16 @@ pub struct SearchBuilder {
     clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>,
     runtime: Arc<crate::SearchRuntime>,
     columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
-    retained: Option<Arc<dyn rtdb_maintenance::RetainedArtefactSource>>,
+    history: Option<Arc<dyn rtdb_maintenance::TableHistorySource>>,
     scrubbed: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), [u8; 32]>>,
 }
 
 impl SearchBuilder {
     pub fn new(database: String, store: Arc<dyn ObjectStore>, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>, runtime: Arc<crate::SearchRuntime>) -> Self {
-        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), retained: None, scrubbed: Mutex::new(BTreeMap::new()) }
+        Self { database, store, storage, memory, clock, runtime, columns: Mutex::new(BTreeMap::new()), history: None, scrubbed: Mutex::new(BTreeMap::new()) }
     }
-    fn with_retained(mut self, retained: Option<Arc<dyn rtdb_maintenance::RetainedArtefactSource>>) -> Self {
-        self.retained = retained;
+    fn with_history(mut self, history: Option<Arc<dyn rtdb_maintenance::TableHistorySource>>) -> Self {
+        self.history = history;
         self
     }
 

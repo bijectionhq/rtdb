@@ -144,6 +144,24 @@ pub async fn visit_trie_iids(
     Ok(())
 }
 
+#[doc(hidden)]
+pub async fn visit_trie_events(
+    storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &tokio_util::sync::CancellationToken,
+    slug: &TableSlug, trie: &TrieKey, mut visit: impl FnMut(&EventBatch) -> Result<()>,
+) -> Result<()> {
+    let mut file = DataFile {
+        storage: Arc::clone(storage), key: ObjectKey::new(slug.data_key(trie))?,
+        metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
+    };
+    let pages = file.open(memory).await?.layout.decoder.page_count();
+    for page in 0..pages {
+        if cancellation.is_cancelled() { return Err(point_cancelled()); }
+        let (batch, _charge) = file.decode_page(page, memory).await?;
+        visit(&EventBatch::new(batch)?)?;
+    }
+    Ok(())
+}
+
 async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<MemoryBudget>) -> Result<(Arc<MetadataFile>, Arc<MemoryReservation>)> {
     if let Some(cached) = storage.view::<CachedMetadata>(key, View::File) {
         audience_work::decode_bytes(cached.bound)?;

@@ -48,11 +48,12 @@ pub async fn order_history(client: &tokio_postgres::Client) -> Vec<Vec<Option<St
 }
 
 async fn start_node(directory: &Arc<dyn Directory>, data: &std::path::Path, agent: AgentOptions, index: usize,
-                    pool: MemberPool, compaction_workers: bool, engine_version: Option<String>) -> process::RunningNode {
+                    pool: MemberPool, compaction_workers: bool, engine_version: Option<String>, search_format: Option<rtdb_node::SearchFileFormat>) -> process::RunningNode {
     let keys: Arc<dyn rtdb_multi::keys::KeyService> = Arc::new(rtdb_multi::keys::LocalKeyService::new(data.join("keys")).unwrap());
     let claim_wait = std::env::var("RTDB_TEST_PLACED_CLAIM_WAIT_MS").ok().map_or(2, |ms| ms.parse().unwrap());
     let connections = pgwire_connections();
-    let configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\nflightSql: {{port: 0, ownedNativeActions: true}}\n")).unwrap();
+    let mut configuration = NodeConfiguration::from_yaml(&format!("authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: 0\n  numThreads: {connections}\nflightSql: {{port: 0, ownedNativeActions: true}}\n")).unwrap();
+    if let Some(format) = search_format { configuration.search.write_format = format; }
     process::start_node(Arc::clone(directory), process::NodeSettings {
         hosted_task: None,
         advertise_host: None,
@@ -173,7 +174,7 @@ impl Cell {
         }
         let mut running = Vec::new();
         for (index, pool) in pools.into_iter().enumerate() {
-            running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers, None).await));
+            running.push(Some(start_node(&directory, data.path(), agent.clone(), index, pool, compaction_workers, None, None).await));
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = listener.local_addr().unwrap();
@@ -207,8 +208,13 @@ impl Cell {
         let index = self.nodes.len();
         let mut agent = AgentOptions::new(self.objects.clone());
         configure(&mut agent);
-        self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false, engine_version).await));
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), agent, index, MemberPool::General, false, engine_version, None).await));
         index
+    }
+
+    pub async fn add_logical_search_node(&mut self) {
+        self.nodes.push(Some(start_node(&self.directory, self.data.path(), AgentOptions::new(self.objects.clone()), self.nodes.len(),
+            MemberPool::General, false, None, Some(rtdb_node::SearchFileFormat::Logical)).await));
     }
 
     pub async fn connect(&self, database: &str) -> Client { connect(&self.gateway.to_string(), database).await }

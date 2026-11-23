@@ -325,6 +325,17 @@ impl TrieCatalog {
         change.abandon() || run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some()))
     }
 
+    fn accepts_search_source(&self, table: &TableRef, change: &log_pb::SearchRunChange) -> bool {
+        let Some(receipt) = change.run.as_ref().and_then(|run| run.source_receipt.as_ref()) else { return true; };
+        if receipt.table() != table.schema_and_table() { return false; }
+        if change.retire_only() || receipt.directory_root.is_none() { return true; }
+        self.entity_directory(table).is_some_and(|directory| directory.root == receipt.directory_root
+            && directory.erase_frontier_digest == receipt.erase_frontier_digest)
+            || (!change.replaces.is_empty() && change.replaces.iter().all(|digest| self.search_runs(table).any(|run|
+                digest.as_slice() == run.digest() && run.source_receipt.as_ref().is_some_and(|prior|
+                    receipt.suffix_through == prior.suffix_through && receipt.extends(prior)))))
+    }
+
     pub fn with_tries(&self, table: TableRef, tries: impl IntoIterator<Item = CatalogTrie>, as_of: Timestamp) -> Result<Self> {
         let mut next = self.clone();
         let expiring_metadata = table.stores_expiring_transaction_metadata();
@@ -383,7 +394,9 @@ impl TrieCatalog {
                 }
                 if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
                     if key.level() == 0 && self.accepts_search_run(table, &record)
-                        && let Ok(change) = log_pb::SearchRunChange::from_artefact(&record) {
+                        && let Ok(change) = log_pb::SearchRunChange::from_artefact(&record)
+                        && change.run.as_ref().is_some_and(|run| run.blocks.first() == Some(&key.block_index().0))
+                        && self.accepts_search_source(table, &change) {
                         std::sync::Arc::make_mut(&mut state.search).apply_uploaded(change, as_of);
                     }
                     continue;
@@ -505,6 +518,11 @@ impl TrieCatalog {
             let reconstruct_watermarks = partitions.first().is_some_and(|partition| partition.max_block_index.is_none());
             let mut state = TableTries::default();
             let wire = blocks[&table].as_proto();
+            if wire.search_runs.iter().chain(wire.retired_search_runs.iter().filter_map(|retired| retired.run.as_ref()))
+                .filter_map(|run| run.source_receipt.as_ref()).any(|receipt| receipt.table() != table.schema_and_table())
+            {
+                return Err(invalid("Search history receipt belongs to another table"));
+            }
             state.directory = std::sync::Arc::new(crate::entity_directory::DirectoryManifest::load(
                 wire.entity_directory.clone(), wire.retired_entity_directories.clone())?);
             state.search = std::sync::Arc::new(crate::search_manifest::SearchManifest::load(&wire.search_runs, &wire.retired_search_runs)?);

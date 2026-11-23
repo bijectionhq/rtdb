@@ -87,21 +87,13 @@ pub trait ArtefactBuilder: Send + Sync {
     async fn wait_for_work(&self) { std::future::pending::<()>().await }
 }
 
-pub type ReplayVisitor<'a> = dyn FnMut(rtdb_types::BlockIndex, &rtdb_format::data::EventBatch) -> Result<()> + Send + 'a;
-
-#[async_trait]
-pub trait RetainedArtefactSource: Send + Sync {
-    async fn replay_table(&self, target: &rtdb_format::catalog::BlockCatalog, table: &TableRef,
-        visit: &mut ReplayVisitor<'_>, cancellation: &CancellationToken) -> Result<bool>;
-}
-
 /// What a kind of artefact is handed to build one database's artefacts.
 pub struct ArtefactDatabase {
     pub name: String,
     pub store: Arc<dyn rtdb_storage::ObjectStore>,
     pub storage: Arc<rtdb_storage::cache::BufferPool>,
     pub memory: Arc<rtdb_columnar::MemoryBudget>,
-    pub retained: Option<Arc<dyn RetainedArtefactSource>>,
+    pub history: Option<Arc<dyn crate::TableHistorySource>>,
     pub clock: Arc<dyn Fn() -> rtdb_types::Timestamp + Send + Sync>,
 }
 

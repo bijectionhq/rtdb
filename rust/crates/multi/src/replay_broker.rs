@@ -1628,7 +1628,7 @@ mod tests {
         let Cas::Applied(record) = installed else { panic!("the directory refused the checkpoint"); };
         observe_checkpoint(&record, checkpoint, manifest, Some(fingerprint));
 
-        assert!(ReplicaTrimPlan::new(record.clone(), checkpoint.boundary, -1, 0).is_none());
+        assert!(ReplicaTrimPlan::new(record.clone(), None, checkpoint.boundary, -1, 0).is_none());
         let members = directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
         let record = advance_body_fence(directory.as_ref(), &members, keys.as_ref(), record, checkpoint.boundary)
             .await.unwrap().unwrap();

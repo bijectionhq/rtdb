@@ -219,6 +219,15 @@ impl rtdb_s3::WriteAuthorization for ScopedWriter {
 
 #[async_trait]
 impl RemoteStorageFactory for CellStoreFactory {
+    fn table_history(&self, configuration: &Any) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> {
+        let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
+            .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
+        if config.writer_epoch.is_none() { return Ok(None); }
+        Ok(Some(Arc::new(crate::archive::table_history::HostedTableReplay::new(
+            Arc::clone(&self.directory), Arc::clone(&self.keys), self.hosted_task.clone(), config,
+        ))))
+    }
+
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         Ok(self.open_for_recovery(configuration, storage_root, io).await?.store)
     }

@@ -3530,6 +3530,95 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_tries() {
+    use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot};
+    use rtdb_multi::packing::{PACK_DIRECTORY, encode_pack, read_index};
+    use rtdb_storage::{LocalStore, ObjectKey, ObjectStore};
+    use rtdb_types::{BlockIndex, StorageEpoch, TableRef};
+
+    let mut cell = Cell::start_durable(0).await;
+    cell.add_logical_search_node().await;
+    admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    let client = cell.connect("shop").await;
+    client.simple_query("CREATE SEARCH INDEX docs_body ON docs (body)").await.unwrap();
+    for (id, body) in [(1, "audit report report"), (2, "audit report"), (3, "audit memo"), (4, "unrelated")] {
+        client.simple_query(&format!("INSERT INTO docs RECORDS {{_id: {id}, body: '{body}'}}")).await.unwrap();
+        cell.node(0).agent.flush("shop").await.unwrap();
+    }
+    let database = cell.node(0).server.node().catalog().database("shop").unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    client.simple_query("INSERT INTO checkpoint_marker (_id) VALUES (1)").await.unwrap();
+    cell.node(0).agent.flush("shop").await.unwrap();
+    let record = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+            if record.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] == record.checkpoint.unwrap().boundary - 1) {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    let table = TableRef::new("public", "docs");
+    let snapshot = database.snapshot();
+    let slug = snapshot.table_entry(&table).unwrap().slug.clone();
+    let catalog = snapshot.trie_catalog();
+    assert!(catalog.current_tries(&table).iter().all(|trie| trie.key.level() > 0));
+    assert_eq!(catalog.l0_source(&table, BlockIndex(-1), BlockIndex(i64::MAX)).count(), 4);
+    let extent = catalog.search_runs(&table).flat_map(|run| run.blocks.iter().copied()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(extent.len(), 4);
+    drop((snapshot, database, client));
+    cell.nodes[0].take().unwrap().kill().await.unwrap();
+
+    let CellStorage::Local { root } = cell.storage() else { unreachable!() };
+    let storage_root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
+    let raw = LocalStore::open(root.join(record.storage_prefix()).join(storage_root)).unwrap();
+    let mut removed = 0;
+    for pack in raw.list(Some(&ObjectKey::new(PACK_DIRECTORY).unwrap())).await.unwrap() {
+        let index = read_index(&raw, &pack.key).await.unwrap();
+        let mut objects = BTreeMap::new();
+        for (name, entry) in index.entries {
+            if name.starts_with(&format!("{}/data/l00-", slug.table_prefix()))
+                || name.starts_with(&format!("{}/meta/l00-", slug.table_prefix()))
+            {
+                removed += 1;
+                continue;
+            }
+            objects.insert(name, raw.get_range(&pack.key, entry.offset..entry.offset + entry.length).await.unwrap());
+        }
+        let (bytes, _) = encode_pack(&objects, index.previous, index.written_at_ms.unwrap());
+        raw.delete(&pack.key).await.unwrap();
+        raw.put(&pack.key, bytes).await.unwrap();
+    }
+    assert_eq!(removed, 8);
+    let runs = raw.list(Some(&ObjectKey::new(rtdb_format::search_manifest::run_prefix(&slug)).unwrap())).await.unwrap();
+    assert!(!runs.is_empty());
+    for object in runs { raw.delete(&object.key).await.unwrap(); }
+
+    cell.add_logical_search_node().await;
+    let client = connect_eventually(&cell, "shop").await;
+    let query = "SELECT _id FROM docs WHERE MATCH(body, 'audit report') ORDER BY _id";
+    assert_eq!(values(&client, query).await, ["1", "2"]);
+    assert_eq!(values(&client, "SELECT _id FROM docs WHERE MATCH(body, 'audit memo')").await, ["3"]);
+    assert_eq!(values(&client, "SELECT _id FROM docs WHERE MATCH(body, 'unrelated')").await, ["4"]);
+    let holder = cell.holder("shop").await.unwrap();
+    let database = cell.node(holder).server.node().catalog().database("shop").unwrap();
+    database.build_artefacts().await.unwrap();
+    let rebuilt = database.trie_catalog();
+    let runs = rebuilt.search_runs(&table).collect::<Vec<_>>();
+    assert_eq!(runs.iter().flat_map(|run| run.blocks.iter().copied()).collect::<std::collections::BTreeSet<_>>(), extent);
+    for run in runs {
+        let receipt = run.source_receipt.as_ref().unwrap();
+        assert_eq!(receipt.checkpoint_boundary(), record.checkpoint.unwrap().boundary);
+        assert_eq!(receipt.blocks, run.blocks);
+        let key = ObjectKey::new(run.object_key(&slug).unwrap()).unwrap();
+        assert!(database.object_store().head_fresh(&key).await.is_ok());
+    }
+    assert_eq!(values(&client, query).await, ["1", "2"]);
+    drop((client, database));
+    cell.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_is_trimmed_below_its_last_published_block_and_still_recovers() {
     let mut cell = Cell::start(2, None).await;
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();

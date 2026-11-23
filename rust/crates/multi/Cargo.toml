@@ -25,7 +25,9 @@ rtdb-columnar.workspace = true
 rtdb-directory = { workspace = true, features = ["network"] }
 rtdb-format.workspace = true
 rtdb-flight-sql.workspace = true
+rtdb-index.workspace = true
 rtdb-logkeeper.workspace = true
+rtdb-maintenance.workspace = true
 ordered-logkeeper.workspace = true
 rtdb-node.workspace = true
 rtdb-plan.workspace = true
@@ -35,6 +37,8 @@ rtdb-replication.workspace = true
 rtdb-s3 = { workspace = true, features = ["versioning"] }
 rtdb-server.workspace = true
 rtdb-storage.workspace = true
+rtdb-trie.workspace = true
+rtdb-tx.workspace = true
 rtdb-types.workspace = true
 async-trait.workspace = true
 base64.workspace = true

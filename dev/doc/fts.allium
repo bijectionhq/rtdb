@@ -204,7 +204,7 @@ rule SearchJobRuns {
     -- A scan uses logical negative evidence within the source extents covered by admitted runs at its pinned basis.
     -- A missing or corrupt run leaves its extent eligible for exact nomination from primary history.
     -- A scan whose bounded gap read cannot establish a complete candidate union executes the ordinary scan.
-    -- A replay-backed repair verifies the checkpoint boundary, replay row count and selected extents, and applies the replayed erase frontier before publication.
+    -- A replay-backed repair verifies the boundary, source row count, exact block extents and erase frontier before publication.
     -- Ranked search and explicit entity point reads can resolve the same complete temporal history.
     when: job: SearchJob.created
 
@@ -246,6 +246,12 @@ rule RepairUnreadableSearchFile {
     -- A single ArtefactsAdded message replaces the shared records after the new files have been uploaded.
     -- A report is dropped when no live member still records that search file or the definition has left force.
     -- A damaged format 16 run with readable source inputs is repaired by ordered publication of a new immutable run over the same extents.
+    -- A native repair can read the retained accepted journal up to the pinned checkpoint boundary.
+    -- A hosted repair reads a directory root anchored in the published checkpoint and verifies the committed replica suffix through the pinned boundary.
+    -- The installed table directory authenticates the surviving event headers and erase frontier at that boundary.
+    -- Repair resolves surviving put payloads from primary data by stable event origin and checks each payload against the directory event.
+    -- A source receipt binds the lineage, replica interval, table, shard, block extents, row count and erase frontier used to build the replacement.
+    -- Replacement compares its extents with the expected active runs and verifies compatible source receipts before adopting the new run.
     when: SearchFileUnreadable(table, owner, definition)
 
     ensures:

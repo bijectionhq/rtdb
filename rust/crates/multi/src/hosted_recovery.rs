@@ -90,6 +90,12 @@ pub(crate) struct ReplicaTrimPlan {
     through: LogOffset,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReplicaTrimWitness {
+    checkpoint: rtdb_directory::Checkpoint,
+    inventory: [u8; 32],
+}
+
 pub(crate) struct ReplicaTrimGrant {
     stream: StreamConfig,
     through: LogOffset,
@@ -110,10 +116,11 @@ const REPLICA_PAYLOAD_TRIM_BATCH: i64 = 64;
 const MAX_PENDING_REPLICA_PAYLOADS: usize = 128;
 
 impl ReplicaTrimPlan {
-    pub(crate) fn new(record: DeploymentRecord, adopted_boundary: i64, trimmed: i64, now_ms: i64) -> Option<Self> {
+    pub(crate) fn new(record: DeploymentRecord, witness: Option<ReplicaTrimWitness>, adopted_boundary: i64, trimmed: i64, now_ms: i64) -> Option<Self> {
+        let witness = witness?;
         let published = record.checkpoint?;
         published.root_sha256?;
-        record.recovery_manifest_sha256?;
+        if published != witness.checkpoint || record.recovery_manifest_sha256 != Some(witness.inventory) { return None; }
         replay_start(&record, published.boundary).ok()?;
         let boundary = published.boundary.min(adopted_boundary);
         let oldest = record.required_replica_offsets(now_ms).min().unwrap_or(boundary);
@@ -302,6 +309,28 @@ pub(crate) async fn advance_body_fence(
     Ok(Some(stored))
 }
 
+impl ReplicaTrimWitness {
+    pub(crate) async fn read(record: &DeploymentRecord, store: &dyn rtdb_storage::ObjectStore,
+        writes_history: bool, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Option<Self>> {
+        let Some((checkpoint, inventory)) = record.checkpoint.zip(record.recovery_manifest_sha256) else { return Ok(None); };
+        let epoch = StorageEpoch(record.log_epoch);
+        let catalog = crate::archive::replica_suffix::read_published_catalog(store, checkpoint, epoch, memory).await?;
+        for entry in catalog.table_entries()? {
+            if entry.table.schema == "xt" || rtdb_types::TableRef::owned_schema(&entry.table.schema) { continue; }
+            let table = crate::archive::table_history::read_table_block(store, &catalog, &entry, memory).await?;
+            let wire = table.as_proto();
+            if table.row_count() > 0 && (writes_history || wire.entity_directory.is_some() || !wire.search_runs.is_empty())
+                && !wire.entity_directory.as_ref().is_some_and(|root|
+                    crate::archive::table_history::complete_directory(root, catalog.block_index(), table.row_count()))
+            {
+                return Ok(None);
+            }
+        }
+        if crate::archive::recovery_manifest_sha256(store, checkpoint, epoch).await? != inventory { return Ok(None); }
+        Ok(Some(Self { checkpoint, inventory }))
+    }
+}
+
 impl ReplicaTrimGrant {
     pub(crate) async fn apply(self, directory: &dyn Directory, keys: &dyn crate::keys::KeyService) -> Result<i64> {
         let mut settlement = None;
@@ -405,6 +434,10 @@ mod tests {
         record
     }
 
+    fn witness(record: &DeploymentRecord) -> Option<ReplicaTrimWitness> {
+        Some(ReplicaTrimWitness { checkpoint: record.checkpoint?, inventory: record.recovery_manifest_sha256? })
+    }
+
     #[test]
     fn replica_trim_tracks_journal_and_archived_custody_separately() {
         let mut record = candidate();
@@ -419,9 +452,9 @@ mod tests {
             replica_through: 6, source_through: 6, journal_interval: [5, 6], journal_sha256: [3; 32],
             expires_at_ms: 50, archive_sha256: None,
         });
-        let planned = |record| ReplicaTrimPlan::new(record, 10, -1, 10).unwrap().through.0;
+        let planned = |record: DeploymentRecord| ReplicaTrimPlan::new(record.clone(), witness(&record), 10, -1, 10).unwrap().through.0;
         assert_eq!(planned(record.clone()), 4);
-        assert_eq!(ReplicaTrimPlan::new(record.clone(), 10, -1, 50).unwrap().through.0, 6);
+        assert_eq!(ReplicaTrimPlan::new(record.clone(), witness(&record), 10, -1, 50).unwrap().through.0, 6);
 
         record.checkpoint_suffix_pins.get_mut(&pin).unwrap().archive_sha256 = Some("settled".into());
         assert_eq!(planned(record.clone()), 6);
@@ -444,7 +477,7 @@ mod tests {
         assert!(!record.requires_replica_offset(5, 0));
         assert!(matches!(replay_start(&record, 4), Err(Error::UnavailableLogRange { first_retained: 9, .. })));
         assert_eq!(journal_replay_start(&record, 2).unwrap(), 3);
-        assert_eq!(ReplicaTrimPlan::new(record, 10, -1, 0).unwrap().through, LogOffset(2));
+        assert_eq!(ReplicaTrimPlan::new(record.clone(), witness(&record), 10, -1, 0).unwrap().through, LogOffset(2));
     }
 
     #[test]
@@ -456,6 +489,38 @@ mod tests {
 
         record.replica_anchor.as_mut().unwrap().interval[1] = i64::MAX;
         assert!(replay_start(&record, 5).is_err());
-        assert!(ReplicaTrimPlan::new(record, 10, -1, 10).is_none());
+        assert!(ReplicaTrimPlan::new(record.clone(), witness(&record), 10, -1, 10).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_semantic_trim_requires_a_directory_in_the_published_table_block() {
+        use rtdb_format::{catalog::{BlockCatalog, TableBlock, TableEntry, publication_digest}, keys::block_key};
+        use rtdb_storage::{MemoryStore, ObjectStore};
+        use rtdb_types::{BlockIndex, TableRef};
+
+        let store = MemoryStore::default();
+        let entry = TableEntry::new(1, TableRef::new("public", "docs")).unwrap();
+        let table = TableBlock::from_parts(Default::default(), &Default::default(), 1, Vec::new()).unwrap().encode();
+        let mut catalog = BlockCatalog::from_proto(rtdb_format::block::proto::Block {
+            block_index: Some(0), boundary_replica_msg_id: Some(10), latest_processed_msg_id: Some(10),
+            tables: vec![entry.to_proto()],
+            table_block_manifest: Some(rtdb_format::block::proto::TableBlockManifest {
+                sha256_by_oid: BTreeMap::from([(entry.oid, publication_digest(&table).to_vec())]),
+            }),
+            ..Default::default()
+        }).unwrap();
+        let bytes = catalog.encode_for_publication();
+        store.put(&ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap(), bytes.into()).await.unwrap();
+        store.put(&ObjectKey::new(entry.slug.block_key(BlockIndex(0)).unwrap()).unwrap(), table.into()).await.unwrap();
+        let mut record = candidate();
+        let checkpoint = rtdb_directory::Checkpoint { block: 0, boundary: 10, source: 10, system_time: i64::MIN,
+            root_sha256: catalog.publication_sha256() };
+        record.checkpoint = Some(checkpoint);
+        record.recovery_manifest_sha256 = Some(crate::archive::recovery_manifest_sha256(&store, checkpoint, StorageEpoch(0)).await.unwrap());
+        let memory = rtdb_types::MemoryBudget::new(1 << 20);
+        let missing = ReplicaTrimWitness::read(&record, &store, true, &memory).await.unwrap();
+        assert!(ReplicaTrimPlan::new(record.clone(), missing, 10, -1, 0).is_none());
+        let physical = ReplicaTrimWitness::read(&record, &store, false, &memory).await.unwrap();
+        assert!(ReplicaTrimPlan::new(record, physical, 10, -1, 0).is_some());
     }
 }

@@ -1,4 +1,4 @@
-//! Copy an admitted replica suffix into the checkpoint capture's key custody.
+//! Authenticate replica suffixes for checkpoint capture, transfer, and table history.
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -29,6 +29,7 @@ use crate::{
     replay_broker::{Client, History, admits_position},
 };
 use rtdb_storage::{IoRegion, ObjectStore, log::ReplicaPayload};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 4096;
@@ -108,6 +109,101 @@ async fn read_base_catalog_at_view(
     let catalog = BlockCatalog::decode(&root_object.open(cipher.as_ref(), &root, root_bytes).await?)?;
     verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
     Ok((catalog, cipher))
+}
+
+pub(crate) async fn read_published_catalog(
+    store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch, memory: &Arc<MemoryBudget>,
+) -> Result<BlockCatalog> {
+    if checkpoint.root_sha256.is_none() { return Err(suffix_unavailable()); }
+    let path = key(&block_key(BlockIndex(checkpoint.block))?)?;
+    let bytes = PayloadBytes::read(store, &path, memory).await?;
+    let charge = memory.reserve(bytes.bytes.len().saturating_mul(8).saturating_add(4096))?;
+    let catalog = BlockCatalog::decode_reserved(&bytes.bytes, charge)?;
+    verify_cut(&catalog, checkpoint, epoch)?;
+    Ok(catalog)
+}
+
+pub(crate) async fn visit_table(
+    directory: &dyn Directory, record: &DeploymentRecord, storage: &CellStorage, keys: &dyn KeyService,
+    checkpoint: Checkpoint, base: &BlockCatalog, target: &BlockCatalog, table: &rtdb_types::TableRef,
+    io: Arc<IoRegion>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+    mut visit: impl FnMut(BlockIndex, &rtdb_format::data::EventBatch) -> Result<()> + Send,
+) -> Result<()> {
+    let epoch = StorageEpoch(record.log_epoch);
+    let through = target.boundary_replica_position().ok_or_else(suffix_unavailable)?.after_offset(epoch);
+    if through == checkpoint.boundary {
+        if target.publication_sha256() != base.publication_sha256() { return Err(suffix_unavailable()); }
+        return Ok(());
+    }
+    let first = crate::hosted_recovery::replay_start(record, checkpoint.boundary)?;
+    if through < first || target.external_source_token().is_some() || base.external_source_token().is_some() {
+        return Err(suffix_unavailable());
+    }
+    let stream = administration_stream(directory, record, 4 << 20).await?;
+    let certificate = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
+    let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?;
+    let cipher = TerminalReplicaCipher::open(record, keys).await?;
+    let payloads = ServingPayloads::new(record, storage, keys, io, memory);
+    let mut fence = rtdb_replication::TermFence::from_catalog(base)?;
+    let mut writer = None;
+    let mut logical = LogicalReplay::new(checkpoint, record.log_epoch, base);
+    let mut latest = base.latest_completed_tx();
+    let mut next = first;
+    let mut terminal_admitted = false;
+    while let Some(mut entries) = cancellation.run_until_cancelled(pages.next_page()).await
+        .ok_or_else(history_cancelled)?? {
+        let bytes = entries.iter().try_fold(0usize, |total, entry|
+            total.checked_add(entry.payload.len().saturating_mul(2).saturating_add(64)).ok_or_else(suffix_unavailable))?;
+        let _charge = memory.reserve(bytes)?;
+        cipher.open_page(&mut entries)?;
+        for entry in entries {
+            if cancellation.is_cancelled() { return Err(history_cancelled()); }
+            if entry.lsn != next || entry.lsn > through { return Err(suffix_unavailable()); }
+            next = next.checked_add(1).ok_or_else(suffix_unavailable)?;
+            let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
+            let _payload;
+            let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                let (resolved, retained) = payloads.resolve_verified(&envelope).await?;
+                _payload = retained;
+                resolved
+            } else { envelope };
+            if entry.lsn == through {
+                let ReplicaBody::BlockBoundary(boundary) = &envelope.message else { return Err(suffix_unavailable()); };
+                if envelope.term != target.boundary_term() || envelope.term_sequence != target.boundary_term_sequence()
+                    || boundary.block_index != Some(target.block_index().0)
+                    || boundary.latest_processed_msg_id != target.as_proto().latest_processed_msg_id
+                { return Err(suffix_unavailable()); }
+                terminal_admitted = true;
+            }
+            match envelope.message {
+                ReplicaBody::ResolvedTx(message) if message.db_op.is_none() && message.external_source_token.is_none() => {
+                    let source = logical.transaction_source(message.src_msg_id)?;
+                    let block = BlockIndex(logical.installed.block.checked_add(1).ok_or_else(suffix_unavailable)?);
+                    let transaction = rtdb_tx::decode_replica(&message, latest, block, memory)?;
+                    let tx = transaction.writes.tx_key();
+                    if latest.is_some_and(|prior| tx.tx_id <= prior.tx_id || tx.system_time <= prior.system_time) {
+                        return Err(suffix_unavailable());
+                    }
+                    if let Some(batch) = transaction.writes.tables().get(table).and_then(|write| write.batch()) {
+                        visit(block, batch.view())?;
+                    }
+                    latest = Some(tx);
+                    logical.source = source;
+                }
+                control => logical.apply_control(ReplayControl::read(&control)?)?,
+            }
+        }
+    }
+    if !terminal_admitted || next.checked_sub(1) != Some(through) || latest != target.latest_completed_tx()
+        || logical.pending.as_ref().map(|cut| cut.block) != Some(target.block_index().0)
+    {
+        return Err(suffix_unavailable());
+    }
+    Ok(())
+}
+
+fn history_cancelled() -> Anomaly {
+    Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.multi/search-history-cancelled", "Table history replay was cancelled")
 }
 
 /// Resolve the original accepted publication to its complete transaction and

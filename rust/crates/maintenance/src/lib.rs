@@ -9,8 +9,10 @@ mod merge;
 mod publication;
 mod retention;
 mod retirement_intent;
+mod table_history;
 
-pub use artefact::{ArtefactBuilder, ArtefactSource, wants, ArtefactDatabase, ReplayVisitor, RetainedArtefactSource, ArtefactDefinition, ArtefactKind, ArtefactDriver, ArtefactHandle, ArtefactJob, ArtefactPublisher, available_artefact_jobs, retired_artefacts, stray_artefacts};
+pub use artefact::{ArtefactBuilder, ArtefactSource, wants, ArtefactDatabase, ArtefactDefinition, ArtefactKind, ArtefactDriver, ArtefactHandle, ArtefactJob, ArtefactPublisher, available_artefact_jobs, retired_artefacts, stray_artefacts};
+pub use table_history::{HistoryCoverage, HistoryRead, HistoryRow, HistoryVisitor, TableHistorySource};
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};
 pub use entity_history::EntityHistoryArtefacts;
 pub use failure::{CompactionFailure, CompactionObserver, StderrCompactionObserver};

@@ -190,6 +190,21 @@ message SearchRun {
     int64 source_rows = 9;
     bool has_erases = 10;
   bytes allocation = 11;
+  reserved 12;
+  SourceReceipt source_receipt = 13;
+}
+
+message SourceReceipt {
+    string lineage = 1;
+    int64 checkpoint_boundary = 2;
+    int64 suffix_through = 3;
+    string table = 4;
+    bytes shard_range = 5;
+    int64 source_rows = 6;
+    bytes erase_frontier_digest = 7;
+    bytes directory_root = 8;
+    repeated int64 blocks = 9;
+    bytes checkpoint_catalog_sha256 = 10;
 }
 
 message SearchRunChange {

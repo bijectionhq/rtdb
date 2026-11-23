@@ -112,6 +112,8 @@ pub struct OpenedRecoveryStore {
 
 #[async_trait]
 pub trait RemoteStorageFactory: Send + Sync {
+    fn table_history(&self, _configuration: &Any) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
+
     /// The returned store is scoped to `storage_root`, under the provider's configured prefix.
     /// Retained provider operations belong to the supplied database region, including after caller cancellation.
     async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>>;
@@ -142,6 +144,8 @@ pub trait RemoteStorageFactory: Send + Sync {
 
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
+    fn table_history(&self, _configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
+
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()>;
     /// Opens a fresh database storage region without opening logs; partial failures drain that region.
     /// The region's operations also belong to this factory's node region, which retains them after caller cancellation.
@@ -276,6 +280,13 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 
 #[async_trait]
 impl ResourceFactory for NativeResources {
+    fn table_history(&self, configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> {
+        let Some(database_config::Storage::RemoteStorage(storage)) = &configuration.storage else { return Ok(None); };
+        let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;
+        let factory = self.storage_factories.get(type_name(configuration)?).ok_or_else(|| invalid("Native storage factory is unavailable"))?;
+        factory.table_history(configuration)
+    }
+
     async fn close(&self) -> Result<()> { if let Some(cache) = &self.disk_cache { cache.close_and_wait().await; } self.io.close_and_wait().await; Ok(()) }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         validate_database_shape(name, configuration)?;
