@@ -25,6 +25,7 @@ rtdb-directory = { workspace = true, features = ["network"] }
 rtdb-format.workspace = true
 rtdb-flight-sql.workspace = true
 rtdb-logkeeper.workspace = true
+ordered-logkeeper.workspace = true
 rtdb-node.workspace = true
 rtdb-plan.workspace = true
 rtdb-query.workspace = true

@@ -22,6 +22,7 @@ pub mod keys;
 pub mod lease;
 pub mod load;
 pub mod logs;
+pub mod journal;
 mod ordered_index_storage;
 pub mod packing;
 pub mod read_width;
