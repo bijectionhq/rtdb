@@ -9,7 +9,7 @@ use arrow_array::{Array, BinaryArray};
 use rtdb_format::data::{StoredEvent, StoredOperation};
 use rtdb_types::{
     EntityId, Iid, Interval, OwnedChangeKind, OwnedRelation, OwnedWorld, Result, StructFields,
-    TableRef, Timestamp, Value, WorldClockMode, WorldShadow,
+    TableRef, Timestamp, TransactionKey, Value, WorldClockMode, WorldShadow,
 };
 
 use super::{OpenTransaction, no_owned_principal, overflow, validate_owned_schema};
@@ -17,6 +17,28 @@ use crate::hosted_control::{
     HostedControlWrite, HostedReplay, ReplayWorlds, ReplayedWorldParent, WorldReadmission,
     replayed_archive_cut, replayed_parent_logical_time, replayed_world_parent,
 };
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayedRegistration {
+    binding: [u8; 32],
+    pin: [u8; 16],
+    source: TransactionKey,
+    logical: Timestamp,
+}
+
+impl ReplayedRegistration {
+    fn precedes(
+        &self, binding: [u8; 32], current: TransactionKey, link: &rtdb_types::OwnedWorldForkLink,
+    ) -> bool {
+        self.binding == binding && self.pin == link.pin && self.logical == link.registered
+            && self.source.tx_id < current.tx_id && self.source.system_time < current.system_time
+    }
+}
+
+fn registration_locator(world: Iid) -> String {
+    format!("native-world-registration/{world}")
+}
 
 impl OpenTransaction<'_> {
     pub(super) async fn readmit_replayed_world<'a>(
@@ -170,7 +192,7 @@ impl OpenTransaction<'_> {
             } else {
                 match previous {
                     None if world.pin == world.id && !world.dropped => {
-                        require_replayed_fork_parent(context, owner, &world, logical).await?;
+                        require_replayed_fork_parent(context, owner, &world, replay).await?;
                     }
                     Some((previous, _))
                         if !previous.dropped && previous.until > logical
@@ -190,6 +212,7 @@ impl OpenTransaction<'_> {
                 self.record_replayed_world_parent(replay, context, &world)
                     .await?;
             }
+            self.record_replayed_registration(replay, &world)?;
             self.buffer.put(
                 OwnedRelation::world_catalog().table(owner),
                 world.record(),
@@ -312,6 +335,24 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
+    fn record_replayed_registration(&mut self, replay: &HostedReplay, world: &OwnedWorld) -> Result<()> {
+        let receipt = ReplayedRegistration {
+            binding: replay.holds_binding(),
+            pin: world.pin.0,
+            source: replay.source_position(),
+            logical: replay.logical_time(),
+        };
+        let body = serde_json::to_vec(&receipt).map_err(|_| OwnedWorld::unavailable())?;
+        self.buffer.put(
+            TableRef::new("public", crate::hosted_control::RESTORE),
+            StructFields::from([
+                ("_id".into(), Value::Utf8(registration_locator(world.id))),
+                ("binding".into(), Value::Binary(body)),
+            ]),
+            Interval::new(Timestamp(0), Timestamp::MAX)?,
+        )
+    }
+
     fn record_replayed_world_relocation(
         &mut self,
         replay: &HostedReplay,
@@ -393,12 +434,13 @@ async fn require_replayed_fork_parent(
     context: &Arc<rtdb_query::QueryContext>,
     owner: &str,
     world: &OwnedWorld,
-    logical: Timestamp,
+    replay: &HostedReplay,
 ) -> Result<()> {
     let unavailable = OwnedWorld::unavailable;
     let Some(link) = world.fork_lineage.last() else { return Ok(()); };
-    let (source, _reservation) =
-        rtdb_query::read_owned_world(Arc::clone(context), owner, Iid(link.world))
+    let logical = replay.logical_time();
+    let (source, destination, _reservation) =
+        rtdb_query::read_owned_world_with_revision(Arc::clone(context), owner, Iid(link.world))
             .await?
             .ok_or_else(unavailable)?;
     let admits_child = if world.ancestor.is_some() {
@@ -406,8 +448,15 @@ async fn require_replayed_fork_parent(
     } else {
         source.can_retain_parent(world)
     };
+    let (receipt, registered_at) = replay_control(context, &registration_locator(source.id)).await?;
+    let registration: ReplayedRegistration = serde_json::from_slice(&receipt).map_err(|_| unavailable())?;
+    let locator = format!("native-transaction/{}", registration.source.tx_id.0);
+    let (accepted, accepted_at) = replay_control(context, &locator).await?;
     if !admits_child
         || source.pin.0 != link.pin
+        || !registration.precedes(replay.holds_binding(), replay.source_position(), link)
+        || destination != registered_at || destination != accepted_at
+        || !replay.matches_parent_receipt(&accepted, registration.source)
         || link.registered >= logical
         || logical >= source.until
         || world.fork_lineage != source.retained_child_lineage(world, link.registered)?
@@ -437,4 +486,30 @@ async fn replay_control(
         .filter(|column| column.is_valid(0) && column.value(0).len() <= 4096)
         .ok_or_else(OwnedWorld::unavailable)?;
     Ok((body.value(0).to_vec(), revision))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplayedRegistration;
+    use rtdb_types::{OwnedWorldForkLink, Timestamp, TransactionKey, TxId};
+
+    #[test]
+    fn replayed_registration_rejects_an_unrelated_pin_or_original_cut() {
+        let source = TransactionKey { tx_id: TxId(8), system_time: Timestamp(90) };
+        let current = TransactionKey { tx_id: TxId(9), system_time: Timestamp(100) };
+        let observed = ReplayedRegistration {
+            binding: [1; 32], pin: [2; 16], source, logical: Timestamp(60),
+        };
+        let mut link = OwnedWorldForkLink {
+            world: [3; 16], pin: [2; 16], registered: Timestamp(60),
+            system: Timestamp(55), logical: Timestamp(41),
+        };
+        assert!(observed.precedes([1; 32], current, &link));
+        assert!(!observed.precedes([1; 32], source, &link));
+        link.pin = [4; 16];
+        assert!(!observed.precedes([1; 32], current, &link));
+        link.pin = [2; 16];
+        link.registered = Timestamp(61);
+        assert!(!observed.precedes([1; 32], current, &link));
+    }
 }

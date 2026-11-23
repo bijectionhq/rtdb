@@ -527,6 +527,8 @@ impl HostedReplay {
         Ok(())
     }
 
+    pub(crate) fn source_position(&self) -> rtdb_types::TransactionKey { self.source }
+
     pub(crate) fn source_time(&self) -> Timestamp { self.source.system_time }
 
     pub(crate) fn lifetimes(&self) -> &[ReplayLifetime] { &self.lifetimes }
