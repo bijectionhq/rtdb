@@ -2165,7 +2165,7 @@ mod tests {
             name: "mod".into(), args: vec![value.expression(), Expr::Literal(Value::I64(2))],
             return_type: LogicalType::Scalar(ScalarType::I64),
         };
-        assert!(!crate::columnar::projection::shaped(&remainder));
+        assert!(crate::columnar::projection::shaped(&remainder));
         let named = |id, name: &str, expr: Expr| NamedExpr {
             field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..value.clone() },
             expr,
@@ -2184,6 +2184,8 @@ mod tests {
             assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow list"); };
             assert!(array.as_any().is::<arrow_array::ListArray>());
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[2] else { panic!("Expected an Arrow remainder"); };
+            assert!(array.as_any().is::<arrow_array::Int64Array>());
             let page = baseline.next_page().await.unwrap().unwrap();
             assert_eq!(page.len(), batch.len);
             for (row, expected) in page.rows().iter().enumerate() {
