@@ -509,15 +509,17 @@ impl OwnedWorldReadResource {
         Ok((conditions, charge))
     }
 
-    fn require_create_absence(&self, nonces: &[u8], write: &rtdb_node::OwnedWorldWrite) -> Result<(), Status> {
+    fn require_create_absence(
+        &self, nonces: &[u8], write: &rtdb_node::OwnedWorldWrite, at: Option<Timestamp>,
+    ) -> Result<(), Status> {
         let stored = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
         if nonces.chunks_exact(16).filter_map(|bytes| Uuid::from_slice(bytes).ok()).any(|nonce| {
             stored.get(&nonce).is_some_and(|condition| condition.absent_in_parent_and_overlay
-                && condition.evidence.is_absent_point(&write.relation, &write.id))
+                && condition.evidence.is_absent_point(&write.relation, &write.id, at))
         }) {
             return Ok(());
         }
-        Err(Status::failed_precondition("A create-only Proposal effect requires original absence in the parent and overlay"))
+        Err(Status::failed_precondition("A world create requires original absence in the parent and overlay"))
     }
 }
 
@@ -4028,10 +4030,13 @@ impl Service {
                     self.decode_world_writes(call, owned_groups(overlay, true, false)?, &mut rows_left, &mut writes, &mut reservations)?;
                     if writes.is_empty() { return Err(invalid("The world overlay has no writes")); }
                     for write in writes.iter().filter(|write| write.create_only) {
-                        if mode != rtdb_types::WorldClockMode::Proposal {
-                            return Err(invalid("Only a Proposal overlay can create"));
-                        }
-                        resource.require_create_absence(nonces, write)?;
+                        let absence_at = match mode {
+                            rtdb_types::WorldClockMode::Held { .. } =>
+                                Some(expected_clock.unwrap_or(resource.snapshot.initial_clock())),
+                            rtdb_types::WorldClockMode::Proposal => None,
+                            rtdb_types::WorldClockMode::Retained => return Err(unsupported()),
+                        };
+                        resource.require_create_absence(nonces, write, absence_at)?;
                     }
                     let effect = match at {
                         Some(at) => rtdb_node::OwnedWorldEffect::TimedOverlay { at, writes },

@@ -1471,6 +1471,8 @@ rule ConsumeIntake {
 -- A held world read exposes its last local clock publication with both the physical revision and logical reading from the original held catalog.
 -- A timed overlay orders a strictly increasing held reading and the overlay facts together.
 -- Acceptance-valid overlay facts begin at that publication's held reading.
+-- A held create checks absence in the local line and its fixed parent at the held tip.
+-- The ordered resolver validates the tip and the original absence witness before creating the row.
 -- Acceptance-valid capacity and unique occupancy checks use that same held reading.
 -- The physical timestamp bounds archive access and retention leases, and the held reading governs the world's effective time.
 -- A valid-time window on the child combines boundaries from both retained cuts and resolves each slice by the same point rule.

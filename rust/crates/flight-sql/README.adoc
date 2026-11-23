@@ -597,9 +597,11 @@ The group count is a big-endian u16 from 1 to 32.
 Each group consists of a relation prefix, its big-endian u32 Arrow length, and one terminated IPC stream with a nonempty batch.
 The request admits up to 4096 rows across all groups.
 Each row has exactly `_id`, `_op: Utf8`, `_valid_from_micros: Int64`, `_valid_to_micros: Int64`, and `fact: Struct?`.
-Both signed endpoints are required and specify a nonempty half-open interval. Use Int64 minimum and maximum for unbounded endpoints.
+An explicit interval requires both signed endpoints and is nonempty and half-open. Use Int64 minimum and maximum for unbounded endpoints.
 A `replace` carries the complete fact fields in its struct. The struct may include `_absent: List<Utf8>` to omit named null cells.
 A `delete` carries a null struct and writes a world tombstone over the interval.
+An acceptance-valid Held `insert` carries a complete fact with null interval endpoints and the original combined point witness for absence at the held tip.
+The resolver checks the local absence and archive purge frontier and accepts the new row at the publication's held reading.
 The resolver validates replacements against the schema inherited from the archived cut and orders all groups atomically at the live world deadline.
 Success returns the standard transaction-key Arrow row.
 

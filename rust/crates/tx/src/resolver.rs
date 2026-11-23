@@ -1502,7 +1502,7 @@ impl<'a> OpenTransaction<'a> {
         });
         if publications.len() + observing_worlds.len() > 8 { return Err(unavailable()); }
         if publications.is_empty() && operations.iter().any(|operation| match operation {
-            Operation::Public(TxOp::OwnedReplaceDocs { relation, .. })
+            Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. })
             | Operation::OwnedWriteIids { relation, .. } => relation.world().is_some(),
             _ => false,
         }) {
@@ -1787,6 +1787,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
+        let mut held_create_readings = BTreeMap::new();
         for operation in operations {
             let Some(write) = crate::hosted_control::proposal_overlay_write(operation) else { continue; };
             let world = write.relation.world().ok_or_else(unavailable)?;
@@ -1798,10 +1799,32 @@ impl<'a> OpenTransaction<'a> {
                 *published == world && (advance.is_none() || held) && !*drop && settlement.is_none()
             });
             if !publishes_overlay
-                || ((bounded && !held || write.create_only) && proposal_overlay != Some(world))
+                || (!held && (bounded || write.create_only) && proposal_overlay != Some(world))
                 || (proposal_overlay == Some(world) && bounded != (write.from.is_some() && write.to.is_some()))
             {
                 return Err(unavailable());
+            }
+            if held && write.create_only {
+                if !record.schemas.relation(&root).is_some_and(|schema| schema.has_acceptance_validity())
+                    || write.from.is_some() || write.to.is_some()
+                {
+                    return Err(unavailable());
+                }
+                let reading = match held_create_readings.entry(world) {
+                    std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
+                        self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()),
+                    ),
+                };
+                for row in write.documents.rows() {
+                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    if !operations.iter().any(|operation| matches!(operation,
+                        Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: None })
+                            if relation == write.relation && observed == &id && *valid_at == reading
+                    )) {
+                        return Err(unavailable());
+                    }
+                }
             }
         }
         if let Some(crate::hosted_control::HostedProposalLanding { world, pin, effect }) = proposal_land {
@@ -1827,7 +1850,7 @@ impl<'a> OpenTransaction<'a> {
                 {
                     for row in 0..documents.row_count() {
                         let id = documents.owned_id(row)?;
-                        self.require_proposal_create_absence(owner, relation, relation, &id).await?;
+                        self.require_world_create_absence(owner, relation, relation, &id).await?;
                     }
                     continue;
                 }
@@ -1839,7 +1862,7 @@ impl<'a> OpenTransaction<'a> {
                 };
                 for document in documents.rows() {
                     let id = crate::source::document_id(document, &self.context.memory)?;
-                    self.require_proposal_create_absence(owner, relation, relation, &id).await?;
+                    self.require_world_create_absence(owner, relation, relation, &id).await?;
                 }
             }
         } else if let Some(world) = retained_release {
@@ -2083,7 +2106,7 @@ impl<'a> OpenTransaction<'a> {
         rtdb_query::read_owned_point_revision(context, owner, relation, id, valid).await
     }
 
-    async fn require_proposal_create_absence(
+    async fn require_world_create_absence(
         &self, owner: &str, root: &rtdb_types::OwnedRelation, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
     ) -> Result<()> {
         let context = self.context.query_context(
@@ -2473,7 +2496,7 @@ impl<'a> OpenTransaction<'a> {
                     _ => return Err(unavailable()),
                 }
             };
-            if (create_only && (record.mode != WorldClockMode::Proposal || explicit))
+            if (create_only && (!record.mode.is_writable() || explicit))
                 || from >= to || !documents.has_exact_presence()
             {
                 return Err(unavailable());
@@ -2495,7 +2518,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 if &shadow.record(&id)? != row { return Err(unavailable()); }
                 if create_only {
-                    self.require_proposal_create_absence(owner, &root, relation, &id).await?;
+                    self.require_world_create_absence(owner, &root, relation, &id).await?;
                 }
             }
             let bounded_held = schema.requires_bounded_period() && matches!(record.mode, WorldClockMode::Held { .. });

@@ -2701,9 +2701,13 @@ impl OwnedWorldWitness {
 
     pub fn matches_scope(&self, scope: rtdb_types::PlacedAttemptScope) -> bool { self.scope == scope }
 
-    pub fn is_absent_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> bool {
+    pub fn is_absent_point(
+        &self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, at: Option<Timestamp>,
+    ) -> bool {
         self.relation.root_relation().as_ref() == Some(relation)
-            && matches!(&self.observation, OwnedWorldObservation::Point { id: observed, revision: None, .. } if observed == id)
+            && matches!(&self.observation,
+                OwnedWorldObservation::Point { id: observed, valid_at, revision: None }
+                    if observed == id && at.is_none_or(|at| at == *valid_at))
     }
 
     pub fn allocation_bound(&self) -> usize {
@@ -2740,6 +2744,27 @@ fn world_witness_matches_only_its_original_history_and_writer_epoch() {
     assert!(witness.matches_scope(scope));
     assert!(!witness.matches_scope(PlacedAttemptScope::new("history-a", 2).unwrap()));
     assert!(!witness.matches_scope(PlacedAttemptScope::new("history-b", 1).unwrap()));
+}
+
+#[cfg(test)]
+#[test]
+fn world_create_absence_matches_the_observed_valid_instant() {
+    use rtdb_types::{EntityId, Iid, OwnedRelation, PlacedAttemptScope};
+
+    let world = Iid([1; 16]);
+    let relation = OwnedRelation::new("facts").unwrap();
+    let id = EntityId::String("one".into());
+    let witness = OwnedWorldWitness {
+        world,
+        pin: Iid([2; 16]),
+        relation: relation.in_world(world).unwrap(),
+        observation: OwnedWorldObservation::Point { id: id.clone(), valid_at: Timestamp(12), revision: None },
+        scope: PlacedAttemptScope::new("history", 1).unwrap(),
+        until: Timestamp(42),
+        purge_frontier: 0,
+    };
+    assert!(witness.is_absent_point(&relation, &id, Some(Timestamp(12))));
+    assert!(!witness.is_absent_point(&relation, &id, Some(Timestamp(11))));
 }
 
 pub struct OwnedForkCut {
@@ -3209,11 +3234,11 @@ impl NativeSession {
             Self::append_world_checks(&mut ops, section.checks);
             let (advance_to, drop_world, settlement_pin) = match section.effect {
                 OwnedWorldEffect::Overlay(writes) => {
-                    self.append_world_writes(&mut ops, section.world, writes, proposal_overlay)?;
+                    self.append_world_writes(&mut ops, section.world, writes)?;
                     (None, false, None)
                 }
                 OwnedWorldEffect::TimedOverlay { at, writes } => {
-                    self.append_world_writes(&mut ops, section.world, writes, false)?;
+                    self.append_world_writes(&mut ops, section.world, writes)?;
                     (Some(at), false, None)
                 }
                 OwnedWorldEffect::Clock(to) => (Some(to), false, None),
@@ -3297,10 +3322,9 @@ impl NativeSession {
 
     fn append_world_writes(
         &self, ops: &mut Vec<TxOp>, world: rtdb_types::Iid, writes: Vec<OwnedWorldWrite>,
-        proposal_overlay: bool,
     ) -> Result<()> {
         for OwnedWorldWrite { relation, id, shadow, valid, create_only } in writes {
-            if create_only && (!proposal_overlay || valid.is_some()
+            if create_only && (valid.is_some()
                 || !matches!(&shadow, rtdb_types::WorldShadow::Present(_)))
             {
                 return Err(rtdb_types::OwnedWorld::unavailable());
