@@ -30,6 +30,7 @@
 --   A feed is exhausted when the relation is exhausted and its change journal also has a zero frontier and no serving tries.
 --   A nested retained world stores an ordered, bounded prefix of original parent registrations and selected cuts in its own world record.
 --   The resolver compares every inherited link and the appended parent edge with the accepted predecessor before it can publish the child.
+--   Live append checks canonical IIDs against each put's active Arrow identity leg under one verification reservation.
 --   Row-based operations carry homogeneous floating-point lists as typed Arrow component buffers.
 --   Staged rows ARE read, by the transactions resolving behind them (read-your-writes), and that stays within the discipline only because the reader is the same owner — the term's own coroutine.
 --   Native resolving snapshots reuse the immutable index segment of each staged write until its read-back.

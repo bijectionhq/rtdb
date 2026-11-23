@@ -52,13 +52,17 @@ See link:../../rust/crates/tx/src/resolver.rs[resolution] and link:../../rust/cr
 
 |Replica log, live index and persistence
 |The live index, replica event payloads, persisted tries and compaction carry Arrow events.
-|Trie navigation, event headers, temporal resolution, file metadata and compaction decisions use Rust control values.
+The live index checks canonical IIDs against the active identity cells.
+Block flush gathers compatible evolving chunks under the captured Arrow layout.
+Block flush and compaction join per-page statistics into the persisted Arrow metadata schema.
+|Trie navigation, event headers, temporal resolution and compaction decisions use Rust control values.
 Explicit event readers can produce a row for callers of the event API.
 See link:../../rust/crates/index/src/live.rs[live index], link:../../rust/crates/format/src/data.rs[event codec] and link:../../rust/crates/maintenance/src[maintenance].
 
 |Dispatch, scans and expressions
 |Ordinary plans, including semantic-page queries, scan, filter and project Arrow payloads and selected positions.
 General expressions publish Arrow output, including mixed layouts represented by positions in their original arrays.
+Scans use cached positions in the trie metadata arrays, including borrowed Bloom bytes and zero-copy pages from cache-owned metadata.
 |System and inspection relations synthesize control and metadata records.
 Generic expression evaluation may decode a scalar or a structured operand when its semantics require the full operand.
 See link:../../rust/crates/query/src/operators.rs[dispatch] and link:../../rust/crates/query/src/columnar.rs[expression and selection operators].

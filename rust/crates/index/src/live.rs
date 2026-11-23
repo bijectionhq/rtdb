@@ -3,8 +3,13 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock, Weak};
 
-use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
+use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, StructArray, UnionArray};
+use arrow_schema::{DataType, Field, SchemaRef, UnionMode};
+use rtdb_columnar::{
+    ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, copy_event_cells,
+    estimate_event_copy_cell_bytes, estimate_read_value_bytes, event_relayout_bound, from_field,
+    read_entity_id, read_execution_value, relayout_event_column, to_field,
+};
 use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch, keyed_put_batch};
 use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, TxId, Value};
@@ -102,28 +107,42 @@ impl IndexBatch {
         let copy = !matches!(mode, EventBuild::Write);
         Self::from_owned(owned_event_batch(events, has_put.then_some(fields), copy, budget)?)
     }
-    fn put_id_matches(&self, row: usize, iid: Iid) -> Option<bool> {
-        let operations = self.arrow().column_by_name("op")?.as_any().downcast_ref::<UnionArray>()?;
-        let put = operations.child(operations.type_id(row)).as_any().downcast_ref::<StructArray>()?;
-        let (index, field) = put.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")?;
-        let column = put.column(index);
-        let offset = operations.value_offset(row);
-        let bound = estimate_read_value_bytes(field, column.as_ref(), offset).ok()?
-            .checked_mul(3)?.checked_add(1024)?;
-        let _scratch = self.owned.reservation().budget().reserve(bound).ok()?;
-        let value = read_execution_value(field, column.as_ref(), offset).ok()?;
-        Some(value.entity_id().ok()?.iid() == iid)
-    }
     fn has_system_time(&self, system_time: Timestamp) -> bool {
         self.system_times.is_none_or(|times| times == (system_time, system_time))
     }
     fn has_canonical_iids(&self) -> Option<bool> {
         if let Some(proof) = self.canonical_iids.get() { return Some(*proof); }
-        for row in 0..self.len() {
-            let header = self.events.header(row).ok()?;
-            if header.op == EventOp::Put && !self.put_id_matches(row, header.iid)? {
-                let _ = self.canonical_iids.set(false);
-                return Some(false);
+        let mut puts = self.headers.0.iter().enumerate().filter(|(_, header)| header.op == EventOp::Put);
+        if let Some(first) = puts.next() {
+            let operations = self.arrow().column_by_name("op")?.as_any().downcast_ref::<UnionArray>()?;
+            let arrow_schema::DataType::Union(legs, _) = operations.data_type() else { return None; };
+            let (put_tag, _) = legs.iter().find(|(_, leg)| leg.name() == "put")?;
+            let put = operations.child(put_tag).as_any().downcast_ref::<StructArray>()?;
+            let (index, field) = put.fields().iter().enumerate().find(|(_, field)| field.name() == "_id")?;
+            let array = put.column(index).as_ref();
+            let budget = self.owned.reservation().budget();
+            let mut scratch = budget.reserve(0).ok()?;
+            let mut typed = None;
+            for (row, header) in std::iter::once(first).chain(puts) {
+                let offset = operations.value_offset(row);
+                let bound = estimate_read_value_bytes(field, array, offset).ok()?
+                    .checked_mul(3)?.checked_add(1024)?;
+                let charge = Arc::get_mut(&mut scratch)?;
+                if bound > charge.bytes() { charge.grow_to(bound).ok()?; }
+                let typed = *typed.get_or_insert_with(|| self.put_field_types.get(index)
+                    .and_then(|logical| to_field(field.name(), logical).ok())
+                    .is_some_and(|canonical| canonical.data_type() == field.data_type() && canonical.metadata() == field.metadata()));
+                let iid = if typed {
+                    let cell = ArrowCell { field, array, row: offset }.physical().ok()?;
+                    cell.signed_integer().map(rtdb_columnar::EntityIdRef::Integer)
+                        .or_else(|| read_entity_id(cell.field, cell.array, cell.row).ok())?.iid()
+                } else {
+                    read_execution_value(field, array, offset).ok()?.entity_id().ok()?.iid()
+                };
+                if iid != header.iid {
+                    let _ = self.canonical_iids.set(false);
+                    return Some(false);
+                }
             }
         }
         let _ = self.canonical_iids.set(true);
@@ -469,19 +488,37 @@ impl LiveTable {
         let _reservation = memory.reserve(self.chunks.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("Invalid block page inventory size"))?)?;
         let empty = IndexBatch::copy_events_with_put_schema(&[], &self.column_types, memory)?;
         let include_origins = self.chunks.iter().any(|(_, batch)| batch.view().has_origin_column());
+        let keyed = self.table.is_owned_event_data();
+        let recency = !self.chunks.is_empty() && self.chunks.iter().all(|(_, batch)| batch.arrow().column_by_name("_recency").is_some());
         let mut schema = empty.arrow().schema();
         let include_positions = self.chunks.iter().any(|(_, batch)| batch.view().has_position_column());
         let topology = self.table.is_owned_world_topology();
-        if topology || include_origins || include_positions {
+        if include_origins || include_positions || topology || keyed || recency {
             let mut fields = schema.fields().to_vec();
-            if topology { fields.push(Arc::new(rtdb_format::data::commit_position_field())); }
-            if include_origins { fields.push(Arc::new(rtdb_format::data::event_origin_field())); }
+            if recency {
+                let system_time = schema.field_with_name("_system_from").map_err(|error| invalid(error.to_string()))?;
+                fields.push(Arc::new(Field::new("_recency", system_time.data_type().clone(), false)));
+            }
+            if keyed {
+                fields.push(Arc::new(rtdb_format::data::entity_key_field()));
+            }
+            if keyed || topology { fields.push(Arc::new(rtdb_format::data::commit_position_field())); }
+            if include_origins {
+                fields.push(Arc::new(rtdb_format::data::event_origin_field()));
+            }
             if include_positions { fields.push(Arc::new(rtdb_format::data::event_position_field())); }
             schema = Arc::new(arrow_schema::Schema::new(fields));
         }
-        let sources = self.chunks.iter().all(|(_, batch)| batch.arrow().schema() == schema)
+        let sources: Option<Vec<_>> = (!keyed && !recency && self.chunks.iter().all(|(_, batch)| batch.arrow().schema() == schema))
             .then(|| self.chunks.iter().map(|(_, batch)| &batch.owned).collect());
-        Ok(BlockPages { table: self, sources, include_origins, memory: Arc::clone(memory), _reservation })
+        let _schema_reservation = match sources.as_ref().and_then(|batches| batches.first()) {
+            Some(batch) => {
+                schema = batch.batch().schema();
+                None
+            }
+            None => Some(Arc::clone(empty.arrow_reservation())),
+        };
+        Ok(BlockPages { table: self, sources, schema, include_origins, memory: Arc::clone(memory), _reservation, _schema_reservation })
     }
     pub fn block_metadata(&self) -> Result<TableMeta> {
         let mut hlls: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -504,9 +541,11 @@ impl IidReader for LiveTable {
 pub struct BlockPages<'a> {
     table: &'a LiveTable,
     sources: Option<Vec<&'a OwnedBatch>>,
+    schema: SchemaRef,
     include_origins: bool,
     memory: Arc<MemoryBudget>,
     _reservation: Arc<MemoryReservation>,
+    _schema_reservation: Option<Arc<MemoryReservation>>,
 }
 
 impl BlockPages<'_> {
@@ -526,6 +565,14 @@ impl BlockPages<'_> {
             });
             match result {
                 Ok(batch) => return Ok(batch),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
+                Err(error) => return Err(error),
+            }
+        }
+        if self.sources.is_none() {
+            match self.copy_relayout(rows) {
+                Ok(Some(batch)) => return Ok(batch),
+                Ok(None) => (),
                 Err(error) if error.code == "rtdb/memory-budget-exceeded" => (),
                 Err(error) => return Err(error),
             }
@@ -551,6 +598,163 @@ impl BlockPages<'_> {
             return rtdb_format::data::append_origins(&batch, std::iter::repeat_n(None, events.len()), &self.memory);
         }
         Ok(batch)
+    }
+
+    fn copy_relayout(&self, rows: &[u32]) -> Result<Option<OwnedBatch>> {
+        if rows.is_empty() { return Ok(None); }
+        let bound = rows.len().checked_mul(96).and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| invalid("Invalid block row selection size"))?;
+        let _selection = self.memory.reserve(bound)?;
+        let mut selected = BTreeMap::<usize, Vec<usize>>::new();
+        let mut positions = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let (chunk, offset) = self.table.locate_row(row)?;
+            selected.entry(chunk).or_default().push(offset as usize);
+            positions.push((chunk, offset as usize));
+        }
+        let mut reservation = Vec::new();
+        let mut aligned = Vec::with_capacity(selected.len());
+        let mut slots = BTreeMap::new();
+        for (chunk, rows) in selected {
+            let input = self.table.chunks[chunk].1.arrow();
+            let Some(columns) = self.align_chunk(input, &rows, &mut reservation)? else { return Ok(None); };
+            slots.insert(chunk, aligned.len());
+            aligned.push(columns);
+        }
+        let positions = positions.into_iter().map(|(chunk, row)| Some((slots[&chunk], row))).collect::<Vec<_>>();
+        let mut builder = BatchBuilder::new(bound, &self.memory)?;
+        let mut columns = Vec::with_capacity(self.schema.fields().len());
+        for (index, field) in self.schema.fields().iter().enumerate() {
+            let arrays = aligned.iter().map(|columns| columns[index].as_ref()).collect::<Vec<_>>();
+            let column = if field.name() == "op" {
+                self.copy_operations(field, &arrays, &positions, &mut builder)?
+            } else {
+                copy_block_column(field, &arrays, &positions, &mut builder)?
+            };
+            columns.push(column);
+        }
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(invalid)?;
+        builder.finish(batch).map(Some)
+    }
+
+    fn copy_operations(
+        &self, field: &Field, arrays: &[&dyn Array], positions: &[Option<(usize, usize)>], builder: &mut BatchBuilder,
+    ) -> Result<ArrayRef> {
+        let DataType::Union(legs, UnionMode::Dense) = field.data_type() else { return Err(invalid("Live operations must be a union")); };
+        let ops = arrays.iter().map(|array| array.as_any().downcast_ref::<UnionArray>()
+            .ok_or_else(|| invalid("Live operations must be a union"))).collect::<Result<Vec<_>>>()?;
+        let mut picks = vec![Vec::new(); legs.len()];
+        let mut tags = Vec::with_capacity(positions.len());
+        let mut offsets = Vec::with_capacity(positions.len());
+        for &(source, row) in positions.iter().flatten() {
+            let tag = ops[source].type_id(row);
+            let index = legs.iter().position(|(candidate, _)| candidate == tag)
+                .ok_or_else(|| invalid("Live operations have an unknown leg"))?;
+            tags.push(tag);
+            offsets.push(i32::try_from(picks[index].len()).map_err(invalid)?);
+            picks[index].push(Some((source, ops[source].value_offset(row))));
+        }
+        let children = legs.iter().zip(picks).map(|((tag, field), picks)| {
+            if field.data_type() == &DataType::Null {
+                return Ok(Arc::new(NullArray::new(picks.len())) as ArrayRef);
+            }
+            let DataType::Struct(fields) = field.data_type() else { return Err(invalid("Live put must be a struct")); };
+            let puts = ops.iter().map(|op| op.child(tag).as_any().downcast_ref::<StructArray>()
+                .ok_or_else(|| invalid("Live put must be a struct"))).collect::<Result<Vec<_>>>()?;
+            let columns = fields.iter().enumerate().map(|(index, field)| {
+                let arrays = puts.iter().map(|put| put.column(index).as_ref()).collect::<Vec<_>>();
+                copy_block_column(field, &arrays, &picks, builder)
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), columns, None, picks.len()).map_err(invalid)?) as ArrayRef)
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(UnionArray::try_new(legs.clone(), tags.into(), Some(offsets.into()), children).map_err(invalid)?))
+    }
+
+    fn align_chunk(
+        &self, input: &RecordBatch, selected: &[usize], scratch: &mut Vec<Arc<MemoryReservation>>,
+    ) -> Result<Option<Vec<ArrayRef>>> {
+        if input.schema_ref().fields().iter().any(|field| self.schema.index_of(field.name()).is_err()) {
+            return Ok(None);
+        }
+        let mut columns = Vec::with_capacity(self.schema.fields().len());
+        for field in self.schema.fields() {
+            let source = input.schema_ref().column_with_name(field.name());
+            let array = match source {
+                Some((index, source)) if source == field.as_ref() && field.name() != "op" => Arc::clone(input.column(index)),
+                Some((index, source)) if field.name() == "op" => {
+                    let Some(array) = self.align_operations(source, input.column(index), field, selected, scratch)? else { return Ok(None); };
+                    array
+                }
+                None if field.name() == rtdb_format::data::EVENT_ORIGIN_FIELD => {
+                    let bytes = input.num_rows().checked_mul(64).and_then(|bytes| bytes.checked_add(1024))
+                        .ok_or_else(|| invalid("Page row allocation overflow"))?;
+                    scratch.push(self.memory.reserve(bytes)?);
+                    arrow_array::new_null_array(field.data_type(), input.num_rows())
+                }
+                _ => return Ok(None),
+            };
+            columns.push(array);
+        }
+        Ok(Some(columns))
+    }
+
+    fn align_operations(
+        &self, source: &Field, array: &ArrayRef, target: &Field, selected: &[usize],
+        scratch: &mut Vec<Arc<MemoryReservation>>,
+    ) -> Result<Option<ArrayRef>> {
+        let DataType::Union(source_legs, UnionMode::Dense) = source.data_type() else { return Ok(None); };
+        let DataType::Union(target_legs, UnionMode::Dense) = target.data_type() else { return Ok(None); };
+        if source_legs.iter().any(|(tag, field)| !target_legs.iter().any(|(candidate, leg)| candidate == tag && leg.name() == field.name())) {
+            return Ok(None);
+        }
+        let ops = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Live operations must be a union"))?;
+        let mut children = Vec::with_capacity(target_legs.len());
+        for (tag, target) in target_legs.iter() {
+            let Some((_, source)) = source_legs.iter().find(|(candidate, _)| *candidate == tag) else {
+                children.push(arrow_array::new_empty_array(target.data_type()));
+                continue;
+            };
+            let source_array = ops.child(tag);
+            if target.name() == "put" {
+                if has_run_end(target.data_type()) || source_array.null_count() != 0
+                    || selected.iter().any(|&row| ops.type_id(row) == tag
+                        && !rtdb_format::data::can_copy_put_cell(source, source_array.as_ref(), ops.value_offset(row))) {
+                    return Ok(None);
+                }
+            }
+            let aligned = if source == target {
+                Arc::clone(source_array)
+            } else {
+                let Ok(bound) = event_relayout_bound(source_array.as_ref(), source, target) else { return Ok(None); };
+                scratch.push(self.memory.reserve(bound)?);
+                let Ok((field, aligned)) = relayout_event_column(Arc::clone(source_array), source, target) else { return Ok(None); };
+                if field != **target { return Ok(None); }
+                aligned
+            };
+            children.push(aligned);
+        }
+        let array = UnionArray::try_new(target_legs.clone(), ops.type_ids().clone(), ops.offsets().cloned(), children).map_err(invalid)?;
+        Ok(Some(Arc::new(array)))
+    }
+}
+
+fn copy_block_column(
+    field: &Field, arrays: &[&dyn Array], positions: &[Option<(usize, usize)>], builder: &mut BatchBuilder,
+) -> Result<ArrayRef> {
+    let bound = positions.iter().flatten().try_fold(4096usize, |bytes, &(source, row)| {
+        estimate_event_copy_cell_bytes(field, arrays[source], row)?.checked_mul(4)
+            .and_then(|size| bytes.checked_add(size)).ok_or_else(|| invalid("Page row allocation overflow"))
+    })?;
+    builder.column(bound, || copy_event_cells(arrays, positions))
+}
+
+fn has_run_end(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::RunEndEncoded(..) => true,
+        DataType::Union(fields, _) => fields.iter().any(|(_, field)| has_run_end(field.data_type())),
+        DataType::Struct(fields) => fields.iter().any(|field| has_run_end(field.data_type())),
+        DataType::List(field) | DataType::FixedSizeList(field, _) | DataType::Map(field, _) => has_run_end(field.data_type()),
+        _ => false,
     }
 }
 
@@ -1227,33 +1431,48 @@ fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtd
 #[test]
 fn block_pages_preserve_order_and_layout_across_live_batches() {
     let memory = MemoryBudget::new(32 << 20);
-    let table = TableRef::new("public", "docs");
-    let rows = |start, time, text| (start..start + 2).map(|id| StoredEvent { position: None,
-        origin: None,
-        commit_position: 0,
-        entity_key: None,
-        iid: EntityId::Integer(id).iid(),
-        system_from: Timestamp(time),
-        valid_time: Interval::ALL,
-        operation: StoredOperation::Put(StructFields::from([
-            ("_id".into(), Value::I64(id)),
-            ("value".into(), if text { Value::Utf8(id.to_string()) } else { Value::I64(id) }),
-        ])),
-        recency: None,
-    }).collect::<Vec<_>>();
-    let first = rows(0, 1, false);
-    for layout_changes in [false, true] {
-        let second = rows(2, 2, layout_changes);
-        let write = |events: &[StoredEvent]| TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(events, &StructFields::new(), &memory).unwrap()));
-        let live = LiveTable::new(table.clone(), BlockIndex(0), TrieConfig::default())
-            .append(&write(&first), Timestamp(1)).unwrap()
-            .append(&write(&second), Timestamp(2)).unwrap();
-        let pages = live.block_pages(&memory).unwrap();
-        assert_eq!(pages.sources.is_some(), !layout_changes);
-        let actual = pages.copy(&[3, 0, 2]).unwrap();
-        let selected = vec![second[1].clone(), first[0].clone(), second[0].clone()];
-        let expected = IndexBatch::copy_events_with_put_schema(&selected, live.column_types(), &memory).unwrap();
-        assert_eq!(actual.batch(), expected.arrow());
+    for (keyed, recency) in [(false, false), (true, false), (true, true)] {
+        let table = if keyed { rtdb_types::OwnedRelation::new("docs").unwrap().table("owner") }
+            else { TableRef::new("public", "docs") };
+        let rows = |start, time, text| (start..start + 2).map(|id| {
+            let id = EntityId::Integer(id);
+            StoredEvent {
+                position: None,
+                origin: None,
+                commit_position: if keyed { time as u32 } else { 0 },
+                entity_key: keyed.then(|| id.handle_bytes().into()),
+                iid: id.iid(),
+                system_from: Timestamp(time),
+                valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("_id".into(), id.as_value()),
+                    ("value".into(), if text { Value::Utf8(time.to_string()) } else { Value::I64(time) }),
+                ])),
+                recency: recency.then_some(Timestamp(time * 100)),
+            }
+        }).enumerate().map(|(offset, mut event)| {
+            if keyed { event.commit_position += offset as u32; }
+            event
+        }).collect::<Vec<_>>();
+        let first = rows(0, 1, false);
+        for layout_changes in [false, true] {
+            let second = rows(2, 2, layout_changes);
+            let write = |events: &[StoredEvent]| TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(events, &StructFields::new(), &memory).unwrap()));
+            let live = LiveTable::new(table.clone(), BlockIndex(0), TrieConfig::default())
+                .append(&write(&first), Timestamp(1)).unwrap()
+                .append(&write(&second), Timestamp(2)).unwrap();
+            let pages = live.block_pages(&memory).unwrap();
+            assert_eq!(pages.sources.is_some(), !layout_changes && !keyed && !recency);
+            let actual = pages.copy(&[3, 0, 2]).unwrap();
+            let selected = vec![second[1].clone(), first[0].clone(), second[0].clone()];
+            let expected = IndexBatch::copy_events_with_put_schema(&selected, live.column_types(), &memory).unwrap();
+            assert_eq!(actual.batch(), expected.arrow());
+            if layout_changes || keyed {
+                assert!(pages.copy_relayout(&[3, 0, 2]).unwrap().is_some());
+            }
+            let bytes = |batch: &RecordBatch| rtdb_format::ipc::write_file(batch.schema_ref(), std::slice::from_ref(batch)).unwrap();
+            assert_eq!(bytes(actual.batch()), bytes(expected.arrow()));
+        }
     }
 }
 
@@ -1442,6 +1661,53 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
     let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
     assert!(empty.append(&first, first_time).unwrap().has_canonical_entity_iids());
     drop(blocker);
+}
+
+#[cfg(test)]
+#[test]
+fn canonical_iid_verification_reads_unsigned_execution_bits_and_active_legs() {
+    let memory = MemoryBudget::new(1 << 20);
+    let system_from = Timestamp(1);
+    let documents = [
+        (EntityId::Integer(-1), Value::U16(u16::MAX)),
+        (EntityId::String("second".into()), Value::Utf8("second".into())),
+    ];
+    let events = documents.iter().map(|(id, value)| StoredEvent {
+        position: None,
+        origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from, valid_time: Interval::ALL,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), value.clone())])), recency: None,
+    }).collect::<Vec<_>>();
+    let batch = IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap();
+    let after_batch = memory.used_bytes();
+    assert_eq!(batch.has_canonical_iids(), Some(true));
+    assert_eq!(memory.used_bytes(), after_batch);
+    let mut wrong = events;
+    wrong[1].iid = wrong[0].iid;
+    let batch = IndexBatch::copy_events(&wrong, &StructFields::new(), &memory).unwrap();
+    assert_eq!(batch.has_canonical_iids(), Some(false));
+}
+
+#[cfg(test)]
+#[test]
+fn foreign_id_aliases_cannot_attest_canonical_iids() {
+    let memory = MemoryBudget::new(1 << 20);
+    let ids = UnionArray::try_new(
+        arrow_schema::UnionFields::try_new([0, 1], [
+            Field::new("i64", DataType::Utf8, false),
+            Field::new("utf8", DataType::Int64, false),
+        ]).unwrap(),
+        vec![0, 1].into(), Some(vec![0, 0].into()),
+        vec![Arc::new(arrow_array::StringArray::from(vec!["id"])), Arc::new(arrow_array::Int64Array::from(vec![1]))],
+    ).unwrap();
+    let fields = vec![Field::new("_id", ids.data_type().clone(), false)].into();
+    let docs = Arc::new(StructArray::try_new(fields, vec![Arc::new(ids)], None).unwrap());
+    let headers = [EntityId::String("id".into()), EntityId::Integer(1)].map(|id| EventHeader {
+        position: None,
+        commit_position: 0, iid: id.iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put,
+    });
+    let batch = rtdb_format::data::owned_put_batch(docs, &headers, None, &memory).unwrap();
+    let batch = IndexBatch::from_owned(batch).unwrap();
+    assert_eq!(batch.has_canonical_iids(), None);
 }
 
 /// Joins every document's column types once per column, which equals folding `merge_column_types` over the documents

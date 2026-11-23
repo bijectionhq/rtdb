@@ -880,9 +880,10 @@ config {
 --
 -- PRODUCE, on reading the boundary back:
 --   1. Finish the live index's block, yielding L0 tries — one per table that took rows in this block, and none at all for a table that took none.
---      Each L0 page retains its computed metadata summary for the metadata file and releases temporary allocations for scanning that page.
+--      Each L0 page retains Arrow statistics for the metadata file and releases temporary allocations for scanning that page.
+--      The metadata writer aligns those arrays to the joined schema and writes the existing node tags and page order.
 --      Each L0 page uses the table's captured column schema and the order of the leaf's rows.
---      The live trie writer gathers compatible document vectors from the leaf's selected positions when a field's layout changes during the block.
+--      The live trie writer aligns compatible Arrow chunk layouts to the captured schema before gathering the leaf's selected positions.
 --      An encoded document column gathers physical run positions and coalesces consecutive values with identical stored representations.
 --      A selected named union leg can use its logical field over compatible stored Arrow buffers.
 --      Timestamp ranges write their selected endpoint integers in the declared range layout.
@@ -2074,7 +2075,8 @@ surface QueryAccess {
         -- A mixed gather packs evaluated cells independently of compatible nested Arrow payloads, which it selects by position.
         -- Evaluated vectors of one list kind pack into a single Arrow column across row and component nulls.
         -- Mixed Float32 and Float64 components retain their respective widths in a dense Arrow union.
-        -- A scan can read compatible leaf counts, bounds, and Bloom bytes directly from metadata arrays.
+        -- A scan reads compatible leaf counts, bounds, and Bloom bytes at cached Arrow positions.
+        -- Metadata read from a cache-owned immutable object retains its Arrow buffers from that object.
         -- A spatial fallback read projects IIDs from persisted pages.
         -- A spatial refinement scan can project the requested put children from persisted pages.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.

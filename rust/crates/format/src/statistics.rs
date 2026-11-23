@@ -1,7 +1,12 @@
 use rtdb_types::StructFields;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
-use arrow_array::{Array, FixedSizeListArray, ListArray, RecordBatch, RunArray, StructArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, RunArray, StringArray, StructArray, UnionArray, builder::BinaryBuilder,
+    types::{Int16Type, Int32Type, Int64Type},
+};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
 
@@ -16,13 +21,37 @@ impl Mask {
 
 #[derive(Default)]
 struct Statistics {
-    fields: StructFields<Value>,
+    flavours: StructFields<Flavour>,
     numeric: BTreeMap<&'static str, (f64, f64)>,
     bytes_seen: bool,
     bloom: Option<BloomFilter>,
 }
 
+enum Flavour {
+    Presence,
+    Child(i32),
+    Children(Vec<i32>),
+    Bounds(Option<f64>, Option<f64>),
+    Bytes(Option<Vec<u8>>),
+}
+
+struct ColumnSummary {
+    name: String,
+    root: bool,
+    count: i64,
+    flavours: StructFields<Flavour>,
+}
+
+pub(crate) fn page_statistics(batch: &RecordBatch, calculate_blooms: bool, base: i32) -> Result<StructArray> {
+    let columns = event_statistics(batch, calculate_blooms, base)?;
+    build_statistics(&columns)
+}
+
 pub fn columns_for_event_page(batch: &RecordBatch, calculate_blooms: bool) -> Result<Vec<Value>> {
+    Ok(event_statistics(batch, calculate_blooms, 0)?.into_iter().map(column_value).collect())
+}
+
+fn event_statistics(batch: &RecordBatch, calculate_blooms: bool, base: i32) -> Result<Vec<ColumnSummary>> {
     let schema = batch.schema();
     let op_index = schema.index_of("op").map_err(invalid)?;
     let op = downcast::<UnionArray>(batch.column(op_index).as_ref())?;
@@ -33,10 +62,9 @@ pub fn columns_for_event_page(batch: &RecordBatch, calculate_blooms: bool) -> Re
     for name in ["_iid", "_valid_from", "_valid_to", "_system_from", "_recency"] {
         match schema.index_of(name) {
             Ok(index) => {
-                let column = column_metadata(schema.field(index), batch.column(index).as_ref(), true, calculate_blooms, &mut output)?;
+                let column = write_column(schema.field(index), batch.column(index).as_ref(), true, calculate_blooms, &Mask::All, &mut output, base, 0)?;
                 if name == "_system_from" && has_redacted {
-                    let Value::Struct(stats) = &mut output[column] else { return Err(invalid("Column metadata must be a struct")); };
-                    stats.insert("redacted?".into(), Value::Bool(true));
+                    output[(column - base) as usize].flavours.insert("redacted?".into(), Flavour::Presence);
                 }
             }
             Err(_) if name == "_recency" => {}
@@ -46,20 +74,26 @@ pub fn columns_for_event_page(batch: &RecordBatch, calculate_blooms: bool) -> Re
     if let Some((id, field)) = fields.iter().find(|(_, field)| field.name() == "put") {
         let put = downcast::<StructArray>(op.child(id).as_ref())?;
         let DataType::Struct(fields) = field.data_type() else { return Err(invalid("Put operation must be a struct")); };
-        for (index, field) in fields.iter().enumerate() { column_metadata(field, put.column(index).as_ref(), true, calculate_blooms, &mut output)?; }
+        for (index, field) in fields.iter().enumerate() { write_column(field, put.column(index).as_ref(), true, calculate_blooms, &Mask::All, &mut output, base, 0)?; }
     }
     Ok(output)
 }
 
 pub fn column_metadata(field: &Field, array: &dyn Array, root: bool, calculate_blooms: bool, output: &mut Vec<Value>) -> Result<usize> {
-    write_column(field, array, root, calculate_blooms, &Mask::All, output, 0)
+    let base = i32::try_from(output.len()).map_err(invalid)?;
+    let mut columns = Vec::new();
+    let index = write_column(field, array, root, calculate_blooms, &Mask::All, &mut columns, base, 0)?;
+    output.extend(columns.into_iter().map(column_value));
+    Ok(index as usize)
 }
 
-fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: bool, mask: &Mask, output: &mut Vec<Value>, depth: usize) -> Result<usize> {
+#[allow(clippy::too_many_arguments)]
+fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: bool, mask: &Mask,
+    output: &mut Vec<ColumnSummary>, base: i32, depth: usize) -> Result<i32> {
     if depth > 128 { return Err(invalid("Column metadata nesting exceeds 128 levels")); }
     let mut statistics = Statistics::default();
     let with_bloom = calculate_blooms || (root && field.name() == "_iid");
-    fold(field, array, mask, with_bloom, calculate_blooms, output, &mut statistics, depth)?;
+    fold(field, array, mask, with_bloom, calculate_blooms, output, &mut statistics, base, depth)?;
     let count = match present_cells(field, array, mask) {
         Some(count) => i64::try_from(count).map_err(invalid)?,
         None => {
@@ -75,28 +109,113 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
             }
         }
     };
-    statistics.fields.insert("col-name".into(), Value::Utf8(field.name().clone()));
-    statistics.fields.insert("root-col?".into(), Value::Bool(root));
-    statistics.fields.insert("count".into(), Value::I64(count));
     for (name, (min, max)) in statistics.numeric {
-        let fields = StructFields::from([
-            ("min".into(), if min == f64::INFINITY { Value::Null } else { Value::F64(min) }),
-            ("max".into(), if max == f64::NEG_INFINITY { Value::Null } else { Value::F64(max) }),
-        ]);
-        statistics.fields.insert(name.into(), Value::Struct(fields));
+        statistics.flavours.insert(name.into(), Flavour::Bounds(
+            (min != f64::INFINITY).then_some(min), (max != f64::NEG_INFINITY).then_some(max),
+        ));
     }
     if statistics.bytes_seen {
-        let bloom = match statistics.bloom { Some(bloom) => Value::Binary(bloom.to_bytes()?), None => Value::Null };
-        statistics.fields.insert("bytes".into(), Value::Struct(StructFields::from([("bloom".into(), bloom)])));
+        let bloom = statistics.bloom.map(|bloom| bloom.to_bytes()).transpose()?;
+        statistics.flavours.insert("bytes".into(), Flavour::Bytes(bloom));
     }
-    let index = output.len();
-    i32::try_from(index).map_err(invalid)?;
-    output.push(Value::Struct(statistics.fields));
+    let index = i32::try_from(output.len()).map_err(invalid)?;
+    let index = index.checked_add(base).ok_or_else(|| Anomaly::incorrect(
+        "rtdb.format/invalid-trie-metadata", "Metadata child index overflow",
+    ))?;
+    output.push(ColumnSummary { name: field.name().clone(), root, count, flavours: statistics.flavours });
     Ok(index)
 }
 
+fn column_value(column: ColumnSummary) -> Value {
+    let mut fields = StructFields::from([
+        ("col-name".into(), Value::Utf8(column.name)),
+        ("root-col?".into(), Value::Bool(column.root)),
+        ("count".into(), Value::I64(column.count)),
+    ]);
+    for (name, flavour) in column.flavours {
+        let value = match flavour {
+            Flavour::Presence => Value::Bool(true),
+            Flavour::Child(index) => Value::I32(index),
+            Flavour::Children(indices) => Value::list(indices.into_iter().map(Value::I32).collect()),
+            Flavour::Bounds(min, max) => Value::Struct(StructFields::from([
+                ("min".into(), min.map_or(Value::Null, Value::F64)),
+                ("max".into(), max.map_or(Value::Null, Value::F64)),
+            ])),
+            Flavour::Bytes(bloom) => Value::Struct(StructFields::from([
+                ("bloom".into(), bloom.map_or(Value::Null, Value::Binary)),
+            ])),
+        };
+        fields.insert(name, value);
+    }
+    Value::Struct(fields)
+}
+
+fn build_statistics(columns: &[ColumnSummary]) -> Result<StructArray> {
+    let mut fields = vec![
+        Field::new("col-name", DataType::Utf8, false),
+        Field::new("root-col?", DataType::Boolean, false),
+        Field::new("count", DataType::Int64, false),
+    ];
+    let mut arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from_iter_values(columns.iter().map(|column| column.name.as_str()))),
+        Arc::new(BooleanArray::from_iter(columns.iter().map(|column| Some(column.root)))),
+        Arc::new(Int64Array::from_iter_values(columns.iter().map(|column| column.count))),
+    ];
+    let flavours: rtdb_types::OrderedSet<&String> = columns.iter().flat_map(|column| column.flavours.keys()).collect();
+    for name in flavours {
+        let cells = || columns.iter().map(|column| column.flavours.get(name));
+        let example = cells().flatten().next().expect("flavour came from a page column");
+        let nulls = || (cells().any(|cell| cell.is_none())).then(|| NullBuffer::from(cells().map(|cell| cell.is_some()).collect::<Vec<_>>()));
+        let (nullable, array): (bool, ArrayRef) = match example {
+            Flavour::Presence => (cells().any(|cell| cell.is_none()), Arc::new(BooleanArray::from_iter(
+                cells().map(|cell| cell.map(|_| true)),
+            ))),
+            Flavour::Child(_) => (true, Arc::new(Int32Array::from_iter(
+                cells().map(|cell| match cell { Some(Flavour::Child(index)) => Some(*index), _ => None }),
+            ))),
+            Flavour::Children(_) => {
+                let item = Arc::new(Field::new("$data$", DataType::Int32, false));
+                let mut offsets = vec![0i32];
+                let mut children = Vec::new();
+                for cell in cells() {
+                    if let Some(Flavour::Children(indices)) = cell { children.extend_from_slice(indices); }
+                    offsets.push(i32::try_from(children.len()).map_err(invalid)?);
+                }
+                (true, Arc::new(ListArray::try_new(item, OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    Arc::new(Int32Array::from(children)), nulls()).map_err(invalid)?))
+            }
+            Flavour::Bounds(..) => {
+                let mut fields = Vec::with_capacity(2);
+                let mut children: Vec<ArrayRef> = Vec::with_capacity(2);
+                for (lower, name) in [(true, "min"), (false, "max")] {
+                    let bound = |cell: &Flavour| match cell { Flavour::Bounds(min, max) => if lower { *min } else { *max }, _ => None };
+                    let nullable = cells().flatten().any(|cell| bound(cell).is_none());
+                    fields.push(Field::new(name, DataType::Float64, nullable));
+                    children.push(Arc::new(Float64Array::from_iter(cells().map(|cell| cell.and_then(bound)))));
+                }
+                (true, Arc::new(StructArray::try_new(fields.into(), children, nulls()).map_err(invalid)?))
+            }
+            Flavour::Bytes(_) => {
+                let bytes = cells().flatten().try_fold(0usize, |bytes, cell| {
+                    let length = match cell { Flavour::Bytes(Some(bloom)) => bloom.len(), _ => 0 };
+                    bytes.checked_add(length).ok_or_else(|| invalid("Bloom metadata allocation overflow"))
+                })?;
+                let mut builder = BinaryBuilder::with_capacity(columns.len(), bytes);
+                for cell in cells() {
+                    builder.append_option(match cell { Some(Flavour::Bytes(bloom)) => bloom.as_deref(), _ => None });
+                }
+                let fields = vec![Field::new("bloom", DataType::Binary, true)].into();
+                (true, Arc::new(StructArray::try_new(fields, vec![Arc::new(builder.finish())], nulls()).map_err(invalid)?))
+            }
+        };
+        fields.push(Field::new(name, array.data_type().clone(), nullable));
+        arrays.push(array);
+    }
+    StructArray::try_new(fields.into(), arrays, None).map_err(invalid)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calculate_blooms: bool, output: &mut Vec<Value>, statistics: &mut Statistics, depth: usize) -> Result<()> {
+fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calculate_blooms: bool, output: &mut Vec<ColumnSummary>, statistics: &mut Statistics, base: i32, depth: usize) -> Result<()> {
     if depth > 128 { return Err(invalid("Column metadata nesting exceeds 128 levels")); }
     match field.data_type() {
         DataType::Union(fields, UnionMode::Dense) => {
@@ -111,7 +230,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
                         Mask::Selected(selected)
                     }
                 };
-                fold(field, child.as_ref(), &child_mask, with_bloom, calculate_blooms, output, statistics, depth + 1)?;
+                fold(field, child.as_ref(), &child_mask, with_bloom, calculate_blooms, output, statistics, base, depth + 1)?;
             }
             return Ok(());
         }
@@ -121,7 +240,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
                     let runs = downcast::<RunArray<$ty>>(array)?;
                     let mut selected = vec![false; runs.values().len()];
                     for row in 0..array.len() { if mask.includes(row) { selected[runs.get_physical_index(row)] = true; } }
-                    fold(value, runs.values().as_ref(), &Mask::Selected(selected), with_bloom, calculate_blooms, output, statistics, depth + 1)
+                    fold(value, runs.values().as_ref(), &Mask::Selected(selected), with_bloom, calculate_blooms, output, statistics, base, depth + 1)
                 }};
             }
             return match ends.data_type() { DataType::Int16 => runs!(Int16Type), DataType::Int32 => runs!(Int32Type), DataType::Int64 => runs!(Int64Type), _ => Err(invalid("Invalid run-end index width")) };
@@ -130,9 +249,9 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
             let values = downcast::<StructArray>(array)?;
             let child_mask = if field.is_nullable() { Mask::Selected((0..array.len()).map(|row| mask.includes(row) && !array.is_null(row)).collect()) } else { mask.clone() };
             let children = fields.iter().enumerate().map(|(index, field)| {
-                write_column(field, values.column(index).as_ref(), false, calculate_blooms, &child_mask, output, depth + 1).and_then(|index| i32::try_from(index).map(Value::I32).map_err(invalid))
+                write_column(field, values.column(index).as_ref(), false, calculate_blooms, &child_mask, output, base, depth + 1)
             }).collect::<Result<Vec<_>>>()?;
-            statistics.fields.insert("struct".into(), Value::list(children));
+            statistics.flavours.insert("struct".into(), Flavour::Children(children));
             return Ok(());
         }
         DataType::List(element) | DataType::FixedSizeList(element, _) => {
@@ -140,9 +259,9 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
                 DataType::List(_) => downcast::<ListArray>(array)?.values(),
                 _ => downcast::<FixedSizeListArray>(array)?.values(),
             };
-            let child = write_column(element, values.as_ref(), false, calculate_blooms, &Mask::All, output, depth + 1)?;
+            let child = write_column(element, values.as_ref(), false, calculate_blooms, &Mask::All, output, base, depth + 1)?;
             let name = if field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).is_some_and(|name| name == "set") { "set" } else { "list" };
-            statistics.fields.insert(name.into(), Value::I32(i32::try_from(child).map_err(invalid)?));
+            statistics.flavours.insert(name.into(), Flavour::Child(child));
             return Ok(());
         }
         DataType::Null => return Ok(()),
@@ -154,7 +273,7 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
     let presence = matches!(field.data_type(), DataType::Boolean | DataType::Interval(_)) || matches!(extension, Some("xt/oid" | "xt/regclass" | "xt/regproc" | "xt/interval-month-day-micro" | "xt/transit+msgpack"));
     if presence {
         let mono = match &ty { LogicalType::Maybe(value) => value.as_ref(), value => value };
-        statistics.fields.insert(rtdb_columnar::leg_name(mono)?, Value::Bool(true));
+        statistics.flavours.insert(rtdb_columnar::leg_name(mono)?, Flavour::Presence);
         return Ok(());
     }
     let byte_backed = matches!(field.data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_));

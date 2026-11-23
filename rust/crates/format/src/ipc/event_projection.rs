@@ -196,7 +196,7 @@ mod tests {
     use arrow_buffer::Buffer;
     use rtdb_types::{EventPosition, Iid, Interval, LogicalType, ScalarType, StructFields, Timestamp, TxId, Value};
 
-    use crate::{data::{EventBatch, PutText, StoredEvent, StoredOperation, build_event_batch}, ipc::{ArrowFile, inspect_file, read_block_from}};
+    use crate::{data::{EventBatch, PutText, StoredEvent, StoredOperation, build_event_batch}, ipc::{ArrowFile, inspect_file, read_block}};
 
     #[test]
     fn search_arrow_projection_decodes_only_selected_children_and_borrows_the_ipc_body() {
@@ -220,7 +220,7 @@ mod tests {
         file.project_event_payload(&["body".into()]);
 
         let block = file.pages.block(0).unwrap();
-        let encoded = read_block_from(file.buffer.as_ref(), file.reader.as_mut(), block).unwrap();
+        let encoded = read_block(file.reader.as_mut(), block).unwrap();
         let (header, body) = super::super::block_message(block, &encoded).unwrap();
         let message = arrow_ipc::root_as_message(&encoded[header]).unwrap();
         let page = file.event_projection.as_ref().unwrap().decode(&file.pages.source_schema, message, &encoded.slice(body))

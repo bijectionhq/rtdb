@@ -215,14 +215,23 @@ async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<
         audience_work::decode_bytes(cached.bound)?;
         return Ok((Arc::clone(&cached.metadata), memory.reserve(cached.bound)?));
     }
-    let lease = storage.get_or(key, memory).await?;
+    let (lease, cache_owned) = match storage.get(key).await {
+        Ok(lease) => (lease, true),
+        Err(rtdb_storage::Error::MemoryLimit { .. }) => (storage.get_or(key, memory).await?, false),
+        Err(error) => return Err(error.into()),
+    };
     audience_work::decode_bytes(lease.as_slice().len())?;
     let mut cursor = Cursor::new(lease);
     let layout = inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes))?;
     let bound = layout.full_allocation_bound()?;
     audience_work::decode_bytes(bound)?;
     let reservation = memory.reserve(bound)?;
-    let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
+    let file = if cache_owned {
+        rtdb_format::ipc::ArrowFile::from_inspected_buffer(page_buffer(cursor.into_inner()), None, layout)?
+    } else {
+        rtdb_format::ipc::ArrowFile::from_inspected_reader(cursor, None, layout)?
+    };
+    let metadata = Arc::new(MetadataFile::read_file(file)?);
     if let Some(retained) = storage.admit(metadata.stored_bytes())
         && storage.insert_view(key, View::File, Arc::new(CachedMetadata { metadata: Arc::clone(&metadata), bound, _reservation: retained })) {
         storage.evict(key);

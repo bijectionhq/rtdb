@@ -127,6 +127,7 @@ config {
 --
 -- Each compaction job yields one or more output segments.
 -- Each output segment consists of a data file and a meta file.
+-- The meta file aligns page statistics to the trie's joined Arrow schema and retains their persisted branch order and Bloom bytes.
 --
 -- Writing the data file has two stages.
 -- Intermediate results are written to disk between stages to bound memory usage.

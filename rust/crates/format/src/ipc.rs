@@ -21,7 +21,6 @@ mod undefined;
 
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
-    buffer: Option<Buffer>,
     event_projection: Option<event_projection::EventProjection>,
     pages: PageDecoder,
     next_page: usize,
@@ -92,39 +91,80 @@ impl Seek for SparseFile {
     }
 }
 
-trait RetainedReader: Read + Seek + Send {}
-impl<T: Read + Seek + Send> RetainedReader for T {}
+trait RetainedReader: Read + Seek + Send {
+    fn block_slice(&self, _range: std::ops::Range<usize>) -> Option<Buffer> { None }
+}
 
-struct RetainedFileBuffer(Buffer);
+struct StreamReader<R>(R);
+impl<R: Read> Read for StreamReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> { self.0.read(bytes) }
+}
+impl<R: Seek> Seek for StreamReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> { self.0.seek(position) }
+}
+impl<R: Read + Seek + Send> RetainedReader for StreamReader<R> {}
 
-impl AsRef<[u8]> for RetainedFileBuffer {
-    fn as_ref(&self) -> &[u8] { self.0.as_slice() }
+struct BufferedReader {
+    buffer: Buffer,
+    position: u64,
+}
+impl Read for BufferedReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let mut cursor = Cursor::new(self.buffer.as_slice());
+        cursor.set_position(self.position);
+        let read = cursor.read(bytes)?;
+        self.position = cursor.position();
+        Ok(read)
+    }
+}
+impl Seek for BufferedReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let mut cursor = Cursor::new(self.buffer.as_slice());
+        cursor.set_position(self.position);
+        self.position = cursor.seek(position)?;
+        Ok(self.position)
+    }
+}
+impl RetainedReader for BufferedReader {
+    fn block_slice(&self, range: std::ops::Range<usize>) -> Option<Buffer> {
+        (range.end <= self.buffer.len()).then(|| {
+            let view = self.buffer.slice_with_length(range.start, range.len());
+            rtdb_columnar::retain_buffer_with_owner(&view, Arc::new(()))
+        })
+    }
 }
 
 impl ArrowFile {
     pub fn open(bytes: Arc<[u8]>, projection: Option<Vec<usize>>) -> Result<Self> {
-        Self::from_reader(Cursor::new(bytes), projection)
+        let pointer = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).expect("Arc slice pointer is non-null");
+        let length = bytes.len();
+        // SAFETY: the owner holds the immutable slice at this address until the last Buffer is dropped.
+        let buffer = unsafe { Buffer::from_custom_allocation(pointer, length, Arc::new(bytes)) };
+        Self::from_buffer(buffer, projection)
     }
 
-    pub fn from_reader(reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>) -> Result<Self> {
-        let mut reader: Box<dyn RetainedReader> = Box::new(reader);
-        let layout = inspect_file(reader.as_mut())?;
+    pub fn from_buffer(buffer: Buffer, projection: Option<Vec<usize>>) -> Result<Self> {
+        let mut reader = BufferedReader { buffer, position: 0 };
+        let layout = inspect_file(&mut reader)?;
+        Self::from_inspected_buffer(reader.buffer, projection, layout)
+    }
+
+    pub fn from_inspected_buffer(buffer: Buffer, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
+        Self::open_inspected(Box::new(BufferedReader { buffer, position: 0 }), projection, layout)
+    }
+
+    pub fn from_reader(mut reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>) -> Result<Self> {
+        let layout = inspect_file(&mut reader)?;
         Self::from_inspected_reader(reader, projection, layout)
     }
 
     /// The layout must describe this immutable reader, as returned by `inspect_file`.
     /// The caller retains a decoding reservation through this reader and every returned buffer or schema.
     pub fn from_inspected_reader(reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
-        Self::from_inspected(reader, None, projection, layout)
+        Self::open_inspected(Box::new(StreamReader(reader)), projection, layout)
     }
 
-    /// Decodes page and dictionary bodies from the caller's retained file buffer.
-    pub fn from_inspected_buffer(buffer: Buffer, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
-        Self::from_inspected(Cursor::new(RetainedFileBuffer(buffer.clone())), Some(buffer), projection, layout)
-    }
-
-    fn from_inspected(reader: impl Read + Seek + Send + 'static, buffer: Option<Buffer>, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
-        let mut reader: Box<dyn RetainedReader> = Box::new(reader);
+    fn open_inspected(mut reader: Box<dyn RetainedReader>, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
         reader.seek(SeekFrom::End(-10)).map_err(invalid)?;
         let mut tail = [0; 10]; reader.read_exact(&mut tail).map_err(invalid)?;
         let length = arrow_ipc::reader::read_footer_length(tail).map_err(invalid)?;
@@ -134,10 +174,10 @@ impl ArrowFile {
         let mut pages = PageDecoder::from_footer(&bytes, data_end, projection)?;
         for index in 0..pages.dictionary_count() {
             let block = pages.dictionaries[index];
-            let bytes = read_block_from(buffer.as_ref(), reader.as_mut(), &block)?;
+            let bytes = read_block(reader.as_mut(), &block)?;
             pages.load_dictionary(index, bytes)?;
         }
-        Ok(Self { reader, buffer, event_projection: None, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
+        Ok(Self { reader, event_projection: None, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -170,7 +210,7 @@ impl ArrowFile {
 
     pub fn read_page(&mut self, page: usize) -> Result<RecordBatch> {
         let block = self.pages.block(page)?;
-        let buffer = read_block_from(self.buffer.as_ref(), self.reader.as_mut(), block)?;
+        let buffer = read_block(self.reader.as_mut(), block)?;
         let batch = if let Some(projection) = &self.event_projection {
             let bytes = prepare_block(block, buffer, &self.pages.source_schema, false)?;
             let (header, body_start) = block_message(block, &bytes)?;
@@ -192,7 +232,7 @@ impl ArrowFile {
 
     /// Reads an event page with only the requested children of its put leg.
     pub fn read_event_page(&mut self, page: usize, put_columns: &[String]) -> Result<RecordBatch> {
-        let buffer = read_block_from(self.buffer.as_ref(), self.reader.as_mut(), self.pages.block(page)?)?;
+        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?)?;
         let batch = self.pages.decode_event_page(page, buffer, put_columns)?;
         self.next_page = page + 1;
         Ok(batch)
@@ -338,18 +378,11 @@ impl Iterator for ArrowFile {
         Some(self.read_page(page))
     }
 }
-fn read_block_from(buffer: Option<&Buffer>, reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
-    let Some(buffer) = buffer else { return read_block(reader, block); };
+fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
     let range = block_range(block)?;
     let start = usize::try_from(range.start).map_err(invalid)?;
     let end = usize::try_from(range.end).map_err(invalid)?;
-    if end > buffer.len() { return Err(invalid("failed to fill whole buffer")); }
-    let block = buffer.slice_with_length(start, end - start);
-    Ok(rtdb_columnar::retain_buffer_with_owner(&block, Arc::new(())))
-}
-
-fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
-    let range = block_range(block)?;
+    if let Some(buffer) = reader.block_slice(start..end) { return Ok(buffer); }
     reader.seek(SeekFrom::Start(range.start)).map_err(invalid)?;
     let mut bytes = vec![0; usize::try_from(range.end - range.start).map_err(invalid)?];
     reader.read_exact(&mut bytes).map_err(invalid)?;

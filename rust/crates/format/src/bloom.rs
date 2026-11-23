@@ -1,9 +1,10 @@
 use std::io::Cursor;
 
-use arrow_array::Array;
+use arrow_array::{Array, cast::AsArray};
 use arrow_schema::Field;
 use roaring::RoaringBitmap;
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_columnar::ArrowCell;
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 
 pub const BLOOM_BITS: u32 = 22;
 pub const BLOOM_K: u32 = 5;
@@ -58,7 +59,6 @@ impl BloomFilter {
     /// Adds the `rows` of a string, binary or fixed-size binary array as `insert_cell` adds each, hashing every cell's
     /// bytes in place and entering their positions in one union; false, adding nothing, for any other layout.
     pub fn insert_byte_cells<'a>(&mut self, array: &'a dyn Array, rows: impl Iterator<Item = usize>) -> bool {
-        use arrow_array::cast::AsArray;
         let cell: Box<dyn Fn(usize) -> &'a [u8] + 'a> = match array.data_type() {
             arrow_schema::DataType::Utf8 => { let array = array.as_string::<i32>(); Box::new(move |row| array.value(row).as_bytes()) }
             arrow_schema::DataType::Binary => { let array = array.as_binary::<i32>(); Box::new(move |row| array.value(row)) }
@@ -78,7 +78,7 @@ impl BloomFilter {
     }
 
     pub fn insert_cell(&mut self, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
-        let (first, second) = byte_hashes(&rtdb_columnar::read_value(field, array, row)?)?;
+        let (first, second) = cell_hashes(field, array, row)?.unwrap_or((0, 0));
         self.insert_hashes(first, second);
         Ok(())
     }
@@ -88,7 +88,7 @@ impl BloomFilter {
     }
 
     pub fn contains_cell(&self, field: &Field, array: &dyn Array, row: usize) -> Result<bool> {
-        let (first, second) = byte_hashes(&rtdb_columnar::read_value(field, array, row)?)?;
+        let (first, second) = cell_hashes(field, array, row)?.unwrap_or((0, 0));
         Ok(self.contains_hashes(first, second))
     }
 
@@ -102,6 +102,38 @@ impl BloomFilter {
     pub fn cardinality(&self) -> u64 { self.bitmap.len() }
 }
 
+fn cell_hashes(field: &Field, array: &dyn Array, row: usize) -> Result<Option<(i32, i32)>> {
+    let cell = ArrowCell { field, array, row };
+    if let Ok(physical) = cell.physical()
+        && let Ok(logical) = physical.logical_type()
+        && (field.data_type() == physical.field.data_type()
+            || rtdb_columnar::from_field(field).and_then(|logical| rtdb_columnar::to_field(field.name(), &logical))
+                .is_ok_and(|canonical| canonical.data_type() == field.data_type())) {
+        let ArrowCell { array, row, .. } = physical;
+        let bytes = match logical {
+            LogicalType::Null => return Ok(None),
+            LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Keyword) => Some(array.as_string::<i32>().value(row).as_bytes()),
+            LogicalType::Scalar(ScalarType::Uri) => {
+                let uri = array.as_string::<i32>().value(row);
+                rtdb_types::UriParts::parse(uri)?;
+                Some(uri.as_bytes())
+            }
+            LogicalType::Scalar(ScalarType::Binary | ScalarType::Transit) => Some(array.as_binary::<i32>().value(row)),
+            LogicalType::Scalar(ScalarType::Uuid | ScalarType::FixedSizeBinary(_)) => Some(array.as_fixed_size_binary().value(row)),
+            _ => None,
+        };
+        if let Some(bytes) = bytes { return Ok(Some(hash_bytes(bytes))); }
+    }
+    match rtdb_columnar::read_value(field, array, row)? {
+        Value::Null | Value::Undefined => Ok(None),
+        value => byte_hashes(&value).map(Some),
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> (i32, i32) {
+    (rtdb_columnar::xxhash32(bytes, 0) as i32, rtdb_columnar::murmur3_32(bytes, 0) as i32)
+}
+
 fn byte_hashes(value: &Value) -> Result<(i32, i32)> {
     let bytes: &[u8] = match value {
         Value::Null | Value::Undefined => return Ok((0, 0)),
@@ -111,7 +143,7 @@ fn byte_hashes(value: &Value) -> Result<(i32, i32)> {
         Value::Uuid(value) => value,
         _ => return Err(Anomaly::unsupported("rtdb.format/non-byte-bloom", "Persisted column Bloom metadata supports byte-backed values")),
     };
-    Ok((rtdb_columnar::xxhash32(bytes, 0) as i32, rtdb_columnar::murmur3_32(bytes, 0) as i32))
+    Ok(hash_bytes(bytes))
 }
 
 pub fn hashes(hash1: i32, hash2: i32) -> [u32; BLOOM_K as usize] {
@@ -120,11 +152,9 @@ pub fn hashes(hash1: i32, hash2: i32) -> [u32; BLOOM_K as usize] {
 
 pub fn from_column(field: &Field, array: &dyn Array) -> Result<BloomFilter> {
     let mut bloom = BloomFilter::default();
-    let reader = rtdb_columnar::ColumnReader::new(field)?;
+    rtdb_columnar::from_field(field)?;
     for row in 0..array.len() {
-        let value = reader.read(array, row)?;
-        if !matches!(value, Value::Null | Value::Undefined) {
-            let (first, second) = byte_hashes(&value)?;
+        if let Some((first, second)) = cell_hashes(field, array, row)? {
             bloom.insert_hashes(first, second);
         }
     }
@@ -138,6 +168,45 @@ fn invalid(error: impl std::fmt::Display) -> Anomaly {
 #[cfg(test)]
 mod bulk_tests {
     use super::*;
+
+    #[test]
+    fn metadata_bloom_cells_hash_active_byte_legs_and_nulls() {
+        use rtdb_types::{Keyword, ScalarType};
+
+        let logical = LogicalType::from_legs([LogicalType::Null, LogicalType::Scalar(ScalarType::Keyword),
+            LogicalType::Scalar(ScalarType::Binary), LogicalType::Scalar(ScalarType::Uuid)]);
+        let values = [Value::Null, Value::Keyword(Keyword::from_name("ns/x")), Value::Binary(vec![0, 0xff]), Value::Uuid([3; 16])];
+        let field = rtdb_columnar::to_field("id", &logical).unwrap();
+        let array = rtdb_columnar::build_array(&logical, &values).unwrap();
+        let mut expected = BloomFilter::default();
+        let mut actual = BloomFilter::default();
+        for (row, value) in values.iter().enumerate() {
+            let (first, second) = byte_hashes(value).unwrap();
+            expected.insert_hashes(first, second);
+            actual.insert_cell(&field, array.as_ref(), row).unwrap();
+            assert!(actual.contains_cell(&field, array.as_ref(), row).unwrap());
+        }
+        assert_eq!(actual.to_bytes().unwrap(), expected.to_bytes().unwrap());
+    }
+
+    #[test]
+    fn metadata_bloom_rejects_aliased_physical_legs() {
+        use std::sync::Arc;
+        use arrow_array::{BinaryArray, StringArray, UnionArray};
+        use arrow_schema::{DataType, UnionFields};
+
+        let array = UnionArray::try_new(UnionFields::try_new([0, 1], [
+            Field::new("binary", DataType::Utf8, false),
+            Field::new("utf8", DataType::Binary, false),
+        ]).unwrap(), vec![0, 1].into(), Some(vec![0, 0].into()), vec![
+            Arc::new(StringArray::from(vec!["text"])),
+            Arc::new(BinaryArray::from_iter_values([b"bytes"])),
+        ]).unwrap();
+        let field = Field::new("id", array.data_type().clone(), false);
+        let expected = rtdb_columnar::read_value(&field, &array, 0).unwrap_err();
+        let actual = BloomFilter::default().insert_cell(&field, &array, 0).unwrap_err();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn positions_added_in_bulk_set_the_same_bits_as_values_added_one_by_one() {

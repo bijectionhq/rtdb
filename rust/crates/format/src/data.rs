@@ -206,6 +206,11 @@ impl<'a> PutRef<'a> {
     }
 }
 
+/// Whether selected puts can be copied directly under a compatible persisted layout.
+pub fn can_copy_put_cell(field: &Field, array: &dyn Array, row: usize) -> bool {
+    columns::valid_cell(field, array, row, true)
+}
+
 /// A borrowed event with its document addressed within an Arrow batch.
 pub struct EventRef<'a> {
     header: EventHeader,

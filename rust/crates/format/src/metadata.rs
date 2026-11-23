@@ -1,10 +1,13 @@
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Int32Array, ListArray, RecordBatch, StructArray, UnionArray};
+use arrow_array::{
+    Array, ArrayRef, Int32Array, ListArray, NullArray, RecordBatch, StructArray,
+    TimestampMicrosecondArray, UnionArray,
+};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Interval, LogicalType, Result, TimeUnit, Timestamp, Value};
 
 use crate::ipc::ArrowFile;
@@ -19,17 +22,35 @@ pub enum MetadataNode {
     Leaf { data_page_index: usize, columns: LeafColumns },
 }
 
-/// A leaf's per-column statistics; a leaf read from a file decodes them each time they are asked for, since a scan
-/// visits few of a file's leaves and the statistics, Bloom bitmaps included, dominate what a whole file decodes to.
 #[derive(Clone)]
 pub struct LeafColumns(Arc<LeafSource>);
-enum LeafSource { Decoded(Vec<Value>), Stored { field: Arc<Field>, columns: ArrayRef, offset: usize } }
+enum LeafSource {
+    Decoded(Vec<Value>),
+    Page(StructArray),
+    Stored { field: Arc<Field>, columns: ArrayRef, offset: usize, statistics: Option<StoredStatistics> },
+}
+
+struct StoredStatistics {
+    field: Arc<Field>,
+    records: ArrayRef,
+    rows: std::ops::Range<usize>,
+}
 impl LeafColumns {
     pub fn new(columns: Vec<Value>) -> Self { Self(Arc::new(LeafSource::Decoded(columns))) }
     pub fn values(&self) -> Result<std::borrow::Cow<'_, [Value]>> {
         match self.0.as_ref() {
             LeafSource::Decoded(columns) => Ok(std::borrow::Cow::Borrowed(columns)),
-            LeafSource::Stored { field, columns, offset } => match rtdb_columnar::read_value(field, columns.as_ref(), *offset)? {
+            LeafSource::Page(page) => {
+                let field = Field::new("$data$", page.data_type().clone(), false);
+                let reader = rtdb_columnar::ColumnReader::new(&field)?;
+                let values = (0..page.len()).map(|row| {
+                    let Value::Struct(mut fields) = reader.read(page, row)? else { return Err(invalid("Column metadata must be a struct")); };
+                    fields.retain(|_, value| !matches!(value, Value::Null));
+                    Ok(Value::Struct(fields))
+                }).collect::<Result<_>>()?;
+                Ok(std::borrow::Cow::Owned(values))
+            }
+            LeafSource::Stored { field, columns, offset, .. } => match rtdb_columnar::read_value(field, columns.as_ref(), *offset)? {
                 Value::List(values) => Ok(std::borrow::Cow::Owned(values.into_values())),
                 _ => Err(invalid("Metadata leaf has no columns")),
             },
@@ -40,33 +61,36 @@ impl LeafColumns {
 pub struct LeafStatistics<'a>(StatisticsSource<'a>);
 enum StatisticsSource<'a> {
     Values(std::borrow::Cow<'a, [Value]>),
-    Arrow { records: &'a StructArray, rows: std::ops::Range<usize> },
+    Arrow { field: Option<&'a Field>, records: &'a dyn Array, rows: std::ops::Range<usize> },
 }
 
 #[derive(Clone, Copy)]
-enum StatisticCell<'a> { Value(&'a Value), Arrow(&'a dyn Array, usize) }
+enum StatisticCell<'a> { Value(&'a Value), Arrow(ArrowCell<'a>), Record(&'a StructArray, usize) }
 
 #[derive(Clone, Copy)]
 pub struct ColumnStatistics<'a>(StatisticCell<'a>);
 
 impl LeafColumns {
     pub fn statistics(&self) -> Result<LeafStatistics<'_>> {
-        fn plain(field: &Field) -> bool {
-            field.metadata().is_empty() && match field.data_type() {
-                DataType::Null | DataType::Boolean | DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Binary => true,
-                DataType::List(child) => plain(child),
-                DataType::Struct(fields) => fields.iter().all(|child| plain(child)),
-                _ => false,
+        match self.0.as_ref() {
+            LeafSource::Page(records) => return Ok(LeafStatistics(StatisticsSource::Arrow {
+                field: None, records, rows: 0..records.len(),
+            })),
+            LeafSource::Stored { statistics: Some(stats), .. } => {
+                return Ok(LeafStatistics(StatisticsSource::Arrow {
+                    field: Some(&stats.field), records: stats.records.as_ref(), rows: stats.rows.clone(),
+                }));
             }
-        }
-        if let LeafSource::Stored { field, columns, offset } = self.0.as_ref()
-            && plain(field)
-            && let Some(list) = columns.as_any().downcast_ref::<ListArray>()
-            && list.is_valid(*offset)
-            && let Some(records) = list.values().as_any().downcast_ref::<StructArray>() {
-            let offsets = list.value_offsets();
-            let rows = offsets[*offset] as usize..offsets[*offset + 1] as usize;
-            return Ok(LeafStatistics(StatisticsSource::Arrow { records, rows }));
+            LeafSource::Stored { field, columns, offset, .. } => {
+                let cell = ArrowCell { field, array: columns.as_ref(), row: *offset };
+                if let Some((field, records, rows)) = cell.sequence_range()
+                    && cell.sequence_kind() == Some(rtdb_types::ListKind::List)
+                    && records.data_type() == field.data_type()
+                    && typed_statistics_layout(field) {
+                    return Ok(LeafStatistics(StatisticsSource::Arrow { field: Some(field), records, rows }));
+                }
+            }
+            LeafSource::Decoded(_) => {}
         }
         self.values().map(|values| LeafStatistics(StatisticsSource::Values(values)))
     }
@@ -76,7 +100,10 @@ impl LeafStatistics<'_> {
     fn columns(&self) -> impl Iterator<Item = ColumnStatistics<'_>> {
         let len = match &self.0 { StatisticsSource::Arrow { rows, .. } => rows.len(), StatisticsSource::Values(values) => values.len() };
         (0..len).map(|position| ColumnStatistics(match &self.0 {
-            StatisticsSource::Arrow { records, rows } => StatisticCell::Arrow(*records, rows.start + position),
+            StatisticsSource::Arrow { field: Some(field), records, rows } => StatisticCell::Arrow(ArrowCell {
+                field, array: *records, row: rows.start + position,
+            }),
+            StatisticsSource::Arrow { field: None, records, rows } => StatisticCell::Record(records.as_any().downcast_ref::<StructArray>().expect("page statistics are a struct"), rows.start + position),
             StatisticsSource::Values(values) => StatisticCell::Value(&values[position]),
         }))
     }
@@ -98,12 +125,19 @@ impl<'a> StatisticCell<'a> {
     fn field(self, name: &str) -> Option<Self> {
         match self {
             Self::Value(value) => value.field(name).map(Self::Value),
-            Self::Arrow(array, row) if array.is_valid(row) => {
-                let records = array.as_any().downcast_ref::<StructArray>()?;
-                Some(Self::Arrow(records.column_by_name(name)?.as_ref(), row))
+            Self::Arrow(cell) => cell.structure()?.find(|child| child.field.name() == name).map(Self::Arrow),
+            Self::Record(records, row) => {
+                let (index, field) = records.fields().iter().enumerate().find(|(_, field)| field.name() == name)?;
+                Some(Self::Arrow(ArrowCell { field, array: records.column(index).as_ref(), row }))
             }
-            _ => None,
         }
+    }
+
+    fn primitive<A: Array + 'static>(self) -> Option<(&'a A, usize)> {
+        let Self::Arrow(cell) = self else { return None; };
+        let ArrowCell { field, array, row } = cell.physical().ok()?;
+        if field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) || array.is_null(row) { return None; }
+        Some((array.as_any().downcast_ref()?, row))
     }
 }
 
@@ -111,45 +145,35 @@ impl<'a> ColumnStatistics<'a> {
     fn name(self) -> Option<&'a str> {
         match self.0.field("col-name")? {
             StatisticCell::Value(Value::Utf8(name)) => Some(name),
-            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
-                array.as_any().downcast_ref::<arrow_array::StringArray>().map(|values| values.value(row)),
-            _ => None,
+            cell => cell.primitive::<arrow_array::StringArray>().map(|(values, row)| values.value(row)),
         }
     }
 
     pub fn flag(self, field: &str) -> Option<bool> {
         match self.0.field(field)? {
             StatisticCell::Value(Value::Bool(value)) => Some(*value),
-            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
-                array.as_any().downcast_ref::<arrow_array::BooleanArray>().map(|values| values.value(row)),
-            _ => None,
+            cell => cell.primitive::<arrow_array::BooleanArray>().map(|(values, row)| values.value(row)),
         }
     }
 
     pub fn count(self) -> Option<i64> {
         match self.0.field("count")? {
             StatisticCell::Value(Value::I64(value)) => Some(*value),
-            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
-                array.as_any().downcast_ref::<arrow_array::Int64Array>().map(|values| values.value(row)),
-            _ => None,
+            cell => cell.primitive::<arrow_array::Int64Array>().map(|(values, row)| values.value(row)),
         }
     }
 
     pub fn bound(self, flavour: &str, key: &str) -> Option<f64> {
         match self.0.field(flavour)?.field(key)? {
             StatisticCell::Value(Value::F64(value)) => Some(*value),
-            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
-                array.as_any().downcast_ref::<arrow_array::Float64Array>().map(|values| values.value(row)),
-            _ => None,
+            cell => cell.primitive::<arrow_array::Float64Array>().map(|(values, row)| values.value(row)),
         }
     }
 
     pub fn bloom(self) -> Option<&'a [u8]> {
         match self.0.field("bytes")?.field("bloom")? {
             StatisticCell::Value(Value::Binary(value)) => Some(value),
-            StatisticCell::Arrow(array, row) if array.is_valid(row) =>
-                array.as_any().downcast_ref::<arrow_array::BinaryArray>().map(|values| values.value(row)),
-            _ => None,
+            cell => cell.primitive::<arrow_array::BinaryArray>().map(|(values, row)| values.value(row)),
         }
     }
 }
@@ -199,7 +223,11 @@ fn retained_node_bytes(node: &MetadataNode) -> Result<usize> {
         MetadataNode::IidBranch(children) => children.capacity().checked_mul(std::mem::size_of::<Option<usize>>()).and_then(|bytes| bytes.checked_add(base)).ok_or_else(metadata_size),
         MetadataNode::RecencyBranch(children) => children.capacity().checked_mul(std::mem::size_of::<(Timestamp, usize)>()).and_then(|bytes| bytes.checked_add(base)).ok_or_else(metadata_size),
         MetadataNode::Leaf { columns, .. } => {
-            let LeafSource::Decoded(columns) = columns.0.as_ref() else { return Ok(base) };
+            let columns = match columns.0.as_ref() {
+                LeafSource::Decoded(columns) => columns,
+                LeafSource::Page(page) => return page.get_array_memory_size().checked_add(base).ok_or_else(metadata_size),
+                LeafSource::Stored { .. } => return Ok(base),
+            };
             let unused = columns.capacity() - columns.len();
             let bytes = unused.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(base)).ok_or_else(metadata_size)?;
             columns.iter().try_fold(bytes, |bytes, column| bytes.checked_add(column.retained_bytes()?).ok_or_else(metadata_size))
@@ -249,35 +277,13 @@ impl MetadataBuilder {
             temporal.min_system_from = Some(temporal.min_system_from.unwrap_or(i64::MAX).min(*system));
             temporal.max_system_from = Some(temporal.max_system_from.unwrap_or(i64::MIN).max(*system));
         }
-        let mut columns = columns_for_event_page(batch, self.calculate_blooms)?;
         let base = i32::try_from(self.column_count).map_err(invalid)?;
+        let columns = crate::statistics::page_statistics(batch, self.calculate_blooms, base)?;
         let column_count = self.column_count.checked_add(columns.len()).ok_or_else(|| invalid("Metadata column count overflow"))?;
         i32::try_from(column_count).map_err(invalid)?;
-        for column in &mut columns {
-            let Value::Struct(fields) = column else { return Err(invalid("Column metadata must be a struct")); };
-            for (name, value) in fields {
-                match (name.as_str(), value) {
-                    ("list" | "set", Value::I32(index)) => *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?,
-                    ("struct", Value::List(children)) if !children.is_empty() => {
-                        let indices = children.array().and_then(|array| array.as_any().downcast_ref::<Int32Array>())
-                            .filter(|indices| indices.null_count() == 0)
-                            .ok_or_else(|| invalid("Struct metadata children must be integers"))?;
-                        let mut shifted = arrow_array::builder::Int32Builder::with_capacity(indices.len());
-                        for &index in indices.values().iter() {
-                            shifted.append_value(index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?);
-                        }
-                        let array = shifted.finish();
-                        let field = Arc::new(Field::new("item", DataType::Int32, false));
-                        *children = rtdb_types::ListValue::from_numeric_arrow(field, Arc::new(array))
-                            .expect("metadata uses i32 indices");
-                    }
-                    _ => {}
-                }
-            }
-        }
         let row_count = self.row_count.checked_add(i64::try_from(batch.num_rows()).map_err(invalid)?).ok_or_else(|| invalid("Metadata row count overflow"))?;
         i32::try_from(self.page_count).map_err(invalid)?;
-        let index = self.push(MetadataNode::Leaf { data_page_index: self.page_count, columns: LeafColumns::new(columns) })?;
+        let index = self.push(MetadataNode::Leaf { data_page_index: self.page_count, columns: LeafColumns(Arc::new(LeafSource::Page(columns))) })?;
         self.column_count = column_count;
         self.page_count += 1;
         self.row_count = row_count;
@@ -319,25 +325,37 @@ impl MetadataBuilder {
 
 impl MetadataFile {
     pub fn read(bytes: Arc<[u8]>) -> Result<Self> {
-        Self::read_reader(std::io::Cursor::new(bytes))
+        Self::read_file(ArrowFile::open(bytes, None)?)
     }
 
     pub fn read_reader(reader: impl std::io::Read + std::io::Seek + Send + 'static) -> Result<Self> {
-        let mut file = ArrowFile::from_reader(reader, None)?;
+        Self::read_file(ArrowFile::from_reader(reader, None)?)
+    }
+
+    pub fn read_file(mut file: ArrowFile) -> Result<Self> {
         if file.page_count() != 1 { return Err(invalid("Trie metadata must contain exactly one Arrow record batch")); }
         let batch = file.read_page(0)?;
         let index = batch.schema().index_of("nodes").map_err(invalid)?;
         let nodes = batch.column(index).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Trie metadata nodes must be a union"))?;
         let DataType::Union(fields, _) = nodes.data_type() else { return Err(invalid("Missing metadata union schema")); };
+        let typed_columns = fields.iter().find(|(_, field)| field.name() == "leaf").is_some_and(|(_, leaf)| {
+            let DataType::Struct(fields) = leaf.data_type() else { return false; };
+            fields.find("columns").is_some_and(|(_, field)| typed_statistics_layout(field))
+        });
         let mut decoded = Vec::with_capacity(nodes.len());
         for row in 0..nodes.len() {
             let id = nodes.type_id(row);
             let field = fields.iter().find_map(|(type_id, field)| (id == type_id).then_some(field)).ok_or_else(|| invalid("Metadata node type has no declared leg"))?;
             if field.name() == "leaf" {
-                decoded.push(stored_leaf(field, nodes.child(id), nodes.value_offset(row))?);
+                decoded.push(stored_leaf(field, nodes.child(id), nodes.value_offset(row), typed_columns)?);
                 continue;
             }
-            let value = rtdb_columnar::read_value(field, nodes.child(id).as_ref(), nodes.value_offset(row))?;
+            let cell = ArrowCell { field, array: nodes.child(id).as_ref(), row: nodes.value_offset(row) };
+            if let Some(branch) = read_branch(cell, row) {
+                decoded.push(branch?);
+                continue;
+            }
+            let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
             decoded.push(match field.name().as_str() {
                 "nil" => MetadataNode::Nil,
                 "branch-iid" => {
@@ -387,7 +405,13 @@ impl MetadataFile {
                 }
                 MetadataNode::Leaf { data_page_index, columns } => {
                     i32::try_from(*data_page_index).map_err(invalid)?;
-                    column_types.extend(columns.values()?.iter().map(Value::logical_type));
+                    match columns.0.as_ref() {
+                        LeafSource::Page(page) => {
+                            let field = Field::new("$data$", page.data_type().clone(), false);
+                            column_types.push(rtdb_columnar::from_field(&field)?);
+                        }
+                        _ => column_types.extend(columns.values()?.iter().map(Value::logical_type)),
+                    }
                 }
             }
         }
@@ -414,6 +438,86 @@ impl MetadataFile {
     }
 
     pub fn write(&self) -> Result<Vec<u8>> {
+        if self.stored_bytes != 0 { return self.write_imported(); }
+        let field = self.schema.field_with_name("nodes").map_err(invalid)?;
+        let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return Err(invalid("Metadata schema must use a dense node union")); };
+        let mut leg_lengths = vec![0usize; fields.len()];
+        let mut ids = Vec::with_capacity(self.nodes.len());
+        let mut offsets = Vec::with_capacity(self.nodes.len());
+        let mut iid = Vec::new();
+        let mut recency_ends = vec![0i32];
+        let mut recency_times = Vec::new();
+        let mut recency_indices = Vec::new();
+        let mut leaf_pages = Vec::new();
+        let mut leaf_ends = vec![0i32];
+        let mut leaf_columns = Vec::new();
+        for node in &self.nodes {
+            let name = match node {
+                MetadataNode::Nil => "nil",
+                MetadataNode::IidBranch(children) => {
+                    for child in children { iid.push(child.map(i32::try_from).transpose().map_err(invalid)?); }
+                    "branch-iid"
+                }
+                MetadataNode::RecencyBranch(children) => {
+                    for (ceiling, child) in children {
+                        recency_times.push(ceiling.0);
+                        recency_indices.push(i32::try_from(*child).map_err(invalid)?);
+                    }
+                    recency_ends.push(i32::try_from(recency_times.len()).map_err(invalid)?);
+                    "branch-recency"
+                }
+                MetadataNode::Leaf { data_page_index, columns } => {
+                    leaf_pages.push(i32::try_from(*data_page_index).map_err(invalid)?);
+                    let (_, leaf) = fields.iter().find(|(_, field)| field.name() == "leaf")
+                        .ok_or_else(|| invalid("Metadata schema has no leaf leg"))?;
+                    let page = leaf_statistics_array(leaf, columns)?;
+                    let rows = i64::from(*leaf_ends.last().expect("leaf offsets start at zero")) + i64::try_from(page.len()).map_err(invalid)?;
+                    leaf_ends.push(i32::try_from(rows).map_err(invalid)?);
+                    leaf_columns.push(page);
+                    "leaf"
+                }
+            };
+            let (position, (id, _)) = fields.iter().enumerate().find(|(_, (_, field))| field.name() == name).ok_or_else(|| invalid(format!("Metadata schema has no {name} leg")))?;
+            ids.push(id);
+            offsets.push(i32::try_from(leg_lengths[position]).map_err(invalid)?);
+            leg_lengths[position] += 1;
+        }
+        let mut iid = Some(iid);
+        let mut recency = Some((recency_ends, recency_times, recency_indices));
+        let mut leaves = Some((leaf_pages, leaf_ends, leaf_columns));
+        let children = fields.iter().zip(leg_lengths).map(|((_, field), len)| match field.name().as_str() {
+            "nil" => Ok(Arc::new(NullArray::new(len)) as ArrayRef),
+            "branch-iid" => {
+                let ends = (0..=len).map(|index| i32::try_from(index * 4).map_err(invalid)).collect::<Result<_>>()?;
+                build_list(field, ends, Arc::new(Int32Array::from(iid.take().unwrap())))
+            }
+            "branch-recency" => {
+                let (ends, times, indices) = recency.take().unwrap();
+                let child = list_item(field)?;
+                let records = build_struct(child, vec![
+                    Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                    Arc::new(Int32Array::from(indices)),
+                ], None, indices_len(&ends))?;
+                build_list(field, ends, records)
+            }
+            "leaf" => {
+                let (pages, ends, columns) = leaves.take().unwrap();
+                let DataType::Struct(children) = field.data_type() else { return Err(invalid("Metadata leaf is not a struct")); };
+                let columns_field = children.find("columns").ok_or_else(|| invalid("Missing metadata field: columns"))?.1;
+                let statistics = if columns.is_empty() { arrow_array::new_empty_array(list_item(columns_field)?.data_type()) } else {
+                    let arrays = columns.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+                    arrow_select::concat::concat(&arrays).map_err(invalid)?
+                };
+                build_struct(field, vec![Arc::new(Int32Array::from(pages)), build_list(columns_field, ends, statistics)?], None, len)
+            }
+            _ => build_field_values(field, &[]),
+        }).collect::<Result<Vec<_>>>()?;
+        let nodes: ArrayRef = Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![nodes]).map_err(invalid)?;
+        crate::ipc::write_file(&self.schema, &[batch])
+    }
+
+    fn write_imported(&self) -> Result<Vec<u8>> {
         let field = self.schema.field_with_name("nodes").map_err(invalid)?;
         let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return Err(invalid("Metadata schema must use a dense node union")); };
         let mut leg_values: Vec<Vec<Value>> = vec![Vec::new(); fields.len()];
@@ -457,6 +561,42 @@ impl MetadataFile {
     }
 }
 
+fn read_branch(cell: ArrowCell<'_>, parent: usize) -> Option<Result<MetadataNode>> {
+    let kind = cell.field.name().as_str();
+    let (item, array, rows) = cell.sequence_range()?;
+    if cell.sequence_kind() != Some(rtdb_types::ListKind::List) { return None; }
+    match kind {
+        "branch-iid" => {
+            let children = array.as_any().downcast_ref::<Int32Array>()?;
+            if !item.metadata().is_empty() { return None; }
+            if rows.len() != 4 { return Some(Err(invalid("IID branch must have four buckets"))); }
+            Some(rows.map(|row| if children.is_null(row) { Ok(None) } else { child_index(children.value(row), parent).map(Some) })
+                .collect::<Result<_>>().map(MetadataNode::IidBranch))
+        }
+        "branch-recency" => {
+            let buckets = array.as_any().downcast_ref::<StructArray>()?;
+            if !item.metadata().is_empty() || buckets.fields().len() != 2 || buckets.null_count() != 0 { return None; }
+            let (index, child_field) = buckets.fields().find("idx")?;
+            let children = buckets.column(index).as_any().downcast_ref::<Int32Array>()?;
+            let (index, time_field) = buckets.fields().find("max-recency")?;
+            let ceilings = buckets.column(index).as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+            if !child_field.metadata().is_empty() || !time_field.metadata().is_empty() { return None; }
+            Some((|| {
+                let mut branch = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if children.is_null(row) { return Err(invalid("Recency bucket has no child index")); }
+                    if ceilings.is_null(row) { return Err(invalid("Recency bucket has no microsecond ceiling")); }
+                    let upper = Timestamp(ceilings.value(row));
+                    if branch.last().is_some_and(|(previous, _)| *previous > upper) { return Err(invalid("Recency ceilings must be nondecreasing")); }
+                    branch.push((upper, child_index(children.value(row), parent)?));
+                }
+                Ok(MetadataNode::RecencyBranch(branch))
+            })())
+        }
+        _ => None,
+    }
+}
+
 fn validate_child(child: usize, parent: usize) -> Result<()> {
     if child >= parent { return Err(invalid("Metadata children must precede their parent")); }
     i32::try_from(child).map_err(invalid)?;
@@ -477,6 +617,45 @@ fn column_stat_field(name: &str, ty: &LogicalType) -> Result<Field> {
         _ => return rtdb_columnar::to_field(name, ty),
     };
     Ok(Field::new(name, data_type, true))
+}
+
+fn list_item(field: &Field) -> Result<&Arc<Field>> {
+    match field.data_type() {
+        DataType::List(item) => Ok(item),
+        _ => Err(invalid("Metadata list field contains a non-list value")),
+    }
+}
+
+fn indices_len(offsets: &[i32]) -> usize { *offsets.last().expect("list offsets start at zero") as usize }
+
+fn build_list(field: &Field, offsets: Vec<i32>, array: ArrayRef) -> Result<ArrayRef> {
+    Ok(Arc::new(ListArray::try_new(list_item(field)?.clone(), OffsetBuffer::new(ScalarBuffer::from(offsets)), array, None).map_err(invalid)?))
+}
+
+fn build_struct(field: &Field, arrays: Vec<ArrayRef>, nulls: Option<NullBuffer>, len: usize) -> Result<ArrayRef> {
+    let DataType::Struct(fields) = field.data_type() else { return Err(invalid("Column metadata must be a struct")); };
+    Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), arrays, nulls, len).map_err(invalid)?))
+}
+
+fn leaf_statistics_array(leaf: &Field, columns: &LeafColumns) -> Result<ArrayRef> {
+    let DataType::Struct(fields) = leaf.data_type() else { return Err(invalid("Metadata leaf is not a struct")); };
+    let columns_field = fields.find("columns").ok_or_else(|| invalid("Missing metadata field: columns"))?.1;
+    let field = list_item(columns_field)?;
+    match columns.0.as_ref() {
+        LeafSource::Page(page) => align_statistics(field, page),
+        _ => build_field_values(field, &columns.values()?),
+    }
+}
+
+fn align_statistics(target: &Field, array: &dyn Array) -> Result<ArrayRef> {
+    if target.data_type() == array.data_type() { return Ok(arrow_array::make_array(array.to_data())); }
+    let DataType::Struct(fields) = target.data_type() else { return Err(invalid("Column statistics layouts differ")); };
+    let source = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Column metadata must be a struct"))?;
+    let children = fields.iter().map(|field| match source.column_by_name(field.name()) {
+        Some(array) => align_statistics(field, array.as_ref()),
+        None => Ok(arrow_array::new_null_array(field.data_type(), source.len())),
+    }).collect::<Result<Vec<_>>>()?;
+    build_struct(target, children, source.nulls().cloned(), source.len())
 }
 
 fn node_value(node: &MetadataNode) -> Result<(&'static str, Value)> {
@@ -533,7 +712,7 @@ fn child_index(value: i32, parent: usize) -> Result<usize> {
     Ok(child)
 }
 
-fn stored_leaf(field: &Field, leaves: &ArrayRef, offset: usize) -> Result<MetadataNode> {
+fn stored_leaf(field: &Field, leaves: &ArrayRef, offset: usize, typed_columns: bool) -> Result<MetadataNode> {
     let leaves = leaves.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Metadata leaf is not a struct"))?;
     let DataType::Struct(fields) = field.data_type() else { return Err(invalid("Metadata leaf is not a struct")); };
     let child = |name: &str| fields.iter().position(|field| field.name() == name).ok_or_else(|| invalid(format!("Missing metadata field: {name}")));
@@ -541,7 +720,40 @@ fn stored_leaf(field: &Field, leaves: &ArrayRef, offset: usize) -> Result<Metada
     if pages.is_null(offset) { return Err(invalid("Metadata leaf has no page index")); }
     let columns = child("columns")?;
     Ok(MetadataNode::Leaf { data_page_index: usize::try_from(pages.value(offset)).map_err(invalid)?,
-        columns: LeafColumns(Arc::new(LeafSource::Stored { field: Arc::clone(&fields[columns]), columns: Arc::clone(leaves.column(columns)), offset })) })
+        columns: LeafColumns(Arc::new(LeafSource::Stored {
+            field: Arc::clone(&fields[columns]), columns: Arc::clone(leaves.column(columns)), offset,
+            statistics: typed_columns.then(|| stored_statistics(&fields[columns], leaves.column(columns).as_ref(), offset)).flatten(),
+        })) })
+}
+
+fn typed_statistics_layout(field: &Field) -> bool {
+    if field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
+        return false;
+    }
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().enumerate().all(|(index, field)| {
+            fields.iter().take(index).all(|earlier| earlier.name() != field.name()) && typed_statistics_layout(field)
+        }),
+        DataType::List(item) | DataType::FixedSizeList(item, _) => typed_statistics_layout(item),
+        DataType::Map(..) => false,
+        DataType::RunEndEncoded(ends, item) =>
+            matches!(ends.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) && typed_statistics_layout(item),
+        DataType::Union(legs, UnionMode::Dense) => legs.iter().all(|(_, leg)| typed_statistics_layout(leg))
+            && rtdb_columnar::from_field(field).and_then(|logical| rtdb_columnar::to_field(field.name(), &logical))
+                .is_ok_and(|canonical| canonical.data_type() == field.data_type()),
+        _ => rtdb_columnar::from_field(field).is_ok(),
+    }
+}
+
+fn stored_statistics(field: &Field, array: &dyn Array, row: usize) -> Option<StoredStatistics> {
+    let DataType::List(item) = field.data_type() else { return None; };
+    let list = array.as_any().downcast_ref::<ListArray>()?;
+    if list.is_null(row) || field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) {
+        return None;
+    }
+    let offsets = list.value_offsets();
+    Some(StoredStatistics { field: Arc::clone(item), records: Arc::clone(list.values()),
+        rows: offsets[row] as usize..offsets[row + 1] as usize })
 }
 
 fn required<'a>(fields: &'a StructFields<Value>, key: &str) -> Result<&'a Value> {
@@ -550,4 +762,111 @@ fn required<'a>(fields: &'a StructFields<Value>, key: &str) -> Result<&'a Value>
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-trie-metadata", error.to_string())
+}
+
+#[cfg(test)]
+mod metadata_wave_tests {
+    use super::*;
+    use crate::data::{StoredEvent, StoredOperation};
+    use rtdb_types::Iid;
+
+    #[test]
+    fn metadata_typed_legs_match_the_legacy_ipc_bytes() {
+        for recency in [false, true] {
+            for blooms in [false, true] {
+                let mut file = MetadataBuilder::new(recency, blooms);
+                file.write_nil().unwrap();
+                for (index, value) in [Value::F64(-0.0), Value::Utf8("s".repeat(2000)), Value::F64(f64::INFINITY), Value::Bool(true)].into_iter().enumerate() {
+                    let row = StructFields::from([
+                        ("a".to_owned(), Value::list(vec![Value::I32(9)])),
+                        ("b".to_owned(), Value::Struct(StructFields::from([("n".into(), value)]))),
+                        ("c".to_owned(), Value::F64(f64::from_bits(0x7ff8_0000_0000_0013))),
+                        ("d".to_owned(), Value::Null),
+                    ]);
+                    let fields = row.iter().map(|(name, val)| (name.clone(), val.logical_type())).collect::<StructFields<_>>();
+                    let events = [StoredEvent {
+                        position: None,
+                        origin: None, commit_position: 0, entity_key: None, iid: Iid([index as u8; 16]),
+                        system_from: Timestamp(10), valid_time: Interval::ALL,
+                        operation: StoredOperation::Put(row), recency: recency.then_some(Timestamp(100)),
+                    }];
+                    let page = crate::data::build_event_batch_with_recency(&events, Some(fields), None, recency).unwrap();
+                    let leaf = file.write_leaf(&page).unwrap();
+                    let MetadataNode::Leaf { columns, .. } = &file.nodes[leaf] else { panic!("expected leaf") };
+                    assert!(matches!(columns.0.as_ref(), LeafSource::Page(_)));
+                    assert_eq!(columns.statistics().unwrap().root_column("a").unwrap().count(), Some(1));
+                }
+                let branch = file.write_iid_branch([Some(1), Some(2), Some(3), Some(4)]).unwrap();
+                if recency { file.write_recency_branch(vec![(Timestamp(100), branch), (Timestamp::MAX, 0)]).unwrap(); }
+                let (file, _) = file.finish().unwrap();
+                let old_nodes = file.nodes.iter().map(|node| match node {
+                    MetadataNode::Leaf { data_page_index, columns } => MetadataNode::Leaf {
+                        data_page_index: *data_page_index, columns: LeafColumns::new(columns.values().unwrap().into_owned()),
+                    },
+                    node => node.clone(),
+                }).collect();
+                let legacy = MetadataFile::from_nodes(old_nodes, recency).unwrap();
+                assert_eq!(file.schema(), legacy.schema());
+                let bytes = file.write().unwrap();
+                assert_eq!(bytes, legacy.write_imported().unwrap());
+                let loaded = MetadataFile::read(bytes.into()).unwrap();
+                assert_eq!(loaded.leaves(), file.leaves());
+                let MetadataNode::Leaf { columns, .. } = &loaded.nodes[2] else { panic!("expected leaf") };
+                let LeafSource::Stored { statistics: Some(cached), .. } = columns.0.as_ref() else { panic!("expected cached metadata positions") };
+                let stats = columns.statistics().unwrap();
+                let StatisticsSource::Arrow { records, .. } = &stats.0 else { panic!("expected typed statistics") };
+                assert!(std::ptr::eq(*records, cached.records.as_ref()));
+                assert_eq!(stats.root_column("b").unwrap().count(), Some(1));
+            }
+        }
+
+    }
+
+    #[test]
+    fn metadata_cached_extended_statistics_borrow_active_bloom_bytes() {
+        use rtdb_types::{RunEndWidth, ScalarType};
+
+        let count_type = LogicalType::RunEndEncoded { width: RunEndWidth::I32, value: Box::new(LogicalType::Scalar(ScalarType::I64)) };
+        let bitmap = crate::bloom::BloomFilter::default().to_bytes().unwrap();
+        let bytes = Arc::new(arrow_array::BinaryArray::from_iter_values([bitmap.as_slice()]));
+        let bitmap_pointer = bytes.value(0).as_ptr();
+        let statistics = StructArray::try_new(vec![
+            Field::new("col-name", DataType::Utf8, false),
+            Field::new("root-col?", DataType::Boolean, false),
+            rtdb_columnar::to_field("count", &count_type).unwrap(),
+            Field::new("bytes", DataType::Struct(vec![Field::new("bloom", DataType::Binary, true)].into()), true),
+        ].into(), vec![
+            Arc::new(arrow_array::StringArray::from(vec!["name"])),
+            Arc::new(arrow_array::BooleanArray::from(vec![true])),
+            rtdb_columnar::build_array(&count_type, &[Value::I64(2)]).unwrap(),
+            Arc::new(StructArray::try_new(vec![Field::new("bloom", DataType::Binary, true)].into(), vec![bytes], None).unwrap()),
+        ], None).unwrap();
+        let item = Arc::new(Field::new("$data$", statistics.data_type().clone(), false));
+        let array: ArrayRef = Arc::new(ListArray::try_new(item, OffsetBuffer::new(vec![0, 1].into()), Arc::new(statistics), None).unwrap());
+        let field = Arc::new(Field::new("columns", array.data_type().clone(), false));
+        assert!(typed_statistics_layout(&field));
+        let stored = stored_statistics(&field, array.as_ref(), 0).unwrap();
+        let columns = LeafColumns(Arc::new(LeafSource::Stored { field, columns: array, offset: 0, statistics: Some(stored) }));
+        let stats = columns.statistics().unwrap();
+        let column = stats.root_column("name").unwrap();
+        assert_eq!(column.count(), Some(2));
+        let bloom = column.bloom().unwrap();
+        assert_eq!(bloom.as_ptr(), bitmap_pointer);
+        assert_eq!(bloom, bitmap.as_slice());
+    }
+
+    #[test]
+    fn metadata_ipc_in_memory_buffer_outlives_its_reader() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arrow_array::Int64Array::from(vec![-1, 4, 6]))]).unwrap();
+        let bytes: Arc<[u8]> = crate::ipc::write_file(&schema, &[batch]).unwrap().into();
+        let range = bytes.as_ptr_range();
+        let mut file = ArrowFile::open(Arc::clone(&bytes), None).unwrap();
+        let read = file.read_page(0).unwrap();
+        let n = read.column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert!(range.contains(&n.values().as_ptr().cast::<u8>()));
+        drop(file);
+        drop(bytes);
+        assert_eq!(n.values().as_ref(), &[-1, 4, 6]);
+    }
 }

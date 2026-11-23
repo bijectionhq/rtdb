@@ -337,10 +337,12 @@ async fn l0_merge_splits_one_history_across_recency_files_and_pages() {
             }
         }
         counts.insert(key.recency(), count);
+        let metadata = store.get(&ObjectKey::new(slug.metadata_key(&key)).unwrap()).await.unwrap();
+        let reopened = MetadataFile::read(Arc::from(metadata.as_ref())).unwrap();
+        assert_eq!(reopened.write().unwrap().as_slice(), metadata.as_ref());
         if key.recency().is_some() {
             assert!(reader.page_count() >= 3);
-            let metadata = store.get(&ObjectKey::new(slug.metadata_key(&key)).unwrap()).await.unwrap();
-            assert!(MetadataFile::read(Arc::from(metadata.as_ref())).unwrap().nodes().iter().any(|node| matches!(node, MetadataNode::RecencyBranch(_))));
+            assert!(reopened.nodes().iter().any(|node| matches!(node, MetadataNode::RecencyBranch(_))));
         }
     }
     assert_eq!(counts, BTreeMap::from([
