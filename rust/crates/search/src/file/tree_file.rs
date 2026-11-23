@@ -638,7 +638,7 @@ impl TreeFile {
                 for row in start..end {
                     let document = docs.value(row);
                     found.entry(iid).or_default().push(PackedEvent {
-                        header: EventHeader { iid, system_from: Timestamp(bounds[0].value(row)), commit_position: locations[0].value(row),
+                        header: EventHeader { position: None, iid, system_from: Timestamp(bounds[0].value(row)), commit_position: locations[0].value(row),
                             valid_time: Interval::from_micros(bounds[1].value(row), bounds[2].value(row))?, op: super::op_of(operations.value(row))? },
                         member: locations[1].value(row), page: locations[2].value(row), row: locations[3].value(row),
                         document: (document < super::NULL_DOC).then_some(document),

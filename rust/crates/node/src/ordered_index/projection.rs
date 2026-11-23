@@ -161,7 +161,7 @@ fn resolve(
     }
     // The previous projection contains exactly the older intervals that can still win.
     for span in before {
-        let header = EventHeader {
+        let header = EventHeader { position: None,
             commit_position: 0,
             iid,
             system_from: Timestamp::MIN,
@@ -426,7 +426,7 @@ mod tests {
     use rtdb_types::{StructFields, Value};
 
     fn put(id: i64, system: i64, valid: Interval, key: i64) -> StoredEvent {
-        StoredEvent {
+        StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,
@@ -550,7 +550,7 @@ mod tests {
         let StoredOperation::Put(row) = &mut peer.operation else { unreachable!(); };
         row.insert("_id".into(), peer_id.as_value());
         peer.entity_key = Some(peer_id.handle_bytes().into());
-        let erase = StoredEvent {
+        let erase = StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: first.entity_key.clone(), iid, system_from: Timestamp(1),
@@ -587,7 +587,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let erase = StoredEvent { origin: None, commit_position: 0, entity_key: None,
+        let erase = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None,
             iid,
             system_from: Timestamp(1),
             valid_time: Interval::ALL,

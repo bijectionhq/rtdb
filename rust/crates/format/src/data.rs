@@ -8,7 +8,7 @@ use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, NullArray,
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
-use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
+use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
 
 #[cfg(test)]
 use arrow_array::{StringArray, cast::AsArray};
@@ -25,6 +25,7 @@ pub enum StoredOperation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredEvent {
+    pub position: Option<EventPosition>,
     pub origin: Option<EventOrigin>,
     /// Canonical complete identity for governed data. IID stays a physical route.
     pub entity_key: Option<Arc<[u8]>>,
@@ -39,7 +40,7 @@ pub struct StoredEvent {
 
 impl StoredEvent {
     pub fn header(&self) -> EventHeader {
-        EventHeader { commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: match &self.operation {
+        EventHeader { position: self.position, commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: match &self.operation {
             StoredOperation::Put(_) => EventOp::Put, StoredOperation::Delete => EventOp::Delete, StoredOperation::Erase => EventOp::Erase,
             StoredOperation::Redacted => EventOp::Redacted,
         } }
@@ -93,6 +94,7 @@ pub struct PageEvent {
     row: usize,
     pub iid: Iid,
     pub system_from: Timestamp,
+    pub position: Option<EventPosition>,
     pub commit_position: u32,
     pub valid_time: Interval,
     pub op: EventOp,
@@ -226,7 +228,7 @@ impl PageEvent {
 }
 
 impl EncodedEvent for PageEvent {
-    fn header(&self) -> EventHeader { EventHeader { commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: self.op } }
+    fn header(&self) -> EventHeader { EventHeader { position: self.position, commit_position: self.commit_position, iid: self.iid, system_from: self.system_from, valid_time: self.valid_time, op: self.op } }
     fn recency(&self) -> Option<Timestamp> { self.recency }
     fn entity_key(&self) -> Option<&[u8]> { self.page.keys.as_ref().map(|keys| keys.value(self.row)) }
     fn origin(&self) -> Option<EventOrigin> { self.origin }
@@ -254,6 +256,7 @@ pub struct EventBatch {
     entity_keys: Option<usize>,
     commit_positions: Option<usize>,
     origins: Option<usize>,
+    event_positions: Option<usize>,
     /// The put leg's logical type, derived from its field on the first put read.
     put_type: std::sync::Arc<std::sync::OnceLock<LogicalType>>,
 }
@@ -272,6 +275,14 @@ impl EventBatch {
         let entity_keys = schema.index_of(ENTITY_KEY_FIELD).ok();
         let commit_positions = schema.index_of(COMMIT_POSITION_FIELD).ok();
         let origins = schema.index_of(EVENT_ORIGIN_FIELD).ok();
+        let event_positions = schema.index_of(EVENT_POSITION_FIELD).ok();
+        if let Some(index) = event_positions
+            && (schema.field(index).is_nullable()
+                || schema.field(index).data_type() != &DataType::FixedSizeBinary(EventPosition::WIDTH)
+                || batch.column(index).null_count() != 0)
+        {
+            return Err(invalid("Event positions require a non-null fixed-width binary column"));
+        }
         if let Some(index) = origins && schema.field(index).data_type() != &DataType::FixedSizeBinary(EventOrigin::WIDTH) {
             return Err(invalid("Event origins have an invalid binary width"));
         }
@@ -313,7 +324,7 @@ impl EventBatch {
                 (name, _) => return Err(invalid(format!("Unknown event operation: {name}"))),
             }
         }
-        Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency, entity_keys, commit_positions, origins, put_type: Default::default() })
+        Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency, entity_keys, commit_positions, origins, event_positions, put_type: Default::default() })
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
@@ -346,6 +357,7 @@ impl EventBatch {
             let valid_time = Interval::new(Timestamp(valid_from[row]), Timestamp(valid_to[row]))?;
             Self::require_redacted_position(op, origin, valid_time)?;
             Ok(PageEvent { page: Arc::clone(&page), offset: union.value_offset(row), row, iid: iids.get(row)?, system_from: Timestamp(system_from[row]),
+                position: self.event_position(row)?,
                 commit_position: positions.map_or(0, |positions| positions.value(row)),
                 valid_time, op, recency: recency.map(|recency| Timestamp(recency[row])), origin, bytes: std::sync::OnceLock::new() })
         }).collect()
@@ -359,6 +371,7 @@ impl EventBatch {
 
     pub fn has_entity_keys(&self) -> bool { self.entity_keys.is_some() }
     pub fn has_origin_column(&self) -> bool { self.origins.is_some() }
+    pub fn has_position_column(&self) -> bool { self.event_positions.is_some() }
 
     pub fn origin(&self, row: usize) -> Result<Option<EventOrigin>> {
         if row >= self.len() { return Err(invalid("Event row exceeds batch length")); }
@@ -366,6 +379,14 @@ impl EventBatch {
         let origins = self.batch.column(index).as_any().downcast_ref::<FixedSizeBinaryArray>()
             .ok_or_else(|| invalid("Event origin array type changed"))?;
         Ok(origins.is_valid(row).then(|| EventOrigin(origins.value(row).try_into().expect("validated event origin width"))))
+    }
+
+    fn event_position(&self, row: usize) -> Result<Option<EventPosition>> {
+        let Some(index) = self.event_positions else { return Ok(None); };
+        let positions = self.batch.column(index).as_any().downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| invalid("Event position array type changed"))?;
+        let bytes = positions.value(row).try_into().map_err(invalid)?;
+        Ok(Some(EventPosition::from_bytes(bytes)))
     }
 
     fn keys(&self) -> Option<&BinaryArray> {
@@ -396,6 +417,7 @@ impl EventBatch {
             Self::require_redacted_position(op, self.origin(row)?, valid_time)?;
         }
         Ok(EventHeader {
+            position: self.event_position(row)?,
             commit_position: self.positions().map_or(0, |positions| positions.value(row)),
             iid: self.iid(row)?,
             system_from: self.timestamp(self.system_from, row)?,
@@ -464,7 +486,7 @@ impl EventBatch {
             EventOp::Erase => StoredOperation::Erase,
             EventOp::Redacted => StoredOperation::Redacted,
         };
-        Ok(StoredEvent { origin: self.origin(row)?, commit_position: header.commit_position, entity_key: self.entity_key(row)?.map(Arc::from), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time, operation,
+        Ok(StoredEvent { position: header.position, origin: self.origin(row)?, commit_position: header.commit_position, entity_key: self.entity_key(row)?.map(Arc::from), iid: header.iid, system_from: header.system_from, valid_time: header.valid_time, operation,
             recency: self.recency.map(|index| self.timestamp(index, row)).transpose()? })
     }
 
@@ -493,7 +515,7 @@ fn validating_a_borrowed_document_keeps_errors_in_unread_fields() {
         ("uri".into(), LogicalType::Scalar(ScalarType::Uri)),
         ("body".into(), LogicalType::Scalar(ScalarType::Utf8)),
     ]);
-    let event = StoredEvent {
+    let event = StoredEvent { position: None,
         origin: None,
         commit_position: 0,
         entity_key: None,
@@ -530,7 +552,7 @@ fn borrowed_events_validate_the_put_layout_when_a_put_is_read() {
     let fields = StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]);
     let events = [StoredOperation::Delete, StoredOperation::Put(StructFields::from([
         ("body".into(), Value::Utf8("indexed text".into())),
-    ]))].into_iter().map(|operation| StoredEvent {
+    ]))].into_iter().map(|operation| StoredEvent { position: None,
         origin: None,
         commit_position: 0,
         entity_key: None,
@@ -662,6 +684,7 @@ fn put_batch(documents: ArrayRef, headers: &[EventHeader], keys: Option<BinaryAr
         columns.push(Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))));
         batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)?;
     }
+    let batch = with_event_positions(batch, headers.iter().map(|header| header.position))?;
     Arc::get_mut(&mut reservation).expect("put construction owns its reservation").shrink_to(batch.get_array_memory_size())?;
     OwnedBatch::with_reservation(batch, reservation)
 }
@@ -724,7 +747,10 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
         if headers.iter().any(|header| header.commit_position != 0) {
             return Err(invalid("A commit position requires a governed event"));
         }
-        return with_event_origins(plain, events);
+        return with_event_positions(
+            with_event_origins(plain, events)?,
+            headers.iter().map(|header| header.position),
+        );
     }
 
     let bytes = events.iter().try_fold(0usize, |bytes, event| {
@@ -743,7 +769,10 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
     let mut columns = plain.columns().to_vec();
     columns.push(Arc::new(keys.finish()));
     columns.push(Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))));
-    with_event_origins(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)?, events)
+    with_event_positions(
+        with_event_origins(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)?, events)?,
+        headers.iter().map(|header| header.position),
+    )
 }
 
 pub const ENTITY_KEY_FIELD: &str = "_entity_key";
@@ -778,7 +807,53 @@ pub fn append_origins(batch: &OwnedBatch, origins: impl IntoIterator<Item = Opti
     let mut lease = memory.reserve(bound)?;
     let column = origin_array(origins)?;
     Arc::get_mut(&mut lease).expect("unpublished origin column owns its reservation").shrink_to(column.get_array_memory_size())?;
-    batch.with_appended_column(event_origin_field(), Arc::new(column), lease)
+    let index = batch.batch().schema().index_of(EVENT_POSITION_FIELD).unwrap_or(batch.batch().num_columns());
+    batch.with_inserted_column(index, event_origin_field(), Arc::new(column), lease)
+}
+
+pub const EVENT_POSITION_FIELD: &str = "_event_position";
+
+pub fn event_position_field() -> Field {
+    Field::new(EVENT_POSITION_FIELD, DataType::FixedSizeBinary(EventPosition::WIDTH), false)
+}
+
+fn positions_array(positions: impl IntoIterator<Item = EventPosition>) -> Result<FixedSizeBinaryArray> {
+    let positions = positions.into_iter();
+    let mut column = FixedSizeBinaryBuilder::with_capacity(positions.size_hint().0, EventPosition::WIDTH);
+    for position in positions {
+        column.append_value(position.to_bytes()).map_err(invalid)?;
+    }
+    Ok(column.finish())
+}
+
+fn with_event_positions(
+    batch: RecordBatch, positions: impl Iterator<Item = Option<EventPosition>> + Clone,
+) -> Result<RecordBatch> {
+    if positions.clone().all(|position| position.is_none()) { return Ok(batch); }
+    if positions.clone().any(|position| position.is_none()) {
+        return Err(invalid("An event batch mixed assigned positions and pending events"));
+    }
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(event_position_field()));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(positions_array(positions.flatten())?));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)
+}
+
+pub fn append_event_positions(
+    batch: &OwnedBatch, positions: impl IntoIterator<Item = EventPosition>, memory: &Arc<MemoryBudget>,
+) -> Result<OwnedBatch> {
+    let bound = batch.batch().num_rows().checked_mul(32)
+        .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(event_size)?;
+    let mut lease = memory.reserve(bound)?;
+    let column = positions_array(positions)?;
+    Arc::get_mut(&mut lease).expect("unpublished event positions own their reservation")
+        .shrink_to(column.get_array_memory_size())?;
+    let field = event_position_field();
+    match batch.batch().schema().index_of(EVENT_POSITION_FIELD) {
+        Ok(index) => batch.with_replaced_column(index, Arc::new(column), lease),
+        Err(_) => batch.with_appended_column(field, Arc::new(column), lease),
+    }
 }
 
 pub fn entity_key_field() -> Field {
@@ -919,7 +994,7 @@ mod tests {
         let documents = StructArray::try_new(vec![Field::new("v", DataType::Utf8, false)].into(), vec![strings], None).unwrap();
         let selected = Arc::new(documents.slice(0, 1));
         let memory = MemoryBudget::new(1 << 17);
-        let header = EventHeader { commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+        let header = EventHeader { position: None, commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
         assert!(selected.get_array_memory_size() > memory.limit_bytes());
 
         let batch = owned_put_batch(selected, &[header], None, &memory).unwrap();
@@ -942,7 +1017,7 @@ mod tests {
         let source_memory = MemoryBudget::new(1 << 22);
         let source = OwnedBatch::new(source, &source_memory).unwrap();
         let memory = MemoryBudget::new(1 << 17);
-        let header = EventHeader { commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
+        let header = EventHeader { position: None, commit_position: 0, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, op: EventOp::Put };
 
         let batch = owned_put_batch(Arc::clone(source.batch().column(0)), &[header], Some(source.reservation().bytes()), &memory).unwrap();
         drop(source);
@@ -954,7 +1029,7 @@ mod tests {
 
     fn page(value: Value) -> Vec<PageEvent> {
         let document = StructFields::from([("v".into(), value.clone())]);
-        let event = StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(document), recency: None };
+        let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(1).iid(), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(document), recency: None };
         let types = StructFields::from([("v".into(), value.logical_type())]);
         EventBatch::new(build_event_batch(&[event], Some(types), None).unwrap()).unwrap().page_events().unwrap()
     }

@@ -470,7 +470,7 @@ mod tests {
         for (copied, omitted, valid) in [(1u32, 2u32, true), (3, 2, false), (2, 2, false)] {
             let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
             transaction.retain_archived_owned_positions(vec![copied])?;
-            transaction.append_archived_world_effect(&overlay, StoredEvent {
+            transaction.append_archived_world_effect(&overlay, StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: Some(original.handle_bytes().into()),

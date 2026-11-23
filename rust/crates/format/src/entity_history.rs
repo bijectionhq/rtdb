@@ -171,7 +171,7 @@ impl HistoryPage {
             0 => EventOp::Put, 1 => EventOp::Delete, 2 => EventOp::Erase, 3 => EventOp::Redacted,
             _ => return Err(invalid("Entity history contains an unknown operation")),
         };
-        Ok((EventHeader { iid: self.iid(row), system_from: time(1), valid_time: Interval::new(time(2), time(3))?,
+        Ok((EventHeader { position: None, iid: self.iid(row), system_from: time(1), valid_time: Interval::new(time(2), time(3))?,
             commit_position: self.0.column(5).as_primitive::<UInt32Type>().value(row), op }, origin))
     }
 }

@@ -248,14 +248,14 @@ mod tests {
         assert!(!state.snapshot().contains_table(&application_table));
 
         let mut metadata = TransactionBuffer::new(state.snapshot(), key(5, 20), Arc::clone(&memory))?.stage()?;
-        metadata.install_prepared_generation(generation.writes)?;
+        metadata.install_prepared_generation(generation.writes, &memory)?;
         assert!(!state.snapshot().contains_table(&application_table));
         state.apply(&metadata)?;
         assert!(state.snapshot().contains_table(&application_table));
 
         let old = PreparedLanding::decode(&frame, Some(b"original footprint"), &memory)?;
         let mut later = TransactionBuffer::new(state.snapshot(), key(6, 30), memory)?.stage()?;
-        assert!(later.install_prepared_generation(old.writes).is_err());
+        assert!(later.install_prepared_generation(old.writes, &memory).is_err());
         Ok(())
     }
 }

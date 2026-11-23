@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn a_uuid_column_does_not_certify_a_mismatched_physical_iid() {
         let id = [1; 16];
-        let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent {
+        let rows = [Iid(id), Iid([2; 16])].map(|iid| StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             iid, entity_key: None, system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
@@ -599,7 +599,7 @@ mod tests {
             ])),
             StoredOperation::Delete,
             StoredOperation::Erase,
-        ].into_iter().enumerate().map(|(index, operation)| StoredEvent {
+        ].into_iter().enumerate().map(|(index, operation)| StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: Some(Arc::from(identities[index].handle_bytes())),
@@ -640,7 +640,7 @@ mod tests {
             Arc::new(StringArray::from(vec!["indexed text"])),
             Arc::new(StringArray::from(vec!["%"])),
         ], None);
-        let header = rtdb_types::EventHeader {
+        let header = rtdb_types::EventHeader { position: None,
             iid: Iid([0; 16]), system_from: Timestamp(10), commit_position: 0, valid_time: Interval::ALL, op: EventOp::Put,
         };
         let memory = MemoryBudget::new(1 << 20);

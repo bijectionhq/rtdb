@@ -703,7 +703,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let mut writes = self.buffer.stage()?;
         if let Some(prepared) = prepared {
-            writes.install_prepared_generation(prepared)?;
+            writes.install_prepared_generation(prepared, &self.context.memory)?;
         }
         ResolvedTx::new(writes, result, input, None, None, self.context)
     }
@@ -934,7 +934,7 @@ impl<'a> OpenTransaction<'a> {
                 let digest = hash.finalize();
                 let iid = Iid::from_slice(&digest[..16])?;
                 let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(StructFields::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
-                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { origin: None, commit_position: 0, entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
+                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
             }
         };
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
@@ -982,7 +982,7 @@ impl<'a> OpenTransaction<'a> {
         let documents = batch.column_by_name("doc")
             .ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document column"))?;
         for row in 0..batch.num_rows() {
-            let header = EventHeader {
+            let header = EventHeader { position: None,
                 commit_position: 0,
                 iid: iids.iid(row)?, system_from: system_time,
                 valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
@@ -1453,7 +1453,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let document = RecordBatch::try_from_iter(columns)
             .map_err(|error| Anomaly::fault("rtdb.owned/path-catalog", error.to_string()))?;
-        let header = EventHeader {
+        let header = EventHeader { position: None,
             commit_position: 0,
             iid: rtdb_types::EntityId::String(name.name().into()).iid(),
             system_from: self.tx_key().system_time,
@@ -2448,7 +2448,7 @@ impl<'a> OpenTransaction<'a> {
         // when the locality prefix is shared or the key has no live winner.
         let first_erase = !self.owned_changes.get(relation.name()).is_some_and(|group| group.erased);
         let fixed_before = self.fixed_range_before(owner, relation, id, Interval::ALL).await;
-        let position = self.buffer.append_to(&table, StoredEvent {
+        let position = self.buffer.append_to(&table, StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
@@ -2523,7 +2523,7 @@ impl<'a> OpenTransaction<'a> {
         self.track_capacity_mutation(owner, relation, id, valid).await?;
         let fixed_before = self.fixed_range_before(owner, relation, id, valid).await;
         let system_from = self.tx_key().system_time;
-        let position = self.buffer.append_to(&relation.table(owner), StoredEvent { origin: None, commit_position: 0, entity_key: Some(id.handle_bytes().into()),
+        let position = self.buffer.append_to(&relation.table(owner), StoredEvent { position: None, origin: None, commit_position: 0, entity_key: Some(id.handle_bytes().into()),
             iid: id.iid(), system_from, valid_time: valid, operation: StoredOperation::Delete, recency: None,
         })?;
         let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
@@ -2908,7 +2908,7 @@ impl<'a> OpenTransaction<'a> {
             let key = self.admit_owned_put(&table, relation, owner, &id, iid, valid_time, create_only).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.owned/missing-entity-key", "Governed put has no complete key"))?;
             let content = rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None)?;
-            let header = EventHeader { commit_position: 0, iid, system_from: base_time, valid_time, op: EventOp::Put };
+            let header = EventHeader { position: None, commit_position: 0, iid, system_from: base_time, valid_time, op: EventOp::Put };
             let fixed_before = self.fixed_range_before(owner, relation, &id, valid_time).await;
             let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
                 let content = content.as_any().downcast_ref::<arrow_array::StructArray>()
@@ -3007,7 +3007,7 @@ impl<'a> OpenTransaction<'a> {
                 rtdb_types::FixedRangeKey::from_cells(value, &id).map(Some)
             });
             let document = document.iter().filter(|(name, _)| is_content(name)).map(|(name, value)| (name.clone(), value.clone())).collect();
-            let position = self.buffer.append_to(table, StoredEvent { origin: None, commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
+            let position = self.buffer.append_to(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key, iid, system_from: self.tx_key().system_time, valid_time, operation: StoredOperation::Put(document), recency: None })?;
             if !relation.is_world_catalog() {
                 self.record_owned_change(relation, id, kind, valid_time, position, fixed)?;
             }
@@ -3138,7 +3138,7 @@ impl<'a> OpenTransaction<'a> {
                 None => documents.iid(row, id.as_ref(), &memory)?,
             };
             let valid_time = interval(row_time(&row_from, row, from.unwrap_or(system_from))?, row_time(&row_to, row, to.unwrap_or(Timestamp::MAX))?)?;
-            Ok(EventHeader { commit_position: 0, iid, system_from, valid_time, op: EventOp::Put })
+            Ok(EventHeader { position: None, commit_position: 0, iid, system_from, valid_time, op: EventOp::Put })
         };
         let (fields, columns): (Vec<_>, Vec<_>) = array.fields().iter().zip(array.columns())
             .filter(|(field, _)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
@@ -3441,7 +3441,7 @@ fn mutation_put_batch(batch: &RecordBatch, system_time: Timestamp, memory: &Arc<
     })?.checked_add(rtdb_index::IndexBatch::header_bytes(batch.num_rows())?).ok_or_else(overflow)?;
     let _scratch = memory.reserve(bound)?;
     let read_header = |row| -> Result<EventHeader> {
-        Ok(EventHeader {
+        Ok(EventHeader { position: None,
             commit_position: 0,
             iid: iid.iid(row)?, system_from: system_time,
             valid_time: interval(from.time(row, system_time)?, to.time(row, Timestamp::MAX)?)?, op: EventOp::Put,
@@ -3501,7 +3501,7 @@ fn mutation_events(batch: &RecordBatch, kind: MutationKind, system_time: Timesta
             (None, MutationKind::Delete) => StoredOperation::Delete,
             (None, _) => StoredOperation::Erase,
         };
-        append(StoredEvent { origin: None, commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
+        append(StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time, operation, recency: None })?;
     }
     Ok(())
 }
@@ -4317,7 +4317,7 @@ mod tests {
                 let Value::FixedSizeBinary(iid) = cell("_iid", row) else { panic!("an IID") };
                 let valid_time = match kind { MutationKind::Erase => Interval::ALL, _ => interval(timestamp(&cell("_valid_from", row), system_time).unwrap(), timestamp(&cell("_valid_to", row), Timestamp::MAX).unwrap()).unwrap() };
                 let operation = match kind { MutationKind::Put => { let Value::Struct(document) = cell("doc", row) else { panic!("a document") }; StoredOperation::Put(document) }, MutationKind::Delete => StoredOperation::Delete, MutationKind::Erase => StoredOperation::Erase };
-                events.push(StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
+                events.push(StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid::from_slice(&iid).unwrap(), system_from: system_time, valid_time, operation, recency: None });
             }
         }
         events

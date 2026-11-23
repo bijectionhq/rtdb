@@ -139,7 +139,7 @@ impl Entity {
             }
             self.identity = Some(id);
         }
-        self.rows.push((ordinal, EventHeader { commit_position: 0, iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
+        self.rows.push((ordinal, EventHeader { position: None, commit_position: 0, iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
         for ((indices, distinct, seen), value) in self.values.iter_mut().zip(row.values) {
             indices.push(value.map(|tokens| *seen.entry(tokens.clone()).or_insert_with(|| { distinct.push(tokens); distinct.len() - 1 })));
         }
@@ -729,7 +729,7 @@ pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Wr
         let header = sidecar.key(row)?;
         let iid = Iid(sidecar.row_iid(row).try_into().map_err(fault)?);
         let key = sidecar.row_identity(row);
-        events.push(EventHeader { iid, system_from: Timestamp(header.system_from), commit_position: 0,
+        events.push(EventHeader { position: None, iid, system_from: Timestamp(header.system_from), commit_position: 0,
             valid_time: Interval::new(Timestamp(header.valid_from), Timestamp(header.valid_to))?, op: header.op },
             (!key.is_empty()).then_some(key))?;
     }

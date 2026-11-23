@@ -292,7 +292,7 @@ impl OpenTransaction<'_> {
                 (WorldShadow::Deleted, OwnedChangeKind::Delete)
             };
             let table = relation.table(owner);
-            let event = StoredEvent {
+            let event = StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: Some(shadow.id.handle_bytes().into()),

@@ -270,7 +270,7 @@ impl ActiveRows {
 struct Head { header: EventHeader, active: usize, priority: usize, ordinal: usize }
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.system_position().cmp(&other.header.system_position()))
+        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.precedence().cmp(&other.header.precedence()))
             .then_with(|| other.priority.cmp(&self.priority)).then_with(|| other.ordinal.cmp(&self.ordinal))
             .then_with(|| other.active.cmp(&self.active))
     }
@@ -1591,7 +1591,7 @@ impl PartitionScan {
             let source = rows.row(index)?;
             let header = source.header()?;
             if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
-            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.system_position() < header.system_position())) {
+            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.precedence() < header.precedence())) {
                 return Err(invalid("page-order", "Data page is not in IID and descending system-position order"));
             }
             previous = Some(header);
@@ -2150,7 +2150,7 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
         let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
-            StoredEvent {
+            StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: None,
@@ -2200,7 +2200,7 @@ mod tests {
 
         for (operation, retained) in [(StoredOperation::Delete, false), (StoredOperation::Redacted, true)] {
             let id = EntityId::Integer(1);
-            let event = StoredEvent {
+            let event = StoredEvent { position: None,
                 iid: id.iid(), entity_key: Some(id.handle_bytes().into()), commit_position: 1,
                 origin: Some(rtdb_types::EventOrigin([9; 32])), operation, ..events[0].clone()
             };
@@ -2230,7 +2230,7 @@ mod tests {
             let mut write = TransactionBuffer::new(state.value().snapshot(),
                 TransactionKey { tx_id: TxId(tx_id as i64), system_time }, Arc::clone(&memory)).unwrap();
             for (iid, value) in rows {
-                write.append(table.clone(), StoredEvent {
+                write.append(table.clone(), StoredEvent { position: None,
                     origin: None, commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time: Interval::ALL,
                     operation: StoredOperation::Put(StructFields::from([("v".into(), Value::I64(value))])), recency: None,
                 }).unwrap();
@@ -2272,7 +2272,7 @@ mod tests {
             let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
             if values.len() > 1 { write.retain_owned_positions().unwrap(); }
             for &value in values {
-                write.append(table.clone(), StoredEvent {
+                write.append(table.clone(), StoredEvent { position: None,
                     origin: None,
                     commit_position: 0,
                     entity_key: Some(id.handle_bytes().into()),
@@ -3761,7 +3761,7 @@ mod tests {
     async fn assert_combined_summary_replacement(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>) {
         let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
         let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
-        write.append(table.clone(), StoredEvent {
+        write.append(table.clone(), StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,

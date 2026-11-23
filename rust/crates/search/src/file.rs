@@ -87,7 +87,7 @@ impl SearchPage for Vec<SearchRow> {
     fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
         let row = &self[row];
         if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the definition's columns")); }
-        let header = EventHeader {
+        let header = EventHeader { position: None,
             iid: Iid(row.iid), system_from: Timestamp(row.system_from), commit_position: 0,
             valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op,
         };

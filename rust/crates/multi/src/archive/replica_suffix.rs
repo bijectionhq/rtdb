@@ -989,7 +989,7 @@ mod custody_tests {
         let large_transaction = |id, time, term| -> Result<ReplicaEnvelope> {
             use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
             use rtdb_types::{EntityId, Interval, LogicalType, ScalarType, StructFields, Value};
-            let row = StoredEvent {
+            let row = StoredEvent { position: None,
                 origin: None,
                 entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(time),
                 commit_position: 0, valid_time: Interval::ALL, recency: None,

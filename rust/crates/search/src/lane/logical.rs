@@ -538,7 +538,7 @@ impl SearchPage for MergedRows {
             MergedRow::Erase(..) => (EventOp::Erase, None),
         };
         let (system_from, commit_position) = row.position();
-        Ok(IndexedRow { header: EventHeader { iid: row.iid(), system_from, commit_position,
+        Ok(IndexedRow { header: EventHeader { position: None, iid: row.iid(), system_from, commit_position,
             valid_time: Interval::ALL, op }, key: None, sql_id, values, revisions })
     }
 }
