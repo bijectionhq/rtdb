@@ -105,16 +105,20 @@ impl EntityId {
             Self::Uuid(bytes) => Iid(*bytes),
             Self::String(value) => Self::string_iid(value),
             Self::Keyword(value) => Self::keyword_iid(value.as_str()),
-            Self::Integer(value) => Self::prefixed_iid(b'i', &value.to_string()),
+            Self::Integer(value) => Self::prefixed_iid(b"i", &value.to_string()),
         }
     }
 
-    pub fn string_iid(value: &str) -> Iid { Self::prefixed_iid(b's', value) }
-    pub fn keyword_iid(name: &str) -> Iid { Self::prefixed_iid(b'k', name) }
+    pub fn string_iid(value: &str) -> Iid { Self::prefixed_iid(b"s", value) }
+    pub fn keyword_iid(name: &str) -> Iid { Self::prefixed_iid(b"k:", name) }
 
-    fn prefixed_iid(prefix: u8, value: &str) -> Iid {
+    /// A version of the streaming keyword hash omitted the colon when writing IIDs.
+    /// Equality scans can include this digest for data written by that version.
+    pub fn legacy_keyword_iid(name: &str) -> Iid { Self::prefixed_iid(b"k", name) }
+
+    fn prefixed_iid(prefix: &[u8], value: &str) -> Iid {
         let mut hash = Sha256::new();
-        hash.update([prefix]);
+        hash.update(prefix);
         hash.update(value.as_bytes());
         let mut iid = [0; 16];
         iid.copy_from_slice(&hash.finalize()[..16]);

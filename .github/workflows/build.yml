@@ -11,8 +11,31 @@ concurrency:
   cancel-in-progress: ${{ !(github.repository == 'xtdb/xtdb' && github.ref_name == 'main') }}
 
 jobs:
+  native-ffi:
+    name: Build RTDB native library
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+      - name: Build RTDB FFI
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '0'
+        run: |
+          rust_version=$(awk -F '"' '$1 == "rust-version = " { print $2; exit }' rust/Cargo.toml)
+          test -n "$rust_version"
+          rustup toolchain install "$rust_version" --profile minimal
+          cargo "+$rust_version" build --locked --manifest-path rust/Cargo.toml --package rtdb-ffi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rtdb-native-ffi
+          path: rust/target/debug/librtdb_ffi.so
+          if-no-files-found: error
+          retention-days: 1
+
   gradle-test:
     name: Gradle Test
+    needs: native-ffi
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,8 +62,13 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: rtdb-native-ffi
+          path: ${{ runner.temp }}/rtdb-native-ffi
+
       - name: Test
-        run: ./gradlew test
+        run: ./gradlew "-Dxtdb.native.library=$RUNNER_TEMP/rtdb-native-ffi/librtdb_ffi.so" test :xtdb-core:jmhClasses
         timeout-minutes: 15
 
       - name: Publish Test Report
@@ -169,6 +197,7 @@ jobs:
 
   integration-test:
     name: Integration Test
+    needs: native-ffi
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -185,8 +214,13 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: rtdb-native-ffi
+          path: ${{ runner.temp }}/rtdb-native-ffi
+
       - name: Integration Test
-        run: ./gradlew integration-test
+        run: ./gradlew "-Dxtdb.native.library=$RUNNER_TEMP/rtdb-native-ffi/librtdb_ffi.so" integration-test
         timeout-minutes: 15
       - name: Publish Test Report
         uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce # v6.7.1

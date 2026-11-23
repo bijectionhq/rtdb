@@ -37,6 +37,23 @@ fn hyperbolic_calls_preserve_signed_zero_nan_and_infinite_limits() {
 }
 
 #[test]
+fn floating_mod_matches_primitive_reference_results_and_errors() {
+    let modulus = |a, b| call("mod", &[V::F64(a), V::F64(b)]);
+    for divisor in [0.0, -0.0] {
+        assert_eq!(modulus(7.0, divisor).unwrap_err().code, "xtdb.expression/unknown-arithmetic-error");
+    }
+    for dividend in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(modulus(dividend, 2.0).unwrap_err().code, "xtdb.expression/number-format-error");
+    }
+    for (a, b, expected) in [(7.5, -3.0, -1.5f64), (-7.5, 3.0, 1.5), (-0.0, 3.0, -0.0), (1e30, 3.0, 0.0)] {
+        let V::F64(actual) = modulus(a, b).unwrap() else { panic!("Expected floating remainder"); };
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+    assert_eq!(call("mod", &[V::F32(-7.5), V::I16(3)]).unwrap(), V::F32(1.5));
+    assert_eq!(call("mod", &[V::I64(i64::MIN), V::I64(-1)]).unwrap(), V::I64(0));
+}
+
+#[test]
 fn abs_keeps_each_numeric_leg_of_a_union_argument() {
     let union = L::join_all(&[L::Scalar(S::I64), L::Scalar(S::F64), L::Null]);
     let result = function_type("abs", std::slice::from_ref(&union)).unwrap();

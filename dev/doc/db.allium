@@ -34,6 +34,16 @@
 --
 -- A query MUST NEVER see a transaction the leader has not read back: external snapshots open at the durable head.
 --
+-- Date64 values retain their raw epoch milliseconds in source and data files.
+-- A same-type Date64 cast and a Date64 extremum preserve the selected raw milliseconds.
+-- Date subtraction checks that both epoch days and their difference fit the signed 32-bit result type.
+-- New Date64 statistics use the UTC day containing the value.
+-- A native scan widens a potentially legacy pre-epoch lower bound by one day when it reads Date64 statistics.
+-- Ordered indexes use a new page namespace when their Date64 key encoding switches to UTC day flooring.
+-- Native writes derive a keyword IID from the keyword's colon-prefixed spelling.
+-- An equality scan on a keyword ID also considers the physical IID that earlier native writes derived from the bare name.
+--
+--
 -- One leader kind, not two.
 --   An external source is an OPTIONAL COLLABORATOR of the leader rather than a separate processor: flush, tries and block coordination and the whole resolve → append → read back → apply pipeline are identical either way.
 --   The two differ only in where a transaction enters and how its tx_id is assigned.

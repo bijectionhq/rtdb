@@ -1,20 +1,21 @@
-use rtdb_types::StructFields;
 use rtdb_columnar::MemoryBudget;
-use rtdb_tx::{Documents,SqlArguments,UserMetadata};
-use rtdb_types::{CivilDate,DateUnit,Value};
+use rtdb_tx::{Documents, SqlArguments, UserMetadata};
+use rtdb_types::{AnomalyCategory, CivilDate, DateUnit, StructFields, Value};
 
 #[test]
-fn transaction_object_owners_admit_wide_dates_before_durable_copying() {
+fn transaction_object_owners_reject_wide_dates_before_durable_copying() {
     let memory = MemoryBudget::new(1 << 20);
-    let date = CivilDate::MAX;
-    let value = Value::calendar_date(date,DateUnit::Day);
-    let expected = Value::DateDay(date.epoch_day() as i32);
-    let documents = Documents::new(vec![StructFields::from([("d".into(),value.clone())])],&memory).unwrap();
-    assert_eq!(documents.rows()[0]["d"],expected);
-    let arguments = SqlArguments::from_rows(vec![vec![Value::List(vec![value.clone()])]],&memory).unwrap();
-    assert_eq!(&*arguments.rows().next().unwrap().unwrap(),[Value::List(vec![expected.clone()])]);
-    let metadata = UserMetadata::new(Value::Struct(StructFields::from([("d".into(),value)])),&memory).unwrap();
-    assert_eq!(metadata.value(),&Value::Struct(StructFields::from([("d".into(),expected)])));
-    drop(documents);drop(arguments);drop(metadata);
-    assert_eq!(memory.used_bytes(),0);
+    for unit in [DateUnit::Day, DateUnit::Millisecond] {
+        let value = Value::calendar_date(CivilDate::MAX, unit);
+        let document = StructFields::from([("d".into(), value.clone())]);
+        for error in [
+            Documents::new(vec![document.clone()], &memory).unwrap_err(),
+            SqlArguments::from_rows(vec![vec![Value::List(vec![value])]], &memory).unwrap_err(),
+            UserMetadata::new(Value::Struct(document), &memory).unwrap_err(),
+        ] {
+            assert_eq!(error.category, AnomalyCategory::Incorrect);
+            assert_eq!(error.code, "xtdb/date-out-of-range");
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }

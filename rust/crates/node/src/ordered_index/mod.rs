@@ -27,7 +27,7 @@ pub(crate) use maintenance::OrderedIndexMaintenance;
 pub(crate) use usage::{Inventory, owned_file_bytes};
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
-const PAGE_LAYOUT_VERSION: u8 = 9;
+const PAGE_LAYOUT_VERSION: u8 = 10;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

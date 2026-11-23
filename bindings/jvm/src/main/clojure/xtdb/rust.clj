@@ -119,10 +119,15 @@
         {:tx-id (get result "tx_id")}
         (serde/->TxKey (get result "tx_id") (time/->instant (get result "system_time")))))))
 
-(defn- connect ^NativeConnection [^NativeDatabase node {:keys [database]}]
+(defn- connect ^NativeConnection [^NativeDatabase node {:keys [database application-name]}]
   (err/wrap-anomaly {}
-    (.connect node
-              (if database (cond-> database (keyword? database) (-> symbol str NormalForm/normalForm)) "xtdb"))))
+    (let [conn (.connect node (if database (cond-> database (keyword? database) (-> symbol str NormalForm/normalForm)) "xtdb"))]
+      (try
+        (.setApplicationName conn (or application-name "XTDB Clojure API"))
+        conn
+        (catch Throwable t
+          (try (.close conn) (catch Throwable close-error (.addSuppressed t close-error)))
+          (throw t))))))
 
 (defn- logical-arguments [args]
   (if (sequential? args)
@@ -132,7 +137,7 @@
 (defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types? explain? explain-analyze?] :as options
                                              :or {key-fn :kebab-case-keyword}}]
   (err/wrap-anomaly {}
-    (with-open [connection (connect node {:database default-db})]
+    (with-open [connection (connect node (assoc options :database default-db))]
       (when-let [token (or await-token (.getAwaitToken node))]
         (set-await-token! connection token))
       (with-read-settings connection options
