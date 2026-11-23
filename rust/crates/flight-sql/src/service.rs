@@ -39,6 +39,7 @@ pub(crate) struct AudienceAdmission {
     seats: Vec<AudienceSessionSeat>,
     memory: Arc<MemoryBudget>,
     cache: Arc<CacheBudget>,
+    pub(crate) transport: Arc<MemoryBudget>,
     sessions: Registry<String, Session>,
 }
 
@@ -118,6 +119,7 @@ impl Service {
         let memory = Arc::clone(node.memory());
         let audience = if let Some(profile) = config.audience {
             let cache = CacheBudget::with_memory(memory.prepay(profile.cache_bytes())?);
+            let transport = memory.prepay(profile.transport_bytes())?;
             let memory = memory.prepay(profile.execution_bytes())?;
             Some(AudienceAdmission {
                 calls: Arc::new(Semaphore::new(profile.permits())),
@@ -127,6 +129,7 @@ impl Service {
                 sessions: Registry::new(clock.clone(), memory.clone()),
                 cache,
                 memory,
+                transport,
             })
         } else { None };
         Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))

@@ -2,6 +2,7 @@ use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, task::{Conte
 use arrow_flight::flight_service_server::FlightServiceServer;
 use futures::StreamExt;
 use rtdb_auth::Authenticator;
+use rtdb_columnar::MemoryReservation;
 use rtdb_node::{Clock, Node, SystemClock};
 use rtdb_types::{Anomaly, Result};
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, net::{TcpListener, TcpStream}, sync::{OwnedSemaphorePermit, Semaphore, watch}};
@@ -9,6 +10,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use crate::{FlightConfig, service::Service};
+use crate::config::{AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS, AUDIENCE_HOLDER_TRANSPORT_BYTES, AUDIENCE_REPLY_BYTES, AUDIENCE_REQUEST_BYTES};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerStatus { pub active_calls: usize, pub sessions: usize, pub transactions: usize, pub prepared_statements: usize, pub stopped: bool }
@@ -40,20 +42,34 @@ impl ServerDriver {
         let listener = self.listener.take().expect("unstarted Flight driver");
         let cancellation = self.service.0.cancellation.clone();
         let incoming_cancel = cancellation.clone();
-        let connections = self.service.0.config.audience.map(|audience| Arc::new(Semaphore::new(audience.permits())));
+        let audience = self.service.0.config.audience;
+        let connections = audience.map(|audience| Arc::new(Semaphore::new(audience.permits())));
+        let transport = self.service.0.audience.as_ref().map(|admission| Arc::clone(&admission.transport));
         let incoming = TcpListenerStream::new(listener).filter_map(move |result| {
             let admission = connections.as_ref().map(|permits| Arc::clone(permits).try_acquire_owned()).transpose();
             let result = match (result, admission) {
                 (Err(error), _) => Some(Err(error)),
                 (Ok(_), Err(_)) => None,
-                (Ok(stream), Ok(admission)) => Some(stream.set_nodelay(true).map(|()| ConnectionIo {
-                    stream, _admission: admission, cancellation: Box::pin(incoming_cancel.clone().cancelled_owned()),
-                })),
+                (Ok(stream), Ok(admission)) => transport.as_ref().map(|transport| transport.reserve(AUDIENCE_HOLDER_TRANSPORT_BYTES))
+                    .transpose().ok().map(|reservation| stream.set_nodelay(true).map(|()| ConnectionIo {
+                        stream, _admission: admission, _transport: reservation,
+                        cancellation: Box::pin(incoming_cancel.clone().cancelled_owned()),
+                    })),
             };
             std::future::ready(result)
         });
-        let server = FlightServiceServer::new(self.service.clone()).max_decoding_message_size(self.service.0.config.maximum_message_bytes).max_encoding_message_size(self.service.0.config.maximum_message_bytes);
-        let serving = tonic::transport::Server::builder().http2_max_header_list_size(8192).add_service(server).serve_with_incoming_shutdown(incoming, cancellation.clone().cancelled_owned());
+        let maximum = self.service.0.config.maximum_message_bytes;
+        let server = FlightServiceServer::new(self.service.clone())
+            .max_decoding_message_size(if audience.is_some() { maximum.min(AUDIENCE_REQUEST_BYTES) } else { maximum })
+            .max_encoding_message_size(if audience.is_some() { maximum.min(AUDIENCE_REPLY_BYTES) } else { maximum });
+        let mut http = tonic::transport::Server::builder().http2_max_header_list_size(8192);
+        if audience.is_some() {
+            http = http.max_concurrent_streams(AUDIENCE_H2_STREAMS)
+                .initial_stream_window_size(AUDIENCE_H2_STREAM_WINDOW)
+                .initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
+                .http2_adaptive_window(Some(false));
+        }
+        let serving = http.add_service(server).serve_with_incoming_shutdown(incoming, cancellation.clone().cancelled_owned());
         tokio::pin!(serving);
         let mut sweep = tokio::time::interval(self.service.0.config.sweep_interval);
         let result = loop { tokio::select! { result = &mut serving => break result.map_err(network), _ = sweep.tick() => self.service.sweep() } };
@@ -64,7 +80,7 @@ impl ServerDriver {
     }
 }
 impl Drop for ServerDriver { fn drop(&mut self) { self.service.0.cancellation.cancel(); self.service.close(); } }
-struct ConnectionIo { stream: TcpStream, _admission: Option<OwnedSemaphorePermit>, cancellation: Pin<Box<dyn Future<Output = ()> + Send>> }
+struct ConnectionIo { stream: TcpStream, _admission: Option<OwnedSemaphorePermit>, _transport: Option<Arc<MemoryReservation>>, cancellation: Pin<Box<dyn Future<Output = ()> + Send>> }
 impl Connected for ConnectionIo { type ConnectInfo = TcpConnectInfo; fn connect_info(&self) -> Self::ConnectInfo { self.stream.connect_info() } }
 impl ConnectionIo { fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> { if self.cancellation.as_mut().poll(cx).is_ready() { Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Flight server stopped")) } else { Ok(()) } } }
 impl AsyncRead for ConnectionIo {

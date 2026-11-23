@@ -312,6 +312,7 @@ pub(crate) struct OwnedReadResource {
     owner: ResourceOwner,
     session: String,
     database: String,
+    audience_work: Option<rtdb_storage::audience_work::TurnAllowance>,
     witnesses: Mutex<BTreeMap<Uuid, RetainedRangeWitness>>,
     spatial_filters: Mutex<BTreeMap<Uuid, Arc<RetainedSpatialFilter>>>,
     _permit: Option<OwnedSemaphorePermit>,
@@ -598,13 +599,24 @@ fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status>
 }
 
 fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
+    charge_audience_arrow(arrow)?;
     let stream = OwnedStream::read(arrow, call.memory()).map_err(status)?;
     single_owned_batch(stream)
 }
 
 fn decode_retained_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
+    charge_audience_arrow(&arrow)?;
     let stream = OwnedStream::read_buffer(arrow_buffer::Buffer::from(arrow), call.memory()).map_err(status)?;
     single_owned_batch(stream)
+}
+
+fn charge_audience_arrow(arrow: &[u8]) -> Result<(), Status> {
+    use rtdb_storage::audience_work;
+    if audience_work::is_bounded() {
+        let bound = rtdb_format::ipc::stream_allocation_bound(arrow).map_err(status)?;
+        audience_work::decode_bytes(bound).map_err(|error| Status::resource_exhausted(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn single_owned_batch(stream: OwnedStream) -> Result<OwnedBatch, Status> {
@@ -1562,6 +1574,7 @@ impl Service {
         }
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
+            audience_work: rtdb_storage::audience_work::current_turn(),
             witnesses: Mutex::default(), spatial_filters: Mutex::default(), _permit: permit, _reservation: reservation,
         });
         let handle = Bytes::copy_from_slice(handle.as_bytes());
@@ -1591,6 +1604,15 @@ impl Service {
             return Err(Status::not_found("unknown owned read"));
         }
         Ok(entry)
+    }
+
+    pub(crate) fn audience_read_work(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<rtdb_storage::audience_work::TurnAllowance, Status> {
+        let (handle, _) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("The audience observation has no original read handle"))?;
+        self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?.audience_work.clone()
+            .ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
     }
 
     pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], with_valid: bool) -> Result<ActionResult, Status> {

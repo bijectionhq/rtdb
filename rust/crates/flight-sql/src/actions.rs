@@ -10,10 +10,26 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
+        use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
         use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V2, READ_HELD_HOSTED_CONTROL_V2};
+        use rtdb_storage::audience_work;
+        let turn = if call.session.audience_source().is_some() {
+            match action.r#type.as_str() {
+                OPEN_APPLIED_OWNED_READ_V4 => Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS)),
+                HELD_OWNED_POINT_V2 | HELD_OWNED_HISTORICAL_POINT_V1 | HELD_OWNED_RANGE_V2
+                    | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 =>
+                    Some(self.audience_read_work(&call, &action.body).map_err(|error| call.error(error))?),
+                _ => None,
+            }
+        } else { None };
+        if let Some(turn) = &turn {
+            turn.admit_action().map_err(|error| call.error(Status::resource_exhausted(error.to_string())))?;
+        }
         let work = async {
             let action_type = action.r#type.as_str();
             if let Some(source) = call.session.audience_source() {
+                audience_work::decode_bytes(action.encoded_len())
+                    .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
                     PREPARE_APPLIED_READ_V2 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
@@ -258,11 +274,17 @@ impl Service {
         let work = async move {
             match owner {
                 Some(owner) => rtdb_storage::IoRegion::retaining(owner,
-                    rtdb_storage::audience_work::within(Some(crate::config::AUDIENCE_READ_LIMITS), work)).await,
+                    audience_work::within_turn(Some(AUDIENCE_READ_LIMITS), turn, work)).await,
                 None => work.await,
             }
         };
         let results = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
+        if call.session.audience_source().is_some()
+            && (results.len() > 1 || results.iter().any(|result| result.as_ref().is_ok_and(|reply|
+                reply.encoded_len() > AUDIENCE_REPLY_BYTES)))
+        {
+            return Err(call.error(Status::resource_exhausted("The audience reply exceeds its transport allowance")));
+        }
         self.publish(); result_stream(call, results)
     }
     fn claim_transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {

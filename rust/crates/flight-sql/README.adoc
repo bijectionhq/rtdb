@@ -289,7 +289,11 @@ Whole objects read into the buffer pool must match the reserved length. The pool
 The reservations remain held while admitted provider work drains after cancellation. The read view requires a whole-object or scan-range reservation for every body.
 Native trie data uses 64 KiB plaintext frames. A point scan can read its footer and pages without decrypting the rest of the file. The object header authenticates the length and content identity, and every selected frame authenticates its key, identity and position.
 Retained archives bind the encrypted frame header in their manifest and authenticate only the requested frames before resealing them for the serving key. Native trie data and retained archives must be written in this format.
-Each audience action has cumulative ceilings of 256 object-store requests, 32 MiB of requested object bodies, 65,536 scan items and 64 MiB in decoding bounds.
+Each audience action has cumulative ceilings of 256 object-store requests, 32 MiB of requested object bodies, 4 MiB of provider metadata envelopes, 65,536 scan items and 64 MiB in decoding bounds.
+An applied hold additionally limits the whole turn to 64 Flight actions, 4096 object-store requests, 512 MiB of requested bodies, 64 MiB of provider metadata envelopes, 1,048,576 scan items and 1 GiB in decoding bounds.
+Each action spends both allowances, including detached provider work.
+Closing the original hold uses cleanup capacity even after the hold exhausts its work allowance.
+The object reader reserves a 16 KiB metadata envelope separately from each requested body, including HEAD, and checks complete range responses under the reserved body length.
 The holder charges these before the counted work. Admitted provider tasks retain the allowance and the call and session permits until their work drains. Listings, unbounded body reads and the ordinary object transport are unavailable during the action.
 Live trie scans locate rows under the audience execution budget without consulting the ordinary leaf caches.
 The holder refuses the handshake if the opened residence needs per-read registration for a legacy object reference or serves a retained archive from a local volume. An admitted S3 archive uses the custody hold acquired when the attachment opened.
@@ -297,6 +301,9 @@ The installed source holder loads pack locations before accepting a session. Its
 Each audience session owns one retained-read slot. A new applied open must advance that session's generation and retires the previous handle before starting the new read.
 A delayed open with an earlier or repeated generation cannot displace the replacement. CloseSession and session expiry both retire its current hold. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
 The audience handshake and subsequent actions use the reserved admission.
+The holder sets aside 12 MiB per reserved connection outside body accounting, with four HTTP/2 streams, an 8 KiB header-list limit, a 512 KiB request message limit and a 2 MiB reply limit.
+The gateway sets aside 2 MiB per reserved peer connection and 2 MiB per forwarded call.
+Its audience upstream has bounded HTTP/2 windows and keeps no idle routes.
 An audience session can read a forward live Root range of up to five nominations through ReadHeldRange.v2 on its prepared hold.
 Its range request permits an exclusive continuation and has a 16 KiB carrier ceiling.
 Applied confirmation on the same prepared session can check the exact partition publication marker against both catalogs.

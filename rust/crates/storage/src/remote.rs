@@ -2,7 +2,7 @@ use crate::{audience_work, Error, IoRegion, ObjectKey, ObjectObservation, Object
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::{Attribute, GetOptions, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
+use object_store::{Attribute, GetOptions, GetRange, GetResult, ObjectMeta, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion, S3ObjectNamespace, TerminalObjectPublication};
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -425,11 +425,24 @@ impl RemoteObjects {
     }
 
     async fn read(&self, key: &ObjectKey, options: GetOptions, body_bytes: Option<usize>) -> Result<GetResult> {
-        if audience_work::is_bounded() {
+        let audience = audience_work::is_bounded();
+        if audience {
             let bytes = body_bytes.ok_or_else(|| Error::Closed("An audience provider read requires an exact body length".into()))?;
             audience_work::provider_read(bytes)?;
         }
         let response = self.reader()?.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
+        if audience {
+            let metadata = &response.meta;
+            let mut remaining = audience_work::PROVIDER_METADATA_BYTES.checked_sub(
+                512 + metadata.location.as_ref().len() + metadata.e_tag.as_ref().map_or(0, String::len)
+                    + metadata.version.as_ref().map_or(0, String::len)
+            ).ok_or(Error::AudienceWorkLimit)?;
+            for (key, value) in response.attributes.iter() {
+                let key_bytes = match key { Attribute::Metadata(key) => key.len(), _ => 0 };
+                remaining = remaining.checked_sub(128 + key_bytes + value.as_ref().len())
+                    .ok_or(Error::AudienceWorkLimit)?;
+            }
+        }
         if self.is_tombstone(&response) {
             return Err(Error::MissingObject(key.to_string()));
         }
@@ -443,7 +456,7 @@ impl RemoteObjects {
     }
 
     async fn metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
-        if self.hide_tombstones {
+        if self.hide_tombstones || audience_work::is_bounded() {
             return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }, Some(0)).await?.meta);
         }
         audience_work::provider_read(0)?;
@@ -478,7 +491,13 @@ impl RemoteObjects {
         }
         if range.is_empty() { return Ok(Bytes::new()); }
         let requested = usize::try_from(range.end - range.start).map_err(|_| Error::AudienceWorkLimit)?;
-        audience_work::provider_read(requested)?;
+        if audience_work::is_bounded() {
+            let options = GetOptions { range: Some(GetRange::Bounded(range.clone())), ..Default::default() };
+            let object = self.read(key, options, Some(requested)).await?;
+            let wrong_size = || crate::object_store::wrong_size(key, requested);
+            if object.range != range || object.meta.size != length { return Err(wrong_size()); }
+            return collect_exact_body(object, key, requested, wrong_size).await;
+        }
         let bytes = self.reader()?.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });

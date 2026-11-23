@@ -5,12 +5,28 @@ use rtdb_types::{Anomaly, Result};
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
 pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v19";
 pub const AUDIENCE_SEAT_HEADER: &str = "x-rtdb-audience-reader-seat";
+pub const AUDIENCE_H2_STREAMS: u32 = 4;
+pub const AUDIENCE_H2_STREAM_WINDOW: u32 = 128 << 10;
+pub const AUDIENCE_H2_CONNECTION_WINDOW: u32 = 512 << 10;
+pub const AUDIENCE_GATEWAY_TRANSPORT_BYTES: usize = 2 << 20;
+pub(crate) const AUDIENCE_HOLDER_TRANSPORT_BYTES: usize = 12 << 20;
+pub(crate) const AUDIENCE_REQUEST_BYTES: usize = 512 << 10;
+pub(crate) const AUDIENCE_REPLY_BYTES: usize = 2 << 20;
 
 pub(crate) const AUDIENCE_READ_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
     provider_requests: 256,
     provider_bytes: 32 << 20,
+    provider_metadata_bytes: 4 << 20,
     scan_items: 65_536,
     decode_bytes: 64 << 20,
+};
+pub(crate) const AUDIENCE_TURN_ACTIONS: usize = 64;
+pub(crate) const AUDIENCE_TURN_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
+    provider_requests: 4096,
+    provider_bytes: 512 << 20,
+    provider_metadata_bytes: 64 << 20,
+    scan_items: 1 << 20,
+    decode_bytes: 1 << 30,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +89,8 @@ impl AudienceFlightConfig {
     /// The installed byte pool includes both the active round and its replacement.
     pub fn execution_bytes(self) -> usize { self.permits() * (16 << 20) }
     pub fn cache_bytes(self) -> usize { self.permits() * (16 << 20) }
-    pub fn prepaid_bytes(self) -> usize { self.execution_bytes() + self.cache_bytes() }
+    pub(crate) fn transport_bytes(self) -> usize { self.permits() * AUDIENCE_HOLDER_TRANSPORT_BYTES }
+    pub fn prepaid_bytes(self) -> usize { self.execution_bytes() + self.cache_bytes() + self.transport_bytes() }
 }
 
 pub trait FlightPeerVerifier: std::fmt::Debug + Send + Sync {

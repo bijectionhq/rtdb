@@ -6,8 +6,10 @@ use http::{HeaderMap, HeaderValue, Request, Response, Uri, header};
 use http_body_util::{Either, Empty};
 use hyper::{body::{Body, Frame, Incoming, SizeHint}, server::conn::http2, service::service_fn};
 use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::{TokioExecutor, TokioIo, TokioTimer}};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_directory::{DeploymentRecord, Directory, MemberId, MemberRecord, now_ms};
 use rtdb_flight_sql::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat};
+use rtdb_flight_sql::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpListener, sync::{OwnedSemaphorePermit, Semaphore}};
@@ -57,6 +59,7 @@ struct Router {
     routes: Cipher,
     transport: Client<HttpConnector, Incoming>,
     calls: Arc<Semaphore>,
+    transport_bytes: Option<Arc<MemoryBudget>>,
     deployments: Option<Arc<DeploymentConnections>>,
     audience: Option<AudienceRoute>,
     options: GatewayOptions,
@@ -65,15 +68,36 @@ struct Router {
 
 struct RoutedBody {
     body: Incoming,
-    _call: OwnedSemaphorePermit,
+    admission: Arc<GatewayCall>,
     _deployment: Option<DeploymentConnection>,
+}
+
+struct GatewayCall {
+    _call: OwnedSemaphorePermit,
+    transport: Option<Arc<MemoryReservation>>,
+}
+
+struct RoutedData {
+    data: Bytes,
+    _admission: Arc<GatewayCall>,
+}
+
+impl AsRef<[u8]> for RoutedData {
+    fn as_ref(&self) -> &[u8] { &self.data }
 }
 
 impl Body for RoutedBody {
     type Data = Bytes;
     type Error = hyper::Error;
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<std::result::Result<Frame<Bytes>, hyper::Error>>> {
-        Pin::new(&mut self.body).poll_frame(cx)
+        Pin::new(&mut self.body).poll_frame(cx).map(|frame| frame.map(|result| {
+            result.map(|frame| {
+                if self.admission.transport.is_none() { return frame; }
+                frame.map_data(|data| Bytes::from_owner(RoutedData {
+                    data, _admission: Arc::clone(&self.admission),
+                }))
+            })
+        }))
     }
     fn is_end_stream(&self) -> bool { self.body.is_end_stream() }
     fn size_hint(&self) -> SizeHint { self.body.size_hint() }
@@ -113,12 +137,21 @@ async fn serve_listener(
     let mut connector = HttpConnector::new();
     connector.set_connect_timeout(Some(options.control_timeout));
     connector.set_nodelay(true);
-    let transport = Client::builder(TokioExecutor::new()).http2_only(true)
-        .retry_canceled_requests(false).pool_timer(TokioTimer::new()).pool_max_idle_per_host(1)
-        .pool_idle_timeout(Duration::from_secs(30)).build(connector);
     let limit = audience.map_or(options.maximum_connections, |audience| audience.profile.permits());
+    let mut client = Client::builder(TokioExecutor::new());
+    client.http2_only(true).retry_canceled_requests(false).pool_timer(TokioTimer::new())
+        .pool_max_idle_per_host(1).pool_idle_timeout(Duration::from_secs(30));
+    let transport_bytes = audience.map(|_| {
+        client.pool_max_idle_per_host(0)
+            .http2_max_header_list_size(MAXIMUM_HEADER_BYTES)
+            .http2_initial_stream_window_size(AUDIENCE_H2_STREAM_WINDOW)
+            .http2_initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
+            .http2_max_send_buf_size(AUDIENCE_H2_STREAM_WINDOW as usize);
+        MemoryBudget::new(2 * limit * AUDIENCE_GATEWAY_TRANSPORT_BYTES)
+    });
+    let transport = client.build(connector);
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
-        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience,
+        secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience, transport_bytes,
         calls: Arc::new(Semaphore::new(limit)),
         deployments: audience.is_none().then(|| Arc::new(DeploymentConnections::new(options.maximum_connections_per_deployment))),
         timeout: options.startup_timeout, options });
@@ -129,9 +162,12 @@ async fn serve_listener(
             result = listener.accept() => result.map_err(network)?,
         };
         let Ok(connection) = Arc::clone(&connections).try_acquire_owned() else { continue };
+        let Ok(codec) = router.transport_bytes.as_ref().map(|bytes| bytes.reserve(AUDIENCE_GATEWAY_TRANSPORT_BYTES)).transpose()
+            else { continue };
         let (tls, router, cancellation) = (tls.clone(), Arc::clone(&router), cancellation.clone());
         tokio::spawn(async move {
             let _connection = connection;
+            let _codec = codec;
             let io = async {
                 match tls {
                     Some(tls) => {
@@ -148,6 +184,7 @@ async fn serve_listener(
 }
 
 async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, remote: IpAddr, router: Arc<Router>) {
+    let audience = router.audience.is_some();
     let service = service_fn(move |request| {
         let router = Arc::clone(&router);
         async move {
@@ -158,8 +195,17 @@ async fn serving(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, r
             Ok::<_, Infallible>(response)
         }
     });
-    let _ = http2::Builder::new(TokioExecutor::new()).max_header_list_size(MAXIMUM_HEADER_BYTES)
-        .max_concurrent_streams(256).serve_connection(TokioIo::new(stream), service).await;
+    let mut http = http2::Builder::new(TokioExecutor::new());
+    http.max_header_list_size(MAXIMUM_HEADER_BYTES);
+    if audience {
+        http.max_concurrent_streams(AUDIENCE_H2_STREAMS)
+            .initial_stream_window_size(AUDIENCE_H2_STREAM_WINDOW)
+            .initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
+            .max_send_buf_size(AUDIENCE_H2_STREAM_WINDOW as usize);
+    } else {
+        http.max_concurrent_streams(256);
+    }
+    let _ = http.serve_connection(TokioIo::new(stream), service).await;
 }
 
 impl Router {
@@ -294,6 +340,9 @@ impl Router {
             return Err(Status::permission_denied("The Flight audience only routes observation actions"));
         }
         let call = Arc::clone(&self.calls).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight SQL gateway call limit reached"))?;
+        let transport = self.transport_bytes.as_ref().map(|bytes| bytes.reserve(AUDIENCE_GATEWAY_TRANSPORT_BYTES))
+            .transpose().map_err(|_| Status::resource_exhausted("Flight SQL gateway transport capacity exhausted"))?;
+        let admission = Arc::new(GatewayCall { _call: call, transport });
         let name = match (&route, selector) {
             (None, None) => return Err(Status::invalid_argument("Flight SQL startup requires x-xtdb-database")),
             (None, Some(selector)) => database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?.0,
@@ -349,7 +398,7 @@ impl Router {
             .build().map_err(|_| Status::internal("Invalid private Flight SQL endpoint"))?;
         let mut response = self.transport.request(request).await.map_err(|_| Status::unavailable("The Flight SQL writer disconnected"))?;
         self.rewrite_response(response.headers_mut(), target, audience, seat)?;
-        Ok(response.map(|body| Either::Right(RoutedBody { body, _call: call, _deployment: deployment })))
+        Ok(response.map(|body| Either::Right(RoutedBody { body, admission, _deployment: deployment })))
     }
 
     fn rewrite_response(&self, headers: &mut HeaderMap, target: Target, audience: Option<AudienceFlightConfig>, seat: Option<AudienceSeat>) -> std::result::Result<(), Status> {

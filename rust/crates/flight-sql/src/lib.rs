@@ -14,6 +14,7 @@ mod ticket;
 mod wire;
 
 pub use config::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat, FlightConfig, FlightPeerVerifier, HostedControlConfig};
+pub use config::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS};
 pub use server::{ServerDriver, ServerHandle, ServerStatus};
 
 mod owned_actions;
