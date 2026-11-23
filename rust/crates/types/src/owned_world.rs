@@ -84,7 +84,7 @@ impl WorldClockMode {
     }
 }
 
-/// The original retained publication of a single writable Held ancestor.
+/// An exact Held publication selected within independently retained media.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OwnedWorldAncestor {
     pub world: [u8; 16],
@@ -92,9 +92,19 @@ pub struct OwnedWorldAncestor {
     pub capture: [u8; 16],
     pub suffix: [u8; 16],
     pub manifest: String,
+    /// The exact end of the archived replica suffix.
     pub basis: TransactionKey,
+    /// The selected application publication, which can precede the media end.
+    pub system: Timestamp,
     pub source_root: TransactionKey,
     pub logical: Timestamp,
+}
+
+impl OwnedWorldAncestor {
+    pub fn covers(&self, system: Timestamp, logical: Timestamp) -> bool {
+        (system == self.system && logical == self.logical)
+            || (system < self.system && logical < self.logical)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,8 +138,8 @@ pub struct OwnedWorld {
 
 impl OwnedWorld {
     /// The publication inherited when this world began its own journal.
-    pub fn inherited_basis(&self) -> TransactionKey {
-        self.ancestor.as_ref().map_or(self.basis, |ancestor| ancestor.basis)
+    pub fn inherited_system(&self) -> Timestamp {
+        self.ancestor.as_ref().map_or(self.basis.system_time, |ancestor| ancestor.system)
     }
 
     pub fn root_clock(&self) -> Timestamp {
@@ -179,6 +189,7 @@ impl OwnedWorld {
                 ("manifest".into(), Value::Utf8(ancestor.manifest.clone())),
                 ("basis_id".into(), Value::I64(ancestor.basis.tx_id.0)),
                 ("basis_time".into(), Value::I64(ancestor.basis.system_time.0)),
+                ("system".into(), Value::I64(ancestor.system.0)),
                 ("source_root_id".into(), Value::I64(ancestor.source_root.tx_id.0)),
                 ("source_root_time".into(), Value::I64(ancestor.source_root.system_time.0)),
                 ("logical".into(), Value::I64(ancestor.logical.0)),
@@ -234,7 +245,7 @@ impl OwnedWorld {
         };
         let ancestor = match row.get("ancestor") {
             None | Some(Value::Null | Value::Undefined) => None,
-            Some(Value::Struct(fields)) if fields.len() == 10 => {
+            Some(Value::Struct(fields)) if fields.len() == 11 => {
                 let uuid = |name| match fields.get(name) {
                     Some(Value::Uuid(id)) if *id != [0; 16] => Ok(*id),
                     _ => Err(Self::unavailable()),
@@ -256,16 +267,18 @@ impl OwnedWorld {
                     system_time: Timestamp(integer("source_root_time")?),
                 };
                 let logical = Timestamp(integer("logical")?);
+                let system = Timestamp(integer("system")?);
                 let world = uuid("world")?;
                 if world == *id || *pin != *id || mode != WorldClockMode::Retained
                     || basis.tx_id.0 <= *tx_id || basis.system_time.0 <= *time
-                    || basis.system_time.0 >= *until || logical <= inherited || logical > basis.system_time
+                    || basis.system_time.0 >= *until || system.0 <= *time || system > basis.system_time
+                    || logical <= inherited || logical > system
                     || source_root.tx_id.0 < 0 || source_root.system_time.0 <= 0 || source_root.system_time.0 > *time
                 {
                     return Err(Self::unavailable());
                 }
                 Some(OwnedWorldAncestor { world, pin: uuid("pin")?, capture: uuid("capture")?,
-                    suffix: uuid("suffix")?, manifest, basis, source_root, logical })
+                    suffix: uuid("suffix")?, manifest, basis, system, source_root, logical })
             }
             _ => return Err(Self::unavailable()),
         };
@@ -321,9 +334,15 @@ impl OwnedWorld {
     pub fn can_retain_overlay(&self, next: &Self) -> bool {
         let Some(overlay) = &next.ancestor else { return false; };
         let same_overlay = match &self.ancestor {
-            Some(inherited) => self.mode == WorldClockMode::Retained && inherited == overlay,
+            Some(inherited) => self.mode == WorldClockMode::Retained
+                && inherited.world == overlay.world && inherited.pin == overlay.pin
+                && inherited.capture == overlay.capture && inherited.suffix == overlay.suffix
+                && inherited.manifest == overlay.manifest && inherited.basis == overlay.basis
+                && inherited.source_root == overlay.source_root
+                && inherited.covers(overlay.system, overlay.logical),
             None => matches!(self.mode, WorldClockMode::Held { .. })
-                && self.id.0 == overlay.world && self.pin.0 == overlay.pin && self.basis == overlay.source_root,
+                && self.id.0 == overlay.world && self.pin.0 == overlay.pin && self.basis == overlay.source_root
+                && overlay.system == overlay.basis.system_time,
         };
         same_overlay && self.id != next.id && next.id == next.pin && !self.dropped && !next.dropped
             && next.mode == WorldClockMode::Retained && next.until <= self.until
@@ -461,6 +480,7 @@ mod tests {
                 world: [3; 16], pin: [3; 16], capture: [4; 16], suffix: [5; 16],
                 manifest: "b".repeat(43),
                 basis: TransactionKey { tx_id: TxId(20), system_time: Timestamp(200) },
+                system: Timestamp(200),
                 source_root: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
                 logical: Timestamp(150),
             }),
@@ -473,7 +493,7 @@ mod tests {
         assert_eq!(OwnedWorld::from_record(&stored)?, child);
         assert_eq!(child.initial_clock(), Timestamp(150));
 
-        assert_eq!(child.inherited_basis().system_time, Timestamp(200));
+        assert_eq!(child.inherited_system(), Timestamp(200));
         let limit = WorldClockLimit { world: child.id, pin: child.pin, before: Timestamp(175) };
         assert!(limit.admits(&child, Timestamp(150)));
         assert!(limit.admits(&child, Timestamp(174)));
@@ -486,6 +506,14 @@ mod tests {
         assert!(child.can_retain_overlay(&descendant));
         assert!(!limit.admits(&descendant, Timestamp(150)));
         assert_eq!(descendant.ancestor, child.ancestor);
+        let selection = descendant.ancestor.as_mut().unwrap();
+        selection.system = Timestamp(190);
+        selection.logical = Timestamp(149);
+        assert!(child.can_retain_overlay(&descendant));
+        assert_eq!(OwnedWorld::from_record(&descendant.record())?.inherited_system(), Timestamp(190));
+        descendant.ancestor.as_mut().unwrap().logical = Timestamp(150);
+        assert!(!child.can_retain_overlay(&descendant));
+        descendant.ancestor = child.ancestor.clone();
         descendant.ancestor.as_mut().unwrap().suffix = [7; 16];
         assert!(!child.can_retain_overlay(&descendant));
         descendant.ancestor = child.ancestor.clone();

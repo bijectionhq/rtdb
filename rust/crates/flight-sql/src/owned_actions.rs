@@ -205,7 +205,7 @@ pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtecte
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
-pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V2: &str = "rtdb.owned.PrepareHeldWorldOverlay.v2";
+pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V3: &str = "rtdb.owned.PrepareHeldWorldOverlay.v3";
 pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
@@ -225,7 +225,7 @@ pub(crate) const HELD_WORLD_AT_PREFLIGHT_V1: &str = "rtdb.owned.PreflightHeldWor
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V1: &str = "rtdb.owned.PublishHeldWorldRetention.v1";
+pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V2: &str = "rtdb.owned.PublishHeldWorldRetention.v2";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
@@ -2529,10 +2529,10 @@ impl Service {
         reply.extend_from_slice(&parent.system_time.0.to_be_bytes());
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
         reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
-        if let Some((world, ancestor)) = snapshot.ancestor() {
+        if let Some((world, system)) = snapshot.ancestor() {
             reply.push(3);
             reply.extend_from_slice(&world.0);
-            reply.extend_from_slice(&ancestor.system_time.0.to_be_bytes());
+            reply.extend_from_slice(&system.0.to_be_bytes());
         } else {
             reply.push(match snapshot.clock_mode() {
                 rtdb_types::WorldClockMode::Retained => 0,

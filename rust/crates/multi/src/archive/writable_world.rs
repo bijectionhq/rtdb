@@ -220,10 +220,15 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     if cut.basis() <= original.basis.system_time || cut.until() <= now() { return Err(unavailable()); }
     if live.world_registration(Iid(*child.as_bytes())).await?.is_some() { return Err(unavailable()); }
     let (ancestor, until) = if let Some(inherited) = &retained.ancestor {
-        if !cut.matches_basis(inherited.basis) || inherited.logical != logical {
+        if !cut.admits_overlay(inherited.basis, cut.basis())
+            || !original.ancestor.as_ref().is_some_and(|ancestor| ancestor.covers(cut.basis(), logical))
+        {
             return Err(unavailable());
         }
-        (inherited.clone(), cut.until())
+        let mut selected = inherited.clone();
+        selected.system = cut.basis();
+        selected.logical = logical;
+        (selected, cut.until())
     } else {
         let (capture, suffix) = if let Some(prior) = source.checkpoint_worlds.get(&child).filter(|prior| prior.until > now()) {
             let ancestor = prior.ancestor.as_ref().filter(|ancestor| {
@@ -268,17 +273,22 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         ).await?;
         let ancestor = rtdb_directory::CheckpointWorldAncestor {
             world: Uuid::from_bytes(world.0), pin: Uuid::from_bytes(pin.0), capture, suffix,
-            manifest_sha256: manifest, basis, source_root: original.basis, logical,
+            manifest_sha256: manifest, basis, system: basis.system_time, source_root: original.basis, logical,
         };
         (ancestor, until)
     };
     let owner = &retained.owner;
     let reopened = open_world(directory.as_ref(), archive, session, deployment, Uuid::from_bytes(world.0)).await?;
     if reopened.record != original || now() >= until { return Err(unavailable()); }
-    let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), &original, ancestor.basis.system_time).await?;
-    if refreshed.overlay() != cut.overlay() || !refreshed.matches_basis(ancestor.basis) || now() >= until {
-        return Err(unavailable());
+    if original.ancestor.is_some() {
+        reopened.snapshot.check_overlay_standing(&original).await?;
+    } else {
+        let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), &original, ancestor.system, None).await?;
+        if refreshed.overlay() != cut.overlay() || !refreshed.matches_basis(ancestor.basis) {
+            return Err(unavailable());
+        }
     }
+    if now() >= until { return Err(unavailable()); }
     let binding = CheckpointWorldRetention {
         world: child, ancestor: Some(ancestor.clone()), owner: owner.clone(),
         capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
@@ -306,7 +316,8 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     }).await?;
     Ok(rtdb_flight_sql::PreparedWorldOverlay {
         world: world.0, parent_pin: pin.0, capture: *ancestor.capture.as_bytes(), suffix: *ancestor.suffix.as_bytes(),
-        manifest: ancestor.manifest_sha256, basis: ancestor.basis, logical, until: retain_until, child: *child.as_bytes(),
+        manifest: ancestor.manifest_sha256, basis: ancestor.basis, system: ancestor.system,
+        logical, until: retain_until, child: *child.as_bytes(),
     })
 }
 
@@ -454,7 +465,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
         let source_world = Iid(original.world);
         let owner = &owner;
         let schemas = &staged.world.schemas;
-        with_registered_capture_context(
+        let system = with_registered_capture_context(
             directory.as_ref(), archive, keys, hosted_task,
             CaptureSelection {
                 deployment, capture, manifest: &archived.manifest, suffix: Some(suffix),
@@ -464,20 +475,26 @@ pub(crate) async fn retain_replayed_checkpoint_world(
             |context, basis| async move {
                 let (record, _) = rtdb_query::read_owned_world(Arc::clone(&context), owner, source_world)
                     .await?.ok_or_else(unavailable)?;
-                let clock = rtdb_query::read_owned_world_clock_revision(context, owner, source_world).await?;
                 if record.dropped || record.pin.0 != original.pin || record.ancestor.is_some()
                     || record.basis != original.source_root
                     || !matches!(record.mode, WorldClockMode::Held { .. }) || &record.schemas != schemas
-                    || clock != Some((original.logical, basis.system_time))
                 {
                     return Err(unavailable());
                 }
-                Ok(())
+                let (system, logical) = rtdb_query::select_owned_world_clock(
+                    &context, owner, source_world, record.basis.system_time, record.initial_clock(), original.logical,
+                ).await?.ok_or_else(unavailable)?;
+                if logical != original.logical
+                    || (system == basis.system_time) != (original.system == original.basis.system_time)
+                {
+                    return Err(unavailable());
+                }
+                Ok(system)
             },
         ).await?;
         Some(rtdb_directory::CheckpointWorldAncestor {
             world: Uuid::from_bytes(original.world), pin: Uuid::from_bytes(original.pin),
-            capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis,
+            capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis, system,
             source_root: original.source_root, logical: original.logical,
         })
     } else {
@@ -591,6 +608,7 @@ fn world_ancestor(retained: &CheckpointWorldRetention) -> Option<rtdb_types::Own
         suffix: *ancestor.suffix.as_bytes(),
         manifest: ancestor.manifest_sha256.clone(),
         basis: ancestor.basis,
+        system: ancestor.system,
         source_root: ancestor.source_root,
         logical: ancestor.logical,
     })
@@ -644,7 +662,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         if !capture.is_nil() || suffix.is_some() || child.is_nil() || retained.world != child
             || fork.world != fork.pin || retained.owner != owner || retained.until != until
             || retained.mode != WorldClockMode::Retained || fork.cut.until() <= now() || until <= now()
-            || ancestor.logical != logical || !fork.cut.matches_basis(ancestor.basis)
+            || ancestor.logical != logical || !fork.cut.admits_overlay(ancestor.basis, ancestor.system)
             || session.placed_history()? != Some(fork.cut.scope())
         {
             return Err(unavailable());

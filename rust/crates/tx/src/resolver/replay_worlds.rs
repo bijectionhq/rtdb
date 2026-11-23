@@ -93,7 +93,16 @@ impl OpenTransaction<'_> {
             if ancestor.basis.system_time != destination
                 || ancestor.basis.tx_id >= ordered.tx_id
                 || destination > lease_start
+                || ancestor.system <= admission.basis.system_time
+                || ancestor.system > destination
             {
+                return Err(unavailable());
+            }
+            let selected = context.with_owned_system_cut(ancestor.system, &context.cancellation)?;
+            let clock = rtdb_query::read_owned_world_clock_revision(
+                selected, owner, Iid(ancestor.world),
+            ).await?;
+            if clock != Some((ancestor.logical, ancestor.system)) {
                 return Err(unavailable());
             }
         }

@@ -46,6 +46,7 @@ pub struct PreparedWorldOverlay {
     pub suffix: [u8; 16],
     pub manifest: String,
     pub basis: TransactionKey,
+    pub system: Timestamp,
     pub logical: Timestamp,
     pub until: Timestamp,
 }
@@ -120,7 +121,7 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>>;
     fn present(&self) -> Timestamp;
-    fn ancestor(&self) -> Option<(rtdb_types::Iid, TransactionKey)>;
+    fn ancestor(&self) -> Option<(rtdb_types::Iid, Timestamp)>;
     fn application_clock(&self) -> Option<Timestamp>;
     fn initial_clock(&self) -> Timestamp;
     fn clock_mode(&self) -> WorldClockMode;

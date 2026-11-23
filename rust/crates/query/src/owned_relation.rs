@@ -592,6 +592,46 @@ pub async fn read_owned_world_clock_revision(
     Ok(clock)
 }
 
+/// An exact accepted Held clock read at a cut of the original overlay.
+pub struct ArchivedHeldClock {
+    world: Iid,
+    pin: Iid,
+    media_end: Timestamp,
+    system: Timestamp,
+    reading: Timestamp,
+}
+
+impl ArchivedHeldClock {
+    pub fn reading(
+        &self, ancestor: &rtdb_types::OwnedWorldAncestor, system: Timestamp,
+    ) -> Result<Timestamp> {
+        if self.world.0 != ancestor.world || self.pin.0 != ancestor.pin
+            || self.media_end != ancestor.basis.system_time || self.system != system
+            || !ancestor.covers(system, self.reading)
+        {
+            return Err(rtdb_types::OwnedWorld::unavailable());
+        }
+        Ok(self.reading)
+    }
+}
+
+pub async fn read_archived_held_clock(
+    context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
+) -> Result<ArchivedHeldClock> {
+    let unavailable = rtdb_types::OwnedWorld::unavailable;
+    let media_end = context.current_time.as_micros()?;
+    let at = context.with_owned_system_cut(system, &context.cancellation)?;
+    let (source, _) = read_owned_world(Arc::clone(&at), owner, world).await?
+        .filter(|(source, _)| !source.dropped && source.ancestor.is_none()
+            && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
+            && source.basis.system_time < system)
+        .ok_or_else(unavailable)?;
+    let (reading, _) = read_owned_world_clock_revision(at, owner, world).await?
+        .filter(|(reading, revision)| *revision == system && *reading > source.initial_clock())
+        .ok_or_else(unavailable)?;
+    Ok(ArchivedHeldClock { world, pin: source.pin, media_end, system, reading })
+}
+
 /// Select an accepted Held or Proposal reading within a certified physical prefix.
 pub async fn select_owned_world_clock(
     context: &Arc<QueryContext>, owner: &str, world: Iid,
