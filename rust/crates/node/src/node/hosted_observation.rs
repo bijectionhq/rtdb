@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, Result, Timestamp};
 
-use super::{OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis};
+use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis};
 
 impl OwnedReadSession {
     /// Compare cumulative journal events from a live held Root against a single
@@ -79,7 +79,7 @@ impl OwnedReadSession {
                 &basis,
                 self.identity.as_ref(),
                 Some(&self.attachment),
-                None,
+                CatalogReadCut::Current,
                 &self.cancellation,
             )
             .await?;
