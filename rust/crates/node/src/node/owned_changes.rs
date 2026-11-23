@@ -21,12 +21,13 @@ pub struct OwnedMergedChanges {
     pub retained_bytes: usize,
     _reservations: Vec<Arc<MemoryReservation>>,
     complete: bool,
+    upper: Timestamp,
 }
 
 impl OwnedMergedChanges {
-    pub fn covered_through(&self, present: Timestamp) -> Result<Timestamp> {
+    pub fn covered_through(&self) -> Result<Timestamp> {
         if self.complete {
-            return Ok(present);
+            return Ok(self.upper);
         }
         self.commits
             .last()
@@ -89,7 +90,7 @@ impl OwnedReadSession {
         let page = self
             .merged_changes(std::slice::from_ref(relation), after, limit)
             .await?;
-        let covered_through = page.covered_through(self.present.system_time)?;
+        let covered_through = page.covered_through()?;
         let groups = page
             .commits
             .into_iter()
@@ -136,10 +137,10 @@ impl OwnedReadSession {
             // Decode one accepted group. Its successors are unnecessary
             // while it still has a candidate or needs a later held present.
             let page = self.merged_change_journals(
-                std::slice::from_ref(relation), through, 1, through == Timestamp::MIN,
+                std::slice::from_ref(relation), through, self.present.system_time, 1, through == Timestamp::MIN,
             ).await?;
             let Some(group) = page.commits.first() else {
-                through = page.covered_through(self.present.system_time)?;
+                through = page.covered_through()?;
                 state = "quiescent";
                 break;
             };
@@ -179,7 +180,7 @@ impl OwnedReadSession {
             }
             through = group.revision;
             if page.complete {
-                through = page.covered_through(self.present.system_time)?;
+                through = page.covered_through()?;
                 state = "quiescent";
                 break;
             }
@@ -191,11 +192,13 @@ impl OwnedReadSession {
     /// Reads exact local overlay commits. The archived parent is immutable;
     /// changes on the root after the fork are outside this world's journal.
     pub async fn world_merged_changes(
-        &self, world: rtdb_types::Iid, relations: &[OwnedRelation], after: Timestamp, limit: usize,
+        &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
+        after: Timestamp, through: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
         let (record, _charge) = self.world_registration(world).await?
             .filter(|(record, _)| !record.dropped && self.present.system_time < record.until)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
+        self.require_change_bounds(after, through)?;
         if after < record.basis.system_time {
             return Err(historical_owned_read::below_floor(record.basis.system_time));
         }
@@ -213,7 +216,7 @@ impl OwnedReadSession {
             }
             relation.in_world(world)
         }).collect::<Result<Vec<_>>>()?;
-        let mut page = self.merged_change_journals(&scoped, after, limit, false).await?;
+        let mut page = self.merged_change_journals(&scoped, after, through, limit, false).await?;
         for commit in &mut page.commits {
             for group in &mut commit.changes {
                 group.relation = group.relation.root_relation().ok_or_else(change_feed_uncovered)?;
@@ -230,18 +233,33 @@ impl OwnedReadSession {
         after: Timestamp,
         limit: usize,
     ) -> Result<OwnedMergedChanges> {
+        self.merged_changes_at(relations, after, self.present.system_time, limit).await
+    }
+
+    /// Merges only the certified interval at or below the original held present.
+    pub async fn merged_changes_at(
+        &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
+    ) -> Result<OwnedMergedChanges> {
         if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
             return Err(change_feed_uncovered());
         }
-        self.merged_change_journals(relations, after, limit, false).await
+        self.merged_change_journals(relations, after, through, limit, false).await
     }
 
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
         self.relation_release_guard_for(relations, true)?()
     }
 
+    fn require_change_bounds(&self, after: Timestamp, through: Timestamp) -> Result<()> {
+        if after > through || through > self.present.system_time {
+            return Err(change_feed_uncovered());
+        }
+        Ok(())
+    }
+
     async fn merged_change_journals(
-        &self, relations: &[OwnedRelation], after: Timestamp, limit: usize, from_retained_start: bool,
+        &self, relations: &[OwnedRelation], after: Timestamp, upper: Timestamp,
+        limit: usize, from_retained_start: bool,
     ) -> Result<OwnedMergedChanges> {
         if !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
             || !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len())
@@ -251,6 +269,7 @@ impl OwnedReadSession {
                 "Invalid merged change page bounds",
             ));
         }
+        self.require_change_bounds(after, upper)?;
         self.admit_read().await?;
         for relation in relations.iter().filter(|relation| relation.world().is_none()) {
             self.lifetime_point_policy(relation).await?;
@@ -261,7 +280,7 @@ impl OwnedReadSession {
         let [snapshot] = database.partitions.as_slice() else {
             return Err(change_feed_uncovered());
         };
-        if snapshot.tx_basis() != Some(self.present) || after > self.present.system_time {
+        if snapshot.tx_basis() != Some(self.present) {
             return Err(change_feed_uncovered());
         }
 
@@ -287,12 +306,13 @@ impl OwnedReadSession {
             retained_bytes: initial_bytes,
             _reservations: vec![initial_charge],
             complete: false,
+            upper,
         };
         while page.commits.len() < limit {
             guarded.check_cancelled()?;
             let Some(revision) = journals
                 .iter()
-                .filter(|journal| journal.active())
+                .filter(|journal| journal.active() && journal.next.committed_at <= upper)
                 .map(|journal| journal.next.committed_at)
                 .min()
             else {
@@ -366,7 +386,7 @@ impl OwnedReadSession {
             page.commits.push(OwnedChangeCommit { revision, changes });
         }
         guarded.check_cancelled()?;
-        page.complete = journals.iter().all(|journal| !journal.active());
+        page.complete = journals.iter().all(|journal| !journal.active() || journal.next.committed_at > upper);
         Ok(page)
     }
 
