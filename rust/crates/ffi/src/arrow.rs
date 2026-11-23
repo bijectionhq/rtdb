@@ -82,10 +82,19 @@ pub(crate) fn export_batch(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Res
 pub(crate) fn export_declared_batch(batch: rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
     let reservation = memory.reserve(super::add(schema_bound(batch.declared_schema())?, batch.batch().get_array_memory_size())?)?;
     let schema = export_schema(batch.declared_schema(), memory)?;
+    Ok((export_array(batch, reservation), schema))
+}
+
+pub(crate) fn export_declared_array(batch: rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<FFI_ArrowArray> {
+    let reservation = memory.reserve(super::add(schema_bound(batch.declared_schema())?, batch.batch().get_array_memory_size())?)?;
+    Ok(export_array(batch, reservation))
+}
+
+fn export_array(batch: rtdb_columnar::DeclaredBatch, reservation: Arc<MemoryReservation>) -> FFI_ArrowArray {
     let array = StructArray::from(batch.batch().clone());
     let mut exported = FFI_ArrowArray::new(&array.to_data());
     retain_array(&mut exported, reservation);
-    Ok((exported, schema))
+    exported
 }
 
 struct ArrayLease { private: *mut c_void, release: Option<unsafe extern "C" fn(*mut FFI_ArrowArray)>, _reservation: Arc<MemoryReservation> }

@@ -4617,6 +4617,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
+ "arrow-flight",
  "arrow-schema",
  "parking_lot",
  "rtdb-auth",

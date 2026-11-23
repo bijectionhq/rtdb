@@ -239,6 +239,111 @@ pub unsafe extern "C" fn rtdb_v1_session_await_token(handle: u64, out: *mut u64,
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_set_await_token(handle: u64, operation: u64, token: *const u8, length: usize, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let session = handles::session(handle)?;
+        let _admitted = session.region.enter()?;
+        let cancellation = handles::cancellation(operation, &session)?;
+        let token = optional_text(token, length)?;
+        let _input = session.region.memory().reserve(add(4096, token.map_or(0, str::len))?)?;
+        session.region.run(async {
+            let mut state = session.state.lock();
+            let _control = state.admit_frontend_prepare(&[], &cancellation).await?;
+            state.state_mut().set_await_token(token.map(str::to_owned))
+        })
+    }) }
+}
+
+#[repr(C)]
+pub struct RtdbReadTime { pub text: RtdbSlice, pub seconds: i64, pub nanos: u32, pub kind: u32 }
+
+unsafe fn optional_text<'a>(data: *const u8, length: usize) -> Result<Option<&'a str>> {
+    if data.is_null() && length == 0 { Ok(None) } else { unsafe { text(data, length).map(Some) } }
+}
+
+enum ReadTime<'a> {
+    Text(&'a str),
+    Instant(rtdb_types::Instant),
+    TemporalText { text: &'a str, oid: u32 },
+}
+
+impl<'a> ReadTime<'a> {
+    unsafe fn parse(input: *const RtdbReadTime) -> Result<Option<Self>> {
+        let Some(input) = (unsafe { input.as_ref() }) else { return Ok(None); };
+        Ok(Some(match input.kind {
+            1 => Self::Text(unsafe { text(input.text.data, input.text.length) }?),
+            2 => Self::Instant(rtdb_types::Instant::new(input.seconds, input.nanos)?),
+            3..=5 => Self::TemporalText {
+                text: unsafe { text(input.text.data, input.text.length) }?,
+                oid: match input.kind { 3 => 1082, 4 => 1114, _ => 1184 },
+            },
+            _ => return Err(invalid("Unknown read time kind")),
+        }))
+    }
+
+    fn text_len(&self) -> usize {
+        match self { Self::Text(value) | Self::TemporalText { text: value, .. } => value.len(), Self::Instant(_) => 0 }
+    }
+    fn snapshot(&self, timezone: &str) -> Result<rtdb_types::Timestamp> {
+        match self {
+            Self::Text(value) => rtdb_expr::parse_timestamp(value, timezone),
+            Self::Instant(instant) => instant.as_micros(),
+            Self::TemporalText { text, oid } => rtdb_expr::timestamp_micros(&Self::temporal_value(*oid, text)?, timezone),
+        }
+    }
+    fn clock(&self, timezone: &str) -> Result<rtdb_types::Instant> {
+        match self {
+            Self::Text(value) => rtdb_types::parse_query_clock(value, timezone),
+            Self::Instant(instant) => Ok(*instant),
+            Self::TemporalText { text, oid } => rtdb_expr::query_clock_instant(&Self::temporal_value(*oid, text)?, timezone),
+        }
+    }
+    fn temporal_value(oid: u32, text: &str) -> Result<rtdb_types::Value> {
+        let mut value = rtdb_pg_codec::read_text(oid, text)?;
+        rtdb_columnar::admit_execution_value(&mut value)?;
+        Ok(value)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_set_read_settings(handle: u64, operation: u64, timezone: *const u8, timezone_length: usize,
+    snapshot: *const u8, snapshot_length: usize, snapshot_time: *const RtdbReadTime, clock_time: *const RtdbReadTime, error: *mut u64,
+) -> i32 {
+    use rtdb_node::{AccessSettings, OptionUpdate, ReadOnlySettings, TransactionSettings};
+    unsafe { call(error, || {
+        let session = handles::session(handle)?;
+        let _admitted = session.region.enter()?;
+        let cancellation = handles::cancellation(operation, &session)?;
+        let timezone = optional_text(timezone, timezone_length)?;
+        let snapshot = optional_text(snapshot, snapshot_length)?;
+        let snapshot_time = ReadTime::parse(snapshot_time)?;
+        let clock_time = ReadTime::parse(clock_time)?;
+        let bytes = [timezone.map_or(0, str::len), snapshot.map_or(0, str::len),
+            snapshot_time.as_ref().map_or(0, ReadTime::text_len), clock_time.as_ref().map_or(0, ReadTime::text_len)]
+            .into_iter().try_fold(0, add)?;
+        let _input = session.region.memory().reserve(add(4096, mul(bytes, 4)?)?)?;
+        session.region.run(async {
+            let mut state = session.state.lock();
+            let _control = state.admit_frontend_prepare(&[], &cancellation).await?;
+            let effective_timezone = match timezone {
+                Some(zone) => rtdb_expr::normalize_timezone(zone)?,
+                None => state.state().effective_timezone().to_owned(),
+            };
+            let settings = ReadOnlySettings {
+                snapshot_token: snapshot.map(str::to_owned).map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
+                snapshot_time: snapshot_time.map(|time| time.snapshot(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
+                clock_time: clock_time.map(|time| time.clock(&effective_timezone)).transpose()?.map_or(OptionUpdate::Unchanged, OptionUpdate::Set),
+                ..Default::default()
+            };
+            state.state_mut().set_transaction(TransactionSettings {
+                access: Some(AccessSettings::ReadOnly(settings)),
+                timezone: timezone.map_or(OptionUpdate::Unchanged, |_| OptionUpdate::Set(effective_timezone)),
+            })
+        })
+    }) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_new(session: u64, source: *const u8, length: usize, bulk: u32, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let out = output(out)?; *out = 0;
@@ -321,6 +426,25 @@ pub unsafe extern "C" fn rtdb_v1_session_query_ra(session: u64, operation: u64, 
     })) }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_session_query_ra_arrow(session: u64, operation: u64, plan: *const u8, plan_length: usize,
+    array: *mut FFI_ArrowArray, schema: *mut FFI_ArrowSchema, out: *mut u64, error: *mut u64,
+) -> i32 {
+    unsafe { call(error, || region::with_query_stack(|| {
+        let out = output(out)?; *out = 0;
+        let session = handles::session(session)?;
+        let _admitted = session.region.enter()?;
+        let operation = handles::cancellation(operation, &session)?;
+        let memory = session.region.memory();
+        let _token_storage = memory.reserve(4096)?;
+        let token = operation.child_token();
+        let source = text(plan, plan_length)?;
+        let bound = arrow::import_retained_arguments(output(array)?, output(schema)?, memory)?;
+        let cursor = session.region.run(async { session.state.lock().query_ra_arrow(source, &bound.names, &bound.arguments, &token).await })?;
+        *out = handles::insert(Handle::Cursor(statement::CursorHandle::new(Arc::clone(&session.region), cursor, token)?))?;
+        Ok(())
+    })) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_statement_update(handle: u64, operation: u64, affected: *mut i64, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let out = output(affected)?; *out = -1;
@@ -350,38 +474,68 @@ pub unsafe extern "C" fn rtdb_v1_cursor_next(handle: u64, out_array: *mut FFI_Ar
     }) }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_cursor_next_array(handle: u64, out_array: *mut FFI_ArrowArray, has_batch: *mut u32, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let has_batch = output(has_batch)?; *has_batch = 0;
+        let out_array = output(out_array)?;
+        if out_array.release.is_some() { return Err(invalid("Output Arrow structs are still owned")); }
+        let cursor = handles::cursor(handle)?; let _admitted = cursor.region.enter()?;
+        if let Some(batch) = cursor.next()? {
+            *out_array = arrow::export_declared_array(batch, cursor.region.memory()).inspect_err(|_| cursor.consumer_error())?;
+            *has_batch = 1;
+        }
+        Ok(())
+    }) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_cursor_consumer_error(handle: u64, error: *mut u64) -> i32 { unsafe { call(error, || { handles::cursor(handle)?.consumer_error(); Ok(()) }) } }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_cursor_next_transit(handle: u64, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {
         let out = output(out)?; *out = 0;
-        let cursor = handles::cursor(handle)?; let _admitted = cursor.region.enter()?;
-        if let Some(batch) = cursor.next()? {
-            let encoded = (|| {
-                let memory = cursor.region.memory();
-                let batch = batch.batch();
-                let bound = (0..batch.num_rows()).try_fold(8192usize, |bound, row| {
-                    batch.schema_ref().fields().iter().zip(batch.columns()).try_fold(add(bound, 1024)?, |bound, (field, column)| {
-                        let cell = rtdb_columnar::ArrowCell { field, array: column.as_ref(), row };
-                        add(bound, add(mul(cell.payload_bytes()?, 32)?, add(mul(field.name().len(), 4)?, 2048)?)?)
-                    })
-                })?;
-                let mut reservation = memory.reserve(bound)?;
-                let mut bytes = vec![b'['];
-                for row in 0..batch.num_rows() {
-                    if row > 0 { bytes.push(b','); }
-                    rtdb_format::transit::write_arrow_row_json(&mut bytes, batch, row)?;
-                }
-                bytes.push(b']');
-                if bytes.capacity() > reservation.bytes() { return Err(invalid("Transit result exceeded its allocation bound")); }
-                Arc::get_mut(&mut reservation).expect("cursor encoding owns its reservation").shrink_to(bytes.capacity())?;
-                let value = rtdb_tx::RetainedBytes::with_reservation(bytes, reservation)?;
-                handles::insert(Handle::Bytes(Arc::new(handles::NativeBytes { value, memory: Arc::clone(memory) })))
-            })().inspect_err(|_| cursor.consumer_error())?;
-            *out = encoded;
-        } Ok(())
+        if let Some((handle, _)) = next_row_bytes(handle)? { *out = handle; }
+        Ok(())
     }) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_cursor_next_row_bytes(handle: u64, view: *mut RtdbSlice, out: *mut u64, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let out = output(out)?; *out = 0;
+        let view = output(view)?; *view = RtdbSlice { data: std::ptr::null(), length: 0 };
+        if let Some((handle, slice)) = next_row_bytes(handle)? { *out = handle; *view = slice; }
+        Ok(())
+    }) }
+}
+
+fn next_row_bytes(handle: u64) -> Result<Option<(u64, RtdbSlice)>> {
+    let cursor = handles::cursor(handle)?;
+    let _admitted = cursor.region.enter()?;
+    let Some(batch) = cursor.next()? else { return Ok(None); };
+    (|| {
+        let memory = cursor.region.memory();
+        let batch = batch.batch();
+        let bound = (0..batch.num_rows()).try_fold(8192usize, |bound, row| {
+            batch.schema_ref().fields().iter().zip(batch.columns()).try_fold(add(bound, 1024)?, |bound, (field, column)| {
+                let cell = rtdb_columnar::ArrowCell { field, array: column.as_ref(), row };
+                add(bound, add(mul(cell.payload_bytes()?, 32)?, add(mul(field.name().len(), 4)?, 2048)?)?)
+            })
+        })?;
+        let mut reservation = memory.reserve(bound)?;
+        let mut bytes = vec![b'['];
+        for row in 0..batch.num_rows() {
+            if row > 0 { bytes.push(b','); }
+            rtdb_format::transit::write_arrow_row_json(&mut bytes, batch, row)?;
+        }
+        bytes.push(b']');
+        if bytes.capacity() > reservation.bytes() { return Err(invalid("Transit result exceeded its allocation bound")); }
+        Arc::get_mut(&mut reservation).expect("cursor encoding owns its reservation").shrink_to(bytes.capacity())?;
+        let value = rtdb_tx::RetainedBytes::with_reservation(bytes, reservation)?;
+        let slice = RtdbSlice { data: value.as_ref().as_ptr(), length: value.as_ref().len() };
+        let handle = handles::insert(Handle::Bytes(Arc::new(handles::NativeBytes { value, memory: Arc::clone(memory) })))?;
+        Ok(Some((handle, slice)))
+    })().inspect_err(|_| cursor.consumer_error())
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_bytes(handle: u64, out: *mut RtdbSlice, error: *mut u64) -> i32 {

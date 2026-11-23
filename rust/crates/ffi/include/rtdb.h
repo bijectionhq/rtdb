@@ -118,9 +118,18 @@ int32_t rtdb_v1_cancel(RtdbHandle operation_or_cursor, RtdbHandle *error);
 
 /* Actions: 0 autocommit off, 1 on, 2 begin, 3 ADBC commit, 4 ADBC rollback,
  * 5 commit sync, 6 commit async, 7 rollback transaction.
- * SET TRANSACTION and other session settings execute through statements.
  */
 int32_t rtdb_v1_session_action(RtdbHandle session, RtdbHandle operation, uint32_t action, RtdbHandle *error);
+
+/* A null token clears the await token. Null read options leave their settings unchanged. */
+int32_t rtdb_v1_session_set_await_token(RtdbHandle session, RtdbHandle operation, const uint8_t *token, size_t length, RtdbHandle *error);
+typedef struct RtdbReadTime {
+    RtdbSlice text;
+    int64_t seconds;
+    uint32_t nanos;
+    uint32_t kind; /* 1: SQL time text, 2: epoch parts, 3: local date, 4: local date-time, 5: zoned date-time */
+} RtdbReadTime;
+int32_t rtdb_v1_session_set_read_settings(RtdbHandle session, RtdbHandle operation, const uint8_t *timezone, size_t timezone_length, const uint8_t *snapshot_token, size_t snapshot_length, const RtdbReadTime *snapshot_time, const RtdbReadTime *clock_time, RtdbHandle *error);
 
 /* bulk=0: SQL source; bulk=1: CREATE_APPEND table name.
  * A bind replaces existing arguments, preserves ordinal positions and explicit zero-row batches.
@@ -150,6 +159,8 @@ int32_t rtdb_v1_statement_query(RtdbHandle statement, RtdbHandle operation, Rtdb
 int32_t rtdb_v1_statement_update(RtdbHandle statement, RtdbHandle operation, int64_t *affected, RtdbHandle *error);
 int32_t rtdb_v1_cursor_schema(RtdbHandle cursor, struct ArrowSchema *out, RtdbHandle *error);
 int32_t rtdb_v1_cursor_next(RtdbHandle cursor, struct ArrowArray *array, struct ArrowSchema *schema, uint32_t *has_batch, RtdbHandle *error);
+/* Uses the fixed schema returned by rtdb_v1_cursor_schema for every batch. */
+int32_t rtdb_v1_cursor_next_array(RtdbHandle cursor, struct ArrowArray *array, uint32_t *has_batch, RtdbHandle *error);
 int32_t rtdb_v1_cursor_consumer_error(RtdbHandle cursor, RtdbHandle *error);
 
 /* Transit row export returns an owned byte handle, or 0 at end-of-stream.
@@ -159,10 +170,14 @@ int32_t rtdb_v1_cursor_consumer_error(RtdbHandle cursor, RtdbHandle *error);
  * its result is an owned Transit JSON transaction-key byte handle.
  */
 int32_t rtdb_v1_cursor_next_transit(RtdbHandle cursor, RtdbHandle *out, RtdbHandle *error);
+/* The byte view is valid until the returned byte handle is released. */
+int32_t rtdb_v1_cursor_next_row_bytes(RtdbHandle cursor, RtdbSlice *view, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_bytes(RtdbHandle bytes, RtdbSlice *out, RtdbHandle *error);
 int32_t rtdb_v1_session_transact(RtdbHandle session, RtdbHandle operation, const uint8_t *request, size_t length, RtdbHandle *out, RtdbHandle *error);
 /* The plan is an EDN logical relation. Arguments are a Transit MessagePack map of named values. */
 int32_t rtdb_v1_session_query_ra(RtdbHandle session, RtdbHandle operation, const uint8_t *plan, size_t plan_length, const uint8_t *arguments, size_t arguments_length, RtdbHandle *out, RtdbHandle *error);
+/* Takes one Arrow row with unique named fields under the retained bind ownership contract. */
+int32_t rtdb_v1_session_query_ra_arrow(RtdbHandle session, RtdbHandle operation, const uint8_t *plan, size_t plan_length, struct ArrowArray *arguments, struct ArrowSchema *schema, RtdbHandle *out, RtdbHandle *error);
 
 /* Metadata JSON: kind 0=getInfo, 1=getTableTypes, 2=getObjects, 3=getTableSchema.
  * Optional fields: info_codes, catalog, schema, table, column, table_types.

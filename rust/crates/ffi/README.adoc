@@ -59,7 +59,8 @@ Bind imports consume valid Arrow structs and copy values into native ownership b
 The caller may then close its original vectors and allocator.
 Immutable producers can call `rtdb_v1_statement_bind_retained` to transfer the C Data buffers without a snapshot copy.
 Those buffers must stay immutable and the producer must support release callbacks on any thread until the last native batch drops.
-The Java ADBC adapter exports through the allocator of the supplied vectors and normalizes batches whose columns belong to different allocator roots.
+The Java ADBC adapter takes one private Arrow buffer copy in the connection allocator and transfers it through the retained bind.
+The caller may close the source vectors and their allocators as soon as binding returns.
 Decimal C formats carry true signed 32-bit precision and scale for all four coefficient widths.
 Native carrier metadata is absent from exports and rejected on imports.
 Replacement C format strings share each schema child's retained release owner, so moving a child out of its parent preserves both its format and reservation.
@@ -69,6 +70,7 @@ ADBC query schema requests acquire a preparation context for each call and repor
 Result schema inference releases its temporary vector of unknown parameter types and the vector's reservation before converting result fields to Arrow.
 DML result schema requests return an empty schema without acquiring that context.
 ADBC cursor schemas retain the advertised result layout.
+Java ADBC imports that schema once per stream, then loads array-only exports into the existing result root.
 Each runtime page passes through the passive `rtdb-columnar::DeclaredBatch` adapter before C export, following `ResultCursor.toArrowReader` and `ConformingUnloader`.
 Present NULL vectors acquire the target physical layout while the exported schema preserves its advertised nullability flags.
 The Rust batch retains nullable physical fields and uses checked Arrow constructors.
@@ -85,16 +87,17 @@ If that budget is exhausted, diagnostic identity `1` reports the reporting failu
 
 == Transit client bridge
 
-The Clojure adapter binds positional rows using Transit MessagePack and consumes bounded batches using Transit JSON.
-The bridge constructs the Transit value tree from admitted cells and serializes each result once.
+The Clojure adapter binds positional SQL rows using Transit MessagePack and can bind named logical-relation parameters through C Data.
+The embedded row cursor writes Transit JSON from the admitted Arrow cells and lends the bytes to the Clojure reader until that batch finishes decoding.
 Result documents use the private `rtdb/struct` tag, allowing the adapter to apply its selected key function to document fields while preserving ordinary map keys.
 Null document fields are omitted and narrow integer/float values retain their Transit tags, matching `RelationReader.toMaps` and `StructVector.getObject0`.
+The legacy C Transit cursor still returns the same owned-byte-handle interface.
 Autonomous transaction requests carry operations, options and the asynchronous flag explicitly.
 Absent SQL arguments and a present empty row batch remain distinct.
 
 == Source verification
 
-The crate and JVM adapter have not been compiled or executed.
+The native regressions exercise the C Data and Transit entry points directly.
 Test source covers released identities, duplicate unnamed arguments, copied foreign binds, retained Arrow batches after parent close, idempotent Arrow release callbacks, independent stream cancellation and concurrent shutdown.
 Decimal fixtures cover signed-parameter import/export, reserved-key rejection and detached schema-child lifetimes.
 JVM and Clojure fixtures retain the upstream `AdbcTest` and `api-adbc-test` case identities.

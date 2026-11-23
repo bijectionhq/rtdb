@@ -4027,6 +4027,33 @@ impl NativeSession {
         let _container = context.memory.reserve(container_bytes)?;
         query.execute_pages(context, arguments.into_values().collect()).await
     }
+
+    pub async fn query_ra_arrow(&mut self, source: &str, names: &[String], arguments: &rtdb_tx::SqlArguments, cancellation: &CancellationToken) -> Result<QueryCursor> {
+        let batch = arguments.single_arrow_page().filter(|batch| batch.batch().num_rows() == 1)
+            .ok_or_else(|| Anomaly::incorrect("rtdb.query/parameter-row", "Logical relation arguments require one Arrow row"))?;
+        let database = self.state.database().to_owned();
+        let context = self.query_context_for(&database, cancellation).await?;
+        let overflow = || Anomaly::incorrect("rtdb.query/parameter-size", "Logical relation parameter metadata exceeds addressable memory");
+        let per_name = std::mem::size_of::<(String, (usize, LogicalType))>() * 16 + 256;
+        let metadata_bytes = names.iter().zip(arguments.types()).try_fold(4096usize, |total, (name, ty)| {
+            let names = name.len().checked_mul(4).ok_or_else(overflow)?;
+            let types = ty.retained_bytes()?.checked_mul(16).ok_or_else(overflow)?;
+            total.checked_add(per_name).and_then(|bytes| bytes.checked_add(names))
+                .and_then(|bytes| bytes.checked_add(types)).ok_or_else(overflow)
+        })?;
+        let _metadata = context.memory.reserve(metadata_bytes)?;
+        let named_parameters = names.iter().cloned().zip(arguments.execution_types()).enumerate()
+            .map(|(index, (name, ty))| (name, (index, ty))).collect::<BTreeMap<_, _>>();
+        if named_parameters.len() != names.len() || names.len() != batch.batch().num_columns() {
+            return Err(Anomaly::incorrect("rtdb.query/parameter-row", "Logical relation arguments require unique column names"));
+        }
+        let options = rtdb_xtql::CompileOptions { named_parameters, default_timezone: context.timezone.clone(), ..Default::default() };
+        let prepared = rtdb_xtql::compile_ra_in(source, &context.catalog, &options, &context.memory)?;
+        let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
+        drop(options);
+        drop(_metadata);
+        query.execute_arrow_pages(context, batch.clone(), arguments.types()).await
+    }
 }
 
 pub(crate) struct NativeSessionService {

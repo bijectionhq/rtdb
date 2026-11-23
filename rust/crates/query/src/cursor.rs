@@ -152,9 +152,19 @@ impl PreparedQuery {
     }
 
     pub async fn execute_arrow_column_rows(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
+        let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
             Box::pin(self.open_arrow(context, batch, row, types, text, Batching::ColumnRows))
+        });
+        measured_open(retention, open).await
+    }
+
+    pub async fn execute_arrow_pages(&self, context: Arc<QueryContext>, batch: OwnedBatch, types: &[LogicalType]) -> Result<QueryCursor> {
+        let context = context.with_plaintext();
+        let retention = Arc::clone(&context);
+        let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+            Box::pin(self.open_arrow(context, batch, 0, types, None, Batching::Pages))
         });
         measured_open(retention, open).await
     }

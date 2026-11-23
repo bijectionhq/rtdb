@@ -66,6 +66,17 @@
            (xt/q node "SELECT a_b FROM docs" {:key-fn :snake-case-string})))
     (is (= 1 (reduce (fn [n _] (reduced (inc n))) 0 (xt/plan-q node "SELECT * FROM docs"))))))
 
+(deftest native-row-stream-preserves-typed-leaves-and-nested-field-names
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (let [day (java.time.LocalDate/parse "2025-01-02")
+          uuid (java.util.UUID/fromString "2a8e228f-d18b-41be-998b-7d8d8658512e")]
+      (xt/execute-tx node [[:put-docs :docs {:xt/id 1, :nested {:a-b (float -0.0) :missing nil :day day :uuid uuid}}]])
+      (let [[{"nested" nested}] (xt/q node "SELECT nested FROM docs" {:key-fn :snake-case-string})]
+        (is (= {"a_b" (float -0.0), "day" day, "uuid" uuid} nested))
+        (is (instance? Float (get nested "a_b")))
+        (is (= Integer/MIN_VALUE (Float/floatToRawIntBits (get nested "a_b"))))))))
+
 (deftest api-adbc-test-native-connection-await-and-database-rejection
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)

@@ -16,7 +16,9 @@
 -- The native pgwire protocol state is in rust/crates/pgwire/src/protocol.rs.
 -- Native Flight SQL handles and captured-basis execution are in rust/crates/flight-sql/src/{state,lease,execute,actions}.rs.
 -- Native embedded ADBC and Clojure adapters are in rust/crates/ffi and bindings/jvm.
--- Embedded ADBC copies bound Arrow buffers into native allocations and releases the foreign buffers before returning.
+-- The copying C Data bind gives embedded ADBC independent native buffers and releases the supplied Arrow data before returning.
+-- Embedded JVM ADBC owns an independent copy of bound Arrow buffers before it lends them to the native statement.
+-- Its result reader imports the stream schema once and reuses it for each Arrow array.
 -- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
 -- Scalar evaluation reads a bound parameter from its Arrow column when the expression reaches it.
 -- A prepared Flight SQL query binds the first row of a multi-row parameter batch for the streaming cursor.
@@ -32,6 +34,7 @@
 -- A computed EXECUTE expression can bind a selected floating-point list from Arrow or use the packed child of a compatible expression result.
 -- A prepared embedded ADBC query that only projects compatible bindings uses the Arrow columns of its single argument row.
 -- The embedded logical relation entry point captures the same connection read basis as a SQL query.
+-- Embedded logical relations can bind a single typed Arrow row by field name.
 -- Logical relation cursors expose the root operator's pages as separate batches.
 -- Native SQL, XTQL, and logical relation execution opens Arrow batches for the root operator.
 -- Semantic pages remain Arrow batches through downstream operators and transport batching.
@@ -44,11 +47,13 @@
 -- A pgwire portal can encode numeric coefficients, standard PostgreSQL arrays, and structured JSON, JSON-LD, and Transit results from their Arrow cells.
 -- Pgwire accepts one-dimensional real and double precision arrays with nullable elements in text and binary format.
 -- Pgwire emits floating-point list results from Arrow components with PostgreSQL array framing.
--- The embedded Transit row cursor writes the typed wire representation from Arrow cell positions.
 -- Transit JSON and MessagePack readers collect floating-point components in typed buffers and resolve tags and cache references in wire order.
 -- Embedded Transit SQL binds and transaction arguments retain compatible parameters in Arrow with the row writer's source layout.
 -- Embedded Transit deletes and erases bind string, keyword, UUID and signed integer IDs from typed Arrow columns.
 -- A mixed ID column retains the ID types in the order they first appear in the request.
+-- An embedded Clojure cursor writes Transit leaves from Arrow cell positions and lends the encoded batch to the row reader for the duration of decoding.
+-- Clojure callers can set the connection await token and the read-only transaction settings through typed session calls.
+-- Embedded ADBC metadata builds its catalog, schema, table, and column arrays with the declared ADBC field order and list validity.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
 -- The authenticated session and original attachment authorize redemption of its ticket.

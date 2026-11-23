@@ -27,6 +27,7 @@ rtdb-format.workspace = true
 rtdb-expr.workspace = true
 rtdb-pg-codec.workspace = true
 arrow-array.workspace = true
+arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }
 arrow-schema.workspace = true
 arrow-data.workspace = true
 arrow-buffer.workspace = true

@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
-use arrow_array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UnionArray, new_empty_array};
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UnionArray, builder::{ArrayBuilder, Int32Builder, StringBuilder}, new_empty_array, new_null_array};
+use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
+use arrow_flight::{error::FlightError, sql::CommandGetTableTypes};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
-use rtdb_columnar::{OwnedBatch, build_array, from_field, to_field};
+use rtdb_columnar::{OwnedBatch, from_field, to_field};
 use rtdb_expr::{EvalContext, evaluate};
 use rtdb_plan::Expr;
 use rtdb_types::{Result, Value};
@@ -27,22 +28,33 @@ pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, reque
         let _fixed = region.memory().reserve(131_072)?;
         match request.kind {
             0 => info(request.info_codes.as_deref(), region.memory()),
-            1 => rows(Schema::new(vec![Field::new("table_type", DataType::Utf8, false)]), vec![vec![Value::Utf8("TABLE".into())]], region.memory()),
+            1 => {
+                let mut builder = CommandGetTableTypes {}.into_builder();
+                let reservation = metadata_reservation(builder.schema().as_ref(), region.memory())?;
+                builder.append("TABLE");
+                let batch = builder.build().map_err(|error| match error {
+                    FlightError::Arrow(error) => arrow_error(error),
+                    error => rtdb_types::Anomaly::incorrect("rtdb.ffi/arrow", error.to_string()),
+                })?;
+                OwnedBatch::with_reservation(batch, reservation)
+            }
             2 | 3 => {
                 let context = session_state.query_context_with(&token, false).await?;
                 if request.kind == 3 {
                     let database = request.catalog.as_deref().unwrap_or_else(|| session_state.state().database());
-                    if context.catalog.database(database).is_err() { return rows(Schema::empty(), Vec::new(), region.memory()); }
+                    if context.catalog.database(database).is_err() { return empty(Schema::empty(), region.memory()); }
                     let table = request.table.as_deref().ok_or_else(|| crate::invalid("Table schema requires a table name"))?;
                     let tables = context.catalog.tables_reserved(database, region.memory())?;
                     let binding = tables.rows().iter().find(|binding| binding.name.table.schema == request.schema.as_deref().unwrap_or("public") && binding.name.table.table == table);
                     let bound = binding.map(|binding| binding.columns.iter().try_fold(8192, |bytes, (name, ty)| crate::add(bytes, crate::mul(crate::add(name.len(), ty.retained_bytes()?)?, 16)?))).transpose()?.unwrap_or(8192);
                     let _schema_charge = region.memory().reserve(bound)?;
                     let fields = binding.map(|binding| binding.columns.iter().map(|(name, ty)| to_field(name, ty)).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
-                    return rows(Schema::new(fields), Vec::new(), region.memory());
+                    return empty(Schema::new(fields), region.memory());
                 }
                 if request.depth > 3 { return Err(crate::invalid("Metadata depth must be ALL, CATALOGS, DB_SCHEMAS or TABLES")); }
-                let mut output = Vec::new();
+                let schema = Arc::new(objects_schema());
+                let mut reservation = metadata_reservation(&schema, region.memory())?;
+                let mut output = Objects::default();
                 let mut charges = Vec::new();
                 for database in context.catalog.database_names() {
                     context.check_cancelled()?;
@@ -54,31 +66,48 @@ pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, reque
                         for (name, ty) in &table.columns { bound = crate::add(bound, crate::add(8192, crate::mul(crate::add(name.len(), ty.retained_bytes()?)?, 8)?)?)?; }
                     }
                     charges.push(region.memory().reserve(bound)?);
-                    let schemas = if request.depth == 1 { Value::Null } else {
-                        let mut schemas = BTreeMap::<String, Vec<Value>>::new();
+                    let schemas_before = output.schema_names.len();
+                    if request.depth != 1 {
+                        let mut schemas = BTreeMap::<&str, Vec<_>>::new();
                         if request.table_types.as_ref().is_none_or(|types| types.iter().any(|ty| ty == "TABLE")) {
                             for table in tables.rows() {
                                 if !matches_pattern(&table.name.table.schema, request.schema.as_deref(), &context)? || !matches_pattern(&table.name.table.table, request.table.as_deref(), &context)? { continue; }
-                                let mut columns = Vec::new();
-                                if request.depth == 0 {
-                                    for name in table.columns.keys() {
-                                        if matches_pattern(name, request.column.as_deref(), &context)? {
-                                            columns.push(object([("column_name", Value::Utf8(name.clone())), ("ordinal_position", Value::I32(i32::try_from(columns.len() + 1).map_err(|_| crate::invalid("Column count exceeds i32"))?))]));
-                                        }
-                                    }
-                                    if columns.is_empty() { continue; }
-                                }
-                                schemas.entry(table.name.table.schema.clone()).or_default().push(object([
-                                    ("table_name", Value::Utf8(table.name.table.table.clone())), ("table_type", Value::Utf8("TABLE".into())),
-                                    ("table_columns", if request.depth == 0 { Value::list(columns) } else { Value::Null }),
-                                ]));
+                                schemas.entry(&table.name.table.schema).or_default().push(table);
                             }
                         }
-                        Value::list(schemas.into_iter().map(|(name, tables)| object([("db_schema_name", Value::Utf8(name)), ("db_schema_tables", if request.depth == 2 { Value::Null } else { Value::list(tables) })])).collect())
-                    };
-                    output.push(vec![Value::Utf8(database.into()), schemas]);
+                        for (name, tables) in schemas {
+                            let tables_before = output.table_names.len();
+                            if request.depth != 2 {
+                                for table in tables {
+                                    let mut columns = 0;
+                                    if request.depth == 0 {
+                                        for name in table.columns.keys() {
+                                            if matches_pattern(name, request.column.as_deref(), &context)? {
+                                                columns += 1;
+                                                output.column_names.append_value(name);
+                                                output.ordinals.append_value(i32::try_from(columns).map_err(|_| crate::invalid("Column count exceeds i32"))?);
+                                            }
+                                        }
+                                        if columns == 0 { continue; }
+                                    }
+                                    output.table_names.append_value(&table.name.table.table);
+                                    output.table_types.append_value("TABLE");
+                                    output.table_columns.append((request.depth == 0).then_some(columns))?;
+                                }
+                            }
+                            let count = output.table_names.len() - tables_before;
+                            if request.depth == 0 && count == 0 { continue; }
+                            output.schema_names.append_value(name);
+                            output.schema_tables.append((request.depth != 2).then_some(count))?;
+                        }
+                    }
+                    output.catalog_names.append_value(database);
+                    output.catalog_schemas.append((request.depth != 1).then_some(output.schema_names.len() - schemas_before))?;
                 }
-                rows(objects_schema(), output, region.memory())
+                let batch = output.finish(schema)?;
+                let bytes = reservation.bytes().max(batch.get_array_memory_size());
+                Arc::get_mut(&mut reservation).expect("metadata owns its reservation").grow_to(bytes)?;
+                OwnedBatch::with_reservation(batch, reservation)
             }
             _ => Err(crate::invalid("Unknown metadata request kind")),
         }
@@ -93,7 +122,6 @@ fn matches_pattern(value: &str, pattern: Option<&str>, context: &rtdb_query::Que
     let expr = Expr::Like { expr: Box::new(Expr::Literal(Value::Utf8(value.into()))), pattern: Box::new(Expr::Literal(Value::Utf8(pattern.into()))), escape: Some('\\'), case_insensitive: false, negated: false };
     Ok(evaluate(&expr, &Default::default(), &[], &EvalContext { parameters: rtdb_expr::Parameters::Values(&[]), parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: Some(&context.catalog) })? == Value::Bool(true))
 }
-fn object<const N: usize>(entries: [(&str, Value); N]) -> Value { Value::Struct(entries.into_iter().map(|(key, value)| (key.into(), value)).collect()) }
 fn list(name: &str, children: Vec<Field>) -> Field { Field::new(name, DataType::List(Arc::new(Field::new("item", DataType::Struct(children.into()), true))), true) }
 pub(crate) fn objects_schema() -> Schema {
     let usage = vec![Field::new("fk_catalog", DataType::Utf8, true), Field::new("fk_db_schema", DataType::Utf8, true), Field::new("fk_table", DataType::Utf8, false), Field::new("fk_column_name", DataType::Utf8, false)];
@@ -123,28 +151,73 @@ fn info(codes: Option<&[u32]>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Res
     let schema = Schema::new(vec![Field::new("info_name", DataType::UInt32, false), Field::new("info_value", DataType::Union(union_fields, UnionMode::Dense), true)]);
     OwnedBatch::with_reservation(RecordBatch::try_new(Arc::new(schema), vec![Arc::new(UInt32Array::from(entries.iter().map(|(code, _)| *code).collect::<Vec<_>>())), Arc::new(union)]).map_err(arrow_error)?, reservation)
 }
-fn rows(schema: Schema, rows: Vec<Vec<Value>>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<OwnedBatch> {
-    let mut bound = crate::arrow::schema_bound(&schema)?;
-    for (index, field) in schema.fields().iter().enumerate() {
-        bound = crate::add(bound, rtdb_columnar::estimate_builder_bytes_refs(&from_field(field)?, rows.iter().map(|row| &row[index]))?)?;
+fn metadata_reservation(schema: &Schema, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
+    let mut bound = crate::arrow::schema_bound(schema)?;
+    for field in schema.fields() {
+        bound = crate::add(bound, rtdb_columnar::estimate_builder_bytes_refs(&from_field(field)?, std::iter::empty())?)?;
     }
-    let reservation = memory.reserve(crate::mul(bound, 4)?)?;
-    let arrays = schema.fields().iter().enumerate().map(|(index, field)| exact_array(field, &rows.iter().map(|row| row[index].clone()).collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?;
-    let batch = RecordBatch::try_new_with_options(Arc::new(schema), arrays, &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows.len()))).map_err(arrow_error)?;
-    OwnedBatch::with_reservation(batch, reservation)
+    memory.reserve(crate::mul(bound, 4)?)
 }
-fn exact_array(field: &Field, values: &[Value]) -> Result<ArrayRef> {
-    match field.data_type() {
-        DataType::Struct(fields) => {
-            let arrays = fields.iter().map(|field| exact_array(field, &values.iter().map(|value| match value { Value::Struct(value) => value.get(field.name()).cloned().unwrap_or(Value::Null), _ => Value::Null }).collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), arrays, validity(values), values.len()).map_err(arrow_error)?))
-        }
-        DataType::List(child) => {
-            let mut offsets = vec![0i32]; let mut flattened = Vec::new();
-            for value in values { if let Value::List(children) = value { flattened.extend(children.iter().map(std::borrow::Cow::into_owned)); } offsets.push(i32::try_from(flattened.len()).map_err(|_| crate::invalid("Metadata list exceeds i32"))?); }
-            Ok(Arc::new(ListArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), exact_array(child, &flattened)?, validity(values)).map_err(arrow_error)?))
-        }
-        _ => build_array(&from_field(&field.clone().with_nullable(true))?, values),
+
+fn empty(schema: Schema, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<OwnedBatch> {
+    let reservation = metadata_reservation(&schema, memory)?;
+    OwnedBatch::with_reservation(RecordBatch::new_empty(Arc::new(schema)), reservation)
+}
+
+#[derive(Default)]
+struct Objects {
+    catalog_names: StringBuilder,
+    schema_names: StringBuilder,
+    table_names: StringBuilder,
+    table_types: StringBuilder,
+    column_names: StringBuilder,
+    ordinals: Int32Builder,
+    catalog_schemas: ListOffsets,
+    schema_tables: ListOffsets,
+    table_columns: ListOffsets,
+}
+
+impl Objects {
+    fn finish(mut self, schema: Arc<Schema>) -> Result<RecordBatch> {
+        let schemas = struct_fields(schema.field(1));
+        let tables = struct_fields(&schemas[1]);
+        let columns = struct_fields(&tables[2]);
+        let column_count = self.column_names.len();
+        let mut column_arrays = vec![Arc::new(self.column_names.finish()) as ArrayRef, Arc::new(self.ordinals.finish())];
+        column_arrays.extend(columns[2..].iter().map(|field| new_null_array(field.data_type(), column_count)));
+        let columns = self.table_columns.finish(&tables[2], column_arrays)?;
+        let constraints = new_null_array(tables[3].data_type(), self.table_names.len());
+        let tables = self.schema_tables.finish(&schemas[1], vec![Arc::new(self.table_names.finish()), Arc::new(self.table_types.finish()), columns, constraints])?;
+        let schemas = self.catalog_schemas.finish(schema.field(1), vec![Arc::new(self.schema_names.finish()), tables])?;
+        RecordBatch::try_new(schema, vec![Arc::new(self.catalog_names.finish()), schemas]).map_err(arrow_error)
     }
 }
-fn validity(values: &[Value]) -> Option<NullBuffer> { values.iter().any(|value| matches!(value, Value::Null)).then(|| NullBuffer::from(values.iter().map(|value| !matches!(value, Value::Null)).collect::<Vec<_>>())) }
+
+struct ListOffsets { offsets: Vec<i32>, validity: NullBufferBuilder }
+
+impl Default for ListOffsets {
+    fn default() -> Self { Self { offsets: vec![0], validity: NullBufferBuilder::new(0) } }
+}
+
+impl ListOffsets {
+    fn append(&mut self, count: Option<usize>) -> Result<()> {
+        let count_i32 = i32::try_from(count.unwrap_or(0)).ok();
+        let offset = count_i32.and_then(|count| self.offsets.last().unwrap().checked_add(count))
+            .ok_or_else(|| crate::invalid("Metadata list exceeds i32"))?;
+        self.offsets.push(offset);
+        self.validity.append(count.is_some());
+        Ok(())
+    }
+
+    fn finish(mut self, field: &Field, columns: Vec<ArrayRef>) -> Result<ArrayRef> {
+        let DataType::List(child) = field.data_type() else { unreachable!() };
+        let entries = StructArray::try_new(struct_fields(field).clone(), columns, None).map_err(arrow_error)?;
+        Ok(Arc::new(ListArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(self.offsets)), Arc::new(entries), self.validity.finish()).map_err(arrow_error)?))
+    }
+}
+
+fn struct_fields(list: &Field) -> &arrow_schema::Fields {
+    let DataType::List(child) = list.data_type() else { unreachable!() };
+    let DataType::Struct(fields) = child.data_type() else { unreachable!() };
+    fields
+}

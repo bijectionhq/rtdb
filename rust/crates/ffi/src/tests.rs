@@ -959,3 +959,130 @@ fn adbc_set_reaches_a_bound_arrow_list_with_null_components() {
     let show = native.statement("SHOW TIME ZONE");
     assert_eq!(native.query_value(show, operation), rtdb_types::Value::Utf8("Europe/Paris".into()));
 }
+
+#[test]
+fn jvm_arrow_logical_query_reuses_schema_and_preserves_semantic_pages() {
+    use arrow_array::Float32Array;
+
+    let mut native = Native::open();
+    let operation = native.operation();
+    let memory = Arc::clone(handles::database(native.database).unwrap().0.memory());
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("parameter", DataType::Float32, false)])),
+        vec![Arc::new(Float32Array::from(vec![-0.0]))]).unwrap();
+    let (mut input, mut schema) = arrow::export_batch(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let plan = b"[:project {:projections [{v ?parameter}]} [:literal-pages {:pages [[{:a 1}] [] [{:a 2} {:a 3}]]}]]";
+    let (mut cursor, mut error) = (0, 0);
+    ok(unsafe { rtdb_v1_session_query_ra_arrow(native.session, operation, plan.as_ptr(), plan.len(), &mut input, &mut schema, &mut cursor, &mut error) }, error);
+    native.retained.push(cursor);
+    assert!(input.release.is_none());
+    assert!(schema.release.is_none());
+    let mut result_schema = FFI_ArrowSchema::empty();
+    ok(unsafe { rtdb_v1_cursor_schema(cursor, &mut result_schema, &mut error) }, error);
+    assert_eq!(Field::try_from(result_schema.child(0)).unwrap().data_type(), &DataType::Float32);
+    for expected in [1, 0, 2] {
+        let mut array = FFI_ArrowArray::empty();
+        let mut present = 0;
+        ok(unsafe { rtdb_v1_cursor_next_array(cursor, &mut array, &mut present, &mut error) }, error);
+        assert_eq!(present, 1);
+        let rows = StructArray::from(unsafe { from_ffi(array, &result_schema) }.unwrap());
+        assert_eq!(rows.len(), expected);
+        let values = rows.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+        assert!(values.values().iter().all(|value| value.to_bits() == (-0.0f32).to_bits()));
+    }
+    let mut present = 1;
+    ok(unsafe { rtdb_v1_cursor_next_array(cursor, &mut input, &mut present, &mut error) }, error);
+    assert_eq!(present, 0);
+}
+
+#[test]
+fn jvm_row_bytes_borrow_the_owned_legacy_transit_encoding() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let statement = native.statement("SELECT CAST(-0.25 AS REAL) AS number, CAST('2024-07-13' AS DATE) AS day");
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_statement_prepare(statement, operation, &mut error) }, error);
+    let cursor = native.query(statement, operation);
+    let legacy_cursor = native.query(statement, operation);
+    let (mut handle, mut legacy_handle) = (0, 0);
+    let mut view = RtdbSlice { data: std::ptr::null(), length: 0 };
+    ok(unsafe { rtdb_v1_cursor_next_row_bytes(cursor, &mut view, &mut handle, &mut error) }, error);
+    native.retained.push(handle);
+    ok(unsafe { rtdb_v1_cursor_next_transit(legacy_cursor, &mut legacy_handle, &mut error) }, error);
+    native.retained.push(legacy_handle);
+    let mut owned = view;
+    let mut legacy = view;
+    ok(unsafe { rtdb_v1_bytes(handle, &mut owned, &mut error) }, error);
+    ok(unsafe { rtdb_v1_bytes(legacy_handle, &mut legacy, &mut error) }, error);
+    assert_eq!((owned.data, owned.length), (view.data, view.length));
+    ok(unsafe { rtdb_v1_close(cursor, &mut error) }, error);
+    let actual = unsafe { bytes(view.data, view.length) }.unwrap();
+    assert_eq!(actual, unsafe { bytes(legacy.data, legacy.length) }.unwrap());
+    assert_eq!(actual, br#"[["~#rtdb/struct",["^ ","number",["~#f32",-0.25],"day",["~#time/date","2024-07-13"]]]]"#);
+}
+
+#[test]
+fn jvm_read_settings_set_the_transaction_basis_and_await_token_directly() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let token = rtdb_format::basis::encode_tx_basis(&rtdb_types::TxBasis::default());
+    let mut error = 0;
+    ok(unsafe { rtdb_v1_session_set_await_token(native.session, operation, token.as_ptr(), token.len(), &mut error) }, error);
+    let session = handles::session(native.session).unwrap();
+    assert_eq!(session.state.lock().state().effective_await_token(), Some(token.as_str()));
+    ok(unsafe { rtdb_v1_session_action(native.session, operation, 2, &mut error) }, error);
+    let zone = b"Europe/Paris";
+    let snapshot = b"2025-01-01T12:03:04.123456789";
+    let snapshot = RtdbReadTime { text: RtdbSlice { data: snapshot.as_ptr(), length: snapshot.len() }, seconds: 0, nanos: 0, kind: 1 };
+    let clock = RtdbReadTime { text: RtdbSlice { data: std::ptr::null(), length: 0 }, seconds: -1, nanos: 999_999_999, kind: 2 };
+    ok(unsafe { rtdb_v1_session_set_read_settings(native.session, operation, zone.as_ptr(), zone.len(), std::ptr::null(), 0,
+        &snapshot, &clock, &mut error) }, error);
+    let basis = session.region.run(async { session.state.lock().state_mut().read_basis().await }).unwrap();
+    assert_eq!(basis.timezone, "Europe/Paris");
+    assert_eq!(basis.current_time, rtdb_types::Instant::new(-1, 999_999_999).unwrap());
+    assert_eq!(basis.snapshot_time, Some(Timestamp(1_735_729_384_123_456)));
+    ok(unsafe { rtdb_v1_session_action(native.session, operation, 7, &mut error) }, error);
+    ok(unsafe { rtdb_v1_session_set_await_token(native.session, operation, std::ptr::null(), 0, &mut error) }, error);
+    assert!(session.state.lock().state().effective_await_token().is_none());
+}
+
+#[test]
+fn jvm_adbc_metadata_distinguishes_null_and_empty_nested_lists() {
+    use arrow_array::{Int32Array, ListArray, StringArray};
+
+    let mut native = Native::open();
+    let operation = native.operation();
+    let insert = native.statement("INSERT INTO docs (_id, alpha, beta) VALUES (1, 2, 3)");
+    let session = handles::session(native.session).unwrap();
+    let token = handles::cancellation(operation, &session).unwrap();
+    handles::statement(insert).unwrap().update(&token).unwrap();
+
+    for (depth, pattern) in [(0, "%ta"), (0, "absent"), (1, "%"), (2, "%"), (3, "%")] {
+        let request = format!(r#"{{"kind":2,"depth":{depth},"table":"docs","column":"{pattern}"}}"#);
+        let (mut handle, mut error) = (0, 0);
+        ok(unsafe { rtdb_v1_metadata(native.session, operation, request.as_ptr(), request.len(), &mut handle, &mut error) }, error);
+        native.retained.push(handle);
+        let batch = handles::cursor(handle).unwrap().next().unwrap().unwrap();
+        let schemas = batch.batch().column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(schemas.is_null(0), depth == 1);
+        let schemas = schemas.value(0);
+        let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(schemas.len(), usize::from(depth != 1 && pattern != "absent"));
+        if schemas.is_empty() { continue; }
+        let tables = schemas.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(tables.is_null(0), depth == 2);
+        if depth == 2 { continue; }
+        let tables = tables.value(0);
+        let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+        let columns = tables.column(2).as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(tables.column(3).is_null(0));
+        assert_eq!(columns.is_null(0), depth == 3);
+        if depth == 0 {
+            let columns = columns.value(0);
+            let columns = columns.as_any().downcast_ref::<StructArray>().unwrap();
+            assert_eq!(columns.len(), 1);
+            assert_eq!(columns.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "beta");
+            assert_eq!(columns.column(1).as_any().downcast_ref::<Int32Array>().unwrap().value(0), 1);
+            assert!(columns.column(2).is_null(0));
+        }
+    }
+}

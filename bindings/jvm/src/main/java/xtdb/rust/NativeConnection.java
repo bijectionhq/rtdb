@@ -2,7 +2,13 @@ package xtdb.rust;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -10,6 +16,9 @@ import java.util.stream.Collectors;
 import org.apache.arrow.adbc.core.AdbcConnection;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.BulkIngestMode;
+import org.apache.arrow.c.ArrowArray;
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -63,6 +72,50 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
         if (token == 0) return null;
         try { return new String(abi.copiedBytes(token), java.nio.charset.StandardCharsets.UTF_8); } finally { abi.dispose(token, false); }
     }
+    public boolean supportsTypedAwaitToken() { return abi.supports("session_set_await_token"); }
+    public boolean supportsTypedReadSettings() { return abi.supports("session_set_read_settings"); }
+    public void setAwaitToken(String token) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var text = optionalText(arena, token);
+            abi.call("session_set_await_token", handle(), operation.id(), text, text.byteSize());
+        }
+    }
+    public void setReadSettings(String timezone, String snapshotToken, Object snapshotTime, Object clockTime) throws AdbcException {
+        try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
+            var zone = optionalText(arena, timezone);
+            var snapshot = optionalText(arena, snapshotToken);
+            abi.call("session_set_read_settings", handle(), operation.id(), zone, zone.byteSize(), snapshot, snapshot.byteSize(),
+                    readTime(arena, snapshotTime), readTime(arena, clockTime));
+        }
+    }
+    private static MemorySegment optionalText(Arena arena, String value) {
+        if (value == null) return MemorySegment.NULL;
+        return value.isEmpty() ? arena.allocate(1).asSlice(0, 0) : NativeAbi.text(arena, value);
+    }
+    private static MemorySegment readTime(Arena arena, Object value) {
+        if (value == null) return MemorySegment.NULL;
+        var time = arena.allocate(32, 8);
+        if (value instanceof Instant instant) {
+            time.set(NativeAbi.I64, 16, instant.getEpochSecond());
+            // Match the microsecond precision of the Transit timestamp object codec.
+            time.set(NativeAbi.I32, 24, instant.getNano() / 1000 * 1000);
+            time.set(NativeAbi.I32, 28, 2);
+        } else {
+            int kind = switch (value) {
+                case String ignored -> 1;
+                case LocalDate ignored -> 3;
+                case LocalDateTime ignored -> 4;
+                case ZonedDateTime ignored -> 5;
+                case OffsetDateTime ignored -> 5;
+                default -> throw new IllegalArgumentException("Unsupported read time: " + value.getClass().getName());
+            };
+            var text = NativeAbi.text(arena, value.toString());
+            time.set(NativeAbi.PTR, 0, text);
+            time.set(NativeAbi.I64, 8, text.byteSize());
+            time.set(NativeAbi.I32, 28, kind);
+        }
+        return time;
+    }
     /** Native transaction request encoded by xtdb.rust; returns the transaction key as Transit JSON. */
     public byte[] transact(byte[] request) throws AdbcException {
         try (Operation operation = operation(); Arena arena = Arena.ofConfined()) {
@@ -79,6 +132,29 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
             long cursor = abi.handle("session_query_ra", handle(), operation.id(), source, source.byteSize(), bindings, bindings.byteSize());
             return new NativeRows(this, cursor, operation);
         } catch (Throwable error) { try { operation.close(); } catch (AdbcException close) { error.addSuppressed(close); } throw error; }
+    }
+    public NativeRows tryQueryLogicalRelation(String plan, Map<?, ?> arguments) throws AdbcException {
+        if (!abi.supports("session_query_ra_arrow")) return null;
+        try (var root = NativeArguments.create(allocator, arguments)) {
+            if (root == null) return null;
+            var operation = operation();
+            try (Arena arena = Arena.ofConfined(); ArrowArray array = ArrowArray.allocateNew(allocator);
+                 ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+                try {
+                    Data.exportVectorSchemaRoot(allocator, root, null, array, schema);
+                    var source = NativeAbi.text(arena, plan);
+                    long cursor = abi.handle("session_query_ra_arrow", handle(), operation.id(), source, source.byteSize(),
+                            NativeAbi.address(array.memoryAddress()), NativeAbi.address(schema.memoryAddress()));
+                    return new NativeRows(this, cursor, operation);
+                } finally {
+                    if (array.snapshot().release != 0) array.release();
+                    if (schema.snapshot().release != 0) schema.release();
+                }
+            } catch (Throwable error) {
+                try { operation.close(); } catch (AdbcException close) { error.addSuppressed(close); }
+                throw error;
+            }
+        }
     }
     @Override public String getCurrentCatalog() throws AdbcException { handle(); return catalog; }
     @Override public String getCurrentDbSchema() { return "public"; }

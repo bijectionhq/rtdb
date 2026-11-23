@@ -9,7 +9,10 @@
             [xtdb.serde :as serde]
             [xtdb.time :as time])
   (:import [clojure.lang IReduceInit]
-           [java.io ByteArrayInputStream ByteArrayOutputStream]
+           [java.io ByteArrayOutputStream]
+           [java.time Instant LocalDate LocalDateTime OffsetDateTime ZonedDateTime]
+           [java.util Locale]
+           [java.util.function Function]
            [org.apache.arrow.vector.types.pojo Field]
            [xtdb.api.query IKeyFn]
            [xtdb.arrow VectorType]
@@ -46,36 +49,47 @@
 (defn- current-await-token [^NativeConnection connection]
   (.getAwaitToken connection))
 
-(defn- set-await-token! [connection token]
-  (execute-set! connection "SET AWAIT_TOKEN = ?" [token]))
+(defn- set-await-token! [^NativeConnection connection token]
+  (if (and (.supportsTypedAwaitToken connection) (or (nil? token) (string? token)))
+    (.setAwaitToken connection token)
+    (execute-set! connection "SET AWAIT_TOKEN = ?" [token])))
 
-(defn- read-rows [bytes ^IKeyFn key-fn]
-  (with-open [input (ByteArrayInputStream. bytes)]
-    (transit/read
-      (transit/reader input :json
-                      {:handlers (assoc serde/transit-read-handlers "rtdb/struct"
-                                        (transit/read-handler
-                                          #(into {} (map (fn [[key value]] [(.denormalize key-fn key) value])) %)))}))))
+(defn- native-read-time? [time]
+  (or (nil? time) (string? time)
+      (instance? LocalDate time) (instance? LocalDateTime time)
+      (instance? ZonedDateTime time) (instance? OffsetDateTime time)
+      (and (instance? Instant time)
+           (< -9223372036854 (.getEpochSecond ^Instant time) 9223372036854))))
+
+(defn- row-reader ^Function [^IKeyFn key-fn]
+  (let [handlers (assoc serde/transit-read-handlers "rtdb/struct"
+                        (transit/read-handler
+                          #(into {} (map (fn [[key value]] [(.denormalize key-fn key) value])) %)))]
+    (reify Function
+      (apply [_ input] (transit/read (transit/reader input :json {:handlers handlers}))))))
 
 (defn- with-read-settings [^NativeConnection connection {:keys [snapshot-token snapshot-time current-time default-tz]} f]
-  (let [settings (filterv (comp some? second)
-                          [["TIMEZONE" (some-> default-tz str)]
-                           ["SNAPSHOT_TOKEN" snapshot-token]
-                           ["SNAPSHOT_TIME" snapshot-time]
-                           ["CLOCK_TIME" current-time]])]
-    (if (empty? settings)
+  (let [timezone (some-> default-tz str)]
+    (if-not (or (some? timezone) (some? snapshot-token) (some? snapshot-time) (some? current-time))
       (f)
       (do
         (.begin connection)
         (try
-          (execute-set! connection
-                        (str "SET TRANSACTION READ ONLY, " (str/join ", " (map #(str (first %) " = ?") settings)))
-                        (mapv second settings))
+          (if (and (.supportsTypedReadSettings connection)
+                   (or (nil? snapshot-token) (string? snapshot-token))
+                   (native-read-time? snapshot-time) (native-read-time? current-time))
+            (.setReadSettings connection timezone snapshot-token snapshot-time current-time)
+            (let [settings (filterv (comp some? second)
+                                    [["TIMEZONE" timezone] ["SNAPSHOT_TOKEN" snapshot-token]
+                                     ["SNAPSHOT_TIME" snapshot-time] ["CLOCK_TIME" current-time]])]
+              (execute-set! connection
+                            (str "SET TRANSACTION READ ONLY, " (str/join ", " (map #(str (first %) " = ?") settings)))
+                            (mapv second settings))))
           (f)
           (finally (.rollbackTx connection)))))))
 
 (defn- plan [^NativeConnection connection sql args {:keys [await-token key-fn] :as options}]
-  (let [key-fn (serde/read-key-fn (or key-fn :kebab-case-keyword))]
+  (let [read-page (row-reader (serde/read-key-fn (or key-fn :kebab-case-keyword)))]
     (reify IReduceInit
       (reduce [_ f initial]
         (err/wrap-anomaly {:sql sql}
@@ -90,11 +104,11 @@
                   (loop [acc initial]
                     (if (reduced? acc)
                       @acc
-                      (if-let [bytes (.next rows)]
+                      (if-let [page (.readNext rows read-page)]
                         (let [next (reduce (fn [acc row]
                                              (let [next (f acc row)]
                                                (if (reduced? next) (reduced next) next)))
-                                           acc (read-rows bytes key-fn))]
+                                           acc page)]
                           (recur next))
                         acc))))))))))))
 
@@ -134,6 +148,25 @@
     (into {} (map-indexed (fn [index value] [(str "?_" index) value])) args)
     (or args {})))
 
+(defn- native-argument-name [key]
+  (cond
+    (string? key) key
+    (keyword? key) (let [name (subs (str key) 1)]
+                     (when (re-matches #"[\u0000-\u007f]+" name)
+                       (-> (if (str/starts-with? name "xt/") (str "_" (subs name 3)) name)
+                           (str/replace "-" "_")
+                           (str/replace #"[./$]" "\\$")
+                           (.toLowerCase Locale/ROOT))))))
+
+(defn- native-logical-arguments [arguments]
+  (when (map? arguments)
+    (reduce-kv (fn [row key value]
+                 (let [name (native-argument-name key)]
+                   (if (and (some? name) (not (contains? row name)))
+                     (assoc row name value)
+                     (reduced nil))))
+               {} arguments)))
+
 (defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types? explain? explain-analyze?] :as options
                                              :or {key-fn :kebab-case-keyword}}]
   (err/wrap-anomaly {}
@@ -145,13 +178,15 @@
           (let [relation (cond
                            explain? [:explain {:mode :plan} relation]
                            explain-analyze? [:explain {:mode :analyze} relation]
-                           :else relation)]
-            (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (logical-arguments args)))]
-              (let [key-fn (serde/read-key-fn key-fn)
+                           :else relation)
+                source (pr-str relation)
+                arguments (logical-arguments args)]
+            (with-open [^NativeRows result (or (when-let [row (native-logical-arguments arguments)] (.tryQueryLogicalRelation connection source row))
+                                               (.queryLogicalRelation connection source (write-request arguments)))]
+              (let [read-page (row-reader (serde/read-key-fn key-fn))
                     rows (loop [rows (transient [])]
-                           (if-let [bytes (.next result)]
-                             (let [page (read-rows bytes key-fn)]
-                               (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
+                           (if-let [page (.readNext result read-page)]
+                             (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page)))
                              (persistent! rows)))]
                 (if with-types?
                   {:res rows

@@ -140,12 +140,37 @@ final class NativeAdbcTest {
             try (var external = new RootAllocator(); var other = new RootAllocator(); var first = new BigIntVector("", external); var second = new BigIntVector("", other)) {
                 first.allocateNew(1); first.setSafe(0, 3); first.setValueCount(1);
                 second.allocateNew(1); second.setSafe(0, 7); second.setValueCount(1);
-                try (var root = new VectorSchemaRoot(List.of(first, second))) { root.setRowCount(1); statement.bind(root); }
+                try (var root = new VectorSchemaRoot(List.of(first, second))) {
+                    root.setRowCount(1);
+                    statement.bind(root);
+                    first.set(0, 300);
+                    second.set(0, 700);
+                }
             }
             try (var result = statement.executeQuery()) {
                 assertTrue(result.getReader().loadNextBatch());
                 assertEquals(3L, result.getReader().getVectorSchemaRoot().getVector("a").getObject(0));
                 assertEquals(7L, result.getReader().getVectorSchemaRoot().getVector("b").getObject(0));
+            }
+        }
+    }
+
+    @Test void logicalRelationBindsNamedArrowColumnsAndScopesTheRowStream() throws Exception {
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            String plan = "[:project {:projections [{v ?parameter}]} [:table {:rows [{}]}]]";
+            try (var rows = connection.tryQueryLogicalRelation(plan, Map.of("parameter", List.of(-0.0f, 0.25f)))) {
+                assertNotNull(rows);
+                var input = rows.readNext(stream -> {
+                    try {
+                        assertEquals("[[\"~#rtdb/struct\",[\"^ \",\"v\",[[\"~#f32\",-0.0],[\"~#f32\",0.25]]]]]",
+                                new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+                        return stream;
+                    } catch (IOException error) {
+                        throw new java.io.UncheckedIOException(error);
+                    }
+                });
+                assertNotNull(input);
+                assertNull(rows.readNext(stream -> fail("extra result batch")));
             }
         }
     }

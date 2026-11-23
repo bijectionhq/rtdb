@@ -547,6 +547,16 @@ The Gradle suites did not run, because this host has JDK 21 and 26 but not the J
 | Per-token strings, posting map keys and run assembly | The analyzer appends lowercase bytes to its Arrow builder and supports a borrowed-term visitor. The writer allocates a term key on first insertion and appends each run's Arrow token vector as a range. |
 | In-memory legacy transcode and query-built search files | Both paths open typed Arrow batches directly. Disk-spooled Tantivy conversion retains its mapped-file custody, and writing format 11 still supplies Tantivy with owned token text at its API boundary. |
 
+#### Embedded JVM and C ABI follow-up
+
+| Audit path | Implementation |
+| --- | --- |
+| Clojure row results | The Arrow encoder writes numeric, temporal, and extension leaves directly while preserving the `rtdb/struct` distinction, and `cursor_next_row_bytes` lends the batch bytes to the Clojure reader for decoding. |
+| JVM ADBC binds and results | `NativeStatement.bind` transfers a private Arrow buffer copy through the retained bind, and `NativeArrowReader` imports the schema once before loading each C Data array into the result root. |
+| Logical relation parameters | Supported Clojure scalars and homogeneous lists bind as one named C Data row and keep the logical relation's semantic pages. |
+| Clojure read settings | Typed session calls set the await token, time zone, snapshot token, snapshot time, and query clock with the existing text parsing and Java temporal precision. |
+| ADBC metadata | GetTableTypes uses the Flight SQL builder, and GetObjects constructs Arrow arrays using the ADBC schema and depth rules. |
+
 ### Pre-integration non-Arrow inventory at `fa969b755`
 
 This source audit covers RTDB vector search at `fa969b755`, from client input and primary storage through exact SQL, the experimental ANN workload, and result export.

@@ -33,19 +33,31 @@ final class NativeArrowReader extends ArrowReader {
     }
     @Override public boolean loadNextBatch() throws IOException {
         prepareLoadNextBatch();
-        try (Arena arena = Arena.ofConfined(); ArrowArray array = ArrowArray.allocateNew(allocator); ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+        try (Arena arena = Arena.ofConfined(); ArrowArray array = ArrowArray.allocateNew(allocator)) {
             try {
                 MemorySegment present = arena.allocate(NativeAbi.I32);
-                abi.call("cursor_next", cursor.get(), NativeAbi.address(array.memoryAddress()), NativeAbi.address(schema.memoryAddress()), present);
-                if (present.get(NativeAbi.I32, 0) == 0) return false;
-                try (VectorSchemaRoot root = Data.importVectorSchemaRoot(allocator, array, schema, null, false)) {
-                    loadRecordBatch(new VectorUnloader(root).getRecordBatch());
+                try {
+                    if (abi.supports("cursor_next_array")) {
+                        abi.call("cursor_next_array", cursor.get(), NativeAbi.address(array.memoryAddress()), present);
+                        if (present.get(NativeAbi.I32, 0) == 0) return false;
+                        Data.importIntoVectorSchemaRoot(allocator, array, getVectorSchemaRoot(), null, false);
+                    } else {
+                        try (ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+                            try {
+                                abi.call("cursor_next", cursor.get(), NativeAbi.address(array.memoryAddress()), NativeAbi.address(schema.memoryAddress()), present);
+                                if (present.get(NativeAbi.I32, 0) == 0) return false;
+                                try (VectorSchemaRoot root = Data.importVectorSchemaRoot(allocator, array, schema, null, false)) {
+                                    loadRecordBatch(new VectorUnloader(root).getRecordBatch());
+                                }
+                            } finally { if (schema.snapshot().release != 0) schema.release(); }
+                        }
+                    }
                 } catch (RuntimeException error) {
                     try { abi.call("cursor_consumer_error", cursor.get()); } catch (AdbcException metric) { error.addSuppressed(metric); }
                     throw error;
                 }
                 return true;
-            } finally { if (array.snapshot().release != 0) array.release(); if (schema.snapshot().release != 0) schema.release(); }
+            } finally { if (array.snapshot().release != 0) array.release(); }
         } catch (AdbcException error) { throw new IOException(error); }
     }
     @Override public long bytesRead() { return -1; }
