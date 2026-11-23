@@ -114,13 +114,10 @@ pub(crate) fn admits_checkpoint_transfer_object(
     }) {
         return true;
     }
-    checkpoint_storage_root().ok().is_some_and(|root| {
-        name.strip_prefix(&format!("{}/{root}/", record.storage_prefix()))
-            .is_some_and(|relative| admits_seeded_transfer_payload(record, stage, relative))
-    })
+    false
 }
 
-fn admits_seeded_transfer_payload(
+pub(crate) fn admits_seeded_transfer_payload(
     record: &DeploymentRecord, stage: &rtdb_directory::CheckpointStage, relative: &str,
 ) -> bool {
     record.checkpoint_transfer_replica.as_deref().is_some_and(|replica| {
@@ -1484,40 +1481,42 @@ pub(crate) async fn seal_checkpoint_transfer(
     await_storage_drain(directory, storage, keys, &source).await?;
     let stream = administration_stream(directory, &source, 4 << 20).await?;
     let sealed = rtdb_logkeeper::seal_recover_committed(&stream, fence.fenced_writer_epoch).await?.0;
-    let first = stage.checkpoint.boundary.checked_add(1)
-        .ok_or_else(|| inconsistent("The checkpoint has no replica successor"))?;
-    let certificate = if sealed >= first {
-        Some(rtdb_logkeeper::certify_committed_range(&stream, first, sealed).await?)
-    } else {
-        if sealed != stage.checkpoint.boundary {
-            return Err(inconsistent("The sealed replica history ends before the checkpoint"));
-        }
-        None
-    };
-    let replica_sha256 = certificate.as_ref().map(|certificate|
-        certificate.digest_bytes().ok_or_else(|| inconsistent("The terminal interval has no canonical digest"))
-    ).transpose()?;
-
     let mut node = rtdb_node::NodeOptions::default();
     node.owned_relations = true;
     let memory = rtdb_columnar::MemoryBudget::new(node.execution_memory_bytes);
     let cache = rtdb_storage::cache::CacheBudget::new(node.cache_bytes);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let (basis, source_through, lifetime_floors_sha256) = replica_suffix::with_terminal_source(
+    let (basis, source_through, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
         directory, storage, keys, hosted_task, fence, sealed, None,
-        |_, source_io| read_world::with_registered_capture_replay(
-            directory, archive, keys, hosted_task,
-            read_world::CaptureSelection {
-                deployment: intent.source, capture: intent.capture,
-                manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
-            },
-            CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-            Some(read_world::TerminalReplay { storage, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
-            |context, basis, source_through| async move {
-                let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
-                Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
-            },
-        ),
+        |_, source_io| async move {
+            let first = stage.checkpoint.boundary.checked_add(1)
+                .ok_or_else(|| inconsistent("The checkpoint has no replica successor"))?;
+            let certificate = if sealed >= first {
+                Some(rtdb_logkeeper::certify_committed_range(&stream, first, sealed).await?)
+            } else {
+                if sealed != stage.checkpoint.boundary {
+                    return Err(inconsistent("The sealed replica history ends before the checkpoint"));
+                }
+                None
+            };
+            let replica_sha256 = certificate.as_ref().map(|certificate|
+                certificate.digest_bytes().ok_or_else(|| inconsistent("The terminal interval has no canonical digest"))
+            ).transpose()?;
+            let (basis, source_through, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
+                directory, archive, keys, hosted_task,
+                read_world::CaptureSelection {
+                    deployment: intent.source, capture: intent.capture,
+                    manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
+                },
+                CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
+                Some(read_world::TerminalReplay { storage, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+                |context, basis, source_through| async move {
+                    let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
+                    Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
+                },
+            ).await?;
+            Ok((basis, source_through, lifetime_floors_sha256, replica_sha256))
+        },
     ).await?;
     directory.record_checkpoint_transfer_terminal(&rtdb_directory::CheckpointTransferTerminal {
         fence: fence.clone(), replica_through: sealed, source_through, basis,

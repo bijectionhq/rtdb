@@ -52,6 +52,32 @@ pub(super) struct ReplicaArtifact<'a> {
     chain_domain: &'static [u8],
 }
 
+pub(super) enum OrderedTransfer {
+    Segments([u8; 32]),
+    Legacy { entries: Vec<ArchivedReplicaEntry>, _reservation: Arc<MemoryReservation> },
+}
+
+impl OrderedTransfer {
+    pub(super) async fn read_page(
+        &self, artifact: &ReplicaArtifact<'_>, first: i64, through: i64, chain: &mut Context,
+    ) -> Result<Vec<ArchivedReplicaEntry>> {
+        match self {
+            Self::Segments(_) => artifact.read_segment(first, through, chain).await,
+            Self::Legacy { entries, .. } => {
+                if require_dense(entries, first, through)? != through { return Err(bad_segment()); }
+                Ok(entries.clone())
+            }
+        }
+    }
+
+    pub(super) fn finish(&self, chain: Context) -> Result<()> {
+        match self {
+            Self::Segments(expected) => require_chain(chain, *expected),
+            Self::Legacy { .. } => Ok(()),
+        }
+    }
+}
+
 impl<'a> ReplicaArtifact<'a> {
     pub(super) async fn open_transfer(
         store: &'a dyn ObjectStore,
@@ -92,6 +118,47 @@ impl<'a> ReplicaArtifact<'a> {
             receipt,
             chain_domain,
         })
+    }
+
+    pub(super) async fn read_ordered_transfer(
+        &self, record: &DeploymentRecord, terminal: &CheckpointTransferTerminal, expected: [u8; 32],
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<OrderedTransfer> {
+        let manifest = self.manifest()?;
+        let manifest_len = 32 + self.receipt.len() + SEALED_OVERHEAD;
+        match self.store.head_fresh(&manifest).await {
+            Ok(head) if head.size == manifest_len as u64 => {
+                let sealed = self.store.observe_fresh_exact(&manifest, manifest_len).await?.value;
+                if sha256(&sealed) == expected {
+                    return Ok(OrderedTransfer::Segments(self.open_manifest(&manifest, &sealed)?));
+                }
+            }
+            Ok(_) | Err(rtdb_storage::Error::MissingObject(_)) => (),
+            Err(error) => return Err(error.into()),
+        }
+        let operation = terminal.fence.destination.intent.operation;
+        let legacy = key(&format!("{}/checkpoint-transfers/{operation}.v1", record.storage_prefix()))?;
+        let maximum = 4 + self.receipt.len() + replica_suffix::MAX_SEGMENT_BYTES + SEALED_OVERHEAD;
+        let size = usize::try_from(self.store.head_fresh(&legacy).await?.size)
+            .ok().filter(|size| *size <= maximum).ok_or_else(bad_segment)?;
+        let reservation = memory.reserve(size.checked_mul(6).ok_or_else(bad_segment)?)?;
+        let sealed = self.store.observe_fresh_exact(&legacy, size).await?.value;
+        if sha256(&sealed) != expected { return Err(bad_segment()); }
+        let opened = self.cipher.open(legacy.as_str(), &sealed)?;
+        let receipt_len = self.receipt.len();
+        if opened.get(..4) != Some((receipt_len as u32).to_be_bytes().as_slice())
+            || opened.get(4..4 + receipt_len) != Some(self.receipt.as_ref())
+        {
+            return Err(bad_segment());
+        }
+        let entries = replica_suffix::decode(opened.slice(4 + receipt_len..))?;
+        let boundary = terminal.fence.destination.checkpoint.boundary;
+        if entries.is_empty() {
+            if boundary != terminal.replica_through { return Err(bad_segment()); }
+        } else if require_dense(&entries, boundary.checked_add(1).ok_or_else(bad_segment)?, terminal.replica_through)? != terminal.replica_through {
+            return Err(bad_segment());
+        }
+        Ok(OrderedTransfer::Legacy { entries, _reservation: reservation })
     }
 
     pub(super) fn chain(&self) -> Context {
@@ -177,7 +244,11 @@ impl<'a> ReplicaArtifact<'a> {
                 "The replica archive differs from its ordered digest",
             ));
         }
-        let opened = self.cipher.open(object.as_str(), &sealed)?;
+        self.open_manifest(&object, &sealed)
+    }
+
+    fn open_manifest(&self, object: &ObjectKey, sealed: &[u8]) -> Result<[u8; 32]> {
+        let opened = self.cipher.open(object.as_str(), sealed)?;
         if opened.get(32..) != Some(self.receipt.as_ref()) {
             return Err(inconsistent(
                 "The replica archive names another exact receipt",
@@ -320,4 +391,55 @@ fn extend_payload(chain: &mut Context, offset: i64, digest: &[u8; 32]) {
 
 fn bad_segment() -> rtdb_types::Anomaly {
     inconsistent("The replica segment has another interval or exceeds its bound")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_directory::{CellMedia, Checkpoint, CheckpointStage, CheckpointStageIntent, CheckpointTransferFence};
+    use rtdb_types::{Timestamp, TransactionKey, TxId};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn an_ordered_inline_bootstrap_reopens_without_trusting_a_provisional_segmented_manifest() -> Result<()> {
+        let bucket = rtdb_storage::MemoryStore::default();
+        let target = DeploymentRecord::new("target", "acme", Vec::new(), 0);
+        let operation = Uuid::new_v4();
+        let terminal = CheckpointTransferTerminal {
+            fence: CheckpointTransferFence {
+                destination: CheckpointStage {
+                    intent: CheckpointStageIntent {
+                        operation, source: Uuid::new_v4(), capture: Uuid::new_v4(), source_manifest_sha256: "source".into(),
+                        destination: target.id.parse().unwrap(), name: target.name.clone(), org: target.org.clone(),
+                    },
+                    source_incarnation: 1, source_log_epoch: 0,
+                    checkpoint: Checkpoint { block: 1, boundary: 7, source: 1, system_time: 10, root_sha256: Some([1; 32]) },
+                    media: CellMedia { objects: "objects".into(), keys: "keys".into() },
+                    transfer_only: true, staged_manifest_sha256: Some("staged".into()),
+                },
+                source_writer_epoch: 1, fenced_writer_epoch: 2,
+            },
+            replica_through: 8, source_through: 2, basis: TransactionKey { tx_id: TxId(2), system_time: Timestamp(11) },
+            replica_sha256: Some([2; 32]), lifetime_floors_sha256: [3; 32],
+        };
+        let key_bytes = [4; crate::keys::KEY_BYTES];
+        let receipt = encode(&terminal)?;
+        let artifact = ReplicaArtifact::new(&bucket, &key_bytes, checkpoint_transfer_prefix(&target, operation), receipt.clone(), b"test\0")?;
+        let entry = ArchivedReplicaEntry { lsn: 8, epoch: 1, timestamp: 11, payload: Bytes::from_static(b"inline") };
+        let object = key(&format!("{}/checkpoint-transfers/{operation}.v1", target.storage_prefix()))?;
+        let mut plaintext = (receipt.len() as u32).to_be_bytes().to_vec();
+        plaintext.extend_from_slice(&receipt);
+        plaintext.extend_from_slice(&replica_suffix::encode_records(std::slice::from_ref(&entry))?);
+        let sealed = Cipher::new(&key_bytes)?.seal_deterministic(object.as_str(), &plaintext)?;
+        let digest = sha256(&sealed);
+        bucket.put(&object, sealed).await?;
+        artifact.put_manifest(artifact.chain()).await?;
+        let memory = MemoryBudget::new(1 << 20);
+        let ordered = artifact.read_ordered_transfer(&target, &terminal, digest, &memory).await?;
+        let mut chain = artifact.chain();
+        assert!(ordered.read_page(&artifact, 8, 8, &mut chain).await? == [entry]);
+        ordered.finish(chain)?;
+        assert!(artifact.read_ordered_transfer(&target, &terminal, [0; 32], &memory).await.is_err());
+        Ok(())
+    }
 }

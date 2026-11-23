@@ -1511,6 +1511,8 @@ rule TrimCertifiedReplicaPrefix {
     -- Fenced, discarded and voided records survive a transfer at their original offsets and require no offloaded payload.
     -- Terminal certification and bootstrap preparation hold the same exact source replay interval through their provider reads.
     -- An admitted offloaded body supplies replay bytes after its digest matches the certified outer frame.
+    -- The target holds each independently authenticated detached body under its own key before committing the page that names it.
+    -- In-flight bootstraps issued in the inline format remain readable under their original ordered receipt.
     -- After transfer, a holder starts intake beyond the exact terminal source position and any possible source positions consumed after its paired replica offset.
     when: ReplicaPrefixCertified(holding, through, digest)
 

@@ -122,7 +122,8 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                 let bucket = storage.bucket(Arc::clone(&region)).await?;
                 let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &current, held_terminal).await?;
                 if let Some(prior) = current.checkpoint_transfer_bootstrap.as_deref() {
-                    artifact.read_manifest(prior.ciphertext_sha256).await?;
+                    let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
+                    artifact.read_ordered_transfer(&current, held_terminal, prior.ciphertext_sha256, &memory).await?;
                     return Ok(prior.ciphertext_sha256);
                 }
                 let (mut recovered, _, pool, memory, options) =
@@ -216,13 +217,13 @@ pub(crate) async fn seed_checkpoint_transfer_target(
 ) -> Result<rtdb_directory::CheckpointTransferReplica> {
     use crate::{
         admin::{choose_ensemble, replica_servers},
-        archive::{checkpoint_storage_root, replica_suffix, stage::{RegionPublication, with_region}, verify_cut},
+        archive::{checkpoint_storage_root, replica_suffix, stage::with_region, verify_cut},
         reference::{PrefixedStore, key},
         store::{EncryptingStore, ROOT_MARKER},
     };
     use rtdb_directory::CheckpointTransferReplica;
     use rtdb_storage::log::LogOffset;
-    use super::super::replica_artifact::require_chain;
+    use super::super::replica_artifact::OrderedTransfer;
 
     let bootstrap = verify_checkpoint_transfer_target(
         Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
@@ -245,14 +246,16 @@ pub(crate) async fn seed_checkpoint_transfer_target(
         Ok(None)
     };
     let ordered = &bootstrap;
-    let publication = RegionPublication::CheckpointTransfer(Arc::clone(&directory), stage.intent.operation);
-    with_region(
-        owner, keys, &target_id, storage, hosted_task.as_ref(), None, Some(publication), admit_target,
+    let task = hosted_task.as_ref();
+    let directory = &directory;
+    Box::pin(with_region(
+        owner, keys, &target_id, storage, task, None, None, admit_target,
         |target, _, region| async move {
             let bucket = storage.bucket(region).await?;
             let artifact = ReplicaArtifact::open_transfer(bucket.as_ref(), keys, &target, terminal).await?;
             let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
-            let expected = artifact.read_manifest(ordered.ciphertext_sha256).await?;
+            let replay = artifact.read_ordered_transfer(&target, terminal, ordered.ciphertext_sha256, &memory).await?;
+            let detached = matches!(&replay, OrderedTransfer::Segments(_));
             let start = transfer_first(stage)?;
             let through = terminal.replica_through;
             let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
@@ -280,15 +283,15 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             // first journal. The streaming write pass reauthenticates each page.
             while next <= through {
                 let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
-                let entries = artifact.read_segment(next, through, &mut chain).await?;
+                let entries = replay.read_page(&artifact, next, through, &mut chain).await?;
                 for entry in &entries {
                     if let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? {
-                        let _ = observe_transfer_record(&artifact, entry.lsn, envelope, &mut chain, &memory).await?;
+                        observe_transfer_payload(&artifact, entry.lsn, &envelope, detached, &mut chain, &memory).await?;
                     }
                 }
                 next += entries.len() as i64;
             }
-            require_chain(chain, expected)?;
+            replay.finish(chain)?;
 
             let reserved = if let Some(existing) = target.checkpoint_transfer_replica.as_deref() {
                 existing.clone()
@@ -306,7 +309,7 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             let stream = rtdb_logkeeper::StreamConfig {
                 servers: reserved.journals.clone(), stream: target.stream("replica"),
                 write_quorum: crate::deployment::write_quorum(reserved.journals.len()),
-                maximum_message_bytes: 4 << 20,
+                maximum_message_bytes: crate::process::MAXIMUM_LOG_MESSAGE_BYTES,
             };
             let epoch = terminal.fence.fenced_writer_epoch;
             let checkpoint = LogOffset(stage.checkpoint.boundary);
@@ -322,22 +325,18 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             while next <= through {
                 let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
                 let first = next;
-                let mut entries = artifact.read_segment(first, through, &mut chain).await?;
+                let mut entries = replay.read_page(&artifact, first, through, &mut chain).await?;
                 for entry in &mut entries {
                     let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? else { continue; };
-                    let (envelope, offloaded) = observe_transfer_record(&artifact, entry.lsn, envelope, &mut chain, &memory).await?;
-                    if let Some(control) = replica_suffix::transfer_control(&envelope, stage.checkpoint)? {
+                    if !detached { continue; }
+                    let offloaded = observe_transfer_payload(&artifact, entry.lsn, &envelope, detached, &mut chain, &memory).await?;
+                    let resolved = offloaded.as_ref().map_or(&envelope, |payload| &payload.resolved);
+                    if let Some(control) = replica_suffix::transfer_control(resolved, stage.checkpoint)? {
                         entry.payload = control;
-                    } else if let Some((key, payload)) = offloaded {
-                        match serving.head_fresh(&key).await {
-                            Ok(existing) if existing.size == payload.bytes.len() as u64 => (),
-                            Ok(_) => return Err(inconsistent("The target has another offloaded replica payload")),
-                            Err(rtdb_storage::Error::MissingObject(_)) => serving.put(&key, payload.bytes.clone()).await?,
-                            Err(error) => return Err(error.into()),
-                        }
-                        if serving.get_fresh_exact(&key, payload.bytes.len()).await? != payload.bytes {
-                            return Err(inconsistent("The target offloaded replica payload differs from its ordered artifact"));
-                        }
+                    } else if let Some(payload) = offloaded.as_ref() {
+                        let proxy = target_payload_proxy(&envelope, resolved, &payload.body.bytes)?;
+                        publish_target_payload(directory, storage, keys, task, &target, &reserved, &payload.path, &payload.body.bytes).await?;
+                        if let Some(proxy) = proxy { entry.payload = proxy; }
                     }
                 }
                 next += entries.len() as i64;
@@ -351,22 +350,125 @@ pub(crate) async fn seed_checkpoint_transfer_target(
                 let proof = rtdb_logkeeper::certify_committed_range(&stream, first, last).await?;
                 rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
             }
-            require_chain(chain, expected)?;
+            replay.finish(chain)?;
             Ok(reserved)
         },
-    ).await
+    )).await
 }
 
-async fn observe_transfer_record(
-    artifact: &ReplicaArtifact<'_>, offset: i64, envelope: ReplicaEnvelope, chain: &mut Context,
+struct DetachedTransferPayload {
+    path: ObjectKey,
+    resolved: ReplicaEnvelope,
+    body: PayloadBytes,
+}
+
+async fn observe_transfer_payload(
+    artifact: &ReplicaArtifact<'_>, offset: i64, envelope: &ReplicaEnvelope, detached: bool, chain: &mut Context,
     memory: &Arc<MemoryBudget>,
-) -> Result<(ReplicaEnvelope, Option<(ObjectKey, PayloadBytes)>)> {
+) -> Result<Option<DetachedTransferPayload>> {
     let Some(relative) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? else {
-        return Ok((envelope, None));
+        return Ok(None);
     };
-    let payload = artifact.read_payload(offset, chain, memory).await?;
-    let resolved = envelope.unwrap_payload(&payload.bytes)?;
-    Ok((resolved, Some((crate::reference::key(&relative)?, payload))))
+    if !detached { return Err(inconsistent("A legacy target bootstrap cannot contain detached payloads")); }
+    let body = artifact.read_payload(offset, chain, memory).await?;
+    let resolved = envelope.unwrap_payload(&body.bytes)?;
+    Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
+}
+
+pub(super) async fn verify_seeded_payloads(
+    bucket: &dyn ObjectStore, serving: &dyn ObjectStore, staged: &dyn ObjectStore,
+    keys: &dyn KeyService, record: &rtdb_directory::DeploymentRecord, stage: &rtdb_directory::CheckpointStage,
+    mut extras: std::collections::BTreeSet<ObjectKey>,
+) -> Result<()> {
+    use crate::archive::{admits_seeded_transfer_payload, replica_suffix, verify_cut};
+    use super::super::replica_artifact::OrderedTransfer;
+    use crate::reference::key;
+
+    if extras.iter().any(|path| !admits_seeded_transfer_payload(record, stage, path.as_str())) {
+        return Err(inconsistent("The staged storage root differs from its accepted inventory"));
+    }
+    let bootstrap = record.checkpoint_transfer_bootstrap.as_deref()
+        .ok_or_else(|| inconsistent("The staged payloads need an ordered bootstrap"))?;
+    let terminal = &bootstrap.terminal;
+    let artifact = ReplicaArtifact::open_transfer(bucket, keys, record, terminal).await?;
+    let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
+    let OrderedTransfer::Segments(expected) = artifact.read_ordered_transfer(record, terminal, bootstrap.ciphertext_sha256, &memory).await?
+    else { return Err(inconsistent("A legacy target bootstrap has no detached payloads")); };
+    let root_key = key(&block_key(BlockIndex(stage.checkpoint.block))?)?;
+    let root = PayloadBytes::read(staged, &root_key, &memory).await?;
+    let catalog = BlockCatalog::decode(&root.bytes)?;
+    verify_cut(&catalog, stage.checkpoint, StorageEpoch(stage.source_log_epoch))?;
+    let mut fence = TermFence::from_catalog(&catalog)?;
+    let mut writer = None;
+    let mut next = transfer_first(stage)?;
+    let mut chain = artifact.chain();
+    while next <= terminal.replica_through {
+        let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
+        let entries = artifact.read_segment(next, terminal.replica_through, &mut chain).await?;
+        for entry in &entries {
+            let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, terminal.fence.source_writer_epoch)? else { continue; };
+            let Some(payload) = observe_transfer_payload(&artifact, entry.lsn, &envelope, true, &mut chain, &memory).await? else { continue; };
+            if replica_suffix::transfer_control(&payload.resolved, stage.checkpoint)?.is_none() && extras.remove(&payload.path)
+                && serving.get_fresh_exact(&payload.path, payload.body.bytes.len()).await? != payload.body.bytes
+            {
+                return Err(inconsistent("A staged replica payload differs from its ordered bootstrap"));
+            }
+        }
+        next += entries.len() as i64;
+    }
+    super::super::replica_artifact::require_chain(chain, expected)?;
+    if !extras.is_empty() { return Err(inconsistent("The staged storage root contains an unordered replica payload")); }
+    Ok(())
+}
+
+fn target_payload_proxy(original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8]) -> Result<Option<bytes::Bytes>> {
+    let rtdb_format::envelope::ReplicaBody::OversizedMessage(reference) = &original.message else {
+        return Err(inconsistent("The target payload has no certified reference"));
+    };
+    if reference.payload_sha256.is_none() { return Ok(None); }
+    let id = reference.payload_id.clone().ok_or_else(|| inconsistent("The target payload has no object identity"))?;
+    let proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
+    Ok(Some(proxy.encode().into()))
+}
+
+async fn publish_target_payload(
+    directory: &Arc<dyn Directory>, storage: &CellStorage, keys: &dyn KeyService, task: Option<&HostedTask>,
+    target: &rtdb_directory::DeploymentRecord, reserved: &rtdb_directory::CheckpointTransferReplica,
+    path: &ObjectKey, bytes: &bytes::Bytes,
+) -> Result<()> {
+    use crate::{
+        archive::{checkpoint_storage_root, admits_seeded_transfer_payload, stage::{RegionPublication, with_region}},
+        reference::{PrefixedStore, key}, store::{CheckpointReplayPublication, EncryptingStore},
+    };
+    let root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
+    let publication = RegionPublication::CheckpointReplay(Arc::clone(directory), CheckpointReplayPublication {
+        bootstrap_sha256: reserved.bootstrap.ciphertext_sha256,
+        object: key(&format!("{root}/{path}"))?,
+    });
+    let stage = &reserved.bootstrap.terminal.fence.destination;
+    Box::pin(with_region(
+        directory.as_ref(), keys, &target.id, storage, task, None, Some(publication),
+        |current| {
+            if current.lifecycle != Lifecycle::Restoring || current.holder.is_some()
+                || current.checkpoint_transfer_replica.as_deref() != Some(reserved)
+                || !admits_seeded_transfer_payload(current, stage, path.as_str())
+            {
+                return Err(inconsistent("The target no longer owns this detached replay payload"));
+            }
+            Ok(None)
+        },
+        |current, _, io| async move {
+            let bucket = storage.bucket(io).await?;
+            let media = keys.existing_key(&current.key_id()).await?
+                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
+            let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(bucket, root)), &media)?;
+            serving.put_with_publication(path, bytes.clone()).await?;
+            if serving.get_fresh_exact(path, bytes.len()).await? != *bytes {
+                return Err(inconsistent("The target offloaded replica payload differs from its ordered artifact"));
+            }
+            Ok(())
+        },
+    )).await
 }
 
 fn transfer_first(stage: &rtdb_directory::CheckpointStage) -> Result<i64> {

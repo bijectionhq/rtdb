@@ -25,7 +25,7 @@ use crate::deployment::LOGKEEPER_LOG_TYPE;
 use crate::lease::{LeaseOptions, MemberLease, Registration};
 use crate::logs::LogkeeperLogFactory;
 
-const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAXIMUM_LOG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const PLACED_FLUSH_INTERVAL_LIMIT: Duration = Duration::from_secs(15 * 60);
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
