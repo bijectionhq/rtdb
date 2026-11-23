@@ -98,19 +98,8 @@ impl ReplicaObjectCustody {
 
     /// The storage broker calls this only after validating the original scope.
     pub async fn read_from(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
-        self.read_publication(store, memory, self.publication()).await
-    }
-
-    /// An authenticated transfer binds its own copy by the original body digest.
-    pub async fn read_transferred_copy(&self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>) -> Result<ReplicaPayload> {
-        self.read_publication(store, memory, None).await
-    }
-
-    async fn read_publication(
-        &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, publication: Option<&PhysicalObjectVersion>,
-    ) -> Result<ReplicaPayload> {
         let view = HeldView::recovery(Arc::new(self.clone()));
-        IoRegion::reading(view, self.reference.read_publication(store, memory, publication)).await
+        IoRegion::reading(view, self.reference.read_at(store, memory)).await
     }
 }
 
@@ -137,18 +126,12 @@ impl ReplicaPayloadReference {
     pub async fn read_at(
         &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>,
     ) -> Result<ReplicaPayload> {
-        self.read_publication(store, memory, self.publication()).await
-    }
-
-    async fn read_publication(
-        &self, store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, publication: Option<&PhysicalObjectVersion>,
-    ) -> Result<ReplicaPayload> {
         let length = usize::try_from(store.head_fresh(&self.key).await?.size).map_err(|_| payload_size())?;
         let allocation = store.exact_object_allocation(&self.key, length)?;
         let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(payload_size)?;
         let charge = memory.reserve(charge).map_err(|error| Error::Task(error.to_string()))?;
         let observed = IoRegion::retaining(charge.clone(), store.observe_fresh_exact(&self.key, length)).await?;
-        if publication.is_some_and(|expected| observed.version.as_ref() != Some(expected)) {
+        if self.publication().is_some_and(|expected| observed.version.as_ref() != Some(expected)) {
             return Err(Error::ConflictingObject(self.key.to_string()));
         }
         self.verify_body(observed.value, charge)

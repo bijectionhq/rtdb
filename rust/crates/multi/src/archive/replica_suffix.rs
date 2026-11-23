@@ -1207,7 +1207,7 @@ mod custody_tests {
             let rtdb_directory::Cas::Applied(holder) = directory.replace_deployment(holder, version).await? else {
                 panic!("the transfer holder lost its placement");
             };
-            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), storage: storage.clone(), custody: ReplayCustody::Local, tasks: Default::default() });
+            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), broker: None, custody: ReplayCustody::Local, tasks: Default::default() });
             let factory = LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Default::default(), holdings);
             let config = holder_config(&holder, seeded.journals.clone(), &storage, Role::Holder);
             let Some(database_config::Log::OtherLog(config)) = config.log else { panic!("target did not use Logkeeper"); };

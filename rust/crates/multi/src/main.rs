@@ -29,7 +29,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway [--directory DIR] [--installed-journals FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
@@ -345,7 +345,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 129 } else { 14 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 130 } else { 15 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
         };
@@ -503,6 +503,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.installed_journal_manifest = installed_journals;
+            agent.replay_broker = replay_broker_client(&arguments, "")?;
             if audience {
                 agent.audience_journal_port = Some(arguments.required("audience-journal-port")?.parse::<u16>().ok()
                     .filter(|port| *port != 0).ok_or_else(|| usage("--audience-journal-port must be a positive port".into()))?);
@@ -1106,6 +1107,20 @@ async fn shutdown_signal() {
 /// The cell secret from `--cell-secret FILE`, shared by a cell's gateways and nodes; without one, reconnection needs nodes that trust the gateway.
 fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capability::CellSecret>>> {
     arguments.optional("cell-secret").map(|path| rtdb_multi::capability::CellSecret::from_file(std::path::Path::new(path)).map(Arc::new)).transpose()
+}
+
+fn replay_broker_client(arguments: &Arguments, prefix: &str) -> Result<Option<rtdb_multi::replay_broker::Client>> {
+    let endpoint = format!("{prefix}replay-broker");
+    let server_name = format!("{prefix}replay-broker-name");
+    let ca = format!("{prefix}replay-broker-ca");
+    let token = format!("{prefix}replay-broker-token-file");
+    if [&endpoint, &server_name, &ca, &token].iter().all(|flag| !arguments.present(flag)) {
+        return Ok(None);
+    }
+    rtdb_multi::replay_broker::Client::from_files(
+        arguments.required(&endpoint)?, arguments.required(&server_name)?,
+        std::path::Path::new(arguments.required(&ca)?), std::path::Path::new(arguments.required(&token)?),
+    ).map(Some)
 }
 
 async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {

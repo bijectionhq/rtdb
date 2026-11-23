@@ -54,6 +54,7 @@ pub struct AgentOptions {
     pub installed_journal_manifest: Option<std::path::PathBuf>,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
+    pub replay_broker: Option<crate::replay_broker::Client>,
     pub replica_payload_reclamation: bool,
     /// How long an activation may take to reach a confirmed leadership before it is abandoned.
     pub activation_timeout: Duration,
@@ -88,7 +89,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { audience_journal_port: None, storage, installed_journal_manifest: None, world_archive: None, s3_write_role: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { audience_journal_port: None, storage, installed_journal_manifest: None, world_archive: None, s3_write_role: None, replay_broker: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }

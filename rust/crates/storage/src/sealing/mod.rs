@@ -120,7 +120,6 @@ impl UnitOutput {
 pub struct EncryptingStore {
     inner: Arc<dyn ObjectStore>,
     keys: ObjectKeys,
-    replica_publications: bool,
     classic_control: Option<ObjectKey>,
 }
 
@@ -134,7 +133,6 @@ impl EncryptingStore {
         Ok(Self {
             inner,
             keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: None },
-            replica_publications: false,
             classic_control: None,
         })
     }
@@ -146,7 +144,6 @@ impl EncryptingStore {
         Ok(Self {
             inner,
             keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: Some(authority) },
-            replica_publications: false,
             classic_control: None,
         })
     }
@@ -155,16 +152,9 @@ impl EncryptingStore {
         Self {
             inner,
             keys: ObjectKeys::Units(ledger),
-            replica_publications: false,
             classic_control: None,
         }
     }
-
-    pub fn with_replica_publications(mut self, enabled: bool) -> Self {
-        self.replica_publications = enabled;
-        self
-    }
-
     fn with_classic_control(mut self, marker: ObjectKey) -> Self {
         self.classic_control = Some(marker);
         self
@@ -278,21 +268,6 @@ impl ObjectStore for EncryptingStore {
 
     fn syncs_checkpoints(&self) -> bool {
         self.classic_control.is_some() && self.inner.syncs_checkpoints()
-    }
-
-    async fn put_replica_payload(
-        &self,
-        key: &ObjectKey,
-        bytes: Bytes,
-    ) -> crate::Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        if !self.replica_publications {
-            self.put(key, bytes).await?;
-            return Ok(None);
-        }
-        Ok(self
-            .put_with_publication(key, bytes)
-            .await?
-            .and_then(rtdb_types::PhysicalObjectPublication::into_version))
     }
 
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {

@@ -177,6 +177,13 @@ pub trait Log: Send + Sync {
     fn needs_published_recovery_checkpoint(&self) -> bool { false }
     /// This replica log confers offload access only through a delivered payload permit.
     fn requires_replica_payload_permit(&self) -> bool { false }
+    /// Publishes a detached body under the replica path's custody.
+    async fn publish_replica_payload(
+        &self, store: &dyn crate::ObjectStore, key: &crate::ObjectKey, body: Bytes,
+    ) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        store.put(key, body).await?;
+        Ok(None)
+    }
     /// A hosted owner attests its exact selected recovery root before a source may confirm it.
     async fn confirms_recovery_checkpoint(&self, _block: i64, _through: LogOffset, _root: [u8; 32]) -> Result<bool> {
         Ok(false)

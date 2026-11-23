@@ -509,11 +509,26 @@ impl SealedLog {
         log.recovery = Some(RecoveryAdmission::new(holds, config));
         Ok(log)
     }
+
+    fn admit_size(&self, payload: &Bytes) -> rtdb_storage::Result<()> {
+        if let Some(maximum) = self.maximum_append_bytes()
+            && payload.len() > maximum
+        {
+            return Err(rtdb_storage::Error::MessageTooLarge { size: payload.len(), maximum });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Log for SealedLog {
     fn requires_replica_payload_permit(&self) -> bool { self.recovery.is_some() }
+    async fn publish_replica_payload(
+        &self, _store: &dyn ObjectStore, key: &ObjectKey, body: Bytes,
+    ) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let admission = self.recovery.as_ref().ok_or_else(|| rtdb_storage::Error::Closed("The detached replay writer is unavailable".into()))?;
+        admission.publish(key, body).await
+    }
     fn requires_checkpoint_digest(&self) -> bool { self.inner.requires_checkpoint_digest() }
     fn needs_published_recovery_checkpoint(&self) -> bool {
         self.recovery.is_some() || self.inner.needs_published_recovery_checkpoint()
@@ -538,11 +553,13 @@ impl Log for SealedLog {
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+        self.admit_size(&payload)?;
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
         let receipt = self.inner.enqueue(self.units.seal(payload).await?, timestamp).await?;
         Ok(observe_attempt(receipt, outcome))
     }
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+        self.admit_size(&payload)?;
         self.inner.enqueue_maintenance(self.units.seal(payload).await?, timestamp).await
     }
     async fn available_append_capacity(&self) -> rtdb_storage::Result<Option<rtdb_storage::log::AppendCapacity>> {
@@ -829,7 +846,7 @@ mod tests {
         };
         let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
         let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(),
-            storage: crate::deployment::CellStorage::Local { root: files.path().to_owned() }, custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
+            broker: None, custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
         let factory = LogkeeperLogFactory::new(1024, Default::default(), holds);
 
         let refused = factory.open(&configuration, LogAccess::ReadWrite, CancellationToken::new()).await.err().unwrap();
@@ -865,10 +882,11 @@ mod tests {
         let files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap()),
-            storage: crate::deployment::CellStorage::Local { root: files.path().to_owned() },
+            broker: None,
             custody: ReplayCustody::Local, tasks: Default::default(),
         });
-        let replica = SealedLog::for_serving(provider.clone(), &[7; 32], &config, holds.clone()).unwrap();
+        holds.keys.key(&config.key_id).await.unwrap();
+        let replica = SealedLog::for_serving(provider.clone(), &config, holds.clone()).await.unwrap();
         for _ in 0..7 {
             replica.enqueue(Bytes::from_static(b"entry"), Timestamp(0)).await.unwrap().durable().await.unwrap();
         }
@@ -918,14 +936,16 @@ mod tests {
             write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
             transferred_source_through: None, transfer_intake_cut: None, placed_transfer: None, frozen_at: None, previous_servers: None,
             placed_receipt_retirement: false,
+            write_quorum: 1,
         };
         let directory_files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(directory_files.path()).unwrap()),
-            storage: crate::deployment::CellStorage::Local { root: directory_files.path().to_owned() },
+            broker: None,
             custody: ReplayCustody::Local, tasks: Default::default(),
         });
-        let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &[7; 32], &config, holds.clone()).unwrap();
+        holds.keys.key(&config.key_id).await.unwrap();
+        let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &config, holds.clone()).await.unwrap();
         let claim = ReplicaEnvelope { term: Term(1), term_sequence: None, message: ReplicaBody::NoOp(Default::default()) };
         replica.enqueue(Bytes::from(claim.encode()), Timestamp(0)).await.unwrap().durable().await.unwrap();
         let mut tail = replica.recovery_tail(LogOffset(-1)).await.unwrap().unwrap();

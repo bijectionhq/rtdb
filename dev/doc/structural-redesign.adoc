@@ -191,8 +191,9 @@ The existing versioned S3 payload collector still waits for the known physical j
 Normal readers register bounded replay holds and retain delivered pointers through provider drain. Archive and transfer reads require an admitted region covering the certified pointer's position.
 The offload retirement record binds the certified sealed frame digest and original replica position to the observed physical publication.
 Installed journal delivery resolves the one payload authenticated at its replica position through the serving lease and unit-key owner.
-Directory-managed serving tails and ranges resolve a delivered pointer through the durable replay ticket and verify the payload digest. Independent copies can resolve the same digest from authenticated transfer custody. The directory path still uses deployment-wide storage and key credentials.
-The detached replay broker can validate a pointer against a committed position without opening the sealed journal frame. It has a separate object namespace and unit-key vault. Serving, administrative and transfer callers still need to switch to it.
+Directory-managed serving writes publish detached bodies through the replay broker. Serving tails and ranges redeem the committed reference through the broker under a durable replay ticket.
+The broker verifies the committed position without opening the sealed journal frame and holds its own admission through delivery and drain. It opens only the detached object namespace and unit-key vault.
+Administrative, transfer and hosted credential provisioning routes still need to switch to that owner before independent payload settlement.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.

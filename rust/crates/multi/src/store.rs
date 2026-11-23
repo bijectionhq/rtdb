@@ -89,7 +89,6 @@ pub struct CellStoreFactory {
     pub storage_namespaces: rtdb_directory::StorageNamespaces,
     pub(crate) hosted_task: Option<HostedTask>,
     pub(crate) audience_source: Option<Uuid>,
-    pub(crate) replica_payload_reclamation: bool,
     pub(crate) storage_regions: TaskTracker,
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
@@ -314,9 +313,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             None => self.enroll_serving_key(&config, &id).await?,
         };
         let delivery = DeploymentDelivery::new(self.keys.clone(), id, &material);
-        let ordinary = EncryptingStore::with_deployment_delivery(cached, &material, delivery.clone())?.with_replica_publications(
-            self.replica_payload_reclamation && matches!(config.storage, crate::deployment::CellStorage::S3 { .. }),
-        );
+        let ordinary = EncryptingStore::with_deployment_delivery(cached, &material, delivery.clone())?;
         let ordinary = Arc::new(ordinary);
         let audience = audience.zip(self.audience_writer(&config, &record)).map(|(store, source)| {
             let store = Arc::new(AudienceObjectStore(EncryptingStore::with_deployment_delivery(store, &material, delivery)?));
@@ -2213,7 +2210,7 @@ mod tests {
         let allocation = uuid::Uuid::new_v4();
         let storage = CellStorage::parse(&format!("s3://fixture?terminal={allocation}.{}", "A".repeat(43))).unwrap();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
-        let factory = CellStoreFactory { replica_payload_reclamation: false,
+        let factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
         };
@@ -2241,7 +2238,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { replica_payload_reclamation: false, directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -2256,7 +2253,7 @@ mod tests {
         let keys = Arc::new(crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap());
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
-        let factory = CellStoreFactory { replica_payload_reclamation: false,
+        let factory = CellStoreFactory {
             directory: directory.clone(), keys: keys.clone(), storage_namespaces,
             storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
         };
@@ -2302,7 +2299,6 @@ mod tests {
         record.linearizable_reads = true;
         let record = directory.create_deployment(record).await.unwrap();
         let factory = CellStoreFactory {
-            replica_payload_reclamation: false,
             directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None,
             audience_source: Some(Uuid::parse_str(&record.id).unwrap()),
@@ -2599,7 +2595,7 @@ mod tests {
         record.storage_namespaces = Some(storage_namespaces);
         let record = directory.create_deployment(record).await.unwrap();
         let key = keys.key(&record.key_id()).await.unwrap();
-        let factory = CellStoreFactory { replica_payload_reclamation: false,
+        let factory = CellStoreFactory {
             directory: directory.clone(),
             keys: keys.clone(),
             storage_regions: TaskTracker::new(),
@@ -2989,7 +2985,7 @@ mod tests {
         for name in [core, packed, loose] { writer.delete(&key(name)).await.unwrap(); }
 
         let tasks = TaskTracker::new();
-        let storage_factory = CellStoreFactory { replica_payload_reclamation: false,
+        let storage_factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, hosted_task: None,
             storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, audience_source: None,
         };

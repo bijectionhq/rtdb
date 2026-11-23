@@ -19,7 +19,7 @@ use tokio_rustls::{
     TlsAcceptor, TlsConnector,
     rustls::{self, ClientConfig, RootCertStore, ServerConfig, pki_types::{CertificateDer, ServerName, pem::PemObject}},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::{
@@ -40,6 +40,7 @@ pub(crate) struct History {
     pub deployment: Uuid,
     pub incarnation: u64,
     pub log_epoch: i32,
+    pub storage_generation: Option<Uuid>,
 }
 
 impl History {
@@ -48,11 +49,13 @@ impl History {
             deployment: Uuid::parse_str(&record.id).map_err(|_| refused())?,
             incarnation: record.incarnation,
             log_epoch: record.log_epoch,
+            storage_generation: record.storage_generation,
         })
     }
 
     fn matches(self, record: &DeploymentRecord) -> bool {
         record.incarnation == self.incarnation && record.log_epoch == self.log_epoch
+            && record.storage_generation == self.storage_generation
             && Uuid::parse_str(&record.id).ok() == Some(self.deployment)
     }
 }
@@ -80,11 +83,27 @@ enum Response {
 }
 
 #[derive(Clone)]
-pub struct Client {
+pub struct Client(Arc<ClientRoute>);
+
+enum ClientRoute {
+    Remote(Remote),
+    Standalone { service: Arc<Service>, tasks: TaskTracker },
+}
+
+struct Remote {
     endpoint: Arc<str>,
     server_name: ServerName<'static>,
     tls: Arc<ClientConfig>,
     token: Arc<str>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_ref() {
+            ClientRoute::Remote(remote) => formatter.debug_struct("ReplayBrokerClient").field("endpoint", &remote.endpoint).finish_non_exhaustive(),
+            ClientRoute::Standalone { .. } => formatter.write_str("StandaloneReplayBroker"),
+        }
+    }
 }
 
 impl Client {
@@ -99,30 +118,36 @@ impl Client {
         let tls = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
             .with_safe_default_protocol_versions().map_err(transport)?
             .with_root_certificates(roots).with_no_client_auth();
-        Ok(Self {
+        Ok(Self(Arc::new(ClientRoute::Remote(Remote {
             endpoint: Arc::from(endpoint),
             server_name: ServerName::try_from(server_name.to_owned()).map_err(transport)?,
             tls: Arc::new(tls),
             token: Arc::from(Token::read(token)?),
-        })
+        }))))
     }
 
-    async fn connect(&self, history: History, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        socket_work(async {
-            let stream = TcpStream::connect(self.endpoint.as_ref()).await.map_err(transport)?;
-            let mut stream = TlsConnector::from(Arc::clone(&self.tls))
-                .connect(self.server_name.clone(), stream).await.map_err(transport)?;
-            send_header(&mut stream, &Request { token: self.token.to_string(), history, action }).await?;
-            Ok(stream)
-        }).await
+    pub(crate) fn standalone(
+        directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>, tasks: TaskTracker,
+    ) -> Result<Self> {
+        let service = Service::open(directory, storage, serving, keys, None, None)?;
+        Ok(Self(Arc::new(ClientRoute::Standalone { service, tasks })))
     }
 
     pub(crate) async fn read(
         &self, history: History, ticket: Uuid, position: i64, frame: &[u8], memory: &Arc<MemoryBudget>,
     ) -> Result<ReplicaPayload> {
+        let ClientRoute::Remote(remote) = self.0.as_ref() else {
+            let ClientRoute::Standalone { service, tasks } = self.0.as_ref() else { unreachable!(); };
+            let service = Arc::clone(service);
+            let memory = Arc::clone(memory);
+            let reference = Bytes::copy_from_slice(frame);
+            return tasks.spawn(async move {
+                service.read_for_ticket(history, ticket, position, &reference, &memory, None).await
+            }).await.map_err(transport)?;
+        };
         let reference = decode_reference(frame)?;
         let action = Action::Read { ticket, position, reference: URL_SAFE_NO_PAD.encode(frame) };
-        let mut socket = self.connect(history, action).await?;
+        let mut socket = remote.connect(history, action).await?;
         socket_work(async {
             let Response::Payload { length } = read_response(&mut socket).await? else {
                 return Err(invalid_frame());
@@ -136,8 +161,17 @@ impl Client {
         &self, history: History, epoch: u64, object: &ObjectKey, bytes: Bytes,
     ) -> Result<Option<PhysicalObjectVersion>> {
         check_length(bytes.len())?;
+        let ClientRoute::Remote(remote) = self.0.as_ref() else {
+            let ClientRoute::Standalone { service, tasks } = self.0.as_ref() else { unreachable!(); };
+            let service = Arc::clone(service);
+            let name = object.clone();
+            let charge = service.memory.reserve(bytes.len())?;
+            return tasks.spawn(async move {
+                service.publish_body(history, epoch, &name, bytes, charge).await
+            }).await.map_err(transport)?;
+        };
         let action = Action::Publish { epoch, object: object.to_string(), length: bytes.len() };
-        let mut socket = self.connect(history, action).await?;
+        let mut socket = remote.connect(history, action).await?;
         socket_work(async {
             socket.write_all(&bytes).await.map_err(transport)?;
             socket.flush().await.map_err(transport)?;
@@ -149,12 +183,24 @@ impl Client {
     }
 }
 
+impl Remote {
+    async fn connect(&self, history: History, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        socket_work(async {
+            let stream = TcpStream::connect(self.endpoint.as_ref()).await.map_err(transport)?;
+            let mut stream = TlsConnector::from(Arc::clone(&self.tls))
+                .connect(self.server_name.clone(), stream).await.map_err(transport)?;
+            send_header(&mut stream, &Request { token: self.token.to_string(), history, action }).await?;
+            Ok(stream)
+        }).await
+    }
+}
+
 pub struct Service {
     directory: Arc<dyn Directory>,
     storage: CellStorage,
     namespace: [u8; 32],
     keys: Arc<dyn KeyService>,
-    token: Token,
+    token: Option<Token>,
     custody: ReplayCustody,
     memory: Arc<MemoryBudget>,
 }
@@ -164,7 +210,20 @@ impl Service {
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
         token: &Path, task: Option<rtdb_directory::HostedTask>,
     ) -> Result<Arc<Self>> {
-        if storage.overlaps(serving)? {
+        Self::open(directory, storage, serving, keys, Some(Token::new(&Token::read(token)?)?), task)
+    }
+
+    fn open(
+        directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
+        token: Option<Token>, task: Option<rtdb_directory::HostedTask>,
+    ) -> Result<Arc<Self>> {
+        let shares_media = match (&storage, serving) {
+            (CellStorage::S3 { config: payload }, CellStorage::S3 { config: serving }) => payload.bucket == serving.bucket,
+            (CellStorage::Local { root: payload }, CellStorage::Local { root: serving }) =>
+                payload.starts_with(serving) || serving.starts_with(payload),
+            _ => false,
+        };
+        if shares_media {
             return Err(Anomaly::incorrect("rtdb.multi/replay-broker-storage",
                 "The detached replay broker requires an object namespace outside serving storage"));
         }
@@ -174,7 +233,7 @@ impl Service {
             (_, owner) => ReplayCustody::Hosted { owner },
         };
         Ok(Arc::new(Self {
-            directory, storage, namespace, keys, custody, token: Token::new(&Token::read(token)?)?,
+            directory, storage, namespace, keys, custody, token,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
         }))
     }
@@ -213,84 +272,99 @@ impl Service {
 
     async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<TcpStream>) -> Result<()> {
         let request: Request = socket_work(receive_header(socket)).await?;
-        if !self.token.accepts(&request.token) { return Err(refused()); }
+        if !self.token.as_ref().is_some_and(|token| token.accepts(&request.token)) { return Err(refused()); }
         let history = request.history;
         match request.action {
             Action::Read { ticket, position, reference } => {
                 let frame = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
-                let reference = decode_reference(&frame)?;
-                let region = Uuid::new_v4();
-                let local = match self.custody {
-                    ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
-                    ReplayCustody::Hosted { .. } => None,
-                };
-                let mut attempted = false;
-                let result = async {
-                    let record = self.admit_read(history, ticket, position, region, &mut attempted).await?;
-                    let io = IoRegion::new();
-                    let read = async {
-                        let payload = self.read_body(&record, position, &frame, &reference, Arc::clone(&io)).await?;
-                        socket_work(async {
-                            send_header(socket, &Response::Payload { length: payload.as_ref().len() }).await?;
-                            socket.write_all(payload.as_ref()).await.map_err(transport)?;
-                            socket.flush().await.map_err(transport)
-                        }).await
-                    }.await;
-                    io.close_and_wait().await;
-                    read
-                }.await;
-                if attempted {
-                    self.release(history, region).await;
-                }
-                if local.is_some() {
-                    drop(local);
-                    self.keys.forget_local_storage_region(region)?;
-                }
-                result
+                self.read_for_ticket(history, ticket, position, &frame, &self.memory, Some(socket)).await?;
+                Ok(())
             }
             Action::Publish { epoch, object, length } => {
                 let key = ObjectKey::new(object)?;
-                check_publish_key(&key)?;
-                let owner = history.deployment.to_string();
-                let task = match &self.custody {
-                    ReplayCustody::Local => None,
-                    ReplayCustody::Hosted { owner } => owner.as_ref(),
-                };
-                // Reserve the broker's provider admission before reading the
-                // body. A concurrent custody closure can now fence or drain it.
-                let body_stream = &mut *socket;
-                let version = crate::archive::stage::with_region(
-                    self.directory.as_ref(), self.keys.as_ref(), &owner, &self.storage, task,
-                    None, None,
-                    |record| {
-                        require_writer(history, epoch, record)?;
-                        Ok(None)
-                    },
-                    |record, _, io| async move {
-                        socket_work(async {
-                            let (body, charge) = receive_body(body_stream, length, &self.memory).await?;
-                            let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
-                            if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                return Err(invalid_frame());
-                            }
-                            let current = self.writer(history, epoch).await?;
-                            if current.storage_prefix() != record.storage_prefix() {
-                                return Err(refused());
-                            }
-                            let files = self.open(&record, io).await?;
-                            let published = IoRegion::retaining(charge, files.put_with_publication(&key, body)).await?;
-                            let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
-                            if version.is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
-                                return Err(Anomaly::incorrect("rtdb.multi/replay-broker-version", "Detached S3 bodies require versioned custody"));
-                            }
-                            Ok(version)
-                        }).await
-                    },
-                ).await?;
                 self.writer(history, epoch).await?;
+                let (body, charge) = socket_work(receive_body(socket, length, &self.memory)).await?;
+                let version = self.publish_body(history, epoch, &key, body, charge).await?;
                 socket_work(send_header(socket, &Response::Publication { version })).await
             }
         }
+    }
+
+    async fn read_for_ticket(
+        &self, history: History, ticket: Uuid, position: i64, frame: &[u8], memory: &Arc<MemoryBudget>,
+        socket: Option<&mut tokio_rustls::server::TlsStream<TcpStream>>,
+    ) -> Result<ReplicaPayload> {
+        let reference = decode_reference(frame)?;
+        let region = Uuid::new_v4();
+        let local = match self.custody {
+            ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
+            ReplayCustody::Hosted { .. } => None,
+        };
+        let mut attempted = false;
+        let result = async {
+            let record = self.admit_read(history, ticket, position, region, &mut attempted).await?;
+            let io = IoRegion::new();
+            let read = async {
+                let payload = self.read_body(&record, position, frame, &reference, Arc::clone(&io), memory).await?;
+                crate::residence_trace::record("read-retained-payload", || serde_json::json!({
+                    "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
+                    "revision": record.version, "stream": record.stream("replica"), "epoch": record.log_epoch,
+                    "hold": region, "residence": residence(&record), "position": position,
+                    "key": format!("{}/{}", residence(&record), reference.object()),
+                    "publication": reference.publication(),
+                }));
+                if let Some(socket) = socket {
+                    socket_work(async {
+                        send_header(socket, &Response::Payload { length: payload.as_ref().len() }).await?;
+                        socket.write_all(payload.as_ref()).await.map_err(transport)?;
+                        socket.flush().await.map_err(transport)
+                    }).await?;
+                }
+                Ok(payload)
+            }.await;
+            io.close_and_wait().await;
+            read
+        }.await;
+        if attempted {
+            self.release(history, region).await;
+        }
+        if local.is_some() {
+            drop(local);
+            self.keys.forget_local_storage_region(region)?;
+        }
+        result
+    }
+
+    async fn publish_body(
+        &self, history: History, epoch: u64, key: &ObjectKey, body: Bytes, charge: Arc<rtdb_types::MemoryReservation>,
+    ) -> Result<Option<PhysicalObjectVersion>> {
+        check_publish_key(key)?;
+        let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
+        if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) { return Err(invalid_frame()); }
+        let deployment = history.deployment.to_string();
+        let task = match &self.custody {
+            ReplayCustody::Local => None,
+            ReplayCustody::Hosted { owner } => owner.as_ref(),
+        };
+        let version = crate::archive::stage::with_region(
+            self.directory.as_ref(), self.keys.as_ref(), &deployment, &self.storage, task, None, None,
+            |record| {
+                require_writer(history, epoch, record)?;
+                Ok(None)
+            },
+            |record, _, io| async move {
+                self.writer(history, epoch).await?;
+                let files = self.open(&record, io).await?;
+                let published = IoRegion::retaining(charge, files.put_with_publication(key, body)).await?;
+                let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
+                if version.is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
+                    return Err(Anomaly::incorrect("rtdb.multi/replay-broker-version", "Detached S3 bodies require versioned custody"));
+                }
+                Ok(version)
+            },
+        ).await?;
+        self.writer(history, epoch).await?;
+        Ok(version)
     }
 
     async fn current(&self, history: History) -> Result<DeploymentRecord> {
@@ -322,6 +396,12 @@ impl Service {
             });
             *attempted = true;
             if let Cas::Applied(stored) = self.directory.replace_deployment(record, version).await? {
+                crate::residence_trace::record("admit-recovery", || serde_json::json!({
+                    "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+                    "revision": stored.version, "stream": stored.stream("replica"), "epoch": stored.log_epoch,
+                    "hold": region, "residence": residence(&stored),
+                    "first_required": position, "through": position,
+                }));
                 return Ok(stored);
             }
         }
@@ -331,7 +411,7 @@ impl Service {
 
     async fn read_body(
         &self, record: &DeploymentRecord, position: i64, frame: &[u8],
-        reference: &ReplicaPayloadReference, io: Arc<IoRegion>,
+        reference: &ReplicaPayloadReference, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
     ) -> Result<ReplicaPayload> {
         let stream = crate::admin::administration_stream(self.directory.as_ref(), record, crate::process::MAXIMUM_LOG_MESSAGE_BYTES).await?;
         let proof = rtdb_logkeeper::certify_committed_range(&stream, position, position).await?;
@@ -348,11 +428,11 @@ impl Service {
         }
         let files = self.open(record, io).await?;
         check_length(usize::try_from(files.head_fresh(reference.object()).await?.size).map_err(transport)?)?;
-        Ok(reference.read_at(&files, &self.memory).await?)
+        Ok(reference.read_at(&files, memory).await?)
     }
 
     async fn open(&self, record: &DeploymentRecord, io: Arc<IoRegion>) -> Result<EncryptingStore> {
-        let residence = format!("replay-bodies/{}/{}", record.storage_prefix(), record.log_epoch);
+        let residence = residence(record);
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
         let files = Arc::new(PrefixedStore::new(bucket, &residence));
         let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, record.log_epoch), io);
@@ -363,12 +443,22 @@ impl Service {
         let deployment = history.deployment.to_string();
         loop {
             match crate::store::release_region(self.directory.as_ref(), &deployment, region, true).await {
-                Ok(()) => return,
+                Ok(()) => {
+                    crate::residence_trace::record("finish-recovery", || serde_json::json!({
+                        "installation": deployment, "stream": format!("{deployment}/{}/replica", history.incarnation),
+                        "epoch": history.log_epoch, "hold": region,
+                    }));
+                    return;
+                }
                 Err(error) => tracing::warn!(%deployment, %region, code = %error.code, "Broker read region is awaiting release"),
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+}
+
+fn residence(record: &DeploymentRecord) -> String {
+    format!("replay-bodies/{}/{}", record.storage_prefix(), record.log_epoch)
 }
 
 fn require_writer(history: History, epoch: u64, record: &DeploymentRecord) -> Result<()> {
