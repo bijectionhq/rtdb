@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
-use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
+use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldPointResult};
 use rtdb_node::{OwnedChangeEdge, NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey, WorldClockMode};
 use uuid::Uuid;
@@ -427,17 +427,11 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 }
 
 fn path_touch_result(present: Timestamp, (fact, shadowed): (Option<crate::archive::WorldFact>, bool)) -> WorldPointResult {
-    let row = fact.map(|fact| {
-        let (fields, revision, assertion, reservation) = fact.into_parts();
-        WorldPointRow { fields, revision, assertion, reservation }
-    });
+    let row = fact.map(crate::archive::WorldFact::into_point_row);
     WorldPointResult { present, row, until: None, shadowed, witness: None }
 }
 
 fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
-    let row = read.fact.map(|fact| {
-        let (fields, revision, assertion, reservation) = fact.into_parts();
-        WorldPointRow { fields, revision, assertion, reservation }
-    });
+    let row = read.fact.map(crate::archive::WorldFact::into_point_row);
     WorldPointResult { present: read.present.system_time, row, until: read.until, shadowed: read.shadowed, witness: read.witness }
 }

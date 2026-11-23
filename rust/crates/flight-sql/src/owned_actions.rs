@@ -4326,7 +4326,7 @@ impl Service {
             metadata.insert(WORLD_POINT_WITNESS.into(), nonce.simple().to_string());
         }
         if let Some(row) = result.row {
-            let crate::WorldPointRow { fields: row, revision, assertion, reservation: _retained } = row;
+            let crate::WorldPointRow { batch: row, revision, assertion, reservation: _retained } = row;
             if let Some(assertion) = assertion {
                 metadata.insert(OWNED_ASSERTION_LINE.into(),
                     Uuid::from_bytes(assertion.line.map_or([0; 16], |line| line.0)).simple().to_string());
@@ -4335,15 +4335,11 @@ impl Service {
                     metadata.insert(OWNED_ASSERTION_HELD_READING.into(), reading.0.to_string());
                 }
             }
-            let bytes = Value::document_retained_bytes(&row).map_err(status)?;
+            let bytes = crate::WorldPointRow::document_bytes(&row).map_err(status)?;
             let _encoding = call.reserve(wire::add(4096, wire::mul(bytes, 8)?)?)?;
-            let mut fields = Vec::with_capacity(row.len());
-            let mut columns = Vec::with_capacity(row.len());
-            for (name, value) in &row {
-                let logical = value.logical_type();
-                fields.push(rtdb_columnar::to_field(name, &logical).map_err(status)?);
-                columns.push(rtdb_columnar::build_array(&logical, std::slice::from_ref(value)).map_err(status)?);
-            }
+            let (fields, columns) = row.schema_ref().fields().iter().zip(row.columns())
+                .map(|(field, array)| world_point_cell(ArrowCell { field, array: array.as_ref(), row: 0 }).map_err(status))
+                .collect::<Result<Vec<_>, _>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
             self.owned_point_reply_in(self.memory(), &schema, Some(&batch), result.present, valid_at, Some(revision), result.until, selection)
@@ -5505,6 +5501,33 @@ fn owned_point_expectation(history: Option<Timestamp>, position: Option<&[u8]>) 
     }
 }
 
+fn world_point_cell(cell: ArrowCell<'_>) -> rtdb_types::Result<(Field, ArrayRef)> {
+    let selected = cell.physical()?;
+    let logical = selected.logical_type()?;
+    let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
+    match &logical {
+        LogicalType::Null => Ok((field, Arc::new(arrow_array::NullArray::new(1)))),
+        LogicalType::Scalar(_) if selected.field.data_type() == field.data_type()
+            && selected.field.metadata() == field.metadata() => {
+            let array = selected.array.slice(selected.row, 1);
+            rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
+            let array = if array.nulls().is_some() {
+                let data = array.to_data().into_builder().nulls(None).build()
+                    .map_err(|error| rtdb_types::Anomaly::incorrect("rtdb/invalid-arrow", error.to_string()))?;
+                arrow_array::make_array(data)
+            } else { array };
+            Ok((field, array))
+        }
+        _ => {
+            let value = rtdb_columnar::read_value(cell.field, cell.array, cell.row)?;
+            let logical = value.logical_type();
+            let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
+            let array = rtdb_columnar::build_array(&logical, &[value])?;
+            Ok((field, array))
+        }
+    }
+}
+
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
     match value {
         Some(Value::I64(time)) => Ok(Some(Timestamp(time))),
@@ -5592,4 +5615,52 @@ fn owned_touches_type() -> rtdb_types::LogicalType {
         ("expiry_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
         ("assertion_ordinal".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
     ])))
+}
+
+#[cfg(test)]
+mod world_point_tests {
+    use super::*;
+    use arrow_array::cast::AsArray;
+    use rtdb_types::{LogicalType, ScalarType};
+
+    #[test]
+    fn world_point_narrows_to_the_selected_leg_and_retains_its_payload() {
+        let logical = LogicalType::from_legs([LogicalType::Null,
+            LogicalType::Scalar(ScalarType::Utf8), LogicalType::Scalar(ScalarType::F64)]);
+        let field = rtdb_columnar::to_field("payload", &logical).unwrap();
+        let bits = 0x7ff8_0000_0000_0013;
+        let values = [Value::Utf8("earlier".into()), Value::F64(f64::from_bits(bits)),
+            Value::Null, Value::Utf8("latest".into())];
+        let array = rtdb_columnar::build_array(&logical, &values).unwrap();
+        for (row, value) in values.into_iter().enumerate().skip(1) {
+            let cell = ArrowCell { field: &field, array: array.as_ref(), row };
+            let active = cell.physical().unwrap();
+            let (actual_field, actual) = world_point_cell(cell).unwrap();
+            let expected_type = value.logical_type();
+            assert_eq!(actual_field, rtdb_columnar::to_field("payload", &expected_type).unwrap());
+            if matches!(value, Value::Utf8(_)) {
+                assert_eq!(actual.as_string::<i32>().value(0).as_ptr(), active.array.as_string::<i32>().value(active.row).as_ptr());
+            }
+            if matches!(value, Value::F64(_)) {
+                assert_eq!(actual.as_primitive::<arrow_array::types::Float64Type>().value(0).to_bits(), bits);
+            }
+            let schema = Arc::new(Schema::new(vec![actual_field]));
+            let expected = rtdb_columnar::build_array(&expected_type, std::slice::from_ref(&value)).unwrap();
+            let actual = RecordBatch::try_new(schema.clone(), vec![actual]).unwrap();
+            let expected = RecordBatch::try_new(schema.clone(), vec![expected]).unwrap();
+            let document = std::iter::once(Ok(("payload".into(), value))).collect::<rtdb_types::Result<StructFields<_>>>().unwrap();
+            assert_eq!(crate::WorldPointRow::document_bytes(&actual).unwrap(), Value::document_retained_bytes(&document).unwrap());
+            let ipc = |batch: &RecordBatch| {
+                write_arrow_stream(&schema, std::slice::from_ref(batch), IpcWriteOptions::default()).unwrap()
+            };
+            assert_eq!(ipc(&actual), ipc(&expected));
+        }
+        let nullable = LogicalType::Scalar(ScalarType::Utf8).maybe();
+        let field = rtdb_columnar::to_field("payload", &nullable).unwrap();
+        let array = Arc::new(StringArray::from(vec![None, Some("selected")]));
+        let (field, narrowed) = world_point_cell(ArrowCell { field: &field, array: array.as_ref(), row: 1 }).unwrap();
+        assert!(!field.is_nullable());
+        assert!(narrowed.nulls().is_none());
+        assert_eq!(narrowed.as_string::<i32>().value(0).as_ptr(), array.value(1).as_ptr());
+    }
 }

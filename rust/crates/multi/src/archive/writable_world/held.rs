@@ -503,14 +503,11 @@ impl HeldCheckpointWorld {
             };
             let (mut fact, shadowed) = self.resolve_local(relation, id, valid, local, None).await?;
             if let Some(fact) = &mut fact {
-                if !fact.row.contains_key("_id") { return Err(OwnedWorld::unavailable()); }
+                if fact.row.schema_ref().index_of("_id").is_err() { return Err(OwnedWorld::unavailable()); }
                 if images {
-                    schema.validate_row(&fact.row)?;
+                    fact.validate(&schema)?;
                 } else {
-                    fact.row.retain(|name, _| name == "_id" || columns.contains(name));
-                    for column in &columns {
-                        if !fact.row.contains_key(column) { fact.row.insert(column.clone(), Value::Null); }
-                    }
+                    fact.select_path(&columns, true)?;
                 }
             }
             *side = (fact, shadowed);
@@ -670,7 +667,7 @@ impl HeldCheckpointWorld {
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         if let Some(fact) = &fact {
             if fact.revision > system { return Err(OwnedWorld::unavailable()); }
-            schema.validate_row(&fact.row)?;
+            fact.validate(&schema)?;
         }
         guard()?;
         self.check_relation(relation)?;
@@ -822,7 +819,7 @@ impl HeldCheckpointWorld {
         if let Some(fact) = &fact {
             let upper = if shadowed { cut.system_time() } else { self.parent_basis().system_time };
             if fact.revision > upper { return Err(OwnedWorld::unavailable()); }
-            schema.validate_row(&fact.row)?;
+            fact.validate(&schema)?;
         }
         self.check_relation(relation)?;
         Ok((fact, shadowed))
@@ -1103,11 +1100,8 @@ impl HeldCheckpointWorld {
                         let shadow = cut.shadow(&id, valid).await?;
                         let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?
                             .ok_or_else(OwnedWorld::unavailable)?;
-                        let row = WorldShadow::from_record(fact.row)?;
-                        let text = match &row {
-                            WorldShadow::Deleted => None,
-                            WorldShadow::Present(row) => search_row_text(row, column)?,
-                        };
+                        let row = fact.into_shadow(self.open.record.id)?;
+                        let text = row.as_ref().map(|fact| search_text(fact, column)).transpose()?.flatten();
                         corpus.shadow(partition, id, text)?;
                     } else {
                         let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
@@ -1331,8 +1325,8 @@ impl HeldCheckpointWorld {
             let (fact, shadowed) = self.resolve_local(relation, id, window[0], local, Some(schema)).await?;
             if let Some(fact) = fact {
                 if fact.revision > group { return Err(OwnedWorld::unavailable()); }
-                schema.validate_row(&fact.row)?;
-                bytes = bytes.checked_add(Value::document_retained_bytes(&fact.row)?)
+                fact.validate(&schema)?;
+                bytes = bytes.checked_add(fact.document_bytes()?)
                     .filter(|bytes| *bytes <= 8 << 20).ok_or_else(history_limit)?;
                 slices.push((Interval::new(window[0], window[1])?, fact, shadowed));
             }
@@ -1559,7 +1553,7 @@ impl HeldCheckpointWorld {
                 let shadow = if let Some(cut) = cut {
                     let read = cut.shadow(&id, valid).await?;
                     decode_point(read.row.into_iter().collect(), &id, &self.memory, None)?
-                        .map(|fact| WorldShadow::from_record(fact.row).map(|shadow| matches!(shadow, WorldShadow::Present(_))))
+                        .map(|fact| fact.into_shadow(self.open.record.id).map(|shadow| shadow.is_some()))
                         .transpose()?
                 } else {
                     self.open.read_local(relation, &id, valid, &self.memory, false).await?.0
@@ -1683,15 +1677,9 @@ fn expired_lifetime() -> rtdb_types::Anomaly {
 }
 
 fn search_text<'a>(fact: &'a WorldFact, column: &str) -> Result<Option<&'a str>> {
-    search_row_text(fact.row(), column)
-}
-
-fn search_row_text<'a>(row: &'a StructFields<Value>, column: &str) -> Result<Option<&'a str>> {
-    match row.get(column) {
-        Some(Value::Utf8(text)) => Ok(Some(text)),
-        None | Some(Value::Null) => Ok(None),
-        _ => Err(OwnedWorld::unavailable()),
-    }
+    let Some(cell) = ArrowCell::named(&fact.row, column, 0) else { return Ok(None); };
+    if cell.logical_type()? == rtdb_types::LogicalType::Null { return Ok(None); }
+    cell.utf8().map(Some).ok_or_else(OwnedWorld::unavailable)
 }
 
 struct InheritedRelation<'a> {
@@ -1807,7 +1795,7 @@ impl<'a> InheritedRelation<'a> {
             if shadow.revision > self.overlay_basis { return Err(unavailable()); }
             let mut fact = shadow.into_shadow(self.world)?;
             if let Some(fact) = &mut fact {
-                self.schema.validate_row(&fact.row)?;
+                fact.validate(self.schema)?;
                 if let Some(assertion) = &mut fact.assertion {
                     let (_, reading) = self.accepted_group(fact.revision).await?;
                     assertion.held_reading = Some(reading);
@@ -1833,7 +1821,7 @@ impl<'a> InheritedRelation<'a> {
         let fact = decode_point(batches.unwrap_or_default(), id, self.memory, None)?;
         if let Some(fact) = &fact {
             if fact.revision > self.root.current_time.as_micros()? { return Err(unavailable()); }
-            self.schema.validate_row(&fact.row)?;
+            fact.validate(self.schema)?;
         }
         self.root.check_cancelled()?;
         Ok((fact, false))
@@ -1938,7 +1926,7 @@ impl<'a> InheritedRelation<'a> {
         for span in boundaries.windows(2) {
             let (fact, shadowed) = self.resolve(id, Interval::at(span[0])?).await?;
             if let Some(fact) = fact {
-                bytes = bytes.checked_add(Value::document_retained_bytes(&fact.row)?)
+                bytes = bytes.checked_add(fact.document_bytes()?)
                     .filter(|bytes| *bytes <= 8 << 20).ok_or_else(history_limit)?;
                 timeline.push((Interval::new(span[0], span[1])?, fact, shadowed));
             }
@@ -2007,10 +1995,7 @@ impl<'a> InheritedRelation<'a> {
         if !images {
             for (fact, _) in &mut sides {
                 if let Some(fact) = fact {
-                    fact.row.retain(|name, _| name == "_id" || columns.contains(name));
-                    for column in &columns {
-                        if !fact.row.contains_key(column) { fact.row.insert(column.clone(), Value::Null); }
-                    }
+                    fact.select_path(&columns, true)?;
                 }
             }
         }
@@ -2311,8 +2296,12 @@ async fn read_boundaries(cursor: Option<rtdb_query::QueryCursor>, valid: Interva
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         let read = |name, row| {
-            let (slot, field) = batch.schema_ref().column_with_name(name).ok_or_else(OwnedWorld::unavailable)?;
-            match rtdb_columnar::read_value(field, batch.column(slot).as_ref(), row)? {
+            let cell = ArrowCell::named(batch, name, row).ok_or_else(OwnedWorld::unavailable)?;
+            if let Some(value) = rtdb_query::owned_micros(cell) { return Ok(value); }
+            if name == "_valid_to" && cell.logical_type()? == rtdb_types::LogicalType::Null {
+                return Ok(Timestamp::MAX);
+            }
+            match rtdb_columnar::read_value(cell.field, cell.array, cell.row)? {
                 Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
                 Value::Null if name == "_valid_to" => Ok(Timestamp::MAX),
                 _ => Err(OwnedWorld::unavailable()),
@@ -2550,7 +2539,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                             ).await?;
                                             let fact = decode_point(batches.unwrap_or_default(), &id, memory, None)?
                                                 .filter(|fact| fact.revision <= system).ok_or_else(OwnedWorld::unavailable)?;
-                                            schemas[0].1.validate_row(&fact.row)?;
+                                            fact.validate(&schemas[0].1)?;
                                             schedule.push((interval, fact.revision));
                                         }
                                         context.check_cancelled()?;
@@ -2617,11 +2606,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                                         return Err(OwnedWorld::unavailable());
                                                     }
                                                     if images {
-                                                        schema.validate_row(&fact.row)?;
+                                                        fact.validate(&schema)?;
                                                     } else {
-                                                        for column in columns {
-                                                            if !fact.row.contains_key(column) { fact.row.insert(column.clone(), Value::Null); }
-                                                        }
+                                                        fact.select_path(columns, false)?;
                                                     }
                                                 }
                                                 Ok(fact)

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use arrow_array::{ArrayRef, NullArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldMedia, CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, WorldForkReservation, now_ms};
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldRegistrationOutcome, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
@@ -1247,33 +1249,82 @@ pub struct WorldPoint {
 }
 
 pub struct WorldFact {
-    row: StructFields<Value>,
+    row: RecordBatch,
     revision: Timestamp,
     assertion: Option<OwnedWorldAssertion>,
     lifetime: Option<Interval>,
-    _reservation: Arc<MemoryReservation>,
+    reservation: Arc<MemoryReservation>,
 }
 
 impl WorldFact {
-    pub fn row(&self) -> &StructFields<Value> {
-        &self.row
+    pub(crate) fn into_point_row(self) -> rtdb_flight_sql::WorldPointRow {
+        rtdb_flight_sql::WorldPointRow { batch: self.row, revision: self.revision, assertion: self.assertion, reservation: self.reservation }
     }
 
-    pub(crate) fn into_parts(self) -> (StructFields<Value>, Timestamp, Option<OwnedWorldAssertion>, Arc<MemoryReservation>) {
-        (self.row, self.revision, self.assertion, self._reservation)
+    fn validate(&self, schema: &rtdb_types::OwnedSchema) -> Result<()> {
+        let types = self.row.schema_ref().fields().iter().zip(self.row.columns()).map(|(field, array)| {
+            let cell = ArrowCell { field, array: array.as_ref(), row: 0 };
+            Ok((field.name().clone(), cell.logical_type()?))
+        }).collect::<Result<_>>()?;
+        schema.validate_types(&types)
+    }
+
+    fn document_bytes(&self) -> Result<usize> {
+        rtdb_flight_sql::WorldPointRow::document_bytes(&self.row)
+    }
+
+    fn select_path(&mut self, names: &[String], trim: bool) -> Result<()> {
+        let mut fields = Vec::new();
+        let mut arrays = Vec::new();
+        for (field, array) in self.row.schema_ref().fields().iter().zip(self.row.columns()) {
+            if !trim || field.name() == "_id" || names.contains(field.name()) {
+                fields.push(Arc::clone(field));
+                arrays.push(Arc::clone(array));
+            }
+        }
+        for name in names {
+            if !fields.iter().any(|field| field.name() == name) {
+                fields.push(Arc::new(Field::new(name, DataType::Null, true)));
+                arrays.push(Arc::new(NullArray::new(1)) as ArrayRef);
+            }
+        }
+        self.row = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|_| OwnedWorld::unavailable())?;
+        Ok(())
     }
 
     fn into_shadow(mut self, line: Iid) -> Result<Option<Self>> {
-        match WorldShadow::from_record(self.row)? {
-            WorldShadow::Deleted => Ok(None),
-            WorldShadow::Present(row) => {
-                self.row = row;
-                if let Some(assertion) = &mut self.assertion {
-                    assertion.line = Some(line);
-                }
-                Ok(Some(self))
+        let unavailable = OwnedWorld::unavailable;
+        let schema = self.row.schema_ref();
+        let identity = schema.index_of("_id").map_err(|_| unavailable())?;
+        let marker = schema.index_of(WorldShadow::FIELDS).map_err(|_| unavailable())?;
+        let field = schema.field(marker);
+        let array = self.row.column(marker);
+        let marker_cell = ArrowCell { field, array: array.as_ref(), row: 0 };
+        if marker_cell.is_undefined()? { return Err(unavailable()); }
+        let deleted = marker_cell.is_null()?;
+        let mut selected = vec![identity];
+        if !deleted {
+            let fields = rtdb_columnar::utf8_list(field, array.as_ref(), 0).map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+            for name in fields {
+                let name = name.map_err(|_| unavailable())?;
+                if name.starts_with('_') { return Err(unavailable()); }
+                let index = schema.index_of(name).map_err(|_| unavailable())?;
+                let cell = ArrowCell { field: schema.field(index), array: self.row.column(index).as_ref(), row: 0 };
+                if selected.contains(&index) || cell.is_undefined()? { return Err(unavailable()); }
+                selected.push(index);
             }
         }
+        for (index, field) in schema.fields().iter().enumerate() {
+            if index == marker || selected.contains(&index) { continue; }
+            let cell = ArrowCell { field, array: self.row.column(index).as_ref(), row: 0 };
+            if !cell.is_null()? { return Err(unavailable()); }
+        }
+        if deleted { return Ok(None); }
+        self.row = self.row.project(&selected).map_err(|_| unavailable())?;
+        if let Some(assertion) = &mut self.assertion {
+            assertion.line = Some(line);
+        }
+        Ok(Some(self))
     }
 }
 
@@ -1297,43 +1348,25 @@ fn decode_point(
                 let (created, expires) = rtdb_query::owned_row_lifetime(batch, row, revision, duration)?;
                 Interval::new(created, expires)
             }).transpose()?;
-            let columns = || {
-                batch
-                    .schema_ref()
-                    .fields()
-                    .iter()
-                    .zip(batch.columns())
-                    .filter(|(field, _)| !matches!(field.name().as_str(),
-                        "_system_from" | "_assertion_ordinal" | rtdb_types::OWNED_EVENT_POSITION_COLUMN)
-                        && !(lifetime.is_some() && matches!(field.name().as_str(), "_valid_from" | "_valid_to")))
-            };
-            let charge = columns().try_fold(4096usize, |bound, (field, column)| {
-                bound
-                    .checked_add(field.name().len() + 256)
-                    .and_then(|bound| {
-                        bound.checked_add(
-                            rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), row)
-                                .ok()?,
-                        )
-                    })
-                    .ok_or_else(OwnedWorld::unavailable)
+            let columns = || batch.schema_ref().fields().iter().enumerate().filter_map(|(index, field)| {
+                (!matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal" | rtdb_types::OWNED_EVENT_POSITION_COLUMN)
+                    && !(lifetime.is_some() && matches!(field.name().as_str(), "_valid_from" | "_valid_to"))).then_some(index)
+            });
+            let charge = columns().try_fold(4096usize, |bound, index| {
+                let field = batch.schema_ref().field(index);
+                bound.checked_add(field.name().len() + 256).and_then(|bound| {
+                    bound.checked_add(rtdb_columnar::estimate_read_value_bytes(field, batch.column(index).as_ref(), row).ok()?)
+                }).ok_or_else(OwnedWorld::unavailable)
             })?;
             let reservation = memory.reserve(charge)?;
-            let fields = columns()
-                .map(|(field, column)| {
-                    Ok((
-                        field.name().clone(),
-                        rtdb_columnar::read_value(field, column.as_ref(), row)?,
-                    ))
-                })
-                .collect::<Result<_>>()?;
-            found = Some(WorldFact {
-                row: fields,
-                revision,
-                assertion,
-                lifetime,
-                _reservation: reservation,
-            });
+            let columns = columns().collect::<Vec<_>>();
+            for &index in &columns {
+                let field = batch.schema_ref().field(index);
+                let logical = rtdb_columnar::from_field(field)?;
+                rtdb_columnar::validate_readable_cell(field, batch.column(index).as_ref(), &logical, row, memory)?;
+            }
+            let row = batch.slice(row, 1).project(&columns).map_err(|_| OwnedWorld::unavailable())?;
+            found = Some(WorldFact { row, revision, assertion, lifetime, reservation });
         }
     }
     Ok(found)
@@ -1425,17 +1458,83 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let id = EntityId::String("item".into());
         let row = WorldShadow::Present(StructFields::from([("_id".into(), id.as_value())])).record(&id)?;
+        let fields = row.iter().map(|(name, value)| rtdb_columnar::to_field(name, &value.logical_type())).collect::<Result<Vec<_>>>()?;
+        let arrays = row.values().map(|value| rtdb_columnar::build_array(&value.logical_type(), std::slice::from_ref(value))).collect::<Result<Vec<_>>>()?;
+        let row = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
         let ordinal = std::num::NonZeroU32::new(3).unwrap();
         let fact = WorldFact {
             row, revision: Timestamp(20), assertion: Some(OwnedWorldAssertion { line: None, ordinal, held_reading: None }),
-            lifetime: None, _reservation: memory.reserve(4096)?,
+            lifetime: None, reservation: memory.reserve(4096)?,
         };
         let line = Iid([7; 16]);
         let fact = fact.into_shadow(line)?.unwrap();
         assert_eq!(fact.revision, Timestamp(20));
         assert_eq!(fact.assertion, Some(OwnedWorldAssertion { line: Some(line), ordinal, held_reading: None }));
-        assert_eq!(fact.row.len(), 1);
+        assert_eq!(fact.row.num_columns(), 1);
         Ok(())
     }
 }
 
+#[cfg(test)]
+mod world_point_tests {
+    use super::*;
+    use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
+    use rtdb_types::{LogicalType, ScalarType};
+
+    #[test]
+    fn world_point_shadow_distinguishes_a_tombstone_from_an_undefined_marker() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let line = Iid([7; 16]);
+        let into_shadow = |marker: Value| -> Result<Option<WorldFact>> {
+            let logical = marker.logical_type();
+            let fields = vec![rtdb_columnar::to_field("_id", &text)?, rtdb_columnar::to_field(WorldShadow::FIELDS, &logical)?];
+            let row = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![
+                Arc::new(StringArray::from(vec!["id"])),
+                rtdb_columnar::build_array(&logical, &[marker])?,
+            ]).unwrap();
+            WorldFact { row, revision: Timestamp(2), assertion: None, lifetime: None, reservation: memory.reserve(4096)? }
+                .into_shadow(line)
+        };
+        assert!(into_shadow(Value::Null)?.is_none());
+        assert!(into_shadow(Value::Undefined).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn world_point_shadow_uses_the_marker_order_and_shares_selected_buffers() {
+        let text = LogicalType::Scalar(ScalarType::Utf8);
+        let nullable_text = text.clone().maybe();
+        let marker = LogicalType::list(text.clone()).maybe();
+        let label = Arc::new(StringArray::from(vec![Some("other"), Some("winning")]));
+        let pointer = label.value(1).as_ptr();
+        let fields = vec![
+            rtdb_columnar::to_field("_id", &text).unwrap(),
+            rtdb_columnar::to_field("unused", &nullable_text).unwrap(),
+            rtdb_columnar::to_field("label", &text).unwrap(),
+            rtdb_columnar::to_field("rank", &nullable_text).unwrap(),
+            rtdb_columnar::to_field(WorldShadow::FIELDS, &marker).unwrap(),
+            Field::new("_system_from", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), false),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![
+            Arc::new(StringArray::from(vec!["other", "id"])),
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+            label,
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+            rtdb_columnar::build_array(&marker, &[Value::Null, Value::list(vec![Value::Utf8("rank".into()), Value::Utf8("label".into())])]).unwrap(),
+            Arc::new(TimestampMicrosecondArray::from(vec![1, 2])),
+        ]).unwrap().slice(1, 1);
+        let memory = MemoryBudget::new(1 << 20);
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let fact = decode_point(vec![batch], &EntityId::String("id".into()), &memory, None)
+            .unwrap().unwrap().into_shadow(Iid([7; 16])).unwrap().unwrap();
+        assert_eq!(fact.revision, Timestamp(2));
+        assert_eq!(fact.row.schema_ref().fields().iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), ["_id", "rank", "label"]);
+        assert!(fact.row.column(1).is_null(0));
+        let selected = ArrowCell::named(&fact.row, "label", 0).unwrap().utf8().unwrap();
+        assert_eq!(selected, "winning");
+        assert_eq!(selected.as_ptr(), pointer);
+        drop(fact);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

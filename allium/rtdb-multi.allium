@@ -1655,6 +1655,9 @@ rule ConsumeIntake {
 -- The retention pin binds their digest, and the ordered resolver checks local facts against the retained schemas.
 -- A local replacement or tombstone covers only its written half-open business-valid interval.
 -- A world point checks the complete local identity at the requested valid instant.
+-- The point carries the selected Arrow fields and writes the winning concrete value type for each returned cell.
+-- Held search reads text from the selected shadow field after interpreting its field-presence marker.
+-- Held validity windows read the timestamp vectors at the admitted coordinates.
 -- If no local version exists at that instant the point reads its archived parent at the same valid instant.
 -- A retained point view of an exact Held publication independently pins its original Root archive and the certified Held overlay.
 -- A child of that retained view pins the same Root and Held positions under its own retention.

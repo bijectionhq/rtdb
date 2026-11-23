@@ -871,6 +871,25 @@ fn address_unavailable() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/address-unavailable", "No exact owned key is available in this scope")
 }
 
+fn typed_owned_cell(cell: rtdb_columnar::ArrowCell<'_>) -> Option<rtdb_columnar::ArrowCell<'_>> {
+    let selected = cell.physical().ok()?;
+    if cell.field.data_type() != selected.field.data_type() {
+        let logical = rtdb_columnar::from_field(cell.field).ok()?;
+        let canonical = rtdb_columnar::to_field(cell.field.name(), &logical).ok()?;
+        if canonical.data_type() != cell.field.data_type() { return None; }
+    }
+    Some(selected)
+}
+
+#[doc(hidden)]
+pub fn owned_micros(cell: rtdb_columnar::ArrowCell<'_>) -> Option<Timestamp> {
+    use arrow_array::{Array, TimestampMicrosecondArray};
+    let cell = typed_owned_cell(cell)?;
+    if cell.field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY) { return None; }
+    let array = cell.array.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+    array.is_valid(cell.row).then(|| Timestamp(array.value(cell.row)))
+}
+
 /// Interprets the winning revision only after checking the complete stored identity.
 pub fn owned_row_revision(
     batch: &arrow_array::RecordBatch,
@@ -893,27 +912,22 @@ pub fn owned_row_revision_for(
     let bound = rtdb_columnar::estimate_read_value_bytes(id_field, id, row)?;
     let _scratch = memory.reserve(bound.checked_add(4096)
         .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned identity allocation overflow"))?)?;
-    let fallback;
-    let actual = match read_entity_id(id_field, id, row) {
-        Ok(id) => id,
-        Err(_) => {
-            fallback = rtdb_columnar::read_value(id_field, id, row)?.entity_id()?;
-            EntityIdRef::from(&fallback)
-        }
+    let typed = typed_owned_cell(rtdb_columnar::ArrowCell { field: id_field, array: id, row })
+        .and_then(|cell| rtdb_columnar::read_entity_id(cell.field, cell.array, cell.row).ok());
+    let matches = match typed {
+        Some(id) => id == expected_id,
+        None => EntityIdRef::from(&rtdb_columnar::read_value(id_field, id, row)?.entity_id()?) == expected_id,
     };
-    if actual != expected_id {
+    if !matches {
         return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity"));
     }
     let (revision_column, revision_field) = schema.column_with_name("_system_from")
         .ok_or_else(|| Anomaly::fault("rtdb.owned/row-revision", "Owned read omitted its revision column"))?;
-    let revisions = batch.column(revision_column).as_ref();
-    if let Ok(Some((field, array, index))) = selected_cell(revision_field, revisions, row)
-        && !field.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)
-        && let Some(array) = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
-    {
-        return Ok(Timestamp(array.value(index)));
+    let array = batch.column(revision_column).as_ref();
+    if let Some(revision) = owned_micros(rtdb_columnar::ArrowCell { field: revision_field, array, row }) {
+        return Ok(revision);
     }
-    match rtdb_columnar::read_value(revision_field, revisions, row)? {
+    match rtdb_columnar::read_value(revision_field, array, row)? {
         Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
         _ => Err(Anomaly::fault("rtdb.owned/row-revision", "Owned row revision is not a microsecond timestamp")),
     }
@@ -1400,4 +1414,32 @@ async fn read_owned_journal_cell(
         }
     }
     entry.ok_or_else(change_feed_uncovered)
+}
+
+#[cfg(test)]
+mod owned_point_revision_tests {
+    use super::*;
+    use arrow_array::{Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow_schema::{Field, Schema};
+    use rtdb_columnar::{ArrowCell, MemoryBudget};
+
+    #[test]
+    fn owned_point_revision_reads_a_selected_union_id_and_checks_the_complete_key() {
+        let ids = [
+            rtdb_columnar::EntityIdRef::Integer(-1),
+            rtdb_columnar::EntityIdRef::String("key"),
+        ];
+        let array = rtdb_columnar::entity_id_array(ids).unwrap();
+        let revisions = TimestampMicrosecondArray::from(vec![Some(3), Some(7)]);
+        let schema = Arc::new(Schema::new(vec![
+            rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type()).unwrap(),
+            Field::new("_system_from", revisions.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![array, Arc::new(revisions)]).unwrap().slice(1, 1);
+        let memory = MemoryBudget::new(1 << 20);
+        assert_eq!(owned_micros(ArrowCell::named(&batch, "_system_from", 0).unwrap()), Some(Timestamp(7)));
+        assert_eq!(owned_row_revision(&batch, 0, &EntityId::String("key".into()), &memory).unwrap(), Timestamp(7));
+        assert_eq!(owned_row_revision(&batch, 0, &EntityId::Integer(-1), &memory).unwrap_err().code, "rtdb.owned/iid-collision");
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }

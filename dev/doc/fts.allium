@@ -16,6 +16,7 @@
 -- Published files include the ordered definition version, artifact identity, and exact token length of each run.
 -- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
 -- Both ranking paths apply the same typed overlay shadows before computing corpus statistics.
+-- Shadow text comes from the selected Arrow field when its presence marker names that field.
 -- A declared optional text column with only null or absent values contributes an empty corpus.
 -- Owned runs carry their full typed identity.
 -- Owned ranked candidates share a projected primary cursor in bounded batches.

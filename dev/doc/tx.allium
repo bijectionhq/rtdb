@@ -40,6 +40,7 @@
 -- Semantic pages remain Arrow batches through downstream operators and transport batching.
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- Arrow result layout adaptation reserves its scratch space against the client operation's budget.
+-- A Flight SQL world point reply retains a compatible selected Arrow value and publishes its concrete cell type.
 -- An Arrow client result union of one data leg and nullable null legs conforms to that leg's declared plain field by Arrow position.
 -- A fixed-size vector result column already in its declared layout keeps its component buffer.
 -- Query output aligns selected floating-point components and compatible scalar aliases with the declared Arrow field.

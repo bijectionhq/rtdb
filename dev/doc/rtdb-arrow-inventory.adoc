@@ -109,3 +109,10 @@ See link:../../rust/crates/query/src/cursor.rs[results], link:../../rust/crates/
 * The source and replica log envelopes transport Arrow payloads with transaction and durability metadata.
 * PostgreSQL protocols and explicit row APIs retain their public representations.
 * Block, table and trie catalogs retain the metadata needed to open persisted Arrow files.
+
+== Held world point and overlay reads
+
+* Point reads retain the selected Arrow fields after the complete identity and revision check.
+* The Flight point response uses the active value leg as each field's concrete result type.
+* Overlay text reads use the shadow's field-presence marker and the selected text cell.
+* Held history takes its validity boundaries from the timestamp columns.

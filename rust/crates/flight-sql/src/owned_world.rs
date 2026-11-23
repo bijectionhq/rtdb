@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use arrow_array::{RecordBatch, cast::AsArray};
 use futures::future::BoxFuture;
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_node::{OwnedChangeEdge, Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorldAssertion, Result, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
+use rtdb_types::{EntityId, Interval, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -88,10 +89,40 @@ pub struct WorldPointResult {
 }
 
 pub struct WorldPointRow {
-    pub fields: StructFields<Value>,
+    pub batch: RecordBatch,
     pub revision: Timestamp,
     pub assertion: Option<OwnedWorldAssertion>,
     pub reservation: Arc<MemoryReservation>,
+}
+
+
+impl WorldPointRow {
+    #[doc(hidden)]
+    pub fn document_bytes(batch: &RecordBatch) -> Result<usize> {
+        let shape = batch.schema_ref().fields().iter().map(|field| Ok((field.name().clone(), Value::Null)))
+            .collect::<Result<StructFields<_>>>()?;
+        let size = Value::document_retained_bytes(&shape)?;
+        batch.schema_ref().fields().iter().zip(batch.columns()).try_fold(size, |bytes, (field, array)| {
+            let selected = ArrowCell { field, array: array.as_ref(), row: 0 }.physical()?;
+            let ArrowCell { array: physical, row, .. } = selected;
+            let heap = match selected.logical_type()? {
+                LogicalType::Scalar(ScalarType::Utf8 | ScalarType::Keyword | ScalarType::Uri) =>
+                    physical.as_string::<i32>().value(row).len(),
+                LogicalType::Scalar(ScalarType::Binary | ScalarType::Transit) =>
+                    physical.as_binary::<i32>().value(row).len(),
+                LogicalType::Scalar(ScalarType::FixedSizeBinary(_)) => physical.as_fixed_size_binary().value(row).len(),
+                LogicalType::Scalar(ScalarType::Timestamp { timezone, .. }) => timezone.as_ref().map_or(0, String::len),
+                LogicalType::Scalar(ScalarType::Decimal { bit_width, .. }) => usize::from(bit_width / 8),
+                LogicalType::List { .. } | LogicalType::Struct(_) => {
+                    let value = rtdb_columnar::read_value(field, array.as_ref(), 0)?;
+                    value.retained_bytes()?.checked_sub(std::mem::size_of::<Value>())
+                        .ok_or_else(rtdb_types::OwnedWorld::unavailable)?
+                }
+                _ => 0,
+            };
+            bytes.checked_add(heap).ok_or_else(rtdb_types::OwnedWorld::unavailable)
+        })
+    }
 }
 
 
