@@ -144,6 +144,26 @@ pub async fn visit_trie_iids(
     Ok(())
 }
 
+async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<MemoryBudget>) -> Result<(Arc<MetadataFile>, Arc<MemoryReservation>)> {
+    if let Some(cached) = storage.view::<CachedMetadata>(key, View::File) {
+        audience_work::decode_bytes(cached.bound)?;
+        return Ok((Arc::clone(&cached.metadata), memory.reserve(cached.bound)?));
+    }
+    let lease = storage.get_or(key, memory).await?;
+    audience_work::decode_bytes(lease.as_slice().len())?;
+    let mut cursor = Cursor::new(lease);
+    let layout = inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes))?;
+    let bound = layout.full_allocation_bound()?;
+    audience_work::decode_bytes(bound)?;
+    let reservation = memory.reserve(bound)?;
+    let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
+    if let Some(retained) = storage.admit(metadata.stored_bytes())
+        && storage.insert_view(key, View::File, Arc::new(CachedMetadata { metadata: Arc::clone(&metadata), bound, _reservation: retained })) {
+        storage.evict(key);
+    }
+    Ok((metadata, reservation))
+}
+
 fn page_buffer(bytes: CacheLease) -> Buffer {
     // A cached page must release the rest of a whole object when the query is done reading it.
     if bytes.is_partial_allocation() { Buffer::from(bytes.as_slice().to_vec()) }
@@ -1448,27 +1468,7 @@ impl PartitionScan {
             if !self.path_matches(lower, upper) { continue; }
             let slug = slug.as_ref().ok_or_else(|| invalid("missing-table-slug", "Persisted trie has no recorded table registry entry"))?;
             let key = ObjectKey::new(slug.metadata_key(&trie.key))?;
-            let (metadata, _reservation) = match self.storage.view::<CachedMetadata>(&key, View::File) {
-                Some(cached) => {
-                    audience_work::decode_bytes(cached.bound)?;
-                    (Arc::clone(&cached.metadata), self.execution.context.memory.reserve(cached.bound)?)
-                }
-                None => {
-                    let lease = self.storage.get_or(&key, &self.execution.context.memory).await?;
-                    audience_work::decode_bytes(lease.as_slice().len())?;
-                    let mut cursor = Cursor::new(lease);
-                    let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
-                    let bound = layout.full_allocation_bound()?;
-                    audience_work::decode_bytes(bound)?;
-                    let reservation = self.execution.context.memory.reserve(bound)?;
-                    let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
-                    if let Some(retained) = self.storage.admit(metadata.stored_bytes())
-                        && self.storage.insert_view(&key, View::File, Arc::new(CachedMetadata { metadata: Arc::clone(&metadata), bound, _reservation: retained })) {
-                        self.storage.evict(&key);
-                    }
-                    (metadata, reservation)
-                }
-            };
+            let (metadata, _reservation) = read_metadata(&self.storage, &key, &self.execution.context.memory).await?;
             files.admit(file_count, &self.execution.context.memory)?;
             let file = files.entries.len();
             files.entries.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, metadata: key.clone(), opened: None });
