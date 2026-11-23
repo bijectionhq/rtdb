@@ -746,6 +746,7 @@ config {
 -- With provider versions, the pack metadata, trailer, index and each returned member range must name the same physical publication.
 -- Hosted publication records the digest of the adopted catalog bytes next to its checkpoint coordinate.
 -- A hosted serving receipt also commits to the exact replay inventory, including each logical length and any observed physical version.
+-- Complete semantic table history lets a serving receipt omit logical search runs and term-directory pages from that inventory.
 -- Its digest covers the root, replica epoch and first required replica offset.
 -- The admitted store recomputes the inventory commitment from fresh storage observations before opening the cut.
 -- A single fresh observation can cover members that share an admitted pack.

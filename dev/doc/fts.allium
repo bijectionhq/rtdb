@@ -248,6 +248,7 @@ rule RepairUnreadableSearchFile {
     -- A damaged format 16 run with readable source inputs is repaired by ordered publication of a new immutable run over the same extents.
     -- A native repair can read the retained accepted journal up to the pinned checkpoint boundary.
     -- A hosted repair reads a directory root anchored in the published checkpoint and verifies the committed replica suffix through the pinned boundary.
+    -- A hosted checkpoint published with a semantic serving inventory can be opened after loss of its logical search runs and term-directory pages.
     -- The installed table directory authenticates the surviving event headers and erase frontier at that boundary.
     -- Repair resolves surviving put payloads from primary data by stable event origin and checks each payload against the directory event.
     -- A source receipt binds the lineage, replica interval, table, shard, block extents, row count and erase frontier used to build the replacement.

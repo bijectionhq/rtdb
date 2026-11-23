@@ -431,7 +431,7 @@ rule DeleteAndCommitChunkRule {
     -- Ordered abandonment succeeds while the allocation is unadopted and fences later adoption at the same identity.
     -- A hosted release uses the installed retirement, the catalog admission floor, and proof of the provider version or terminal publication.
     -- Checkpoint recovery retains the abandonment after physical release.
-    -- Replay checkpoint and archive dependencies include every authenticated page reached by the recorded term directory roots.
+    -- Replay archives include every authenticated page reached by the recorded term directory roots.
     -- Term directory pages can be shared across catalog generations, and survive retirement of individual posting runs.
     -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
     -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.

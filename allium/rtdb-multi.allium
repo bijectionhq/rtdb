@@ -1782,6 +1782,9 @@ rule PublishCheckpoint {
     -- The directory receipt binds the adopted logical root bytes to the published coordinate.
     -- A serving checkpoint commits to its replay inventory in the same directory update as its log boundary.
     -- The inventory is derived from the root and the verified table blocks.
+    -- For a table with a complete semantic history directory, the serving inventory binds its directory pages and primary payloads and allows logical search runs and term-directory pages to be rebuilt after startup.
+    -- Replay archives verify the complete set of recorded search dependencies when they capture a checkpoint.
+    -- A receipt published with the full replay inventory is verified against that inventory.
     -- Each entry binds its logical path and length to the provider version where available.
     -- An unversioned entry uses the immutable-object contract.
     -- The receipt binds the journal epoch and the first replica record required after the checkpoint.

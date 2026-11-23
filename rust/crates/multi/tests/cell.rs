@@ -3533,7 +3533,7 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
 async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_tries() {
     use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot};
     use rtdb_multi::packing::{PACK_DIRECTORY, encode_pack, read_index};
-    use rtdb_storage::{LocalStore, ObjectKey, ObjectStore};
+    use rtdb_storage::{LocalStore, ObjectKey, ObjectStore, log::Log};
     use rtdb_types::{BlockIndex, StorageEpoch, TableRef};
 
     let mut cell = Cell::start_durable(0).await;
@@ -3558,6 +3558,23 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.unwrap();
+    let checkpoint = record.checkpoint.unwrap();
+    let members = cell.directory.members().await.unwrap().into_iter()
+        .map(|member| (member.id, member.address)).collect::<BTreeMap<_, _>>();
+    let reader = rtdb_logkeeper::open_reader(rtdb_logkeeper::StreamConfig {
+        servers: record.ensemble.iter().map(|id| members[id].clone().into()).collect(),
+        stream: record.stream("replica"),
+        write_quorum: 2,
+        maximum_message_bytes: 4 << 20,
+    }, Default::default()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if reader.retained_floor().await.unwrap().is_some_and(|floor| floor.0 == checkpoint.boundary) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the logkeepers trimmed the replica prefix before restarting the holder");
     let table = TableRef::new("public", "docs");
     let snapshot = database.snapshot();
     let slug = snapshot.table_entry(&table).unwrap().slug.clone();
@@ -3590,9 +3607,11 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
         raw.put(&pack.key, bytes).await.unwrap();
     }
     assert_eq!(removed, 8);
-    let runs = raw.list(Some(&ObjectKey::new(rtdb_format::search_manifest::run_prefix(&slug)).unwrap())).await.unwrap();
-    assert!(!runs.is_empty());
-    for object in runs { raw.delete(&object.key).await.unwrap(); }
+    for prefix in [rtdb_format::search_manifest::run_prefix(&slug), rtdb_format::term_directory::page_prefix(&slug)] {
+        let objects = raw.list(Some(&ObjectKey::new(prefix).unwrap())).await.unwrap();
+        assert!(!objects.is_empty());
+        for object in objects { raw.delete(&object.key).await.unwrap(); }
+    }
 
     cell.add_logical_search_node().await;
     let client = connect_eventually(&cell, "shop").await;
@@ -3608,11 +3627,17 @@ async fn hosted_search_rebuilds_after_trim_and_loss_of_postings_and_all_source_t
     assert_eq!(runs.iter().flat_map(|run| run.blocks.iter().copied()).collect::<std::collections::BTreeSet<_>>(), extent);
     for run in runs {
         let receipt = run.source_receipt.as_ref().unwrap();
-        assert_eq!(receipt.checkpoint_boundary(), record.checkpoint.unwrap().boundary);
+        assert_eq!(receipt.checkpoint_boundary(), checkpoint.boundary);
         assert_eq!(receipt.blocks, run.blocks);
         let key = ObjectKey::new(run.object_key(&slug).unwrap()).unwrap();
         assert!(database.object_store().head_fresh(&key).await.is_ok());
     }
+    let run = rebuilt.search_runs(&table).next().unwrap();
+    let term_directory = rebuilt.term_directory(&table, run.definition_id(), run.definition_version()).unwrap();
+    let root = term_directory.page_root().unwrap().unwrap();
+    let prefix = rtdb_format::term_directory::page_prefix(&slug);
+    let page = ObjectKey::new(rtdb_format::cow_tree::page_key(&prefix, root.digest)).unwrap();
+    assert!(database.object_store().head_fresh(&page).await.is_ok());
     assert_eq!(values(&client, query).await, ["1", "2"]);
     drop((client, database));
     cell.stop().await;

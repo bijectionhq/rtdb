@@ -503,7 +503,7 @@ impl CheckpointCustody {
         let catalog = BlockCatalog::decode(&store.get(&root).await?)?;
         crate::archive::verify_cut(&catalog, checkpoint, self.epoch)?;
         // Check that the selected catalog's closure is present in this manifest.
-        let _ = crate::archive::recovery_manifest_sha256(store.as_ref(), checkpoint, self.epoch)
+        let _ = crate::archive::replay_inventory_sha256(store.as_ref(), checkpoint, self.epoch)
             .await?;
         Ok(OpenedCheckpoint { checkpoint, store, authority: manifest.authority })
     }

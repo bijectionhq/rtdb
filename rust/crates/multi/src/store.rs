@@ -303,7 +303,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             if let Some(expected) = record.recovery_manifest_sha256 {
                 let checkpoint = record.checkpoint.ok_or_else(|| storage_region_error("A recovery manifest has no checkpoint"))?;
                 let plaintext = EncryptingStore::published(opened.clone(), publications.clone());
-                if crate::archive::recovery_manifest_sha256(&plaintext, checkpoint, rtdb_types::StorageEpoch(record.log_epoch)).await? != expected {
+                if !crate::archive::matches_recovery_manifest(&plaintext, checkpoint, rtdb_types::StorageEpoch(record.log_epoch), expected).await? {
                     return Err(storage_region_error("The recovery inventory does not match the directory receipt"));
                 }
             }

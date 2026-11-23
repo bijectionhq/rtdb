@@ -1274,6 +1274,12 @@ impl CheckpointMember {
 type CheckpointObjects = BTreeMap<ObjectKey, CheckpointMember>;
 const OBSERVATION_BATCH_MEMBERS: usize = 256;
 
+#[derive(Clone, Copy)]
+enum CheckpointInventory {
+    Copy(CheckpointContents),
+    Serving,
+}
+
 async fn observe_checkpoint_batch(
     store: &dyn ObjectStore, batch: Vec<(ObjectKey, CheckpointMember)>,
 ) -> Result<Vec<CheckpointCopySource>> {
@@ -1300,14 +1306,18 @@ async fn checkpoint_objects_at_view(plaintext: &dyn ObjectStore, point: &Capture
     let catalog_key = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&catalog_key).await?)?;
     verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
-    catalog_objects_at_view(plaintext, &catalog, contents, held).await
+    catalog_objects_at_view(plaintext, &catalog, CheckpointInventory::Copy(contents), held).await
 }
 
 async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents) -> Result<CheckpointObjects> {
-    catalog_objects_at_view(plaintext, catalog, contents, false).await
+    catalog_objects_at_view(plaintext, catalog, CheckpointInventory::Copy(contents), false).await
 }
 
-async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents, held: bool) -> Result<CheckpointObjects> {
+async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, inventory: CheckpointInventory), held: bool) -> Result<CheckpointObjects> {
+    let contents = match inventory {
+        CheckpointInventory::Copy(contents) => contents,
+        CheckpointInventory::Serving => CheckpointContents::Replay,
+    };
     let block = catalog.block_index();
     let root_digest = catalog.publication_sha256().ok_or_else(|| inconsistent("Checkpoint root bytes were not observed"))?;
     let mut closure = BTreeMap::from([(key(&block_key(block)?)?, CheckpointMember::metadata(root_digest))]);
@@ -1320,12 +1330,16 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
             return Err(inconsistent("Checkpoint table bytes do not match the root manifest"));
         }
         let metadata = TableBlock::decode(&bytes)?;
+        let rebuildable_search = matches!(inventory, CheckpointInventory::Serving)
+            && metadata.as_proto().entity_directory.as_ref().is_some_and(|directory|
+                table_history::complete_directory(directory, block, metadata.row_count()));
         if closure.insert(path, CheckpointMember::metadata(observed)).is_some() {
             return Err(inconsistent("Two checkpoint tables use the same storage path"));
         }
         let prefix = rtdb_format::entity_directory::prefix(&table.slug);
         let pages = rtdb_storage::cow_pages::FreshPages { store: plaintext, prefix: &prefix };
         for object in metadata.checkpoint_trie_files_with_pages(&table, contents, &pages).await? {
+            if rebuildable_search && rtdb_format::search_manifest::is_run_key(&object) { continue; }
             let member = rtdb_format::entity_directory::page_digest(&object)
                 .map_or_else(CheckpointMember::default, |page| CheckpointMember::metadata(page.0));
             closure.entry(key(&object)?).or_insert(member);
@@ -1338,7 +1352,7 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
                 member.bind_extent(extent)?;
             }
         }
-        if contents == CheckpointContents::Replay {
+        if contents == CheckpointContents::Replay && !rebuildable_search {
             for run in &metadata.as_proto().search_runs {
                 let name = key(&run.object_key(&table.slug)?)?;
                 let extent = u64::try_from(run.file_size()).map_err(|_| inconsistent("A checkpoint search run has a negative extent"))?;
@@ -1346,7 +1360,8 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
                     .bind_extent(extent)?;
             }
         }
-        if contents == CheckpointContents::Replay {
+        }
+        if contents == CheckpointContents::Replay && !rebuildable_search {
             retain_term_directory_pages(plaintext, &metadata, &table.slug, &mut closure).await?;
         }
     }
@@ -1378,7 +1393,7 @@ async fn retain_term_directory_pages(store: &dyn ObjectStore, block: &TableBlock
         let Some(root) = directory.page_root()? else { continue; };
         for digest in cow_tree::reachable(&pages, &root).await? {
             let object = key(&cow_tree::page_key(&pages.prefix, digest))?;
-            closure.insert(object, Some(digest.0));
+            closure.insert(object, CheckpointMember::metadata(digest.0));
         }
     }
     Ok(())
@@ -1387,6 +1402,26 @@ async fn retain_term_directory_pages(store: &dyn ObjectStore, block: &TableBlock
 pub(crate) async fn recovery_manifest_sha256(
     store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch,
 ) -> Result<[u8; 32]> {
+    hash_recovery_inventory(store, checkpoint, epoch, CheckpointInventory::Serving).await
+}
+
+pub(crate) async fn replay_inventory_sha256(
+    store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch,
+) -> Result<[u8; 32]> {
+    hash_recovery_inventory(store, checkpoint, epoch, CheckpointInventory::Copy(CheckpointContents::Replay)).await
+}
+
+pub(crate) async fn matches_recovery_manifest(
+    store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch, expected: [u8; 32],
+) -> Result<bool> {
+    if recovery_manifest_sha256(store, checkpoint, epoch).await? == expected { return Ok(true); }
+    // Older receipts committed to the full replay copy inventory.
+    Ok(replay_inventory_sha256(store, checkpoint, epoch).await? == expected)
+}
+
+async fn hash_recovery_inventory(
+    store: &dyn ObjectStore, checkpoint: Checkpoint, epoch: StorageEpoch, inventory: CheckpointInventory,
+) -> Result<[u8; 32]> {
     let root = checkpoint.root_sha256.ok_or_else(|| inconsistent("A recovery manifest requires a checkpoint root digest"))?;
     let first_required = checkpoint.boundary.checked_add(1)
         .filter(|first| *first > 0)
@@ -1394,7 +1429,7 @@ pub(crate) async fn recovery_manifest_sha256(
     let path = key(&block_key(BlockIndex(checkpoint.block))?)?;
     let catalog = BlockCatalog::decode(&store.get_fresh(&path).await?)?;
     verify_cut(&catalog, checkpoint, epoch)?;
-    let mut closure = catalog_objects(store, &catalog, CheckpointContents::Replay).await?.into_iter();
+    let mut closure = catalog_objects_at_view(store, &catalog, inventory, false).await?.into_iter();
 
     let mut manifest = ring::digest::Context::new(&ring::digest::SHA256);
     manifest.update(b"rtdb/recovery-manifest/v1\0");
@@ -3110,6 +3145,71 @@ mod tests {
             store.put(&required, fixture.files[&required].clone()).await?;
         }
         assert_ne!(recovery_manifest_sha256(&store, checkpoint, epoch).await?, published);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_serving_manifest_requires_history_and_primary_data_after_postings_are_lost() -> Result<()> {
+        use prost::Message;
+        use rtdb_format::{
+            block::proto, cow_tree::{Edit, NoSummary, Row}, entity_directory, keys::TrieKey,
+            log::proto::{EntityDirectoryRoot, SearchRun},
+        };
+        use rtdb_storage::{MemoryStore, cache::BufferPool, cow_pages::ObjectPageStore};
+        use rtdb_types::MemoryBudget;
+
+        let mut fixture = replay_fixture()?;
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        let entry = BlockCatalog::decode(&fixture.files[&fixture.root])?.table_entries()?.pop().unwrap();
+        let pages = ObjectPageStore {
+            store: store.clone(), storage: Arc::new(BufferPool::new(store.clone(), 1 << 20)),
+            prefix: entity_directory::prefix(&entry.slug),
+        };
+        let edits = vec![Edit::Put(Row { key: vec![0], value: vec![1] })];
+        let (root, _) = cow_tree::apply(&pages, None, edits, &NoSummary, &MemoryBudget::new(1 << 20)).await?;
+        let root = root.unwrap();
+        let page = key(&cow_tree::page_key(&pages.prefix, root.digest))?;
+        let run = SearchRun {
+            definition_id: Some("body".into()), definition_version: Some(1), blocks: vec![0],
+            digest: Some(vec![1; 32]), source_rows: Some(1), file_size: Some(8), locator: Some(vec![1]),
+            ..Default::default()
+        };
+        let posting = key(&run.object_key(&entry.slug)?)?;
+        let directory = EntityDirectoryRoot {
+            root: Some(root.encode()), through_block: Some(fixture.point.checkpoint.block), source_rows: Some(1),
+            erase_frontier_digest: Some(vec![0; 32]), allocation: Some(vec![1; 16]), writer_fence: Some(1),
+            ..Default::default()
+        };
+        let table = TableBlock::decode(&fixture.files[&fixture.table])?
+            .with_search_runs(vec![run], vec![]).with_entity_directory(Some(directory), vec![]).encode();
+        let mut catalog = proto::Block::decode(fixture.files[&fixture.root].clone()).unwrap();
+        catalog.table_block_manifest.as_mut().unwrap().sha256_by_oid
+            .insert(entry.oid, publication_digest(&table).to_vec());
+        let catalog = catalog.encode_to_vec();
+        let checkpoint = Checkpoint { root_sha256: Some(publication_digest(&catalog)), ..fixture.point.checkpoint };
+        fixture.files.insert(fixture.root, catalog.into());
+        fixture.files.insert(fixture.table, table.into());
+        fixture.files.insert(posting.clone(), Bytes::from_static(b"postings"));
+        for (object, bytes) in fixture.files { store.put(&object, bytes).await?; }
+
+        let epoch = StorageEpoch(fixture.point.log_epoch);
+        let published = recovery_manifest_sha256(store.as_ref(), checkpoint, epoch).await?;
+        let legacy = replay_inventory_sha256(store.as_ref(), checkpoint, epoch).await?;
+        assert_ne!(legacy, published);
+        assert!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, legacy).await?);
+        store.delete(&posting).await?;
+        assert!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, published).await?);
+        assert_eq!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, legacy).await.unwrap_err().code,
+            "rtdb.storage/missing-object");
+
+        let primary = key(&entry.slug.data_key(&TrieKey::new(2, None, vec![0], BlockIndex(checkpoint.block))?))?;
+        for required in [primary, page] {
+            let bytes = store.get(&required).await?;
+            store.delete(&required).await?;
+            assert_eq!(matches_recovery_manifest(store.as_ref(), checkpoint, epoch, published).await.unwrap_err().code,
+                "rtdb.storage/missing-object");
+            store.put(&required, bytes).await?;
+        }
         Ok(())
     }
 

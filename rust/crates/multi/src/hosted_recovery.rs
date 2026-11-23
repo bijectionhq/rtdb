@@ -326,7 +326,7 @@ impl ReplicaTrimWitness {
                 return Ok(None);
             }
         }
-        if crate::archive::recovery_manifest_sha256(store, checkpoint, epoch).await? != inventory { return Ok(None); }
+        if !crate::archive::matches_recovery_manifest(store, checkpoint, epoch, inventory).await? { return Ok(None); }
         Ok(Some(Self { checkpoint, inventory }))
     }
 }
