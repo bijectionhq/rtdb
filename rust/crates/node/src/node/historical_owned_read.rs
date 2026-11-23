@@ -26,7 +26,7 @@ impl OwnedReadSession {
     ) -> Result<Option<Self>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        if requested > self.present.system_time
+        if self.is_applied() || requested > self.present.system_time
             || !(1..=MAX_SCOPE_RELATIONS).contains(&relations.len())
         {
             return Err(unavailable());
@@ -95,6 +95,7 @@ impl OwnedReadSession {
             owner: self.owner.clone(),
             present: self.present,
             witness_scope: None,
+            applied_scope: None,
             witness_until: selected,
             fork_until: self.fork_until,
             cancellation,

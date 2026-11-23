@@ -2,7 +2,7 @@ use super::*;
 use rtdb_node::AppliedOwnedPoint;
 
 pub(crate) const OBSERVE_HELD_HOSTED_V1: &str = "rtdb.owned.ObserveHeldHosted.v1";
-pub(crate) const CONFIRM_APPLIED_HOSTED_V2: &str = "rtdb.owned.ConfirmAppliedHosted.v2";
+pub(crate) const CONFIRM_APPLIED_HOSTED_V3: &str = "rtdb.owned.ConfirmAppliedHosted.v3";
 
 fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Status> {
     let (kind, body) = body.split_first().ok_or_else(|| invalid("Applied confirmation requires a point flag"))?;
@@ -56,7 +56,7 @@ impl Service {
             tx_id: rtdb_types::TxId(offset),
             system_time: Timestamp(i64::from_be_bytes(*time)),
         };
-        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512 + 8192)?;
         let (point, body) = applied_point(body)?;
         let groups = owned_groups(body, true, false)?;
