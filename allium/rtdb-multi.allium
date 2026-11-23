@@ -6,6 +6,7 @@
 -- Hosted fork selects a registered capture in the authenticated writer's deployment and derives its basis from the verified archive root.
 -- Hosted world writes use the retained schema and the ordered registration's lifetime.
 -- A held world point handle keeps one ordered local capture and one verified archive region until bounded expiry or close.
+-- A hosted row-erasure owner can observe whether one exact ciphertext carrier exists anywhere in valid time under its held Root cut. The reply contains only a Boolean.
 -- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
 -- A held point condition preserves the local shadow revision, including a tombstone, or verified local absence.
 -- Ordered conditional world writes validate the witnessed placement, deadline and all local conditions before applying effects.
