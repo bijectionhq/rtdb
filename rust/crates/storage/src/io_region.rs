@@ -94,6 +94,18 @@ impl IoRegion {
         scope_io_owner!(HELD_VIEW, view, work; combine)
     }
 
+    /// Transfers this read's held authority before spawning work that may admit reads of its own.
+    pub fn inherit_reading<F: std::future::Future>(work: F) -> impl std::future::Future<Output = F::Output> {
+        let view = HELD_VIEW.try_with(Arc::clone).ok();
+        let work = crate::sealing::PlaintextView::inherit(Self::leased(None, work));
+        async move {
+            match view {
+                Some(view) => Self::reading(view, work).await,
+                None => work.await,
+            }
+        }
+    }
+
     /// Classic recovery selects a checkpoint while holding the storage owner's deletion gate.
     /// Hosted callers supply their directory-issued registration through `reading`.
     pub async fn reading_recovery<T>(
@@ -211,6 +223,7 @@ impl IoRegion {
     async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let audience = Self::requires_audience_transport();
+        let work = Self::inherit_reading(work);
         // Verus checks the shared captures with contract adapters for the coroutine blocks.
         macro_rules! spawn {
             ($worker:ident; $captures:tt => $body:block) => { tokio::spawn(async move $body) };

@@ -31,6 +31,9 @@ pub trait ObjectCipher: Send + Sync {
         operation: UnitOperation,
     ) -> crate::Result<UnitOutput>;
 
+    /// An enclosing provider lease can shorten a unit delivery grant.
+    fn delivery_deadline(&self) -> Option<std::time::Instant> { None }
+
     async fn withdraw(&self, _name: &ObjectKey) -> crate::Result<()> {
         Err(Error::Closed(
             "The object cipher has no Classic withdrawal authority".into(),

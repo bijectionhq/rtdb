@@ -149,6 +149,8 @@ impl UnitLedger {
 
 #[async_trait::async_trait]
 impl ObjectCipher for UnitLedger {
+    fn delivery_deadline(&self) -> Option<Instant> { self.deadline }
+
     async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
         UnitLedger::operate(self, name, operation).await
     }

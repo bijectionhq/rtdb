@@ -534,7 +534,8 @@ impl Fragment {
         if !matches!(self.state, FragmentState::Pending) { return; }
         let (fragmenter, request) = (Arc::clone(fragmenter), Arc::clone(&self.request));
         let memory = Arc::clone(memory);
-        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(async move { fragmenter.dispatch_reply(&request, &memory).await })));
+        let work = rtdb_storage::IoRegion::inherit_reading(async move { fragmenter.dispatch_reply(&request, &memory).await });
+        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(work)));
     }
     async fn next_batch(&mut self, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
         if let FragmentState::Dispatched(dispatch) = &mut self.state {

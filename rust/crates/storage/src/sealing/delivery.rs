@@ -55,6 +55,16 @@ impl PlaintextView {
         PLAINTEXT_VIEWS.scope(views.into(), work).await
     }
 
+    pub(crate) fn inherit<F: Future>(work: F) -> impl Future<Output = F::Output> {
+        let views = PLAINTEXT_VIEWS.try_with(Arc::clone).ok();
+        async move {
+            match views {
+                Some(views) => PLAINTEXT_VIEWS.scope(views, work).await,
+                None => work.await,
+            }
+        }
+    }
+
     pub(super) fn track(cipher: &Arc<dyn ObjectCipher>, name: &ObjectKey) -> Result<()> {
         let tracked = PLAINTEXT_VIEWS.try_with(|views| {
             for view in views.iter() {
@@ -86,7 +96,10 @@ impl PlaintextView {
             let expires = match cached.filter(|expires| *expires > Instant::now() + Duration::from_secs(1)) {
                 Some(expires) => expires,
                 None => {
-                    let cutoff = Instant::now() + GRANT_WINDOW;
+                    let now = Instant::now();
+                    let cutoff = now + GRANT_WINDOW;
+                    let cutoff = unit.cipher.delivery_deadline().map_or(cutoff, |provider| provider.min(cutoff));
+                    if cutoff <= now { return Err(expired()); }
                     let checked = tokio::time::timeout_at(cutoff.into(), unit.cipher.operate(&unit.name, UnitOperation::Grant))
                         .await.map_err(|_| expired())??;
                     checked.granted()?;
