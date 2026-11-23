@@ -45,7 +45,7 @@ impl JournalKey {
 
 pub(super) fn key_error(error: Anomaly) -> Error {
     match error.code.as_ref() {
-        "rtdb.multi/key-destroyed" | "rtdb.multi/archive-revoked" => Error::ErasedUnderView,
+        "rtdb.multi/key-destroyed" | "rtdb.multi/archive-revoked" | "rtdb/erased-under-view" => Error::ErasedUnderView,
         _ => Error::Remote { key: "journal payload key".into(), message: error.to_string() },
     }
 }

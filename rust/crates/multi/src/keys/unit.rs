@@ -32,7 +32,7 @@ impl UnitScope {
         residence: &[u8],
     ) -> Self {
         let mut digest = Context::new(&SHA256);
-        digest.update(b"rtdb.multi/unit-scope/v1\0");
+        digest.update(b"rtdb.multi/unit-scope/v2\0");
         digest.update(placement.deployment.as_bytes());
         digest.update(placement.incarnation.as_bytes());
         digest.update(placement.group.as_bytes());
@@ -43,7 +43,7 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
-    fn namespace(self) -> String {
+    pub(super) fn namespace(self) -> String {
         format!("{SLOT_PREFIX}{}", hex(&self.0))
     }
 
@@ -51,7 +51,7 @@ impl UnitScope {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {
             scope: self,
-            name: hex(name.as_ref()),
+            digest: name.as_ref().try_into().expect("SHA-256 width"),
         }
     }
 }
@@ -66,13 +66,13 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 pub struct UnitSlot {
-    scope: UnitScope,
-    name: String,
+    pub(super) scope: UnitScope,
+    pub(super) digest: [u8; 32],
 }
 
 impl UnitSlot {
     pub(super) fn id(&self) -> String {
-        format!("{}-{}", self.scope.namespace(), self.name)
+        format!("{}-{}", self.scope.namespace(), hex(&self.digest))
     }
 }
 

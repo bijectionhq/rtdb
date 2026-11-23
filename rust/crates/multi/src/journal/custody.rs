@@ -517,13 +517,11 @@ impl CheckpointCustody {
             for logical in selected.members.keys() {
                 let key = self.member(chosen.custody, &ObjectKey::new(logical.as_str())?)?;
                 effects.fence_create_only(&key, token).await?;
-                ledger.withdraw(&key).await?;
             }
             effects.fence_create_only(&preparation, token).await?;
-            ledger.withdraw(&preparation).await?;
             effects.fence_create_only(&root, token).await?;
         }
-        ledger.withdraw(&root).await?;
+        ledger.withdraw_scope().await?;
         if !effects.confirms(&preparation, token).await? {
             return Err(invalid("The provider has not fenced the preparation"));
         }

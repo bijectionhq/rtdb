@@ -93,7 +93,7 @@ struct Receipt {
     floor_lsn: u64,
     inspected_through_lsn: u64,
     settled_at_ms: i64,
-    local_key_scope_withdrawn: bool,
+    key_scope_withdrawn: bool,
 }
 
 /// What one pass established for one superseded epoch.
@@ -409,6 +409,10 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
             }).await?;
         }
         Provider::ExactVersions(inventory) | Provider::Tombstones(inventory) => {
+            let ledger = super::storage::serving_ledger(
+                Arc::clone(keys), placement.worker.placement(), identity, objects, IoRegion::new(),
+            );
+            ledger.withdraw_scope().await?;
             if matches!(provider, Provider::ExactVersions(_)) {
                 inventory.purge(&scope).await?;
                 if !inventory.is_empty(&scope).await? || !bucket.list(Some(&scope)).await?.is_empty() {
@@ -440,7 +444,7 @@ async fn retire_one(one: RetireOne<'_>) -> Result<Outcome> {
         floor_lsn: route.floor.next_lsn,
         inspected_through_lsn: route.head.next_lsn,
         settled_at_ms: rtdb_directory::now_ms(),
-        local_key_scope_withdrawn: matches!(provider, Provider::Local(_)),
+        key_scope_withdrawn: true,
     }).await?;
     Ok(Outcome::Retired)
 }
