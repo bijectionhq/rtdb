@@ -81,9 +81,7 @@ pub async fn original_sync_observations(
         return Err(range_unavailable());
     };
     let offset = entry.lsn;
-    let mut original = RetainedChain::new(&origin.stream, offset);
-    original.append(entry);
-    let digest = original.bytes();
+    let digest = original_entry_digest(entry).ok_or_else(range_unavailable)?;
     let origin_identity = origin.fingerprint();
     // An address can have been reused by a different journal. Each probe binds the expected
     // identity on the connection, and at most one result per original voter can contribute.
@@ -119,6 +117,28 @@ pub async fn original_sync_observations(
         }
     }
     Ok(observations)
+}
+
+/// The original stream's digest of this timed entry: computed from the original append's
+/// exact bytes, or carried by a copy whose payload was resealed.
+fn original_entry_digest(entry: &Entry) -> Option<[u8; 32]> {
+    let origin = entry.timed_origin.as_ref()?;
+    if !origin.original_entry_sha256.is_empty() {
+        return origin.original_entry_sha256.as_ref().try_into().ok();
+    }
+    let mut original = RetainedChain::new(&origin.stream, entry.lsn);
+    original.append(entry);
+    Some(original.bytes())
+}
+
+/// Before replacing a timed entry's payload, retain the digest its original voters hold.
+/// Call it on the exact bytes read from the installation's replica stream.
+pub fn retain_original_entry_digest(entry: &mut Entry) {
+    if let Some(digest) = original_entry_digest(entry)
+        && let Some(origin) = entry.timed_origin.as_mut()
+    {
+        origin.original_entry_sha256 = bytes::Bytes::copy_from_slice(&digest);
+    }
 }
 
 /// The original quorum's earliest qualifying upper bound, if it can be recovered.
@@ -451,7 +471,7 @@ mod tests {
             lsn: 0, epoch: 1, guarded: true, guarded_before: Some(100),
             timed_origin: Some(TimedJournalOrigin {
                 journals: (1..=3).map(journal).collect(), write_quorum: 2, stream: "original".to_owned(),
-                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]),
+                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]), original_entry_sha256: bytes::Bytes::new(),
             }),
             ..Default::default()
         };
@@ -472,7 +492,7 @@ mod tests {
                 journals: (1..=3).map(|id| uuid::Uuid::from_u128(id).to_string()).collect(),
                 write_quorum: 2,
                 stream: "original".to_owned(),
-                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]),
+                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]), original_entry_sha256: bytes::Bytes::new(),
             }),
             ..Default::default()
         };
@@ -484,6 +504,38 @@ mod tests {
         entry.timed_origin.as_mut().unwrap().clock_certificate_sha256 = bytes::Bytes::from_static(&[8; 32]);
         assert!(entry.valid_guard());
         assert!(verify_certified_range(&proof, &[entry]).is_err());
+    }
+
+    #[test]
+    fn a_resealed_copy_keeps_the_digest_its_original_voters_hold() {
+        let mut entry = Entry {
+            lsn: 4, epoch: 1, timestamp: 70, guarded: true, guarded_before: Some(100),
+            payload: bytes::Bytes::from_static(b"source-sealed"),
+            timed_origin: Some(TimedJournalOrigin {
+                journals: (1..=3).map(|id| uuid::Uuid::from_u128(id).to_string()).collect(),
+                write_quorum: 2,
+                stream: "original".to_owned(),
+                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]), original_entry_sha256: bytes::Bytes::new(),
+            }),
+            ..Default::default()
+        };
+        let original = super::original_entry_digest(&entry).unwrap();
+        let mut copied = entry.clone();
+        super::retain_original_entry_digest(&mut copied);
+        copied.payload = bytes::Bytes::from_static(b"target-sealed");
+        assert!(copied.valid_guard());
+        assert_eq!(super::original_entry_digest(&copied), Some(original));
+        super::retain_original_entry_digest(&mut copied);
+        assert_eq!(super::original_entry_digest(&copied), Some(original));
+
+        let mut chain = RetainedChain::new("copy", 4);
+        chain.append(&copied);
+        let proof = JournalDigest { stream: "copy".to_owned(), interval: [4, 4], digest: chain.digest() };
+        assert!(verify_certified_range(&proof, std::slice::from_ref(&copied)).is_ok());
+        copied.timed_origin.as_mut().unwrap().original_entry_sha256 = bytes::Bytes::from_static(&[9; 32]);
+        assert!(verify_certified_range(&proof, &[copied]).is_err());
+        entry.payload = bytes::Bytes::from_static(b"target-sealed");
+        assert_ne!(super::original_entry_digest(&entry), Some(original));
     }
 
     #[test]

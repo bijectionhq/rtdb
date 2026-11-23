@@ -347,6 +347,8 @@ impl TerminalReplicaCipher {
 
     pub(super) fn open_page(&self, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
         for entry in entries {
+            // The copy is resealed later; keep the digest its original voters retain.
+            rtdb_logkeeper::retain_original_entry_digest(entry);
             entry.payload = self.cipher.open(&self.scope, &entry.payload)?;
         }
         Ok(())

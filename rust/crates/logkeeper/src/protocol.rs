@@ -51,12 +51,18 @@ pub struct TimedJournalOrigin {
     pub stream: String,
     #[prost(bytes = "bytes", tag = "4")]
     pub clock_certificate_sha256: Bytes,
+    /// Empty on the original append. A copy whose payload is resealed keeps the original
+    /// stream's digest of the exact appended entry, so its original voters remain findable.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub original_entry_sha256: Bytes,
 }
 
 impl TimedJournalOrigin {
     pub(crate) fn valid(&self) -> bool {
         let count = self.journals.len() as u64;
         self.clock_certificate_sha256.len() == 32 && self.clock_certificate_sha256.as_ref() != &[0; 32]
+            && (self.original_entry_sha256.is_empty()
+                || self.original_entry_sha256.len() == 32 && self.original_entry_sha256.as_ref() != &[0; 32])
             && !self.stream.is_empty() && count / 2 < self.write_quorum && self.write_quorum <= count
             && self.journals.windows(2).all(|pair| pair[0] < pair[1])
             && self.journals.iter().all(|id| rtdb_types::valid_journal_identity(id))

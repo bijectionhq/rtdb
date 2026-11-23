@@ -246,7 +246,8 @@ impl<P: Payload> StreamState<P> {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
         if entries.iter().any(|entry| !entry.valid_guard()
-            || entry.timed_origin.as_ref().is_some_and(|origin| origin.ensemble_identity() != ensemble))
+            || entry.timed_origin.as_ref().is_some_and(|origin| origin.ensemble_identity() != ensemble
+                || !origin.original_entry_sha256.is_empty()))
         {
             return invalid("the timed entry must name the activated original ensemble");
         }

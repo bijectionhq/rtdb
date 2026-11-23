@@ -388,7 +388,7 @@ impl Writer {
         let Phase::Serving(pipeline) = &mut self.phase else { return None };
         let lsn = pipeline.next_lsn;
         pipeline.next_lsn += 1;
-        let entry = Entry { lsn, epoch, timestamp, payload, guarded: false, guarded_before: None };
+        let entry = Entry { lsn, epoch, timestamp, payload, guarded: false, guarded_before: None, timed_origin: None };
         pipeline.history.push(lsn, epoch);
         pipeline.buffer.push_back(Buffered { entry: entry.clone(), receipt: true });
         let commit = pipeline.commit;

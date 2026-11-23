@@ -67,6 +67,7 @@ pub(crate) fn held(state: &StreamState) -> Vec<Entry> {
     state.entries.iter().zip(state.trim + 1..).map(|(held, lsn)| Entry {
         lsn, epoch: held.epoch, timestamp: held.timestamp, payload: held.payload.clone(),
         guarded: held.guarded, guarded_before: held.guarded_before,
+        timed_origin: held.timed_origin.as_deref().cloned(),
     }).collect()
 }
 

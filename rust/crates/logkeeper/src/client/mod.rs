@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use writer::{AppendTime, Tip, Writer};
 
-pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, original_sync_observations, timely_original_sync_upper, verify_certified_range};
+pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, original_sync_observations, retain_original_entry_digest, timely_original_sync_upper, verify_certified_range};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;

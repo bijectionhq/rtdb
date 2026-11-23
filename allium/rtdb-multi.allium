@@ -503,6 +503,7 @@ contract LogService {
         -- A physically bounded append records its exclusive journal cutoff in the entry. A sample at or above that cutoff can never vote, including during recovery.
         -- Timed acceptance retains the digest of the exact receiver clock certificate with the cutoff. Recovery and the exact-record audit preserve that identity.
         -- The writer seals both inside the record's acceptance stage and derives the guarded append from it. The audit refuses a frame that does not repeat the sealed pair.
+        -- An original append carries no original entry digest. A copy whose payload is resealed records the original stream's digest of the exact appended entry, so the audit can still find the original voters.
         -- The raw record binds its original physical stream, distinct journal identities and quorum size across moves and archives.
         -- Current placement agreement establishes exact retained bytes. Only matching, timely samples from the recorded original quorum establish the sync bound, under the installed clock bounds.
 

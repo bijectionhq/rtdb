@@ -89,6 +89,7 @@ impl Ensemble {
         crate::protocol::TimedJournalOrigin {
             journals, write_quorum: self.config.write_quorum as u64, stream: self.stream(),
             clock_certificate_sha256: Bytes::copy_from_slice(&certificate),
+            original_entry_sha256: Bytes::new(),
         }
     }
 

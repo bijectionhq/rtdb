@@ -43,6 +43,10 @@ impl RetainedChain {
             link.update(b"rtdb.logkeeper/timed-original-ensemble\0");
             link.update(origin.fingerprint());
             link.update(&origin.clock_certificate_sha256);
+            if !origin.original_entry_sha256.is_empty() {
+                link.update(b"rtdb.logkeeper/timed-original-entry\0");
+                link.update(&origin.original_entry_sha256);
+            }
         }
         self.0 = link.finalize();
     }
