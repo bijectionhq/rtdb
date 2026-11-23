@@ -260,7 +260,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         let original = &original;
         with_registered_capture_context(
             directory.as_ref(), archive, keys, hosted_task,
-            CaptureSelection { deployment, capture, manifest: &manifest, suffix: Some(suffix), expected_basis: Some(basis) },
+            CaptureSelection { deployment, capture, manifest: &manifest, suffix: Some(suffix), expected_basis: Some(basis), require_replay: false },
             resources, |context, basis| async move {
                 let (archived, _charge) = rtdb_query::read_owned_world(Arc::clone(&context), owner, world)
                     .await?.ok_or_else(unavailable)?;
@@ -403,7 +403,7 @@ pub(crate) async fn prepare_checkpoint_replay_parent(
         .ok_or_else(OwnedWorld::unavailable)?;
     let basis = with_registered_capture_context(
         directory.as_ref(), archive, keys, hosted_task,
-        CaptureSelection { deployment, capture, manifest: &manifest, suffix, expected_basis: None },
+        CaptureSelection { deployment, capture, manifest: &manifest, suffix, expected_basis: None, require_replay: false },
         resources, |context, basis| {
             let owner = &owner;
             async move {
@@ -469,7 +469,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
             directory.as_ref(), archive, keys, hosted_task,
             CaptureSelection {
                 deployment, capture, manifest: &archived.manifest, suffix: Some(suffix),
-                expected_basis: Some(archived.basis),
+                expected_basis: Some(archived.basis), require_replay: false,
             },
             resources,
             |context, basis| async move {
@@ -771,7 +771,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
     };
     let ((schemas, _schema_charge), parent_publication, basis) = with_registered_capture_context(
         directory.as_ref(), archive, keys, hosted_task,
-        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis },
+        CaptureSelection { deployment: deployment_id, capture, manifest: &manifest, suffix, expected_basis, require_replay: false },
         resources,
         |context, basis| {
             let owner = &owner;

@@ -156,7 +156,7 @@ where
 {
     with_registered_capture_context(
         directory, archive, keys, hosted_task,
-        CaptureSelection { deployment: world.deployment, capture: world.capture, manifest: &world.manifest_sha256, suffix: world.suffix, expected_basis: Some(world.basis) },
+        CaptureSelection { deployment: world.deployment, capture: world.capture, manifest: &world.manifest_sha256, suffix: world.suffix, expected_basis: Some(world.basis), require_replay: false },
         resources, |context, _| run(context),
     ).await
 }
@@ -167,6 +167,7 @@ pub(super) struct CaptureSelection<'a> {
     pub manifest: &'a str,
     pub suffix: Option<Uuid>,
     pub expected_basis: Option<TransactionKey>,
+    pub require_replay: bool,
 }
 
 pub(super) async fn with_registered_capture_context<T, F, Fut>(
@@ -275,6 +276,9 @@ where
                 }
                 let (manifest, material) =
                     verified_archive(bucket.clone(), &capture, selected.manifest, keys).await?;
+                if selected.require_replay && manifest.format != rtdb_format::catalog::CheckpointContents::Replay {
+                    return Err(inconsistent("An installation serving from a replay archive requires a complete replay restore"));
+                }
                 let store: Arc<dyn ObjectStore> = Arc::new(CapturedObjects {
                     files: PrefixedStore::new(
                         Arc::clone(&bucket),

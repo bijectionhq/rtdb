@@ -1,7 +1,7 @@
 {
   "summary": "Checkpoint metadata is collectible only below the published block and every active metadata hold.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 13,
+  "min_verified_functions": 17,
   "controls": {
     "ignore_active_holds": {
       "mutate": [{
@@ -14,7 +14,7 @@
         "function": "checkpoint_metadata_collectable",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 12
+      "min_verified_functions": 16
     },
     "ignore_active_holds_and_weaken_contract": {
       "mutate": [{
@@ -35,7 +35,7 @@
         "function": "checkpoint_pack_collectable",
         "category": "postcondition not satisfied"
       }],
-      "min_verified_functions": 11
+      "min_verified_functions": 15
     },
     "ignore_retirement_authority": {
       "defect": "Admit a past checkpoint even though no hold closed off its retirement.",
@@ -53,7 +53,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 16
     },
     "ignore_retirement_authority_and_weaken_contract": {
       "defect": "Admit a past checkpoint even though no hold closed off its retirement.",
@@ -74,9 +74,14 @@
           "file": "verification/verus/checkpoint_metadata/laws.rs",
           "function": "an_unheld_older_checkpoint_is_refused",
           "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/checkpoint_metadata/laws.rs",
+          "function": "a_retirable_pack_cannot_be_newly_admitted_as_a_historical_checkpoint",
+          "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 15
     },
     "refuse_predecessor_handoff": {
       "defect": "Refuse to share a past checkpoint already protected by a live source hold.",
@@ -94,7 +99,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 16
     },
     "refuse_predecessor_handoff_and_weaken_contract": {
       "defect": "Refuse to share a past checkpoint already protected by a live source hold.",
@@ -117,7 +122,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 16
     },
     "ignore_pack_member_bound": {
       "mutate": [
@@ -134,7 +139,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 16
     },
     "ignore_pack_member_bound_and_weaken_contract": {
       "mutate": [
@@ -156,7 +161,46 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 16
+    },
+    "retire_at_the_last_certified_boundary": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "        && boundary < anchor_through && anchor_through < published_boundary\n}",
+          "replace": "        && boundary <= anchor_through && anchor_through < published_boundary\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "function": "replay_archive_covers_pack",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "retire_at_the_last_certified_boundary_and_weaken_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "        && boundary < anchor_through && anchor_through < published_boundary\n}",
+          "replace": "        && boundary <= anchor_through && anchor_through < published_boundary\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/checkpoint_retention.rs",
+          "find": "        && boundary < anchor_through && anchor_through < published_boundary,",
+          "replace": "        && boundary <= anchor_through && anchor_through < published_boundary,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/checkpoint_metadata/laws.rs",
+          "function": "a_replay_archive_never_retires_the_servable_boundary_or_the_published_pack",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
     }
   }
 }

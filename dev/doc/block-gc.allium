@@ -20,6 +20,8 @@
 -- checkpoint metadata at or above an active startup or capture floor.
 -- A covered pack must contain only checkpoint metadata. An ordinary hosted
 -- release by path can withdraw a reference but cannot erase an owned pack.
+-- On local Multi storage, the reaper may retire a mixed pack below the published checkpoint under the replay archive handoff in rtdb-multi.allium.
+-- Its old checkpoint boundary lies within an excluded replica prefix and every L0 member has an authenticated copy under independent archive custody.
 --
 -- Offloaded replica-message payloads (`oversized/b{idx}-{uuid}.binpb`, see db.allium's OversizedMessage) are collected by the same cycle, keyed on block index and swept by the same rule.
 -- They are the one kind here whose read path is not confined to startup: a payload is fetched while APPLYING its replica-log record, so `blocks_to_keep` doubles as the bound on how far a follower may lag before its payloads are collected under it.

@@ -37,6 +37,8 @@
 -- An admitted snapshot still checks the lease before beginning each provider request.
 -- The native collector deletes an eligible trie only once `reader_lease` has passed on its own monotonic clock since it first observed that trie as eligible.
 -- In Multi, that deletion records a release, which the cell reaper erases only after its grace.
+-- Local Multi can also erase an original L0 pack under independent replay archive custody.
+-- That erasure retains logical L0 descriptors so ordered-index replay can resolve the same inputs.
 -- Native nodes with a local journal and local storage share a catalog floor at the storage root.
 -- Catalog admission and floor advancement use the same filesystem lock.
 -- A reader's shared ticket lock retains its catalog until its last provider operation completes or its process exits.

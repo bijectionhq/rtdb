@@ -1,4 +1,4 @@
-use crate::production::{checkpoint_metadata_admissible, checkpoint_metadata_collectable, checkpoint_pack_collectable};
+use crate::production::{checkpoint_metadata_admissible, checkpoint_metadata_collectable, checkpoint_pack_collectable, replay_archive_covers_pack};
 use vstd::prelude::*;
 
 verus! {
@@ -79,6 +79,32 @@ pub fn a_future_checkpoint_cannot_inherit_protection(block: i64, published: i64,
 {
     let admit = checkpoint_metadata_admissible(block, Some(published), Some(first));
     assert(!admit);
+}
+
+pub fn a_replay_archive_can_cover_an_older_pack_inside_the_certified_prefix(
+    pack: i64, published: i64, boundary: i64, first: i64, through: i64, published_boundary: i64,
+)
+    requires pack < published, 0 <= first <= boundary < through < published_boundary,
+{
+    let covered = replay_archive_covers_pack(pack, published, boundary, first, through, published_boundary);
+    assert(covered);
+}
+
+pub fn a_replay_archive_never_retires_the_servable_boundary_or_the_published_pack(
+    pack: i64, published: i64, boundary: i64, first: i64, through: i64, published_boundary: i64,
+)
+    requires pack >= published || boundary >= through || through >= published_boundary || boundary < first,
+{
+    let covered = replay_archive_covers_pack(pack, published, boundary, first, through, published_boundary);
+    assert(!covered);
+}
+
+pub fn a_retirable_pack_cannot_be_newly_admitted_as_a_historical_checkpoint(
+    pack: i64, published: i64, boundary: i64, first: i64, through: i64, published_boundary: i64,
+) {
+    let covered = replay_archive_covers_pack(pack, published, boundary, first, through, published_boundary);
+    let admit = checkpoint_metadata_admissible(pack, Some(published), None);
+    assert(covered ==> !admit);
 }
 
 }

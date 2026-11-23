@@ -36,6 +36,7 @@ use crate::reference::custody::ReferenceReads;
 #[path = "key_enrollment.rs"]
 mod key_enrollment;
 mod exact_retirement;
+mod replay_retirement;
 
 /// The protobuf type name the cell's storage factory is registered under.
 pub const CELL_STORAGE_TYPE: &str = "rtdb.multi.CellStorage";
@@ -1601,7 +1602,7 @@ pub async fn run_reaper(
                     if let Some(maintenance) = &maintenance {
                         for record in &deployments {
                             if cancellation.is_cancelled() { return; }
-                            if let Err(error) = reap_local(directory.as_ref(), &storage, maintenance.clone(), record, now, grace).await {
+                            if let Err(error) = reap_local(directory.as_ref(), &storage, maintenance.clone(), record, now, grace, keys.as_deref()).await {
                                 eprintln!("Local garbage for {} is pending: {}", record.id, error.code);
                             }
                         }
@@ -1753,7 +1754,7 @@ pub(crate) async fn recover_hosted_lineage(directory: &dyn Directory, lineage: &
 }
 
 async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenance: Arc<File>,
-    candidate: &DeploymentRecord, now_ms: i64, grace: Duration) -> Result<Reaped> {
+    candidate: &DeploymentRecord, now_ms: i64, grace: Duration, keys: Option<&dyn KeyService>) -> Result<Reaped> {
     let lineage = &candidate.lineage;
     let source = candidate.storage_prefix();
     let local_volume = storage.custody_namespace()?;
@@ -1775,7 +1776,9 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
             break;
         }
     }
-    if !due { return Ok(Reaped::default()); }
+    if !due && !(keys.is_some() && replay_retirement::has_older_pack(bucket.as_ref(), candidate).await?) {
+        return Ok(Reaped::default());
+    }
     let generation = state.retirement_generation();
     let retirement = LineageRetirement { token: Uuid::new_v4(), source, work: RetirementWork::Local { local_volume } };
     directory.change_lineage(lineage, LineageChange::ReserveRetirement {
@@ -1786,7 +1789,11 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && can_reap(record))
             else { return Ok(Reaped::default()); };
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await
+        let mut reaped = reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await?;
+        if let Some(keys) = keys.filter(|_| replay_retirement::eligible(record)) {
+            reaped.erased += replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references, threshold).await?;
+        }
+        Ok(reaped)
     }.await;
     io.close_and_wait().await;
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await?;
@@ -1871,13 +1878,13 @@ mod tests {
         let local_volume = storage.custody_namespace().unwrap();
         directory.change_lineage(&parent.lineage, LineageChange::PrepareFork { preparation, local_volume }).await.unwrap();
         let lock = Arc::new(storage.try_local_maintenance().unwrap().unwrap());
-        assert_eq!(reap_local(directory.as_ref(), &storage, lock.clone(), &stale, i64::MAX, Duration::ZERO).await.unwrap(), Reaped::default());
+        assert_eq!(reap_local(directory.as_ref(), &storage, lock.clone(), &stale, i64::MAX, Duration::ZERO, None).await.unwrap(), Reaped::default());
         let state = directory.lineage_state(&parent.lineage).await.unwrap();
         assert!(state.local_preparations(local_volume).next().is_none());
         assert_eq!(state.retirement_generation(), 0);
 
         source.delete(&file).await.unwrap();
-        let outcome = reap_local(directory.as_ref(), &storage, lock, &stale, i64::MAX, Duration::ZERO).await.unwrap();
+        let outcome = reap_local(directory.as_ref(), &storage, lock, &stale, i64::MAX, Duration::ZERO, None).await.unwrap();
 
         let state = directory.lineage_state(&parent.lineage).await.unwrap();
         assert_eq!(state.retirement_generation(), 1);
