@@ -3257,6 +3257,9 @@ actor Gateway {
     -- A gateway configured with a PostgreSQL TLS key store completes the client's TLS handshake before it routes startup.
     -- A configured gateway refuses plaintext startup before any holder receives credentials.
     -- A Flight SQL gateway forwards the authenticated transport peer using a proof for the deployment and writer epoch.
+    -- An audience handshake uses the installed read-only directory transport to locate the existing holder by exact deployment identity.
+    -- The audience route derives the holder endpoint from that member's advertised host and the installed audience port.
+    -- It cannot activate or warm a deployment or ask the ordinary control endpoint for a route.
     -- The writer authenticates the session with the peer in that proof.
     -- Each Flight SQL call using a session token resolves its original writer placement.
     -- A displaced Flight SQL session must establish a new authenticated session.

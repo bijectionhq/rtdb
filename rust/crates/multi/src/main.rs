@@ -30,7 +30,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway [--directory DIR] [--installed-journals FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway [--directory DIR] [--installed-journals FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -508,13 +508,22 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             Ok(())
         }
         "gateway" => {
+            let audience = arguments.audience_listener("flight-audience", "flight-audience-listen")?;
+            let holder_port = match (audience.is_some(), arguments.optional("flight-audience-holder-port")) {
+                (true, Some(port)) => Some(port.parse::<std::num::NonZeroU16>()
+                    .map_err(|_| usage("--flight-audience-holder-port must be a nonzero TCP port".into()))?),
+                (true, None) => return Err(usage("--flight-audience-holder-port is required with an audience listener".into())),
+                (false, Some(_)) => return Err(usage("--flight-audience-holder-port requires an audience listener".into())),
+                (false, None) => None,
+            };
             let installed_journals = arguments.optional("installed-journals")
                 .map(|path| rtdb_multi::journal::hosted::GatewayRoutes::read(std::path::Path::new(path))).transpose()?.map(Arc::new);
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
-                Some(address) => directory(address).await?,
-                None if installed_journals.is_some() => rtdb_directory::MemoryDirectory::new(),
-                None => return Err(usage("--directory is required without an installed journal manifest".into())),
+                Some(address) => open_directory(address, audience.is_some()).await?,
+                None if installed_journals.is_some() && audience.is_none() => rtdb_directory::MemoryDirectory::new(),
+                None => return Err(usage("--directory is required for audience Flight or without an installed journal manifest".into())),
             };
+            if audience.is_some() { directory.require_audience_reads()?; }
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
             eprintln!("gateway listening on {}", listener.local_addr().map_err(io)?);
             let tls = if let Some(path) = arguments.optional("config") {
@@ -548,14 +557,15 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     None => std::future::pending().await,
                 }
             };
-            let audience = if let Some((address, audience)) = arguments.audience_listener("flight-audience", "flight-audience-listen")? {
+            let audience = if let Some(((address, audience), holder_port)) = audience.zip(holder_port) {
                 let listener = tokio::net::TcpListener::bind(address).await.map_err(io)?;
                 eprintln!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
-                Some((listener, audience))
+                Some((listener, audience, holder_port))
             } else { None };
             let audience_flight = async {
                 match audience {
-                    Some((listener, audience)) => rtdb_multi::flight_gateway::serve_audience(listener, Arc::clone(&directory), options.clone(), audience, cancellation.clone()).await,
+                    Some((listener, audience, holder_port)) => rtdb_multi::flight_gateway::serve_audience(listener,
+                        Arc::clone(&directory), options.clone(), audience, holder_port, cancellation.clone()).await,
                     None => std::future::pending().await,
                 }
             };
@@ -1116,7 +1126,7 @@ async fn open_directory(spec: &str, audience: bool) -> Result<Arc<dyn Directory>
     if let Some(prefix) = spec.strip_prefix("dynamodb:") { return dynamodb(prefix, false, audience).await; }
     if let Some(prefix) = spec.strip_prefix("dynamodb+packed:") { return dynamodb(prefix, true, audience).await; }
     if audience {
-        return Err(Anomaly::unsupported("rtdb.multi/audience-directory", "An audience holder requires a directory with a dedicated read transport"));
+        return Err(Anomaly::unsupported("rtdb.multi/audience-directory", "An audience listener requires a directory with a dedicated read transport"));
     }
     let mut attempts = 0;
     loop {

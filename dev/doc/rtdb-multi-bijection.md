@@ -66,6 +66,11 @@ It remains absent if the required original samples are unavailable.
 It also reports the audit process's rounded clock immediately after establishing quorum agreement.
 The audit time includes probe latency and requires bounded clock uncertainty when compared with the writer's sample.
 
+The installed audience Flight gateway discovers its existing holder with its own DynamoDB client.
+It reads the exact deployment and that deployment's member by key and dials the configured audience port on the member's advertised host.
+A missing, stale, or parked placement makes the audience handshake unavailable.
+The writer lifecycle remains with the placement owners. At the holder, acquisition verifies the recovered source and writer quorum.
+
 ### Query from the application
 
 Funrun reads through the Conductor at the transaction's basis, served from the holder's tail and cache.

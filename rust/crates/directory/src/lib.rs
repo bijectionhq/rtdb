@@ -1133,6 +1133,11 @@ pub trait Directory: Send + Sync {
     fn require_audience_reads(&self) -> Result<()> {
         Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
     }
+    /// Locates the existing holder using the audience's point-read transport.
+    /// The caller must still check its exact name, authority, and eligibility.
+    async fn audience_holder(&self, _id: &str) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
+        Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The directory has no audience read transport"))
+    }
     /// Reads the current deployment and member over the audience transport.
     /// These strongly consistent point reads leave the exact writer epoch check to the holder and journal.
     async fn audience_authority(&self, _id: &str, _member: &MemberId) -> Result<Option<(DeploymentRecord, MemberRecord)>> {

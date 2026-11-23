@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 mod common;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU16, sync::Arc, time::Duration};
 
 use arrow_flight::{Action, FlightDescriptor, HandshakeRequest, Ticket, flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient}};
@@ -129,8 +129,18 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
     let audience_address = audience_listener.local_addr().unwrap();
     let audience = rtdb_flight_sql::AudienceFlightConfig::parse(&format!("{installation}/1")).unwrap();
     let audience_driver = tokio::spawn(flight_gateway::serve_audience(
-        audience_listener, Arc::clone(&cell.directory), options, audience, cancellation.clone(),
+        audience_listener, Arc::clone(&cell.directory), options, audience, NonZeroU16::new(5454).unwrap(), cancellation.clone(),
     ));
+
+    let mut audience_client = FlightServiceClient::new(channel(audience_address).await);
+    let mut unavailable = Request::new(futures::stream::iter([HandshakeRequest::default()]));
+    unavailable.metadata_mut().insert("x-xtdb-database", selector.parse().unwrap());
+    unavailable.metadata_mut().insert(rtdb_flight_sql::AUDIENCE_FLIGHT_HEADER, audience.to_string().parse().unwrap());
+    assert_eq!(audience_client.handshake(unavailable).await.unwrap_err().code(), Code::Unavailable);
+    let unchanged = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    assert!(unchanged.holder.is_none());
+    assert_eq!(unchanged.version, deployment.version);
+
     let mut flight = FlightSqlServiceClient::new(channel(address).await);
     flight.set_header("x-xtdb-database", &selector);
     flight.handshake("xtdb", "cell-test").await.unwrap();
@@ -151,7 +161,6 @@ async fn flight_gateway_routes_authenticated_streams_and_refuses_a_displaced_ses
         request
     };
     let mut raw = FlightServiceClient::new(channel(address).await);
-    let mut audience_client = FlightServiceClient::new(channel(audience_address).await);
     let mut ordinary_route = Request::new(Action { r#type: "CloseSession".into(), body: Default::default() });
     ordinary_route.metadata_mut().insert("authorization", format!("Bearer {route}").parse().unwrap());
     assert_eq!(audience_client.do_action(ordinary_route).await.unwrap_err().code(), Code::PermissionDenied);

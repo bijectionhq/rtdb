@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net::IpAddr, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
+use std::{convert::Infallible, net::IpAddr, num::NonZeroU16, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -44,6 +44,12 @@ struct SessionRoute {
     audience: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct AudienceRoute {
+    profile: AudienceFlightConfig,
+    holder_port: NonZeroU16,
+}
+
 struct Router {
     directory: Arc<dyn Directory>,
     control: control::ControlKey,
@@ -52,7 +58,7 @@ struct Router {
     transport: Client<HttpConnector, Incoming>,
     calls: Arc<Semaphore>,
     deployments: Option<Arc<DeploymentConnections>>,
-    audience: Option<AudienceFlightConfig>,
+    audience: Option<AudienceRoute>,
     options: GatewayOptions,
     timeout: Duration,
 }
@@ -81,14 +87,14 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
 
 pub async fn serve_audience(
     listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions,
-    audience: AudienceFlightConfig, cancellation: CancellationToken,
+    audience: AudienceFlightConfig, holder_port: NonZeroU16, cancellation: CancellationToken,
 ) -> Result<()> {
-    serve_listener(listener, directory, options, Some(audience), cancellation).await
+    serve_listener(listener, directory, options, Some(AudienceRoute { profile: audience, holder_port }), cancellation).await
 }
 
 async fn serve_listener(
     listener: TcpListener, directory: Arc<dyn Directory>, options: GatewayOptions,
-    audience: Option<AudienceFlightConfig>, cancellation: CancellationToken,
+    audience: Option<AudienceRoute>, cancellation: CancellationToken,
 ) -> Result<()> {
     let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect("rtdb.multi/flight-secret", "Flight SQL routing requires the cell secret"))?;
     let address = listener.local_addr().map_err(network)?;
@@ -110,7 +116,7 @@ async fn serve_listener(
     let transport = Client::builder(TokioExecutor::new()).http2_only(true)
         .retry_canceled_requests(false).pool_timer(TokioTimer::new()).pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(30)).build(connector);
-    let limit = audience.map_or(options.maximum_connections, AudienceFlightConfig::permits);
+    let limit = audience.map_or(options.maximum_connections, |audience| audience.profile.permits());
     let router = Arc::new(Router { directory, control: control::ControlKey(Some(Arc::clone(secret))),
         secret: Arc::clone(secret), routes: secret.flight_session_cipher()?, transport, audience,
         calls: Arc::new(Semaphore::new(limit)),
@@ -175,12 +181,15 @@ impl Router {
 
     async fn first_target(&self, selector: &str) -> std::result::Result<Target, Status> {
         let (name, installation) = database_selector(selector).map_err(|_| Status::invalid_argument("Invalid Flight SQL deployment selector"))?;
+        if let Some(audience) = self.audience {
+            return self.audience_target(name, installation, audience).await;
+        }
         if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
-            if self.audience.is_some() || installation.is_some_and(|id| id != installed.deployment) {
+            if installation.is_some_and(|id| id != installed.deployment) {
                 return Err(Status::not_found("No matching installed Flight SQL deployment"));
             }
             let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, |worker, _| async move {
-                let reply = control::call(&worker.control, &control::Request::FlightEndpoint { audience: false },
+                let reply = control::call(&worker.control, &control::Request::FlightEndpoint,
                     self.timeout, &self.control).await?;
                 match reply {
                     control::Response::FlightEndpoint { address } => Ok(address),
@@ -193,8 +202,7 @@ impl Router {
             return Ok(target);
         }
         let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
-            .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id)
-                && self.audience.is_none_or(|profile| Uuid::parse_str(&record.id).ok() == Some(profile.source())))
+            .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id))
             .ok_or_else(|| Status::not_found("No matching local Flight SQL deployment"))?;
         if record.writer_pool().is_none() { return Err(moved()); }
         let holder = admin::ensure_held(self.directory.as_ref(), name, &self.control).await
@@ -203,10 +211,32 @@ impl Router {
         let current = current.filter(|record| record.writer_pool().is_some() && record.holder.as_ref() == Some(&holder)).ok_or_else(moved)?;
         let member = member.filter(|member| holder_is_current(&current, member)).ok_or_else(moved)?;
         let control = member.control_address.as_deref().ok_or_else(moved)?;
-        let reply = control::call(control, &control::Request::FlightEndpoint { audience: self.audience.is_some() }, self.timeout, &self.control).await
+        let reply = control::call(control, &control::Request::FlightEndpoint, self.timeout, &self.control).await
             .map_err(|_| Status::unavailable("The holder did not report a Flight SQL endpoint"))?;
         let control::Response::FlightEndpoint { address } = reply else { return Err(Status::unavailable("The holder has no Flight SQL endpoint")); };
         Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None })
+    }
+
+    async fn audience_target(
+        &self, name: &str, installation: Option<Uuid>, route: AudienceRoute,
+    ) -> std::result::Result<Target, Status> {
+        let source = route.profile.source();
+        if installation.is_some_and(|id| id != source)
+            || self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)).is_some()
+        {
+            return Err(Status::not_found("No matching installed Flight audience"));
+        }
+        let (record, member) = self.directory.audience_holder(&source.to_string()).await.map_err(directory_error)?
+            .ok_or_else(moved)?;
+        // This lookup only locates the existing holder. The peer proof names
+        // the epoch and the holder confirms the recovered source and quorum.
+        if record.id != source.to_string() || record.name != name || record.epoch == 0
+            || !record.linearizable_reads || !holder_is_current(&record, &member)
+        {
+            return Err(moved());
+        }
+        let address = audience_holder_address(&member.address, route.holder_port)?;
+        Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None })
     }
 
     async fn validate(&self, target: &Target) -> std::result::Result<(), Status> {
@@ -248,7 +278,7 @@ impl Router {
             (Some(_), None) => routed_audience,
             _ => return Err(Status::permission_denied("The Flight audience is fixed at its handshake")),
         };
-        if audience != self.audience {
+        if audience != self.audience.map(|route| route.profile) {
             return Err(Status::permission_denied("The Flight route belongs to another listener"));
         }
         if routed_audience.is_some() && request.uri().path() != DO_ACTION {
@@ -346,6 +376,12 @@ fn flight_cookie(headers: &HeaderMap) -> std::result::Result<Option<&str>, Statu
     let first = named.next();
     if named.next().is_some() { return Err(Status::unauthenticated("Duplicate Flight SQL session cookies")); }
     Ok(first)
+}
+
+fn audience_holder_address(advertised: &str, port: NonZeroU16) -> std::result::Result<String, Status> {
+    let authority = advertised.parse::<http::uri::Authority>().map_err(|_| moved())?;
+    let (host, _) = advertised.rsplit_once(':').filter(|_| authority.port_u16().is_some()).ok_or_else(moved)?;
+    Ok(format!("{host}:{port}"))
 }
 
 fn holder_is_current(record: &DeploymentRecord, member: &MemberRecord) -> bool {

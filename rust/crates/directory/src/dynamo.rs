@@ -583,6 +583,19 @@ impl Directory for DynamoDirectory {
         else { Err(Anomaly::unsupported("rtdb.directory/audience-transport", "The audience read transport was not installed")) }
     }
 
+    async fn audience_holder(&self, id: &str) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
+        let reader = self.audience_reader.as_ref().ok_or_else(|| Anomaly::unsupported(
+            "rtdb.directory/audience-transport", "The audience read transport was not installed",
+        ))?;
+        let Some(record) = get_item(reader, &self.tables.deployments, ID, id).await? else {
+            return Ok(None);
+        };
+        let record = decode_deployment(&record)?;
+        let Some(holder) = &record.holder else { return Ok(None) };
+        let member = get_item(reader, &self.tables.members, ID, holder.as_str()).await?;
+        Ok(member.as_ref().map(decode_member).transpose()?.map(|member| (record, member)))
+    }
+
     async fn audience_authority(&self, id: &str, member: &MemberId) -> Result<Option<(DeploymentRecord, MemberRecord)>> {
         let reader = self.audience_reader.as_ref().ok_or_else(|| Anomaly::unsupported(
             "rtdb.directory/audience-transport", "The audience read transport was not installed",
