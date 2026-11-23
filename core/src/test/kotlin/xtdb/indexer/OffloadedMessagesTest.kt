@@ -85,6 +85,20 @@ class OffloadedMessagesTest {
         }
 
     @Test
+    fun `an offloaded payload digest rejects a replacement with the same term and sequence`(al: BufferAllocator) = runTest {
+        MemoryStorage(al, 0).use { bufferPool ->
+            val declining = DecliningDriver(maxBytes = 1024)
+            val declined = bigTriesAdded().withTermSeq(4)
+            offloading(bufferPool, declining, blockIndex = 7).appendToReplica(declined)
+            val ref = assertInstanceOf(ReplicaMessage.OversizedMessage::class.java, declining.appended.single())
+            val corrupt = ref.copy(payloadSha256 = ByteString.copyFrom(ByteArray(32)))
+            val record = Log.Record(0, 0, Instant.EPOCH, corrupt as ReplicaMessage)
+
+            assertThrows<IllegalStateException> { bufferPool.resolveOversized(record) }
+        }
+    }
+
+    @Test
     fun `a message the log accepts is appended untouched`(al: BufferAllocator) = runTest {
         MemoryStorage(al, 0).use { bufferPool ->
             val declining = DecliningDriver(maxBytes = 1024)

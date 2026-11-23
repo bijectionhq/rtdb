@@ -52,3 +52,32 @@ pub(crate) fn replay_window(submitted_at: i64, not_after: i64) -> ReplayWindow {
         None => ReplayWindow::Unrepresentable,
     }
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if previous < appended { appended } else { previous },
+))]
+pub(crate) fn advance_retry_clock(previous: i64, appended: i64) -> i64 {
+    previous.max(appended)
+}
+
+pub(crate) enum BoundedWindow {
+    Expired,
+    TooLong,
+    Open,
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        (out is Expired) == (not_after <= observed),
+        (out is TooLong) == (not_after as int - observed as int > 3_600_000_000),
+        (out is Open) == (observed < not_after && not_after as int - observed as int <= 3_600_000_000),
+))]
+pub(crate) fn bounded_window(observed: i64, not_after: i64) -> BoundedWindow {
+    if not_after <= observed {
+        BoundedWindow::Expired
+    } else if (not_after as i128) - (observed as i128) > HOUR_MICROS as i128 {
+        BoundedWindow::TooLong
+    } else {
+        BoundedWindow::Open
+    }
+}

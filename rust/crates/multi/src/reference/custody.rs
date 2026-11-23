@@ -73,7 +73,7 @@ impl ReferenceReads {
                 }) {
                     return Err(Anomaly::new(AnomalyCategory::Unavailable, CLOSED, "The reference's physical residence no longer admits reads"));
                 }
-                owner.storage_regions.insert(id, StorageRegion::ReferenceRead { custody: worker.custody.clone(), object: Some(object.clone()) });
+                owner.storage_regions.insert(id, StorageRegion::ReferenceRead { custody: worker.custody.clone(), object: Some(object.clone()), archive_source: None });
                 Ok(())
             }).await;
             let opened = accepted.is_ok();

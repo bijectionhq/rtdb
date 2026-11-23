@@ -374,6 +374,18 @@ def verify_lean_model(args, scratch, path, study, controls, theorems, env=None):
 
 
 
+def verify_read_index_frontiers(args, scratch):
+    path = Path("verification/lean/ReadIndexFrontiers.lean")
+    controls = {
+        "ignore-unobserved-slot": (
+            "observedVotes replies + missingVotes replies",
+            "observedVotes replies",
+            ["completed_position_is_below_the_read_bound", "missing_reply_can_hide_a_completed_position"],
+        ),
+    }
+    verify_lean_model(args, scratch, path, "read-index-frontiers", controls, 3)
+
+
 def verify_search_member_bounds(args, scratch):
     path = Path("verification/lean/SearchMemberBounds.lean")
     assignment = "prefixCount doc (startsFrom 0 counts) - 1"
@@ -1798,6 +1810,38 @@ def verify_gateway_replay_lean(args, scratch):
 
 def verify_lean(args, scratch):
     verify_gateway_replay_lean(args, scratch)
+    verify_lean_model(
+        args, scratch, Path("verification/lean/ObservedClockAndRetry.lean"), "observed-clock-and-retry",
+        {
+            "report-projected-time": (
+                "⟨position, sample, max sample (previous.projected + 1)⟩",
+                "⟨position, max sample (previous.projected + 1), max sample (previous.projected + 1)⟩",
+                ["ordered_projection_preserves_the_unsmoothed_observation"],
+            ),
+            "allow-regressed-clock": (
+                "let observed := max state.clock sample", "let observed := sample",
+                ["observing_expiry_is_irreversible", "same_body_redeems_the_original_terminal_outcome"],
+            ),
+            "rerun-original": (
+                "then (withClock, .existing original.outcome)",
+                "then ({ withClock with receipt := some body }, .applied body.outcome)",
+                ["same_body_redeems_the_original_terminal_outcome", "the_first_terminal_outcome_survives_all_other_attempts"],
+            ),
+            "keep-expired-rows": (
+                "rows.filter (retained clock)", "rows",
+                ["retirement_selects_exactly_open_payloads"],
+            ),
+            "accept-unmarked-multirow-outcome": (
+                "(versioned || events.length == 1)", "true",
+                ["legacy_accepts_only_the_single_current_outcome"],
+            ),
+            "erase-current-outcome": (
+                "| .erase id => id != current", "| .erase _ => true",
+                ["accepted_outcome_cannot_erase_its_current_attempt"],
+            ),
+        },
+        8,
+    )
     path = Path("verification/lean/History.lean")
     controls = {
         "baseline": None,
@@ -1874,6 +1918,7 @@ def verify_lean(args, scratch):
             verify_replica_prefix(args, scratch)
             verify_progress_wait(args, scratch)
             verify_logkeeper(args, scratch)
+            verify_read_index_frontiers(args, scratch)
             verify_reader_retention(args, scratch)
             verify_generation_retention(args, scratch)
             verify_hosted_trie_release(args, scratch)
@@ -2052,6 +2097,34 @@ TLA_CASES = (
     ("PlacedServingAuthority", "placed-directory-outage-witness",
      ("INVARIANTS ReceiptNamesTheAttempt BasisNamesCommittedAttempt BasisAppearsAfterApply ClosedReceiptIsAbsent FreshReadIncludesPriorCommits",
       "INVARIANT NeverServesDuringOutage"), "NeverServesDuringOutage"),
+    ("CaptureKeyRevocation", "capture-key-revocation", None, None),
+    ("CaptureKeyRevocation", "capture-key-bypasses-tombstone",
+     ('Mutation = "none"', 'Mutation = "bypass_tombstone"'), "NoPostClosureUse"),
+    ("CaptureKeyRevocation", "capture-key-ignores-active-provider",
+     ('Mutation = "none"', 'Mutation = "ignore_active_provider"'), "NoPostClosureUse"),
+    ("CaptureKeyRevocation", "capture-key-exports-material",
+     ('Mutation = "none"', 'Mutation = "export_material"'), "CommitHasClosedKey"),
+    ("CaptureKeyRevocation", "capture-key-publishes-before-withdrawal",
+     ('Mutation = "none"', 'Mutation = "publish_before_withdrawal"'), "CommitHasClosedKey"),
+    ("CaptureKeyRevocation", "capture-key-assumes-empty-inventory",
+     ('Mutation = "none"', 'Mutation = "assume_inventory_empty"'), "SettlementHasEmptyInventory"),
+    ("CaptureKeyRevocation", "capture-key-aliases-export",
+     ('Mutation = "none"', 'Mutation = "alias_destination"'), "IndependentCopyStaysReadable"),
+    ("CaptureKeyRevocation", "capture-key-lost-reply-witness",
+     ("INVARIANTS NoPostClosureUse CommitHasClosedKey SettlementHasEmptyInventory IndependentCopyStaysReadable",
+      "INVARIANT NeverRecoverAfterLostReply"), "NeverRecoverAfterLostReply"),
+    ("CaptureScheduledExpiry", "capture-scheduled-expiry", None, None),
+    ("CaptureScheduledExpiry", "capture-scheduled-expiry-reports-before-arm",
+     ('Mutation = "none"', 'Mutation = "ack_before_arm"'), "AcknowledgedIsDurable"),
+    ("CaptureScheduledExpiry", "capture-scheduled-expiry-forgets-the-schedule",
+     ('Mutation = "none"', 'Mutation = "forget_schedule"'), "AcknowledgedIsDurable"),
+    ("CaptureScheduledExpiry", "capture-scheduled-expiry-changes-deadline",
+     ('Mutation = "none"', 'Mutation = "change_due"'), "DueIsImmutable"),
+    ("CaptureScheduledExpiry", "capture-scheduled-expiry-returns-late-crypto",
+     ('Mutation = "none"', 'Mutation = "skip_completion_check"'), "NoCryptoResultAtOrAfterExpiry"),
+    ("CaptureScheduledExpiry", "capture-scheduled-expiry-recovers-arm-after-lost-reply-witness",
+     ("INVARIANTS AcknowledgedIsDurable DueIsImmutable NoCryptoResultAtOrAfterExpiry",
+      "INVARIANT NeverRecoversArmingAfterLostReply"), "NeverRecoversArmingAfterLostReply"),
     ("ErasureCustody", "erasure-custody", None, None),
     ("KeyLineageEnrollment", "key-lineage-enrollment", None, None),
     ("KeyLineageEnrollment", "enrollment-trusts-missing-directory-history",
@@ -2511,6 +2584,23 @@ TLA_CASES = (
      ("INVARIANT Safe", "INVARIANT NeverCancelsAfterRefusal"), "NeverCancelsAfterRefusal"),
     ("CheckpointPhysicalOwners", "physical-owners-publication-witness",
      ("INVARIANT Safe", "INVARIANT NeverPublishes"), "NeverPublishes"),
+    ("ArchiveCustodyTransitions", "archive-custody-transitions", None, None),
+    ("ArchiveCustodyTransitions", "archive-custody-skip-exact-binding",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "skip_exact_binding"\nINVARIANT SourceRetained'), "SourceRetained"),
+    ("ArchiveCustodyTransitions", "archive-custody-release-before-drain",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "release_before_drain"\nINVARIANT SourceRetained'), "SourceRetained"),
+    ("ArchiveCustodyTransitions", "archive-custody-withdraw-before-drain",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "withdraw_before_drain"\nINVARIANT ArchiveReadRetained'), "ArchiveReadRetained"),
+    ("ArchiveCustodyTransitions", "archive-custody-settle-before-withdrawal",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "settle_before_withdrawal"\nINVARIANT SettlementHasWithdrawal'), "SettlementHasWithdrawal"),
+    ("ArchiveCustodyTransitions", "archive-custody-withdraw-independent-key",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "withdraw_independent_key"\nINVARIANT IndependentCustody'), "IndependentCustody"),
+    ("ArchiveCustodyTransitions", "archive-custody-unqualified-deadline",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "unqualified_deadline"\nINVARIANT QualifiedDeadlinesOnly'), "QualifiedDeadlinesOnly"),
+    ("ArchiveCustodyTransitions", "archive-custody-unrelated-retirement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverRetiresUnrelated"), "NeverRetiresUnrelated"),
+    ("ArchiveCustodyTransitions", "archive-custody-settlement-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettles"), "NeverSettles"),
     ("CheckpointSourceHandoff", "source-handoff-exact", None, None),
     ("CheckpointSourceHandoff", "source-handoff-residence",
      ('Design = "exact"\n    Mutation = "none"\nINVARIANT Safe', 'Design = "residence"\n    Mutation = "none"\nINVARIANTS Safe NeverReclaimsWhileHeld'), None),
@@ -2911,6 +3001,27 @@ TLA_CASES = (
     ("ReplicaTrimAdmission", "replica-trim-replacement-witness",
      ("INVARIANTS PublishedCheckpointCovered ActiveRecoveryCovered PublishedManifestComplete AuthorizedTrimHasManifest",
       "INVARIANT NeverRecoveredAfterTrim"), "NeverRecoveredAfterTrim"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-reclamation", None, None),
+    ("OffloadedReplicaReclamation", "offloaded-replica-pending-append",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "trust_pending_append"\nINVARIANT BindingNamesCommittedRecord'), "BindingNamesCommittedRecord"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-legacy-read",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "enable_before_legacy_drain"\nINVARIANT AdmittedReaderCanResolve'), "AdmittedReaderCanResolve"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-stale-legacy-route",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "legacy_reopens_after_closure"\nINVARIANT AdmittedReaderCanResolve'), "AdmittedReaderCanResolve"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-live-read",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "ignore_live_read"\nINVARIANT AdmittedReaderCanResolve'), "AdmittedReaderCanResolve"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-reopen-below-anchor",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "live_reopens_after_anchor"\nINVARIANT FutureAdmissionRespectsAnchor'), "FutureAdmissionRespectsAnchor"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-delete-from-authorization",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "delete_on_authorization"\nINVARIANT DeletionHasPhysicalTrim'), "DeletionHasPhysicalTrim"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-lose-plan-on-crash",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "lose_plan_on_crash"\nINVARIANT SettlementHasExactPlan'), "SettlementHasExactPlan"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-delete-key",
+     ('Mutation = "none"\nINVARIANT Safe', 'Mutation = "delete_by_key"\nINVARIANT OtherVersionsSurvive'), "OtherVersionsSurvive"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-lost-reply-and-crash-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettlesLostReplyAfterCrash"), "NeverSettlesLostReplyAfterCrash"),
+    ("OffloadedReplicaReclamation", "offloaded-replica-lost-delete-reply-witness",
+     ("INVARIANT Safe", "INVARIANT NeverSettlesAfterDeleteCrash"), "NeverSettlesAfterDeleteCrash"),
     ("ReplicaTrimArchive", "replica-trim-archive", None, None),
     ("ReplicaTrimArchive", "replica-trim-ignore-pending-archive",
      ('Mutation = "none"', 'Mutation = "ignore_pending_archive"'), "PendingPinRetainsJournal"),

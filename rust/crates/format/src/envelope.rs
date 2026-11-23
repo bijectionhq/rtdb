@@ -1,8 +1,11 @@
 use prost::Message;
-use rtdb_types::{Anomaly, BlockIndex, PlacedAttempt, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
+use sha2::{Digest, Sha256};
+use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, PlacedAttempt, Result, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+
+const ADMITTED_OFFLOAD_STORAGE: i32 = -1;
 
 pub use crate::generated::xtdb::log::proto::replica_log_message::Message as ReplicaBody;
 pub use crate::generated::xtdb::log::proto::source_log_message::Message as SourceBody;
@@ -131,6 +134,27 @@ pub struct AcceptanceStageWitness {
     pub cutoff: Timestamp,
 }
 
+const RETIREMENT_MARKER: &[u8] = b"rtdb/placed-receipt-retirement/v1\0";
+
+pub fn encode_replica_outcome_attempt(attempt: PlacedAttempt, retirement: bool) -> Vec<u8> {
+    let bytes = attempt.encode();
+    if !retirement { return bytes.to_vec(); }
+    let mut encoded = Vec::with_capacity(RETIREMENT_MARKER.len() + bytes.len());
+    encoded.extend_from_slice(RETIREMENT_MARKER);
+    encoded.extend_from_slice(&bytes);
+    encoded
+}
+
+pub fn decode_replica_outcome_attempt(bytes: &[u8]) -> Result<(PlacedAttempt, bool)> {
+    match PlacedAttempt::decode(bytes) {
+        Ok(attempt) => Ok((attempt, false)),
+        Err(error) => {
+            let attempt = bytes.strip_prefix(RETIREMENT_MARKER).ok_or(error)?;
+            Ok((PlacedAttempt::decode(attempt)?, true))
+        }
+    }
+}
+
 impl crate::log::proto::ResolvedTx {
     /// Coordinates retained with a strict committed transaction. The sample
     /// is the writer's admission clock, before quorum durability.
@@ -140,8 +164,9 @@ impl crate::log::proto::ResolvedTx {
             (stage.clock_upper_micros, stage.cutoff_micros, self.src_msg_id, self.system_time_micros)
         else { return Err(invalid("Incomplete strict acceptance stage")); };
         let attempt = self.placed_attempt.as_deref().ok_or_else(|| invalid("Strict acceptance stage has no placed attempt"))?;
+        let (attempt, _) = decode_replica_outcome_attempt(attempt)?;
         if self.committed != Some(true) || self.tx_id != Some(source) || self.db_op.is_some()
-            || PlacedAttempt::decode(attempt)?.position() != SourcePosition(source)
+            || attempt.position() != SourcePosition(source)
             || upper <= 0 || upper >= cutoff || ordered_at >= cutoff
         {
             return Err(invalid("Strict acceptance stage does not match a committed placed transaction"));
@@ -154,6 +179,19 @@ impl crate::log::proto::ResolvedTx {
 }
 
 impl ReplicaFrame {
+    pub fn has_external_payload(bytes: &[u8]) -> Result<bool> {
+        let (&header, mut payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
+        if header != PROTOBUF_LOG_HEADER {
+            return Err(invalid(format!("Unknown replica message header: {header}")));
+        }
+        while !payload.is_empty() {
+            let (field, wire) = wire_key(&mut payload)?;
+            skip_wire(&mut payload, field, wire, 0)?;
+            if field == 8 && wire == 2 { return Ok(true); }
+        }
+        Ok(false)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
         if header != PROTOBUF_LOG_HEADER {
@@ -201,10 +239,27 @@ impl ReplicaEnvelope {
         self
     }
 
+    pub fn offloaded(&self, version: StorageVersion, epoch: StorageEpoch, block: BlockIndex, payload_id: String, bytes: &[u8]) -> Self {
+        Self {
+            term: self.term,
+            term_sequence: self.term_sequence,
+            message: ReplicaBody::OversizedMessage(crate::log::proto::OversizedMessage {
+                storage_version: Some(version.0),
+                storage_epoch: Some(epoch.0),
+                block_index: Some(block.0),
+                payload_id: Some(payload_id),
+                payload_sha256: Some(Sha256::digest(bytes).to_vec()),
+                publication: None,
+            }),
+        }
+    }
+
     /// The caller admits the envelope's term before reading the returned payload key.
     pub fn oversized_payload(&self, version: StorageVersion, epoch: StorageEpoch) -> Result<Option<String>> {
         let ReplicaBody::OversizedMessage(message) = &self.message else { return Ok(None) };
-        let message_version = StorageVersion(message.storage_version.unwrap_or_default());
+        let message_version = if message.storage_version == Some(ADMITTED_OFFLOAD_STORAGE) {
+            self.offload_publication()?.ok_or_else(|| invalid("Admitted offload has no publication"))?.0
+        } else { StorageVersion(message.storage_version.unwrap_or_default()) };
         let message_epoch = StorageEpoch(message.storage_epoch.unwrap_or_default());
         if message_version != version || message_epoch != epoch {
             return Err(Anomaly::fault(
@@ -219,10 +274,46 @@ impl ReplicaEnvelope {
         Ok(Some(key))
     }
 
+    pub fn offload_publication(&self) -> Result<Option<(StorageVersion, PhysicalObjectVersion)>> {
+        let ReplicaBody::OversizedMessage(message) = &self.message else { return Ok(None) };
+        if message.storage_version != Some(ADMITTED_OFFLOAD_STORAGE) { return Ok(None); }
+        let publication = message.publication.as_ref().ok_or_else(|| invalid("Admitted offload has no publication"))?;
+        let (Some(version), Some(bucket), Some(key), Some(version_id)) =
+            (publication.storage_version, &publication.bucket, &publication.key, &publication.version_id)
+            else { return Err(invalid("Admitted offload has an incomplete publication")); };
+        if version < 0 || bucket.is_empty() || key.is_empty() || version_id.is_empty() || version_id == "null"
+            || message.payload_sha256.as_ref().is_none_or(|digest| digest.len() != 32)
+        {
+            return Err(invalid("Admitted offload has an invalid publication"));
+        }
+        Ok(Some((StorageVersion(version), PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: bucket.clone(), endpoint: publication.endpoint.clone(), region: publication.region.clone() },
+            key: key.clone(), version: version_id.clone(),
+        })))
+    }
+
+    pub fn bind_offload_publication(&mut self, version: PhysicalObjectVersion) -> Result<()> {
+        let ReplicaBody::OversizedMessage(message) = &mut self.message else {
+            return Err(invalid("An object publication requires an oversized envelope"));
+        };
+        message.publication = Some(crate::log::proto::ReplicaPayloadPublication {
+            storage_version: message.storage_version,
+            bucket: Some(version.namespace.bucket), endpoint: version.namespace.endpoint, region: version.namespace.region,
+            key: Some(version.key), version_id: Some(version.version),
+        });
+        message.storage_version = Some(ADMITTED_OFFLOAD_STORAGE);
+        self.offload_publication().map(drop)
+    }
+
     /// Checks the fetched record against the already-admitted envelope without admitting it a second time.
     pub fn unwrap_payload(&self, bytes: &[u8]) -> Result<Self> {
-        if !matches!(self.message, ReplicaBody::OversizedMessage(_)) {
+        let ReplicaBody::OversizedMessage(reference) = &self.message else {
             return Err(invalid("Only an oversized envelope has an external payload"));
+        };
+        if let Some(expected) = &reference.payload_sha256
+            && expected.as_slice() != Sha256::digest(bytes).as_slice()
+        {
+            return Err(Anomaly::fault("rtdb.format/oversized-payload-mismatch", "Oversized payload bytes differ from their replica reference"));
         }
         let payload = Self::decode(bytes)?.ok_or_else(|| invalid("Oversized payload has no replica message"))?;
         if payload.term != self.term || payload.term_sequence != self.term_sequence {

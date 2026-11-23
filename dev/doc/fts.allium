@@ -363,6 +363,11 @@ contract SearchCorrectness {
     @invariant RankedLimitKeepsTheFirstRows
         -- Under a ranked LIMIT, the scan hands on every row among the first n by the SQL ordering.
         -- A tie at the cutoff remains eligible until the optimizer can prove its position.
+        -- A bitemporal point scan on one partition may break score ties by ascending UUID _id when the captured table stores UUIDs as their canonical IIDs.
+        -- The live sources attest this identity relationship, and publication records it only after checking every put in the ordered Arrow tree's input.
+        -- The first document in an unread rank range supplies a lower UUID bound for the range because the tree assigns document ordinals in nondecreasing IID order.
+        -- An uncertified tree, an overlapping legacy search file, or missing live identity evidence leaves the UUID cutoff score-only.
+        -- Any unread candidate or window with an unknown tie bound remains eligible at an equal score.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.

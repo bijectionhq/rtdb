@@ -6,6 +6,7 @@ use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use async_trait::async_trait;
@@ -31,11 +32,22 @@ pub struct MergeConfig {
     pub recency_partition: RecencyPartition,
     pub temporary_directory: PathBuf,
     pub temporary_byte_limit: u64,
+    pub scan_tie_order_from_naming_epoch: Option<NonZeroU64>,
 }
 
 impl Default for MergeConfig {
     fn default() -> Self { Self { page_size: 1024, run_end_encoded_iids: false, within_file_recency_branching: false,
-        recency_partition: RecencyPartition::Week, temporary_directory: std::env::temp_dir(), temporary_byte_limit: 16 * 1024 * 1024 * 1024 } }
+        recency_partition: RecencyPartition::Week, temporary_directory: std::env::temp_dir(), temporary_byte_limit: 16 * 1024 * 1024 * 1024,
+        scan_tie_order_from_naming_epoch: None } }
+}
+
+impl MergeConfig {
+    fn tie_order(&self, naming_epoch: u64) -> planner::TieOrder {
+        match self.scan_tie_order_from_naming_epoch {
+            Some(first) if naming_epoch >= first.get() => planner::TieOrder::Scan,
+            _ => planner::TieOrder::Legacy,
+        }
+    }
 }
 
 pub struct SegmentCompactor {
@@ -247,30 +259,29 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
             calculator: AdmittedPolygonCalculator::new(None, Arc::clone(memory)),
             system_from: None, seen_erase: false, erased: false,
         })?;
+        if state.erased { continue; }
         if state.system_from != Some(event.system_from) {
             state.calculator.reset();
             state.system_from = Some(event.system_from);
             state.seen_erase = false;
         }
         let header = event.header();
-        let resolved = if state.erased { None } else {
-            state.calculator.visit(&header, |polygon| {
-                if header.commit_position != 0 {
+        let resolved = state.calculator.visit(&header, |polygon| {
+            if header.commit_position != 0 {
+                charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
+                result.push(event.clone());
+                return Ok(());
+            }
+            for (valid_from, valid_to, system_to) in polygon.ranges() {
+                if system_to > event.system_from {
                     charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                    result.push(event.clone());
-                    return Ok(());
+                    let mut event = event.clone();
+                    event.valid_time = Interval::new(valid_from, valid_to)?;
+                    result.push(event);
                 }
-                for (valid_from, valid_to, system_to) in polygon.ranges() {
-                    if system_to > event.system_from {
-                        charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
-                        let mut event = event.clone();
-                        event.valid_time = Interval::new(valid_from, valid_to)?;
-                        result.push(event);
-                    }
-                }
-                Ok(())
-            })?
-        };
+            }
+            Ok(())
+        })?;
         if header.op == EventOp::Erase { state.erased = true; }
         if resolved.is_none() {
             if !state.seen_erase {
@@ -324,6 +335,13 @@ impl CompactionExecutor for SegmentCompactor {
         let put = merged_put_schema(&inputs)?;
         let carry = self.config.within_file_recency_branching && job.output.recency().is_some() && inputs.iter().all(|input| input.reader.schema().index_of("_recency").is_ok());
         let tasks = planner::plan(&inputs, &job.part)?;
+        let tie_order = self.config.tie_order(job.output.epoch());
+        let mut sources: Vec<_> = (0..inputs.len()).collect();
+        sources.sort_by(|&left, &right| inputs[left].key.scan_precedence().cmp(&inputs[right].key.scan_precedence()));
+        let mut source_precedence = vec![0; inputs.len()];
+        for (priority, source) in sources.into_iter().enumerate() {
+            source_precedence[source] = priority;
+        }
         let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
         let initial_carry = job.recency_mode == RecencyMode::Preserve && carry;
         let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, keyed, &self.config, &self.memory)?];
@@ -344,14 +362,14 @@ impl CompactionExecutor for SegmentCompactor {
                 let path = if job.part.len() > task.path.len() { &job.part } else { &task.path };
                 events.retain(|event| planner::matches_path(event.iid, path));
                 charges.push(event_reservation(&self.memory, &events, 2)?);
-                rows.push(events);
+                rows.push(planner::PageRows { source_precedence: source_precedence[page.segment], events });
             }
-            let mut heap = planner::RowHeap::new(&rows)?;
+            let mut heap = planner::RowHeap::new(&rows, tie_order)?;
             let mut states = EntityStates::new();
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
             while let Some((stream, row)) = heap.next() {
-                let event = &rows[stream][row];
+                let event = &rows[stream].events[row];
                 let calculator = states.get(event, &self.memory, || AdmittedPolygonCalculator::new(None, Arc::clone(&self.memory)))?;
                 let Some(mut recency) = calculator.visit(&event.header(), |polygon| Ok(polygon.recency()))? else { continue; };
                 if event.commit_position != 0 {
@@ -469,13 +487,21 @@ mod tests {
     #[test]
     fn same_time_compaction_keeps_fully_superseded_landing_assertions_until_erasure() {
         let memory = MemoryBudget::new(1 << 20);
+        let page = |events: &[StoredEvent]| {
+            let fields = StructFields::from([("payload".into(), LogicalType::Scalar(rtdb_types::ScalarType::Utf8))]);
+            EventBatch::new(build_event_batch(events, Some(fields), None).unwrap()).unwrap().page_events().unwrap()
+        };
         let assertions = [2, 1].map(|commit_position| StoredEvent {
             commit_position,
             entity_key: Some(Arc::from(b"entity".as_slice())),
             iid: Iid([1; 16]),
             system_from: Timestamp(100),
             valid_time: Interval::from_micros(10, 20).unwrap(),
-            operation: StoredOperation::Delete,
+            operation: if commit_position == 2 {
+                StoredOperation::Put(StructFields::from([("payload".into(), rtdb_types::Value::Utf8("erase me".into()))]))
+            } else {
+                StoredOperation::Delete
+            },
             recency: None,
         });
         let (surviving, _charges) = resolve_same_time(&page(&assertions), &memory).unwrap();
@@ -562,22 +588,22 @@ mod tests {
         let key = |event: &PageEvent| (event.iid, Reverse(event.system_from));
         for count in 0..=4 {
             for mut choice in 0..pages.len().pow(count) {
-                let streams: Vec<_> = (0..count).map(|_| {
-                    let rows = pages[choice % pages.len()].clone();
+                let streams: Vec<_> = (0..count).map(|source_precedence| {
+                    let events = pages[choice % pages.len()].clone();
                     choice /= pages.len();
-                    rows
+                    planner::PageRows { source_precedence: source_precedence as usize, events }
                 }).collect();
-                let lengths: Vec<_> = streams.iter().map(Vec::len).collect();
-                let mut expected: Vec<_> = streams.iter().flatten().map(key).collect();
+                let lengths: Vec<_> = streams.iter().map(|page| page.events.len()).collect();
+                let mut expected: Vec<_> = streams.iter().flat_map(|page| page.events.iter()).map(key).collect();
                 expected.sort();
 
-                let mut heap = planner::RowHeap::new(&streams).unwrap();
+                let mut heap = planner::RowHeap::new(&streams, planner::TieOrder::Scan).unwrap();
                 let mut positions = vec![0; streams.len()];
                 let mut observed = Vec::with_capacity(expected.len());
                 while let Some((stream, row)) = heap.next() {
                     assert_eq!(row, positions[stream], "merge skipped or repeated a row in a stream");
                     positions[stream] += 1;
-                    observed.push(key(&streams[stream][row]));
+                    observed.push(key(&streams[stream].events[row]));
                 }
                 assert_eq!(positions, lengths, "merge did not consume every input occurrence");
                 assert_eq!(observed, expected, "merge order differs from sorting the input");
@@ -585,9 +611,9 @@ mod tests {
         }
 
         for [later, earlier] in [[&events[1], &events[0]], [&events[2], &events[0]]] {
-            let unsorted = [page(&[later.clone(), earlier.clone()])];
-            let error = planner::RowHeap::new(&unsorted).err().unwrap();
-            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-time descending"));
+            let unsorted = [planner::PageRows { source_precedence: 0, events: page(&[later.clone(), earlier.clone()]) }];
+            let error = planner::RowHeap::new(&unsorted, planner::TieOrder::Scan).err().unwrap();
+            assert_eq!(error.message.as_deref(), Some("Compaction page is not IID ascending and system-position descending"));
         }
     }
 

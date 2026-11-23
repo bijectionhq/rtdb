@@ -3666,16 +3666,9 @@ impl Service {
             }
             Ok(reply)
         } else {
-            let empty;
-            let planned;
-            let schema = if path_columns.is_some() {
-                empty = Schema::empty();
-                &empty
-            } else {
-                planned = wire::plan_schema(cursor.runtime_schema(), memory)?;
-                &*planned
-            };
-            let schema = with_point_witness(schema, witness(None)?);
+            let schema = if path_columns.is_some() { wire::OwnedSchema::empty(memory)? }
+                else { wire::plan_schema(cursor.runtime_schema(), memory)? };
+            let schema = with_point_witness(&schema, witness(None)?);
             self.owned_point_reply_in(memory, &schema, None, present, valid, None, None)
         }
     }

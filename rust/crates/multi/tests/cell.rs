@@ -2333,20 +2333,26 @@ async fn cold_snapshot_refuses_a_mismatched_recovery_manifest() {
     drop(client);
     let agent = &cell.node(0).agent;
     agent.park("shop").await.unwrap();
-    let mut parked = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+    let parked = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
     let expected = parked.recovery_manifest_sha256.unwrap();
+    let set_manifest = async |digest| {
+        for _ in 0..8 {
+            let mut current = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+            let version = current.version;
+            current.recovery_manifest_sha256 = Some(digest);
+            if cell.directory.replace_deployment(current, version).await.unwrap().applied().is_some() {
+                return;
+            }
+        }
+        panic!("the parked record kept changing while setting its recovery manifest");
+    };
     let mut wrong = expected;
     wrong[0] ^= 1;
-    parked.recovery_manifest_sha256 = Some(wrong);
-    let version = parked.version;
-    let mut parked = cell.directory.replace_deployment(parked, version).await.unwrap().applied().unwrap();
+    set_manifest(wrong).await;
     let error = agent.snapshot("shop").await.unwrap_err();
     assert_eq!(error.code, "rtdb.multi/storage-region");
 
-    parked = cell.directory.deployment(&parked.id).await.unwrap().unwrap();
-    parked.recovery_manifest_sha256 = Some(expected);
-    let version = parked.version;
-    assert!(cell.directory.replace_deployment(parked, version).await.unwrap().applied().is_some());
+    set_manifest(expected).await;
     agent.snapshot("shop").await.unwrap();
     cell.stop().await;
 }

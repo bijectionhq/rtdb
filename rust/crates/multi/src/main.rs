@@ -23,7 +23,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replica-payload-reclamation] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
@@ -47,6 +47,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
        rtdb-multi move --directory DIR --name NAME --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi pin-engine --directory DIR --name NAME (--version VERSION | --clear)\n\
+       rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
        rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--org ORG] [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
@@ -66,7 +67,7 @@ DIR is HOST:PORT of a directory server, or dynamodb:PREFIX for DynamoDB tables n
 Use dynamodb+packed:PREFIX to write packed parked rows after all readers have upgraded.\n\
 MAP is HOST:PORT of a cell-map server, or dynamodb:PREFIX for tables named PREFIX-cells and PREFIX-placements.\n\
 DynamoDB requires the `dynamodb` feature. RTDB_DYNAMODB_ENDPOINT points at DynamoDB Local.\n\
-For --keys, use a private directory, a dynamodb:TABLE locator, or s3://BUCKET?region=REGION for a never-versioned key vault.\n";
+For --keys, use a private directory, local-broker:PATH, a dynamodb:TABLE locator, or s3://BUCKET?region=REGION for a never-versioned key vault.\n";
 
 fn main() {
     let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
@@ -332,12 +333,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             standalone_protocol: u32,
             hosted_protocol: u32,
             pgwire_arrow_copy_out: bool,
+            placed_receipt_retirement: bool,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 56 } else { 13 },
             pgwire_arrow_copy_out: true,
+            placed_receipt_retirement: true,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
@@ -402,6 +405,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 return Err(usage("--audience-journal-port requires the node's audience Flight listener".into()));
             }
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
+            agent.replica_payload_reclamation = arguments.present("replica-payload-reclamation");
             if arguments.present("s3-write-role") {
                 let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
                 agent.s3_write_role = Some(rtdb_multi::agent::S3WriteRole { arn: arguments.required("s3-write-role")?.to_owned(),
@@ -658,6 +662,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let directory = directory(arguments.required("directory")?).await?;
             for member in admin::roll_engine(directory.as_ref(), arguments.required("version")?).await? { println!("{member}"); }
             Ok(())
+        }
+        "enable-placed-receipt-retirement" => {
+            let directory = directory(arguments.required("directory")?).await?;
+            admin::enable_placed_receipt_retirement(directory.as_ref(), arguments.required("name")?).await.map(|_| ())
         }
         "read-width" => {
             let directory = directory(arguments.required("directory")?).await?;
@@ -960,6 +968,9 @@ fn cell_secret(arguments: &Arguments) -> Result<Option<Arc<rtdb_multi::capabilit
 }
 
 async fn key_service(specification: &str) -> Result<Arc<dyn rtdb_multi::keys::KeyService>> {
+    if let Some(path) = specification.strip_prefix("local-broker:") {
+        return Ok(Arc::new(rtdb_multi::keys::LocalKeyService::with_archive_broker(path)?));
+    }
     if let Some(table) = specification.strip_prefix("dynamodb:") {
         return dynamo_keys(table).await;
     }
