@@ -209,6 +209,29 @@ impl InstalledJournal {
         Ok(page)
     }
 
+    pub(super) async fn inspect_checkpoint(
+        &self,
+        base: Checkpoint,
+        from: Cut,
+        through: Cut,
+        maximum_bytes: u64,
+    ) -> Result<ReplayPage> {
+        match self
+            .call(Operation::InspectCheckpoint {
+                base,
+                from,
+                through,
+                maximum_bytes,
+            })
+            .await?
+        {
+            Reply::Replay(page) => Ok(page),
+            _ => Err(mismatch(
+                "The peer did not return the checkpoint inspection page",
+            )),
+        }
+    }
+
     pub async fn checkpoint_replay(
         &self,
         preparation: CheckpointPreparation,

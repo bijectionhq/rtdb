@@ -21,6 +21,7 @@ use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTick
 use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
 use crate::lease::MemberLease;
 use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
+use crate::journal::hosted::checkpoint_for_block;
 
 enum SuffixCut<'a> {
     Tip(TransactionKey),
@@ -768,7 +769,7 @@ impl NodeAgent {
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
                 placement.publish_checkpoint(self.keys.as_ref(), Some((admission, checkpoint)),
-                    &self.options.storage).await?.ok_or_else(||
+                    &self.options.storage, self.node.memory()).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
             return Ok(Response::Flushed { checkpoint });
@@ -1615,7 +1616,7 @@ impl NodeAgent {
         for (name, placement) in self.ordered.custody_placements() {
             let _ = placement.retain_selected().await;
             let publish = placement.publish_checkpoint(self.keys.as_ref(), offered.remove(name),
-                &self.options.storage);
+                &self.options.storage, self.node.memory());
             if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
                 let _ = placement.retain_selected().await;
             }
@@ -1669,18 +1670,6 @@ async fn flush_local(database: &Database) -> Result<Arc<BlockCatalog>> {
             AnomalyCategory::Unavailable, rtdb_node::NOT_HELD, "The holder stopped before adopting its flush",
         )));
     }
-}
-
-fn checkpoint_for_block(block: &BlockCatalog, log_epoch: StorageEpoch) -> Option<Checkpoint> {
-    let boundary = block.boundary_replica_position()?.after_offset(log_epoch);
-    if boundary < 0 { return None; }
-    Some(Checkpoint {
-        block: block.block_index().0,
-        boundary,
-        source: block.latest_source_position().map_or(-1, |position| position.after_offset(log_epoch)),
-        system_time: block.latest_completed_tx().map_or(i64::MIN, |tx| tx.system_time.0),
-        root_sha256: Some(block.publication_sha256()?),
-    })
 }
 
 fn short_handoff_tail(database: &Database, log_epoch: StorageEpoch) -> bool {

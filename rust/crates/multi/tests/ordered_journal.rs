@@ -601,6 +601,7 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
     let pressure = route(&next).await;
     assert_eq!(pressure.window_spent, ORDINARY);
     assert_eq!(pressure.maintenance_retained, maintained.byte_end);
+    assert_eq!(pressure.last_maintenance, Some(maintained.cut));
     assert_eq!(
         reconcile(&next, replacement, original.clone()).await,
         appended
@@ -619,6 +620,28 @@ async fn funded_control_reconciles_lost_append_and_read_replies_through_trim_and
     // This case drives the journal authority in isolation. The separate RTDB
     // case below supplies the real provider validation and recoverable copy.
     let view = route(&custody).await;
+    let inspect = Operation::InspectCheckpoint {
+        base: view.checkpoint,
+        from: view.checkpoint.cut,
+        through: maintained.cut,
+        maximum_bytes: ORDINARY + 1024,
+    };
+    assert!(matches!(
+        next.call(inspect.clone()).await.unwrap(),
+        Reply::Refused(Refusal::Unauthorized)
+    ));
+    let Reply::Replay(candidate) = custody.call(inspect).await.unwrap() else {
+        panic!("the custodian cannot discover the retained chosen input");
+    };
+    assert_eq!(candidate.through, maintained.cut);
+    assert_eq!(
+        candidate
+            .records
+            .iter()
+            .map(|row| row.result)
+            .collect::<Vec<_>>(),
+        [appended, maintained]
+    );
     let preparation = CheckpointPreparation {
         checkpoint: exact.cut,
         root: exact.root,
@@ -949,6 +972,15 @@ async fn flight_client(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
+    recover_after_writer_loss(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_custodian_discovers_the_chosen_upload_after_writer_loss() {
+    recover_after_writer_loss(false).await;
+}
+
+async fn recover_after_writer_loss(prepare_before_loss: bool) {
     use futures::TryStreamExt;
 
     let record = DeploymentRecord::new("shop", "acceptance", Vec::new(), now_ms());
@@ -1003,6 +1035,7 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
         })
     };
     let mut nodes = Vec::new();
+    let mut standby = None;
     for (index, (pgwire, control)) in ports.into_iter().enumerate() {
         let path = authority
             .data
@@ -1013,7 +1046,8 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
             &json!([{
                 "deployment": record,
                 "worker": installed_client(&authority.workers[index], json!({"kind": "worker", "enrollment": authority.enrollments[index]})),
-                "custody": installed_client(&authority.custodian, json!({"kind": "custody"})),
+                "custody": (prepare_before_loss || index == 1)
+                    .then(|| installed_client(&authority.custodian, json!({"kind": "custody"}))),
                 "endpoints": endpoints,
                 "archive": archive,
                 "archive_prefix": "checkpoints",
@@ -1028,31 +1062,34 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
         let mut agent = AgentOptions::new(storage.clone());
         agent.installed_journal_manifest = Some(path);
         agent.watch_interval = Duration::from_millis(50);
-        drop(control);
-        drop(pgwire);
-        let node = process::start_node(
-            MemoryDirectory::new(),
-            process::NodeSettings {
-                configuration,
-                allocation_limit_bytes: 1 << 30,
-                control: control_address,
-                advertise_host: Some("127.0.0.1".into()),
-                hosted_task: None,
-                availability_zone: format!("worker-zone-{index}"),
-                engine_version: None,
-                agent,
-                lease: common::lease(),
-                pool: MemberPool::General,
-                claim_wait: Duration::from_millis(2),
-                keys: keys.clone(),
-                cache_dir: authority.data.path().join(format!("cache-{index}")),
-                local_compaction: false,
-                capabilities: Some(common::secret()),
-            },
-        )
-        .await
-        .unwrap();
-        nodes.push(Some(node));
+        let settings = process::NodeSettings {
+            configuration,
+            allocation_limit_bytes: 1 << 30,
+            control: control_address,
+            advertise_host: Some("127.0.0.1".into()),
+            hosted_task: None,
+            availability_zone: format!("worker-zone-{index}"),
+            engine_version: None,
+            agent,
+            lease: common::lease(),
+            pool: MemberPool::General,
+            claim_wait: Duration::from_millis(2),
+            keys: keys.clone(),
+            cache_dir: authority.data.path().join(format!("cache-{index}")),
+            local_compaction: false,
+            capabilities: Some(common::secret()),
+        };
+        if !prepare_before_loss && index == 1 {
+            standby = Some((settings, pgwire, control));
+            nodes.push(None);
+        } else {
+            drop(control);
+            drop(pgwire);
+            let node = process::start_node(MemoryDirectory::new(), settings)
+                .await
+                .unwrap();
+            nodes.push(Some(node));
+        }
     }
 
     let gateway_manifest = authority.data.path().join("gateway.json");
@@ -1151,11 +1188,16 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
     let original_node = nodes[incumbent_index].as_ref().unwrap();
     assert!(original_node.agent.flush("shop").await.is_err());
     let interrupted = route(&routing).await;
-    let pending = interrupted
-        .preparing
-        .expect("the exact provider intent was ordered before the fault");
-    assert_eq!(pending.source, incumbent);
-    assert_eq!(pending.custody.allocation, allocation);
+    let pending = interrupted.preparing;
+    if prepare_before_loss {
+        let pending = pending.expect("the exact provider intent was ordered before the fault");
+        assert_eq!(pending.source, incumbent);
+        assert_eq!(pending.custody.allocation, allocation);
+    } else {
+        assert_eq!(incumbent_index, 0);
+        assert!(pending.is_none());
+        assert!(interrupted.head.next_lsn > before.head.next_lsn);
+    }
     assert_eq!(interrupted.checkpoint, before.checkpoint);
     assert_eq!(interrupted.floor, before.floor);
     assert!(
@@ -1204,35 +1246,56 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
         .await;
     nodes[incumbent_index].take().unwrap().kill().await.unwrap();
     let view = route(&routing).await;
-    if view.writer.grant == Some(incumbent) {
-        let old_writer = authority.workers[incumbent_index].client(&cohort.route);
-        assert_eq!(
-            execute(
-                &old_writer,
-                request(
-                    view,
-                    Principal::Worker(incumbent.enrollment),
-                    Command::Vacate { grant: incumbent }
+    let old_writer = authority.workers[incumbent_index].client(&cohort.route);
+    let stranded = if prepare_before_loss {
+        if view.writer.grant == Some(incumbent) {
+            assert_eq!(
+                execute(
+                    &old_writer,
+                    request(
+                        view,
+                        Principal::Worker(incumbent.enrollment),
+                        Command::Vacate { grant: incumbent }
+                    )
                 )
-            )
-            .await
-            .receipt
-            .outcome,
-            Ok(Outcome::Vacated)
+                .await
+                .receipt
+                .outcome,
+                Ok(Outcome::Vacated)
+            );
+        }
+        None
+    } else {
+        let strand = match view.writer.grant {
+            Some(strand) => strand,
+            None => {
+                let (strand, held) = grant(&old_writer, incumbent.enrollment).await;
+                release(&old_writer, held).await;
+                strand
+            }
+        };
+        let (settings, pgwire, control) = standby.take().unwrap();
+        drop(pgwire);
+        drop(control);
+        nodes[1] = Some(
+            process::start_node(MemoryDirectory::new(), settings)
+                .await
+                .unwrap(),
         );
-    }
-    assert!(route(&routing).await.writer.grant.is_none());
+        Some(strand)
+    };
+    assert_eq!(route(&routing).await.writer.grant, stranded);
     drop(blocker);
 
-    // The second node's custodian resumes the chosen copy before any client
-    // can promote it as a writer.
     let published = eventually(async || {
         let view = route(&routing).await;
-        (view.checkpoint.custody == pending.custody && view.floor == pending.checkpoint)
+        (view.checkpoint.custody.allocation == allocation
+            && view.floor == view.checkpoint.cut
+            && view.floor != before.floor)
             .then_some(view)
     })
     .await;
-    assert!(published.writer.grant.is_none());
+    assert_eq!(published.writer.grant, stranded);
     let replacement = common::connect(&sql_address.to_string(), "shop").await;
     assert_eq!(
         common::values(&replacement, "SELECT total FROM orders WHERE _id = 1").await,
@@ -1254,8 +1317,13 @@ async fn gateway_replaces_a_writer_and_resumes_its_prepared_provider_copy() {
     assert!(elected.epoch > incumbent.epoch);
     assert!(directory.deployments().await.unwrap().is_empty());
 
-    assert_eq!(published.checkpoint.cut, pending.checkpoint);
-    assert_eq!(published.checkpoint.root, pending.root);
+    if let Some(pending) = pending {
+        assert_eq!(published.checkpoint.cut, pending.checkpoint);
+        assert_eq!(published.checkpoint.root, pending.root);
+    } else {
+        assert!(published.checkpoint.cut.next_lsn < interrupted.head.next_lsn);
+        assert_ne!(published.checkpoint.root, [0; 32]);
+    }
     assert!(published.preparing.is_none());
     assert!(
         allocation_parent

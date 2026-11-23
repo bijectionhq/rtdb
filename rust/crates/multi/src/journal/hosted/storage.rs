@@ -162,7 +162,7 @@ fn source_prefix(
     format!("{storage_prefix}/~ordered/{generation}/{writer_epoch}/{root}")
 }
 
-struct ReplicaObjects {
+pub(super) struct ReplicaObjects {
     installed: Placement,
     storage_prefix: String,
     root: ObjectKey,
@@ -171,6 +171,21 @@ struct ReplicaObjects {
 }
 
 impl ReplicaObjects {
+    pub(super) async fn for_custodian(
+        placement: &super::Placement,
+        storage: &CellStorage,
+        material: &[u8],
+        io: Arc<IoRegion>,
+    ) -> Result<Self> {
+        Ok(Self {
+            installed: placement.worker.placement(),
+            storage_prefix: placement.record.storage_prefix(),
+            root: ObjectKey::new(crate::archive::checkpoint_storage_root()?)?,
+            bucket: storage.bucket(io).await?,
+            material: material.to_vec(),
+        })
+    }
+
     async fn open(&self, scope: ReplicaObjectScope) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
         if scope.deployment != self.installed.deployment
             || scope.incarnation != self.installed.incarnation
@@ -182,10 +197,17 @@ impl ReplicaObjects {
                 "The replica object scope belongs to a different installed placement".into(),
             ));
         }
+        self.open_writer(scope.writer_epoch).await
+    }
+
+    pub(super) async fn open_writer(
+        &self,
+        epoch: u64,
+    ) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
         let prefix = source_prefix(
             &self.storage_prefix,
-            scope.generation,
-            scope.writer_epoch,
+            self.installed.generation,
+            epoch,
             &self.root,
         );
         let bucket = Arc::new(crate::reference::PrefixedStore::new(

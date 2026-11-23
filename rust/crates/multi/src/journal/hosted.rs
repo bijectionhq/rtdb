@@ -1,5 +1,6 @@
 //! Attachment of an installed journal to RTDB's database factories.
 
+mod discovery;
 mod storage;
 
 use super::{
@@ -8,17 +9,19 @@ use super::{
 };
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
-    Checkpoint, Command, Enrollment, Grant, Hold, Request, Window, service::Route,
+    Checkpoint, Command, Cut, Enrollment, Grant, Hold, Request, Window, service::Route,
 };
 use prost_types::Any;
+use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{Checkpoint as RtdbCheckpoint, DeploymentRecord};
 use rtdb_format::{
+    catalog::BlockCatalog,
     database::proto::{DatabaseConfig, RemoteStorage, database_config},
     envelope::{ReplicaBody, ReplicaEnvelope},
 };
 use rtdb_node::{LogAccess, LogFactory, OpenedLogs};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, Result, StorageEpoch};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -68,7 +71,7 @@ pub(crate) struct Placement {
     endpoints: BTreeMap<Enrollment, WorkerEndpoint>,
     nomination: tokio::sync::Mutex<Option<Request>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
-    publication: tokio::sync::Mutex<()>,
+    publication: tokio::sync::Mutex<Option<(Checkpoint, Cut)>>,
 }
 
 #[derive(Default)]
@@ -353,13 +356,21 @@ impl Placement {
         keys: &dyn crate::keys::KeyService,
         offered: Option<(WriterAdmission, RtdbCheckpoint)>,
         serving: &crate::deployment::CellStorage,
+        memory: &Arc<MemoryBudget>,
     ) -> Result<Option<RtdbCheckpoint>> {
-        let _publication = self.publication.lock().await;
+        let mut inspected = self.publication.lock().await;
         let custodian = self
             .custodian
             .as_ref()
             .ok_or_else(|| invalid("This placement has no checkpoint custodian"))?;
-        if offered.is_none() && custodian.route().await?.preparing.is_none() {
+        let initial = custodian.route().await?;
+        if offered.is_none()
+            && initial.preparing.is_none()
+            && initial.last_maintenance.is_none_or(|through| {
+                through.next_lsn <= initial.checkpoint.cut.next_lsn
+                    || *inspected == Some((initial.checkpoint, through))
+            })
+        {
             return Ok(None);
         }
         let material = material(keys, &self.record).await?;
@@ -409,27 +420,52 @@ impl Placement {
             };
             let origin = match (current.preparing, requested) {
                 (Some(chosen), _) => Preparation::recover(chosen, reservation)?,
-                (None, Some((admission, checkpoint, next))) => {
-                    let through = custodian.checkpoint_cut(next).await?;
-                    let origin = Preparation {
-                        writer: admission.grant,
-                        base: admission.recovery.checkpoint,
-                        through,
-                        checkpoint,
+                (None, Some((admission, checkpoint, next))) => Preparation {
+                    writer: admission.grant,
+                    base: admission.recovery.checkpoint,
+                    through: custodian.checkpoint_cut(next).await?,
+                    checkpoint,
+                },
+                (None, None) => {
+                    let Some(through) = current
+                        .last_maintenance
+                        .filter(|cut| cut.next_lsn > published.cut.next_lsn)
+                    else {
+                        return Ok(None);
                     };
-                    let source =
-                        storage::reopen_source(self, serving, &provider, &material, &io, origin)
-                            .await?;
-                    provider
-                        .preflight(&reservation, origin, source.as_ref())
-                        .await?;
-                    custodian
-                        .prepare_checkpoint(&current, origin.ordered(reservation)?)
-                        .await?;
-                    origin
+                    let cut = (published, through);
+                    if *inspected == Some(cut) {
+                        return Ok(None);
+                    }
+                    let objects = storage::ReplicaObjects::for_custodian(
+                        self,
+                        serving,
+                        &material,
+                        Arc::clone(&io),
+                    )
+                    .await?;
+                    let Some(candidate) = discovery::discover(
+                        self, custodian, &provider, cut, &objects, &material, memory,
+                    )
+                    .await?
+                    else {
+                        *inspected = Some(cut);
+                        return Ok(None);
+                    };
+                    candidate
                 }
-                (None, None) => return Ok(None),
             };
+            if current.preparing.is_none() {
+                let source =
+                    storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                        .await?;
+                provider
+                    .preflight(&reservation, origin, source.as_ref())
+                    .await?;
+                custodian
+                    .prepare_checkpoint(&current, origin.ordered(reservation)?)
+                    .await?;
+            }
             let origin = provider.begin(&reservation, origin).await?;
             let staged = match provider.prepared(reservation, origin).await? {
                 Some(prepared) => prepared,
@@ -440,6 +476,9 @@ impl Placement {
                         reservation,
                         origin,
                         &material,
+                        serving,
+                        &io,
+                        memory,
                     )
                     .await?;
                     let source =
@@ -465,6 +504,9 @@ impl Placement {
         reservation: Reservation,
         origin: Preparation,
         material: &[u8],
+        serving: &crate::deployment::CellStorage,
+        io: &Arc<IoRegion>,
+        memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
         let preparation = origin.ordered(reservation)?;
         let previous = origin
@@ -475,6 +517,7 @@ impl Placement {
         let from = custodian.checkpoint_cut(previous).await?;
         let maximum = crate::process::MAXIMUM_LOG_MESSAGE_BYTES as u64
             + ordered_logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES;
+        let _page = memory.reserve((maximum as usize) * 5)?;
         let page = custodian
             .checkpoint_replay(preparation, base, from, maximum)
             .await?;
@@ -485,11 +528,22 @@ impl Placement {
         };
         let bytes = crate::cipher::Cipher::new(material)?
             .open(&self.record.replica_seal_scope(), &boundary.payload)?;
-        let Some(ReplicaEnvelope {
-            message: ReplicaBody::BlockBoundary(chosen),
-            ..
-        }) = ReplicaEnvelope::decode(&bytes)?
-        else {
+        let envelope = ReplicaEnvelope::decode(&bytes)?
+            .ok_or_else(|| invalid("The prepared checkpoint has an unknown boundary record"))?;
+        let _offloaded;
+        let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+            let objects =
+                storage::ReplicaObjects::for_custodian(self, serving, material, Arc::clone(io))
+                    .await?;
+            let (resolved, charge) =
+                discovery::resolve_offload(envelope, boundary.grant.epoch, &objects, memory)
+                    .await?;
+            _offloaded = charge;
+            resolved
+        } else {
+            envelope
+        };
+        let ReplicaBody::BlockBoundary(chosen) = envelope.message else {
             return Err(invalid(
                 "The prepared checkpoint does not end at a chosen native boundary",
             ));
@@ -701,6 +755,27 @@ async fn material(
         .await?
         .map(|key| key.to_vec())
         .ok_or_else(|| invalid("The installed deployment's serving key is unavailable"))
+}
+
+pub(crate) fn checkpoint_for_block(
+    block: &BlockCatalog,
+    log_epoch: StorageEpoch,
+) -> Option<RtdbCheckpoint> {
+    let boundary = block.boundary_replica_position()?.after_offset(log_epoch);
+    if boundary < 0 {
+        return None;
+    }
+    Some(RtdbCheckpoint {
+        block: block.block_index().0,
+        boundary,
+        source: block
+            .latest_source_position()
+            .map_or(-1, |position| position.after_offset(log_epoch)),
+        system_time: block
+            .latest_completed_tx()
+            .map_or(i64::MIN, |tx| tx.system_time.0),
+        root_sha256: Some(block.publication_sha256()?),
+    })
 }
 
 fn genesis(checkpoint: Checkpoint) -> bool {
