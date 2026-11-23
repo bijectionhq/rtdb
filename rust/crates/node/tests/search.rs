@@ -1949,6 +1949,7 @@ async fn a_same_commit_reinsert_keeps_only_the_post_erase_search_revision() {
     let page = rtdb_storage::ObjectKey::new(rtdb_format::cow_tree::page_key(
         &rtdb_format::term_directory::page_prefix(&slug), root.digest)).unwrap();
     database.storage().invalidate(&page).await.unwrap();
+    database.object_store().delete(&page).await.unwrap();
     database.object_store().put(&page, bytes::Bytes::from_static(b"corrupt")).await.unwrap();
     let gaps = runtime.serving_gaps();
     assert_eq!(ids(rows(session.query_sql("SELECT _id FROM docs WHERE MATCH(body, 'newrevision')", vec![]).await.unwrap()).await), [1]);
