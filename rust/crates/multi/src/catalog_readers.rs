@@ -132,12 +132,13 @@ impl CatalogReaders {
         let floor = CatalogAdmissionFloor {
             residence: self.residence.clone(), object_namespace: self.namespaces.objects, cut: installed,
         };
+        let has_exact_witness = paths.iter().any(Option::is_some);
         let record = update_installation(self.directory.as_ref(), &self.deployment, |record| {
             if !self.residence_is_open(record) || self.writer_epoch != Some(record.epoch) || record.holder.is_none() {
                 return Err(closed());
             }
             if self.floor(record).is_none_or(|existing| existing < installed.through)
-                && paths.iter().any(|path| readers_allow(record, &self.storage_root, installed, *path))
+                && (has_exact_witness || readers_allow(record, &self.storage_root, installed, None))
             {
                 record.catalog_admission_floors.insert(self.storage_root.clone(), floor.clone());
             }
@@ -145,10 +146,11 @@ impl CatalogReaders {
         }).await?;
         let closed = self.floor(&record).is_some_and(|existing| existing >= installed.through);
         let allowed = paths.iter().map(|path| closed && readers_allow(&record, &self.storage_root, installed, *path)).collect();
-        if paths.iter().all(Option::is_none) && readers_allow(&record, &self.storage_root, installed, None)
-            && self.floor(&record) == Some(installed.through)
+        if self.floor(&record) == Some(installed.through)
+            && (has_exact_witness || readers_allow(&record, &self.storage_root, installed, None))
         {
-            crate::residence_trace::record("advance-floor", || serde_json::json!({
+            let event = if has_exact_witness { "close-catalog-admission" } else { "advance-floor" };
+            crate::residence_trace::record(event, || serde_json::json!({
                 "lineage": record.lineage, "installation": self.deployment, "residence": self.residence, "namespace": self.namespaces.objects,
                 "root": self.storage_root, "revision": record.version, "epoch": self.replica_epoch, "through": installed.through,
             }));
@@ -465,9 +467,11 @@ mod tests {
             .data_key(&"l01-rc-b00".parse().unwrap());
         let hold = readers.retain_with_primary(Some(old), Some(vec![held_path.clone()].into())).await.unwrap();
 
+        let (_, allowed) = readers.close_admission(installed, &[Some(&held_path)]).await.unwrap();
+        assert_eq!(allowed, [false]);
+        assert_eq!(readers.retain(Some(old)).await.err().unwrap().code, CATALOG_NOT_CURRENT);
         let (_, allowed) = readers.close_admission(installed, &[Some(&held_path), Some(&unrelated_path), None]).await.unwrap();
         assert_eq!(allowed, [false, true, false]);
-        assert_eq!(readers.retain(Some(old)).await.err().unwrap().code, CATALOG_NOT_CURRENT);
         assert!(!readers.advance(installed).await.unwrap());
 
         let current = directory.deployment(&origin.id).await.unwrap().unwrap();
