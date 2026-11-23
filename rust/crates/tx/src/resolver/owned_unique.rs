@@ -518,6 +518,10 @@ pub(super) fn unique_key(value: Value) -> Result<Vec<u8>> {
     }
 }
 
+pub(super) fn unique_key_bytes(value: Option<&[u8]>) -> Result<&[u8]> {
+    value.filter(|key| (1..=MAX_KEY_BYTES).contains(&key.len())).ok_or_else(invalid_key)
+}
+
 pub(super) fn invalid_key() -> Anomaly {
     Anomaly::incorrect("rtdb.owned/unique-key", "The unique path requires a nonempty Binary key of at most 4096 bytes")
 }

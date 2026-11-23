@@ -2,10 +2,10 @@ use rtdb_plan::Catalog;
 use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, PlacedAttemptScope, WorldClockMode, WorldShadow};
 
 use super::{
-    owned_capacity::{CapacityCondition, CapacityRule, PERIOD_MEMBERSHIP, SAMPLE_MEMBERSHIP, SamplePopulation, SampleProjection, capacity_conditions, count_bound_exceeded, period_population, predicates, uncovered},
+    owned_capacity::{CapacityCondition, CapacityRule, PERIOD_MEMBERSHIP, SAMPLE_MEMBERSHIP, SamplePopulation, SampleProjection, capacity_conditions, invalid_key as invalid_capacity_key, count_bound_exceeded, period_population, predicates, uncovered},
     owned_unique::{
         invalid_key as invalid_unique_key, merge_windows, occupancy_value_at, ordered_segments,
-        unique_key, unique_segment_interval, unique_taken, unique_uncovered, Segment,
+        unique_key, unique_key_bytes, unique_segment_interval, unique_taken, unique_uncovered, Segment,
     },
     *,
 };
@@ -458,10 +458,10 @@ async fn prepare_finite_unique_claims<'a>(
                 write.to.ok_or_else(unique_uncovered)?,
             )?;
             for row in write.documents.rows() {
-                if WorldShadow::is_tombstone(row) { continue; }
-                let key = unique_key(row.get(column.as_str()).cloned().unwrap_or(Value::Undefined))?;
-                budget.reservations.push(local.memory.reserve(key.capacity().saturating_add(192))?);
-                affected.entry(key).or_default().push(valid);
+                if row.is_tombstone()? { continue; }
+                let key = unique_key_bytes(row.binary(column, invalid_unique_key)?)?;
+                budget.reservations.push(local.memory.reserve(key.len().saturating_add(192))?);
+                affected.entry(key.to_vec()).or_default().push(valid);
             }
         }
         let mut claims = BTreeMap::new();
@@ -492,7 +492,7 @@ impl OpenTransaction<'_> {
         let _groups = self.context.memory.reserve(operations.len().saturating_mul(128))?;
         let mut groups = BTreeMap::<&OwnedRelation, Vec<crate::hosted_control::ProposalOverlayWrite<'_>>>::new();
         for write in operations.iter().filter_map(crate::hosted_control::proposal_overlay_write) {
-            if write.documents.rows().iter().any(|row| !WorldShadow::is_tombstone(row)) {
+            if write.documents.rows().try_fold(false, |present, row| row.is_tombstone().map(|deleted| present || !deleted))? {
                 groups.entry(write.relation).or_default().push(write);
             }
         }
@@ -566,12 +566,12 @@ impl OpenTransaction<'_> {
                         .or_insert(bound.at_most);
                 }
                 for row in writes.iter().flat_map(|write| write.documents.rows()) {
-                    if WorldShadow::is_tombstone(row) { continue; }
-                    if let Some(key) = rule.key(&counts.qualifiers, |name| Ok(row.get(name).cloned().unwrap_or(Value::Undefined)))?
-                        && !counts.buckets.contains_key(&key)
+                    if row.is_tombstone()? { continue; }
+                    if let Some(key) = rule.borrowed_key(&counts.qualifiers, |name| row.binary(name, invalid_capacity_key))?
+                        && !counts.buckets.contains_key(key)
                     {
-                        reservations.push(self.context.memory.reserve(key.capacity().saturating_add(192))?);
-                        counts.buckets.insert(key, [0, 0]);
+                        reservations.push(self.context.memory.reserve(key.len().saturating_add(192))?);
+                        counts.buckets.insert(key.to_vec(), [0, 0]);
                     }
                 }
                 if !counts.buckets.is_empty() { rules.push(counts); }
@@ -639,11 +639,11 @@ impl OpenTransaction<'_> {
                 }
                 let mut keys = BTreeMap::new();
                 for row in writes.iter().flat_map(|write| write.documents.rows()) {
-                    if WorldShadow::is_tombstone(row) { continue; }
-                    let key = unique_key(row.get(column).cloned().unwrap_or(Value::Undefined))?;
-                    if !keys.contains_key(&key) {
-                        reservations.push(self.context.memory.reserve(key.capacity().saturating_add(192))?);
-                        keys.insert(key, false);
+                    if row.is_tombstone()? { continue; }
+                    let key = unique_key_bytes(row.binary(column, invalid_unique_key)?)?;
+                    if !keys.contains_key(key) {
+                        reservations.push(self.context.memory.reserve(key.len().saturating_add(192))?);
+                        keys.insert(key.to_vec(), false);
                     }
                 }
                 unique.push(UniqueClaims { path, column, keys });

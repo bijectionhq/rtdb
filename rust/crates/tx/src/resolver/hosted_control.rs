@@ -342,7 +342,7 @@ impl OpenTransaction<'_> {
                 swept_present_through: archived.swept_present_through,
             };
             if next != before {
-                self.buffer.put(relation.lifetime_table(owner), next.record(&relation), Interval::ALL)?;
+                self.put_owned_lifetime_floor(owner, &relation, next)?;
             }
         }
         Ok(())

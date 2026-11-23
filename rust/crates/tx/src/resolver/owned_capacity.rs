@@ -144,6 +144,16 @@ impl CapacityRule {
         Ok(Some(key))
     }
 
+    pub(super) fn borrowed_key<'a>(
+        &self, qualifiers: &[(&str, &[u8])], binary: impl Fn(&str) -> Result<Option<&'a [u8]>>,
+    ) -> Result<Option<&'a [u8]>> {
+        for &(column, expected) in qualifiers {
+            if binary(column)? != Some(expected) { return Ok(None); }
+        }
+        let key = binary(&self.column)?.ok_or_else(invalid_key)?;
+        self.bucket(key).map(Some).ok_or_else(invalid_key)
+    }
+
     fn decode(value: &Value) -> Result<Self> {
         let Value::Struct(rule) = value else {
             return Err(uncovered());
@@ -352,9 +362,17 @@ impl OpenTransaction<'_> {
     pub(super) async fn require_noncharging_world_write(
         &self, owner: &str, root: &OwnedRelation, schema: &OwnedSchema, rows: &[StructFields<Value>],
     ) -> Result<()> {
+        self.require_noncharging_world_rows(owner, root, schema, rows.iter().all(WorldShadow::is_tombstone),
+            rows.len(), |row, qualifiers| shadow_charges(&rows[row], qualifiers)).await
+    }
+
+    pub(super) async fn require_noncharging_world_rows(
+        &self, owner: &str, root: &OwnedRelation, schema: &OwnedSchema, all_deleted: bool, rows: usize,
+        charges: impl Fn(usize, &[(&str, &[u8])]) -> Result<bool>,
+    ) -> Result<()> {
         // A shadow outside every current bucket can only release occupancy,
         // regardless of whether it displaces an archived or local fact.
-        if rows.iter().all(WorldShadow::is_tombstone) {
+        if all_deleted {
             return Ok(());
         }
         let base = self.buffer.base_snapshot();
@@ -374,9 +392,9 @@ impl OpenTransaction<'_> {
                 return Err(uncovered());
             }
             let qualifiers = predicates(&rule.when)?;
-            for row in rows {
+            for row in 0..rows {
                 self.context.check_cancelled()?;
-                if shadow_charges(row, &qualifiers)? {
+                if charges(row, &qualifiers)? {
                     return Err(Anomaly::incorrect(
                         "rtdb.owned/world-capacity-uncovered",
                         "The world charge requires inherited capacity accounting",
@@ -1181,7 +1199,7 @@ fn invalid_rule() -> Anomaly {
     )
 }
 
-fn invalid_key() -> Anomaly {
+pub(super) fn invalid_key() -> Anomaly {
     Anomaly::incorrect(
         "rtdb.owned/capacity-key",
         "A capacity key must contain its declared Binary partition within 4096 bytes",

@@ -1708,8 +1708,8 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                     (Some(from), Some(to)) if Timestamp::MIN < from && from < to && to < Timestamp::MAX => Some(from),
                     _ => return None,
                 };
-                if write.documents.rows().len() != 1 { return None; }
-                let id = write.documents.rows()[0].get("_id")?.entity_id().ok()?;
+                if write.documents.row_count() != 1 { return None; }
+                let id = write.documents.rows().next()?.id().ok()?;
                 if write.create_only && start.is_some() { return None; }
                 writes.push((write.relation, id.handle_bytes(), start, write.create_only));
             }
@@ -1731,10 +1731,97 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
 
 pub(crate) struct ProposalOverlayWrite<'a> {
     pub(crate) relation: &'a OwnedRelation,
-    pub(crate) documents: &'a crate::Documents,
+    pub(crate) documents: OwnedDocumentPage<'a>,
     pub(crate) from: Option<Timestamp>,
     pub(crate) to: Option<Timestamp>,
     pub(crate) create_only: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OwnedDocumentPage<'a> {
+    Rows(&'a crate::Documents),
+    Arrow(&'a crate::ArrowDocuments),
+}
+
+impl<'a> OwnedDocumentPage<'a> {
+    fn row_count(self) -> usize {
+        match self { Self::Rows(rows) => rows.rows().len(), Self::Arrow(page) => page.row_count() }
+    }
+
+    fn has_exact_presence(self) -> bool {
+        use crate::values::LegacyOwnedPresence;
+        match self {
+            Self::Rows(rows) => rows.has_exact_presence(),
+            Self::Arrow(page) => matches!(page.legacy_owned_presence(), Some(LegacyOwnedPresence::Exact(_) | LegacyOwnedPresence::Submitted)),
+        }
+    }
+
+    pub(crate) fn rows(self) -> impl Iterator<Item = OwnedDocumentRow<'a>> {
+        (0..self.row_count()).map(move |row| match self {
+            Self::Rows(rows) => OwnedDocumentRow::Values(&rows.rows()[row]),
+            Self::Arrow(page) => OwnedDocumentRow::Arrow(page, row),
+        })
+    }
+}
+
+pub(crate) enum OwnedDocumentRow<'a> {
+    Values(&'a StructFields<Value>),
+    Arrow(&'a crate::ArrowDocuments, usize),
+}
+
+impl<'a> OwnedDocumentRow<'a> {
+    fn id(&self) -> Result<EntityId> {
+        match self {
+            Self::Values(row) => row.get("_id").ok_or_else(rtdb_types::OwnedWorld::unavailable)?.entity_id(),
+            Self::Arrow(page, row) => page.owned_id(*row),
+        }
+    }
+
+    fn cell(&self, name: &str) -> Result<Option<rtdb_columnar::ArrowCell<'a>>> {
+        let Self::Arrow(page, row) = *self else { return Ok(None); };
+        page.legacy_owned_cell(name, row)
+    }
+
+    fn string_id(&self) -> Option<&'a str> {
+        match self {
+            Self::Values(row) => match row.get("_id") { Some(Value::Utf8(id)) => Some(id), _ => None },
+            Self::Arrow(..) => self.cell("_id").ok().flatten()?.utf8(),
+        }
+    }
+
+    fn only_id(&self) -> bool {
+        match self {
+            Self::Values(row) => row.len() == 1,
+            Self::Arrow(page, _) => page.columns().iter().all(|name| {
+                name == "_id" || matches!(self.cell(name), Ok(None))
+            }),
+        }
+    }
+
+    pub(crate) fn is_tombstone(&self) -> Result<bool> {
+        let name = rtdb_types::WorldShadow::FIELDS;
+        match self {
+            Self::Values(row) => Ok(rtdb_types::WorldShadow::is_tombstone(row)),
+            Self::Arrow(..) => match self.cell(name)? {
+                Some(cell) => Ok(cell.is_null()? && !cell.is_undefined()?),
+                None => Ok(false),
+            },
+        }
+    }
+
+    pub(crate) fn binary(&self, name: &str, invalid: impl Fn() -> Anomaly) -> Result<Option<&'a [u8]>> {
+        match self {
+            Self::Values(row) => match row.get(name) {
+                Some(Value::Binary(bytes)) => Ok(Some(bytes)),
+                None | Some(Value::Null | Value::Undefined) => Ok(None),
+                _ => Err(invalid()),
+            },
+            Self::Arrow(..) => match self.cell(name)? {
+                Some(cell) if !cell.is_null()? && !cell.is_undefined()? => cell.binary().map(Some).ok_or_else(invalid),
+                _ => Ok(None),
+            },
+        }
+    }
 }
 
 pub(crate) fn proposal_overlay_write(
@@ -1743,11 +1830,15 @@ pub(crate) fn proposal_overlay_write(
     use crate::{TxOp, source::Operation};
     let (relation, documents, from, to, create_only) = match operation {
         Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) =>
-            (relation, documents, valid_from, valid_to, false),
+            (relation, OwnedDocumentPage::Rows(documents), valid_from, valid_to, false),
         Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to }) =>
-            (relation, documents, valid_from, valid_to, true),
+            (relation, OwnedDocumentPage::Rows(documents), valid_from, valid_to, true),
         Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only, .. } =>
-            (relation, documents, valid_from, valid_to, *create_only),
+            (relation, OwnedDocumentPage::Rows(documents), valid_from, valid_to, *create_only),
+        Operation::Public(TxOp::OwnedArrowDocs { relation, documents, valid_from, valid_to, create_only })
+        | Operation::OwnedArrowIids { relation, documents, valid_from, valid_to, create_only, .. }
+            if documents.legacy_owned_presence().is_some() =>
+            (relation, OwnedDocumentPage::Arrow(documents), valid_from, valid_to, *create_only),
         _ => return None,
     };
     relation.world().map(|_| ProposalOverlayWrite {
@@ -1959,20 +2050,23 @@ pub(crate) fn root_partition_frontiers_match(operations: &[crate::source::Operat
 }
 
 fn proposal_frontier_rows(
-    relation: &OwnedRelation, documents: &crate::Documents, from: Option<Timestamp>, to: Option<Timestamp>,
+    relation: &OwnedRelation, documents: OwnedDocumentPage<'_>, from: Option<Timestamp>, to: Option<Timestamp>,
 ) -> bool {
     relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
         && from == Some(Timestamp::MIN) && to.is_none_or(|to| to == Timestamp::MAX)
         && documents.has_exact_presence()
-        && (1..=MAX_PROPOSAL_LAND_ROWS).contains(&documents.rows().len())
-        && documents.rows().iter().all(|row| {
-            row.len() == 1 && matches!(row.get("_id"), Some(Value::Utf8(id)) if public_fact_frontier(id))
-        })
+        && (1..=MAX_PROPOSAL_LAND_ROWS).contains(&documents.row_count())
+        && documents.rows().all(|row| row.only_id() && row.string_id().is_some_and(public_fact_frontier))
 }
 
 pub fn is_proposal_landing_frontier(op: &crate::TxOp) -> bool {
-    matches!(op, crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
-        if proposal_frontier_rows(relation, documents, *valid_from, *valid_to))
+    match op {
+        crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to } =>
+            proposal_frontier_rows(relation, OwnedDocumentPage::Rows(documents), *valid_from, *valid_to),
+        crate::TxOp::OwnedArrowDocs { relation, documents, valid_from, valid_to, create_only: false } =>
+            proposal_frontier_rows(relation, OwnedDocumentPage::Arrow(documents), *valid_from, *valid_to),
+        _ => false,
+    }
 }
 
 fn finite_landing_period(from: Option<Timestamp>, to: Option<Timestamp>) -> Option<Interval> {
@@ -2002,14 +2096,18 @@ pub fn proposal_landing_write_rows(op: &crate::TxOp) -> Option<usize> {
     (relation.is_root_data() && !documents.rows().is_empty()).then_some(documents.rows().len())
 }
 
-pub(crate) fn proposal_landing_frontier_rows(op: &crate::source::Operation) -> Option<&crate::Documents> {
+pub(crate) fn proposal_landing_frontier_rows(op: &crate::source::Operation) -> Option<OwnedDocumentPage<'_>> {
     use crate::{TxOp, source::Operation};
-    match op {
+    let (relation, documents, from, to) = match op {
         Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
-        | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
-            if proposal_frontier_rows(relation, documents, *valid_from, *valid_to) => Some(documents),
-        _ => None,
-    }
+        | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. } =>
+            (relation, OwnedDocumentPage::Rows(documents), valid_from, valid_to),
+        Operation::Public(TxOp::OwnedArrowDocs { relation, documents, valid_from, valid_to, create_only: false })
+        | Operation::OwnedArrowIids { relation, documents, valid_from, valid_to, create_only: false, .. } =>
+            (relation, OwnedDocumentPage::Arrow(documents), valid_from, valid_to),
+        _ => return None,
+    };
+    proposal_frontier_rows(relation, documents, *from, *to).then_some(documents)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2049,7 +2147,7 @@ pub(crate) fn hosted_proposal_land(
         if root_partition_frontier_rows(op).is_some() || source_public_root_version_marker(op) { continue; }
         if let Some(documents) = proposal_landing_frontier_rows(op) {
             for row in documents.rows() {
-                let Value::Utf8(id) = row.get("_id")? else { return None; };
+                let id = row.string_id()?;
                 if !frontiers.insert(id) { return None; }
             }
             continue;

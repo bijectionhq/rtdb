@@ -125,18 +125,21 @@ pub(crate) fn owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> R
 }
 
 #[test]
-fn owned_payload_retains_a_vector_with_legacy_upload_metadata() {
-    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray};
+fn owned_payload_retains_a_vector_and_struct_with_legacy_upload_metadata() {
+    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray, StructArray};
     use arrow_schema::{DataType, Field, Schema};
 
     let memory = MemoryBudget::new(1 << 20);
     let vector = ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
         Some(vec![Some(-0.0), None]), None,
     ]);
+    let companion = StructArray::new(vec![Field::new("key", DataType::Int64, false)].into(),
+        vec![Arc::new(Int64Array::from(vec![9, 10]))], None);
     let schema = Arc::new(Schema::new(vec![Field::new("_id", DataType::Int64, false),
-        Field::new("v", vector.data_type().clone(), true).with_metadata([("description".into(), "vector".into())].into())]));
+        Field::new("v", vector.data_type().clone(), true).with_metadata([("description".into(), "vector".into())].into()),
+        Field::new("detail", companion.data_type().clone(), false)]));
     let batch = RecordBatch::try_new(schema, vec![
-        Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef, Arc::new(vector),
+        Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef, Arc::new(vector), Arc::new(companion),
     ]).unwrap();
     let batch = OwnedBatch::new(batch, &memory).unwrap();
     let assert_components = |array: &dyn Array| {

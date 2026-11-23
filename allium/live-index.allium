@@ -449,6 +449,8 @@ rule GetTableTx {
 rule LogPut {
     -- The put preserves the table's explicitly declared columns when the document omits them.
     -- Reading an omitted column in the row yields null.
+    -- Compatible governed writes stage the selected Arrow fields after each ordered check.
+    -- World registration and lifetime floor writes stage Arrow catalog records in the same transaction as their effects.
     when: LogPut(table_tx, iid, valid_time, doc)
 
     requires: table_tx.transaction.status = active

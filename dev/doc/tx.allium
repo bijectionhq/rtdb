@@ -122,7 +122,10 @@
 -- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
--- A Flight owned create or commit with compatible legacy vector fields retains the uploaded Arrow components through source encoding.
+-- A Flight owned create or commit with compatible legacy document fields retains its vector and structured columns through source encoding.
+-- Ordered shadow replay validates the exact field marker and the inherited schema from the selected Arrow cells.
+-- Proposal publication and inherited constraints read shadow markers, identities, and binary keys from selected document fields.
+-- Ordered lifetime replay checks compatible legacy Arrow facts against the declared schema before admitting the expiry floor and effects.
 -- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
 -- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.

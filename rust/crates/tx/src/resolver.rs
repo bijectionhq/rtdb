@@ -13,7 +13,7 @@ use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, OwnedRelation, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::bounded_retry::is_bounded_receipts_table;
@@ -1344,7 +1344,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(lifetime_uncovered());
             }
             let floor = rtdb_types::OwnedLifetimeFloor::at(duration, self.tx_key().system_time)?;
-            self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
+            self.put_owned_lifetime_floor(owner, relation, floor)?;
         }
         self.check_capacity_schema(snapshot.clone(), owner, relation, schema).await?;
         self.check_unique_schema(snapshot, owner, relation, schema).await?;
@@ -1758,7 +1758,8 @@ impl<'a> OpenTransaction<'a> {
         if publications.len() + observing_worlds.len() > 8 { return Err(unavailable()); }
         if publications.is_empty() && operations.iter().any(|operation| match operation {
             Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. })
-            | Operation::OwnedWriteIids { relation, .. } => relation.world().is_some(),
+            | Operation::OwnedWriteIids { relation, .. }
+            | Operation::OwnedArrowIids { relation, .. } => relation.world().is_some(),
             _ => false,
         }) {
             return Err(unavailable());
@@ -2117,7 +2118,15 @@ impl<'a> OpenTransaction<'a> {
                     ),
                 };
                 for row in write.documents.rows() {
-                    let id = crate::source::document_id(row, &self.context.memory)?;
+                    use crate::hosted_control::OwnedDocumentRow;
+                    let (id, _identity) = match row {
+                        OwnedDocumentRow::Values(row) => (crate::source::document_id(row, &self.context.memory)?, None),
+                        OwnedDocumentRow::Arrow(documents, row) => {
+                            let id = documents.owned_id_ref(row)?;
+                            let reservation = self.context.memory.reserve(id.owned_payload_bytes().saturating_mul(4))?;
+                            (id.into_owned(), Some(reservation))
+                        }
+                    };
                     if !operations.iter().any(|operation| matches!(operation,
                         Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: None })
                             if relation == write.relation && observed == &id && *valid_at == reading
@@ -2205,11 +2214,9 @@ impl<'a> OpenTransaction<'a> {
                         root_rows += 1;
                         1
                     }
-                    Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })
-                    | Operation::OwnedWriteIids { relation, documents, .. }
-                        if !documents.rows().is_empty() => {
+                    _ if operation.owned_documents().is_some_and(|(_, rows)| rows != 0) => {
+                        let (relation, count) = operation.owned_documents().expect("matched document write");
                         let world = relation.world().ok_or_else(unavailable)?;
-                        let count = documents.rows().len();
                         counts.entry(world).or_default().0 += count;
                         count
                     }
@@ -2547,7 +2554,7 @@ impl<'a> OpenTransaction<'a> {
         floor.swept_present_through = floor.swept_present_through.max(cutoff);
         let original = rtdb_types::expired_lifetime_interval(created, expires)?;
         self.erase_owned(relation, id, OwnedChangeKind::Expired(original)).await?;
-        self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
+        self.put_owned_lifetime_floor(owner, relation, floor)?;
         Ok(())
     }
 
@@ -2811,41 +2818,9 @@ impl<'a> OpenTransaction<'a> {
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         if let Some(root) = relation.root_relation() {
-            use rtdb_types::WorldClockMode;
-
             let snapshot = self.snapshot()?;
             let unavailable = rtdb_types::OwnedWorld::unavailable;
-            let world = relation.world().ok_or_else(unavailable)?;
-            let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
-            let schema = record.schemas.relation(&root)
-                .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
-            if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
-            let (from, to, explicit) = if matches!(record.mode, WorldClockMode::Held { .. }) && schema.has_acceptance_validity() {
-                let accepted = self.held_overlay_reading(owner, record).await?;
-                if (from, to) != (None, None) && (from, to) != (Some(accepted), Some(Timestamp::MAX)) {
-                    return Err(Anomaly::incorrect(
-                        "rtdb.owned/validity-policy",
-                        "This held relation requires validity from its ordered world clock with an open end",
-                    ));
-                }
-                (accepted, Timestamp::MAX, false)
-            } else {
-                match (record.mode, from, to) {
-                    (mode, Some(from), Some(to)) if mode.is_writable() => (from, to, true),
-                    (WorldClockMode::Proposal, None, None) => (self.terms_time, Timestamp::MAX, false),
-                    _ => return Err(unavailable()),
-                }
-            };
-            if (create_only && (!record.mode.is_writable() || explicit))
-                || from >= to || !documents.has_exact_presence()
-            {
-                return Err(unavailable());
-            }
-            if schema.requires_bounded_period() {
-                schema.require_root_write_period(Some(from), Some(to))?;
-            } else {
-                schema.require_write_validity(explicit)?;
-            }
+            let (schema, period, bounded_held) = self.world_shadow_write_period(owner, relation, &root, from, to, create_only, documents.has_exact_presence()).await?;
             for row in documents.rows() {
                 let _scratch = self.context.memory.reserve(Value::document_retained_bytes(row)?
                     .checked_mul(2).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
@@ -2861,7 +2836,6 @@ impl<'a> OpenTransaction<'a> {
                     self.require_world_create_absence(owner, &root, relation, &id).await?;
                 }
             }
-            let bounded_held = schema.requires_bounded_period() && matches!(record.mode, WorldClockMode::Held { .. });
             if self.context.world_constraints.is_none() {
                 self.require_noncharging_world_write(owner, &root, schema, documents.rows()).await?;
                 if snapshot.contains_table(&root.unique_table(owner))
@@ -2876,7 +2850,7 @@ impl<'a> OpenTransaction<'a> {
                     self.reserve_bounded_period_write(relation, id)?;
                 }
             }
-            return self.put_documents(&table, documents, iids, Some(from), Some(to),
+            return self.put_documents(&table, documents, iids, Some(period.lower()), Some(period.upper()),
                 DocumentWrite::Owned { relation, owner, create_only }).await;
         }
         let declaration = self.read_owned_schema(owner, relation).await?;
@@ -2964,7 +2938,7 @@ impl<'a> OpenTransaction<'a> {
                     }
                 }
                 if next.expired_created_through > floor.expired_created_through {
-                    self.buffer.put(relation.lifetime_table(owner), next.record(relation), Interval::ALL)?;
+                    self.put_owned_lifetime_floor(owner, relation, next)?;
                 }
                 return self.put_documents(&table, documents, iids, Some(created), Some(expires),
                     DocumentWrite::Owned { relation, owner, create_only }).await;
@@ -2973,21 +2947,200 @@ impl<'a> OpenTransaction<'a> {
         self.put_documents(&table, documents, iids, from, to, DocumentWrite::Owned { relation, owner, create_only }).await
     }
 
+    async fn world_shadow_write_period(
+        &self, owner: &str, relation: &OwnedRelation, root: &OwnedRelation,
+        from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool, exact: bool,
+    ) -> Result<(&rtdb_types::OwnedSchema, Interval, bool)> {
+        use rtdb_types::WorldClockMode;
+
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let world = relation.world().ok_or_else(unavailable)?;
+        let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
+        let schema = record.schemas.relation(root)
+            .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
+        if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
+        let (from, to, explicit) = if matches!(record.mode, WorldClockMode::Held { .. }) && schema.has_acceptance_validity() {
+            let accepted = self.held_overlay_reading(owner, record).await?;
+            if (from, to) != (None, None) && (from, to) != (Some(accepted), Some(Timestamp::MAX)) {
+                return Err(Anomaly::incorrect(
+                    "rtdb.owned/validity-policy",
+                    "This held relation requires validity from its ordered world clock with an open end",
+                ));
+            }
+            (accepted, Timestamp::MAX, false)
+        } else {
+            match (record.mode, from, to) {
+                (mode, Some(from), Some(to)) if mode.is_writable() => (from, to, true),
+                (WorldClockMode::Proposal, None, None) => (self.terms_time, Timestamp::MAX, false),
+                _ => return Err(unavailable()),
+            }
+        };
+        if (create_only && (!record.mode.is_writable() || explicit))
+            || from >= to || !exact
+        {
+            return Err(unavailable());
+        }
+        if schema.requires_bounded_period() {
+            schema.require_root_write_period(Some(from), Some(to))?;
+        } else {
+            schema.require_write_validity(explicit)?;
+        }
+        let bounded_held = schema.requires_bounded_period() && matches!(record.mode, WorldClockMode::Held { .. });
+        Ok((schema, interval(from, to)?, bounded_held))
+    }
+
+    async fn write_legacy_world_shadow(
+        &mut self, owner: &str, relation: &OwnedRelation, root: &OwnedRelation,
+        documents: &ArrowDocuments, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>,
+        create_only: bool,
+    ) -> Result<()> {
+        use rtdb_types::{OwnedChangeKind, OwnedWorld, WorldShadow};
+
+        let array = documents.array();
+        let memory = Arc::clone(&self.context.memory);
+        let unavailable = OwnedWorld::unavailable;
+        let snapshot = self.snapshot()?;
+        let exact = matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Exact(_) | LegacyOwnedPresence::Submitted));
+        let (schema, valid, bounded_held) = self.world_shadow_write_period(owner, relation, root, from, to, create_only, exact).await?;
+        let row_cells = |row: usize| array.fields().iter().zip(array.columns()).map(move |(field, values)| ArrowCell { field, array: values.as_ref(), row });
+        let selected = |row| row_cells(row).filter_map(|cell| match documents.legacy_owned_cell_is_present(cell) {
+            Ok(true) => Some(Ok(cell)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        });
+        let _scratch = memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(512)))?;
+        let mut all_deleted = true;
+        for row in 0..array.len() {
+            let cells = selected(row).collect::<Result<Vec<_>>>()?;
+            let marker = cells.iter().find(|cell| cell.field.name() == WorldShadow::FIELDS).copied().ok_or_else(unavailable)?;
+            let deleted = marker.is_null()? && !marker.is_undefined()?;
+            if deleted {
+                let id = cells.iter().find(|cell| cell.field.name() == "_id").ok_or_else(unavailable)?;
+                if create_only || cells.len() != 2
+                    || matches!(id.logical_type()?, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32))
+                { return Err(unavailable()); }
+            } else {
+                let names = marker.list().ok_or_else(unavailable)?;
+                let mut types = StructFields::new();
+                let mut nan = false;
+                for name in names {
+                    let name = name.utf8().filter(|name| !name.starts_with('_')).ok_or_else(unavailable)?;
+                    let cell = cells.iter().find(|cell| cell.field.name() == name).copied().ok_or_else(unavailable)?;
+                    let ty = cell.logical_type()?;
+                    if ty == LogicalType::Nothing { return Err(unavailable()); }
+                    let physical = cell.physical()?;
+                    nan |= match ty {
+                        LogicalType::Scalar(ScalarType::F32) => physical.array.as_primitive::<arrow_array::types::Float32Type>().value(physical.row).is_nan(),
+                        LogicalType::Scalar(ScalarType::F64) => physical.array.as_primitive::<arrow_array::types::Float64Type>().value(physical.row).is_nan(),
+                        _ => false,
+                    };
+                    if types.insert(name.to_owned(), ty).is_some() { return Err(unavailable()); }
+                }
+                for cell in &cells {
+                    let name = cell.field.name().as_str();
+                    if !matches!(name, "_id" | WorldShadow::FIELDS) && !types.contains_key(name)
+                        && !cell.is_null()? && !cell.is_undefined()?
+                    { return Err(unavailable()); }
+                }
+                schema.validate_types(&types)?;
+                // The shadow contract compares the reconstructed fact using Value equality.
+                if nan || types.len() + 2 != cells.len() { return Err(unavailable()); }
+            }
+            all_deleted &= deleted;
+            if create_only {
+                let id = documents.owned_id(row)?;
+                self.require_world_create_absence(owner, root, relation, &id).await?;
+            }
+        }
+        if self.context.world_constraints.is_none() {
+            self.require_noncharging_world_rows(owner, root, schema, all_deleted, array.len(), |row, qualifiers| {
+                let cells = selected(row).collect::<Result<Vec<_>>>()?;
+                if cells.iter().find(|cell| cell.field.name() == WorldShadow::FIELDS)
+                    .is_some_and(|cell| cell.list().is_none())
+                { return Ok(false); }
+                for &(name, expected) in qualifiers {
+                    if !cells.iter().find(|cell| cell.field.name() == name).and_then(|cell| cell.binary()).is_some_and(|bytes| bytes == expected) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }).await?;
+            if !all_deleted && snapshot.contains_table(&root.unique_table(owner)) {
+                return Err(Anomaly::incorrect("rtdb.owned/world-unique-uncovered", "World writes require inherited unique occupancy"));
+            }
+        }
+        if bounded_held {
+            for row in 0..array.len() { self.reserve_bounded_period_write(relation, documents.owned_id(row)?)?; }
+        }
+        let table = relation.table(owner);
+        let system_from = self.tx_key().system_time;
+        let mut projection = OwnedPutProjection::default();
+        for row in 0..array.len() {
+            let id = documents.owned_id(row)?;
+            let iid = iids.map_or_else(|| id.iid(), |iids| iids[row]);
+            let mut positions = Vec::new();
+            let mut kind = OwnedChangeKind::Put;
+            for (position, cell) in row_cells(row).enumerate() {
+                if !documents.legacy_owned_cell_is_present(cell)? { continue; }
+                if cell.field.name() == WorldShadow::FIELDS && cell.is_null()? { kind = OwnedChangeKind::Delete; }
+                positions.push(position);
+            }
+            let key = self.admit_owned_put(&table, relation, owner, &id, iid, valid, create_only).await?
+                .ok_or_else(|| Anomaly::fault("rtdb.owned/missing-entity-key", "Governed put has no complete key"))?;
+            let content = projection.select(array, positions, row, BTreeMap::new())?;
+            let header = EventHeader { position: None, commit_position: 0, iid, system_from, valid_time: valid, op: EventOp::Put };
+            let fixed_before = self.fixed_range_before(owner, relation, &id, valid).await;
+            let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
+                let content = content.as_any().downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(rtdb_types::change_feed_uncovered)?;
+                let Some((field, values)) = content.fields().iter().zip(content.columns())
+                    .find(|(field, _)| field.name() == column)
+                else { return Err(rtdb_types::change_feed_uncovered()); };
+                let size = rtdb_columnar::estimate_read_value_bytes(field, values.as_ref(), 0)?;
+                let _charge = memory.reserve(size.checked_add(512).ok_or_else(overflow)?)?;
+                let value = rtdb_columnar::read_value(field, values.as_ref(), 0)?;
+                rtdb_types::FixedRangeKey::from_cells(&value, &id).map(Some)
+            });
+            let position = self.buffer.append_owned_put(&table, content, header, &key, documents.source_bytes())?;
+            self.record_owned_change(relation, id, kind, valid, position, fixed)?;
+        }
+        self.buffer.declare_document_types(&table, documents.declared_types().iter())
+    }
+
     async fn write_owned_arrow(
         &mut self, relation: &rtdb_types::OwnedRelation, documents: &ArrowDocuments,
         replay: Option<(&[Iid], Option<&[BTreeSet<String>]>)>,
         from: Option<Timestamp>, to: Option<Timestamp>, create_only: bool,
     ) -> Result<()> {
         let legacy = documents.legacy_owned_presence().is_some();
-        if !relation.is_root_data() && !(legacy && relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION) {
+        if !relation.is_root_data()
+            && !(legacy && (relation.world().is_some() || relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION))
+        {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if legacy && let Some((iids, _)) = replay {
+            if iids.len() != documents.row_count() {
+                return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
+            }
+            for (row, iid) in iids.iter().enumerate() {
+                if documents.owned_id_ref(row)?.iid() != *iid {
+                    return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
+                }
+            }
+        }
+        if let Some(root) = relation.root_relation() {
+            return self.write_legacy_world_shadow(owner, relation, &root, documents, replay.map(|(iids, _)| iids), from, to, create_only).await;
+        }
         let table = relation.table(owner);
         let declaration = self.read_owned_schema(owner, relation).await?;
         if legacy && (declaration.is_some() || self.hosted_replay.is_some()) {
-            let rows = documents.read_legacy_owned_rows(&self.context.memory)?;
-            return self.write_owned(relation, &rows, replay.map(|(iids, _)| iids), from, to, create_only).await;
+            let typed_lifetime = declaration.as_ref().is_some_and(|(schema, _)| schema.lifetime_micros().is_some())
+                && matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Exact(_) | LegacyOwnedPresence::Submitted));
+            if !typed_lifetime {
+                let rows = documents.read_legacy_owned_rows(&self.context.memory)?;
+                return self.write_owned(relation, &rows, replay.map(|(iids, _)| iids), from, to, create_only).await;
+            }
         }
         let base_time = self.terms_time;
         let restoring = self.hosted_replay.as_ref().map(|replay| replay.source_time());
@@ -3002,6 +3155,24 @@ impl<'a> OpenTransaction<'a> {
                 schema.require_root_write_period(from, to)?;
             }
             if let Some(duration) = schema.lifetime_micros() {
+                if legacy {
+                    if restoring.is_some() && !create_only { return Err(replay_period_unavailable()); }
+                    let array = documents.array();
+                    let _scratch = self.context.memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(512)))?;
+                    for row in 0..array.len() {
+                        let mut types = StructFields::new();
+                        let mut explicit_validity = false;
+                        for (field, data) in array.fields().iter().zip(array.columns()) {
+                            let cell = ArrowCell { field, array: data.as_ref(), row };
+                            if !documents.legacy_owned_cell_is_present(cell)? { continue; }
+                            if matches!(field.name().as_str(), "_valid_from" | "_valid_to") { explicit_validity = true; }
+                            types.insert(field.name().clone(), cell.logical_type()?);
+                        }
+                        if restoring.is_some() && explicit_validity { return Err(replay_period_unavailable()); }
+                        schema.require_write_validity(explicit_validity)?;
+                        schema.validate_types(&types)?;
+                    }
+                }
                 if !create_only {
                     return Err(if restoring.is_some() { replay_period_unavailable() } else { lifetime_uncovered() });
                 }
@@ -3026,13 +3197,6 @@ impl<'a> OpenTransaction<'a> {
         if replay.is_some_and(|(iids, presence)| iids.len() != array.len() || presence.is_some_and(|fields| fields.len() != array.len())) {
             return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ"));
         }
-        if legacy && let Some((iids, _)) = replay {
-            for (row, iid) in iids.iter().enumerate() {
-                if documents.owned_id_ref(row)?.iid() != *iid {
-                    return Err(Anomaly::incorrect("xtdb/invalid-iids", "Owned document IID does not match its identity"));
-                }
-            }
-        }
         let memory = Arc::clone(&self.context.memory);
         let _scratch = memory.reserve(4096usize.saturating_add(array.fields().len().saturating_mul(256)))?;
         let row_cells = |row: usize| array.fields().iter().zip(array.columns()).map(move |(field, values)| ArrowCell { field, array: values.as_ref(), row });
@@ -3040,6 +3204,9 @@ impl<'a> OpenTransaction<'a> {
             if cell.is_null()? { return Ok(None); }
             cell.zoned_micros().map(Some).ok_or_else(|| Anomaly::fault("xtdb/invalid-timestamp-col-type", "Invalid timestamp col type"))
         };
+        if let Some(floor) = lifetime_floor {
+            self.put_owned_lifetime_floor(owner, relation, floor)?;
+        }
         let mut projection = OwnedPutProjection::default();
         for row in 0..array.len() {
             let selected = replay.and_then(|(_, presence)| presence).map(|fields| &fields[row]);
@@ -3161,9 +3328,6 @@ impl<'a> OpenTransaction<'a> {
             let position = self.buffer.append_owned_put(&table, content, header, &key, documents.source_bytes())?;
             self.record_owned_change(relation, id, rtdb_types::OwnedChangeKind::Put, valid_time, position, fixed)?;
         }
-        if let Some(floor) = lifetime_floor {
-            self.buffer.put(relation.lifetime_table(owner), floor.record(relation), Interval::ALL)?;
-        }
         if matches!(documents.legacy_owned_presence(), Some(LegacyOwnedPresence::Implicit | LegacyOwnedPresence::Exact(_))) && !array.is_empty() {
             self.buffer.declare_document_types(&table, documents.declared_types().iter()
                 .filter(|(name, _)| !matches!(name.as_str(), "_valid_from" | "_valid_to")))?;
@@ -3219,6 +3383,26 @@ impl<'a> OpenTransaction<'a> {
         require_empty_insert(query.execute_columns(context, Vec::new()).await?).await
     }
 
+    fn put_owned_lifetime_floor(&mut self, owner: &str, relation: &OwnedRelation, floor: rtdb_types::OwnedLifetimeFloor) -> Result<()> {
+        use arrow_array::{ArrayRef, Int64Array, StringArray, StructArray};
+
+        let _scratch = self.context.memory.reserve(4096 + relation.name().len())?;
+        let integer = |value| Arc::new(Int64Array::from(vec![value])) as ArrayRef;
+        let document = RecordBatch::try_from_iter([
+            ("_id", Arc::new(StringArray::from(vec![relation.name()])) as ArrayRef),
+            ("duration", integer(floor.duration)),
+            ("expired_created_through", integer(floor.expired_created_through.0)),
+            ("swept_present_through", integer(floor.swept_present_through.0)),
+        ]).map_err(|error| Anomaly::fault("rtdb.owned/lifetime-floor", error.to_string()))?;
+        let header = EventHeader {
+            position: None,
+            commit_position: 0, iid: EntityId::String(relation.name().into()).iid(),
+            system_from: self.tx_key().system_time, valid_time: Interval::ALL, op: EventOp::Put,
+        };
+        let batch = rtdb_format::data::owned_put_batch(Arc::new(StructArray::from(document)), &[header], None, &self.context.memory)?;
+        self.buffer.append_batch(&relation.lifetime_table(owner), batch)
+    }
+
     async fn put_documents(&mut self, table: &TableRef, documents: &crate::Documents, iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>, write: DocumentWrite<'_>) -> Result<()> {
 
         if iids.is_some_and(|iids| iids.len() != documents.rows().len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
@@ -3244,6 +3428,14 @@ impl<'a> OpenTransaction<'a> {
                 rtdb_types::OwnedChangeKind::Put
             };
             let entity_key = self.admit_owned_put(table, relation, owner, &id, iid, valid_time, create_only).await?;
+            if relation.is_world_catalog() {
+                let documents = crate::source::owned_row_documents(documents, &self.context.memory)?;
+                let header = EventHeader { position: None, commit_position: 0, iid, system_from: self.tx_key().system_time, valid_time, op: EventOp::Put };
+                let content = Arc::new(documents.array().slice(index, 1));
+                let batch = rtdb_format::data::owned_put_batch(content, &[header], documents.source_bytes(), &self.context.memory)?;
+                self.buffer.append_batch(table, batch)?;
+                continue;
+            }
             let fixed_before = self.fixed_range_before(owner, relation, &id, valid_time).await;
             let fixed = self.fixed_range_pair(&id, fixed_before, |column| {
                 let value = document.get(column).ok_or_else(rtdb_types::change_feed_uncovered)?;
@@ -3589,14 +3781,21 @@ impl OwnedPutProjection {
         mut filled: BTreeMap<&str, Vec<u8>>,
     ) -> Result<arrow_array::ArrayRef> {
         if !filled.is_empty() {
-            let (fields, columns): (Vec<_>, Vec<arrow_array::ArrayRef>) = positions.into_iter().map(|position| {
+            let mut fields = Vec::with_capacity(positions.len());
+            let mut columns: Vec<arrow_array::ArrayRef> = Vec::with_capacity(positions.len());
+            for position in positions {
                 let field = &array.fields()[position];
-                match filled.remove(field.name().as_str()) {
-                    Some(bytes) => (Arc::new(arrow_schema::Field::new(field.name(), arrow_schema::DataType::Binary, false)),
-                        Arc::new(arrow_array::BinaryArray::from_iter_values([bytes])) as arrow_array::ArrayRef),
-                    None => (Arc::clone(field), array.column(position).slice(row, 1)),
-                }
-            }).unzip();
+                let Some(bytes) = filled.remove(field.name().as_str()) else {
+                    fields.push(Arc::clone(field));
+                    columns.push(array.column(position).slice(row, 1));
+                    continue;
+                };
+                let end = i32::try_from(bytes.len()).map_err(|_| overflow())?;
+                let offsets = arrow_buffer::OffsetBuffer::new(vec![0, end].into());
+                let replacement = arrow_array::BinaryArray::new(offsets, arrow_buffer::Buffer::from_vec(bytes), None);
+                fields.push(Arc::new(arrow_schema::Field::new(field.name(), arrow_schema::DataType::Binary, false)));
+                columns.push(Arc::new(replacement));
+            }
             return rtdb_columnar::build_struct_array(fields.into(), &columns, 1, None);
         }
         if positions.len() == array.num_columns() {
@@ -3650,7 +3849,13 @@ fn validate_document_operation(operation: &Operation, owner: Option<&str>) -> Re
     let root_columns = &["_id", "_fn", "_valid_from", "_valid_to", ordered_micros::FIELD][..];
     if let Operation::Public(TxOp::OwnedArrowDocs { relation, documents, .. }) | Operation::OwnedArrowIids { relation, documents, .. } = operation {
         let owner = owner.filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
-        let permitted = if relation.is_root_data() { root_columns } else { put_columns };
+        let permitted = if relation.world().is_some() {
+            &["_id", rtdb_types::WorldShadow::FIELDS][..]
+        } else if relation.is_root_data() {
+            root_columns
+        } else {
+            put_columns
+        };
         return validate_document_columns(&relation.table(owner), documents.columns(), "insert", permitted);
     }
     if let Operation::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. }) | Operation::OwnedWriteIids { relation, documents, .. } = operation {
@@ -4045,6 +4250,84 @@ mod tests {
         let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(values.is_null(0));
         assert_eq!(values.value(1).to_bits(), 0x7ff8_0000_0000_1234);
+    }
+
+    #[test]
+    fn owned_put_projection_adopts_the_filled_binary_buffer() {
+        use arrow_array::{BinaryArray, StructArray};
+
+        let source = Arc::new(BinaryArray::from_iter_values([b"original"]));
+        let batch = RecordBatch::try_from_iter([("payload", source.clone() as arrow_array::ArrayRef)]).unwrap();
+        let content = StructArray::from(batch);
+        let bytes = Vec::from(*b"accepted");
+        let pointer = bytes.as_ptr();
+        let mut projection = OwnedPutProjection::default();
+        let projected = projection.select(&content, vec![0], 0, BTreeMap::from([("payload", bytes)])).unwrap();
+        let written = projected.as_struct().column(0).as_binary::<i32>();
+        assert_eq!(written.value(0).as_ptr(), pointer);
+        assert_eq!(written.value(0), b"accepted");
+        assert_eq!(source.value(0), b"original");
+    }
+
+    #[tokio::test]
+    async fn legacy_lifetime_replay_stages_arrow_and_preserves_the_replica_tables() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            decision_clock: None,
+            write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None,
+            world_constraints: None, database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory), query_options: QueryOptions::default(), scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(NoRoleChecks),
+            execution_observer: None, tracer: None,
+        };
+        let partition = rtdb_index::PartitionState::empty(Default::default())?;
+        let relation = OwnedRelation::new("expiring")?;
+        let schema = rtdb_types::OwnedSchema::from_json(br#"{
+            "fields":[{"name":"v","type":{"kind":"binary"},"optional":true,"nullable":true}],
+            "validity":"acceptance","lifetime_micros":50
+        }"#)?;
+        let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
+        let mut declare = OpenTransaction::new(partition.snapshot(), TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) }, &options, &context)?;
+        declare.declare_owned_relation(&relation, &schema).await?;
+        let snapshot = declare.snapshot()?;
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(125) };
+        let row = |id| StructFields::from([("_id".into(), Value::I64(id))]);
+        let mut first = row(1);
+        first.insert("v".into(), Value::Binary(vec![7, 9]));
+        let mut second = row(2);
+        second.insert("v".into(), Value::Null);
+        let documents = crate::Documents::new(vec![first, second, row(3)], &memory)?;
+        let source = SourceTransaction::new(vec![TxOp::OwnedInsertDocs {
+            relation: relation.clone(), documents, valid_from: None, valid_to: None,
+        }], options.clone(), &memory)?;
+        let bytes = source.encode()?;
+        let message = rtdb_format::envelope::SourceMessage::decode(bytes.as_slice())?.unwrap();
+        let replay = SourceTransaction::decode(&message, &memory)?;
+        let [operation @ Operation::OwnedArrowIids { documents, iids, .. }] = replay.operations.as_slice() else {
+            panic!("expected an Arrow lifetime mutation");
+        };
+        let rows = documents.read_legacy_owned_rows(&memory)?;
+        let mut baseline = OpenTransaction::new(snapshot.clone(), key, &options, &context)?;
+        baseline.write_owned(&relation, &rows, Some(iids), None, None, true).await?;
+        let mut typed = OpenTransaction::new(snapshot, key, &options, &context)?;
+        typed.apply(operation).await?;
+        let baseline = baseline.buffer.stage()?;
+        let typed = typed.buffer.stage()?;
+        for table in [relation.table("owner"), relation.lifetime_table("owner")] {
+            let expected = baseline.tables()[&table].batch().unwrap().arrow();
+            let observed = typed.tables()[&table].batch().unwrap().arrow();
+            let encode = |batch: &RecordBatch| crate::ipc::encode(batch.schema_ref(), [batch], &memory);
+            assert_eq!(encode(expected)?.as_slice(), encode(observed)?.as_slice());
+        }
+        let table = relation.lifetime_table("owner");
+        let mut previous = TransactionBuffer::new(partition.snapshot(), key, Arc::clone(&memory))?;
+        previous.put(table.clone(), rtdb_types::OwnedLifetimeFloor::at(50, key.system_time)?.record(&relation), Interval::ALL)?;
+        let previous = previous.stage()?;
+        let encode = |batch: &RecordBatch| crate::ipc::encode(batch.schema_ref(), [batch], &memory);
+        assert_eq!(encode(previous.tables()[&table].batch().unwrap().arrow())?.as_slice(),
+            encode(typed.tables()[&table].batch().unwrap().arrow())?.as_slice());
+        Ok(())
     }
 
     struct NoRoleChecks;
@@ -4662,12 +4945,48 @@ mod tests {
         );
 
         let first = [write(WorldShadow::Present(fact(&one, b"one")), &one)?];
+        let [Operation::Public(operation)] = &first else { unreachable!() };
+        let source = SourceTransaction::new(vec![operation.clone()], options.clone(), &memory)?;
+        let bytes = source.encode()?;
+        let message = rtdb_format::envelope::SourceMessage::decode(bytes.as_slice())?.unwrap();
+        let replay = SourceTransaction::decode(&message, &memory)?;
+        let [Operation::OwnedArrowIids { .. }] = replay.operations.as_slice() else {
+            panic!("expected an Arrow world shadow");
+        };
+        assert_eq!(replay.body_digest()?, source.body_digest()?);
+        let base = cap.snapshot()?;
+        let key = TransactionKey { tx_id: TxId(3), system_time: Timestamp(300) };
+        let catalog = OwnedRelation::world_catalog();
+        let catalog_table = catalog.table("owner");
+        let mut catalog_write = OpenTransaction::new(base.clone(), key, &options, &context)?;
+        let catalog_document = record.record();
+        let catalog_rows = crate::Documents::new(vec![catalog_document.clone()], &memory)?;
+        catalog_write.write_owned(&catalog, &catalog_rows, None, None, None, true).await?;
+        let mut row_catalog = TransactionBuffer::new(base.clone(), key, Arc::clone(&memory))?;
+        row_catalog.put(catalog_table.clone(), catalog_document, Interval::ALL)?;
+        let row_catalog = row_catalog.stage()?;
+        let arrow_catalog = catalog_write.buffer.stage()?;
+        let encode_table = |write: &StagedWrite| {
+            let batch = write.tables()[&catalog_table].batch().unwrap().arrow();
+            crate::ipc::encode(batch.schema_ref(), [batch], &memory)
+        };
+        assert_eq!(encode_table(&row_catalog)?.as_slice(), encode_table(&arrow_catalog)?.as_slice());
         let mut accepted = OpenTransaction::new(
-            cap.snapshot()?, TransactionKey { tx_id: TxId(3), system_time: Timestamp(300) }, &options, &context,
+            base.clone(), key, &options, &context,
         )?;
         accepted.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
         accepted.apply(&first[0]).await?;
         accepted.check_final_constraints(&first).await?;
+        let mut typed = OpenTransaction::new(base, key, &options, &context)?;
+        typed.owned_worlds.insert(world, (record.clone(), memory.reserve(4096)?));
+        typed.apply(&replay.operations[0]).await?;
+        typed.check_final_constraints(&replay.operations).await?;
+        let table = overlay.table("owner");
+        let encode = |snapshot: Snapshot| -> Result<_> {
+            let batch = snapshot.iter_segments(&table).flat_map(|segment| segment.batches()).next().unwrap().arrow();
+            crate::ipc::encode(batch.schema_ref(), [batch], &memory)
+        };
+        assert_eq!(encode(typed.snapshot()?)?.as_slice(), encode(accepted.snapshot()?)?.as_slice());
 
         let two = EntityId::String("two".into());
         let before = accepted.snapshot()?;

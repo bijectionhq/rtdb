@@ -546,6 +546,7 @@ enum SourceOperationBody<'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourcePurpose { Log, Receipt }
 
+#[derive(Clone, Copy)]
 enum SourceDocuments<'a> {
     Rows(&'a Documents),
     Arrow(&'a ArrowDocuments),
@@ -1286,6 +1287,24 @@ fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memo
     if lists.iter().any(|list| matches!(list, SourceDocuments::Arrow(_)))
         && lists.iter().any(|list| matches!(list, SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some()))
     {
+        let stable = lists.iter().try_fold(true, |stable, list| match list {
+            SourceDocuments::Canonical { documents, .. } if stable => legacy_page_has_stable_layout(documents, arrays),
+            _ => Ok(stable),
+        })?;
+        if stable {
+            let pages = lists.iter().map(|list| match list {
+                SourceDocuments::Canonical { documents, .. } => {
+                    let mut builder = BatchBuilder::new(4096, memory)?;
+                    let array = canonical_document_struct(std::slice::from_ref(list), documents.row_count(), &mut builder, memory)?;
+                    own_documents(array, builder, memory).map(Some)
+                }
+                _ => Ok(None),
+            }).collect::<Result<Vec<_>>>()?;
+            let mixed = lists.iter().zip(&pages).map(|(list, page)| {
+                page.as_ref().map_or(*list, SourceDocuments::Arrow)
+            }).collect::<Vec<_>>();
+            if let Some(leg) = mixed_document_leg(&mixed, arrays)? { return Ok(leg); }
+        }
         let legacy = lists.iter().map(|list| match list {
             SourceDocuments::Canonical { documents, .. } if documents.legacy_owned_presence().is_some() => {
                 documents.read_legacy_owned_rows(memory).map(Some)
@@ -1313,6 +1332,27 @@ fn document_leg(lists: Vec<SourceDocuments<'_>>, arrays: &mut BatchBuilder, memo
     let offsets = document_offsets(lists.iter().map(SourceDocuments::len))?;
     let structs = canonical_document_struct(&lists, *offsets.last().expect("document origin") as usize, arrays, memory)?;
     document_list(structs, offsets)
+}
+
+fn document_observed_type_bytes(cell: ArrowCell<'_>) -> Result<usize> {
+    if crate::values::float_vector_field(cell.field) {
+        return Ok(cell.field.size().saturating_mul(16).saturating_add(4096));
+    }
+    cell.observed_type_bytes()
+}
+
+fn legacy_page_has_stable_layout(documents: &ArrowDocuments, arrays: &BatchBuilder) -> Result<bool> {
+    if documents.legacy_owned_presence().is_none() { return Ok(false); }
+    for (field, column) in documents.array().fields().iter().zip(documents.array().columns()) {
+        if !crate::values::legacy_owned_arrow_field(field) { return Ok(false); }
+        for row in 0..documents.row_count() {
+            let cell = ArrowCell { field, array: column.as_ref(), row };
+            if !documents.legacy_owned_cell_is_present(cell)? { return Ok(false); }
+            let _type = arrays.reserve_scratch(document_observed_type_bytes(cell)?)?;
+            if documents.column_type(field.name()) != Some(&cell.observed_type()?) { return Ok(false); }
+        }
+    }
+    Ok(true)
 }
 
 fn mixed_document_leg(lists: &[SourceDocuments<'_>], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
@@ -1659,7 +1699,7 @@ pub(crate) fn owned_projected_documents(
             let actual = cell.observed_type(memory)?;
             if ty != actual { ty = ty.join(&actual); }
         }
-        let (field, column) = canonical_cells(name, ty, &cells, &mut arrays, memory)?;
+        let (field, column) = canonical_cells(name, ty, &cells, &mut arrays, memory, false)?;
         schema.push(field);
         columns.push(column);
     }
@@ -1674,13 +1714,16 @@ fn canonical_cells_bound(rows: usize) -> Result<usize> {
 
 fn canonical_cells(
     name: &str, mut ty: LogicalType, cells: &[Option<&DocumentCell<'_>>],
-    arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>,
+    arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>, legacy_arrow: bool,
 ) -> Result<(Arc<Field>, ArrayRef)> {
     if struct_backfill_depth(&ty) != 0 {
         let writers = cells.iter().map(|cell| cell.map_or(WriterCell::Null, DocumentCell::writer)).collect::<Vec<_>>();
         ty = backfilled_nullability(ty, &writers);
     }
     let target = to_field(name, &ty)?;
+    if legacy_arrow && let Some(column) = canonical_arrow_document_column(&target, cells, arrays)? {
+        return Ok((Arc::new(target), column));
+    }
     let (array, _writer) = match copy_document_floats(&target, &ty, cells, memory) {
         Ok(Some(output)) => output,
         Ok(None) | Err(_) => {
@@ -1853,6 +1896,10 @@ fn gather_float_layout(target: &Field, cells: &[FloatCell<'_>], interleaved: boo
 fn canonical_document_struct(
     lists: &[SourceDocuments<'_>], length: usize, arrays: &mut BatchBuilder, memory: &Arc<MemoryBudget>,
 ) -> Result<ArrayRef> {
+    let legacy_arrow = lists.iter().any(|list| match list {
+        SourceDocuments::Rows(_) => false,
+        SourceDocuments::Arrow(documents) | SourceDocuments::Canonical { documents, .. } => documents.legacy_owned_presence().is_some(),
+    });
     let names = lists.iter().flat_map(SourceDocuments::columns).collect::<OrderedSet<_>>();
     let _inventory = memory.reserve(canonical_cells_bound(length)?)?;
     let mut columns = Vec::with_capacity(names.len());
@@ -1897,32 +1944,89 @@ fn canonical_document_struct(
                 }
             }
             for cell in cells[start..].iter().flatten() {
-                let actual = cell.observed_type(memory)?;
+                let actual = if legacy_arrow
+                    && let DocumentCell::Arrow { cell, .. } = cell
+                    && !float_field(cell.field)
+                    && crate::values::legacy_owned_arrow_field(cell.field)
+                    && crate::values::valid_argument_union_cell(cell.field, cell.array, cell.row)
+                {
+                    let _scratch = memory.reserve(cell.observed_type_bytes()?)?;
+                    cell.observed_type()?
+                } else {
+                    cell.observed_type(memory)?
+                };
                 if ty != actual { ty = ty.join(&actual); }
                 present = present.checked_add(1).ok_or_else(overflow)?;
             }
         }
         if present < length || present == 0 { ty = ty.maybe(); }
         let cells = cells.iter().map(Option::as_ref).collect::<Vec<_>>();
-        let (field, column) = canonical_cells(name, ty, &cells, arrays, memory)?;
+        let (field, column) = canonical_cells(name, ty, &cells, arrays, memory, legacy_arrow)?;
         schema.push(field);
         columns.push(column);
     }
     rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))
 }
 
+fn canonical_arrow_document_column(field: &Field, cells: &[Option<&DocumentCell<'_>>], arrays: &mut BatchBuilder) -> Result<Option<ArrayRef>> {
+    if canonical_float_field(field) || !crate::values::legacy_owned_arrow_field(field) || cells.is_empty() { return Ok(None); }
+    let _selection = arrays.reserve_scratch(cells.len().checked_mul(128).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+    let mut sources: Vec<(&Field, &dyn Array)> = Vec::new();
+    let mut picks = Vec::with_capacity(cells.len());
+    let mut bound = cells.len().checked_mul(64).and_then(|bytes| bytes.checked_add(field.size().checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
+    for cell in cells {
+        let Some(DocumentCell::Arrow { cell: selected, .. }) = cell else {
+            if cell.is_some() { return Ok(None); }
+            picks.push(None);
+            continue;
+        };
+        let ArrowCell { field: source, array: column, row } = *selected;
+        if !crate::values::legacy_owned_arrow_field(source) { return Ok(None); }
+        if selected.is_null()? {
+            picks.push(None);
+        } else {
+            if !crate::values::valid_argument_union_cell(source, column, row) { return Ok(None); }
+            let position = if sources.last().is_some_and(|(last_field, array)| std::ptr::eq(*last_field, source) && std::ptr::eq(*array, column)) {
+                sources.len() - 1
+            } else {
+                sources.push((source, column));
+                sources.len() - 1
+            };
+            picks.push(Some((position, row)));
+        }
+        bound = bound.checked_add(rtdb_columnar::estimate_event_copy_cell_bytes(source, column, row)?.checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)?;
+    }
+    if sources.is_empty() { return Ok(None); }
+    let mut inputs = Vec::with_capacity(sources.len());
+    let mut scratch = Vec::new();
+    for (source, column) in sources {
+        if source.data_type() == field.data_type() {
+            inputs.push(arrow_array::make_array(column.to_data()));
+        } else {
+            let Ok(bytes) = rtdb_columnar::arrow_relayout_bound(column, source, field) else { return Ok(None); };
+            let lease = arrays.reserve_scratch(bytes)?;
+            let Ok((_, aligned)) = rtdb_columnar::relayout_arrow_column(arrow_array::make_array(column.to_data()), source, field) else { return Ok(None); };
+            if aligned.data_type() != field.data_type() { return Ok(None); }
+            inputs.push(aligned);
+            scratch.push(lease);
+        }
+    }
+    let columns = inputs.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+    arrays.column(bound, || rtdb_columnar::copy_event_cells(&columns, &picks)).map(Some)
+}
+
 fn legacy_owned_arrow_documents(
     array: &StructArray, layout: &Arc<DecodedDocumentLayout>, source_bytes: usize,
     presence: Option<&[std::collections::BTreeSet<String>]>, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<ArrowDocuments>> {
-    use crate::values::{float_vector_field, legacy_owned_field_name, plain_scalar_field, valid_argument_union_cell};
+    use crate::values::{legacy_owned_arrow_field, legacy_owned_field_name, valid_argument_union_cell};
 
-    if array.null_count() != 0 || array.is_empty() || !array.fields().iter().any(|field| float_vector_field(field))
+    if array.null_count() != 0 || array.is_empty()
         || presence.is_some_and(|fields| fields.len() != array.len())
         || !array.fields().iter().all(|field| {
-            legacy_owned_field_name(field.name()) && (float_vector_field(field) || plain_scalar_field(field) || field.name() == "_id"
-                || (matches!(field.name().as_str(), "_valid_from" | "_valid_to") && field.extension_type_name().is_none()
-                    && matches!(field.data_type(), DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)))))
+            (legacy_owned_field_name(field.name()) || field.name() == rtdb_types::WorldShadow::FIELDS)
+                && legacy_owned_arrow_field(field)
         }) {
         return Ok(None);
     }
@@ -1931,12 +2035,13 @@ fn legacy_owned_arrow_documents(
     let mut aligned = false;
     for (field, column) in array.fields().iter().zip(array.columns()) {
         let logical = layout.column_type(field.name()).ok_or_else(|| invalid("Document column has no logical type"))?;
-        if !canonical_union_layouts(field)
-            || (0..array.len()).any(|row| !valid_argument_union_cell(field, column.as_ref(), row))
+        if (0..array.len()).any(|row| !valid_argument_union_cell(field, column.as_ref(), row))
         {
             return Ok(None);
         }
-        rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
+        if *logical != LogicalType::Nothing {
+            rtdb_columnar::validate_readable_column(field, column.as_ref(), logical, memory)?;
+        }
         let target = to_field(field.name(), logical)?;
         if field.as_ref() == &target {
             fields.push(Arc::clone(field));
@@ -2520,7 +2625,7 @@ impl SourceOperationReader<'_> {
                         return Ok(Operation::OwnedArrowIids { create_only: name == "rtdb-owned-insert-v1", relation, documents, iids,
                             presence: Some(presence), valid_from, valid_to });
                     }
-                    if (relation.is_root_data() || (!relative && relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION))
+                    if (relation.is_root_data() || (!relative && (relation.world().is_some() || relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)))
                         && let Some(documents) = legacy_owned_arrow_documents(structs, &layout, source_bytes, presence.as_deref(), memory)?
                     {
                         if (0..documents.row_count()).all(|row| {
@@ -2803,8 +2908,8 @@ mod tests {
         }) if *period == relative(None, None, Some(Timestamp(-7)), Some(Timestamp(3)))));
         assert!(replayed.place_owned_periods(Timestamp(123), false).is_err());
         replayed.place_owned_periods(Timestamp(123), true).unwrap();
-        assert!(matches!(&replayed.operations[0], Operation::Public(TxOp::OwnedReplaceDocs {
-            valid_from: Some(Timestamp(116)), valid_to: Some(Timestamp(126)), ..
+        assert!(matches!(&replayed.operations[0], Operation::Public(TxOp::OwnedArrowDocs {
+            create_only: false, valid_from: Some(Timestamp(116)), valid_to: Some(Timestamp(126)), ..
         })));
         assert!(matches!(&replayed.operations[1], Operation::Public(TxOp::OwnedDelete {
             valid_from: Some(Timestamp(131)), valid_to: Some(Timestamp(133)), ..
@@ -4235,6 +4340,21 @@ mod tests {
     }
 
     #[test]
+    fn proposal_landing_frontier_is_recognized_after_arrow_replay() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION).unwrap();
+        let id = "public_fact_head:AAAAAAAAAAAAAAAAAAAAAA";
+        let documents = Documents::new(vec![StructFields::from([("_id".into(), Value::Utf8(id.into()))])], &memory).unwrap();
+        let source = SourceTransaction::new(vec![TxOp::OwnedReplaceDocs {
+            relation, documents, valid_from: Some(Timestamp::MIN), valid_to: None,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let replay = roundtrip(&source);
+        assert!(matches!(&replay.operations[0], Operation::OwnedArrowIids { .. }));
+        assert!(crate::hosted_control::proposal_landing_frontier_rows(&replay.operations[0]).is_some());
+        assert_eq!(source.body_digest().unwrap(), replay.body_digest().unwrap());
+    }
+
+    #[test]
     fn legacy_flight_vector_upload_encodes_like_row_submission_with_and_without_a_typed_sibling() {
         let memory = budget();
         let relation = rtdb_types::OwnedRelation::new("vectors").unwrap();
@@ -4250,7 +4370,9 @@ mod tests {
         let typed = |documents| TxOp::OwnedArrowDocs {
             relation: relation.clone(), documents, create_only: true, valid_from: None, valid_to: None,
         };
-        let arrow = typed(ArrowDocuments::from_legacy_owned_payload(&upload(1, fields.clone()), &memory).unwrap().unwrap());
+        let documents = ArrowDocuments::from_legacy_owned_payload(&upload(1, fields.clone()), &memory).unwrap().unwrap();
+        assert!(legacy_page_has_stable_layout(&documents, &BatchBuilder::new(4096, &memory).unwrap()).unwrap());
+        let arrow = typed(documents);
         let rows = TxOp::OwnedInsertDocs {
             relation: relation.clone(), documents: Documents::new(vec![StructFields::from([
                 ("_id".into(), Value::I64(1)), ("v".into(), vector.clone()),
@@ -4266,6 +4388,45 @@ mod tests {
             assert_eq!(arrow.encode().unwrap().as_slice(), rows.encode().unwrap().as_slice());
             assert_eq!(arrow.body_digest().unwrap(), rows.body_digest().unwrap());
         }
+    }
+
+    #[test]
+    fn legacy_upload_retags_foreign_union_children_and_retains_struct_companions() {
+        use arrow_array::{Float32Array, Float64Array, Int64Array};
+
+        let memory = budget();
+        let float = f32::from_bits(0x7fc0_7654);
+        let legs = UnionFields::new([17, 3, 29], [
+            Field::new("real", DataType::Float32, false),
+            Field::new("double", DataType::Float64, false),
+            Field::new("missing", DataType::Null, true),
+        ]);
+        let components = UnionArray::try_new(legs, vec![17, 29, 3].into(), Some(vec![0, 0, 0].into()), vec![
+            Arc::new(Float32Array::from(vec![float])), Arc::new(Float64Array::from(vec![-0.0])),
+            Arc::new(arrow_array::NullArray::new(1)),
+        ]).unwrap();
+        let vector = ListArray::new(Arc::new(Field::new("item", components.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 3].into()), Arc::new(components), None);
+        let detail = StructArray::new(vec![Field::new("count", DataType::Int64, false)].into(),
+            vec![Arc::new(Int64Array::from(vec![12]))], None);
+        let upload = OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false), Field::new("v", vector.data_type().clone(), false),
+            Field::new("detail", detail.data_type().clone(), false),
+        ])), vec![Arc::new(Int64Array::from(vec![1])), Arc::new(vector), Arc::new(detail)]).unwrap(), &memory).unwrap();
+        let documents = ArrowDocuments::from_legacy_owned_payload(&upload, &memory).unwrap().unwrap();
+        let relation = rtdb_types::OwnedRelation::new("vectors").unwrap();
+        let source = |operation| SourceTransaction::new(vec![operation], SubmitOptions::default(), &memory).unwrap();
+        let rows = source(TxOp::OwnedInsertDocs {
+            relation: relation.clone(), documents: Documents::new(vec![StructFields::from([
+                ("_id".into(), Value::I64(1)),
+                ("v".into(), Value::list(vec![Value::F32(float), Value::Null, Value::F64(-0.0)])),
+                ("detail".into(), Value::Struct(StructFields::from([("count".into(), Value::I64(12))]))),
+            ])], &memory).unwrap(), valid_from: None, valid_to: None,
+        });
+        let arrow = source(TxOp::OwnedArrowDocs { relation, documents, create_only: true, valid_from: None, valid_to: None });
+        assert_eq!(arrow.encode().unwrap().as_slice(), rows.encode().unwrap().as_slice());
+        assert_eq!(arrow.body_digest().unwrap(), rows.body_digest().unwrap());
+        assert!(matches!(roundtrip(&rows).operations.as_slice(), [Operation::OwnedArrowIids { .. }]));
     }
 
     #[test]

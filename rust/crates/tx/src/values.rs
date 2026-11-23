@@ -450,13 +450,14 @@ impl ArrowDocuments {
         Ok(Some(Self { array: StructArray::from(batch.clone()), layout, source_bytes: None, legacy_owned_presence: None }))
     }
 
-    /// Retains a floating-point vector upload with compatible layouts, scalar companion fields, and complete entity IDs.
+    /// Retains compatible legacy document columns with complete entity IDs.
     /// `None` lets the caller use the legacy row reader.
     pub fn from_legacy_owned_payload(batch: &OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let source = batch.batch();
         let fields = source.schema_ref().fields();
-        if source.num_rows() == 0 || !fields.iter().any(|field| float_vector_field(field))
-            || fields.iter().any(|field| !legacy_owned_field_name(field.name()))
+        if source.num_rows() == 0 || fields.iter().any(|field| {
+            !legacy_owned_field_name(field.name()) || !legacy_owned_arrow_field(field)
+        })
             || fields.iter().map(|field| field.name()).collect::<BTreeSet<_>>().len() != fields.len()
         {
             return Ok(None);
@@ -469,11 +470,6 @@ impl ArrowDocuments {
         }
         for (field, column) in fields.iter().zip(source.columns()) {
             let logical = documents.column_type(field.name()).expect("upload layout covers its fields");
-            if !float_vector_field(field) && !matches!(logical, LogicalType::Scalar(_) | LogicalType::Null | LogicalType::Nothing)
-                && !matches!(logical, LogicalType::Maybe(inner) if matches!(inner.as_ref(), LogicalType::Scalar(_)))
-            {
-                return Ok(None);
-            }
             if (0..source.num_rows()).any(|row| !valid_argument_union_cell(field, column.as_ref(), row)) {
                 return Ok(None);
             }
@@ -563,6 +559,16 @@ impl ArrowDocuments {
             LegacyOwnedPresence::Implicit => Ok(cell.field.name() == "_id"
                 || (cell.field.data_type() == &DataType::Null && !cell.field.is_nullable()) || !cell.is_null()?),
         }
+    }
+
+    pub(crate) fn legacy_owned_cell(&self, name: &str, row: usize) -> Result<Option<rtdb_columnar::ArrowCell<'_>>> {
+        for (field, array) in self.array.fields().iter().zip(self.array.columns()) {
+            if field.name() == name {
+                let cell = rtdb_columnar::ArrowCell { field, array: array.as_ref(), row };
+                return Ok(self.legacy_owned_cell_is_present(cell)?.then_some(cell));
+            }
+        }
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -757,6 +763,32 @@ pub(crate) fn float_vector_field(field: &arrow_schema::Field) -> bool {
 
 pub(crate) fn legacy_owned_field_name(name: &str) -> bool {
     !name.starts_with('_') || matches!(name, "_id" | "_fn" | "_valid_from" | "_valid_to")
+}
+
+pub(crate) fn legacy_owned_arrow_field(field: &arrow_schema::Field) -> bool {
+    if field.extension_type_name().is_some() { return uuid_field(field); }
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let mut names = BTreeSet::new();
+            fields.iter().all(|field| names.insert(field.name()) && legacy_owned_arrow_field(field))
+        }
+        DataType::List(item) | DataType::FixedSizeList(item, _) => legacy_owned_arrow_field(item),
+        DataType::Union(legs, arrow_schema::UnionMode::Dense) => {
+            let mut names = BTreeSet::new();
+            let Ok(LogicalType::Union(types)) = from_field(field) else { return false; };
+            legs.iter().all(|(_, leg)| {
+                if !legacy_owned_arrow_field(leg) { return false; }
+                let Ok(ty) = from_field(leg) else { return false; };
+                let Ok(name) = rtdb_columnar::leg_name(&ty) else { return false; };
+                names.insert(name) && types.iter().all(|candidate| {
+                    rtdb_columnar::leg_name(candidate).is_ok_and(|name| name != *leg.name() || *candidate == ty)
+                })
+            })
+        }
+        DataType::Null | DataType::Float16 | DataType::Date32 | DataType::Date64
+        | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Timestamp(..) => true,
+        _ => plain_scalar_field(&field.clone().with_metadata(Default::default())),
+    }
 }
 
 pub(crate) fn compatible_document_metadata(field: &arrow_schema::Field) -> bool {
