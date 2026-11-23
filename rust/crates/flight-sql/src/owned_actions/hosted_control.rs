@@ -46,7 +46,7 @@ impl Service {
         let (handle, body) = body
             .split_first_chunk::<16>()
             .ok_or_else(|| invalid("Hosted control point has no held handle"))?;
-        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (table, ipc) = split_relation(body)?;
         admit_control_targets(policy, [&table])?;
         let batch = request_batch(call, ipc)?;

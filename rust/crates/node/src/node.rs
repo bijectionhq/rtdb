@@ -384,17 +384,17 @@ impl Node {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
-        match cut {
+        let hosted_fence = match cut {
             CatalogReadCut::HostedApplied(_) => {
                 self.ensure_indexing()?;
-                let attached = held.as_ref().filter(|_| placed && placement.is_some()).ok_or_else(hosted_source_unavailable)?;
-                let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
-                fence.confirm_hosted(attached).await?;
+                if !placed || placement.is_none() { return Err(hosted_source_unavailable()); }
+                Some(self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?)
             }
             CatalogReadCut::Current | CatalogReadCut::Reserved(_) => {
                 if let Some(fence) = &self.read_fence { fence.confirm(database).await?; }
+                None
             }
-        }
+        };
         if let Some(previous) = &held {
             let current = self.catalog.database(database).map_err(|_| lost_placement(database))?;
             if !Arc::ptr_eq(previous, &current) { return Err(lost_placement(database)); }
@@ -409,7 +409,7 @@ impl Node {
         for (name, database) in held.into_iter().map(|held| (database.to_owned(), held)).chain(classic) {
             if !placed && identity.authorize_database(&name, DatabaseAccess::Read).is_err() { continue; }
             let database_lease = match cut {
-                CatalogReadCut::HostedApplied(_) => Some(database.applied_read_lease(&self.factory.clock, &self.factory.options.garbage)?),
+                CatalogReadCut::HostedApplied(_) => None,
                 CatalogReadCut::Current | CatalogReadCut::Reserved(_) => self.catalog_read_lease(&database).await?,
             };
             if let Some(database_lease) = database_lease {
@@ -428,7 +428,6 @@ impl Node {
                     snapshot
                 }
                 CatalogReadCut::HostedApplied(minimum) => {
-                    crate::read_currency::require_current(&name, lease.as_deref())?;
                     let snapshot = database.partition.snapshot();
                     let selected = snapshot.tx_basis().filter(|selected| covers_transaction(*selected, minimum))
                         .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-below-floor",
@@ -444,7 +443,17 @@ impl Node {
             let cap = requested.map(|time| time.as_micros()).transpose()?;
             let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
             let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
-            let snapshot = rtdb_query::retain_catalog_snapshot(snapshot.with_system_time_cap(cap)?, &database.storage).await?;
+            let snapshot = snapshot.with_system_time_cap(cap)?;
+            let snapshot = if let Some(fence) = hosted_fence {
+                let cut = snapshot.catalog_cut().ok_or_else(applied_catalog_unretained)?;
+                let permit = database.storage.object_store().retain_catalog(Some(cut)).await?
+                    .ok_or_else(applied_catalog_unretained)?;
+                fence.confirm_hosted(&database).await?;
+                self.attached_database(&name, placement)?;
+                snapshot.with_catalog_read(permit)
+            } else {
+                rtdb_query::retain_catalog_snapshot(snapshot, &database.storage).await?
+            };
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }
         crate::read_currency::require_current(database, lease.as_deref())?;
@@ -1065,6 +1074,7 @@ pub struct OwnedReadSession {
     owner: String,
     present: TransactionKey,
     witness_scope: Option<rtdb_types::PlacedAttemptScope>,
+    applied_scope: Option<rtdb_types::PlacedAttemptScope>,
     witness_until: Timestamp,
     fork_until: Timestamp,
     cancellation: CancellationToken,
@@ -1084,6 +1094,8 @@ pub struct OwnedReplayWorld {
 
 impl OwnedReadSession {
     pub fn present(&self) -> TransactionKey { self.present }
+
+    pub fn is_applied(&self) -> bool { self.applied_scope.is_some() }
 
     pub fn evidence_until(&self) -> Timestamp { self.witness_until }
 
@@ -1108,7 +1120,7 @@ impl OwnedReadSession {
         Ok(Self {
             context, node: self.node.clone(), identity: Arc::clone(&self.identity),
             database: self.database.clone(), owner: self.owner.clone(), present: self.present,
-            witness_scope: self.witness_scope, witness_until: self.witness_until, fork_until: self.fork_until,
+            witness_scope: self.witness_scope, applied_scope: None, witness_until: self.witness_until, fork_until: self.fork_until,
             cancellation, session_cancellation: self.session_cancellation.clone(),
             historical: None, scoped_root: Some(relations), attachment: self.attachment.clone(),
             _reservation: reservation,
@@ -1143,7 +1155,7 @@ impl OwnedReadSession {
         self.admit_access().await?;
         let attached_scope = self.attachment.upgrade()
             .and_then(|database| database.await_authority.codec().map(|codec| codec.scope()));
-        if attached_scope != Some(scope) || self.node.now() >= self.fork_until {
+        if self.is_applied() || attached_scope != Some(scope) || self.node.now() >= self.fork_until {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
         if let Some(historical) = &self.historical {
@@ -2879,10 +2891,11 @@ impl NativeSession {
         let charge = node.memory().reserve(database.capacity().checked_add(owner.capacity()).and_then(|bytes| bytes.checked_add(2048))
             .ok_or_else(|| Anomaly::incorrect("rtdb.owned/read-size", "Retained read allocation overflow"))?)?;
         let attached = node.attached_database(&database, self.service.placement.as_ref())?;
-        let witness_scope = match &attached.await_authority {
+        let attached_scope = match &attached.await_authority {
             AwaitAuthority::Live { codec, .. } => Some(codec.scope()),
             _ => None,
         };
+        let applied_scope = applied_floor.map(|_| attached_scope.ok_or_else(hosted_source_unavailable)).transpose()?;
         let attached = Arc::downgrade(&attached);
         let (reserved, cut) = match applied_floor {
             Some(minimum) => (None, CatalogReadCut::HostedApplied(minimum)),
@@ -2905,7 +2918,7 @@ impl NativeSession {
         let present = context.catalog.database(&database)?.partitions.first().and_then(|partition| partition.tx_basis())
             .ok_or_else(hosted_source_unavailable)?;
         let lease = context.catalog.read_lease();
-        let witness_scope = witness_scope.filter(|_| lease.as_ref().and_then(|lease| lease.deadline()).is_some());
+        let witness_scope = attached_scope.filter(|_| applied_scope.is_none() && lease.as_ref().and_then(|lease| lease.deadline()).is_some());
         let clock = Arc::clone(&node.factory.clock);
         let now = clock.monotonic_micros();
         let deadline = now.saturating_add(60_000_000);
@@ -2929,7 +2942,7 @@ impl NativeSession {
         }));
         context.check_cancelled()?;
         Ok(OwnedReadSession {
-            context, node, identity, database, owner, present, witness_scope, witness_until, fork_until: witness_until,
+            context, node, identity, database, owner, present, witness_scope, applied_scope, witness_until, fork_until: witness_until,
             cancellation, session_cancellation, historical: None, scoped_root: None, attachment: placement, _reservation: charge,
         })
     }
@@ -3181,6 +3194,9 @@ fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-c
 fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled") }
 fn hosted_source_unavailable() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.node/hosted-source-unavailable", "The host cannot confirm this database's durable history")
+}
+fn applied_catalog_unretained() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-catalog-unretained", "The applied catalog has no exact storage retention")
 }
 fn bad_attempt_outcome() -> Anomaly {
     Anomaly::fault("rtdb.node/attempt-outcome", "Installed attempt outcome does not match the durable transaction")

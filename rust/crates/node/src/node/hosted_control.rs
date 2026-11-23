@@ -21,7 +21,7 @@ impl OwnedReadSession {
                 "Hosted controls require their original live placed hold",
             )
         };
-        if Some(target.scope()) != self.witness_scope {
+        if Some(target.scope()) != self.witness_scope.or(self.applied_scope) {
             return Err(unavailable());
         }
         let database = self.context.catalog.database(&self.database)?;

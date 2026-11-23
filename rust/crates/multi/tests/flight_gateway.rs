@@ -19,10 +19,10 @@ async fn channel(address: SocketAddr) -> Channel {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn applied_owned_read_reuses_the_catalog_and_refuses_an_unapplied_floor() {
+async fn applied_owned_read_pins_the_catalog_without_reserving_or_delegating_a_present() {
     let cell = Cell::start(1, None).await;
     let id = uuid::Uuid::new_v4();
-    admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
+    let deployment = admin::install_deployment(cell.directory.as_ref(), id, "shop", "acme", 3).await.unwrap();
     let pgwire = cell.connect("shop").await;
     pgwire.simple_query("INSERT INTO orders (_id, total) VALUES (1, 77)").await.unwrap();
     pgwire.simple_query("SELECT total FROM orders").await.unwrap();
@@ -50,22 +50,43 @@ async fn applied_owned_read_reuses_the_catalog_and_refuses_an_unapplied_floor() 
     request.extend_from_slice(&floor.system_time.0.to_be_bytes());
     let mut raw = FlightServiceClient::new(channel(address).await);
     for _ in 0..2 {
-        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v1", request.clone()))
+        let before = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let mut results = raw.do_action(action("rtdb.owned.OpenAppliedRead.v2", request.clone()))
             .await.unwrap().into_inner();
         let result = results.message().await.unwrap().unwrap();
         assert!(results.message().await.unwrap().is_none());
         assert_eq!(result.body.len(), 32);
         assert_eq!(&result.body[16..24], &floor.system_time.0.to_be_bytes());
         assert_eq!(&result.body[24..32], &floor.tx_id.0.to_be_bytes());
+        let pinned = cell.directory.deployment(&deployment.id).await.unwrap().unwrap();
+        let (&reader, pin) = pinned.catalog_readers.iter()
+            .find(|(reader, _)| !before.catalog_readers.contains_key(*reader)).unwrap();
+        assert!(pin.cut.is_some());
+
+        let mut scoped = result.body[..16].to_vec();
+        scoped.extend_from_slice(&1u16.to_be_bytes());
+        scoped.extend_from_slice(&6u16.to_be_bytes());
+        scoped.extend_from_slice(b"orders");
+        let error = match raw.do_action(action("rtdb.owned.OpenOwnedScopedRead.v1", scoped)).await {
+            Ok(response) => response.into_inner().message().await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), Code::PermissionDenied);
+
         let mut closed = raw.do_action(action("rtdb.owned.CloseRead.v1", result.body[..16].to_vec()))
             .await.unwrap().into_inner();
         assert!(closed.message().await.unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cell.directory.deployment(&deployment.id).await.unwrap().unwrap().catalog_readers.contains_key(&reader) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
     }
     assert_eq!(node.latest_completed_transactions().unwrap()["shop"][0], Some(floor));
 
     request[..8].copy_from_slice(&(floor.tx_id.0 + 1).to_be_bytes());
     request[8..].copy_from_slice(&(floor.system_time.0 + 1).to_be_bytes());
-    let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v1", request)).await {
+    let error = match raw.do_action(action("rtdb.owned.OpenAppliedRead.v2", request)).await {
         Ok(response) => response.into_inner().message().await.unwrap_err(),
         Err(error) => error,
     };

@@ -135,15 +135,6 @@ impl Database {
         Ok(Arc::new(rtdb_storage::ReadLease::new(current, Arc::new(move || clock.monotonic_micros()))))
     }
 
-    /// Lease an applied catalog using the currency maintained by the database driver.
-    pub(crate) fn applied_read_lease(&self, clock: &Arc<dyn Clock>, garbage: &rtdb_maintenance::GarbageConfig) -> Result<Arc<rtdb_storage::ReadLease>> {
-        use rtdb_storage::read_lease::lease_deadline;
-        let (lease, margin) = (garbage.reader_lease_micros()?, garbage.reader_lease_margin_micros()?);
-        let applied = self.replication.status().installed.map(|prefix| prefix.replica);
-        let deadline = self.currency.anchor(applied).and_then(|anchor| lease_deadline(anchor, lease, margin));
-        let clock = Arc::clone(clock);
-        Ok(Arc::new(rtdb_storage::ReadLease::new(deadline, Arc::new(move || clock.monotonic_micros()))))
-    }
     pub async fn block_lag(&self) -> Result<i64> {
         let current = self.status().adopted_block.as_ref().map_or(-1, |block| block.block_index().0);
         let prefix = rtdb_storage::ObjectKey::new("blocks")?;

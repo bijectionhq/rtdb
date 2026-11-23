@@ -3,7 +3,7 @@ mod hosted_observation;
 mod unique;
 
 pub(crate) use hosted_control::READ_HELD_HOSTED_CONTROL_V1;
-pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V2, OBSERVE_HELD_HOSTED_V1};
+pub(crate) use hosted_observation::{CONFIRM_APPLIED_HOSTED_V3, OBSERVE_HELD_HOSTED_V1};
 pub(crate) use unique::READ_HELD_UNIQUE_V1;
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration};
@@ -175,7 +175,7 @@ pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_SCOPED_READ_V1: &str = "rtdb.owned.OpenOwnedScopedRead.v1";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
-pub(crate) const OPEN_APPLIED_OWNED_READ_V1: &str = "rtdb.owned.OpenAppliedRead.v1";
+pub(crate) const OPEN_APPLIED_OWNED_READ_V2: &str = "rtdb.owned.OpenAppliedRead.v2";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
 pub(crate) const HELD_WORLD_VERSION_V2: &str = "rtdb.owned.ReadHeldWorldVersion.v2";
@@ -1165,6 +1165,14 @@ impl Service {
     }
 
     fn owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
+        let entry = self.retained_owned_read(call, handle)?;
+        if entry.snapshot.is_applied() {
+            return Err(Status::permission_denied("The applied read handle is limited to point and hosted control observations"));
+        }
+        Ok(entry)
+    }
+
+    fn retained_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
         let entry = found(self.0.owned_reads.lookup(handle, false), "owned read")?;
         if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
             return Err(Status::not_found("unknown owned read"));
@@ -1176,7 +1184,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = self.owned_read(call, &handle)?;
+        let held = self.retained_owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
             if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
             return Err(status(error));
@@ -1190,7 +1198,7 @@ impl Service {
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned historical point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned historical point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
-        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Optional)?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
@@ -2200,7 +2208,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if body.len() != 16 { return Err(invalid("Owned read close requires one 16-byte handle")); }
         let handle = Bytes::copy_from_slice(body);
-        self.owned_read(call, &handle)?;
+        self.retained_owned_read(call, &handle)?;
         let entry = found(self.0.owned_reads.take(&handle), "owned read")?;
         entry.close();
         Ok(())

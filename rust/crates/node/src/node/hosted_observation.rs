@@ -167,7 +167,7 @@ impl OwnedReadSession {
     ) -> Result<Option<TransactionKey>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        if self.witness_scope != Some(scope)
+        if self.applied_scope != Some(scope)
             || self.node.now() >= until
             || controls.is_empty()
             || controls.iter().any(|control| !control.is_check() || control.scope() != scope)
