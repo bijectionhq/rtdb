@@ -824,7 +824,24 @@ impl TransactionBuffer {
     }
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event).map(drop) }
     /// As `append`, copying the table reference only for the table's first write.
-    pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<Option<NonZeroU32>> {
+    pub fn append_to(&mut self, table: &TableRef, event: StoredEvent) -> Result<Option<NonZeroU32>> {
+        let position = self.next_owned_position(table)?;
+        self.stage_event(table, event, position.unwrap_or(0))?;
+        if let Some(position) = position {
+            self.consume_owned_position(position);
+        }
+        Ok(position.and_then(NonZeroU32::new))
+    }
+
+    /// Stage an archive reconstruction that has no original assertion ordinal.
+    pub fn append_unpositioned_replay(&mut self, table: &TableRef, event: StoredEvent) -> Result<()> {
+        if !table.is_owned_event_data() || matches!(&self.owned_positions, Some(OwnedCommitPositions::Landing(_))) {
+            return Err(invalid("An unpositioned replay event requires an owned archive relation"));
+        }
+        self.stage_event(table, event, 0)
+    }
+
+    fn stage_event(&mut self, table: &TableRef, mut event: StoredEvent, position: u32) -> Result<()> {
         if event.entity_key.is_some() != table.is_owned_event_data() {
             return Err(invalid("The transaction event has the wrong physical entity-key layout"));
         }
@@ -832,7 +849,6 @@ impl TransactionBuffer {
         if event.commit_position != 0 {
             return Err(invalid("The transaction buffer assigns owned commit positions"));
         }
-        let position = self.next_owned_position(table)?;
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().try_for_each(Value::admit_object_dates)?; }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
         let bytes = document_bytes.checked_add(event.entity_key.as_ref().map_or(0, |key| key.len()))
@@ -840,14 +856,11 @@ impl TransactionBuffer {
             .ok_or_else(|| invalid("Transaction event size overflow"))?;
         let reservation = self.budget.reserve(bytes)?;
         if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
-        if let Some(position) = position {
-            event.commit_position = position;
-            self.consume_owned_position(position);
-        }
+        event.commit_position = position;
         let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         pending.events.push(event);
         pending.reservations.push(reservation);
-        Ok(position.and_then(NonZeroU32::new))
+        Ok(())
     }
     fn next_owned_position(&self, table: &TableRef) -> Result<Option<u32>> {
         Ok(if table.is_owned_event_data() {
@@ -1213,6 +1226,15 @@ mod chunk_tests {
         let put = transaction.append_owned_put(
             &table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None,
         ).unwrap();
+        let overlay = rtdb_types::OwnedRelation::new("locations").unwrap()
+            .in_world(Iid([1; 16])).unwrap().table("owner");
+        transaction.append_unpositioned_replay(&overlay, StoredEvent {
+            origin: None,
+            commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
+            system_from: key.system_time, valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
+            recency: None,
+        }).unwrap();
         let delete = transaction.append_to(&table, StoredEvent {
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
@@ -1222,6 +1244,8 @@ mod chunk_tests {
         assert_eq!(put, NonZeroU32::new(3));
         assert_eq!(delete, NonZeroU32::new(7));
         let staged = transaction.stage().unwrap();
+        let rebuilt = staged.tables()[&overlay].batch().unwrap();
+        assert_eq!(rebuilt.view().read_event(0).unwrap().header().commit_position, 0);
         let batch = staged.tables()[&table].batch().unwrap();
         let first = batch.view().read_event(0).unwrap();
         let second = batch.view().read_event(1).unwrap();
