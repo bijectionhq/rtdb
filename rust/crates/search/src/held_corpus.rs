@@ -6,7 +6,7 @@ use std::{
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 
 use crate::{OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
 
@@ -71,7 +71,7 @@ impl HeldTextCorpus {
         })
     }
 
-    pub fn observe(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
+    fn observe(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
         self.identities += 1;
         if self.identities > MAX_IDENTITIES {
             return Err(corpus_limit());
@@ -129,6 +129,60 @@ impl HeldTextCorpus {
         self.shadows.get(&partition).is_some_and(|ids| ids.contains(id))
     }
 
+    pub(crate) async fn read_root_partition(
+        &mut self,
+        context: &Arc<QueryContext>,
+        owner: &str,
+        relation: &OwnedRelation,
+        path: &OwnedRelation,
+        partition: usize,
+        valid: Timestamp,
+    ) -> Result<()> {
+        let column = owned_text_column(Arc::clone(context), owner, relation, path).await?;
+        let database = context.catalog.database(context.catalog.default_database())?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(corpus_limit()); };
+        if snapshot.system_time_cap() != Some(context.current_time.as_micros()?) {
+            return Err(corpus_limit());
+        }
+        let table = relation.table(owner);
+        if !snapshot.contains_table(&table) {
+            return Ok(());
+        }
+        let types = snapshot.column_types_for(&table, [column.clone()]);
+        if !types.get(&column).is_some_and(rtdb_types::LogicalType::is_clear_search_text) {
+            return Err(Anomaly::incorrect("rtdb.owned/search-column", "Owned search path no longer describes only clear text"));
+        }
+        let Some(mut cursor) = rtdb_query::open_owned_root_projection(
+            Arc::clone(context), owner, relation, valid, &["_id", &column],
+        ).await? else { return Err(corpus_limit()); };
+        let shadows = self.shadows.remove(&partition).unwrap_or_default();
+        while let Some(batch) = cursor.next_batch().await? {
+            let batch = batch.batch();
+            let schema = batch.schema_ref();
+            let (id_column, id_field) = schema.column_with_name("_id").ok_or_else(corpus_limit)?;
+            let (text_column, text_field) = schema.column_with_name(&column).ok_or_else(corpus_limit)?;
+            let ids = batch.column(id_column).as_ref();
+            let text = batch.column(text_column).as_ref();
+            for row in 0..batch.num_rows() {
+                context.check_cancelled_at(row)?;
+                let id_bytes = rtdb_columnar::estimate_read_value_bytes(id_field, ids, row)?;
+                let _identity = self.memory.reserve(id_bytes.saturating_mul(2))?;
+                let id = rtdb_columnar::read_value(id_field, ids, row)?.entity_id()?;
+                if shadows.contains(&id) { continue; }
+                let bytes = rtdb_columnar::estimate_read_value_bytes(text_field, text, row)?;
+                let _text = self.memory.reserve(bytes)?;
+                let value = rtdb_columnar::read_value(text_field, text, row)?;
+                let value = match &value {
+                    Value::Utf8(text) => Some(text.as_str()),
+                    Value::Null | Value::Undefined => None,
+                    _ => return Err(corpus_limit()),
+                };
+                self.shadow(partition, id, value)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn shadowed(&self, partition: usize) -> Option<&BTreeSet<EntityId>> {
         self.shadows.get(&partition)
     }
@@ -137,10 +191,14 @@ impl HeldTextCorpus {
         &self.corpus
     }
 
-    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow) -> Result<()> {
-        if scorer.query() != &self.query {
+    pub(crate) fn require_query(&self, query: &Query) -> Result<()> {
+        if query != &self.query {
             return Err(corpus_limit());
         }
+        Ok(())
+    }
+
+    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow) -> Result<()> {
         for matched in self.matches {
             window.admit_candidate()?;
             let score = scorer.score(&matched.frequencies, matched.length);

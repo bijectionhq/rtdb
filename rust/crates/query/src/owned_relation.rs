@@ -153,8 +153,8 @@ pub async fn open_owned_valid_boundaries(
     open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), Some(valid), Some(&["_id"]), true).await
 }
 
-/// Streams the projected members of an owned Root at the declaring transaction's cut.
-pub async fn open_owned_constraint_projection(
+/// Streams the projected members of an owned Root at the caller's admitted cut.
+pub async fn open_owned_root_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
     valid: Timestamp, columns: &[&str],
 ) -> Result<Option<QueryCursor>> {

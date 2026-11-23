@@ -13,7 +13,8 @@
 -- An owned clear-text declaration comes from the authenticated principal's protected search-path catalog.
 -- The artefact lane feeds its one explicitly declared UTF-8 column to the same search-file builder.
 -- Published files include the ordered definition version, artifact identity, and exact token length of each run.
--- Owned corpus statistics require published files covering all sources of the held cut.
+-- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
+-- Both ranking paths apply the same typed overlay shadows before computing corpus statistics.
 -- Owned runs carry their full typed identity. Ranked candidates verify that identity, their winning revision, and the declared text at the held cut.
 -- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
 -- Retained-world ranking checks for a placed world host before decoding the Flight request.

@@ -821,7 +821,7 @@ impl OpenTransaction<'_> {
                 self.trace_parent,
             )?
             .with_accelerators(Arc::from([]));
-        let Some(mut rows) = rtdb_query::open_owned_constraint_projection(
+        let Some(mut rows) = rtdb_query::open_owned_root_projection(
             context,
             owner,
             relation,

@@ -894,7 +894,6 @@ impl HeldCheckpointWorld {
         } else {
             Vec::new()
         };
-        let has_staged = staged.is_some();
         let overlay = if use_overlay {
             let corpus = match staged {
                 Some(staged) => staged,
@@ -907,17 +906,11 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
-            partitions: partitions.clone(), frontiers, query: query.clone(), overlay,
+            partitions, frontiers, query, overlay,
             ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
-            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
-        let page = match page {
-            Err(error) if !has_staged && !historical && earlier.is_none() && writable && error.code == "rtdb.owned/search-uncovered" => {
-                self.rank_visible_documents(&partitions, &columns, &query, offset, limit, valid, &guard).await?
-            }
-            other => other?,
-        };
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
         self.check()?;
         guard()?;
         Ok((page, witnesses))
@@ -996,31 +989,6 @@ impl HeldCheckpointWorld {
             return Err(OwnedWorld::unavailable());
         }
         Ok(columns)
-    }
-
-    async fn rank_visible_documents(
-        &self, partitions: &[(OwnedRelation, OwnedRelation)], columns: &[String], query: &str,
-        offset: usize, limit: usize, valid: Timestamp,
-        guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
-    ) -> Result<rtdb_node::OwnedSearchPage> {
-        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(&self.memory), query)?;
-        for (partition, ((relation, _), column)) in partitions.iter().zip(columns).enumerate() {
-            let mut after = None;
-            loop {
-                guard()?;
-                let page = self.identity_page(relation, valid, after.as_deref(), 128).await?;
-                for key in &page.keys {
-                    let id = EntityId::String(key.clone());
-                    let point = self.point(relation, &id, valid, false).await?;
-                    let fact = point.fact.ok_or_else(OwnedWorld::unavailable)?;
-                    corpus.observe(partition, id, search_text(&fact, column)?)?;
-                }
-                if !page.more { break; }
-                after = Some(page.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
-            }
-        }
-        guard()?;
-        corpus.finish(offset, limit)
     }
 
     pub async fn range(

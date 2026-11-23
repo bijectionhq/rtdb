@@ -87,7 +87,7 @@ impl ArchivedWorldConstraints<'_> {
             }
         }
         let names = projected_columns(&self.rules, &[], false);
-        if !self.rules.is_empty() && let Some(mut cursor) = rtdb_query::open_owned_constraint_projection(
+        if !self.rules.is_empty() && let Some(mut cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(&parent), self.owner, self.relation, self.valid, &names,
         ).await? {
             while let Some(batch) = cursor.next_batch().await? {
