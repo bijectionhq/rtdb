@@ -1,11 +1,25 @@
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == !installed,
+))]
 pub(crate) fn directory_route_allowed(installed: bool) -> bool {
     !installed
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == !(installed && moving),
+))]
 pub(crate) fn directory_move_park_allowed(installed: bool, moving: bool) -> bool {
     !(installed && moving)
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (directory_holding && !protected && resident),
+))]
 pub(crate) fn pressure_candidate(directory_holding: bool, protected: bool, resident: bool) -> bool {
     directory_holding && !protected && resident
 }

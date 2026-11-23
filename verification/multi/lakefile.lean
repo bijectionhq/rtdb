@@ -8,7 +8,7 @@ require logkeeper from git
 
 lean_lib OrderedModels where
   srcDir := "lean"
-  roots := #[`CheckpointReplay, `OrderedCapacity, `OrderedJournal, `OrderedQuorum, `ReplayClosure, `HeldWorldsOrder, `FencedTermAdmission, `MaintenanceBound]
+  roots := #[`CheckpointReplay, `OrderedCapacity, `OrderedJournal, `OrderedQuorum, `ReplayClosure, `HeldWorldsOrder, `FencedTermAdmission, `MaintenanceBound, `InstalledJournalGuards]
 
 lean_lib MaintenanceBound where
   srcDir := defaultPackagesDir / "logkeeper" / "verification" / "111-maintenance-liveness"

@@ -484,6 +484,7 @@ contract LogService {
         -- The reservation occupies the identity without supplying a directory deployment record, epoch or version.
         -- Directory creation and staging require an unreserved identity, and effects on an existing directory deployment require its versioned record.
         -- A worker sends a configured installed name through authenticated journal activation and uses directory control only for its directory deployments.
+        -- Execution-memory pressure selects only holdings under directory authority.
         -- The installed grant and custody decisions authorize serving, recovery, checkpoint publication, trim and retirement of journal-owned media.
 
     @invariant InstalledJournalOwnsWriterAndRecovery
@@ -555,6 +556,8 @@ contract LogService {
         -- Local checkpoint staging and readers share the allocation lock until exclusive retirement.
         -- A custodian synchronizes a reused local object and its directory entries before treating it as durable.
         -- The journal orders publication under the custodian before accepting trim through that cut.
+        -- An ordinary native checkpoint cut is the inclusive replica boundary plus one.
+        -- The custodian names the selected checkpoint and its exact cut when advancing the retained floor.
         -- A live replay reservation protects its exact interval, and an independent checkpoint hold protects its original root.
 
     @invariant InstalledServingPrefixRetirement
@@ -578,7 +581,8 @@ contract LogService {
         -- An authorized retirement of a superseded grant's prefix covers that prefix's candidate records as well.
 
     @invariant FreshJournalReadConsumesAnInvocation
-        -- The chosen read result authenticates the exact placement, writer grant, invocation and applied cut.
+        -- The journal admits a fresh barrier under the exact enrolled worker identity at its chosen head.
+        -- The chosen read result authenticates the exact placement, reader enrollment, invocation and applied cut.
         -- The receiving database applies the protected cut before the fresh read can proceed.
         -- Every read is a fresh admission under a new invocation, and the journal never replays an earlier read's result.
         -- A reader that loses a read's outcome releases it by invocation identity, and that release settles once the invocation can no longer be admitted.

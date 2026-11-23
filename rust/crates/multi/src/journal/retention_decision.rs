@@ -1,12 +1,23 @@
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+use crate::Cut;
+#[cfg(not(verus_keep_ghost))]
 use ordered_logkeeper::ordered::Cut;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(verus_keep_ghost), derive(Clone, Copy, Debug, PartialEq, Eq))]
 pub(crate) enum RetentionAction {
     DisposeExpired,
     RetainSelected,
     Publish,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out@[0] is DisposeExpired, out@[1] is RetainSelected, out@[2] is Publish,
+))]
 pub(crate) fn retention_actions() -> [RetentionAction; 3] {
     [
         RetentionAction::DisposeExpired,
@@ -15,6 +26,9 @@ pub(crate) fn retention_actions() -> [RetentionAction; 3] {
     ]
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (if -1 <= boundary < i64::MAX { Some((boundary as int + 1) as u64) } else { None }),
+))]
 pub(super) fn checkpoint_next_lsn(boundary: i64) -> Option<u64> {
     match boundary.checked_add(1) {
         Some(offset) if offset >= 0 => Some(offset as u64),
@@ -22,6 +36,9 @@ pub(super) fn checkpoint_next_lsn(boundary: i64) -> Option<u64> {
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (if floor.next_lsn < selected.next_lsn { Some(selected) } else { None }),
+))]
 pub(super) fn trim_target(floor: Cut, selected: Cut) -> Option<Cut> {
     if floor.next_lsn < selected.next_lsn {
         Some(selected)

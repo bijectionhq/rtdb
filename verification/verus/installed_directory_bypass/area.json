@@ -1,0 +1,178 @@
+{
+  "summary": "Installed reservations, named directory controls and pressure selection exclude installed journal deployments.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "production::dynamo",
+    "--verify-module",
+    "node",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 18,
+  "controls": {
+    "allow-reserved-stage": {
+      "defect": "A staged replacement can publish over an installed UUID.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "ensures out == !(reserved || (!replacing_stage && exists)),",
+          "replace": "ensures out == !(!replacing_stage && (reserved || exists)), "
+        },
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "    !(reserved || (!replacing_stage && exists))",
+          "replace": "    !(!replacing_stage && (reserved || exists))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "reserved_identity_refuses_directory_insert",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "reserve-existing-record": {
+      "defect": "A reservation succeeds for an already occupied directory identity.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "ensures out == !record_exists,",
+          "replace": "ensures out == record_exists,"
+        },
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "    !record_exists\n",
+          "replace": "    record_exists\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "directory_record_refuses_reservation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "reservation-with-version": {
+      "defect": "A DynamoDB reservation has a version field which can satisfy a conditional overwrite.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "out@[1]@ == \"installed_journal\"@",
+          "replace": "out@[1]@ == \"version\"@"
+        },
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "        [ID, INSTALLED_JOURNAL]",
+          "replace": "        [ID, VERSION]"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "dynamo_reservation_refuses_directory_write",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "reservation-without-key": {
+      "defect": "The projected DynamoDB reservation has no primary-key field.",
+      "mutate": [
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "out@[0]@ == \"id\"@",
+          "replace": "out@[0]@ == \"version\"@"
+        },
+        {
+          "file": "rust/crates/directory/src/installed_reservation.rs",
+          "find": "        [ID, INSTALLED_JOURNAL]",
+          "replace": "        [VERSION, INSTALLED_JOURNAL]"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "dynamo_reservation_refuses_directory_write",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "admit-installed-route": {
+      "defect": "Named directory node controls can run on an installed name.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/directory_bypass.rs",
+          "find": "ensures out == !installed,",
+          "replace": "ensures out == installed,"
+        },
+        {
+          "file": "rust/crates/multi/src/directory_bypass.rs",
+          "find": "    !installed\n",
+          "replace": "    installed\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "installed_name_refuses_directory_route",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "admit-installed-move": {
+      "defect": "A directory move may park an installed holding.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/directory_bypass.rs",
+          "find": "ensures out == !(installed && moving),",
+          "replace": "ensures out == (installed || !moving),"
+        },
+        {
+          "file": "rust/crates/multi/src/directory_bypass.rs",
+          "find": "    !(installed && moving)\n",
+          "replace": "    installed || !moving\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "installed_name_refuses_directory_move_park",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "pressure-includes-journal": {
+      "defect": "An eligible installed holding becomes a pressure victim.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/directory_bypass.rs",
+          "find": "ensures out == (directory_holding && !protected && resident),",
+          "replace": "ensures out == (!protected && resident),"
+        },
+        {
+          "file": "rust/crates/multi/src/directory_bypass.rs",
+          "find": "    directory_holding && !protected && resident\n",
+          "replace": "    !protected && resident\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_directory_bypass/laws.rs",
+          "function": "journal_holding_is_never_a_pressure_candidate",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    }
+  }
+}

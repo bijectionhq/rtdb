@@ -1,0 +1,273 @@
+{
+  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "uuid_model"
+  ],
+  "min_verified_functions": 23,
+  "controls": {
+    "ignore-placement-group": {
+      "defect": "An adapter accepts a route from a different group in the same deployment.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == (expected == observed),",
+          "replace": "ensures out == (expected == (Placement { group: expected.group, ..observed })),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "        && group.as_u128() == observed.group.as_u128()\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "observed_scope_must_match",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "use-wrong-request-principal": {
+      "defect": "The request sent under a worker or custodian certificate claims the route reader principal.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "out.principal == principal",
+          "replace": "out.principal == Principal::RouteReader"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    Request {\n        placement,\n        principal,",
+          "replace": "    Request {\n        placement,\n        principal: Principal::RouteReader,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "request_names_the_exact_scope",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "barrier_names_the_enrolled_reader",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "ignore-grant-key-generation": {
+      "defect": "An observed writer grant with the wrong key generation passes the local fence.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == (observed == Some(local)),",
+          "replace": "ensures out == (match observed { Some(g) => g == (Grant { key_generation: g.key_generation, ..local }), None => false }),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "        && grant.key_generation == key_generation\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "append_request_names_observed_head",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "ignore-read-retry-horizon": {
+      "defect": "A response with the correct nonce but a different retry horizon passes the barrier identity check.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == (invocation == read),",
+          "replace": "ensures out == (invocation.nonce == read.nonce),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "nonce.as_u128() == read.nonce.as_u128() && expires_at == read.expires_at",
+          "replace": "nonce.as_u128() == read.nonce.as_u128()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "barrier_returns_the_exact_read_identity",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "change-release-retry-horizon": {
+      "defect": "ReleaseRead carries the original nonce with a different expiry.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == (Command::ReleaseRead { read }),",
+          "replace": "ensures out == (Command::ReleaseRead { read: RequestId { expires_at: 0, ..read } }),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    Command::ReleaseRead { read }\n",
+          "replace": "    Command::ReleaseRead { read: RequestId { expires_at: 0, ..read } }\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "release_names_the_barrier_invocation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "append-at-zero": {
+      "defect": "Append names LSN zero regardless of the observed head.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "returned_next == expected_next",
+          "replace": "returned_next == 0"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "        expected_next,\n        timestamp,",
+          "replace": "        expected_next: 0,\n        timestamp,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "append_request_names_observed_head",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "change-lease-generation": {
+      "defect": "A lease renewal carries a generation other than the caller's grant generation.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == (Command::Lease { grant }),",
+          "replace": "ensures out == (Command::Lease { grant: Grant { key_generation: 0, ..grant } }),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    Command::Lease { grant }\n",
+          "replace": "    Command::Lease { grant: Grant { key_generation: 0, ..grant } }\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "lease_request_names_the_supplied_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "change-disposal-enrollment": {
+      "defect": "The custodian names the worker but loses the exact enrollment serial.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == (Command::DisposeExpired { enrollment }),",
+          "replace": "ensures out == (Command::DisposeExpired { enrollment: Enrollment { serial: 0, ..enrollment } }),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    Command::DisposeExpired { enrollment }\n",
+          "replace": "    Command::DisposeExpired { enrollment: Enrollment { serial: 0, ..enrollment } }\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "disposal_attempt_copies_the_queried_enrollment",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "ignore-selected-time": {
+      "defect": "A worker due for disposal at the observed journal time is not considered eligible.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "        Some(eligible) => eligible <= local_time || eligible <= route_time,\n        None => false,\n    }),",
+          "replace": "        Some(eligible) => eligible <= local_time,\n        None => false,\n    }),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "        Some(eligible) => eligible <= local_time || eligible <= route_time,\n        None => false,\n    }\n}",
+          "replace": "        Some(eligible) => eligible <= local_time,\n        None => false,\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "disposal_due_uses_eligibility",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "drop-append-references": {
+      "defect": "Append silently discards the supplied reference list.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "&& sent == references,",
+          "replace": "&& sent is None,"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "        references,\n",
+          "replace": "        references: None,\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "append_preserves_reference_list",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    },
+    "reuse-range-hold-for-barrier": {
+      "defect": "A fresh barrier sends a range hold instead of choosing the current read cut.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "ensures out == Command::Barrier,",
+          "replace": "ensures out == (Command::ProtectRange { from: 0, through: 0 }),"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    Command::Barrier\n",
+          "replace": "    Command::ProtectRange { from: 0, through: 0 }\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_adapter/laws.rs",
+          "function": "barrier_names_the_enrolled_reader",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
+    }
+  }
+}

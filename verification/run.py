@@ -1919,7 +1919,24 @@ def verify_fenced_replica_lean(args, scratch):
     )
 
 
+def verify_installed_guards_lean(args, scratch):
+    path = Path("verification/multi/lean/InstalledJournalGuards.lean")
+    verify_lean_model(args, scratch, path, "installed-journal-guards", {
+        "drop-append-references": (
+            ": Option (List Nat) := supplied",
+            ": Option (List Nat) := match supplied with | none => none | some _ => none",
+            ["a_reference_list_stays_explicit_across_append_construction", "append_preserves_reference_list"],
+        ),
+        "ignore-reader-serial": (
+            "| .worker reader => roster = some reader",
+            "| .worker reader => roster.map Enrollment.worker = some reader.worker",
+            ["barrier_refuses_a_superseded_enrollment"],
+        ),
+    }, 22)
+
+
 def verify_lean(args, scratch):
+    verify_installed_guards_lean(args, scratch)
     verify_fenced_replica_lean(args, scratch)
     verify_gateway_replay_lean(args, scratch)
     verify_lean_model(

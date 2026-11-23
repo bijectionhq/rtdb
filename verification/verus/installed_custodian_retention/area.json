@@ -1,0 +1,110 @@
+{
+  "summary": "The maintenance pass attempts disposal before trim and binds a trim to the exact selected checkpoint cut.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 7,
+  "controls": {
+    "retain-before-dispose": {
+      "defect": "The maintenance pass attempts trim before checking expired workers.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "out@[0] is DisposeExpired, out@[1] is RetainSelected",
+          "replace": "out@[0] is RetainSelected, out@[1] is DisposeExpired"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "        RetentionAction::DisposeExpired,\n        RetentionAction::RetainSelected,",
+          "replace": "        RetentionAction::RetainSelected,\n        RetentionAction::DisposeExpired,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_custodian_retention/laws.rs",
+          "function": "retention_attempts_disposal_before_trim",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "advance-two-from-boundary": {
+      "defect": "An offered checkpoint covers one extra record after its boundary.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "if -1 <= boundary < i64::MAX { Some((boundary as int + 1) as u64) }",
+          "replace": "if -2 <= boundary < i64::MAX - 1 { Some((boundary as int + 2) as u64) }"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "    match boundary.checked_add(1)",
+          "replace": "    match boundary.checked_add(2)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_custodian_retention/laws.rs",
+          "function": "checkpoint_next_lsn_is_boundary_successor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "trim-beyond-selected": {
+      "defect": "Trim advances to the maximum LSN instead of the selected successor.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "{ Some(selected) }",
+          "replace": "{ Some(Cut { next_lsn: u64::MAX, ..selected }) }"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "        Some(selected)\n",
+          "replace": "        Some(Cut { next_lsn: u64::MAX, ..selected })\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_custodian_retention/laws.rs",
+          "function": "trim_uses_selected_cut",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/installed_custodian_retention/laws.rs",
+          "function": "native_trim_stops_at_boundary_successor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 5
+    },
+    "trim-at-wrong-history": {
+      "defect": "Trim reuses the floor digest at the selected position.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "{ Some(selected) }",
+          "replace": "{ Some(Cut { history: floor.history, ..selected }) }"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/retention_decision.rs",
+          "find": "        Some(selected)\n",
+          "replace": "        Some(Cut { history: floor.history, ..selected })\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/installed_custodian_retention/laws.rs",
+          "function": "trim_uses_selected_cut",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 6
+    }
+  }
+}

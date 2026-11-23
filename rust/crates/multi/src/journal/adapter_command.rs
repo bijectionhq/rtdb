@@ -1,8 +1,22 @@
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+use crate::{
+    AppendClass, Bytes, Command, Enrollment, Grant, ObjectName, Placement, Principal, Request, RequestId,
+};
+#[cfg(not(verus_keep_ghost))]
 use bytes::Bytes;
+#[cfg(not(verus_keep_ghost))]
 use ordered_logkeeper::ordered::{
     AppendClass, Command, Enrollment, Grant, ObjectName, Placement, Principal, Request, RequestId,
 };
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (expected == observed),
+))]
 pub(super) fn placement_matches(expected: Placement, observed: Placement) -> bool {
     let Placement {
         deployment,
@@ -16,11 +30,20 @@ pub(super) fn placement_matches(expected: Placement, observed: Placement) -> boo
         && generation == observed.generation
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (invocation == read),
+))]
 pub(super) fn barrier_read_matches(invocation: RequestId, read: RequestId) -> bool {
     let RequestId { nonce, expires_at } = invocation;
     nonce.as_u128() == read.nonce.as_u128() && expires_at == read.expires_at
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (match eligible_at {
+        Some(eligible) => eligible <= local_time || eligible <= route_time,
+        None => false,
+    }),
+))]
 pub(super) fn disposal_is_due(eligible_at: Option<u64>, local_time: u64, route_time: u64) -> bool {
     match eligible_at {
         Some(eligible) => eligible <= local_time || eligible <= route_time,
@@ -28,6 +51,9 @@ pub(super) fn disposal_is_due(eligible_at: Option<u64>, local_time: u64, route_t
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out.placement == placement, out.principal == principal, out.id == id, out.command == command,
+))]
 pub(super) fn scoped_request(
     placement: Placement,
     principal: Principal,
@@ -42,6 +68,9 @@ pub(super) fn scoped_request(
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (observed == Some(local)),
+))]
 pub(super) fn same_writer(observed: Option<Grant>, local: Grant) -> bool {
     let Some(grant) = observed else {
         return false;
@@ -57,14 +86,27 @@ pub(super) fn same_writer(observed: Option<Grant>, local: Grant) -> bool {
         && grant.key_generation == key_generation
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == Command::Barrier,
+))]
 pub(super) fn barrier_command() -> Command {
     Command::Barrier
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (Command::ReleaseRead { read }),
+))]
 pub(super) fn release_read_command(read: RequestId) -> Command {
     Command::ReleaseRead { read }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out matches Command::Append {
+        class: returned_class, grant: returned_grant, expected_next: returned_next,
+        timestamp: returned_timestamp, payload: returned_payload, references: sent,
+    } && returned_class == class && returned_grant == grant && returned_next == expected_next
+        && returned_timestamp == timestamp && returned_payload == payload && sent == references,
+))]
 pub(super) fn append_command(
     class: AppendClass,
     grant: Grant,
@@ -83,10 +125,16 @@ pub(super) fn append_command(
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (Command::Lease { grant }),
+))]
 pub(super) fn lease_command(grant: Grant) -> Command {
     Command::Lease { grant }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (Command::DisposeExpired { enrollment }),
+))]
 pub(super) fn dispose_expired_command(enrollment: Enrollment) -> Command {
     Command::DisposeExpired { enrollment }
 }
