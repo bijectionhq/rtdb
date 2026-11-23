@@ -3,7 +3,14 @@ use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
-pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v17";
+pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v18";
+
+pub(crate) const AUDIENCE_READ_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
+    provider_requests: 256,
+    provider_bytes: 32 << 20,
+    scan_items: 65_536,
+    decode_bytes: 64 << 20,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudienceFlightConfig {

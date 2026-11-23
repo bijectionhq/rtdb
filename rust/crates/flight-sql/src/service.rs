@@ -48,7 +48,7 @@ pub(crate) struct Call {
     pub minted: bool,
     pub database: String,
     pub cancellation: CancellationToken,
-    _admission: Admission,
+    admission: Arc<Admission>,
     _lease: Option<AcquiredSession>,
     _active_call: Option<Box<dyn Send + Sync>>,
     _reservation: Arc<MemoryReservation>,
@@ -64,6 +64,11 @@ impl Drop for Call {
     fn drop(&mut self) { self.cancellation.cancel(); self._lease.take(); }
 }
 impl Call {
+    pub(crate) fn audience_io_owner(&self) -> Option<Arc<dyn Send + Sync>> {
+        self.session.audience_source()?;
+        Some(Arc::new((Arc::clone(&self.admission), Arc::clone(&self.session))))
+    }
+
     pub fn response<T>(&self, value: T) -> Result<Response<T>, Status> {
         let mut response = Response::new(value);
         if self.session.closed() {
@@ -158,7 +163,7 @@ impl Service {
         let sessions = self.sessions(audience.is_some());
         let permits = audience.map_or(&self.0.permits, |audience| &audience.calls);
         let permit = Arc::clone(permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
-        let admission = Admission::new(self.clone(), permit);
+        let admission = Arc::new(Admission::new(self.clone(), permit));
         let header_bytes = request.metadata().iter().try_fold(4096usize, |bytes, entry| {
             let size = match entry { tonic::metadata::KeyAndValueRef::Ascii(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())?, tonic::metadata::KeyAndValueRef::Binary(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())? };
             wire::add(bytes, wire::mul(size, 16)?)
@@ -237,7 +242,7 @@ impl Service {
         let (database, attachment) = session.resolve_database(requested_database, &self.0.node)?;
         let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment));
         let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(),
-            _admission: admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
+            admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
         self.publish(); Ok(call)
     }
     pub async fn admit_database(&self, database: &str) -> Result<bool, Status> {

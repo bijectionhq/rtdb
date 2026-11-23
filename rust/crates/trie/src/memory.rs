@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
 
 use rtdb_columnar::IidView;
-use rtdb_types::{Anomaly, Iid, Result};
+use rtdb_types::{Anomaly, Iid, MemoryBudget, MemoryReservation, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bucketer::invalid_bucket_depth;
@@ -60,11 +60,26 @@ impl Leaf {
     pub fn sorted_rows<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Arc<[u32]>> {
         if self.log.is_empty() { return Ok(Arc::clone(&self.data)); }
         if let Some(sorted) = self.sorted.get() { return Ok(Arc::clone(sorted)); }
-        let merged: Arc<[u32]> = merge_pending_rows(&self.data, self.log.iter().copied(), |row| {
-            reader.iid(row).map(|iid| iid.0)
-        })?.into();
+        let merged: Arc<[u32]> = self.merge_rows(reader)?.into();
         let _ = self.sorted.set(Arc::clone(&merged));
         Ok(merged)
+    }
+
+    /// Copies and orders rows in the caller's budget without consulting or populating the shared leaf cache.
+    pub fn sorted_rows_in<R: IidReader + ?Sized>(&self, reader: &R, memory: &Arc<MemoryBudget>) -> Result<(Vec<u32>, Arc<MemoryReservation>)> {
+        let overflow = || Anomaly::incorrect("rtdb/trie-sort-allocation", "Trie sorting allocation exceeds addressable memory");
+        let bytes = self.len().checked_mul(std::mem::size_of::<u32>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(overflow)?;
+        let retained = memory.reserve(bytes)?;
+        if self.log.is_empty() { return Ok((self.data.to_vec(), retained)); }
+        let scratch = self.log.len().checked_mul(std::mem::size_of::<crate::leaf_sort_step::KeyedRow>() + std::mem::size_of::<u32>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+        let _scratch = memory.reserve(scratch)?;
+        Ok((self.merge_rows(reader)?, retained))
+    }
+
+    fn merge_rows<R: IidReader + ?Sized>(&self, reader: &R) -> Result<Vec<u32>> {
+        merge_pending_rows(&self.data, self.log.iter().copied(), |row| reader.iid(row).map(|iid| iid.0))
     }
 }
 

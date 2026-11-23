@@ -12,7 +12,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builde
 use rtdb_format::{ipc::{PageDecoder, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
-use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease, Cached, View}};
+use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
 use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp, Value};
@@ -52,12 +52,18 @@ impl DataFile {
             bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?)
                 .ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
         }
+        audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
         let batch = reader.decode_page(page, page_buffer(bytes))?;
         Ok((batch, charged))
     }
 
     async fn read_range(&self, whole: Option<&CacheLease>, range: std::ops::Range<u64>, memory: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        if audience_work::is_bounded() {
+            let bytes = range.end.checked_sub(range.start).and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| invalid("page-range", "Scan range exceeds addressable memory"))?;
+            audience_work::decode_bytes(bytes)?;
+        }
         if let Some(whole) = whole {
             let start = usize::try_from(range.start).map_err(|error| invalid("page-range", error))?;
             let end = usize::try_from(range.end).map_err(|error| invalid("page-range", error))?;
@@ -68,6 +74,7 @@ impl DataFile {
 
     async fn open_layout(&self, whole: Option<&CacheLease>, memory: &Arc<MemoryBudget>) -> Result<(Arc<CachedLayout>, Arc<MemoryReservation>)> {
         if let Some(cached) = self.storage.view::<CachedLayout>(&self.key, View::Layout) {
+            audience_work::decode_bytes(cached._reservation.bytes())?;
             let opening = memory.reserve(cached._reservation.bytes())?;
             return Ok((cached, opening));
         }
@@ -80,12 +87,15 @@ impl DataFile {
         let bytes = self.read_range(whole, footer..tail, memory).await?;
         let bound = length.checked_mul(16).and_then(|bytes| bytes.checked_add(65_536))
             .ok_or_else(|| invalid("file-layout-size", "Arrow footer allocation exceeds addressable memory"))?;
+        audience_work::decode_bytes(bound)?;
         let opening = memory.reserve(bound)?;
         let mut decoder = PageDecoder::from_footer(bytes.as_slice(), footer, None)?;
         let mut dictionaries = Vec::new();
         for index in 0..decoder.dictionary_count() {
             let bytes = self.read_range(whole, decoder.dictionary_range(index)?, memory).await?;
-            dictionaries.push(memory.reserve(decoder.dictionary_bound(index, bytes.as_slice())?)?);
+            let bound = decoder.dictionary_bound(index, bytes.as_slice())?;
+            audience_work::decode_bytes(bound)?;
+            dictionaries.push(memory.reserve(bound)?);
             decoder.load_dictionary(index, page_buffer(bytes))?;
         }
         // Dictionary buffers are charged to this query. Cache only directories that do not retain those buffers.
@@ -891,9 +901,17 @@ impl PartitionScan {
         let catalog = self.snapshot.trie_catalog();
         // A trie without rows has no temporal bounds to record, and a candidate without bounds stops the selection below
         // from pruning any other: compaction writes such a current trie whenever every row it merges has a finite recency.
-        let current_tries = || catalog.iter_tries(table).filter(|trie| trie.state == TrieState::Live
-            && !trie.metadata.as_ref().is_some_and(|metadata| metadata.row_count == Some(0)));
-        let trie_count = current_tries().count();
+        let candidate = |trie: &CatalogTrie| trie.state == TrieState::Live
+            && !trie.metadata.as_ref().is_some_and(|metadata| metadata.row_count == Some(0));
+        let current_tries = || catalog.iter_tries(table).filter(|trie| candidate(trie));
+        let trie_count = if audience_work::is_bounded() {
+            catalog.iter_tries(table).try_fold(0, |count, trie| -> Result<usize> {
+                audience_work::scan_items(1)?;
+                Ok(count + candidate(trie) as usize)
+            })?
+        } else {
+            current_tries().count()
+        };
         let candidate_reservation = if trie_count == 0 { None } else {
             let bytes = trie_count.checked_mul(std::mem::size_of::<&CatalogTrie>()).and_then(|bytes| bytes.checked_add(256))
                 .ok_or_else(|| invalid("scan-candidate-size", "Scan trie candidate capacity exceeds addressable memory"))?;
@@ -919,12 +937,19 @@ impl PartitionScan {
         let mut pages = PageDescriptors::default();
         let mut live_segment_count = 0;
         for segment in self.snapshot.iter_segments(table) {
+            audience_work::scan_items(1)?;
             let priority = live_segment_count;
             live_segment_count += 1;
             segment.trie().try_visit_leaves(|leaf| {
+                audience_work::scan_items(1)?;
                 let (lower, upper) = path_range(leaf.path().as_slice())?;
                 if !self.path_matches(lower, upper) { return Ok(()); }
-                let rows = segment.located_rows(leaf)?;
+                audience_work::scan_items(leaf.len())?;
+                let rows = if audience_work::is_bounded() {
+                    segment.located_rows_in(leaf, &self.execution.context.memory)?
+                } else {
+                    segment.located_rows(leaf)?
+                };
                 let temporal = summarize_headers(rows.headers.iter().copied());
                 pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true, unread: None,
                     summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)
@@ -985,12 +1010,17 @@ impl PartitionScan {
             let slug = slug.as_ref().ok_or_else(|| invalid("missing-table-slug", "Persisted trie has no recorded table registry entry"))?;
             let key = ObjectKey::new(slug.metadata_key(&trie.key))?;
             let (metadata, _reservation) = match self.storage.view::<CachedMetadata>(&key, View::File) {
-                Some(cached) => (Arc::clone(&cached.metadata), self.execution.context.memory.reserve(cached.bound)?),
+                Some(cached) => {
+                    audience_work::decode_bytes(cached.bound)?;
+                    (Arc::clone(&cached.metadata), self.execution.context.memory.reserve(cached.bound)?)
+                }
                 None => {
                     let lease = self.storage.get_or(&key, &self.execution.context.memory).await?;
+                    audience_work::decode_bytes(lease.as_slice().len())?;
                     let mut cursor = Cursor::new(lease);
                     let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
                     let bound = layout.full_allocation_bound()?;
+                    audience_work::decode_bytes(bound)?;
                     let reservation = self.execution.context.memory.reserve(bound)?;
                     let metadata = Arc::new(MetadataFile::read_reader(cursor)?);
                     if let Some(retained) = self.storage.admit(metadata.stored_bytes())
@@ -1010,6 +1040,7 @@ impl PartitionScan {
                 pending.push(MetadataVisit { node, path: [0; MAX_IID_DEPTH], depth: 0, recency: trie_recency }, memory)?;
             }
             while let Some(visit) = pending.entries.pop() {
+                audience_work::scan_items(1)?;
                 self.execution.context.check_cancelled()?;
                 let path = visit.path.get(..visit.depth).ok_or_else(invalid_iid_path)?;
                 let (lower, upper) = path_range(path)?;
@@ -1023,9 +1054,12 @@ impl PartitionScan {
                             pending.push(next, memory)?;
                         }
                     },
-                    MetadataNode::RecencyBranch(children) => for (upper, node) in children.iter().rev() {
-                        pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
-                    },
+                    MetadataNode::RecencyBranch(children) => {
+                        audience_work::scan_items(children.len())?;
+                        for (upper, node) in children.iter().rev() {
+                            pending.push(MetadataVisit { node: *node, recency: visit.recency.min(*upper), ..visit }, memory)?;
+                        }
+                    }
                     MetadataNode::Leaf { data_page_index, columns } => {
                         // An ordered scan may stop after its first tasks, so it reads a leaf's statistics when it reaches the leaf's task.
                         let (content_matches, temporal, unread) = if self.order.is_some() { (true, None, Some(visit.node)) } else {
@@ -1066,6 +1100,7 @@ impl PartitionScan {
             let data = &self.files.entries[*file];
             let read = match data.storage.view::<CachedMetadata>(&data.metadata, View::File) {
                 Some(cached) => {
+                    audience_work::decode_bytes(cached.bound)?;
                     let _charge = self.execution.context.memory.reserve(cached.bound)?;
                     let Some(MetadataNode::Leaf { columns, .. }) = cached.metadata.nodes().get(node) else { return Err(invalid("metadata-node", "A page's metadata node is not a leaf")) };
                     let columns = &columns.statistics()?;
@@ -1094,6 +1129,7 @@ impl PartitionScan {
         let rows = match (&page.source, hit) {
             (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table), rows: Arc::clone(rows) },
             (PageSource::File { .. }, Some(held)) => {
+                audience_work::decode_bytes(held.bound)?;
                 charge = Some(self.execution.context.memory.reserve(held.bound)?);
                 cached = true;
                 ActiveRows::File(Arc::clone(&held.batch))
@@ -1102,6 +1138,7 @@ impl PartitionScan {
                 let data = &mut self.files.entries[*file];
                 let (page, charged) = data.decode_page(*page_index, &self.execution.context.memory).await?;
                 let bound = charged.bytes();
+                audience_work::scan_items(page.num_rows())?;
                 let headers = IndexBatch::header_bytes(page.num_rows())?;
                 let batch = match data.storage.admit(bound).zip(data.storage.admit(headers)) {
                     Some((reservation, headers)) => {
@@ -1147,10 +1184,12 @@ impl PartitionScan {
             self.output_reservation = None;
             let task = self.tasks.as_mut().map(ScanTaskPlan::next).transpose()?.flatten();
             let Some(task) = task else { self.loaded.clear();return Ok(None); };
+            audience_work::scan_items(1)?;
             if self.path_matches(task.range.lower,task.range.upper) { self.buffer_task(task).await?; }
         }
     }
     async fn buffer_task(&mut self,task: ScanTask) -> Result<()> {
+        audience_work::scan_items(task.pages.len())?;
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
         self.read_statistics(&task.pages)?;
@@ -1198,6 +1237,7 @@ impl PartitionScan {
         let mut handles: Vec<Vec<u32>> = vec![Vec::new(); active.len()];
         let mut next = heads.pop();
         while let Some(head) = next.take() {
+            audience_work::scan_items(1)?;
             self.execution.context.check_cancelled_at(visited)?;
             visited += 1;
             let rows = active[head.active];

@@ -1,4 +1,4 @@
-use crate::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
+use crate::{audience_work, Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -199,7 +199,9 @@ impl ObjectStore for RemoteStore {
         let (objects, key) = (self.objects.clone(), key.clone());
         self.io.run_async(async move {
             let path = objects.path(&key);
-            let response = match objects.read(&key, GetOptions::new().with_range(Some(range.clone()))).await {
+            let length = usize::try_from(range.end - range.start)
+                .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
+            let response = match objects.read(&key, GetOptions::new().with_range(Some(range.clone())), Some(length)).await {
                 Ok(response) => response,
                 Err(error @ Error::MissingObject(_)) => return Err(error),
                 Err(error) => {
@@ -213,8 +215,6 @@ impl ObjectStore for RemoteStore {
                 return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
             }
             let version = physical_version(Some(&namespace), &path, response.meta.version.clone());
-            let length = usize::try_from(range.end - range.start)
-                .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
             let value = collect_exact_body(response, &key, length, || Error::Remote {
                 key: key.to_string(), message: "provider returned a different byte range length".into(),
             }).await?;
@@ -390,10 +390,17 @@ impl RemoteObjects {
         if IoRegion::requires_audience_transport() {
             return self.audience_reader.as_deref().ok_or_else(|| Error::Closed("The provider has no dedicated audience read transport".into()));
         }
+        if audience_work::is_bounded() {
+            return Err(Error::Closed("The audience action requires its dedicated object transport".into()));
+        }
         Ok(self.client.as_ref())
     }
 
-    async fn read(&self, key: &ObjectKey, options: GetOptions) -> Result<GetResult> {
+    async fn read(&self, key: &ObjectKey, options: GetOptions, body_bytes: Option<usize>) -> Result<GetResult> {
+        if audience_work::is_bounded() {
+            let bytes = body_bytes.ok_or_else(|| Error::Closed("An audience provider read requires an exact body length".into()))?;
+            audience_work::provider_read(bytes)?;
+        }
         let response = self.reader()?.get_opts(&self.path(key), options).await.map_err(|error| provider_error(key, error))?;
         if self.is_tombstone(&response) {
             return Err(Error::MissingObject(key.to_string()));
@@ -409,8 +416,9 @@ impl RemoteObjects {
 
     async fn metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
         if self.hide_tombstones {
-            return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }).await?.meta);
+            return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }, Some(0)).await?.meta);
         }
+        audience_work::provider_read(0)?;
         self.reader()?.head(&self.path(key)).await.map_err(|error| provider_error(key, error))
     }
 
@@ -420,12 +428,12 @@ impl RemoteObjects {
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        self.read(key, GetOptions::default()).await?.bytes().await.map_err(|error| provider_error(key, error))
+        self.read(key, GetOptions::default(), None).await?.bytes().await.map_err(|error| provider_error(key, error))
     }
 
     async fn observe_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
         let path = self.path(key);
-        let object = self.read(key, GetOptions::default()).await?;
+        let object = self.read(key, GetOptions::default(), Some(length)).await?;
         let wrong_size = || crate::object_store::wrong_size(key, length);
         if object.meta.size != length as u64 || object.range != (0..length as u64) {
             return Err(wrong_size());
@@ -441,6 +449,8 @@ impl RemoteObjects {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
         }
         if range.is_empty() { return Ok(Bytes::new()); }
+        let requested = usize::try_from(range.end - range.start).map_err(|_| Error::AudienceWorkLimit)?;
+        audience_work::provider_read(requested)?;
         let bytes = self.reader()?.get_range(&self.path(key), range.clone()).await.map_err(|error| provider_error(key, error))?;
         if bytes.len() as u64 != range.end - range.start {
             return Err(Error::Remote { key: key.to_string(), message: "provider returned an incomplete byte range".into() });
@@ -562,6 +572,9 @@ impl RemoteObjects {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
+        if audience_work::is_bounded() {
+            return Err(Error::Closed("An audience action cannot list provider objects".into()));
+        }
         let namespace = self.prefix.as_ref().map(|key| Path::from(key.as_str()));
         let path = directory.map(|key| self.path(key)).or_else(|| namespace.clone());
         let prefix = namespace.map(|path| format!("{path}/"));

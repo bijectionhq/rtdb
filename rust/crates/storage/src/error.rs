@@ -28,6 +28,8 @@ pub enum Error {
     MessageTooLarge { size: usize, maximum: usize },
     #[error("cache requires {requested} bytes; limit is {limit} with {retained} retained")]
     MemoryLimit { requested: usize, limit: usize, retained: usize },
+    #[error("audience read work exceeded its installed allowance")]
+    AudienceWorkLimit,
     #[error("storage task failed: {0}")]
     Task(String),
     #[error("remote storage at {key}: {message}")]
@@ -66,6 +68,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::LogReadLimit { maximum_records, maximum_payload_bytes } => (Category::Busy, "rtdb.storage/log-read-limit", serde_json::json!({"maximum-records": maximum_records, "maximum-payload-bytes": maximum_payload_bytes})),
             Error::MessageTooLarge { size, maximum } => (Category::Incorrect, "rtdb.storage/message-too-large", serde_json::json!({"size": size, "maximum": maximum})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
+            Error::AudienceWorkLimit => (Category::Busy, "rtdb.storage/audience-work-limit", serde_json::json!({})),
             Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
             Error::Deposed { epoch, promised } => (Category::Conflict, "rtdb.storage/deposed", serde_json::json!({"epoch": epoch, "promised": promised})),

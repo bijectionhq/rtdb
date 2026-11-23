@@ -205,9 +205,25 @@ impl LiveTable {
         let key = leaf as *const rtdb_trie::Leaf as usize;
         if let Some(rows) = self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.get(&key) { return Ok(Arc::clone(rows)); }
         let rows = leaf.sorted_rows(self)?;
-        let bytes = rows.len().checked_mul(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()).and_then(|bytes| bytes.checked_add(256))
-            .ok_or_else(|| invalid("Located leaf rows exceed addressable memory"))?;
-        let _reservation = self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget().reserve(bytes)).transpose()?;
+        let bytes = Self::located_row_bytes(rows.len())?;
+        let reservation = self.chunks.first().map(|(_, batch)| batch.owned.reservation().budget().reserve(bytes)).transpose()?;
+        let rows = self.copy_located_rows(&rows, reservation)?;
+        Ok(Arc::clone(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.entry(key).or_insert(rows)))
+    }
+
+    /// Locates the leaf under the caller's prepaid memory with no shared cache dependency.
+    pub fn located_rows_in(&self, leaf: &rtdb_trie::Leaf, memory: &Arc<MemoryBudget>) -> Result<Arc<LocatedRows>> {
+        let reservation = memory.reserve(Self::located_row_bytes(leaf.len())?)?;
+        let (rows, _sorted) = leaf.sorted_rows_in(self, memory)?;
+        self.copy_located_rows(&rows, Some(reservation))
+    }
+
+    fn located_row_bytes(count: usize) -> Result<usize> {
+        count.checked_mul(std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<EventHeader>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("Located leaf rows exceed addressable memory"))
+    }
+
+    fn copy_located_rows(&self, rows: &[u32], _reservation: Option<Arc<MemoryReservation>>) -> Result<Arc<LocatedRows>> {
         let mut located = Vec::with_capacity(rows.len());
         let mut headers = Vec::with_capacity(rows.len());
         for row in rows.iter() {
@@ -215,8 +231,7 @@ impl LiveTable {
             headers.push(self.header_at(at)?);
             located.push(at);
         }
-        let rows = Arc::new(LocatedRows { located, headers, _reservation });
-        Ok(Arc::clone(self.located.0.lock().map_err(|_| invalid("Located leaf cache is poisoned"))?.entry(key).or_insert(rows)))
+        Ok(Arc::new(LocatedRows { located, headers, _reservation }))
     }
     /// The header of a row `locate` found.
     pub fn header_at(&self, (chunk, offset): (u32, u32)) -> Result<EventHeader> {

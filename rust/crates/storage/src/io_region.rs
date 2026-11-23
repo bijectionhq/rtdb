@@ -150,8 +150,10 @@ impl IoRegion {
     async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let audience = Self::requires_audience_transport();
+        let budget = crate::audience_work::current();
         tokio::spawn(async move {
             let operation = operation;
+            let work = crate::audience_work::inherit(budget, work);
             let result = if audience { Self::audience_object_read(work).await } else { work.await };
             drop(sender.send(result));
             drop(operation);

@@ -237,6 +237,14 @@ impl Service {
                 _ => Err(unsupported()),
             }
         };
+        let owner = call.audience_io_owner();
+        let work = async move {
+            match owner {
+                Some(owner) => rtdb_storage::IoRegion::retaining(owner,
+                    rtdb_storage::audience_work::within(Some(crate::config::AUDIENCE_READ_LIMITS), work)).await,
+                None => work.await,
+            }
+        };
         let results = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         self.publish(); result_stream(call, results)
     }
