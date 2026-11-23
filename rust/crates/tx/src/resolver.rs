@@ -3672,6 +3672,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hosted_root_can_publish_only_a_ready_spatial_index() -> Result<()> {
+        use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, PlacedAttemptScope, SpatialGeometryEncoding};
+
+        let scope = PlacedAttemptScope::new("spatial-catalog", 1)?;
+        let memory = MemoryBudget::new(1 << 24);
+        let context = ResolveContext {
+            write_event_origins: false,
+            placed_receipt_retirement: false,
+            owned_witness_scope: Some(scope),
+            world_constraints: None,
+            database: "application".into(),
+            storage: Arc::new(BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            memory: Arc::clone(&memory),
+            query_options: QueryOptions::default(),
+            scan_accelerators: Default::default(),
+            cancellation: CancellationToken::new(),
+            default_tz: "UTC".into(),
+            authorization: Arc::new(NoRoleChecks),
+            execution_observer: None,
+            tracer: None,
+        };
+        let options = SubmitOptions { user: Some("owner".into()), ..Default::default() };
+        let state = rtdb_index::PartitionState::empty(Default::default())?;
+        let installed_at = TransactionKey { tx_id: TxId(1), system_time: Timestamp(100) };
+        let mut installation = OpenTransaction::new(state.snapshot(), installed_at, &options, &context)?;
+        let relation = OwnedRelation::new("places")?;
+        let path = OwnedRelation::new("by-location")?;
+        let catalog = OwnedRelation::new("bj_fact_root_owner")?;
+        let marker = OwnedRelation::new("fact_publications")?;
+        let catalog_row = |schema| StructFields::from([
+            ("_id".into(), Value::Utf8("root".into())),
+            ("schema".into(), Value::I64(schema)),
+        ]);
+        installation.buffer.put(
+            TableRef::new("public", catalog.name()),
+            catalog_row(1),
+            Interval::new(Timestamp(0), Timestamp::MAX)?,
+        )?;
+        let schema = OwnedSchema::from_json(
+            br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#,
+        )?;
+        installation.apply(&Operation::Public(TxOp::OwnedDeclareRelation {
+            relation: relation.clone(), schema,
+        })).await?;
+        installation.apply(&Operation::Public(TxOp::OwnedDeclareRelation {
+            relation: marker.clone(), schema: OwnedSchema::from_json(br#"{"fields":[]}"#)?,
+        })).await?;
+        let durable = installation.snapshot()?;
+        let mut resolver = TxResolver::new(durable.tx_basis(), SourcePosition(1), None, &memory)?;
+        let encoding = SpatialGeometryEncoding::BijectionGeometry;
+        let columns = vec!["location".into()];
+        let publication = |encoding| -> Result<SourceTransaction> {
+            let control = crate::HostedControlWrite::new(
+                catalog.clone(), scope, Some(installed_at.system_time), catalog_row(2),
+            )?;
+            let documents = crate::Documents::new(vec![StructFields::from([
+                ("_id".into(), Value::Utf8("head".into())),
+            ])], &memory)?;
+            let operations = vec![
+                TxOp::OwnedDeadline { until: Timestamp(1000), recheck_at_staging: false, journal_before: None },
+                TxOp::OwnedReplaceDocs { relation: marker.clone(), documents, valid_from: Some(Timestamp::MIN), valid_to: None },
+                TxOp::OwnedRequireSpatialPath { relation: relation.clone(), name: path.clone(), columns: columns.clone(), encoding },
+                TxOp::HostedControl(control),
+            ];
+            Ok(SourceTransaction::new(operations, options.clone(), &memory)?.with_placed_seed(Some(scope.issue())))
+        };
+
+        let before_backfill = resolver.resolve_source(
+            durable.clone(), SourcePosition(2), Timestamp(200), publication(encoding)?, &context,
+        ).await?;
+        assert_eq!(before_backfill.result().error().unwrap().code, "rtdb.owned/spatial-not-ready");
+
+        let declaration = SourceTransaction::new(vec![TxOp::OwnedDeclareEncodedSpatialPath {
+            relation: relation.clone(), name: path.clone(), columns: columns.clone(), encoding,
+        }], options.clone(), &memory)?.with_placed_seed(Some(scope.issue()));
+        let staged = resolver.resolve_source(durable.clone(), SourcePosition(3), Timestamp(300), declaration, &context).await?;
+        assert!(staged.result().committed(), "{:?}", staged.result().error());
+
+        let wrong_encoding = resolver.resolve_source(
+            durable.clone(), SourcePosition(4), Timestamp(400),
+            publication(SpatialGeometryEncoding::TaggedWkb)?, &context,
+        ).await?;
+        assert_eq!(wrong_encoding.result().error().unwrap().code, "rtdb.owned/spatial-not-ready");
+
+        let ordered = resolver.resolve_source(
+            durable.clone(), SourcePosition(5), Timestamp(500), publication(encoding)?, &context,
+        ).await?;
+        assert!(ordered.result().committed(), "{:?}", ordered.result().error());
+        let published = context.query_context(resolver.resolving_snapshot(durable)?, Timestamp(500), "UTC", None)?;
+        let observed = rtdb_query::read_hosted_control_point(
+            published, TableRef::new("public", catalog.name()), &EntityId::String("root".into()), false,
+        ).await?;
+        assert_eq!(observed.row.map(|(_, revision)| revision), Some(ordered.result().tx_key().system_time));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn governed_worlds_order_withdrawals_and_uncapped_replacements() -> Result<()> {
         use rtdb_types::{EntityId, OwnedRelation, OwnedSchema, OwnedWorld, WorldClockMode, WorldSchemas, WorldShadow};
 
