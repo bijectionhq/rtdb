@@ -2922,7 +2922,7 @@ async fn an_asymmetric_gateway_stall_uses_the_existing_writer_and_preserves_auth
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
+async fn a_new_holder_uses_the_surviving_quorum_of_its_installed_journals() {
     let mut cell = Cell::start(2, None).await;
     cell.add_logkeeper().await;
     let record = admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
@@ -2932,8 +2932,6 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
 
     fn position(cell: &Cell, id: &rtdb_directory::MemberId) -> Option<usize> { cell.logkeepers.iter().position(|logkeeper| logkeeper.lease.id() == *id) }
     let first_dead = position(&cell, &record.ensemble[0]).unwrap();
-    let dead_id = record.ensemble[0].clone();
-    let retired = rtdb_types::JournalEndpoint::Member { address: cell.logkeepers[first_dead].address.to_string(), journal: dead_id.0.clone() };
     cell.logkeepers.remove(first_dead).stop().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1700)).await;
     let holder = cell.holder("shop").await.unwrap();
@@ -2941,22 +2939,16 @@ async fn a_new_holder_moves_a_degraded_stream_to_live_logkeepers() {
 
     let client = cell.connect("shop").await;
     assert_eq!(values(&client, "SELECT total FROM orders").await, ["10"]);
-    let moved = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
-    assert!(!moved.ensemble.contains(&dead_id), "the dead logkeeper left the ensemble: {:?}", moved.ensemble);
-    assert_eq!(moved.ensemble.len(), 3);
-    assert!(moved.replica_journals.contains(&retired));
+    let recovered = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
+    assert_eq!(recovered.ensemble, record.ensemble);
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
-
-    let second = record.ensemble.iter().skip(1).find_map(|id| position(&cell, id)).unwrap();
-    cell.logkeepers.remove(second).stop().await.unwrap();
-    client.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
-    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20", "30"], "a second original logkeeper's death leaves a quorum of the new ensemble");
+    assert_eq!(values(&client, "SELECT total FROM orders").await, ["10", "20"]);
     drop(client);
     cell.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn journal_replacement_keeps_acknowledged_history_after_interrupted_trim() {
+async fn holder_replacement_keeps_acknowledged_history_after_interrupted_trim() {
     use rtdb_storage::log::Log;
 
     let directory = ObservedDirectory::new();
@@ -3015,16 +3007,12 @@ async fn journal_replacement_keeps_acknowledged_history_after_interrupted_trim()
     assert!(moved.epoch > checkpointed.epoch);
     assert_eq!(moved.checkpoint, Some(checkpoint));
     assert_eq!(moved.replica_anchor.as_ref(), Some(anchor));
-    assert!(!moved.ensemble.contains(missing));
+    assert_eq!(moved.ensemble, checkpointed.ensemble);
     assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11"]);
     assert_eq!(values(&recovered, "SELECT total FROM orders FOR ALL SYSTEM_TIME FOR ALL VALID_TIME").await, history);
     recovered.simple_query(&format!("SET AWAIT_TOKEN TO '{latest}'")).await.unwrap();
     assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11"]);
 
-    let second = cell.logkeepers.iter().position(|keeper| {
-        keeper.lease.id() != *missing && checkpointed.ensemble.contains(&keeper.lease.id())
-    }).unwrap();
-    cell.logkeepers.remove(second).stop().await.unwrap();
     recovered.simple_query("INSERT INTO orders (_id, total) VALUES (3, 30)").await.unwrap();
     assert_eq!(values(&recovered, "SELECT total FROM orders").await, ["11", "30"]);
     drop(recovered);

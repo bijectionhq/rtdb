@@ -569,7 +569,9 @@ A cell needs a quorum log shared by every deployment, with group commit across d
    A missing key stops the log open before it can reserve journal endpoints or change a quorum promise.
 3. **Ensemble assignment.**
    The directory records each loglet's ensemble; the controller balances writers across logkeepers.
-   Assignment spreads an ensemble across distinct declared zones where possible and retains surviving members during repair.
+   Assignment spreads an ensemble across distinct declared zones where possible.
+   A replacement holder opens the installed journals and must reach their original quorum.
+   A separate durability placement operation changes which journals hold the deployment.
 4. **Deployment of the logkeepers.**
    The logkeeper is the first production loglet (decision 2, settled).
    Logkeepers run on EC2 instances with instance-store NVMe, at least one per availability zone per ensemble, with ensembles spread so that losing a host re-replicates its streams to the rest of the cell.

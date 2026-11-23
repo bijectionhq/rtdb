@@ -455,6 +455,10 @@ contract LogService {
         -- A replacement must reacquire the journal and obtain a new lease after the prior lease ends.
         -- A stable advertised address remains reserved for that journal.
 
+    @invariant WriterReplacementRetainsInstalledJournals
+        -- A worker opening an installed deployment uses its installed journal ensemble.
+        -- A separate durability-placement decision authorises a change of journals.
+
     @invariant QuorumsCountDistinctJournals
         -- Each loglet slot names a distinct durable journal.
         -- The client verifies the journal on each session before sending a journal operation.
@@ -1113,7 +1117,7 @@ rule Claim {
 
     ensures:
         let e = Epoch(value: expected_epoch.value + 1)
-        let fresh = Loglet.created(epoch: e, ensemble: EnsembleFor(member), start_lsn: NextLsn(record))
+        let fresh = Loglet.created(epoch: e, ensemble: InstalledEnsembleFor(record), start_lsn: NextLsn(record))
         Directory.cas(record.id, expected_epoch, change: {
             epoch: e,
             holder: member,

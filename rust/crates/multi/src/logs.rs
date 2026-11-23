@@ -66,12 +66,11 @@ impl PlacedReceiptCodec for DeploymentReceipts {
 /// The writers a node has opened, by deployment, for confirming leadership before a linearizable read.
 pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<rtdb_logkeeper::QuorumLog>>>>;
 
-/// Records a completed ensemble move, as the holder that made it at `epoch`, before anything is appended on the new ensemble.
+/// Records the journal endpoints that may retain physical copies.
 #[async_trait]
 pub trait EnsembleRecorder: Send + Sync {
     /// Records every endpoint a copy can touch before any bytes move.
     async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[JournalEndpoint]) -> Result<()>;
-    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
 }
 
 pub(crate) struct LogkeeperLogFactory {
@@ -108,17 +107,6 @@ impl EnsembleRecorder for DirectoryRecorder {
             if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(record, version).await? { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its log copy was reserved"))
-    }
-
-    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
-        for _ in 0..8 {
-            let current = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
-            if current.epoch != epoch { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its new ensemble was recorded")); }
-            let mut next = current.clone();
-            next.ensemble = ensemble.clone();
-            if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
-        }
-        Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))
     }
 }
 
@@ -165,21 +153,9 @@ impl LogFactory for LogkeeperLogFactory {
         let (quorum, key) = match access {
             LogAccess::ReadWrite => {
                 let key = self.holds.keys.existing(&config.key_id).await?;
-                // An interrupted copy can leave records even if the new
-                // ensemble never becomes the reported serving ensemble.
-                let ensemble = member_ids(&stream.servers)?;
+                member_ids(&stream.servers)?;
                 self.recorder.reserve_copy(&config.deployment, config.epoch, &stream.servers).await?;
-                let writer = match &config.previous_servers {
-                    Some(previous) => {
-                        member_ids(previous)?;
-                        self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
-                        let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0 }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
-                        // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
-                        self.recorder.record(&config.deployment, config.epoch, ensemble).await?;
-                        moved
-                    }
-                    None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
-                };
+                let writer = rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?;
                 self.writers.lock().insert(config.deployment.clone(), Arc::downgrade(&writer));
                 (writer, key)
             }
@@ -636,7 +612,6 @@ mod tests {
             transferred_source_through: None,
             transfer_intake_cut: None,
             frozen_at: None,
-            previous_servers: None,
         };
         let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
         let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
@@ -661,7 +636,6 @@ mod tests {
             key_id: record.key_id(),
             replica_stream: record.stream("replica"),
             replica_seal_scope: record.replica_seal_scope(),
-            previous_servers: None,
             epoch: record.epoch,
             require_read_index: true,
             placed_receipt_retirement: false,

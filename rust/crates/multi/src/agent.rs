@@ -18,7 +18,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, StorageEpoch, TransactionKey}
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{ACTIVATION_RATE_LIMITED, CLAIM_CONTENDED, Handler, MoveTicket, NODE_UNDER_PRESSURE, NOT_CLAIMABLE, Request, Response};
-use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, journal_endpoint, select_logkeepers};
+use crate::deployment::{CellStorage, Role, database_config, ensemble_servers};
 use crate::lease::MemberLease;
 use crate::hosted_recovery::{ReplicaTrimPlan, replay_start};
 
@@ -413,7 +413,8 @@ impl NodeAgent {
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
-            let configuration = self.holder_config(&record, members)?;
+            let servers = ensemble_servers(&record, members)?;
+            let configuration = database_config(&record, servers, &self.options.storage, Role::Holder);
             let database = self.node.database_or_attach(record.name.clone(), configuration).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the deployment"))?;
             self.await_leadership(&record.name, &database).await?;
@@ -442,24 +443,7 @@ impl NodeAgent {
         }
     }
 
-    /// The configuration a holder opens `record` with: on its ensemble while a quorum of it is live and every member is, otherwise moving the stream to an ensemble of live logkeepers that keeps the live members (`FlushOnDegradedEnsemble`).
-    fn holder_config(&self, record: &DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<rtdb_format::database::proto::DatabaseConfig> {
-        let now = now_ms();
-        let live = |id: &MemberId| members.get(id).is_some_and(|member| member.is_live(now));
-        let servers = ensemble_servers(record, members)?;
-        let alive: Vec<MemberId> = record.ensemble.iter().filter(|id| live(id)).cloned().collect();
-        if alive.len() == record.ensemble.len() || alive.len() < crate::deployment::write_quorum(record.ensemble.len()) {
-            return Ok(database_config(record, servers, &self.options.storage, Role::Holder));
-        }
-        let candidates: Vec<&MemberRecord> = members.values().filter(|member| member.role == rtdb_directory::MemberRole::Logkeeper && member.is_live(now) && !record.ensemble.contains(&member.id)).collect();
-        let live_members = alive.iter().map(|id| &members[id]).collect();
-        let selected = select_logkeepers(&record.storage_identity(), record.ensemble.len(), live_members, &candidates);
-        if selected.len() < record.ensemble.len() { return Ok(database_config(record, servers, &self.options.storage, Role::Holder)); }
-        let next = selected.into_iter().map(journal_endpoint).collect();
-        Ok(crate::deployment::moving_config(record, next, Some(servers), &self.options.storage, Role::Holder))
-    }
-
-    /// Before a query on a deployment held with linearizable reads, confirms with a quorum of its logkeepers that no later holder has sealed its stream (`ServeLinearizableReadOnWriter`).
+    /// Confirms that no later holder has sealed the stream before a linearizable query.
     pub async fn confirm_read(&self, name: &str) -> Result<()> {
         let Some(id) = self.holdings.lock().get(name).filter(|holding| holding.linearizable).map(|holding| holding.id.clone()) else { return Ok(()) };
         self.confirm_holder(name, &id, None).await

@@ -237,9 +237,6 @@ pub struct LogkeeperLogConfig {
     pub key_id: String,
     pub replica_stream: String,
     pub replica_seal_scope: String,
-    /// The ensemble the stream moves from, when the holder opening it moves it to `servers`.
-    #[serde(default)]
-    pub previous_servers: Option<Vec<JournalEndpoint>>,
     /// The writer epoch for opening a stream and for confirming a read index.
     pub epoch: u64,
     #[serde(default)]
@@ -316,11 +313,6 @@ pub(crate) fn ensemble_servers(record: &DeploymentRecord, members: &BTreeMap<Mem
 
 /// The configuration a node opens `record` with, given its ensemble's journals.
 pub fn database_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, storage: &CellStorage, role: Role) -> DatabaseConfig {
-    moving_config(record, servers, None, storage, role)
-}
-
-/// The configuration a holder opens `record` with when it moves the stream from `previous_servers` to `servers`.
-pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, previous_servers: Option<Vec<JournalEndpoint>>, storage: &CellStorage, role: Role) -> DatabaseConfig {
     let log = LogkeeperLogConfig {
         write_quorum: write_quorum(servers.len()),
         servers,
@@ -341,7 +333,6 @@ pub fn moving_config(record: &DeploymentRecord, servers: Vec<JournalEndpoint>, p
             TransferIntakeCut { replica_through: terminal.replica_through, source_through: terminal.source_through }
         }),
         frozen_at: match role { Role::Snapshot(checkpoint) => Some(checkpoint), _ => None },
-        previous_servers,
     };
     let store = crate::store::CellStoreConfig { storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),
         writer_epoch: (role == Role::Holder).then_some(record.epoch), compactor: role == Role::Compactor,
