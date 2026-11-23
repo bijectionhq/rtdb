@@ -776,6 +776,9 @@ Moves are invisible to clients only if the gateway owns connections and session 
    It wraps the backend's session metadata in an encrypted routing token and checks the writer assignment before forwarding another call.
    Request and response bodies stream through with HTTP/2 flow control, and the gateway holds its admission slots until the response ends.
    After a holder change, a client opens a new authenticated Flight SQL session to reach the new holder.
+   For a single-installation `rtdb-multi standalone` process, pass `--owned-flight` to expose the same owned Flight actions on a second TLS loopback listener.
+   The protocol 2 readiness record includes `owned_flight_port` only when that listener is enabled.
+   Pass `--flight-control-relations` with a comma-separated allowlist to enable held control actions for the same authenticated standalone root principal.
 3. **Crate `affinity`**, ported from Bijection's `crates/affinity` with its score vectors, and routing by it (`RouteRead`), with per-key in-flight bounds and pressure.
    Each pgwire gateway admits at most 4,096 connections overall and 256 for one deployment name by default.
    Set these limits with `--max-connections` and `--max-connections-per-deployment`.

@@ -20,7 +20,7 @@ const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-directory --state PATH\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
-       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
+       rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--owned-flight [--flight-control-relations LIST]] [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
        rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
@@ -363,6 +363,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 private_key: arguments.required("private-key")?.into(),
                 password_file: arguments.required("password-file")?.into(),
                 ready_file: arguments.required("ready-file")?.into(),
+                owned_flight: arguments.present("owned-flight"),
+                flight_control_relations: arguments.present("flight-control-relations")
+                    .then(|| arguments.required("flight-control-relations")
+                        .map(|list| list.split(',').map(str::to_owned).collect()))
+                    .transpose()?,
             }, cancellation).await
         }
         "initialize-directory" => MemoryDirectory::initialize(std::path::Path::new(arguments.required("state")?)),
