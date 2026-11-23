@@ -8,8 +8,10 @@ use crate::protocol::Entries;
 use crate::protocol::{Accepted, Entry, EpochRun, Refused, ResponseBody, Sealed};
 use bytes::Bytes;
 use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 
 const RETAINED_ENTRY_OVERHEAD: usize = 32;
+const SYNC_OBSERVATION_OVERHEAD: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -41,6 +43,14 @@ pub struct Held<P = Bytes> {
     pub epoch: u64,
     pub timestamp: i64,
     pub payload: P,
+    pub(super) observed_sync: Option<Arc<OnceLock<i64>>>,
+}
+
+impl<P: Payload> Held<P> {
+    fn retained_size(&self) -> usize {
+        self.payload.bytes() + RETAINED_ENTRY_OVERHEAD
+            + usize::from(self.observed_sync.is_some()) * SYNC_OBSERVATION_OVERHEAD
+    }
 }
 
 /// Entries selected by `StreamState::window`, with the stream's positions as of the selection.
@@ -115,13 +125,25 @@ impl<P: Payload> StreamState<P> {
         if self.epoch_runs.back().is_none_or(|run| run.epoch != held.epoch) {
             self.epoch_runs.push_back(EpochRun { start_lsn: lsn, epoch: held.epoch });
         }
-        self.retained_bytes += held.payload.bytes() + RETAINED_ENTRY_OVERHEAD;
+        self.retained_bytes += held.retained_size();
         self.entries.push_back(held);
     }
 
     pub fn held_mut(&mut self, lsn: i64) -> Option<&mut Held<P>> {
         if lsn <= self.trim { return None; }
         self.entries.get_mut((lsn - self.trim - 1) as usize)
+    }
+
+    pub(super) fn sync_observation(&self, lsn: i64) -> Option<Arc<OnceLock<i64>>> {
+        if lsn <= self.trim { return None; }
+        self.entries.get((lsn - (self.trim + 1)) as usize)?.observed_sync.clone()
+    }
+
+    pub(super) fn track_sync(&mut self, lsn: i64, observation: Arc<OnceLock<i64>>) -> bool {
+        let Some(held) = self.held_mut(lsn).filter(|held| held.observed_sync.is_none()) else { return false; };
+        held.observed_sync = Some(observation);
+        self.retained_bytes += SYNC_OBSERVATION_OVERHEAD;
+        true
     }
 
     pub fn apply(&mut self, event: &Event) {
@@ -139,13 +161,14 @@ impl<P: Payload> StreamState<P> {
             }
             Event::Truncate(from) => {
                 let keep = (from - self.trim - 1).clamp(0, self.entries.len() as i64);
-                self.retained_bytes -= self.entries.drain(keep as usize..).map(|held| held.payload.bytes() + RETAINED_ENTRY_OVERHEAD).sum::<usize>();
+                self.retained_bytes -= self.entries.drain(keep as usize..).map(|held| held.retained_size()).sum::<usize>();
                 let last = self.last();
                 while self.epoch_runs.back().is_some_and(|run| run.start_lsn > last) { self.epoch_runs.pop_back(); }
                 self.commit = self.commit.min(last);
             }
             Event::Append(entry) => {
-                self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp, payload: P::decided(&entry.payload) });
+                self.append_held(entry.lsn, Held { epoch: entry.epoch, timestamp: entry.timestamp,
+                    payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Commit(lsn) => self.commit = self.commit.max((*lsn).min(self.last())),
             Event::Trim(through) => {
@@ -156,7 +179,7 @@ impl<P: Payload> StreamState<P> {
                     self.epoch_runs.clear();
                     self.retained_bytes = 0;
                 } else {
-                    self.retained_bytes -= self.entries.drain(..(through - self.trim) as usize).map(|held| held.payload.bytes() + RETAINED_ENTRY_OVERHEAD).sum::<usize>();
+                    self.retained_bytes -= self.entries.drain(..(through - self.trim) as usize).map(|held| held.retained_size()).sum::<usize>();
                     let first = through + 1;
                     while self.epoch_runs.get(1).is_some_and(|run| run.start_lsn <= first) { self.epoch_runs.pop_front(); }
                     self.epoch_runs.front_mut().expect("retained entries have an epoch").start_lsn = first;

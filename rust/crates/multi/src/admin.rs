@@ -1946,6 +1946,8 @@ pub struct AuditAcceptanceQuorum {
     pub acceptance: AuditAcceptanceStage,
     pub replica_append_sample_micros: i64,
     pub quorum_observed_clock_upper_micros: i64,
+    pub journal_sync_observations: BTreeMap<String, i64>,
+    pub quorum_sync_clock_upper_micros: Option<i64>,
 }
 
 /// Read one strict placed transaction whose encrypted replica entry matches a write quorum.
@@ -1966,7 +1968,7 @@ pub async fn audit_acceptance_quorum(
     ).ok_or_else(unavailable)?;
     let servers = replica_servers(directory, &current).await?;
     let stream = StreamConfig { write_quorum: write_quorum(servers.len()), servers, stream: current.stream("replica"), maximum_message_bytes };
-    let proof = rtdb_logkeeper::certify_committed_range(&stream, offset, offset).await?;
+    let (proof, journal_sync_observations) = rtdb_logkeeper::certify_observed_entry(&stream, offset).await?;
     let quorum_observed_clock_upper_micros = chrono::Utc::now().timestamp_micros().checked_add(1)
         .filter(|upper| *upper > 0).ok_or_else(|| Anomaly::fault("rtdb.multi/acceptance-audit-clock", "The audit clock has no valid upper sample"))?;
 
@@ -1983,6 +1985,8 @@ pub async fn audit_acceptance_quorum(
         record.id == id && record.incarnation == incarnation && record.log_epoch == log_epoch && record.lifecycle != Lifecycle::Deleted,
     ).ok_or_else(unavailable)?;
     if replica_servers(directory, &after).await? != stream.servers { return Err(unavailable()); }
+    let quorum_sync_clock_upper_micros = journal_sync_observations.get(stream.write_quorum - 1)
+        .map(|observation| observation.synced_clock_upper_micros);
 
     Ok(AuditAcceptanceQuorum {
         authority, incarnation, log_epoch, replica_stream: proof.stream, replica_digest: proof.digest,
@@ -1994,6 +1998,9 @@ pub async fn audit_acceptance_quorum(
         },
         replica_append_sample_micros: entry.timestamp,
         quorum_observed_clock_upper_micros,
+        journal_sync_observations: journal_sync_observations.into_iter()
+            .map(|observation| (observation.journal, observation.synced_clock_upper_micros)).collect(),
+        quorum_sync_clock_upper_micros,
     })
 }
 

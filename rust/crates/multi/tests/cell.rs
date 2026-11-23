@@ -557,6 +557,11 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     assert_eq!(report.acceptance.staging_clock_upper_micros, 120);
     assert_eq!(report.replica_append_sample_micros, 124);
     assert!(report.quorum_observed_clock_upper_micros > 124);
+    assert!(report.journal_sync_observations.len() >= report.required_replica_quorum);
+    let mut observed = report.journal_sync_observations.values().copied().collect::<Vec<_>>();
+    observed.sort_unstable();
+    assert_eq!(report.quorum_sync_clock_upper_micros, Some(observed[1]));
+    assert!(observed[1] > 124);
     assert!(admin::audit_acceptance_quorum(directory, &keys, authority, deployment.incarnation,
         deployment.log_epoch + 1, 0, 4 << 20).await.is_err());
     cell.stop().await;

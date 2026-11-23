@@ -212,6 +212,8 @@ pub(crate) enum RequestBody {
     Identify(Identify),
     #[prost(message, tag = "18")]
     ConfirmAuthority(LogletCheck),
+    #[prost(message, tag = "19")]
+    AppendObserved(Append),
     #[prost(message, tag = "30")]
     TrimDurable(Trim),
 }
@@ -220,7 +222,7 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 30")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 30")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -286,6 +288,8 @@ pub struct PageDigest {
     pub through_lsn: i64,
     #[prost(bytes = "bytes", tag = "2")]
     pub digest: Bytes,
+    #[prost(sfixed64, optional, tag = "3")]
+    pub synced_clock_upper_micros: Option<i64>,
 }
 
 /// Confirms only the promised writer. It conveys no append or commit position.

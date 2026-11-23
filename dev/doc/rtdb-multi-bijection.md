@@ -52,6 +52,10 @@ The `CommitHostedStaged.v3` Flight action requires a guarded replica provider.
 The provider samples under the journal writer lock after encryption and payload copying, before assigning the offset or sending a replica request.
 For a strict placed acceptance, `rtdb-multi audit-acceptance` reads one replica offset for the exact installation, incarnation and log epoch.
 It requires a matching write quorum, checks the sealed record against that quorum's digest, and exports the original staging sample, cutoff and append timestamp.
+Each journal records its own upper clock sample after syncing the original guarded append.
+The sample is synced as local metadata before the reply and survives restart and compaction with the exact entry.
+Recovery copies carry the entry without creating observations of the original append.
+The audit includes each matching journal's retained sample and the quorum order statistic when enough original samples survive.
 It also reports the audit process's rounded clock immediately after establishing quorum agreement.
 The audit time includes probe latency and requires bounded clock uncertainty when compared with the writer's sample.
 

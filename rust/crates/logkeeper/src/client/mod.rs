@@ -21,9 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use writer::{Tip, Writer};
+use writer::{AppendTime, Tip, Writer};
 
-pub use audit::{CertifiedRangeReader, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, copy_certified_range, verify_certified_range};
+pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, audit_retained, certify_committed_prefix, certify_committed_range, certify_observed_entry, copy_certified_range, verify_certified_range};
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
@@ -329,12 +329,12 @@ fn read_index_frontiers(held: &mut [i64], published: i64, journals: usize, quoru
 }
 
 impl QuorumLog {
-    fn enqueue_at(&self, payload: Bytes, sample: impl FnOnce() -> Result<Timestamp>) -> Result<AppendReceipt> {
+    fn enqueue_at(&self, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
         if payload.len() > maximum { return Err(Error::MessageTooLarge { size: payload.len(), maximum }); }
         self.shared.check_open()?;
         match &self.shared.role {
-            Role::Writer(writer) => writer.enqueue(payload, sample),
+            Role::Writer(writer) => writer.enqueue(payload, time),
             Role::Reader(_) => Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream))),
         }
     }
@@ -566,11 +566,11 @@ impl Log for QuorumLog {
     fn maximum_guarded_append_bytes(&self) -> Option<usize> { self.maximum_append_bytes() }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, || Ok(timestamp))
+        self.enqueue_at(payload, AppendTime::Ordinary(timestamp))
     }
 
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, || guard.sample())
+        self.enqueue_at(payload, AppendTime::Guarded(guard))
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.latest().map(LogOffset) }
