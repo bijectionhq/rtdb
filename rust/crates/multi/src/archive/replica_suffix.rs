@@ -3,7 +3,7 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use prost::Message;
-use rtdb_directory::{Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
+use rtdb_directory::{Checkpoint, CheckpointSuffixCustody, CheckpointSuffixPin, CheckpointTransferFence, CheckpointTransferTerminal, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
 use rtdb_format::{
     catalog::BlockCatalog,
     envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
@@ -59,6 +59,13 @@ impl<'a> ServingPayloads<'a> {
             let material = self.keys.existing_key(&self.record.key_id()).await?
                 .ok_or_else(suffix_unavailable)?;
             let bucket = self.storage.bucket(Arc::clone(&self.io)).await?;
+            if self.record.storage_namespaces.is_some() {
+                let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?
+                    .ok_or_else(suffix_unavailable)?;
+                crate::deployment::require_storage_namespaces(self.record, rtdb_directory::StorageNamespaces {
+                    objects, keys: self.keys.namespace_id().await?,
+                })?;
+            }
             let root = format!("{}/{}", self.record.storage_prefix(), checkpoint_storage_root()?);
             let files = PrefixedStore::new(bucket, root);
             let owner = files.observe_fresh_exact(&key(ROOT_MARKER)?, self.record.id.len()).await?;
@@ -68,6 +75,16 @@ impl<'a> ServingPayloads<'a> {
             EncryptingStore::new(Arc::new(files), &material)
         }).await?;
         PayloadBytes::read(store, &key(&name)?, self.memory).await
+    }
+
+    pub(super) async fn resolve_verified(&self, envelope: &ReplicaEnvelope) -> Result<(ReplicaEnvelope, PayloadBytes)> {
+        let ReplicaBody::OversizedMessage(reference) = &envelope.message else { return Err(suffix_unavailable()); };
+        if self.record.storage_namespaces.is_none() || reference.payload_sha256.as_ref().is_none_or(|digest| digest.len() != 32) {
+            return Err(suffix_unavailable());
+        }
+        let body = self.read(envelope).await?;
+        let resolved = envelope.unwrap_payload(&body.bytes)?;
+        Ok((resolved, body))
     }
 }
 
@@ -106,10 +123,11 @@ pub(crate) async fn find_held_publication(
         cipher.open_page(&mut entries)?;
         for entry in entries {
             let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
-            let payload;
+            let _payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                payload = payloads.read(&envelope).await?;
-                envelope.unwrap_payload(&payload.bytes)?
+                let (resolved, body) = payloads.resolve_verified(&envelope).await?;
+                _payload = body;
+                resolved
             } else {
                 envelope
             };
@@ -182,8 +200,7 @@ pub(crate) async fn capture(
                             for entry in entries {
                                 let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
                                 if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                    let payload = payloads.read(&envelope).await?;
-                                    let resolved = envelope.unwrap_payload(&payload.bytes)?;
+                                    let (resolved, payload) = payloads.resolve_verified(&envelope).await?;
                                     progress.apply(resolved, pin, |_| Ok(()))?;
                                     artifact.put_payload(entry.lsn, &payload.bytes, &mut chain).await?;
                                 } else {
@@ -394,6 +411,44 @@ impl TerminalReplayProgress {
     }
 }
 
+pub(super) async fn with_terminal_source<T, F, Fut>(
+    directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
+    fence: &CheckpointTransferFence, through: i64, expected: Option<&CheckpointTransferTerminal>, run: F,
+) -> Result<T>
+where
+    F: FnOnce(DeploymentRecord, Arc<IoRegion>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let stage = &fence.destination;
+    let deployment = stage.intent.source.to_string();
+    Box::pin(with_region(
+        directory, keys, &deployment, storage, hosted_task, Some((stage.intent.capture, None)), None,
+        |source| terminal_replay_floor(source, fence, through, expected),
+        |source, _, io| run(source, io),
+    )).await
+}
+
+fn terminal_replay_floor(
+    source: &DeploymentRecord, fence: &CheckpointTransferFence, through: i64,
+    expected: Option<&CheckpointTransferTerminal>,
+) -> Result<Option<i64>> {
+    let stage = &fence.destination;
+    if source.id != stage.intent.source.to_string() || source.lifecycle != Lifecycle::Restoring
+        || source.holder.is_some() || source.epoch != fence.fenced_writer_epoch
+        || source.incarnation != stage.source_incarnation || source.log_epoch != stage.source_log_epoch
+        || source.checkpoint != Some(stage.checkpoint) || source.checkpoint_transfer_fence.as_deref() != Some(fence)
+        || expected.is_some_and(|expected| source.checkpoint_transfer_terminal.as_deref() != Some(expected)
+            || expected.replica_through != through || &expected.fence != fence)
+        || source.replica_anchor.as_ref().is_some_and(|anchor| anchor.root_incarnation != source.incarnation)
+        || through < stage.checkpoint.boundary
+    {
+        return Err(suffix_unavailable());
+    }
+    require_capture_open(source, stage.intent.capture)?;
+    if through == stage.checkpoint.boundary { return Ok(None); }
+    Ok(Some(crate::hosted_recovery::replay_start(source, stage.checkpoint.boundary)?))
+}
+
 /// Reopen the original certified source interval without accumulating its raw bytes.
 pub(super) async fn replay_certified_terminal(
     source: &DeploymentRecord, storage: &CellStorage, io: Arc<IoRegion>,
@@ -419,10 +474,11 @@ pub(super) async fn replay_certified_terminal(
             cipher.open_page(&mut entries)?;
             for entry in entries {
                 let Some(envelope) = progress.admit(&entry, fence, recovered)? else { continue; };
-                let payload;
+                let _payload;
                 let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                    payload = payloads.read(&envelope).await?;
-                    envelope.unwrap_payload(&payload.bytes)?
+                    let (resolved, body) = payloads.resolve_verified(&envelope).await?;
+                    _payload = body;
+                    resolved
                 } else {
                     envelope
                 };
@@ -742,6 +798,41 @@ mod custody_tests {
         assert!(admit(3, 0, 3, claim())?.is_none());
         assert!(admit(3, 1, 3, offloaded())?.is_some());
         assert_eq!(fence.position(), TermPosition::Expecting(TermSequence(2)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_custody_requires_the_serving_body_bound_to_the_certified_frame() -> Result<()> {
+        let location = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: location.path().join("serving") };
+        let keys = crate::keys::LocalKeyService::new(&location.path().join("keys"))?;
+        let io = IoRegion::new();
+        let bucket = storage.bucket(Arc::clone(&io)).await?;
+        let mut record = DeploymentRecord::new("source", "acme", Vec::new(), now_ms());
+        record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await?);
+        let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
+        let files = PrefixedStore::new(bucket, root);
+        files.put(&key(ROOT_MARKER)?, Bytes::copy_from_slice(record.id.as_bytes())).await?;
+        let material = keys.key(&record.key_id()).await?;
+        let objects = EncryptingStore::new(Arc::new(files), &material)?;
+        let memory = MemoryBudget::new(1 << 20);
+        let payloads = ServingPayloads::new(&record, &storage, &keys, io, &memory);
+        let original = ReplicaEnvelope {
+            term: Term(2), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(17) }),
+        };
+        let body = original.encode();
+        let proxy = original.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "payload".into(), &body);
+        let path = key(&proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap())?;
+        assert!(payloads.resolve_verified(&proxy).await.is_err());
+        let wrong = ReplicaEnvelope { message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(18) }), ..original.clone() };
+        objects.put(&path, wrong.encode().into()).await?;
+        assert_eq!(payloads.resolve_verified(&proxy).await.err().unwrap().code, "rtdb.format/oversized-payload-mismatch");
+        objects.delete(&path).await?;
+        objects.put(&path, body.into()).await?;
+        assert_eq!(payloads.resolve_verified(&proxy).await?.0, original);
+        let mut legacy = proxy;
+        if let ReplicaBody::OversizedMessage(reference) = &mut legacy.message { reference.payload_sha256 = None; }
+        assert!(payloads.resolve_verified(&legacy).await.is_err());
         Ok(())
     }
 

@@ -1509,6 +1509,8 @@ rule TrimCertifiedReplicaPrefix {
     -- A copy admitted against a pending suffix retains its first required replica record until its provider region drains.
     -- Archive certification covers every replica offset and replay applies only the messages admitted by the checkpoint's term fence.
     -- Fenced, discarded and voided records survive a transfer at their original offsets and require no offloaded payload.
+    -- Terminal certification and bootstrap preparation hold the same exact source replay interval through their provider reads.
+    -- An admitted offloaded body supplies replay bytes after its digest matches the certified outer frame.
     -- After transfer, a holder starts intake beyond the exact terminal source position and any possible source positions consumed after its paired replica offset.
     when: ReplicaPrefixCertified(holding, through, digest)
 

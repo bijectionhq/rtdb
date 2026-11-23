@@ -1503,18 +1503,21 @@ pub(crate) async fn seal_checkpoint_transfer(
     let memory = rtdb_columnar::MemoryBudget::new(node.execution_memory_bytes);
     let cache = rtdb_storage::cache::CacheBudget::new(node.cache_bytes);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let (basis, source_through, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
-        directory, archive, keys, hosted_task,
-        read_world::CaptureSelection {
-            deployment: intent.source, capture: intent.capture,
-            manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
-        },
-        CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-        Some(read_world::TerminalReplay { storage, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
-        |context, basis, source_through| async move {
-            let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
-            Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
-        },
+    let (basis, source_through, lifetime_floors_sha256) = replica_suffix::with_terminal_source(
+        directory, storage, keys, hosted_task, fence, sealed, None,
+        |_, source_io| read_world::with_registered_capture_replay(
+            directory, archive, keys, hosted_task,
+            read_world::CaptureSelection {
+                deployment: intent.source, capture: intent.capture,
+                manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None,
+            },
+            CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
+            Some(read_world::TerminalReplay { storage, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+            |context, basis, source_through| async move {
+                let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
+                Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
+            },
+        ),
     ).await?;
     directory.record_checkpoint_transfer_terminal(&rtdb_directory::CheckpointTransferTerminal {
         fence: fence.clone(), replica_through: sealed, source_through, basis,

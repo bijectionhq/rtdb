@@ -103,9 +103,10 @@ pub(crate) async fn verify_checkpoint_transfer_target(
         let publication = prior.is_none().then(|| {
             RegionPublication::CheckpointTransfer(Arc::clone(&replay_directory), operation)
         });
-        let (held_authority, held_terminal, source, owner) = (&authority, &terminal, &source, replay_directory.as_ref());
+        let (held_authority, held_terminal, owner) = (&authority, &terminal, replay_directory.as_ref());
+        let hosted = hosted_task_for_write.as_ref();
         let ciphertext_sha256 = with_region(
-            owner, keys, &record.id, storage, hosted_task_for_write.as_ref(), None, publication,
+            owner, keys, &record.id, storage, hosted, None, publication,
             |current| {
                 held_authority.require_held(current)?;
                 if current.checkpoint_transfer_fence.as_deref() != Some(&held_terminal.fence)
@@ -130,37 +131,41 @@ pub(crate) async fn verify_checkpoint_transfer_target(
                 let mut replay = replica_suffix::TerminalReplayProgress::new(fence, &recovered)?;
                 let mut chain = artifact.chain();
                 if let Some(digest) = held_terminal.replica_sha256 {
-                    let stream = administration_stream(owner, source, 4 << 20).await?;
-                    let first = transfer_first(&held_terminal.fence.destination)?;
-                    let certificate = rtdb_logkeeper::JournalDigest::from_digest_bytes(
-                        source.stream("replica"), [first, held_terminal.replica_through], digest,
-                    );
-                    let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
-                    let source_cipher = replica_suffix::TerminalReplicaCipher::open(source, keys).await?;
-                    let payloads = replica_suffix::ServingPayloads::new(source, storage, keys, region, &memory);
-                    while let Some(mut entries) = segments.next().await? {
-                        let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
-                        let through = entries.last().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
-                        // Stage only exact committed segments so a disagreeing raw read
-                        // cannot occupy the canonical target name ahead of a retry.
-                        let proof = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
-                        rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
-                        let bytes = entries.iter().map(|entry| entry.payload.len() * 2 + 64).sum();
-                        let _charge = memory.reserve(bytes)?;
-                        source_cipher.open_page(&mut entries)?;
-                        artifact.put_segment(&entries, &mut chain).await?;
-                        for entry in entries {
-                            let Some(envelope) = replay.admit(&entry, fence, &mut recovered)? else { continue; };
-                            if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                let payload = payloads.read(&envelope).await?;
-                                let resolved = envelope.unwrap_payload(&payload.bytes)?;
-                                replay.apply(resolved, &mut recovered, &memory)?;
-                                artifact.put_payload(entry.lsn, &payload.bytes, &mut chain).await?;
-                            } else {
-                                replay.apply(envelope, &mut recovered, &memory)?;
+                    let (replay, recovered, memory, artifact, chain) = (&mut replay, &mut recovered, &memory, &artifact, &mut chain);
+                    replica_suffix::with_terminal_source(
+                        owner, storage, keys, hosted, fence, held_terminal.replica_through, Some(held_terminal),
+                        |source, source_io| async move {
+                            let stream = administration_stream(owner, &source, 4 << 20).await?;
+                            let first = transfer_first(&fence.destination)?;
+                            let certificate = rtdb_logkeeper::JournalDigest::from_digest_bytes(
+                                source.stream("replica"), [first, held_terminal.replica_through], digest,
+                            );
+                            let _pages = memory.reserve(32 << 20)?;
+                            let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
+                            let source_cipher = replica_suffix::TerminalReplicaCipher::open(&source, keys).await?;
+                            let payloads = replica_suffix::ServingPayloads::new(&source, storage, keys, source_io, memory);
+                            while let Some(mut entries) = segments.next().await? {
+                                let first = entries.first().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
+                                let through = entries.last().ok_or_else(|| inconsistent("An authenticated segment was empty"))?.lsn;
+                                // A provisional read cannot occupy a canonical target name.
+                                let proof = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
+                                rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
+                                source_cipher.open_page(&mut entries)?;
+                                artifact.put_segment(&entries, chain).await?;
+                                for entry in entries {
+                                    let Some(envelope) = replay.admit(&entry, fence, recovered)? else { continue; };
+                                    if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                                        let (resolved, payload) = payloads.resolve_verified(&envelope).await?;
+                                        replay.apply(resolved, recovered, memory)?;
+                                        artifact.put_payload(entry.lsn, &payload.bytes, chain).await?;
+                                    } else {
+                                        replay.apply(envelope, recovered, memory)?;
+                                    }
+                                }
                             }
-                        }
-                    }
+                            Ok(())
+                        },
+                    ).await?;
                 }
                 let snapshot = recovered.partition.snapshot();
                 if replay.finish(held_terminal.replica_through)? != held_terminal.source_through
