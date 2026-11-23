@@ -13,12 +13,13 @@ use crate::context::Execution;
 use crate::invalid;
 use crate::join_key::JoinLayout;
 use crate::join_spill::{BlockWriter, Partitions};
-use crate::join_storage::{HashIndex, combine_cell_hash, hash_values};
+use crate::join_storage::HashIndex;
 use crate::operators::{BatchOutput, DeferredInput, build_batch_input};
 use crate::pages::{BoxPageCursor, OwnedPage, PageCursor};
 use crate::pushdown::{PushdownBuilder, Pushdowns};
 use crate::runtime_schema::EmittedRelation;
 use crate::scalar_key::ScalarKey;
+use crate::set_keys::{Key, direct_key_equal};
 
 /// For each equality, whether its first operand is the build side's key; `None` where the join needs the row join.
 pub(crate) fn key_order(layout: &JoinLayout, output: BatchOutput) -> Option<Vec<bool>> {
@@ -393,10 +394,12 @@ impl Spec {
     }
 
     fn key_hash(&self, batch: &ColumnBatch, row: usize, side: usize) -> Result<u32> {
+        self.key(batch, row, side)?.vector_hash()
+    }
+
+    fn key<'a>(&'a self, batch: &'a ColumnBatch, row: usize, side: usize) -> Result<Key<'a>> {
         let positions = if side == 0 { &self.build_keys } else { &self.probe_keys };
-        if let Some(hash) = arrow_hash(batch, row, positions) { return Ok(hash); }
-        let (values, _reservation) = self.value_keys(batch, row, positions, side)?;
-        hash_values(&values)
+        Key::for_columns(batch, row, self.projected[side], positions, &self.execution.context)
     }
 
     /// Hands the input read so far, and the rest, to the row join, which spills a build side this large.
@@ -482,17 +485,11 @@ impl Spec {
         residual: Option<&PreparedResidual<'_>>,
         mut accept: impl FnMut(usize) -> Result<ControlFlow<()>>,
     ) -> Result<bool> {
-        let mut probe_values = None;
+        let mut key = None;
         let mut hashed = if self.kind != JoinKind::Anti {
-            let hash = match arrow_hash(probe, row, &self.probe_keys) {
-                Some(hash) => hash,
-                None => {
-                    let key = self.value_keys(probe, row, &self.probe_keys, 1)?;
-                    let hash = hash_values(&key.0)?;
-                    probe_values = Some(key);
-                    hash
-                }
-            };
+            let probe_key = self.key(probe, row, 1)?;
+            let hash = probe_key.vector_hash()?;
+            key = Some(probe_key);
             Some(table.index.candidates(hash))
         } else {
             None
@@ -512,15 +509,10 @@ impl Spec {
                 }
                 continue;
             }
-            let equal = if let Some(equal) = self.equal_arrow(build, offset, probe, row) {
-                equal
-            } else {
-                if probe_values.is_none() { probe_values = Some(self.value_keys(probe, row, &self.probe_keys, 1)?); }
-                let key = &probe_values.as_ref().expect("The probe key was read").0;
-                let (build, _scratch) = self.value_keys(build, offset, &self.build_keys, 0)?;
-                self.equal_values(&build, key, equality)?
-            };
-            if equal && self.matches_theta(build, offset, probe, row)? {
+            if key.is_none() { key = Some(self.key(probe, row, 1)?); }
+            let probe_key = key.as_ref().expect("The probe key has been read");
+            let build_key = self.key(build, offset, 0)?;
+            if self.equal_keys(&build_key, probe_key, Some(equality))? && self.matches_theta(build, offset, probe, row)? {
                 matched = true;
                 if accept(ordinal)?.is_break() { break; }
             }
@@ -534,13 +526,7 @@ impl Spec {
         let mut unknown = false;
         for ((&left, &right), &build_first) in self.build_keys.iter().zip(&self.probe_keys).zip(&self.order) {
             let (left, right) = (&build.columns[left], &probe.columns[right]);
-            let typed = match (ScalarKey::read(left, build_row), ScalarKey::read(right, probe_row)) {
-                (Some(left), Some(right)) => left.equal(right).map(|equal| {
-                    if left == ScalarKey::Null || right == ScalarKey::Null { self.preserves_probe().then_some(equal) } else { Some(equal) }
-                }),
-                _ => None,
-            };
-            let equal = if let Some(typed) = typed {
+            let equal = if let Some(typed) = direct_key_equal(left, build_row, right, probe_row, self.preserves_probe()) {
                 typed
             } else {
                 let _scratch = memory.reserve(left.bound(build_row)?.checked_add(right.bound(probe_row)?).ok_or_else(size_error)?)?;
@@ -656,63 +642,25 @@ impl Spec {
     fn probe_arrow_keys(&self, table: &Table, probe: &ColumnBatch, matches: &mut Matches) -> Result<()> {
         for row in 0..probe.len {
             self.execution.context.check_cancelled_at(row)?;
-            let mut probe_values = None;
-            let hash = match arrow_hash(probe, row, &self.probe_keys) {
-                Some(hash) => hash,
-                None => {
-                    let key = self.value_keys(probe, row, &self.probe_keys, 1)?;
-                    let hash = hash_values(&key.0)?;
-                    probe_values = Some(key);
-                    hash
-                }
-            };
+            let probe_key = self.key(probe, row, 1)?;
+            let hash = probe_key.vector_hash()?;
             for (candidate, build) in table.index.candidates(hash).enumerate() {
                 self.execution.context.check_cancelled_at(candidate)?;
                 let (batch_index, build_row) = table.position(build);
-                let batch = &table.batches[batch_index];
-                let typed = if probe_values.is_none() { self.equal_arrow(batch, build_row, probe, row) } else { None };
-                let matched = match typed {
-                    Some(matched) => matched,
-                    None => {
-                        if probe_values.is_none() {
-                            probe_values = Some(self.value_keys(probe, row, &self.probe_keys, 1)?);
-                        }
-                        let (probe_key, _) = probe_values.as_ref().expect("A fallback probe key has been read");
-                        let (build_key, _scratch) = self.value_keys(batch, build_row, &self.build_keys, 0)?;
-                        self.equal_values(&build_key, probe_key, &self.execution.scope()?)?
-                    }
-                };
-                if matched { matches.push(table, build, row)?; }
+                let build_key = self.key(&table.batches[batch_index], build_row, 0)?;
+                if self.equal_keys(&build_key, &probe_key, None)? {
+                    matches.push(table, build, row)?;
+                }
             }
         }
         Ok(())
     }
 
-    fn equal_arrow(&self, build: &ColumnBatch, build_row: usize, probe: &ColumnBatch, probe_row: usize) -> Option<bool> {
-        let mut matched = true;
-        for (&left, &right) in self.build_keys.iter().zip(&self.probe_keys) {
-            let left = ScalarKey::read(&build.columns[left], build_row)?;
-            let right = ScalarKey::read(&probe.columns[right], probe_row)?;
-            matched &= left.equal(right)? && (self.preserves_probe() || left != ScalarKey::Null);
-        }
-        Some(matched)
-    }
-
-    fn equal_values(&self, build: &[Value], probe: &[Value], equality: &rtdb_expr::EvaluationScope) -> Result<bool> {
+    fn equal_keys(&self, build: &Key<'_>, probe: &Key<'_>, equality: Option<&rtdb_expr::EvaluationScope>) -> Result<bool> {
         let mut unknown = false;
-        for ((build, probe), build_first) in build.iter().zip(probe).zip(&self.order) {
-            if self.preserves_probe() {
-                let build_null = matches!(build, Value::Null | Value::Undefined);
-                let probe_null = matches!(probe, Value::Null | Value::Undefined);
-                if build_null || probe_null {
-                    if build_null != probe_null { return Ok(false); }
-                    continue;
-                }
-            }
+        for (index, build_first) in self.order.iter().enumerate() {
             let (left, right) = if *build_first { (build, probe) } else { (probe, build) };
-            let equal = rtdb_expr::sql_eq_in_timezone(left, right, &self.execution.context.timezone, equality)?;
-            equality.reset()?;
-            match equal {
+            match left.equal_at(right, index, self.preserves_probe(), &self.execution.context, equality)? {
                 None => unknown = true,
                 Some(false) => return Ok(false),
                 Some(true) => {}
@@ -720,26 +668,6 @@ impl Spec {
         }
         Ok(!unknown)
     }
-
-    fn value_keys(&self, batch: &ColumnBatch, row: usize, positions: &[usize], side: usize) -> Result<(Vec<Value>, Arc<MemoryReservation>)> {
-        let reservation = self.execution.context.memory.reserve(key_bound(batch, row, positions)?)?;
-        let keys = positions.iter().map(|&position| self.cell(&batch.columns[position], row, side)).collect::<Result<_>>()?;
-        Ok((keys, reservation))
-    }
-}
-
-fn arrow_hash(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Option<u32> {
-    positions.iter().try_fold(0, |hash, &position| {
-        ScalarKey::read(&batch.columns[position], row).map(|key| combine_cell_hash(hash, key.hash() as i32))
-    })
-}
-
-fn key_bound(batch: &ColumnBatch, row: usize, positions: &[usize]) -> Result<usize> {
-    let base = positions.len().checked_mul(std::mem::size_of::<Value>())
-        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
-    positions.iter().try_fold(base, |bytes, &position| {
-        batch.columns[position].bound(row)?.checked_mul(2).and_then(|bound| bytes.checked_add(bound)).ok_or_else(size_error)
-    })
 }
 
 /// The build and probe rows a probe batch matched, in probe order, charged as they grow.

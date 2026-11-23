@@ -279,6 +279,11 @@ impl PushdownBuilder {
                 }
                 continue;
             }
+            if let Some(((xxhash, murmur3), null)) = crate::set_keys::direct_bloom_hashes(column, row) {
+                key.add(rtdb_format::bloom::hashes(xxhash, murmur3));
+                if !null { key.filter.iids = None; }
+                continue;
+            }
             let scope = rtdb_expr::EvaluationScope::new(memory)?;
             let value = column.expression_value(row, true, Some(&scope))?;
             key.add(BloomFilter::value_positions(&value)?);

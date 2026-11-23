@@ -48,6 +48,13 @@ pub fn xxhash32(bytes: &[u8], seed: u32) -> u32 {
 
 fn combine(current: i32, next: i32) -> i32 { current.wrapping_mul(31).wrapping_add(next) }
 
+pub fn hash_float_components(values: impl Iterator<Item = Option<f64>>, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) -> i32 {
+    values.fold(0, |hash, value| {
+        let value = value.map_or(0, |value| hash_bytes(&value.to_bits().to_be_bytes(), seed) as i32);
+        combine(hash, value)
+    })
+}
+
 /// Hashes the JVM vector interpretation of one semantic value.
 /// Struct children follow this value's key order; use `hash_cell` for an existing physical schema.
 /// Unadmitted calendar objects are rejected.
@@ -107,9 +114,7 @@ fn hash_value_with(value: &Value, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) 
         Value::List(_) | Value::FixedSizeList(_) => {
             let values = value.list_view().unwrap();
             if values.is_float() {
-                (0..values.len()).fold(0, |hash, index| {
-                    combine(hash, values.float_component(index).map_or(0, |value| float_hash(value, seed)))
-                })
+                hash_float_components((0..values.len()).map(|index| values.float_component(index)), seed, hash_bytes)
             } else if let rtdb_types::ListView::Numeric(values) = values {
                 let array = values.array().as_ref();
                 (0..array.len()).try_fold(0, |hash, row| {

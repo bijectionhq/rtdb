@@ -189,3 +189,28 @@ fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_typ
     builder.finish().unwrap()
 }
 fn raw_literal(value: rtdb_types::Value) -> RegexForm { raw_build(|builder| builder.literal(&value)) }
+
+#[tokio::test]
+async fn arrow_equijoin_matches_float_widths_and_rejects_unknown_vector_keys_across_spill() {
+    let vector = |value| Value::list(vec![value]);
+    let build = [vector(Value::F32(17.0)), vector(Value::Null), Value::Null];
+    let probe = [vector(Value::F64(17.0)), vector(Value::F64(18.0)), vector(Value::Null), Value::Null];
+    for threshold in [0, 100] {
+        let execution = execution(32, threshold);
+        let left = table(0, &build);
+        let right = table(1, &probe);
+        let condition = equal(&left, &right);
+        let relation = join(left, right, JoinKind::Inner, Some(condition));
+        let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
+        let mut count = 0;
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            for row in 0..batch.len {
+                assert_eq!(batch.columns[0].value(row).unwrap(), build[0]);
+                assert_eq!(batch.columns[1].value(row).unwrap(), probe[0]);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+    }
+}

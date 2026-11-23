@@ -39,6 +39,7 @@
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
 -- When a bound Boolean or nullable buffer needs normalization, the projection copies selected cells within Arrow.
 -- Compatible nested fields and union legs retain their value buffers when encoding changes their declared layout.
+-- Floating-point list output gathers selected row and component validity into the declared Arrow layout.
 -- Columnar UNION ALL preserves duplicates and forwards batches in input order.
 -- A columnar sort on input fields orders batch and row positions using the SQL key comparator.
 -- The sort gathers payload columns by position and uses Arrow IPC for its spill runs.

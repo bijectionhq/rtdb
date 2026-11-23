@@ -1,5 +1,6 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
+pub(crate) mod float_vector;
 mod patch;
 pub(crate) mod search;
 

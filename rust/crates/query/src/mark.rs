@@ -266,12 +266,7 @@ impl MembershipSpill {
 }
 
 fn membership_hash(batch: &ColumnBatch, row: usize, key: usize, context: &crate::QueryContext) -> Result<u32> {
-    let column = &batch.columns[key];
-    if let Some(hash) = crate::set_keys::vector_cell_hash(column, row) {
-        return Ok(crate::join_storage::combine_cell_hash(0, hash));
-    }
-    let _scratch = context.memory.reserve(column.bound(row)?)?;
-    hash_values(std::iter::once(&column.value(row)?))
+    crate::set_keys::Key::for_columns(batch, row, false, &[key], context)?.vector_hash()
 }
 
 fn mark_size() -> rtdb_types::Anomaly {
@@ -523,7 +518,7 @@ impl rtdb_expr::RowInput for MarkRow<'_> {
 
 async fn compare_page(
     probe: &crate::columnar::BatchRow<'_>, page: &ColumnBatch, invocation: &rtdb_expr::ExpressionInvocation<'_>,
-    mark: &mut Option<bool>, short_circuit: bool, execution: &Execution,
+    mark: &mut Option<bool>, short_circuit: bool, vector_keys: Option<(usize, usize)>, execution: &Execution,
 ) -> Result<()> {
     for row in 0..page.len {
         execution.context.check_cancelled_at(row)?;
@@ -531,15 +526,26 @@ async fn compare_page(
             probe: crate::columnar::BatchRow { batch: probe.batch, row: probe.row, admit_dates: probe.admit_dates },
             candidate: crate::columnar::BatchRow { batch: page, row, admit_dates: true },
         };
-        let scope = execution.scope()?;
-        match execution.evaluate_invocation_row(&scope, invocation, rtdb_expr::ExpressionRow::Borrowed(&input)).await? {
-            Value::Bool(true) => {
+        let direct = vector_keys.and_then(|(left, right)| {
+            crate::set_keys::direct_key_equal(&probe.batch.columns[left], probe.row, &page.columns[right], row, false)
+        });
+        let equal = if let Some(equal) = direct {
+            equal
+        } else {
+            let scope = execution.scope()?;
+            match execution.evaluate_invocation_row(&scope, invocation, rtdb_expr::ExpressionRow::Borrowed(&input)).await? {
+                Value::Bool(equal) => Some(equal),
+                Value::Null => None,
+                _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+            }
+        };
+        match equal {
+            Some(true) => {
                 *mark = Some(true);
                 if short_circuit { break; }
             }
-            Value::Null if *mark != Some(true) => *mark = None,
-            Value::Bool(false) | Value::Null => (),
-            _ => return Err(invalid("mark-type", "Mark comparison must return Boolean or null")),
+            None if *mark != Some(true) => *mark = None,
+            Some(false) | None => (),
         }
     }
     Ok(())
@@ -553,7 +559,7 @@ pub(crate) async fn correlated_batch_mark(batch: &ColumnBatch, row: usize, mut d
         page.validate_readable(&execution.context)?;
         let metadata = execution.scope()?;
         let invocation = execution.prepare_expression(comparison, schema, &metadata)?;
-        compare_page(&probe, &page, &invocation, &mut mark, false, execution).await?;
+        compare_page(&probe, &page, &invocation, &mut mark, false, None, execution).await?;
         if mark == Some(true) { break; }
     }
     Ok(mark)
@@ -613,11 +619,24 @@ impl SharedBatchMark {
         }
     }
 
+    fn vector_keys(&self, probe_width: usize) -> Option<(usize, usize)> {
+        let Expr::Binary { op: BinaryOp::Eq, left, right } = &self.comparison else { return None; };
+        let position = |expr: &Expr| {
+            let Expr::Column { id, .. } = expr else { return None; };
+            let index = self.schema.position(*id)?;
+            crate::columnar::float_vector::logical_vector(&self.schema.fields()[index].data_type).then_some(index)
+        };
+        let (left, right) = (position(left)?, position(right)?);
+        let (probe, build) = if left < right { (left, right) } else { (right, left) };
+        (probe < probe_width && build >= probe_width).then(|| (probe, build - probe_width))
+    }
+
     async fn apply(&mut self, mut batch: ColumnBatch, candidates: &CandidatePages) -> Result<ColumnBatch> {
         let context = &self.execution.context;
         batch.validate_readable(context)?;
         let memory = &context.memory;
         let reservation = memory.reserve(batch.len.checked_mul(2).and_then(|bytes| bytes.checked_add(256)).ok_or_else(mark_size)?)?;
+        let vector_keys = self.vector_keys(batch.columns.len());
         let metadata = self.execution.scope()?;
         let invocation = self.execution.prepare_expression(&self.comparison, &self.schema, &metadata)?;
         let mut marks = arrow_array::builder::BooleanBuilder::with_capacity(batch.len);
@@ -631,14 +650,14 @@ impl SharedBatchMark {
             let mut mark = Some(false);
             match candidates {
                 CandidatePages::Memory(pages, _charge) => for page in pages {
-                    compare_page(&probe, page, &invocation, &mut mark, true, &self.execution).await?;
+                    compare_page(&probe, page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
                     if mark == Some(true) { break; }
                 },
                 CandidatePages::Spill(_, _) => {
                     let (reader, width) = spill.as_mut().expect("The mark opened its candidate spill");
                     reader.rewind()?;
                     while let Some(page) = reader.read_columns(*width)? {
-                        compare_page(&probe, &page, &invocation, &mut mark, true, &self.execution).await?;
+                        compare_page(&probe, &page, &invocation, &mut mark, true, vector_keys, &self.execution).await?;
                         if mark == Some(true) { break; }
                     }
                 }
@@ -695,6 +714,36 @@ mod facts_tests {
             assert!(!facts.empty);assert!(facts.null);assert!(facts.nested);assert_eq!(facts.unmatched(false),Value::Null);
         }
         assert_eq!(memory.used_bytes(),0);
+    }
+
+    #[test]
+    fn membership_hash_reads_decorated_float_lists_under_the_cell_decode_budget() {
+        use std::collections::{BTreeMap, HashMap};
+        use arrow_array::{Array, Float32Array, ListArray};
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::{DataType, Field};
+        use rtdb_storage::{MemoryStore, cache::BufferPool};
+        use rtdb_types::Timestamp;
+        use tokio_util::sync::CancellationToken;
+
+        let database = crate::DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+        let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = crate::QueryContext::new(catalog, MemoryBudget::new(64 * 1024),
+            Timestamp(0), "UTC", crate::QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let values = Float32Array::from((0..8192).map(|row| (row % 2 == 0).then_some(-(row as f32))).collect::<Vec<_>>());
+        let items = Arc::new(Field::new("item", DataType::Float32, true).with_metadata(HashMap::from([("source".into(), "test".into())])));
+        let array = Arc::new(ListArray::new(items, OffsetBuffer::new(vec![0, 8192].into()), Arc::new(values.clone()), None));
+        let field = Arc::new(Field::new("v", array.data_type().clone(), false));
+        let column = Column::Arrow { array, logical: Some(rtdb_columnar::from_field(&field).unwrap()), field };
+        assert!(column.bound(0).unwrap() > context.memory.limit_bytes());
+        let charge = MemoryBudget::new(1 << 20).reserve(column.retained_bytes().unwrap() + 512).unwrap();
+        let batch = ColumnBatch::settled(vec![column], 1, charge).unwrap();
+        let value = Value::List(rtdb_types::ListValue::from_f32(values));
+
+        assert_eq!(membership_hash(&batch, 0, 0, &context).unwrap(), hash_values([&value]).unwrap());
+        let (actual, null) = crate::set_keys::direct_bloom_hashes(&batch.columns[0], 0).unwrap();
+        assert_eq!(actual, (rtdb_columnar::hash_value(&value, 0).unwrap(), rtdb_columnar::hash_value_murmur3(&value, 0).unwrap()));
+        assert!(!null);
     }
 
     struct EmptyCallback { remaining: bool,memory: Arc<MemoryBudget> }

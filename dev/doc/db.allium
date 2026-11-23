@@ -2030,7 +2030,8 @@ surface QueryAccess {
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.
         -- DISTINCT and set operations with columnar inputs select their output positions from those Arrow batches.
-        -- Their key index retains Arrow batches and compares compatible nulls, booleans, signed integers, text and binary cells at their indexed positions.
+        -- Their key index retains Arrow batches and hashes and compares compatible scalar and floating-point vector cells at their indexed positions.
+        -- A composite set key reads an owned scalar cell for each column that requires scalar hashing or equality.
         -- Compatible global counts and floating-point sums and averages reduce Arrow columns and emit scalar result vectors.
         -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
         -- Grouped output keeps the configured transport row limit.
@@ -2042,7 +2043,9 @@ surface QueryAccess {
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
         -- An Arrow join can evaluate a residual predicate from borrowed cells on either side while gathering the result payloads from the input batches.
         -- Join partitions retain flat and nested layouts in Arrow IPC, including selected cells whose physical fields differ.
+        -- An Arrow equijoin uses the raw vector hash of compatible floating-point list keys and compares their selected components.
         -- A shared mark can replay its candidate Arrow pages to evaluate arbitrary Boolean comparisons.
+        -- Direct floating-point list comparisons in a shared mark preserve SQL unknown results across candidate pages.
         -- Materialized bindings retain their semantic page boundaries and physical fields in Arrow IPC.
         -- Outer joins track unmatched build positions through partition replay.
         -- A correlated query retains its outer Arrow row position and gathers its output from the selected dependent positions.
@@ -2079,6 +2082,7 @@ surface QueryAccess {
         -- When selected cells need layout alignment before they can share one array, the scan retains their source vectors and positions.
         -- Reading a selected struct during evaluation preserves which keys its source has.
         -- Compatible fixed-size lists stay in Arrow through sparse selection and output.
+        -- Cursor output gathers selected floating-point list rows and components directly into their declared fields and union legs.
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.

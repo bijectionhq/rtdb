@@ -1266,28 +1266,21 @@ impl crate::columnar::BatchCursor for BatchDistinct {
     }
 }
 
+pub(crate) fn has_uri(value: &Value) -> bool {
+    match value {
+        Value::Uri(_) => true,
+        Value::Set(values) => values.iter().any(has_uri),
+        Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(has_uri)),
+        Value::Struct(fields) => fields.values().any(has_uri),
+        Value::Map { entries, .. } => entries.iter().any(|(key,value)| has_uri(key) || has_uri(value)),
+        _ => false,
+    }
+}
+
 pub(crate) fn uri_hashes_match(left: &[Value], right: &[Value], memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<bool> {
-    fn has_uri(value: &Value) -> bool {
-        match value {
-            Value::Uri(_) => true,
-            Value::Set(values) => values.iter().any(has_uri),
-            Value::List(values) | Value::FixedSizeList(values) => matches!(values.view(), rtdb_types::ListView::Values(values) if values.iter().any(has_uri)),
-            Value::Struct(fields) => fields.values().any(has_uri),
-            Value::Map { entries, .. } => entries.iter().any(|(key,value)| has_uri(key) || has_uri(value)),
-            _ => false,
-        }
-    }
-    fn hash(values: &[Value]) -> Result<u32> {
-        values.iter().try_fold(0u32, |hash,value| {
-            let cell = rtdb_columnar::hash_value(value,0)? as u32;
-            // Apache Arrow 19 MurmurHasher.combineHashCode, as used by IndexHasher.
-            let cell = cell.wrapping_mul(0xcc9e_2d51).rotate_left(15).wrapping_mul(0x1b87_3593);
-            Ok((hash ^ cell).rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64))
-        })
-    }
     if !left.iter().chain(right).any(has_uri) { return Ok(true); }
     let _scratch = memory.reserve(4096)?;
-    Ok(hash(left)? == hash(right)?)
+    Ok(crate::join_storage::hash_values(left)? == crate::join_storage::hash_values(right)?)
 }
 
 pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<bool> {
@@ -1302,6 +1295,10 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
 /// A date or timestamp equals one of another unit or zone once the session zone localizes it, so it hashes as the
 /// wall-clock time it reads as there; date-times nested in a container hash alike, and `rows_equal` tells them apart.
 pub(crate) fn equality_hash(values: &[Value], timezone: &str) -> u32 {
+    values.iter().fold(0, |hash, value| combine_equality_hash(hash, equality_cell_hash(value, timezone)))
+}
+
+pub(crate) fn equality_cell_hash(value: &Value, timezone: &str) -> u32 {
     fn temporal(value: &Value) -> bool {
         match value {
             Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) | Value::Date(_) | Value::TimestampTzRange { .. } => true,
@@ -1318,15 +1315,12 @@ pub(crate) fn equality_hash(values: &[Value], timezone: &str) -> u32 {
             _ => false,
         }
     }
-    values.iter().fold(0u32, |hash, value| {
-        let cell = match value {
+    match value {
             Value::Timestamp { .. } | Value::DateDay(_) | Value::DateMilli(_) => rtdb_expr::local_micros(value, timezone)
                 .and_then(|micros| rtdb_columnar::hash_value(&Value::I64(micros), 0).ok()).map_or(0x7e3a_11c5, |cell| (cell as u32) ^ 0x7e3a_11c5),
             value if temporal(value) => 0x7e3a_11c5,
             value => rtdb_columnar::hash_value(value, 0).map_or(0x5bd1_e995, |cell| cell as u32),
-        };
-        combine_equality_hash(hash, cell)
-    })
+    }
 }
 
 pub(crate) fn combine_equality_hash(hash: u32, cell: u32) -> u32 {
@@ -1723,7 +1717,7 @@ impl BatchApplyPlan {
                 let (page, charge) = if let Some(physical) = projection.physical_record(&schema, memory)? {
                     physical
                 } else {
-                    let output = crate::cursor::column_batch(&schema, memory, projection)?;
+                    let output = crate::cursor::apply_document_batch(&schema, memory, projection)?;
                     (output.batch().clone(), Arc::clone(output.reservation()))
                 };
                 let record: ArrayRef = Arc::new(StructArray::try_new_with_length(page.schema_ref().fields().clone(),

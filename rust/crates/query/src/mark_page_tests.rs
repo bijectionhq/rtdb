@@ -319,3 +319,30 @@ async fn spilled_keyless_mark_preserves_first_true_short_circuit_between_partiti
     assert_eq!(page_rows(retained),[vec![Value::I64(1),Value::Bool(true)],vec![Value::I64(2),Value::Bool(true)]]);
     assert_eq!(execution.context.memory.used_bytes(),baseline);
 }
+
+#[tokio::test]
+async fn arrow_vector_membership_preserves_unknown_and_signed_zero_across_candidate_pages() {
+    let vector = |value| Value::list(vec![value]);
+    let probe = [vector(Value::F32(-0.0)), vector(Value::F32(4.0)), vector(Value::Null), Value::Null];
+    let build = [vector(Value::F64(0.0)), vector(Value::Null)];
+    let values = |id, rows: &[Value]| {
+        let ty = LogicalType::join_all(rows.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
+        Arc::new(Relation::new(Schema::new(vec![field(id, ty)]).unwrap(), RelationNode::Values {
+            rows: rows.iter().cloned().map(|value| vec![Expr::Literal(value)]).collect(),
+        }).unwrap())
+    };
+    for threshold in [0, 10] {
+        let execution = execution_threshold(32, threshold);
+        let input = values(0, &probe);
+        let dependent = values(1, &build);
+        let comparison = Expr::binary(BinaryOp::Eq, input.schema().fields()[0].expression(), dependent.schema().fields()[0].expression());
+        let relation = mark(input, dependent, comparison, false);
+        let runtime = EmittedRelation::derive(relation, &execution.context.catalog, &[], &execution.context.memory).unwrap();
+        let mut cursor = crate::operators::build_columns(runtime, execution).await.unwrap().unwrap();
+        let mut marks = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            marks.extend((0..batch.len).map(|row| batch.columns[1].value(row).unwrap()));
+        }
+        assert_eq!(marks, [Value::Bool(true), Value::Null, Value::Null, Value::Null]);
+    }
+}

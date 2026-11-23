@@ -1,14 +1,15 @@
-use std::{collections::HashMap, mem::size_of, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, mem::size_of, sync::Arc};
 
+use arrow_schema::DataType;
 use rtdb_columnar::MemoryReservation;
-use rtdb_types::{LogicalType, Result};
+use rtdb_types::{Result, Value};
 
 use crate::{
     QueryContext,
-    columnar::{Column, ColumnBatch},
-    cursor::OwnedRow,
+    columnar::{Column, ColumnBatch, float_vector::{FloatVector, read_position}},
     invalid,
-    operators::{combine_equality_hash, equality_hash, rows_equal},
+    join_storage::combine_cell_hash,
+    operators::{combine_equality_hash, equality_cell_hash, has_uri},
     scalar_key::ScalarKey,
 };
 
@@ -19,34 +20,11 @@ struct ArrowKey<'a> {
     projected: bool,
 }
 
-impl ArrowKey<'_> {
-    fn read(self, context: &QueryContext) -> Result<OwnedRow> {
-        let memory = &context.memory;
-        let bound = self
-            .batch
-            .columns
-            .iter()
-            .try_fold(256usize, |bytes, column| {
-                bytes
-                    .checked_add(column.bound(self.row)?)
-                    .ok_or_else(size_error)
-            })?;
-        let _scratch = memory.reserve(bound)?;
-        let mut values = Vec::with_capacity(self.batch.columns.len());
-        for column in &self.batch.columns {
-            let mut value = column.value(self.row)?;
-            if self.projected {
-                value.admit_expression_dates()?;
-            }
-            values.push(value);
-        }
-        OwnedRow::new(values, memory)
-    }
-}
-
-enum Key<'a> {
-    Arrow(ArrowKey<'a>),
-    Scalar(OwnedRow),
+pub(crate) struct Key<'a> {
+    source: ArrowKey<'a>,
+    positions: Option<&'a [usize]>,
+    values: Vec<(usize, Value)>,
+    _reservation: Option<Arc<MemoryReservation>>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,99 +33,220 @@ enum KeyHash {
     Vector,
 }
 
-pub(crate) fn vector_cell_hash(column: &Column, row: usize) -> Option<i32> {
-    if let Some(key) = ScalarKey::read(column, row) { return Some(key.hash() as i32); }
-    let (array, field, logical, offset) = column.arrow_cell(row)??;
-    let logical = match logical? { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
-    if !matches!(logical, LogicalType::Scalar(_)) && column.expression_cell(row)?.float_list_span().is_none() {
-        return None;
+#[derive(Clone)]
+enum DirectKey<'a> {
+    Scalar(ScalarKey<'a>),
+    FloatList(FloatVector<'a>),
+}
+
+impl<'a> DirectKey<'a> {
+    fn read(column: &'a Column, row: usize) -> Option<Self> {
+        if let Column::Values(values) = column { return values.get(row).and_then(Self::from_value); }
+        if let Some(scalar) = ScalarKey::read(column, row) { return Some(Self::Scalar(scalar)); }
+        let cell = read_position(column, row)??;
+        if cell.field.data_type() == &DataType::Null || cell.array.is_null(cell.row) {
+            return Some(Self::Scalar(ScalarKey::Null));
+        }
+        FloatVector::arrow(cell).map(Self::FloatList)
     }
-    let physical = rtdb_columnar::from_field(field).ok()?;
-    let physical = match &physical { LogicalType::Maybe(inner) => inner.as_ref(), physical => physical };
-    if physical != logical { return None; }
-    rtdb_columnar::hash_cell(field, array, offset, 0).ok()
+
+    fn from_value(value: &'a Value) -> Option<Self> {
+        if matches!(value, Value::Null | Value::Undefined) { return Some(Self::Scalar(ScalarKey::Null)); }
+        FloatVector::value(value).map(Self::FloatList)
+    }
+
+    fn equal(self, right: Self, nulls_equal: bool) -> Option<Option<bool>> {
+        match (self, right) {
+            (Self::Scalar(ScalarKey::Null), Self::Scalar(ScalarKey::Null)) =>
+                Some(nulls_equal.then_some(true)),
+            (Self::Scalar(ScalarKey::Null), _) | (_, Self::Scalar(ScalarKey::Null)) =>
+                Some(nulls_equal.then_some(false)),
+            (Self::Scalar(left), Self::Scalar(right)) => left.equal(right).map(Some),
+            (Self::FloatList(left), Self::FloatList(right)) => {
+                if left.width.is_some() != right.width.is_some() || left.range.len() != right.range.len() {
+                    return Some(Some(false));
+                }
+                let mut unknown = false;
+                for (l, r) in left.range.clone().zip(right.range.clone()) {
+                    match (left.float_component(l), right.float_component(r)) {
+                        (Some(l), Some(r)) if l == r => {}
+                        (Some(_), Some(_)) => return Some(Some(false)),
+                        _ => unknown = true,
+                    }
+                }
+                Some((!unknown).then_some(true))
+            }
+            _ => Some(Some(false)),
+        }
+    }
+
+    fn equal_value(&self, value: &Value, nulls_equal: bool) -> Option<Option<bool>> {
+        let Self::FloatList(vector) = self else { return None; };
+        let list = match value {
+            Value::List(list) if vector.width.is_none() => list,
+            Value::FixedSizeList(list) if vector.width.is_some() => list,
+            Value::Null | Value::Undefined => return Some(nulls_equal.then_some(false)),
+            Value::Transit(_) => return None,
+            _ => return Some(Some(false)),
+        };
+        if vector.range.len() != list.len() { return Some(Some(false)); }
+        let mut unknown = false;
+        for (index, value) in vector.range.clone().zip(list.iter()) {
+            let left = vector.float_component(index);
+            if left.is_none() || matches!(value.as_ref(), Value::Null | Value::Undefined) {
+                unknown = true;
+            } else if matches!(value.as_ref(), Value::Transit(_)) {
+                return None;
+            } else if left != rtdb_expr::number(value.as_ref()) {
+                return Some(Some(false));
+            }
+        }
+        Some((!unknown).then_some(true))
+    }
+
+    fn hash(self) -> i32 {
+        self.hash_with(ScalarKey::hash, rtdb_columnar::xxhash32)
+    }
+
+    fn hash_with(self, hash_key: fn(ScalarKey<'a>) -> u32, hash_bytes: fn(&[u8], u32) -> u32) -> i32 {
+        match self {
+            Self::Scalar(key) => hash_key(key) as i32,
+            Self::FloatList(vector) => rtdb_columnar::hash_float_components(
+                vector.range.clone().map(|index| vector.float_component(index)), 0, hash_bytes,
+            ),
+        }
+    }
+}
+
+pub(crate) fn direct_key_equal(left: &Column, l: usize, right: &Column, r: usize, nulls_equal: bool) -> Option<Option<bool>> {
+    DirectKey::read(left, l)?.equal(DirectKey::read(right, r)?, nulls_equal)
+}
+
+pub(crate) fn direct_bloom_hashes(column: &Column, row: usize) -> Option<((i32, i32), bool)> {
+    let key = DirectKey::read(column, row)?;
+    let null = matches!(key, DirectKey::Scalar(ScalarKey::Null));
+    Some(((key.clone().hash(), key.hash_with(ScalarKey::murmur3, rtdb_columnar::murmur3_32)), null))
 }
 
 impl<'a> Key<'a> {
-    fn bind(
-        batch: &'a ColumnBatch,
-        row: usize,
-        projected: bool,
-        context: &QueryContext,
-        hashing: KeyHash,
-    ) -> Result<(u32, Self)> {
-        let hash = batch.columns.iter().try_fold(0, |hash, column| {
-            match hashing {
-                KeyHash::Set => ScalarKey::read(column, row).map(|cell| cell.hash())
-                    .or_else(|| {
-                        let cell = column.expression_cell(row)?;
-                        cell.float_list_span()?;
-                        rtdb_columnar::hash_cell(cell.field, cell.array, cell.row, 0).ok().map(|value| value as u32)
-                    }).map(|cell| combine_equality_hash(hash, cell)),
-                KeyHash::Vector => vector_cell_hash(column, row).map(|cell| crate::join_storage::combine_cell_hash(hash, cell)),
-            }
-        });
-        let key = ArrowKey {
-            batch,
-            row,
-            projected,
-        };
-        match hash {
-            Some(hash) => Ok((hash, Self::Arrow(key))),
-            None => {
-                let key = key.read(context)?;
-                let hash = match hashing {
-                    KeyHash::Set => equality_hash(&key.values, &context.timezone),
-                    KeyHash::Vector => crate::join_storage::hash_values(&key.values)?,
-                };
-                Ok((hash, Self::Scalar(key)))
+    fn read(source: ArrowKey<'a>, positions: Option<&'a [usize]>, context: &QueryContext) -> Result<Self> {
+        let mut key = Self { source, positions, values: Vec::new(), _reservation: None };
+        let mut bound = 256usize;
+        for index in 0..key.len() {
+            let column = key.column(index);
+            if DirectKey::read(column, source.row).is_none() {
+                bound = bound.checked_add(column.bound(source.row)?)
+                    .and_then(|bound| bound.checked_add(4 * size_of::<(usize, Value)>()))
+                    .ok_or_else(size_error)?;
+                match &mut key._reservation {
+                    Some(reservation) => Arc::get_mut(reservation).expect("A key owns its scratch").grow_to(bound)?,
+                    None => key._reservation = Some(context.memory.reserve(bound)?),
+                }
+                key.values.push((index, key.read_value(index)?));
             }
         }
+        Ok(key)
+    }
+
+    pub(crate) fn for_columns(batch: &'a ColumnBatch, row: usize, projected: bool, positions: &'a [usize],
+        context: &QueryContext) -> Result<Self> {
+        Self::read(ArrowKey { batch, row, projected }, Some(positions), context)
+    }
+
+    fn len(&self) -> usize {
+        self.positions.map_or(self.source.batch.columns.len(), <[usize]>::len)
+    }
+
+    fn column(&self, index: usize) -> &'a Column {
+        &self.source.batch.columns[self.positions.map_or(index, |positions| positions[index])]
+    }
+
+    fn read_value(&self, index: usize) -> Result<Value> {
+        let mut value = self.column(index).value(self.source.row)?;
+        if self.source.projected { value.admit_expression_dates()?; }
+        Ok(value)
+    }
+
+    fn cached(&self, index: usize) -> Option<&Value> {
+        let position = self.values.binary_search_by_key(&index, |(column, _)| *column).ok()?;
+        Some(&self.values[position].1)
+    }
+
+    fn direct(&self, index: usize) -> Option<DirectKey<'_>> {
+        match self.cached(index) {
+            Some(value) => DirectKey::from_value(value),
+            None => DirectKey::read(self.column(index), self.source.row),
+        }
+    }
+
+    fn bind(batch: &'a ColumnBatch, row: usize, projected: bool, context: &QueryContext, hashing: KeyHash) -> Result<(u32, Self)> {
+        let key = Self::read(ArrowKey { batch, row, projected }, None, context)?;
+        let hash = match hashing {
+            KeyHash::Set => (0..key.len()).fold(0, |hash, index| {
+                let cell = match key.cached(index) {
+                    Some(value) => equality_cell_hash(value, &context.timezone),
+                    None => key.direct(index).expect("An unread key has a direct reader").hash() as u32,
+                };
+                combine_equality_hash(hash, cell)
+            }),
+            KeyHash::Vector => key.vector_hash()?,
+        };
+        Ok((hash, key))
+    }
+
+    pub(crate) fn vector_hash(&self) -> Result<u32> {
+        (0..self.len()).try_fold(0, |hash, index| {
+            let cell = match self.cached(index) {
+                Some(value) => rtdb_columnar::hash_value(value, 0)?,
+                None => self.direct(index).expect("An unread key has a direct reader").hash(),
+            };
+            Ok(combine_cell_hash(hash, cell))
+        })
     }
 
     fn equals(&self, other: ArrowKey<'_>, context: &QueryContext) -> Result<bool> {
-        if let Self::Arrow(key) = self
-            && let Some(equal) = direct_equal(*key, other)
-        {
-            return Ok(equal);
+        if self.len() != other.batch.columns.len() { return Ok(false); }
+        let right = Key::read(other, None, context)?;
+        // URI preflight can raise a hash error in a later cell even if an earlier cell compares unequal.
+        if self.values.iter().chain(&right.values).any(|(_, value)| has_uri(value)) {
+            let _scratch = context.memory.reserve(4096)?;
+            if self.vector_hash()? != right.vector_hash()? { return Ok(false); }
         }
-        let (left, keep);
-        match self {
-            Self::Arrow(key) => {
-                keep = key.read(context)?;
-                left = &keep.values;
-            }
-            Self::Scalar(key) => left = &key.values,
+        for index in 0..self.len() {
+            if self.equal_at(&right, index, true, context, None)? != Some(true) { return Ok(false); }
         }
-        let right = other.read(context)?;
-        rows_equal(left, &right.values, &context.timezone, &context.memory)
+        Ok(true)
     }
-}
 
-fn direct_equal(left: ArrowKey<'_>, right: ArrowKey<'_>) -> Option<bool> {
-    if left.batch.columns.len() != right.batch.columns.len() {
-        return Some(false);
-    }
-    let mut equal = true;
-    for (left_column, right_column) in left.batch.columns.iter().zip(&right.batch.columns) {
-        let scalar = ScalarKey::read(left_column, left.row).zip(ScalarKey::read(right_column, right.row));
-        if let Some((left, right)) = scalar {
-            equal &= left.equal(right)?;
-            continue;
+    pub(crate) fn equal_at(&self, right: &Key<'_>, index: usize, nulls_equal: bool, context: &QueryContext,
+        scope: Option<&rtdb_expr::EvaluationScope>) -> Result<Option<bool>> {
+        let direct = match (self.direct(index), right.direct(index)) {
+            (Some(a), Some(b)) => a.equal(b, nulls_equal),
+            (Some(a), None) => right.cached(index).and_then(|value| a.equal_value(value, nulls_equal)),
+            (None, Some(b)) => self.cached(index).and_then(|value| b.equal_value(value, nulls_equal)),
+            _ => None,
+        };
+        if let Some(equal) = direct { return Ok(equal); }
+        let bound = |key: &Key<'_>| -> Result<usize> {
+            if key.cached(index).is_some() { Ok(0) } else { key.column(index).bound(key.source.row) }
+        };
+        let _scratch = context.memory.reserve(bound(self)?.checked_add(bound(right)?).ok_or_else(size_error)?)?;
+        let l = if let Some(value) = self.cached(index) { Cow::Borrowed(value) } else { Cow::Owned(self.read_value(index)?) };
+        let r = if let Some(value) = right.cached(index) { Cow::Borrowed(value) } else { Cow::Owned(right.read_value(index)?) };
+        let local;
+        let scope = match scope {
+            Some(scope) => scope,
+            None => { local = rtdb_expr::EvaluationScope::new(&context.memory)?; &local }
+        };
+        if nulls_equal {
+            if matches!(l.as_ref(), Value::Null | Value::Undefined) || matches!(r.as_ref(), Value::Null | Value::Undefined) {
+                return Ok(Some(matches!(l.as_ref(), Value::Null | Value::Undefined) && matches!(r.as_ref(), Value::Null | Value::Undefined)));
+            }
         }
-        let left = left_column.expression_cell(left.row)?;
-        let right = right_column.expression_cell(right.row)?;
-        if std::mem::discriminant(&left.sequence_kind()?) != std::mem::discriminant(&right.sequence_kind()?) {
-            return None;
-        }
-        let (left, a) = left.float_list_span()?;
-        let (right, b) = right.float_list_span()?;
-        equal &= a.len() == b.len() && a.zip(b).all(|(a, b)| match (left.float_component(a), right.float_component(b)) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        });
+        let equal = rtdb_expr::sql_eq_in_timezone(&l, &r, &context.timezone, scope)?;
+        scope.reset()?;
+        Ok(equal)
     }
-    Some(equal)
 }
 
 #[derive(Clone, Copy)]
@@ -506,7 +605,7 @@ mod tests {
         );
         let (first, key) = Key::bind(&right, 0, false, &context, KeyHash::Set).unwrap();
         let (second, _) = Key::bind(&right, 1, false, &context, KeyHash::Set).unwrap();
-        assert!(matches!(key, Key::Arrow(_)));
+        assert!(key.values.is_empty());
         assert_eq!(first, second);
         let mut index = BatchKeyIndex::new(&context).unwrap();
         index.build(right, false, &context).unwrap();
@@ -613,4 +712,38 @@ mod tests {
             "rtdb/jvm-half-float"
         );
     }
+
+    #[test]
+    fn composite_keys_decode_only_the_column_that_needs_scalar_semantics() {
+        use rtdb_types::{LogicalType, ScalarType};
+
+        let context = context();
+        let vector = |value| Value::list(vec![value]);
+        let left = [Value::DateDay(0), vector(Value::F32(-0.0))];
+        let right = [Value::DateMilli(0), vector(Value::F64(-0.0))];
+        let batch = |values: &[Value]| {
+            let types = [values[0].logical_type(), LogicalType::list(LogicalType::from_legs([
+                LogicalType::Scalar(ScalarType::F32), LogicalType::Null, LogicalType::Scalar(ScalarType::F64),
+            ]))];
+            let fields = types.iter().enumerate().map(|(i, ty)| rtdb_columnar::to_field(&format!("k{i}"), ty).unwrap()).collect::<Vec<_>>();
+            let arrays = types.iter().zip(values).map(|(ty, value)| rtdb_columnar::copy_array(ty, std::slice::from_ref(value)).unwrap()).collect();
+            ColumnBatch::from_owned(OwnedBatch::new(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap(), &context.memory).unwrap()).unwrap()
+        };
+        let left_batch = batch(&left);
+        let right_batch = batch(&right);
+        let (hash, key) = Key::bind(&left_batch, 0, false, &context, KeyHash::Set).unwrap();
+        assert_eq!(key.values, [(0, Value::DateDay(0))]);
+        assert_eq!(hash, crate::operators::equality_hash(&left, &context.timezone));
+        assert_eq!(hash, crate::operators::equality_hash(&right, &context.timezone));
+        let mut index = BatchKeyIndex::new(&context).unwrap();
+        index.build(left_batch, false, &context).unwrap();
+        assert!(index.matches(&right_batch, 0, false, true, &context).unwrap());
+        assert!(!index.matches(&right_batch, 0, false, true, &context).unwrap());
+
+        let join = Key::for_columns(&right_batch, 0, false, &[0, 1], &context).unwrap();
+        assert_eq!(join.values, [(0, Value::DateMilli(0))]);
+        assert_eq!(join.vector_hash().unwrap(), crate::join_storage::hash_values(&right).unwrap());
+        assert!(matches!(join.direct(1), Some(DirectKey::FloatList(_))));
+    }
+
 }
