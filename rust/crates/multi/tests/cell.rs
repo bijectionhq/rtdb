@@ -2266,6 +2266,27 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
     let mut foreign = prepared.clone();
     foreign.intent.operation = Some(uuid::Uuid::new_v4());
     assert!(admin::activate_managed_cell_transfer(&from, &to, &foreign).await.is_err());
+
+    let CellStorage::Local { root } = to.storage else { panic!("a disposable local fixture") };
+    let block = rtdb_types::BlockIndex(pending.checkpoint.unwrap().block);
+    let catalog = rtdb_format::keys::block_key(block).unwrap();
+    let root_key = rtdb_format::keys::StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0)).unwrap().key();
+    let storage_root = root.join(pending.storage_prefix()).join(root_key);
+    let pack = storage_root.join(rtdb_multi::packing::block_pack(&catalog));
+    let missing = tempfile::tempdir_in(root).unwrap();
+    let displaced = missing.path().join("checkpoint.pack");
+    std::fs::rename(&pack, &displaced).unwrap();
+    assert!(admin::activate_managed_cell_transfer(&from, &to, &prepared).await.is_err());
+    assert_eq!(cell.directory.deployment(&id.to_string()).await.unwrap().unwrap().lifecycle, Lifecycle::Moving);
+    assert_eq!(destination.directory.deployment(&id.to_string()).await.unwrap().unwrap().lifecycle, Lifecycle::Moving);
+    std::fs::rename(&displaced, &pack).unwrap();
+
+    let marker = storage_root.join(rtdb_multi::store::ROOT_MARKER);
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&marker).unwrap();
+    assert_eq!(admin::activate_managed_cell_transfer(&from, &to, &prepared).await.unwrap_err().code, "rtdb.multi/foreign-root");
+    assert_eq!(cell.directory.deployment(&id.to_string()).await.unwrap().unwrap().lifecycle, Lifecycle::Moving);
+    std::fs::remove_file(marker).unwrap();
+
     let arrived = admin::activate_managed_cell_transfer(&from, &to, &prepared).await.unwrap();
     assert_eq!(arrived.lifecycle, Lifecycle::Live);
     assert_eq!(admin::prepare_managed_cell_transfer(&from, &to, &intent, 4 << 20, None).await.unwrap(), prepared);

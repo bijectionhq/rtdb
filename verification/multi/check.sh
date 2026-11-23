@@ -43,6 +43,7 @@ while IFS='|' read -r module config expected_status expected_message; do
     printf '%s: %s\n' "$config" "$expected_message"
 done <<'CONFIGURATIONS'
 RTDBCellTransfer|RTDBCellTransfer|0|No error has been found
+RTDBCellTransfer|RTDBCellTransferWithoutFrames|12|Invariant RoutedCheckpointFramed is violated
 RTDBDeletion|RTDBDeletion|0|No error has been found
 RTDBDeletion|RTDBDeletionUndrainedAdministrator|12|Invariant NoObjectAfterReceipt is violated
 RTDBDeletion|RTDBDeletionWithoutLegacyHorizon|12|Invariant FirstInventoryFollowsExpiry is violated

@@ -338,21 +338,12 @@ impl ArchivedCheckpoint {
     }
 
     async fn verify_serving_transfer_envelopes(&self, raw: &dyn ObjectStore) -> Result<()> {
-        use crate::cipher::object::{FramedObject, SEALED_HEADER_BYTES, framed, sealed_size};
-
-        for name in self.objects.keys().filter(|key| framed(key)) {
-            let object = match raw.observe_head(name).await {
-                Ok(object) => object,
-                Err(Error::MissingObject(_)) => continue,
+        for name in self.objects.keys().filter(|key| crate::cipher::object::framed(key)) {
+            match raw.observe_head(name).await {
+                Ok(object) => verify_transfer_envelope(raw, &self.serving_cipher, name, object).await?,
+                Err(Error::MissingObject(_)) => (),
                 Err(error) => return Err(error.into()),
             };
-            let unframed = || unavailable("Cell transfer requires framed originals for the selected replay archive");
-            if object.value.size < SEALED_HEADER_BYTES as u64 { return Err(unframed()); }
-            let header = raw.observe_range(name, 0..SEALED_HEADER_BYTES as u64).await?;
-            let layout = FramedObject::open_header(&self.serving_cipher, name, &header.value).map_err(|_| unframed())?;
-            if object.version != header.version || object.value.size != sealed_size(name, layout.length())? as u64 {
-                return Err(unframed());
-            }
         }
         Ok(())
     }
@@ -453,6 +444,52 @@ impl ArchivedCheckpoint {
         }
         Ok(())
     }
+}
+
+async fn verify_transfer_envelope(
+    raw: &dyn ObjectStore, cipher: &Cipher, name: &ObjectKey, object: ObjectObservation<StoredObject>,
+) -> Result<()> {
+    use crate::cipher::object::{FramedObject, SEALED_HEADER_BYTES, sealed_size};
+
+    let unframed = || unavailable("Cell transfer requires authenticated frames in checkpoint trie files");
+    if object.value.size < SEALED_HEADER_BYTES as u64 { return Err(unframed()); }
+    let header = raw.observe_range(name, 0..SEALED_HEADER_BYTES as u64).await?;
+    let layout = FramedObject::open_header(cipher, name, &header.value).map_err(|_| unframed())?;
+    if object.version != header.version || object.value.size != sealed_size(name, layout.length())? as u64 {
+        return Err(unframed());
+    }
+    Ok(())
+}
+
+pub(crate) async fn verify_cell_move_checkpoint(
+    record: &DeploymentRecord, bucket: Arc<dyn ObjectStore>, material: Option<&[u8; crate::keys::KEY_BYTES]>,
+) -> Result<()> {
+    let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
+    let physical = PrefixedStore::new(bucket.clone(), root.clone());
+    crate::store::check_root(&physical, &record.id, false).await?;
+    let Some(checkpoint) = record.checkpoint else { return Ok(()); };
+    let material = material.ok_or_else(|| {
+        Anomaly::fault("rtdb.multi/transfer-key", "The transfer checkpoint has no installation key")
+    })?;
+    let raw = open_deployment_store(bucket, &root, PackDiscovery::From(checkpoint.block), wall_clock()).await?;
+    let cipher = Cipher::new(material)?;
+    let plaintext = EncryptingStore::new(raw.clone(), material)?;
+    let catalog = BlockCatalog::decode(&plaintext.get_fresh(&key(&block_key(BlockIndex(checkpoint.block))?)?).await?)?;
+    verify_cut(&catalog, checkpoint, StorageEpoch(record.log_epoch))?;
+    let closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
+    let tries = closure.iter().filter_map(|(name, digest)| digest.is_none().then_some(name));
+    futures::stream::iter(tries.map(Ok)).try_for_each_concurrent(16, |name| {
+        let raw = raw.as_ref();
+        let cipher = &cipher;
+        async move {
+            if crate::cipher::object::framed(name) {
+                verify_transfer_envelope(raw, cipher, name, raw.observe_head(name).await?).await?;
+            } else {
+                raw.head_fresh(name).await?;
+            }
+            Ok(())
+        }
+    }).await
 }
 
 pub(crate) async fn require_transferable_serving_archive(
@@ -2897,6 +2934,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transferred_checkpoint_requires_its_trie_metadata() -> Result<()> {
+        let fixture = replay_fixture()?;
+        let material = [5; crate::keys::KEY_BYTES];
+        let cipher = Cipher::new(&material)?;
+        let mut record = DeploymentRecord::new("orders", "acme", Vec::new(), 0);
+        record.checkpoint = Some(fixture.point.checkpoint);
+        let bucket: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
+        let raw = PrefixedStore::new(bucket.clone(), format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?));
+        let metadata = &fixture.retained[1];
+        for (name, bytes) in fixture.files.iter().filter(|(name, _)| *name != metadata) {
+            raw.put(name, cipher.seal_object(name, bytes)?).await?;
+        }
+        let absent = verify_cell_move_checkpoint(&record, bucket.clone(), Some(&material)).await.unwrap_err();
+        assert_eq!(absent.code, "rtdb.storage/missing-object");
+
+        raw.put(metadata, cipher.seal_object(metadata, &fixture.files[metadata])?).await?;
+        verify_cell_move_checkpoint(&record, bucket, Some(&material)).await
+    }
+
+    #[tokio::test]
     async fn a_parked_checkpoint_with_an_unframed_pack_can_adopt_a_framed_replay_archive() -> Result<()> {
         let fixture = replay_fixture()?;
         let location = tempfile::tempdir().unwrap();
@@ -2927,6 +2984,8 @@ mod tests {
         let original = physical.get(&pack).await?;
         let before = EncryptingStore::new(packed, &material)?;
         assert!(before.get(legacy).await.is_err());
+        let transfer = verify_cell_move_checkpoint(&record, bucket.clone(), Some(&material)).await.unwrap_err();
+        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires authenticated frames in checkpoint trie files"));
         directory.create_deployment(record).await?;
 
         let captured = capture(directory.clone(), &storage, &archive, &keys, deployment, operation, None, None).await?;
@@ -2976,7 +3035,7 @@ mod tests {
         assert_eq!(adopted.checkpoint, Some(checkpoint));
         let current = directory.deployment(&deployment.to_string()).await?.unwrap();
         let transfer = require_transferable_serving_archive(directory.as_ref(), &storage, &keys, &current, None).await.unwrap_err();
-        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires framed originals for the selected replay archive"));
+        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires authenticated frames in checkpoint trie files"));
         let current = directory.deployment(&deployment.to_string()).await?.unwrap();
         assert_eq!(current.lifecycle, Lifecycle::Live);
         let reopened = with_replay_archive(directory.as_ref(), &storage, &keys, &current, None, |_, _, replay| async {

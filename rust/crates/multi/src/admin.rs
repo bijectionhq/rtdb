@@ -967,6 +967,13 @@ async fn prepared_cell_move(
             && target.move_from.is_none()
             && matches!(target.lifecycle, Lifecycle::Moving | Lifecycle::Live | Lifecycle::Quarantined)
     }).ok_or_else(conflict)?;
+    if target.lifecycle == Lifecycle::Moving {
+        require_storage_drained(&target)?;
+        let bucket = to.storage.bucket(rtdb_storage::IoRegion::new()).await?;
+        require_storage_namespaces(&target, storage_namespaces(bucket.as_ref(), to.keys).await?)?;
+        let material = if target.checkpoint.is_some() { to.keys.existing_key(&target.key_id()).await? } else { None };
+        Box::pin(crate::archive::verify_cell_move_checkpoint(&target, bucket, material.as_ref())).await?;
+    }
     Ok((source, target))
 }
 
@@ -1000,7 +1007,9 @@ async fn settle_cell_move(
             return Err(conflict());
         }
         match record.lifecycle {
-            Lifecycle::Moving if record.epoch == source.epoch => record.lifecycle = Lifecycle::Live,
+            Lifecycle::Moving if record.epoch == source.epoch && record.log_epoch == target.log_epoch && record.checkpoint == target.checkpoint => {
+                record.lifecycle = Lifecycle::Live;
+            }
             Lifecycle::Live | Lifecycle::Quarantined => {}
             _ => return Err(conflict()),
         }
@@ -1202,8 +1211,8 @@ async fn prepare_cell_move(
     let mut bound_source = current.clone();
     bind_admin_storage(&mut bound_source, source_binding)?;
     let material = from.keys.existing_key(&current.key_id()).await?;
-    if let Some(material) = material {
-        to.keys.validate_install(&arrival.key_id(), &material).await?;
+    if let Some(material) = material.as_ref() {
+        to.keys.validate_install(&arrival.key_id(), material).await?;
     } else if current.checkpoint.is_some() {
         return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
     }
@@ -1230,7 +1239,11 @@ async fn prepare_cell_move(
     }
 
     let serving_archive = if current.lifecycle == Lifecycle::Live {
-        Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.storage, from.keys, &current, hosted_task.as_ref())).await?
+        let archive = Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.storage, from.keys, &current, hosted_task.as_ref())).await?;
+        if archive.is_none() {
+            Box::pin(crate::archive::verify_cell_move_checkpoint(&current, source_bucket, material.as_ref())).await?;
+        }
+        archive
     } else {
         crate::archive::serving_archive_operation(&current)?
     };
@@ -1338,7 +1351,7 @@ async fn prepare_cell_move(
         }
     };
     if staged.move_from.is_none() {
-        return Ok((source, staged));
+        return prepared_cell_move(from, to, intent).await;
     }
 
     if staged.move_from.as_ref() != Some(&source_stream.servers) {
@@ -1362,7 +1375,12 @@ async fn prepare_cell_move(
 
     rtdb_logkeeper::copy_retained(source_stream, target_stream, source.epoch).await?;
     let prepared = update_installation(to.directory.as_ref(), &staged.id, |record| {
-        if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch {
+        if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch
+            || record.checkpoint != staged.checkpoint || record.storage_namespaces != staged.storage_namespaces
+            || record.storage_prefix() != staged.storage_prefix() || record.log_epoch != staged.log_epoch
+            || record.ensemble != staged.ensemble || record.replica_journals != staged.replica_journals
+            || record.move_from.as_ref().is_some_and(|journals| Some(journals) != staged.move_from.as_ref())
+        {
             return Err(conflict());
         }
         require_storage_drained(record)?;
@@ -1428,6 +1446,7 @@ async fn stage_cell_storage(
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }
+        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, material.as_ref())).await?;
         // A never-opened source need not provision a key merely to move.
         // The source vault is read-only for the transfer operator.
         if let Some(material) = material {

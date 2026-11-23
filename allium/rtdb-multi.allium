@@ -3061,7 +3061,8 @@ rule UpgradeFormatLazily {
 rule BeginCellMove {
     -- The source and target have distinct object and key namespaces.
     -- Each cell's object namespace lies outside the other's cleanup prefix for the deployment.
-    -- An incomplete copy can be retried at a fresh destination prefix.
+    -- A retry holds the original source fence and resumes the registered destination prefix.
+    -- A fresh attempt after conflicting immutable bytes still needs its own admission and disposition.
     -- A source whose selected replay archive still overlays unframed original members reports the envelope mismatch before fencing.
     -- Only the attempt recorded as prepared can be published.
     when: CellMoveRequested(record, target_cell)
@@ -3084,6 +3085,9 @@ rule MoveCutover {
     -- The destination's first holder imports the sealed source log before it can serve.
     -- A retry after the switch finishes publication and leaves the source tombstone.
     -- Forks in the source cell retain access to every object they share.
+    -- Verify the destination's root owner, checkpoint catalog, required trie metadata and trie envelopes against its own storage generation.
+    -- Record preparation after all destination storage regions drain.
+    -- Before activating an already prepared destination, recheck that same checkpoint in its recorded namespace.
     when: DestinationPrepared(record, target_cell)
 
     requires: record.lifecycle = moving

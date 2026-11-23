@@ -1221,10 +1221,14 @@ Unbounded means adding cells (spec contract `CellMap`).
 2. Cell move: fork into the target cell, fence, copy the remaining tail, flip the map, leave a forwarding tombstone (`BeginCellMove`, `MoveCutover`).
    The source and target must have distinct physical object namespaces and key namespaces.
    A move verifies both before fencing the source.
+   It checks the source checkpoint's visible trie frames before fencing and verifies the root owner, exact catalog, required trie metadata and frame headers in the destination.
+   The destination records preparation after its storage regions drain.
+   An activation retry for an already prepared destination rechecks the checkpoint in the recorded storage generation before settling the source.
    It refuses a shared namespace, a storage root inside the other deployment's cleanup prefix, or a conflicting destination key.
    Overlapping S3 prefixes in the same named bucket are rejected before writing namespace markers.
    Retry `move-cell` with the same source, destination and namespace configuration when preparation or cutover is interrupted.
-   A retry before preparation completes copies to a fresh destination prefix under the original writer fence.
+   Before preparation completes, a retry keeps the original writer fence and reuses the registered destination prefix.
+   Recovery from conflicting immutable bytes in that prefix still requires an independently fenced destination attempt.
    The destination prefix must be disjoint from all deployment prefixes recorded in the destination directory.
    Once prepared, the source records the chosen prefix, the destination staged record waits for the placement switch, and retry finishes the same switch or source tombstone.
    The destination's holder imports the old log ensemble before log-fed replicas can serve it.
