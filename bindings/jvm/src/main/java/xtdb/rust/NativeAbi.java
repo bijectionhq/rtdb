@@ -42,6 +42,7 @@ final class NativeAbi {
         register(library, linker, "cancel", I64, PTR);
         register(library, linker, "session_action", I64, I64, I32, PTR);
         register(library, linker, "session_set_catalog", I64, PTR, I64, PTR);
+        registerOptional(library, linker, "session_set_application_name", I64, PTR, I64, PTR);
         register(library, linker, "session_transact", I64, I64, PTR, I64, PTR, PTR);
         registerOptional(library, linker, "session_query_ra", I64, I64, PTR, I64, PTR, I64, PTR, PTR);
         register(library, linker, "session_await_token", I64, PTR, PTR);
@@ -74,6 +75,7 @@ final class NativeAbi {
     private void registerOptional(SymbolLookup library, Linker linker, String name, MemoryLayout... arguments) {
         library.find("rtdb_v1_" + name).ifPresent(symbol -> functions.put(name, linker.downcallHandle(symbol, FunctionDescriptor.of(I32, arguments))));
     }
+    boolean supports(String name) { return functions.containsKey(name); }
     private int invoke(String name, Object... arguments) throws AdbcException {
         MethodHandle function = functions.get(name);
         if (function == null) throw AdbcException.invalidState("Native ABI entry point is unavailable: " + name);

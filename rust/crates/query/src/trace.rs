@@ -10,7 +10,9 @@ pub(crate) struct QueryTrace { span: Box<dyn TraceSpan>, memory: Arc<rtdb_column
 impl QueryTrace {
     pub fn start(context: &Arc<QueryContext>, text: Option<&str>) -> Option<Self> {
         let tracer = context.tracer.as_ref().filter(|tracer| tracer.query_enabled())?;
-        let span = match text { Some(text) => tracer.start(context.trace_parent, "xtdb.query", &[("query.text", TraceValue::Text(text))]), None => tracer.start(context.trace_parent, "xtdb.query", &[]) }?;
+        let mut span = tracer.start(context.trace_parent, "xtdb.query", &[])?;
+        if let Some(text) = text { span.attribute("query.text", TraceValue::Text(text)); }
+        if let Some((name, _)) = &context.application_name { span.attribute("application.name", TraceValue::Text(name)); }
         Some(Self { span, memory: Arc::clone(&context.memory) })
     }
     pub fn context(&self) -> SpanContext { self.span.context() }
@@ -20,7 +22,7 @@ impl Drop for QueryTrace { fn drop(&mut self) { self.span.attribute("query.peak_
 pub(crate) struct CursorTrace {
     tracer: Arc<dyn Tracer>, parent: SpanContext, name: String, kind: &'static str,
     span: Option<Box<dyn TraceSpan>>, started: bool, total: Duration, first: Option<Duration>,
-    rows: u64, pulls: u64, end: SystemTime, pages: bool, _reservation: Arc<MemoryReservation>,
+    rows: u64, pulls: u64, end: SystemTime, pages: bool, operator_memory: Option<Arc<rtdb_columnar::MemoryBudget>>, _reservation: Arc<MemoryReservation>,
 }
 impl CursorTrace {
     pub fn new(context: &Arc<QueryContext>, kind: &'static str, name: &str, pages: bool) -> Option<Self> {
@@ -28,7 +30,8 @@ impl CursorTrace {
         let parent = context.trace_parent?;
         let reservation = context.memory.reserve(name.len().checked_add(2048)?).ok()?;
         Some(Self { tracer, parent, name: name.into(), kind, span: None, started: false, total: Duration::ZERO,
-            first: None, rows: 0, pulls: 0, end: SystemTime::now(), pages, _reservation: reservation })
+            first: None, rows: 0, pulls: 0, end: SystemTime::now(), pages,
+            operator_memory: context.operator_root.as_ref().map(|_| Arc::clone(&context.memory)), _reservation: reservation })
     }
     pub fn start(&mut self) {
         if !self.started {
@@ -49,11 +52,14 @@ impl Drop for CursorTrace {
             if let Some(first) = self.first { span.attribute(if self.pages { "cursor.time_to_first_page_ms" } else { "cursor.time_to_first_pull_ms" }, TraceValue::Unsigned(first.as_millis().min(u64::MAX as u128) as u64)); }
             span.attribute(if self.pages { "cursor.page_count" } else { "cursor.pull_count" }, TraceValue::Unsigned(self.pulls));
             span.attribute("cursor.row_count", TraceValue::Unsigned(self.rows));
+            if let Some(memory) = &self.operator_memory {
+                span.attribute("cursor.peak_memory_bytes", TraceValue::Unsigned(memory.peak_bytes() as u64));
+            }
             span.end_at(self.end);
         }
     }
 }
-fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
+pub(crate) fn operator_trace(relation: &Relation, context: &Arc<QueryContext>) -> Option<CursorTrace> {
     context.trace_parent?;
     let kind = crate::analysis::operator(relation);
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };

@@ -814,8 +814,8 @@ impl crate::columnar::BatchCursor for CoveredBatches {
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
-        span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Boolean(true));
+        span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Boolean(true));
         self.batches.trace_attributes(span);
     }
 }
@@ -907,8 +907,8 @@ impl crate::columnar::BatchCursor for OrderedPayload {
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
-        span.attribute("scan_ordered_payload_batches", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Boolean(true));
+        span.attribute("scan_ordered_payload_batches", rtdb_plan::TraceValue::Boolean(true));
     }
 }
 
@@ -1664,7 +1664,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
-    fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_one_iid() {
+    fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_known_iids() {
         let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
         let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
         let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
@@ -2464,7 +2464,7 @@ mod tests {
             name: "mod".into(), args: vec![value.expression(), Expr::Literal(Value::I64(2))],
             return_type: LogicalType::Scalar(ScalarType::I64),
         };
-        assert!(!crate::columnar::projection::shaped(&remainder));
+        assert!(crate::columnar::projection::shaped(&remainder));
         let named = |id, name: &str, expr: Expr| NamedExpr {
             field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..value.clone() },
             expr,
@@ -2483,6 +2483,8 @@ mod tests {
             assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow list"); };
             assert!(array.as_any().is::<arrow_array::ListArray>());
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[2] else { panic!("Expected an Arrow remainder"); };
+            assert!(array.as_any().is::<arrow_array::Int64Array>());
             let page = baseline.next_page().await.unwrap().unwrap();
             assert_eq!(page.len(), batch.len);
             for (row, expected) in page.rows().iter().enumerate() {
@@ -2951,17 +2953,21 @@ mod tests {
         }).unwrap());
         let relation = Arc::new(Relation::new(schema, RelationNode::Let { binding, body }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
-        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
-        assert!(execution.context.spill_bytes() > 0);
-        let mut values = Vec::new();
-        while let Some(batch) = cursor.next_batch().await.unwrap() {
-            let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow IPC output"); };
-            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
-            values.extend(array.values().iter().copied());
+        for (row_threshold, expect_spill) in [(100, false), (2, true)] {
+            let mut execution = execution.clone();
+            Arc::make_mut(&mut execution.context).options.materialized_spill_rows = row_threshold;
+            let mut cursor = crate::operators::build_columns(Arc::clone(&runtime), execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
+            assert_eq!(execution.context.spill_bytes() > 0, expect_spill);
+            let mut values = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow output"); };
+                let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                values.extend(array.values().iter().copied());
+            }
+            assert_eq!(values, [1, 2, 3, 1, 2, 3]);
+            drop(cursor);
+            assert_eq!(execution.context.spill_bytes(), 0);
         }
-        assert_eq!(values, [1, 2, 3, 1, 2, 3]);
-        drop(cursor);
-        assert_eq!(execution.context.spill_bytes(), 0);
 
         let mut field = relation.schema().fields()[0].clone();
         let expr = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(Value::I64(1)));

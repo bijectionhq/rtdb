@@ -43,6 +43,7 @@ zeroize = "=1.9.1"
 [dev-dependencies]
 async-trait.workspace = true
 rtdb-maintenance.workspace = true
+rtdb-metrics.workspace = true
 
 [lints]
 workspace = true
