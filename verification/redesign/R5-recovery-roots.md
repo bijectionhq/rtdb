@@ -126,6 +126,17 @@ It checks the exact captured boundary, admitted intervening uploads, per-block L
 The native regression reopens a writer, removes a historical L0 input and the ordered pages, and compares the rebuilt bytes and indexed queries with the L0-based projection across an erasure.
 Automatic L0 reclamation still requires coverage for replay archives, replay inputs outside the supported native journal, and journal and offload retention through the agreed recovery interval.
 
+## Replay archive handoff model
+
+[ReplaySourceHandoff](../tla/ReplaySourceHandoff.tla) checks the proposed switch from original L0 custody to a separately verified archive at a single checkpoint.
+The archive owns its serving inventory and its exact-cut event source before new reads route to it.
+An admitted source copy keeps its journal through provider drain.
+An already admitted reader or an outstanding startup block confirmation keeps the original files after the switch.
+The model reaches a state with an admitted archive reader and both original sources removed.
+TLC checks 420 states and rejects publication before synchronization, a foreign replay cut, retirement during an original read or pending confirmation, and trimming before the copy drains.
+The model takes the exact-cut check and independent durable archive content as inputs.
+The runtime still needs an archive format and a custody admission that supply both.
+
 ## Source retention through copy completion
 
 A verified copy has two independent obligations.
