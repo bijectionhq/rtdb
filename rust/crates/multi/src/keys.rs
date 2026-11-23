@@ -5,7 +5,7 @@ use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -18,6 +18,9 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 mod archive;
 mod assertion;
 mod journal;
+mod unit;
+pub use unit::{UnitOperation, UnitOutput, UnitSlot};
+pub(crate) use unit::{UnitLedger, UnitScope};
 pub use assertion::{AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;
 pub use archive::ArchiveKey;
@@ -73,20 +76,34 @@ pub trait KeyService: Send + Sync {
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> { None }
 
+    async fn use_unit_key(&self, _slot: UnitSlot, _name: rtdb_storage::ObjectKey, _operation: UnitOperation,
+        _io: &Arc<IoRegion>) -> rtdb_storage::Result<UnitOutput> {
+        Err(journal::key_error(unit::unsupported()))
+    }
+
+    async fn withdraw_unit_key(&self, _slot: UnitSlot, _io: &Arc<IoRegion>) -> Result<()> {
+        Err(unit::unsupported())
+    }
+
+
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
         self.key(&key.id()).await.map(|_| ())
     }
 
     async fn seal_journal_payload(&self, key: JournalKey, _io: &Arc<IoRegion>, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
         let id = key.id();
-        let material = self.existing(&id).await.map_err(journal::key_error)?;
-        crate::cipher::Cipher::new(&material).map_err(journal::key_error)?.seal(&id, &plaintext)
+        let deadline = Instant::now() + unit::OPERATION_LIMIT;
+        let material = tokio::time::timeout_at(deadline.into(), self.existing(&id))
+            .await.map_err(|_| unit::expired())?.map_err(journal::key_error)?;
+        unit::with_material(material, deadline, |cipher| cipher.seal(&id, &plaintext))
     }
 
     async fn open_journal_payload(&self, key: JournalKey, _io: &Arc<IoRegion>, ciphertext: Bytes) -> rtdb_storage::Result<Bytes> {
         let id = key.id();
-        let material = self.existing(&id).await.map_err(journal::key_error)?;
-        crate::cipher::Cipher::new(&material).map_err(journal::key_error)?.open(&id, &ciphertext)
+        let deadline = Instant::now() + unit::OPERATION_LIMIT;
+        let material = tokio::time::timeout_at(deadline.into(), self.existing(&id))
+            .await.map_err(|_| unit::expired())?.map_err(journal::key_error)?;
+        unit::with_material(material, deadline, |cipher| cipher.open(&id, &ciphertext))
     }
 
     async fn archive_key(&self, id: &str, provision: bool, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
@@ -191,7 +208,7 @@ impl LocalKeyService {
     }
 
     fn require_raw_key(&self, id: &str) -> Result<()> {
-        assertion::require_other_key_namespace(id)?;
+        require_general_key_namespace(id)?;
         self.require_service_root()?;
         if self.is_brokered(id)? {
             return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/key-non-exportable",
@@ -201,7 +218,7 @@ impl LocalKeyService {
     }
 
     fn open_archive_key(&self, id: String, provision: bool, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
-        assertion::require_other_key_namespace(&id)?;
+        require_general_key_namespace(&id)?;
         self.require_service_root()?;
         let path = self.path(&id)?;
         let raw_lock = self.lock_key(&path)?;
@@ -354,6 +371,15 @@ impl KeyService for LocalKeyService {
         self.provision_archive_keys.then_some(self as &dyn AssertionKeyService)
     }
 
+    async fn use_unit_key(&self, slot: UnitSlot, name: rtdb_storage::ObjectKey, operation: UnitOperation,
+        io: &Arc<IoRegion>) -> rtdb_storage::Result<UnitOutput> {
+        self.use_local_unit(slot, name, operation, io).await
+    }
+
+    async fn withdraw_unit_key(&self, slot: UnitSlot, io: &Arc<IoRegion>) -> Result<()> {
+        self.withdraw_local_unit(slot, io).await
+    }
+
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
         let vault = self.clone();
         tokio::task::spawn_blocking(move || vault.provision_journal(key)).await
@@ -376,13 +402,13 @@ impl KeyService for LocalKeyService {
     }
 
     async fn archive_key_is_operation_only(&self, id: &str) -> Result<bool> {
-        assertion::require_other_key_namespace(id)?;
+        require_general_key_namespace(id)?;
         self.require_service_root()?;
         self.is_brokered(id)
     }
 
     async fn schedule_archive_key(&self, id: &str, due_at_ms: i64) -> Result<bool> {
-        assertion::require_other_key_namespace(id)?;
+        require_general_key_namespace(id)?;
         let service = self.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -400,7 +426,7 @@ impl KeyService for LocalKeyService {
     }
 
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
-        assertion::require_other_key_namespace(id)?;
+        require_general_key_namespace(id)?;
         let vault = self.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -494,6 +520,13 @@ fn require_matching_key(deployment: &str, key: &[u8; KEY_BYTES], installed: &[u8
         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/key-conflict", format!("The key for {deployment} is already installed with a different value")));
     }
     Ok(())
+}
+
+fn require_general_key_namespace(id: &str) -> Result<()> {
+    if id.starts_with(unit::SLOT_PREFIX) {
+        return Err(Anomaly::incorrect("rtdb.multi/key-id", "An immutable-unit key requires its custody API"));
+    }
+    assertion::require_other_key_namespace(id)
 }
 
 fn read_key(path: &Path, bytes: Vec<u8>) -> Result<[u8; KEY_BYTES]> {

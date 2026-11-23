@@ -130,12 +130,17 @@ Full recovery closures, terminal coverage for other mixed packs and live provide
 
 |6
 |Sealing and the key ledger for every durable unit.
-|Revised design
+|Installed serving objects and independently copied checkpoint members, including their manifests and preparation records, use per-publication slots in the local or S3 key vault.
+Installed replay opens detached payloads under the original serving slot.
+Checkpoint retirement withdraws its listed slots and records settlement.
+Serving-prefix slot census and retirement, directory-managed and classic stores, and archive and transfer coverage remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
 |The operation-only local archive broker persists scheduled capture-key revocation and attests physical settlement on the original media.
-The live serving and replay paths still require bounded key grants and readable successor roots to make a deadline commitment for SQL erasure.
+Installed serving reads enforce their journal lease through body delivery, and installed payload cryptography bounds each provider operation.
+Installed recovery opens independently sealed checkpoint closures before their publication, then serves and replays from the selected closure.
+SQL erasure still requires ordered closure of affected admissions, a complete survivor rebuild and retiring-key census, bounded plaintext drain, and evidenced provider destruction.
 
 |8
 |Transaction metadata retention.

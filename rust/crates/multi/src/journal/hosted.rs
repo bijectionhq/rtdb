@@ -372,7 +372,7 @@ impl Placement {
 
     pub(crate) async fn publish_checkpoint(
         &self,
-        keys: &dyn crate::keys::KeyService,
+        keys: &Arc<dyn KeyService>,
         offered: Option<(WriterAdmission, RtdbCheckpoint)>,
         serving: &crate::deployment::CellStorage,
         memory: &Arc<MemoryBudget>,
@@ -392,9 +392,8 @@ impl Placement {
         {
             return Ok(None);
         }
-        let material = material(keys, &self.record).await?;
         let io = IoRegion::new();
-        let provider = self.checkpoint_custody(Arc::clone(&io), &material).await?;
+        let provider = self.checkpoint_custody(Arc::clone(&io), Arc::clone(keys)).await?;
         let requested = offered
             .map(|(admission, checkpoint)| {
                 let next = checkpoint
@@ -459,12 +458,12 @@ impl Placement {
                     let objects = storage::ReplicaObjects::for_custodian(
                         self,
                         serving,
-                        &material,
+                        Arc::clone(keys),
                         Arc::clone(&io),
                     )
                     .await?;
                     let Some(candidate) = discovery::discover(
-                        self, custodian, &provider, cut, &objects, (keys, &io), memory,
+                        self, custodian, &provider, cut, &objects, (keys.as_ref(), &io), memory,
                     )
                     .await?
                     else {
@@ -476,7 +475,7 @@ impl Placement {
             };
             if current.preparing.is_none() {
                 let source =
-                    storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                    storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
                         .await?;
                 provider
                     .preflight(&reservation, origin, source.as_ref())
@@ -494,14 +493,14 @@ impl Placement {
                         published,
                         reservation,
                         origin,
-                        (keys, &material),
+                        keys,
                         serving,
                         &io,
                         memory,
                     )
                     .await?;
                     let source =
-                        storage::reopen_source(self, serving, &provider, &material, &io, origin)
+                        storage::reopen_source(self, serving, &provider, Arc::clone(keys), &io, origin)
                             .await?;
                     provider
                         .prepare(&reservation, origin, source.as_ref())
@@ -522,7 +521,7 @@ impl Placement {
         base: Checkpoint,
         reservation: Reservation,
         origin: Preparation,
-        (keys, material): (&dyn KeyService, &[u8]),
+        keys: &Arc<dyn KeyService>,
         serving: &crate::deployment::CellStorage,
         io: &Arc<IoRegion>,
         memory: &Arc<MemoryBudget>,
@@ -548,14 +547,14 @@ impl Placement {
         let key = JournalKey::new(custodian.placement(), boundary.grant.key_generation);
         let bytes = IoRegion::retaining(
             _page.clone(),
-            key.open(keys, io, boundary.payload.clone()),
+            key.open(keys.as_ref(), io, boundary.payload.clone()),
         ).await?;
         let envelope = ReplicaEnvelope::decode(&bytes)?
             .ok_or_else(|| invalid("The prepared checkpoint has an unknown boundary record"))?;
         let _offloaded;
         let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
             let objects =
-                storage::ReplicaObjects::for_custodian(self, serving, material, Arc::clone(io))
+                storage::ReplicaObjects::for_custodian(self, serving, Arc::clone(keys), Arc::clone(io))
                     .await?;
             let (resolved, charge) =
                 discovery::resolve_offload(envelope, boundary.grant.epoch, &objects, memory)
@@ -658,7 +657,7 @@ impl Placement {
 
     pub(crate) async fn retire_unheld_checkpoint(
         &self,
-        keys: &dyn crate::keys::KeyService,
+        keys: &Arc<dyn KeyService>,
     ) -> Result<()> {
         let Some(custodian) = self.custodian.as_ref() else {
             return Ok(());
@@ -672,8 +671,7 @@ impl Placement {
                 .close_checkpoint(&route, retired.checkpoint)
                 .await?;
         }
-        let material = material(keys, &self.record).await?;
-        let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
+        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
         let disposition = match &self.archive {
             crate::deployment::CellStorage::S3 { config } => {
                 provider.retire_s3(config, retired.checkpoint).await?
@@ -728,23 +726,23 @@ impl Placement {
     pub(crate) async fn checkpoint_custody(
         &self,
         io: Arc<IoRegion>,
-        material: &[u8],
+        keys: Arc<dyn KeyService>,
     ) -> Result<CheckpointCustody> {
-        let bucket = self.archive.bucket(io).await?;
+        let bucket = self.archive.bucket(Arc::clone(&io)).await?;
         let owner = archive_owner(&self.archive, bucket.as_ref(), &self.archive_prefix).await?;
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(crate::store::EncryptingStore::new(bucket, material)?);
         let custody = CheckpointCustody::new(
-            store,
+            bucket,
             self.archive_prefix.clone(),
             self.worker.placement(),
             self.worker.log_epoch(),
             owner,
+            keys,
+            io,
         );
         match &self.archive {
             crate::deployment::CellStorage::S3 { .. } => Ok(custody),
             crate::deployment::CellStorage::Local { root } => {
-                custody.on_local_volume(root, material)
+                custody.on_local_volume(root)
             }
         }
     }
@@ -752,14 +750,13 @@ impl Placement {
     pub(crate) async fn configuration(
         &self,
         admission: WriterAdmission,
-        keys: &dyn crate::keys::KeyService,
+        keys: &Arc<dyn KeyService>,
     ) -> Result<DatabaseConfig> {
         let chosen = admission.recovery.checkpoint;
         let checkpoint = if genesis(chosen) {
             None
         } else {
-            let material = material(keys, &self.record).await?;
-            let provider = self.checkpoint_custody(IoRegion::new(), &material).await?;
+            let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
             Some(provider.open(chosen).await?.checkpoint)
         };
         let attachment = Attachment {
@@ -837,7 +834,7 @@ impl LogFactory for Logs {
 }
 
 async fn material(
-    keys: &dyn crate::keys::KeyService,
+    keys: &dyn KeyService,
     record: &DeploymentRecord,
 ) -> Result<Vec<u8>> {
     keys.existing_key(&record.key_id())

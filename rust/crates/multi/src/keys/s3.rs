@@ -1,6 +1,6 @@
 //! Current deployment keys in a dedicated, never-versioned S3 bucket.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use aws_sdk_s3::{Client, primitives::ByteStream, types::ServerSideEncryption};
 use bytes::Bytes;
@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use super::{
     AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
-    KeyService, NAMESPACE_KEY_ID, malformed, new_key, require_matching_key,
+    KeyService, NAMESPACE_KEY_ID, UnitOperation, UnitOutput, UnitSlot, malformed, new_key,
+    require_matching_key, journal::key_error, unit::{self, OPERATION_LIMIT},
 };
 
 pub struct S3KeyService {
@@ -183,6 +184,30 @@ impl KeyService for S3KeyService {
 
     async fn destroy(&self, id: &str) -> Result<()> {
         self.withdraw_current(&object_path(id)?).await
+    }
+
+    async fn use_unit_key(&self, slot: UnitSlot, name: rtdb_storage::ObjectKey, operation: UnitOperation,
+        _io: &Arc<IoRegion>) -> rtdb_storage::Result<UnitOutput> {
+        let path = format!("keys/{}", slot.id());
+        let deadline = Instant::now() + OPERATION_LIMIT;
+        tokio::time::timeout_at(deadline.into(), async {
+            self.require_never_versioned().await.map_err(key_error)?;
+            let mut current = self.current(&path).await.map_err(key_error)?;
+            if matches!(current, Current::Absent) && operation.provisions() {
+                self.put(&path, &new_key().map_err(key_error)?, Precondition::Absent).await.map_err(key_error)?;
+                current = self.current(&path).await.map_err(key_error)?;
+            }
+            match current {
+                Current::Live { key, .. } => unit::with_material(key, deadline, |cipher| operation.apply(cipher, &name)),
+                Current::Withdrawn => Err(Error::ErasedUnderView),
+                Current::Absent => Err(key_error(unavailable("confirm immutable-unit custody"))),
+            }
+        }).await.map_err(|_| unit::expired())?
+    }
+
+    async fn withdraw_unit_key(&self, slot: UnitSlot, _io: &Arc<IoRegion>) -> Result<()> {
+        self.require_never_versioned().await?;
+        self.withdraw_current(&format!("keys/{}", slot.id())).await
     }
 
     fn assertion_keys(&self) -> Option<&dyn AssertionKeyService> {

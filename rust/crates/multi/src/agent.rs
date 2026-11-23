@@ -469,7 +469,7 @@ impl NodeAgent {
         self.stop_running(name).await;
         let admission = placement.nominate(&route).await?;
         let opened = async {
-            let config = placement.configuration(admission, self.keys.as_ref()).await?;
+            let config = placement.configuration(admission, &self.keys).await?;
             let database = self.node.database_or_attach(name.to_owned(), config).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined the ordered database attachment"))?;
             self.await_leadership(name, &database).await?;
@@ -766,7 +766,7 @@ impl NodeAgent {
                 let block = flush_local(&database).await?;
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
-                placement.publish_checkpoint(self.keys.as_ref(), Some((admission, checkpoint)),
+                placement.publish_checkpoint(&self.keys, Some((admission, checkpoint)),
                     &self.options.storage, self.node.memory()).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
@@ -1618,12 +1618,12 @@ impl NodeAgent {
         for (name, placement) in self.ordered.custody_placements() {
             let _ = placement.dispose_withdrawn_workers().await;
             let _ = placement.retain_selected().await;
-            let publish = placement.publish_checkpoint(self.keys.as_ref(), offered.remove(name),
+            let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),
                 &self.options.storage, self.node.memory());
             if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
                 let _ = placement.retain_selected().await;
             }
-            let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());
+            let retirement = placement.retire_unheld_checkpoint(&self.keys);
             let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
             let serving = placement.retire_serving_prefixes(&self.options.storage);
             let _ = tokio::time::timeout(self.options.activation_timeout, serving).await;
