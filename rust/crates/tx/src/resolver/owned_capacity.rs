@@ -10,6 +10,11 @@ use super::{
 
 use crate::hosted_control::ReplayConstraintKind;
 
+mod protected_membership;
+mod sample_membership;
+use protected_membership::{PROTECTED_MEMBERSHIP, ProtectedProjection};
+pub(super) use sample_membership::{SAMPLE_MEMBERSHIP, SamplePopulation, SampleProjection};
+
 const RULE: &str = "!rule";
 const MAX_RULES: usize = 16;
 const MAX_PREDICATES: usize = 4;
@@ -476,19 +481,41 @@ impl OpenTransaction<'_> {
             }
             let root = relation.root_relation();
             let root = root.as_ref().unwrap_or(relation);
-            if column == PERIOD_MEMBERSHIP {
+            if matches!(column, PERIOD_MEMBERSHIP | SAMPLE_MEMBERSHIP | PROTECTED_MEMBERSHIP) {
                 let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
-                if !prefix.is_empty() || !root.is_root_data() || !root.name().starts_with("fact_")
+                if !root.is_root_data() || !root.name().starts_with("fact_")
                     || !self.context.authorization.is_hosted_control_owner(owner)
                     || self.context.owned_witness_scope.is_none()
                     || !operations.iter().any(|op| matches!(op, Operation::Public(TxOp::HostedControl(control))
                         if control.is_check() && control.name() == "bj_installation" && control.expected().is_some()
                             && matches!(control.id(), EntityId::String(id) if id == "authority"))
                     )
-                    || !self.read_owned_schema(owner, root).await?.is_some_and(|(schema, _)|
-                        schema.requires_bounded_period() && !schema.has_opaque_columns())
                 {
                     return Err(count_uncovered(uncovered()));
+                }
+                let (schema, _) = self.read_owned_schema(owner, root).await?
+                    .ok_or_else(uncovered)?;
+                if column == PROTECTED_MEMBERSHIP {
+                    if world.is_some() || !schema.has_acceptance_validity() {
+                        return Err(uncovered());
+                    }
+                    if matches!(ProtectedProjection::decode(prefix)?, ProtectedProjection::Rows(_))
+                        && schema.path_column_type("membership_until") != Some(ScalarType::Binary)
+                    {
+                        return Err(uncovered());
+                    }
+                } else if schema.has_opaque_columns() {
+                    return Err(uncovered());
+                } else if column == PERIOD_MEMBERSHIP {
+                    if !prefix.is_empty() || !schema.requires_bounded_period() { return Err(uncovered()); }
+                } else {
+                    let sample = SampleProjection::decode(prefix)?;
+                    if schema.lifetime_micros().is_some() || !schema.has_acceptance_validity()
+                        || sample.fields.iter().any(|name| schema.path_column_type(name) != Some(ScalarType::Binary))
+                    {
+                        return Err(uncovered());
+                    }
+                    sample.require_suffix(root, operations, signed_root)?;
                 }
             } else {
                 self.declared_prefix_count(base.clone(), root, column, prefix).await?;
@@ -514,13 +541,22 @@ impl OpenTransaction<'_> {
                 continue;
             };
             if relation.world().is_some() { continue; }
-            let count = if column == PERIOD_MEMBERSHIP {
+            let count = if matches!(column, PERIOD_MEMBERSHIP | SAMPLE_MEMBERSHIP | PROTECTED_MEMBERSHIP) {
                 let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
                 let ordered = self.tx_key().system_time;
                 let context = self.context.query_context(
                     snapshot.clone(), ordered, &self.options.default_tz, self.trace_parent,
                 )?;
-                period_population(context, owner, relation, ordered, &BTreeSet::new()).await?
+                if column == PERIOD_MEMBERSHIP {
+                    period_population(context, owner, relation, ordered, &BTreeSet::new()).await?
+                } else if column == PROTECTED_MEMBERSHIP {
+                    ProtectedProjection::decode(prefix)?.count(context, owner, relation, ordered).await?
+                } else {
+                    let projection = SampleProjection::decode(prefix)?;
+                    let mut population = SamplePopulation::default();
+                    population.collect(Arc::clone(&context), owner, relation, ordered, &projection).await?;
+                    population.count(&context)?
+                }
             } else {
                 self.declared_prefix_count(snapshot.clone(), relation, column, prefix).await?
             };

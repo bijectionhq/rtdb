@@ -183,7 +183,7 @@ pub async fn open_owned_root_projection(
     if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns).await
+    open_constraint_projection(context, owner, relation, valid, columns, None).await
 }
 
 pub async fn open_owned_world_constraint_projection(
@@ -193,12 +193,26 @@ pub async fn open_owned_world_constraint_projection(
     if owner.is_empty() || relation.root_relation().is_none() || columns.is_empty() {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns).await
+    open_constraint_projection(context, owner, relation, valid, columns, None).await
+}
+
+/// Restrict a receiver projection to one complete installed identity prefix.
+pub async fn open_owned_root_prefix_projection(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid: Timestamp, columns: &[&str], prefix: &str,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || prefix.is_empty()
+        || !prefix.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'/' || byte == b'-')
+        || columns.first() != Some(&"_id")
+    {
+        return Err(address_unavailable());
+    }
+    open_constraint_projection(context, owner, relation, valid, columns, Some(prefix)).await
 }
 
 async fn open_constraint_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str],
+    valid: Timestamp, columns: &[&str], prefix: Option<&str>,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
@@ -209,14 +223,25 @@ async fn open_constraint_projection(
     let columns = columns.iter().enumerate().map(|(index, name)| Field {
         id: ColumnId(index as u32), name: (*name).into(), qualifier: None, qualified_only: false,
         unnamed: false, data_type: table.scan_column_type(name),
-    }).collect();
+    }).collect::<Vec<_>>();
+    let mut predicates = Vec::new();
+    if let Some(prefix) = prefix {
+        let mut upper = prefix.to_owned();
+        let last = upper.pop().ok_or_else(address_unavailable)?;
+        upper.push(char::from(last as u8 + 1));
+        let id = columns[0].expression();
+        predicates.extend([
+            Expr::binary(BinaryOp::GtEq, id.clone(), Expr::Literal(Value::Utf8(prefix.to_owned()))),
+            Expr::binary(BinaryOp::Lt, id, Expr::Literal(Value::Utf8(upper))),
+        ]);
+    }
     let scan = Arc::new(Relation::scan(Scan {
         table, columns,
         valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
             value: valid.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
         })),
         system_time: TemporalFilter::Default, clamp_valid_time: false,
-        iids: None, predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
+        iids: None, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }

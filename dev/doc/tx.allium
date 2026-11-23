@@ -157,6 +157,11 @@
 -- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
 -- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.
 -- In a Proposal, local period rows and absence shadows mask the same identity in the held parent at that cut.
+-- An installed sample projection folds the complete assertion population per series in accepted order and counts each surviving sample coordinate once.
+-- A later retraction removes a point or span and a later append establishes membership again.
+-- For a reviewed landing prefix the receiver admits exclusions only for later sample assertions carried by the candidate.
+-- Fixed-label protected count guards use the complete carrier identity population with ordered row or unit fences and row expiry metadata.
+-- The protected membership projection reads no carrier body.
 -- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
 -- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.

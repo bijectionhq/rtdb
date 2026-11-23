@@ -2,7 +2,7 @@ use rtdb_plan::Catalog;
 use rtdb_types::{EntityId, OwnedRelation, OwnedWorld, PlacedAttemptScope, WorldClockMode, WorldShadow};
 
 use super::{
-    owned_capacity::{CapacityCondition, CapacityRule, PERIOD_MEMBERSHIP, capacity_conditions, count_bound_exceeded, period_population, predicates, uncovered},
+    owned_capacity::{CapacityCondition, CapacityRule, PERIOD_MEMBERSHIP, SAMPLE_MEMBERSHIP, SamplePopulation, SampleProjection, capacity_conditions, count_bound_exceeded, period_population, predicates, uncovered},
     owned_unique::{
         invalid_key as invalid_unique_key, merge_windows, occupancy_value_at, ordered_segments,
         unique_key, unique_segment_interval, unique_taken, unique_uncovered, Segment,
@@ -35,6 +35,7 @@ pub struct ArchivedWorldConstraints<'a> {
     unique: Vec<UniqueClaims<'a>>,
     finite_unique: Option<FiniteUniqueClaims<'a>>,
     period_count: Option<(i64, i64)>,
+    sample_counts: Vec<(SampleProjection<'a>, SamplePopulation, i64)>,
 }
 
 struct RuleCounts<'a> {
@@ -238,6 +239,10 @@ impl ArchivedWorldConstraints<'_> {
                 return Err(count_bound_exceeded());
             }
         }
+        for (projection, mut population, maximum) in self.sample_counts {
+            population.collect(Arc::clone(&parent), self.owner, self.relation, self.valid, &projection).await?;
+            if population.count(&parent)? > maximum { return Err(count_bound_exceeded()); }
+        }
         let names = projected_columns(&self.rules, &[], false);
         if !self.rules.is_empty() && let Some(mut cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(&parent), self.owner, self.relation, self.valid, &names,
@@ -397,9 +402,14 @@ impl OpenTransaction<'_> {
             let mut asserted = bounds.remove(overlay).unwrap_or_default();
             let period_maximum = asserted.iter().filter(|bound| bound.column == PERIOD_MEMBERSHIP)
                 .map(|bound| bound.at_most).min();
-            asserted.retain(|bound| bound.column != PERIOD_MEMBERSHIP);
+            let mut sample_bounds = BTreeMap::new();
+            for bound in asserted.iter().filter(|bound| bound.column == SAMPLE_MEMBERSHIP) {
+                sample_bounds.entry(bound.prefix).and_modify(|maximum: &mut i64| *maximum = (*maximum).min(bound.at_most))
+                    .or_insert(bound.at_most);
+            }
+            asserted.retain(|bound| !matches!(bound.column, PERIOD_MEMBERSHIP | SAMPLE_MEMBERSHIP));
             if policy.rules.is_empty() && unique_policy.paths.is_empty()
-                && asserted.is_empty() && period_maximum.is_none() { continue; }
+                && asserted.is_empty() && period_maximum.is_none() && sample_bounds.is_empty() { continue; }
             let frontier = final_state.relation_event_frontier(&root.table(owner))?;
             if !policy.rules.is_empty() && frontier != policy.through_events {
                 return Err(uncovered());
@@ -503,7 +513,7 @@ impl OpenTransaction<'_> {
                         purge_frontier: final_state.relation_event_frontier(&root.purge_table(owner))?,
                         before: BTreeSet::new(), after,
                         rules, unique: Vec::new(), finite_unique: (!finite.paths.is_empty()).then_some(finite),
-                        period_count: period_maximum.map(|maximum| (members, maximum)),
+                        period_count: period_maximum.map(|maximum| (members, maximum)), sample_counts: Vec::new(),
                     }).await?;
                 }
                 continue;
@@ -524,7 +534,7 @@ impl OpenTransaction<'_> {
                 }
                 unique.push(UniqueClaims { path, column, keys });
             }
-            if rules.is_empty() && unique.is_empty() { continue; }
+            if rules.is_empty() && unique.is_empty() && sample_bounds.is_empty() { continue; }
             // An open-ended assertion cannot introduce a second membership
             // change after the world clock used for this count.
             if !schema.has_acceptance_validity() {
@@ -542,6 +552,22 @@ impl OpenTransaction<'_> {
                 WorldClockMode::Held { .. } => self.held_overlay_reading(owner, world).await?,
                 WorldClockMode::Retained => return Err(uncovered()),
             };
+            let mut sample_counts = Vec::new();
+            for (prefix, maximum) in sample_bounds {
+                let projection = SampleProjection::decode(prefix)?;
+                if world.mode != WorldClockMode::Proposal || schema.has_opaque_columns()
+                    || schema.lifetime_micros().is_some()
+                    || projection.fields.iter().any(|name| schema.path_column_type(name) != Some(ScalarType::Binary))
+                {
+                    return Err(uncovered());
+                }
+                let local = self.context.query_context(
+                    final_state.clone(), ordered, &self.options.default_tz, self.trace_parent,
+                )?;
+                let mut population = SamplePopulation::default();
+                population.collect(local, owner, overlay, valid, &projection).await?;
+                sample_counts.push((projection, population, maximum));
+            }
             let mut masks = [BTreeSet::new(), BTreeSet::new()];
             for (side, snapshot) in [&base, &final_state].into_iter().enumerate() {
                 if side == 0 && rules.is_empty() { continue; }
@@ -587,7 +613,7 @@ impl OpenTransaction<'_> {
                 owner, world, ordered, memory: &self.context.memory, cache: Arc::clone(self.context.storage.budget()),
                 cancellation: &self.context.cancellation,
                 relation: &root, valid, purge_frontier: final_state.relation_event_frontier(&root.purge_table(owner))?,
-                before, after, rules, unique, finite_unique: None, period_count: None,
+                before, after, rules, unique, finite_unique: None, period_count: None, sample_counts,
             }).await?;
             drop(reservations);
         }
