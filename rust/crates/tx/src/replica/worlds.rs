@@ -11,13 +11,13 @@ use super::invalid;
 pub(crate) const WORLD_EFFECTS: &str = "owned_world_effects";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { Root, Overlay, ProposalOverlay, ProposalSettlement, ProposalLanding, ProposalClose, Clock, Fork, RootHeldFork, ControlsHeldFork, RootRetainedFork, RootRetainedAdvance, RootRetainedRenewal, RootRetainedSibling, ControlsRetainedFork, ProposalControlsFork, ProposalRootFork, ProposalRootHold, ProposalRootShorten, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
+enum Kind { Root, Overlay, TimedOverlay, ProposalOverlay, ProposalSettlement, ProposalLanding, ProposalClose, Clock, Fork, RootHeldFork, ControlsHeldFork, RootRetainedFork, RootRetainedAdvance, RootRetainedRenewal, RootRetainedSibling, ControlsRetainedFork, ProposalControlsFork, ProposalRootFork, ProposalRootHold, ProposalRootShorten, Advance, Drop, ControlsRetainedDrop, RootRetainedDrop }
 
 const ROOT: Iid = Iid([0; 16]);
 
 impl Kind {
     fn writes_data(self) -> bool {
-        matches!(self, Self::Root | Self::Overlay | Self::ProposalOverlay | Self::RootHeldFork | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalRootShorten | Self::ProposalLanding | Self::ProposalClose)
+        matches!(self, Self::Root | Self::Overlay | Self::TimedOverlay | Self::ProposalOverlay | Self::RootHeldFork | Self::RootRetainedFork | Self::RootRetainedAdvance | Self::RootRetainedRenewal | Self::RootRetainedSibling | Self::RootRetainedDrop | Self::ProposalRootFork | Self::ProposalRootHold | Self::ProposalRootShorten | Self::ProposalLanding | Self::ProposalClose)
     }
 
     fn relation_world(self, registered_world: Iid) -> Iid {
@@ -28,6 +28,7 @@ impl Kind {
         match self {
             Self::Root => "root",
             Self::Overlay => "overlay",
+            Self::TimedOverlay => "timed-overlay",
             Self::ProposalOverlay => "proposal-overlay",
             Self::ProposalSettlement => "proposal-settlement",
             Self::ProposalClose => "proposal-close",
@@ -56,6 +57,7 @@ impl Kind {
         match name {
             "root" => Ok(Self::Root),
             "overlay" => Ok(Self::Overlay),
+            "timed-overlay" => Ok(Self::TimedOverlay),
             "proposal-overlay" => Ok(Self::ProposalOverlay),
             "proposal-settlement" => Ok(Self::ProposalSettlement),
             "proposal-close" => Ok(Self::ProposalClose),
@@ -86,8 +88,12 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
     use crate::hosted_control::ProposalLandingEffect;
 
     let mut selected = BTreeMap::<Iid, BTreeSet<&str>>::new();
+    let mut readings = BTreeMap::new();
     let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
     for operation in operations {
+        if let Operation::Public(TxOp::OwnedPublishWorld { world, advance_to: Some(at), .. }) = operation {
+            readings.insert(*world, *at);
+        }
         if proposal_land.is_some_and(|landing| landing.effect != ProposalLandingEffect::Close)
             && crate::hosted_control::proposal_landing_frontier_rows(operation).is_some()
         {
@@ -145,14 +151,19 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
     }).map(|effect| {
         let (world, kind, attempt, fingerprint) = effect?;
         let relations = selected.remove(&kind.relation_world(world)).unwrap_or_default();
+        let kind = if kind == Kind::Clock && !relations.is_empty() { Kind::TimedOverlay } else { kind };
         if relations.is_empty() == kind.writes_data() { return Err(mismatch()); }
-        Ok(Value::Struct(StructFields::from([
+        let mut effect = StructFields::from([
             ("world".into(), Value::Uuid(world.0)),
             ("kind".into(), Value::Utf8(kind.name().to_owned())),
             ("attempt".into(), Value::Utf8(attempt.clone())),
             ("fingerprint".into(), Value::Binary(fingerprint.to_vec())),
             ("relations".into(), Value::list(relations.into_iter().map(|name| Value::Utf8(name.to_owned())).collect())),
-        ])))
+        ]);
+        if kind == Kind::TimedOverlay {
+            effect.insert("reading".into(), Value::I64(readings.get(&world).ok_or_else(mismatch)?.0));
+        }
+        Ok(Value::Struct(effect))
     }).collect()
 }
 
@@ -162,6 +173,7 @@ pub(super) fn verify(
 ) -> Result<HostedEffects> {
     if !(1..=9).contains(&effects.len()) { return Err(mismatch()); }
     let mut worlds = BTreeMap::new();
+    let mut timed_readings = BTreeMap::new();
     let mut attempts = BTreeMap::new();
     let mut expected_data = BTreeSet::new();
     let mut common_fingerprint: Option<&[u8]> = None;
@@ -175,7 +187,11 @@ pub(super) fn verify(
         else { return Err(mismatch()); };
         let kind = Kind::parse(kind)?;
         let world = Iid(*world);
-        if fields.len() != 5 || relations.is_empty() == kind.writes_data()
+        if kind == Kind::TimedOverlay {
+            let Some(Value::I64(reading)) = fields.get("reading") else { return Err(mismatch()); };
+            timed_readings.insert(world, *reading);
+        }
+        if fields.len() != 5 + usize::from(kind == Kind::TimedOverlay) || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootHeldFork | Kind::ControlsHeldFork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose))
@@ -263,8 +279,9 @@ pub(super) fn verify(
                 let world = Iid(*world);
                 let clock_kind = worlds.get(&world);
                 if row.len() != 2 || !(Timestamp::MIN.0 < *clock && *clock < Timestamp::MAX.0)
-                    || !matches!(clock_kind, Some(Kind::Overlay | Kind::ProposalOverlay | Kind::Clock))
+                    || !matches!(clock_kind, Some(Kind::Overlay | Kind::TimedOverlay | Kind::ProposalOverlay | Kind::Clock))
                     || (clock_kind == Some(&Kind::ProposalOverlay) && *clock > key.system_time.0)
+                    || timed_readings.get(&world).is_some_and(|reading| clock != reading)
                     || !clocks.insert(world)
                 {
                     return Err(mismatch());
@@ -333,7 +350,7 @@ pub(super) fn verify(
             let is_data = name == relation;
             let world = OwnedRelation::from_source(relation.to_owned()).map_err(|_| mismatch())?.world();
             if let Some(world) = world {
-                if !matches!(worlds.get(&world), Some(Kind::Overlay | Kind::ProposalOverlay)) { return Err(mismatch()); }
+                if !matches!(worlds.get(&world), Some(Kind::Overlay | Kind::TimedOverlay | Kind::ProposalOverlay)) { return Err(mismatch()); }
                 if is_data { overlays.insert(world); }
             }
             if is_data {
@@ -384,7 +401,7 @@ pub(super) fn verify(
         || !journals.remove(OWNED_ATTEMPT_RELATION) || journals != expected_data
         || worlds.iter().any(|(world, kind)| match kind {
             Kind::Root | Kind::ProposalSettlement => false,
-            Kind::Overlay | Kind::ProposalOverlay => !overlays.contains(world) || !clocks.contains(world),
+            Kind::Overlay | Kind::TimedOverlay | Kind::ProposalOverlay => !overlays.contains(world) || !clocks.contains(world),
             Kind::Clock => !clocks.contains(world),
             Kind::ProposalLanding | Kind::ProposalClose | Kind::Fork | Kind::RootHeldFork | Kind::ControlsHeldFork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::Drop | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop => !registrations.contains(world),
         })
@@ -468,4 +485,29 @@ mod tests {
         assert!(matches!(effect.get("kind"), Some(Value::Utf8(kind)) if kind == "controls-held-fork"));
         Ok(())
     }
+    #[test]
+    fn timed_overlay_inventory_binds_facts_and_exact_reading() -> Result<()> {
+        let world = Iid([1; 16]);
+        let relation = OwnedRelation::new("orders")?.in_world(world)?;
+        let memory = MemoryBudget::new(1 << 20);
+        let documents = crate::Documents::new(vec![StructFields::from([
+            ("_id".into(), Value::I64(1)),
+        ])], &memory)?;
+        let inventory = source_inventory(&[
+            Operation::Public(TxOp::OwnedReplaceDocs {
+                relation, documents, valid_from: None, valid_to: None,
+            }),
+            Operation::Public(TxOp::OwnedPublishWorld {
+                world, parent_pin: world, attempt: "1".repeat(22), fingerprint: [2; 32],
+                expected: None, advance_to: Some(Timestamp(400)), drop_world: false,
+                settlement_pin: None, land_root: None, delete_root: None,
+            }),
+        ])?;
+        let [Value::Struct(effect)] = inventory.as_slice() else { panic!("Expected one world effect"); };
+        assert!(matches!(effect.get("kind"), Some(Value::Utf8(kind)) if kind == "timed-overlay"));
+        assert!(matches!(effect.get("reading"), Some(Value::I64(400))));
+        assert!(matches!(effect.get("relations"), Some(Value::List(relations)) if relations.len() == 1));
+        Ok(())
+    }
+
 }

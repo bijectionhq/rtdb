@@ -983,3 +983,10 @@ It compares each maximum with the covered count after applying all of this trans
 An exceeded maximum aborts the entire transaction with
 `rtdb.owned/count-bound-exceeded`. Other clocks, world overlays, and erase
 entries are unsupported by this action.
+
+
+=== Held world batch effects
+
+Effect 4 of the owned world batch carries a signed big-endian microsecond reading followed by the existing length-prefixed grouped overlay.
+It applies only to a writable held world.
+Ordering checks the held predecessor and publishes the clock reading and every grouped write atomically.

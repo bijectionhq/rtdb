@@ -3924,18 +3924,25 @@ impl Service {
                 && ((*kind == 0 && count != 0) || *kind == 3);
             terminal_proposal |= *kind == 3;
             let standing_drop = *kind == 2 && mode != rtdb_types::WorldClockMode::Proposal;
-            if count == 0 && !matches!(*kind, 0 | 1) && !standing_drop
+            if count == 0 && !matches!(*kind, 0 | 1 | 4) && !standing_drop
                 && !close_eligible && !(proposal_eligible && terminal_proposal)
             {
                 return Err(invalid("This world effect requires original witnesses"));
             }
             if (*kind == 0 && !mode.is_writable())
-                || (*kind == 1 && !matches!(mode, rtdb_types::WorldClockMode::Held { .. }))
+                || (matches!(*kind, 1 | 4) && !matches!(mode, rtdb_types::WorldClockMode::Held { .. }))
             {
                 return Err(Status::failed_precondition("The world clock mode does not admit this effect"));
             }
             let (effect, rest) = match *kind {
-                0 => {
+                0 | 4 => {
+                    let (at, rest) = if *kind == 4 {
+                        let (at, rest) = rest.split_first_chunk::<8>()
+                            .ok_or_else(|| invalid("Missing held overlay reading"))?;
+                        (Some(Timestamp(i64::from_be_bytes(*at))), rest)
+                    } else {
+                        (None, rest)
+                    };
                     let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Missing world overlay length"))?;
                     let (overlay, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
                         .ok_or_else(|| invalid("Incomplete world overlay"))?;
@@ -3948,7 +3955,11 @@ impl Service {
                         }
                         resource.require_create_absence(nonces, write)?;
                     }
-                    (rtdb_node::OwnedWorldEffect::Overlay(writes), rest)
+                    let effect = match at {
+                        Some(at) => rtdb_node::OwnedWorldEffect::TimedOverlay { at, writes },
+                        None => rtdb_node::OwnedWorldEffect::Overlay(writes),
+                    };
+                    (effect, rest)
                 }
                 1 => {
                     let (target, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world clock target"))?;

@@ -2839,6 +2839,7 @@ pub struct OwnedWorldSection {
 pub enum OwnedWorldEffect {
     SettleProposal,
     Overlay(Vec<OwnedWorldWrite>),
+    TimedOverlay { at: Timestamp, writes: Vec<OwnedWorldWrite> },
     Clock(Timestamp),
     Drop,
 }
@@ -3116,12 +3117,15 @@ impl NativeSession {
                 return Err(unavailable());
             }
             let writes = match &section.effect {
-                OwnedWorldEffect::Overlay(writes) if !writes.is_empty() => writes.len(),
-                OwnedWorldEffect::Overlay(_) => return Err(unavailable()),
+                OwnedWorldEffect::Overlay(writes) | OwnedWorldEffect::TimedOverlay { writes, .. } => {
+                    if writes.is_empty() { return Err(unavailable()); }
+                    writes.len()
+                },
                 OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop | OwnedWorldEffect::SettleProposal => 0,
             };
             let standing = !proposal_overlay && matches!(&section.effect,
-                OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop);
+                OwnedWorldEffect::Overlay(_) | OwnedWorldEffect::TimedOverlay { .. }
+                    | OwnedWorldEffect::Clock(_) | OwnedWorldEffect::Drop);
             if !worlds.insert(section.world)
                 || (section.checks.is_empty() && !standing && !retained_release && !terminal_proposal && !proposal_close)
                 || section.checks.len() > 128
@@ -3178,6 +3182,10 @@ impl NativeSession {
                 OwnedWorldEffect::Overlay(writes) => {
                     self.append_world_writes(&mut ops, section.world, writes, proposal_overlay)?;
                     (None, false, None)
+                }
+                OwnedWorldEffect::TimedOverlay { at, writes } => {
+                    self.append_world_writes(&mut ops, section.world, writes, false)?;
+                    (Some(at), false, None)
                 }
                 OwnedWorldEffect::Clock(to) => (Some(to), false, None),
                 OwnedWorldEffect::Drop => (None, true, None),

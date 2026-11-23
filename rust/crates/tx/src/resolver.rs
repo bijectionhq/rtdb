@@ -659,13 +659,14 @@ pub struct OpenTransaction<'a> {
     unique_changes: OwnedUniqueChanges,
     capacity_changes: OwnedCapacityChanges,
     owned_worlds: BTreeMap<Iid, (rtdb_types::OwnedWorld, Arc<MemoryReservation>)>,
+    timed_world_overlays: BTreeMap<Iid, Timestamp>,
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -1705,7 +1706,7 @@ impl<'a> OpenTransaction<'a> {
             let bounded = record.schemas.relation(&root).is_some_and(|schema| schema.requires_bounded_period());
             let held = matches!(record.mode, rtdb_types::WorldClockMode::Held { .. });
             let publishes_overlay = publications.iter().any(|(published, _, _, advance, drop, settlement, _)| {
-                *published == world && advance.is_none() && !*drop && settlement.is_none()
+                *published == world && (advance.is_none() || held) && !*drop && settlement.is_none()
             });
             if !publishes_overlay
                 || ((bounded && !held || write.create_only) && proposal_overlay != Some(world))
@@ -1844,10 +1845,20 @@ impl<'a> OpenTransaction<'a> {
                     record.mode == rtdb_types::WorldClockMode::Proposal);
                 if (witnesses == 0 && (proposal_drop || (proposal_overlay.is_some() && settlement_pin.is_none())))
                     || witnesses > 128 || !attempts.insert(attempt) || own_fingerprint != fingerprint
-                    || (rows == 0) != (advance_to.is_some() || drop_world || settlement_pin.is_some())
+                    || (rows == 0 && advance_to.is_none() && !drop_world && settlement_pin.is_none())
+                    || (rows != 0 && (drop_world || settlement_pin.is_some()))
                     || drop_world && advance_to.is_some()
                 {
                     return Err(unavailable());
+                }
+                if let Some(at) = advance_to.filter(|_| rows != 0) {
+                    let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
+                    if !matches!(record.mode, rtdb_types::WorldClockMode::Held { .. })
+                        || !record.admits_clock_publication(at, self.tx_key().system_time)
+                    {
+                        return Err(unavailable());
+                    }
+                    self.timed_world_overlays.insert(world, at);
                 }
             }
             if counts.iter().any(|(world, (rows, witnesses))| {
@@ -2343,8 +2354,11 @@ impl<'a> OpenTransaction<'a> {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
             if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
             let (from, to, explicit) = if matches!(record.mode, WorldClockMode::Held { .. }) && schema.has_acceptance_validity() {
-                let head = self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock());
-                let accepted = head.next()?;
+                let accepted = if let Some(at) = self.timed_world_overlays.get(&world) {
+                    *at
+                } else {
+                    self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()).next()?
+                };
                 if (from, to) != (None, None) && (from, to) != (Some(accepted), Some(Timestamp::MAX)) {
                     return Err(Anomaly::incorrect(
                         "rtdb.owned/validity-policy",
