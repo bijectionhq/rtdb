@@ -337,3 +337,40 @@ The ANN columns show 32 probes.
 | Random, ~1% | 61.44 / 62.70 | 10.69 / 10.87 | 19.07 / 19.26 | 5.72 / 6.24 | 6.11 / 6.47 | 32 / 3.11 | 60.0% |
 | Random, ~10% | 480.13 / 488.64 | 12.99 / 13.46 | 29.84 / 30.59 | 5.75 / 5.87 | 6.05 / 6.12 | 32 / 3.11 | 72.5% |
 | Whole clusters, ~1% | 70.86 / 71.10 | 10.97 / 11.21 | 19.03 / 19.37 | 5.80 / 5.82 | 5.93 / 5.97 | 6 / 0.50 | 100.0% |
+
+### Arrow benchmark at 1,000,000 embeddings
+
+The file-backed workload uses the same Arrow code, filter definitions, and GloVe dataset as the paired 100,000-vector run.
+All 60 stationary and 20 churn cases matched the scalar control in ID order and distance bits under exact SQL.
+Each ANN sample kept the original recall and result count.
+Shadowing 67 changed IIDs in the full-probe churn canary restored 10 exact neighbors from the 2 returned by the stale shortlist.
+
+Loading and flushing the table took 14.02 s.
+Completing both ordered indexes took 35 min 32 s.
+Packing the Arrow centroid ranges took 0.87 s after training.
+The centroid object used 420,401,416 bytes, with the IIDs carried by the Arrow batches in place of the original 24,000,000-byte dictionary.
+The unfiltered exact query took 5,861.39 ms p50 with the batch scorer and 46,823.71 ms with the scalar control on the same captured snapshot, a 8.0× speedup.
+Unfiltered ANN at 32 probes took 139.74 ms warm and 139.31 ms cold p50, with 91.7% mean recall@10.
+
+The latency cells show p50 / p95 milliseconds.
+The ANN columns show 32 probes.
+
+**Stationary**
+
+| Filter | Exact scalar control | Exact Arrow | Ordered exact Arrow | Warm ANN | Cold ANN | Cold reads / MiB, p50 | Mean recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 46,823.71 / 46,863.23 | 5,861.39 / 5,966.52 | 5,855.94 / 5,871.22 | 139.74 / 149.54 | 139.31 / 150.76 | 32 / 27.09 | 91.7% |
+| Random, ~0.1% | 284.30 / 285.34 | 231.11 / 232.31 | 203.69 / 215.22 | 136.59 / 146.15 | 137.10 / 148.02 | 32 / 27.09 | 46.7% |
+| Random, ~1% | 721.37 / 727.51 | 244.00 / 244.86 | 242.38 / 277.95 | 138.28 / 157.02 | 139.01 / 159.29 | 32 / 27.09 | 63.3% |
+| Random, ~10% | 4,896.23 / 4,921.97 | 264.80 / 266.51 | 300.02 / 320.41 | 140.45 / 147.76 | 141.04 / 147.81 | 32 / 27.09 | 76.7% |
+| Whole clusters, ~1% | 880.44 / 884.02 | 244.56 / 245.70 | 252.08 / 364.58 | 138.73 / 151.24 | 138.66 / 149.30 | 6 / 5.38 | 100.0% |
+
+**Churn**
+
+| Filter | Exact scalar control | Exact Arrow | Ordered exact Arrow | Warm ANN | Cold ANN | Cold reads / MiB, p50 | Mean recall@10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| None | 46,578.31 / 46,620.07 | 5,863.74 / 5,872.71 | 5,865.84 / 5,869.12 | 180.80 / 189.24 | 181.35 / 188.79 | 32 / 30.59 | 82.5% |
+| Random, ~0.1% | 284.76 / 302.04 | 231.27 / 231.97 | 240.26 / 290.81 | 172.04 / 182.76 | 172.92 / 183.11 | 32 / 30.59 | 50.0% |
+| Random, ~1% | 722.09 / 726.25 | 245.57 / 245.93 | 276.31 / 277.61 | 177.24 / 185.78 | 178.15 / 186.72 | 32 / 30.59 | 75.0% |
+| Random, ~10% | 4,885.60 / 4,909.79 | 265.97 / 266.70 | 330.96 / 334.55 | 179.02 / 182.86 | 180.09 / 183.93 | 32 / 30.59 | 80.0% |
+| Whole clusters, ~1% | 882.51 / 882.93 | 244.77 / 245.63 | 288.01 / 387.64 | 183.96 / 187.99 | 183.38 / 188.80 | 6 / 5.38 | 100.0% |
