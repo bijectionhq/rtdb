@@ -316,19 +316,30 @@ impl Postings {
                 .collect::<Vec<_>>(),
         );
         let iids = rtdb_columnar::build_iids(
-            &keys.iter().map(|(_, _, address)| address.iid).collect::<Vec<_>>(),
+            &keys
+                .iter()
+                .map(|(_, _, address)| address.iid)
+                .collect::<Vec<_>>(),
             None,
         )?;
-        let bytes = keys.iter().try_fold(0usize, |sum, (_, _, address)|
-            sum.checked_add(address.key.len()).ok_or_else(invalid))?;
+        let bytes = keys.iter().try_fold(0usize, |sum, (_, _, address)| {
+            sum.checked_add(address.key.len()).ok_or_else(invalid)
+        })?;
         i32::try_from(bytes).map_err(format_error)?;
         let mut identities = BinaryBuilder::with_capacity(keys.len(), bytes);
-        for (_, _, address) in keys { identities.append_value(address.key); }
+        for (_, _, address) in keys {
+            identities.append_value(address.key);
+        }
         let tuples = keys.iter().map(|(_, tuple, _)| *tuple).collect::<Vec<_>>();
         KeyBatch::build(
             &tuples,
             BatchKind::Posting,
-            vec![Arc::new(levels), Arc::new(starts), iids, Arc::new(identities.finish())],
+            vec![
+                Arc::new(levels),
+                Arc::new(starts),
+                iids,
+                Arc::new(identities.finish()),
+            ],
         )
         .map(Self)
     }
@@ -353,7 +364,9 @@ impl Postings {
             Tuple::Arrow(&self.0, row),
             AddressRef {
                 iid: Iid(fixed(self.0.batch.column(2).as_ref(), row)),
-                key: arrow::<BinaryArray>(self.0.batch.column(3).as_ref()).expect("validated entity key").value(row),
+                key: arrow::<BinaryArray>(self.0.batch.column(3).as_ref())
+                    .expect("validated entity key")
+                    .value(row),
             },
         )
     }
@@ -372,7 +385,8 @@ impl Postings {
         let postings = Self(batch);
         for row in 0..postings.len() {
             let (bucket, _, address) = postings.at(row);
-            if (!address.key.is_empty() && rtdb_types::EntityId::from_handle_bytes(address.key).is_err())
+            if (!address.key.is_empty()
+                && rtdb_types::EntityId::from_handle_bytes(address.key).is_err())
                 || bucket.level > 64
                 || super::domain::bucket_start(bucket.start.into(), bucket.level) != bucket.start
             {
@@ -456,6 +470,73 @@ impl KeyBatch {
         }
         let batch = RecordBatch::try_new(schema, arrays).map_err(format_error)?;
         Self::new(layouts, batch, kind.prefix())
+    }
+
+    pub fn build_with_prefix(
+        tuples: &[Tuple<'_>],
+        mut fields: Vec<Field>,
+        mut arrays: Vec<ArrayRef>,
+    ) -> Result<Self> {
+        let width = tuples.first().ok_or_else(invalid)?.len();
+        if tuples.iter().any(|tuple| tuple.len() != width) || arrays.len() != fields.len() {
+            return Err(invalid());
+        }
+        let prefix = fields.len();
+        let mut layouts = Vec::with_capacity(width);
+        for slot in 0..width {
+            let cells = tuples
+                .iter()
+                .map(|tuple| tuple.cell(slot))
+                .collect::<Vec<_>>();
+            let layout = Layout(
+                cells
+                    .iter()
+                    .fold(0, |mask, &cell| mask | Kind::of(cell).bit()),
+            );
+            let name = format!("{slot}_{:x}", layout.0);
+            let field = layout.field(slot)?.with_name(name);
+            arrays.push(layout.build(&field, cells)?);
+            fields.push(field);
+            layouts.push(layout);
+        }
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(format_error)?;
+        Self::new(layouts, batch, prefix)
+    }
+
+    pub fn from_batch(batch: RecordBatch, prefix: &[Field]) -> Result<Self> {
+        let fields = batch.schema_ref().fields();
+        if batch.num_rows() == 0
+            || fields.len() < prefix.len()
+            || fields
+                .iter()
+                .zip(prefix)
+                .any(|(actual, expected)| actual.as_ref() != expected)
+            || batch
+                .columns()
+                .iter()
+                .zip(prefix)
+                .any(|(column, field)| !field.is_nullable() && column.null_count() != 0)
+        {
+            return Err(invalid());
+        }
+        let layouts = fields[prefix.len()..]
+            .iter()
+            .enumerate()
+            .map(|(slot, field)| {
+                let (_, bits) = field.name().rsplit_once('_').ok_or_else(invalid)?;
+                let mask = u16::from_str_radix(bits, 16).map_err(format_error)?;
+                let layout = Layout(mask);
+                if mask == 0
+                    || mask & !VALID_LAYOUT_BITS != 0
+                    || &layout.field(slot)?.with_name(format!("{slot}_{mask:x}")) != field.as_ref()
+                {
+                    return Err(invalid());
+                }
+                Ok(layout)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(layouts, batch, prefix.len())
     }
 
     fn new(layouts: Vec<Layout>, batch: RecordBatch, prefix: usize) -> Result<Self> {
@@ -564,15 +645,22 @@ impl KeyBatch {
         let mut nodes = nodes.iter();
         let mut buffers = buffers.iter();
         for (index, layout) in std::iter::repeat_n(None, kind.prefix())
-            .chain(layouts.iter().copied().map(Some)).enumerate()
+            .chain(layouts.iter().copied().map(Some))
+            .enumerate()
         {
             let node = nodes.next().ok_or_else(invalid)?;
             if node.length() != record.length() {
                 return Err(invalid());
             }
             let Some(layout) = layout else {
-                let count = if matches!(kind, BatchKind::Posting) && index == 3 { 3 } else { 2 };
-                for _ in 0..count { buffers.next().ok_or_else(invalid)?; }
+                let count = if matches!(kind, BatchKind::Posting) && index == 3 {
+                    3
+                } else {
+                    2
+                };
+                for _ in 0..count {
+                    buffers.next().ok_or_else(invalid)?;
+                }
                 continue;
             };
             if let Some(kind) = layout.plain() {
@@ -649,6 +737,7 @@ fn invalid() -> rtdb_types::Anomaly {
 pub(super) enum Tuple<'a> {
     Owned(&'a [Atom]),
     Cells(&'a [AtomRef<'a>]),
+    Nulls(usize),
     Arrow(&'a KeyBatch, usize),
 }
 
@@ -657,6 +746,7 @@ impl<'a> Tuple<'a> {
         match self {
             Self::Owned(atoms) => atoms.len(),
             Self::Cells(cells) => cells.len(),
+            Self::Nulls(width) => width,
             Self::Arrow(postings, _) => postings.layouts.len(),
         }
     }
@@ -665,6 +755,7 @@ impl<'a> Tuple<'a> {
         match self {
             Self::Owned(atoms) => atoms.get(slot).map(Atom::borrowed),
             Self::Cells(cells) => cells.get(slot).copied(),
+            Self::Nulls(width) => (slot < width).then_some(AtomRef::Null),
             Self::Arrow(postings, row) => postings.layouts.get(slot).map(|layout| {
                 layout.cell(postings.batch.column(slot + postings.prefix).as_ref(), row)
             }),
@@ -811,7 +902,16 @@ mod tests {
         let keys: Vec<_> = rows
             .iter()
             .enumerate()
-            .map(|(row, cells)| (bucket, Tuple::Owned(cells), AddressRef { iid: Iid([row as u8; 16]), key: &[] }))
+            .map(|(row, cells)| {
+                (
+                    bucket,
+                    Tuple::Owned(cells),
+                    AddressRef {
+                        iid: Iid([row as u8; 16]),
+                        key: &[],
+                    },
+                )
+            })
             .collect();
         let encoded = Postings::build(&keys)
             .unwrap()
@@ -843,7 +943,10 @@ mod tests {
                 start: 0,
             },
             Tuple::Owned(&cells),
-            AddressRef { iid: Iid::MIN, key: &[] },
+            AddressRef {
+                iid: Iid::MIN,
+                key: &[],
+            },
         )];
         let encoded = Postings::build(&keys).unwrap().encode(&[], &[]).unwrap();
         let aligned = Buffer::from_slice_ref(&encoded);

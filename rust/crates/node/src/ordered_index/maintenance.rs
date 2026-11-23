@@ -30,6 +30,7 @@ pub(crate) struct OrderedIndexMaintenance {
     clock: Arc<dyn crate::Clock>,
     snapshots: Arc<dyn SnapshotSource>,
     logs: Arc<PartitionLogs>,
+    arrow_references: bool,
 }
 
 impl OrderedIndexMaintenance {
@@ -40,6 +41,7 @@ impl OrderedIndexMaintenance {
         clock: Arc<dyn crate::Clock>,
         snapshots: Arc<dyn SnapshotSource>,
         logs: Arc<PartitionLogs>,
+        arrow_references: bool,
     ) -> Self {
         Self {
             database,
@@ -48,6 +50,7 @@ impl OrderedIndexMaintenance {
             clock,
             snapshots,
             logs,
+            arrow_references,
         }
     }
 
@@ -119,8 +122,9 @@ impl OrderedIndexMaintenance {
         if let Ok(Some(checkpoint)) =
             checkpoint::latest(&self.storage, directory, &self.memory, through).await
             && checkpoint.source_rows <= expected
-            && let Ok(tree) = Tree::new(&self.storage, directory, &self.memory, checkpoint.scope).await
+            && let Ok(mut tree) = Tree::new(&self.storage, directory, &self.memory, checkpoint.scope).await
         {
+            tree.arrow_references = self.arrow_references;
             if checkpoint.through == through && checkpoint.source_rows == expected {
                 match checkpoint.collect(&tree, cancellation).await {
                     Ok(()) => return Ok(()),
@@ -159,7 +163,8 @@ impl OrderedIndexMaintenance {
         }
         let sources = source_files(snapshot, &definition.table, -1, through)?;
         let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
-        let tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
+        let mut tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
+        tree.arrow_references = self.arrow_references;
         checkpoint::request_collection(&tree, through).await?;
         let mut roots = RevisionRoots::default();
         let rows =
@@ -193,7 +198,8 @@ impl OrderedIndexMaintenance {
         }
         coverage.finish(expected)?;
 
-        let tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
+        let mut tree = Tree::new(&self.storage, directory, &self.memory, cuts.scope).await?;
+        tree.arrow_references = self.arrow_references;
         checkpoint::request_collection(&tree, through).await?;
         let mut replay = RetainedTableReplay::open(&self.logs, target, &definition.table).await?.ok_or_else(incomplete_source)?;
         let mut coverage = ReplayCoverage::new(&sources);

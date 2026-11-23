@@ -28,6 +28,10 @@ entity Checkpoint {
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A read or maintenance cycle owns index page buffers for its own lifetime.
 -- A point read merges bucket prefixes in key order.
+-- Every reader opens both JSON and Arrow IPC branch pages, revision directories, and checkpoint manifests within the current layout.
+-- Arrow reference publication starts after each reader in the installation can open both formats.
+-- A newly published page can keep a reference to a page originally written in JSON.
+-- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.
 -- Every immutable page reference binds its exact subtree entry count and full fences.
 -- A covered held count subtracts the full-key boundary ranks in each bucket containing the requested valid instant.
 -- The bucket cover makes the counts disjoint across the visible postings for that instant.

@@ -25,6 +25,7 @@ impl NodeConfiguration {
             None => Membership::Durable { primary: self.primary.clone(), skipped: self.skipped_databases.clone() },
         };
         options.read_only = self.read_only_databases;
+        options.ordered_index_arrow_references = self.ordered_index_arrow_references;
         options.default_timezone = self.node_timezone().to_owned();
         options.query.join_build_rows = self.join_build_rows;
         options.query.generate_series_end_exclusive = self.generate_series_end_exclusive;

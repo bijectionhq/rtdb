@@ -379,6 +379,7 @@ impl DatabaseFactory {
             } else { None };
             let ordered_worker = (!read_only && self.options.replication.enabled && self.options.replication.may_lead).then(|| Arc::new(OrderedIndexMaintenance::new(
                 name.clone(), Arc::clone(&storage), Arc::clone(&self.memory), Arc::clone(&self.clock), Arc::clone(&snapshots), Arc::clone(&logs),
+                self.options.ordered_index_arrow_references,
             )));
             let ordered_cycle = ordered_worker.as_ref().map(|_| watch::channel(None).0);
             let currency = Arc::<ReadCurrency>::default();

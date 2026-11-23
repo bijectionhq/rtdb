@@ -16,11 +16,11 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    correction, format_error,
+    correction, format_error, ipc,
     key::{Atom, AtomRef, Bucket},
     maintenance::cancelled,
     postings::{KeyRow, Postings, Tuple},
-    seek,
+    references, seek,
 };
 
 const FANOUT: usize = 64;
@@ -42,20 +42,46 @@ pub(super) struct AddressRef<'a> {
 impl AddressRef<'_> {
     pub fn compare(self, other: Self) -> Ordering {
         self.key.cmp(other.key).then_with(|| {
-            if self.key.is_empty() { self.iid.cmp(&other.iid) } else { Ordering::Equal }
+            if self.key.is_empty() {
+                self.iid.cmp(&other.iid)
+            } else {
+                Ordering::Equal
+            }
         })
     }
-    pub fn owned(self) -> Address { Address { iid: self.iid, key: self.key.to_vec() } }
+    pub fn owned(self) -> Address {
+        Address {
+            iid: self.iid,
+            key: self.key.to_vec(),
+        }
+    }
 }
 
 impl Address {
-    pub fn view(&self) -> AddressRef<'_> { AddressRef { iid: self.iid, key: &self.key } }
+    pub fn view(&self) -> AddressRef<'_> {
+        AddressRef {
+            iid: self.iid,
+            key: &self.key,
+        }
+    }
 }
 
-impl PartialEq for Address { fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() } }
+impl PartialEq for Address {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
 impl Eq for Address {}
-impl PartialOrd for Address { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-impl Ord for Address { fn cmp(&self, other: &Self) -> Ordering { self.view().compare(other.view()) } }
+impl PartialOrd for Address {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Address {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.view().compare(other.view())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Key {
@@ -69,9 +95,13 @@ pub(super) enum Key {
 }
 
 impl Key {
-    fn view(&self) -> KeyRef<'_> {
+    pub(super) fn view(&self) -> KeyRef<'_> {
         match self {
-            Self::Posting { bucket, tuple, address } => KeyRef::Posting(*bucket, tuple.view(), address.view()),
+            Self::Posting {
+                bucket,
+                tuple,
+                address,
+            } => KeyRef::Posting(*bucket, tuple.view(), address.view()),
             Self::Row(address) => KeyRef::Row(address.view()),
             Self::Revision(time) => KeyRef::Revision(*time),
         }
@@ -153,10 +183,13 @@ impl EntryView<'_> {
     fn bytes(self) -> usize {
         let key = size_of::<Key>()
             + match self.key {
-                KeyRef::Posting(_, tuple, address) => address.key.len() + tuple
-                    .iter()
-                    .map(|cell| size_of::<Atom>() + cell.retained_bytes())
-                    .sum::<usize>(),
+                KeyRef::Posting(_, tuple, address) => {
+                    address.key.len()
+                        + tuple
+                            .iter()
+                            .map(|cell| size_of::<Atom>() + cell.retained_bytes())
+                            .sum::<usize>()
+                }
                 KeyRef::Row(address) => address.key.len(),
                 KeyRef::Revision(_) => 0,
             };
@@ -226,8 +259,8 @@ impl MeasureDomain {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Measure {
     pub count: u64,
-    domain: MeasureDomain,
-    sum: [u8; 32],
+    pub(super) domain: MeasureDomain,
+    pub(super) sum: [u8; 32],
 }
 
 impl Measure {
@@ -278,12 +311,12 @@ impl Measure {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Pointer {
     pub digest: String,
-    generation: i64,
-    size: usize,
-    entries: u64,
-    measure: Measure,
-    first: Key,
-    last: Key,
+    pub(super) generation: i64,
+    pub(super) size: usize,
+    pub(super) entries: u64,
+    pub(super) measure: Measure,
+    pub(super) first: Key,
+    pub(super) last: Key,
 }
 
 impl Pointer {
@@ -536,6 +569,7 @@ pub(super) struct Tree {
     pub directory: ObjectKey,
     pub scope: u64,
     pub memory: Arc<MemoryBudget>,
+    pub arrow_references: bool,
     decoded: Mutex<DecodedPages>,
     // Drop this after the decoded cache.
     permit: Option<Arc<dyn Send + Sync>>,
@@ -564,6 +598,7 @@ impl Tree {
             directory: directory.clone(),
             scope,
             memory: memory.clone(),
+            arrow_references: false,
             decoded: Mutex::default(),
             permit,
         })
@@ -573,7 +608,10 @@ impl Tree {
         self.permit.is_none() || rtdb_query::encoding_ordered_batch()
     }
 
-    pub fn retain_result_buffers(&self, reservation: &Arc<MemoryReservation>) -> Arc<dyn Send + Sync> {
+    pub fn retain_result_buffers(
+        &self,
+        reservation: &Arc<MemoryReservation>,
+    ) -> Arc<dyn Send + Sync> {
         match &self.permit {
             Some(permit) => Arc::new((reservation.clone(), permit.clone())),
             None => reservation.clone(),
@@ -1018,16 +1056,16 @@ impl Tree {
                             .metadata
                             .iter()
                             .map(|entry| match (&entry.key, &entry.item) {
-                                (Key::Revision(time), Item::Revision(root)) => {
-                                    Ok((*time, root.clone()))
-                                }
-                                _ => Err(format_error(
-                                    "Ordered index revision leaf contains other entries",
-                                )),
+                                (Key::Revision(time), Item::Revision(root)) => Ok((*time, root.clone())),
+                                _ => Err(format_error("Ordered index revision leaf contains other entries")),
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        serde_json::to_vec(&StoredPage::Revisions(revisions))
-                            .map_err(format_error)?
+                        if self.arrow_references {
+                            let references = revisions.iter().map(|(time, root)| (Some(*time), root.as_deref())).collect::<Vec<_>>();
+                            ipc::encode(&references::encode(&references)?)?
+                        } else {
+                            serde_json::to_vec(&StoredPage::Revisions(revisions)).map_err(format_error)?
+                        }
                     }
                 }
                 Page::Branch(children) => {
@@ -1038,7 +1076,12 @@ impl Tree {
                                 .await?,
                         );
                     }
-                    serde_json::to_vec(&StoredPage::Branch(pointers)).map_err(format_error)?
+                    if self.arrow_references {
+                        let references = pointers.iter().map(|pointer| (None, Some(pointer.as_ref()))).collect::<Vec<_>>();
+                        ipc::encode(&references::encode(&references)?)?
+                    } else {
+                        serde_json::to_vec(&StoredPage::Branch(pointers)).map_err(format_error)?
+                    }
                 }
             };
             let digest = format!("{:x}", Sha256::digest(&encoded));
@@ -1121,6 +1164,48 @@ fn decode(bytes: Bytes, generation: i64, memory: &Arc<MemoryReservation>) -> Res
         (Some(postings), metadata)
     } else if bytes.starts_with(&correction::HEADER) {
         (None, correction::decode(bytes, FANOUT, memory)?)
+    } else if bytes.starts_with(&ipc::CONTINUATION) {
+        let parents = references::decode(ipc::decode(bytes, FANOUT * 2)?, FANOUT, memory)?;
+        if parents.first().is_some_and(|(time, _)| time.is_some()) {
+            (
+                None,
+                parents
+                    .into_iter()
+                    .map(|(time, root)| {
+                        Ok(Entry {
+                            key: Key::Revision(
+                                time.ok_or_else(|| {
+                                    format_error("Revision entry omitted its time")
+                                })?,
+                            ),
+                            item: Item::Revision(root),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            let children = parents
+                .into_iter()
+                .map(|(time, root)| match (time, root) {
+                    (None, Some(child))
+                        if child.exists_by(generation) && child.first <= child.last =>
+                    {
+                        Ok(child)
+                    }
+                    _ => Err(format_error("Invalid ordered index branch reference")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if children.is_empty()
+                || children
+                    .windows(2)
+                    .any(|pair| pair[0].last >= pair[1].first)
+            {
+                return Err(format_error("Invalid ordered index branch order"));
+            }
+            return Ok(Page::Branch(
+                children.into_iter().map(Link::Stored).collect(),
+            ));
+        }
     } else {
         match serde_json::from_slice(&bytes).map_err(format_error)? {
             StoredPage::Revisions(revisions) => (

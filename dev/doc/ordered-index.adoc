@@ -52,6 +52,11 @@ The point read applies later erasures to the selected root.
 The projector reads typed Arrow cells directly from table events.
 A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
 Seeks compare cells in the leaf's Arrow buffers, and a page rewrite copies surviving cells directly into the new buffers.
+Readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
+Set `orderedIndexArrowReferences: true` on writers after upgrading every node that reads ordered-index objects in the installation.
+The default publishes JSON references for compatibility during the reader rollout.
+A new Arrow page can refer to an existing JSON page.
+Arrow references preserve complete key fences, entry counts, and measured subtree coefficients.
 Correction spans refer to rows of index-owned Arrow key batches.
 A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.
 Branch fences and the revision directory carry the remaining tree metadata.

@@ -23,6 +23,13 @@ fn startup_defaults_match_the_pinned_factories() {
 }
 
 #[test]
+fn ordered_index_reference_publication_uses_the_configured_format() -> rtdb_types::Result<()> {
+    assert!(!decode("{}")?.node_options(1 << 20)?.ordered_index_arrow_references);
+    assert!(decode("orderedIndexArrowReferences: true")?.node_options(1 << 20)?.ordered_index_arrow_references);
+    Ok(())
+}
+
+#[test]
 fn yaml_and_edn_preserve_the_difference_between_omitted_and_configured_timezones() {
     let omitted = decode("{}").unwrap();
     assert_eq!(omitted.default_timezone, None);
