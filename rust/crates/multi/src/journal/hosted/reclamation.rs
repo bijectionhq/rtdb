@@ -229,7 +229,7 @@ pub(super) async fn settle_receipts(
             },
         }
         let Some(fence) = custodian.withdraw_object(&route, candidate.publication.withdrawal()?).await? else { continue; };
-        let grant = InstalledPublicationDeletionGrant::from_journal(&target, &candidate.publication, fence)?;
+        let grant = InstalledPublicationDeletionGrant::from_journal(&target, &candidate.publication, fence, route.placement)?;
         ledger.withdraw(&key).await?;
         grant.settle(&inventory).await?;
     }

@@ -1,10 +1,12 @@
 """Validate RTDB residence observations or project a bounded composed replay."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
+from urllib.parse import unquote
 
 from recovery_trace import digest
 
@@ -54,10 +56,31 @@ def physical_retirement(event):
             json.dumps(event["publication"], sort_keys=True))
 
 
+def ordered_object_fence(event):
+    require(digest(event["name"]) and digest(event["version"]), "object fence lacks exact publication fingerprints")
+    placement = scope(event, ("deployment", "incarnation", "group", "generation"))
+    require(placement[3] >= 0 and all(placement[:3]), "object fence lacks its installed placement")
+    return (*placement, json.dumps(event["position"], sort_keys=True), tuple(event["name"]), tuple(event["version"]))
+
+
+def installed_publication(event):
+    require(bytes(event["name"]) == hashlib.sha256(bytes(event["address_bytes"])).digest()
+            and bytes(event["version"]) == hashlib.sha256(bytes(event["publication_bytes"])).digest(),
+            "physical publication differs from the ordered fence")
+    object = json.loads(bytes(event["publication_bytes"]))
+    address = json.loads(bytes(event["address_bytes"]))
+    record = object[object["publication"]]
+    require(address == [record["namespace"], record["key"]], "the publication differs from the fenced provider path")
+    physical_path = unquote(record["key"])
+    require(physical_path == event["key"] or physical_path.endswith("/" + event["key"]),
+            "the provider effect names another object path")
+    return (*ordered_object_fence(event), event["key"])
+
+
 def verify_native(events, *, verify_catalog_history=True):
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
-    published_decisions = set()
+    published_decisions, installed_grants = set(), set()
     for index, event in enumerate(events):
         try:
             kind = event["event"]
@@ -71,6 +94,12 @@ def verify_native(events, *, verify_catalog_history=True):
                     require(deletes.setdefault(key, identity) == identity, "retirement changed its publication")
                 else:
                     require(deletes.get(key) == identity, "delete lacks a matching exact authorization")
+            elif kind == "ordered-object-fence":
+                ordered_object_fence(event)
+            elif kind == "authorize-installed-publication":
+                installed_grants.add(installed_publication(event))
+            elif kind == "remove-installed-publication":
+                require(installed_publication(event) in installed_grants, "installed deletion lacks its exact grant")
             elif kind == "quorum-publication":
                 peers = event["installed"]
                 require(digest(event["ensemble"]) and event["epoch"] > 0 and event["through"] >= 0
@@ -196,6 +225,7 @@ def verify_joined(captures):
             publication = (*replica_scope(event), event["key"], key[-1])
             exclusions[publication] = min(event["revision"], exclusions.get(publication, event["revision"]))
     verify_catalogs(catalogs)
+    ordered_fences = {ordered_object_fence(event) for event in events if event["event"] == "ordered-object-fence"}
     joined = 0
     for event in events:
         kind = event["event"]
@@ -222,6 +252,11 @@ def verify_joined(captures):
                 publication = (*replica_scope(event), event["key"], json.dumps(event["publication"], sort_keys=True))
                 require(publication not in exclusions or event["revision"] < exclusions[publication],
                         "payload read follows its installed recovery exclusion")
+            joined += 1
+            continue
+        elif kind == "remove-installed-publication":
+            require(ordered_object_fence(event) in ordered_fences,
+                    "installed deletion lacks the matching ordered recovery exclusion")
             joined += 1
             continue
         elif kind == "remove-version" and "/oversized/" in event["key"]:

@@ -291,14 +291,18 @@ impl InstalledPublication {
     pub(crate) fn withdrawal(&self) -> Result<ordered_logkeeper::ordered::ObjectWithdrawal> {
         use ring::digest::{SHA256, digest};
 
+        let exact = serde_json::to_vec(self).map_err(|error| Error::Task(error.to_string()))?;
+        let name = self.serialized_address()?;
+        let hashed = |bytes: &[u8]| digest(&SHA256, bytes).as_ref().try_into().expect("SHA-256 width");
+        Ok(ordered_logkeeper::ordered::ObjectWithdrawal { name: hashed(&name), version: hashed(&exact) })
+    }
+
+    fn serialized_address(&self) -> Result<Vec<u8>> {
         let position = match self {
             Self::Version { version } => (&version.namespace, &version.key),
             Self::Terminal { terminal } => (&terminal.namespace, &terminal.key),
         };
-        let exact = serde_json::to_vec(self).map_err(|error| Error::Task(error.to_string()))?;
-        let name = serde_json::to_vec(&position).map_err(|error| Error::Task(error.to_string()))?;
-        let hashed = |bytes: &[u8]| digest(&SHA256, bytes).as_ref().try_into().expect("SHA-256 width");
-        Ok(ordered_logkeeper::ordered::ObjectWithdrawal { name: hashed(&name), version: hashed(&exact) })
+        serde_json::to_vec(&position).map_err(|error| Error::Task(error.to_string()).into())
     }
 
     pub(crate) async fn available(&self, key: &ObjectKey, provider: &rtdb_s3::VersionedInventory) -> Result<bool> {
@@ -325,20 +329,25 @@ pub(crate) struct InstalledPublicationDeletionGrant<'a> {
     key: &'a ObjectKey,
     publication: &'a InstalledPublication,
     fence: ordered_logkeeper::ordered::ObjectFence,
+    placement: ordered_logkeeper::ordered::Placement,
 }
 
 impl<'a> InstalledPublicationDeletionGrant<'a> {
     pub(crate) fn from_journal(
         key: &'a ObjectKey, publication: &'a InstalledPublication, fence: ordered_logkeeper::ordered::ObjectFence,
+        placement: ordered_logkeeper::ordered::Placement,
     ) -> Result<Self> {
         if publication.withdrawal()? != fence.object { return Err(changed()); }
-        Ok(Self { key, publication, fence })
+        Ok(Self { key, publication, fence, placement })
     }
 
     pub(crate) async fn settle(self, provider: &rtdb_s3::VersionedInventory) -> Result<()> {
         let observed = || serde_json::json!({
-            "position": self.fence.position, "name": self.fence.object.name,
-            "key": self.key.as_str(), "publication": self.publication,
+            "deployment": self.placement.deployment, "incarnation": self.placement.incarnation,
+            "group": self.placement.group, "generation": self.placement.generation,
+            "position": self.fence.position, "name": self.fence.object.name, "version": self.fence.object.version,
+            "key": self.key.as_str(), "publication_bytes": serde_json::to_vec(self.publication).expect("publication encodes"),
+            "address_bytes": self.publication.serialized_address().expect("provider address encodes"),
         });
         crate::residence_trace::record("authorize-installed-publication", observed);
         match self.publication {
