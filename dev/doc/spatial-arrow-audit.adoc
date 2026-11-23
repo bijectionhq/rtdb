@@ -6,11 +6,21 @@ This inventory follows the native geospatial path from Bijection's clear Root in
 |===
 | Path | Avoidable conversion | Current path
 
+| Bijection spatial schema authoring
+| The current table builder could not declare a spatial path from the SDK.
+| The SDK exports the native geometry field validator independently of the `spatialIndex` recipe.
+Adding the recipe to an installed eligible table keeps the validator and the stored geometry carrier fixed, so Root publication can stage and backfill the new path.
+
 | Bijection write admission
 | The admission check serialized admitted geometry to WKB and discarded the bytes.
 | Admission checks the geometry model.
 New paths index the canonical Binary document field directly.
 Existing declarations keep their original tagged WKB carrier.
+
+| Bijection spatial query admission
+| The host assembled a generic JSON query from the decoded request and parsed that query into the engine's typed plan.
+| It decodes the guest's partition values and predicates directly into the spatial source and its operators.
+The planner keeps the restriction on the source, applies the application filter to candidate rows, and leaves the nearest result limit to the ranker.
 
 | Bijection spatial pagination
 | Every page encoded the same query geometry and canonical scalar partition values and rebuilt Arrow filters.
@@ -75,6 +85,7 @@ The projected reply carries the identity once and associates the document by its
 | A held result was rebuilt as a fact image and then as a complete document before filters or staged effects could reject it.
 | Bijection measures the logical charge directly from the canonical Arrow cells and decodes only the fields each filter reaches.
 The application result materializes after the row is selected.
+The host checks the SDK reply's encoded size with a bounded byte counter.
 
 | Clear Root geometry writes
 | Create and commit converted geometry and partition columns to document maps before rebuilding the source Arrow vectors.

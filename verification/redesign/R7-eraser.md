@@ -28,15 +28,16 @@ It states the fate of the source's own ciphertext and decryption grants.
    A protected log suffix can retain only ciphertext whose keys are covered by the same revocation or whose records are free of the targeted history.
 3. Prove the clean closures are durable at the provider and ready for every affected root.
    A lost or ambiguous provider reply delays the commit until reconciled.
-4. Atomically publish the erasing generation and arm revocation for the old key slots.
-   The commit is the observable start of the deadline and makes new views exclude the erased history.
-   This transition needs a custody provider that can guarantee irreversible revocation and expiry of all outstanding grants within 120 seconds of that commit.
-   Until a provider and cache policy qualify, a request may remain pending or receive a failure before this commit.
-5. Until the deadline, already admitted views retain their captured answer under bounded old grants.
-   After the deadline, an old view that requires revoked key material receives `rtdb/erased-under-view`.
+4. Atomically select the erasing generation, close affected admission and renewal in the publication order, and record destruction obligations for the exact old key slots.
+   New views exclude the erased history from that decision.
+   A promised deadline budgets both the maximum drain and the provider's evidenced destruction tail from the commit.
+   Until a provider and cache policy qualify, a request may remain pending or receive a failure before a fixed deadline is committed.
+5. Previously admitted views may finish under their original exclusive grant deadlines.
+   A key authority may withdraw the required material after the drain, when no admitted work can use or release the old body.
+   An old view that requires a withdrawn key receives `rtdb/erased-under-view`.
    The new root and its clean history remain readable.
-6. A completion receipt binds the erasing generation and evidence of revocation to the enumerated domain.
-   Provider cleanup of unreachable ciphertext can be retried after decryption becomes impossible.
+6. Completion binds the erasing generation and provider evidence to the enumerated domain after the drain and key destruction have been confirmed.
+   Unreachable ciphertext cleanup can proceed independently.
 
 The committed deadline uses the authoritative clock and a measured bound for grant expiry, including clock error and outstanding I/O.
 A provider that may grant indefinite access to an old key cannot take the transition in step 4.
@@ -76,7 +77,12 @@ RTDB owns the clean successor, the evidence for all selectable roots, the ordere
 The installed custodian's coordinator checks the exact prepared and published head, validates the rotation receipt, and requires both recovery slots to attest the clean root and successor suffix generation before it calls the custody commit authority.
 The custody adapter owns the durable admission fence, construction and staging of the clean closure, recovery slot attestations, and the atomic commit and expiry.
 The native tests exercise the coordinator with Logkeeper application decisions and a local vault under an injected custody adapter.
-Physical slot attestation, trie and artefact rewriting, and atomic deadline qualification remain implementation requirements.
+Installed serving reads carry the journal-issued lease through provider access and check it again before returning a body.
+Detached replica objects inherit the servicing lease for cryptography and open in the original writer's key namespace.
+Installed log and object key operations have a local monotonic time limit.
+These bounds cover the key operations and affected storage responses; decoded pages, query results, and other working copies require their own drain evidence.
+Independent checkpoint member slots allow a staged successor to open with no dependency on the prior writer or checkpoint allocation's object keys.
+The SQL path still needs an authority that closes admission for the exact target census, rewrites the complete survivor closure, attests the two recovery slots, and confirms destruction after the drain.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

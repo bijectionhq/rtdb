@@ -512,12 +512,26 @@ impl BlockStore {
             let file = writer.ok_or_else(|| invalid("Nonempty live table produced no pages"))?.finish()?;
             rtdb_storage::sync_file(&file).map_err(io_error)?;
             let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
-            self.store.put_file(&ObjectKey::new(entry.slug.data_key(&trie))?, temporary.path()).await?;
+            let data_key = ObjectKey::new(entry.slug.data_key(&trie))?;
+            let release_receipt_l0 = self.store.releases_receipt_l0() && table.stores_expiring_transaction_metadata()
+                && rtdb_format::keys::is_receipt_l0_file(data_key.as_str());
+            let data = if release_receipt_l0 {
+                self.store.put_file_with_publication(&data_key, temporary.path()).await?
+            } else {
+                self.store.put_file(&data_key, temporary.path()).await?;
+                None
+            };
             check_cancelled(cancellation)?;
             let _metadata_serialization = self.memory.reserve(metadata.serialization_bound()?)?;
             let (metadata_file, summary) = metadata.finish()?;
             let bytes = metadata_file.write()?;
-            self.store.put(&ObjectKey::new(entry.slug.metadata_key(&trie))?, Bytes::from(bytes)).await?;
+            let metadata_key = ObjectKey::new(entry.slug.metadata_key(&trie))?;
+            let metadata = if release_receipt_l0 {
+                self.store.put_with_publication(&metadata_key, Bytes::from(bytes)).await?
+            } else {
+                self.store.put(&metadata_key, Bytes::from(bytes)).await?;
+                None
+            };
             let artefacts = match (self.staged_table_artefacts(entry, index).await?, search) {
                 (Some(records), _) => records,
                 (None, Some(search)) => search.seal(prepared.value(), table, &trie, temporary.path(), size as u64, cancellation).await?,
@@ -525,6 +539,21 @@ impl BlockStore {
             };
             let mut notification = CatalogTrie::notification(trie, size, Some(summary))?;
             notification.artefacts = artefacts;
+            if release_receipt_l0 {
+                let data = match data {
+                    Some(publication) => Some(publication),
+                    None => self.store.retirement_publication(&data_key).await?,
+                };
+                let metadata = match metadata {
+                    Some(publication) => Some(publication),
+                    None => self.store.retirement_publication(&metadata_key).await?,
+                };
+                if data.is_some() || metadata.is_some() {
+                    notification.published_files = Some(proto::TrieFileVersions {
+                        data: data.map(Into::into), metadata: metadata.map(Into::into),
+                    });
+                }
+            }
             tries.insert(table.clone(), vec![notification]);
             tokio::task::yield_now().await;
         }

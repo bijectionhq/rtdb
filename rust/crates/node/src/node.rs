@@ -574,7 +574,9 @@ impl Node {
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {
-        if !self.factory.options.replication.enabled { return Ok(None); }
+        if !self.factory.options.replication.enabled || database.storage.object_store().defers_trie_releases() {
+            return Ok(None);
+        }
         database.read_lease(&self.factory.clock, &self.factory.options.garbage).await.map(Some)
     }
 
@@ -642,11 +644,25 @@ impl Node {
         let seed = authority.map(|authority| authority.scope().issue());
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
             .with_placed_seed(seed);
-        let (source, submitted_at) = match replay {
+        let (mut source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),
         };
+        let prepared_clock = cancellation.run_until_cancelled(
+            source.prepare_proposal_generation(|| database.snapshot(), &database.resolve)
+        ).await.ok_or_else(cancelled)??;
         let payload = source.encode()?.into_bytes();
+        drop(source);
+        if let Some(reading) = prepared_clock {
+            let delay = reading.0.saturating_sub(self.now().0);
+            if delay > 1_000_000 {
+                return Err(Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"));
+            }
+            if delay > 0 {
+                let wait = tokio::time::sleep(std::time::Duration::from_micros(delay as u64));
+                cancellation.run_until_cancelled(wait).await.ok_or_else(cancelled)?;
+            }
+        }
         let submitted_bytes = payload.len() as u64;
         let append_time = submitted_at.unwrap_or_else(|| self.now());
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??;
@@ -3165,8 +3181,8 @@ impl NativeSession {
         }
         if proposal_overlay && (sections.len() != 1 || root.publication.is_some()
             || match &sections[0].1.effect {
-                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls),
-                OwnedWorldEffect::SettleProposal => !rtdb_tx::retained_delete_controls(&controls),
+                OwnedWorldEffect::Overlay(_) => !rtdb_tx::proposal_overlay_controls(&controls, true),
+                OwnedWorldEffect::SettleProposal => !rtdb_tx::proposal_overlay_controls(&controls, false),
                 _ => true,
             })
         {
@@ -3638,10 +3654,15 @@ impl SessionService for NativeSessionService {
         Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
     async fn fresh_snapshot_basis(&self, cancellation: &CancellationToken) -> Result<TimeBasis> {
-        if self.node.catalog.is_placed() {
-            self.database()?.confirm_replica_snapshot(cancellation).await?;
+        if !self.node.catalog.is_placed() { return self.snapshot_basis(); }
+        self.node.ensure_open()?;
+        let database = self.database()?;
+        let snapshot = database.capture_replica_snapshot(cancellation).await?;
+        if !Arc::ptr_eq(&database, &self.database()?) {
+            return Err(hosted_source_unavailable());
         }
-        self.snapshot_basis()
+        let time = snapshot.tx_basis().map(|key| key.system_time.into());
+        Ok(TimeBasis { databases: BTreeMap::from([(self.database.clone(), vec![time])]) })
     }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> {
         if !self.node.catalog.is_placed() { return self.node.await_basis(basis, timeout, cancellation).await; }

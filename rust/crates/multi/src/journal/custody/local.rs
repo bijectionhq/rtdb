@@ -1,6 +1,6 @@
 //! Exclusive lifetime for locally staged and retired checkpoint allocations.
 
-use crate::cipher::Cipher;
+use crate::keys::{UnitLedger, UnitOperation};
 use bytes::Bytes;
 use rtdb_storage::{Error, IoRegion, LocalStore, ObjectKey, ObjectStore, sync_directory};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -13,8 +13,6 @@ use super::{Fingerprint, invalid};
 
 pub(super) struct LocalArchive {
     root: PathBuf,
-    cipher: Cipher,
-    key: Vec<u8>,
 }
 
 pub(super) struct Allocation<'a> {
@@ -26,13 +24,9 @@ pub(super) struct Allocation<'a> {
 }
 
 impl LocalArchive {
-    pub(super) fn new(root: &Path, key: &[u8]) -> Result<Self> {
+    pub(super) fn new(root: &Path) -> Result<Self> {
         let root = root.canonicalize().map_err(local_error)?;
-        Ok(Self {
-            root,
-            cipher: Cipher::new(key)?,
-            key: key.to_vec(),
-        })
+        Ok(Self { root })
     }
 
     pub(super) async fn acquire<'a>(
@@ -96,12 +90,16 @@ impl Allocation<'_> {
         }
     }
 
-    pub(super) fn read_store(&self) -> Result<Arc<dyn ObjectStore>> {
-        let raw = LocalStore::open_in(&self.archive.root, Arc::clone(&self.io))?;
-        Ok(Arc::new(crate::store::EncryptingStore::new(
+    pub(super) fn region(&self) -> Arc<IoRegion> {
+        Arc::clone(&self.io)
+    }
+
+    pub(super) fn read_store(&self, ledger: UnitLedger) -> Result<Arc<dyn ObjectStore>> {
+        let raw = LocalStore::open_in(&self.archive.root, self.region())?;
+        Ok(Arc::new(crate::store::EncryptingStore::with_units(
             Arc::new(raw),
-            &self.archive.key,
-        )?))
+            ledger,
+        )))
     }
 
     async fn sync_scope(&self) -> rtdb_storage::Result<()> {
@@ -129,7 +127,12 @@ impl Allocation<'_> {
             .await
     }
 
-    pub(super) async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+    pub(super) async fn put(
+        &self,
+        ledger: &UnitLedger,
+        key: &ObjectKey,
+        bytes: Bytes,
+    ) -> rtdb_storage::Result<()> {
         if self.closed().await?.is_some() {
             return Err(Error::Closed(
                 "The local checkpoint allocation is permanently closed".into(),
@@ -145,26 +148,41 @@ impl Allocation<'_> {
         // holds the file lock through cancellation of any blocking write.
         let data = LocalStore::open_in(&self.data, Arc::clone(&self.io))?;
         match data.get_fresh(&relative).await {
-            Ok(sealed) if self.archive.cipher.open_object(key, &sealed)? == bytes => {
-                return self.sync_scope().await;
+            Ok(sealed) => {
+                let plaintext = ledger
+                    .operate(key, UnitOperation::Open(sealed))
+                    .await?
+                    .bytes()?;
+                return if plaintext == bytes {
+                    self.sync_scope().await
+                } else {
+                    Err(Error::ConflictingObject(key.to_string()))
+                };
             }
-            Ok(_) => return Err(Error::ConflictingObject(key.to_string())),
             Err(Error::MissingObject(_)) => {}
             Err(error) => return Err(error),
         }
-        data.put(&relative, self.archive.cipher.seal_object(key, &bytes)?)
-            .await?;
+        let sealed = ledger
+            .operate(key, UnitOperation::Seal(bytes))
+            .await?
+            .bytes()?;
+        data.put(&relative, sealed).await?;
         self.sync_scope().await
     }
 
-    pub(super) async fn retire(&self, manifest: Fingerprint) -> Result<()> {
+    pub(super) async fn close(&self, manifest: Fingerprint) -> Result<()> {
+        self.mark("closed", manifest).await
+    }
+
+    async fn mark(&self, name: &str, manifest: Fingerprint) -> Result<()> {
         self.state
-            .put(
-                &ObjectKey::new("closed")?,
-                Bytes::copy_from_slice(&manifest),
-            )
+            .put(&ObjectKey::new(name)?, Bytes::copy_from_slice(&manifest))
             .await?;
         self.sync_scope().await?;
+        Ok(())
+    }
+
+    pub(super) async fn retire(&self) -> Result<()> {
         let path = self.data.clone();
         self.io
             .run_blocking(move || {
@@ -206,17 +224,43 @@ mod tests {
     #[tokio::test]
     async fn a_checkpoint_reader_delays_disposal_and_closed_scope_cannot_reopen() {
         let volume = tempfile::tempdir().unwrap();
-        let archive = LocalArchive::new(volume.path(), &[7; 32]).unwrap();
+        use crate::keys::{LocalKeyService, UnitScope};
+        use ordered_logkeeper::ordered::Placement;
+        use uuid::Uuid;
+
+        let vault = tempfile::tempdir().unwrap();
+        let keys = Arc::new(LocalKeyService::new(vault.path()).unwrap());
+        let archive = LocalArchive::new(volume.path()).unwrap();
         let scope = "archive/placement/revision/allocation";
         let key = ObjectKey::new(format!("{scope}/manifest")).unwrap();
         let digest = [23; 32];
+        let placement = Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        };
+        let key_scope = UnitScope::new(placement, b"checkpoint", scope.as_bytes());
 
         let writer = archive.acquire(scope, true).await.unwrap();
         let body = Bytes::from_static(b"exact archive manifest");
-        writer.put(&key, body.clone()).await.unwrap();
+        writer
+            .put(
+                &UnitLedger::new(keys.clone(), key_scope, writer.region()),
+                &key,
+                body.clone(),
+            )
+            .await
+            .unwrap();
         drop(writer);
         let allocation = archive.acquire(scope, false).await.unwrap();
-        let reader = allocation.read_store().unwrap();
+        let reader = allocation
+            .read_store(UnitLedger::new(
+                keys.clone(),
+                key_scope,
+                allocation.region(),
+            ))
+            .unwrap();
         drop(allocation);
         assert_eq!(reader.get(&key).await.unwrap(), body);
         assert!(archive.acquire(scope, true).await.is_err());
@@ -224,13 +268,16 @@ mod tests {
 
         let retirement = archive.acquire(scope, true).await.unwrap();
         assert!(!retirement.require_disposition(digest).await.unwrap());
-        retirement.retire(digest).await.unwrap();
+        retirement.close(digest).await.unwrap();
+        let ledger = UnitLedger::new(keys, key_scope, retirement.region());
+        ledger.withdraw_scope().await.unwrap();
+        retirement.retire().await.unwrap();
         assert!(!volume.path().join(scope).exists());
         assert!(retirement.require_disposition(digest).await.unwrap());
         assert!(matches!(
-            retirement.put(&key, body).await,
+            retirement.put(&ledger, &key, body).await,
             Err(Error::Closed(_))
         ));
-        retirement.retire(digest).await.unwrap();
+        retirement.retire().await.unwrap();
     }
 }

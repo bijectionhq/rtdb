@@ -193,6 +193,11 @@ impl TableRef {
             .with_context("table-ref", value.into())
     }
 
+    pub fn stores_expiring_transaction_metadata(&self) -> bool {
+        self.schema == "xt" && matches!(self.table.as_str(),
+            "idempotency_receipts" | "bounded_retry_receipts" | "rtdb_replay_keys" | crate::PLACED_ATTEMPT_OUTCOME_TABLE)
+    }
+
     pub fn schema_and_table(&self) -> String { format!("{}/{}", self.schema, self.table) }
 }
 

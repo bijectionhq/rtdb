@@ -193,6 +193,7 @@ impl JournalLog {
         if current.writer.grant != Some(writer.grant) || current.head != writer.head {
             return Err(deposed(writer.grant, &current));
         }
+        let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
         let key = JournalKey::new(current.placement, writer.grant.key_generation);
         let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
@@ -210,6 +211,7 @@ impl JournalLog {
                 .map_err(storage)?,
         );
         let committed = self.finish_append(&mut writer).await?;
+        if let Some(outcome) = outcome { outcome.observe(committed); }
         Ok(AppendReceipt::observed(async move { Ok(committed) }))
     }
 
@@ -324,8 +326,14 @@ impl ReplicaReadIndex for JournalLog {
                     writer.unsettled_reads.retain(|read| *read != invocation.id);
                     let hold = proof.claim.read();
                     let retention = self.reads.retain(hold);
+                    let offset = latest(hold.through)?;
+                    crate::residence_trace::record("ordered-read-index", || serde_json::json!({
+                        "deployment": current.placement.deployment, "incarnation": current.placement.incarnation,
+                        "group": current.placement.group, "generation": current.placement.generation,
+                        "epoch": writer.grant.epoch, "invocation": hold.id.nonce, "through": offset.0,
+                    }));
                     return Ok(ProtectedReadIndex {
-                        offset: latest(hold.through)?,
+                        offset,
                         wait: Duration::from_secs(2),
                         retention: Some(retention),
                     });

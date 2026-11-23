@@ -1,5 +1,5 @@
 use rtdb_directory::{
-    Checkpoint, DeploymentRecord, Directory, HostedTask, LineageChange, LineageRetirement, LineageState,
+    Checkpoint, DeploymentRecord, Directory, ExactRetirementGrant, HostedTask, LineageChange, LineageRetirement, LineageState,
     RetirementWork, StorageRegion, now_ms,
 };
 use rtdb_format::{catalog::BlockCatalog, keys::block_key};
@@ -112,18 +112,35 @@ async fn finish(
     bucket: &dyn ObjectStore, provider: &VersionedInventory, lineage: &str, state: &LineageState,
     retirement: &LineageRetirement, threshold: i64,
 ) -> Result<bool> {
-    let ReplayRetirement { deployment, target, publication, .. } = ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
-    let target = key(target)?;
-    if !state.exact_erasure_authorized() {
+    let ReplayRetirement { deployment, .. } = ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
+    let authorized;
+    let grant = if let Some(grant) = state.exact_retirement_grant(retirement) {
+        grant
+    } else {
         let prepared = authorize(directory, storage, keys, task, bucket, provider, lineage, retirement, threshold).await;
-        let state = directory.lineage_state(lineage).await?;
-        if state.retirement() != Some(retirement) { return prepared.map(|()| false); }
-        if !state.exact_erasure_authorized() {
+        authorized = directory.lineage_state(lineage).await?;
+        if authorized.retirement() != Some(retirement) { return prepared.map(|()| false); }
+        let Some(grant) = authorized.exact_retirement_grant(retirement) else {
             directory.change_lineage(lineage, LineageChange::AbandonExactRetirement { retirement: retirement.clone() }).await?;
             crate::store::release_region(directory, deployment, retirement.token, false).await?;
             return prepared.map(|()| false);
-        }
-    }
+        };
+        grant
+    };
+    erase_granted(directory, provider, lineage, grant).await?;
+    settle(directory, lineage, deployment, retirement).await?;
+    Ok(true)
+}
+
+async fn erase_granted(directory: &dyn Directory, provider: &VersionedInventory, lineage: &str, grant: ExactRetirementGrant<'_>) -> Result<()> {
+    let retirement = grant.retirement();
+    let ReplayRetirement { target, publication, .. } = ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
+    let target = key(target)?;
+    let observed = || serde_json::json!({
+        "lineage": lineage, "revision": grant.revision(), "residence": retirement.source, "retirement": retirement.token,
+        "key": target.as_str(), "publication": retirement.work,
+    });
+    crate::residence_trace::record("authorize-replay-pack", observed);
     match publication {
         Publication::Version(version) => {
             provider.retire_observed_version(&target, version).await?;
@@ -136,8 +153,8 @@ async fn finish(
             retire(&proof, &journal, &target, tombstone).await?;
         }
     }
-    settle(directory, lineage, deployment, retirement).await?;
-    Ok(true)
+    crate::residence_trace::record("remove-replay-pack", observed);
+    Ok(())
 }
 
 async fn authorize(

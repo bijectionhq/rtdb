@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedReplayedPrimary, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
+use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, PublishedPrimaryReset, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, checkpoint_digest, matches_catalog_boundary, matches_confirmation, validate_uploaded_root};
@@ -164,22 +164,14 @@ impl TermHandle {
     /// Replaces a quiescent catalog and returns after its new block has been adopted in this term.
     /// The caller must exclusively operate the database with compaction and GC disabled.
     /// A failed receipt never permits deletion of the old catalog's files.
-    pub async fn reset_compactor(&self, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>) -> Result<BlockIndex> {
-        self.replace_primary(expected, expected_block, Replacement::L0(replacements), reservations).await
-    }
-    pub async fn reset_replayed_compactor(&self, published: PublishedReplayedPrimary, reservations: Arc<[Arc<MemoryReservation>]>,
+    pub async fn reset_compactor(&self, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>,
     ) -> Result<BlockIndex> {
-        if !Arc::ptr_eq(&self.handle.logs, &published.source) {
-            return Err(invalid("Replayed primary files belong to another journal"));
+        if !Arc::ptr_eq(&self.handle.logs, &primary.source) {
+            return Err(invalid("The reset primary belongs to another journal"));
         }
-        self.replace_primary(published.expected, published.block,
-            Replacement::Replayed { catalog: published.catalog, target: published.target }, reservations).await
-    }
-    async fn replace_primary(&self, expected: Arc<TrieCatalog>, expected_block: BlockIndex,
-        replacement: Replacement, reservations: Arc<[Arc<MemoryReservation>]>,
-    ) -> Result<BlockIndex> {
         let (completion, receiver) = oneshot::channel();
-        self.handle.commands.send(Command::ResetCompactor { term: self.term, expected, expected_block, replacement, reservations, completion }).await.map_err(|_| term_ended())?;
+        self.handle.commands.send(Command::ResetCompactor { term: self.term, primary, reservations, completion })
+            .await.map_err(|_| term_ended())?;
         receiver.await.map_err(|_| term_ended())?
     }
     pub async fn publish_deletions(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> {
@@ -220,13 +212,8 @@ impl ExternalReceipt {
 
 }
 
-enum Replacement {
-    L0(BTreeMap<TableRef, Vec<CatalogTrie>>),
-    Replayed { catalog: TrieCatalog, target: TransactionKey },
-}
-
 enum Command {
-    ResetCompactor { term: Term, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacement: Replacement, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
+    ResetCompactor { term: Term, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
     Retire { term: Term, tables: Vec<TableRef>, as_of: Timestamp, completion: oneshot::Sender<Result<Applied>> },
     External { term: Term, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>, completion: oneshot::Sender<Result<Applied>> },
@@ -1353,7 +1340,7 @@ impl ReplicationDriver {
                 let source = SourceInput { position, log_time: metadata.timestamp, work, _decode_charge: decode_charge };
                 // Keep this position as the source head until every previously queued replica
                 // write has been read back. In particular, none can still be offloading a body.
-                if matches!(&source.work, SourceWork::Resolve(request) if request.uses_staging_deadline())
+                if matches!(&source.work, SourceWork::Resolve(request) if request.requires_durable_predecessor())
                     && !leader.drained_for_strict_source()
                 {
                     leader.waiting_strict_source = Some(source);
@@ -1428,13 +1415,20 @@ impl ReplicationDriver {
             let result = match work {
                 SourceWork::Resolve(request) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
                     Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,
-                SourceWork::Skip(message) => async {
+                SourceWork::Skip(mut message) => async {
+                    let attempt = SourceTransaction::skipped_attempt(&message, position)?;
+                    if let SourceMessage::Protobuf(SourceBody::Tx(tx)) = &mut message {
+                        tx.user_metadata = None;
+                        tx.idempotency_guard = None;
+                        tx.bounded_retry = None;
+                        tx.replay_submission = None;
+                        tx.placed_attempt_seed = None;
+                    }
                     let digits = position.0.to_string();
                     let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
                     let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
                     let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                     context.storage.object_store().put(&key, payload).await?;
-                    let attempt = SourceTransaction::skipped_attempt(&message, position)?;
                     resolver.resolve_skipped(durable, position, log_time, attempt, &context).await
                 }.await,
             };
@@ -1492,29 +1486,36 @@ impl ReplicationDriver {
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
-            Command::ResetCompactor { expected, expected_block, replacement, reservations, completion, .. } => {
+            Command::ResetCompactor { primary, reservations, completion, .. } => {
                 let value = self.partition.value();
                 if !leader.confirmed || !leader.pending.is_empty() || self.pending_block.is_some() || leader.production.is_some() || leader.compactor_reset.is_some()
-                    || value.live().block_index() != expected_block || !Arc::ptr_eq(value.trie_catalog(), &expected) {
+                    || value.live().block_index() != primary.block || !Arc::ptr_eq(value.trie_catalog(), &primary.expected) {
                     let _ = completion.send(Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.compactor-reset/catalog-moved", "Database changed while the reset was being prepared; prepare it again")));
                     return Ok(());
                 }
-                if value.live().latest_completed_tx().is_none() {
-                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.compactor-reset/no-transactions", "Compactor reset requires a completed transaction")));
+                if let Err(error) = self.partition.install_reset_primary(primary.catalog, primary.target) {
+                    let _ = completion.send(Err(error));
                     return Ok(());
                 }
-                let install = match replacement {
-                    Replacement::L0(tries) => self.partition.reset_to_l0(tries),
-                    Replacement::Replayed { catalog, target } => self.partition.reset_to_replayed_primary(catalog, target),
-                };
-                if let Err(error) = install { let _ = completion.send(Err(error)); return Ok(()); }
-                leader.compactor_reset = Some(CompactorReset { block: expected_block, completion: Some(completion), _reservations: reservations });
+                leader.compactor_reset = Some(CompactorReset { block: primary.block, completion: Some(completion), _reservations: reservations });
                 self.cut().await
             }
             Command::Delete { table, keys, completion, .. } => {
-                if keys.is_empty() || keys.iter().any(|key| key.level() == 0) {
-                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "A trie removal requires at least one non-L0 trie and contains no L0 trie")));
+                if keys.is_empty() || (keys.iter().any(|key| key.level() == 0)
+                    && !(self.resolve.storage.object_store().releases_receipt_l0() && table.stores_expiring_transaction_metadata()))
+                {
+                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "The requested trie batch is empty or contains an ineligible L0 file")));
                     return Ok(());
+                }
+                if keys.iter().any(|key| key.level() == 0) {
+                    let collection = self.partition.trie_collection();
+                    let eligible: BTreeSet<_> = collection.eligible_receipt_l0(&table, Timestamp::MAX).cloned().collect();
+                    if keys.iter().any(|key| key.level() == 0 && collection.current().retains_trie(&table, key)
+                        && !eligible.contains(key))
+                    {
+                        let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "A receipt L0 file still belongs to an admitted view")));
+                        return Ok(());
+                    }
                 }
                 let message = proto::TriesDeleted { table_name: Some(table.schema_and_table()), trie_keys: keys.into_iter().map(|key| key.to_string()).collect() };
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesDeleted(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)

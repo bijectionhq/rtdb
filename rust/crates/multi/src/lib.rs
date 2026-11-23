@@ -37,5 +37,6 @@ pub mod process;
 pub mod relay;
 mod replica_retention;
 mod hosted_recovery;
+mod residence_trace;
 pub mod session;
 pub mod store;

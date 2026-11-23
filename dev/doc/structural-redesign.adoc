@@ -102,7 +102,7 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 
 |2
 |Engine-owned retry receipts with body digest and principal scope.
-|Landed; physical expiry follows increment 8
+|Landed. Increment 8 tracks physical expiry across storage copies.
 
 |3
 |Epoch-qualified physical names; delete the reset fence.
@@ -110,8 +110,12 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 
 |4
 |Residence ledger with holds and collection floor; delete the timer stack.
-|Multi and native local storage enforce a catalog admission floor and retry trie retirement from installed receipts.
-Remote classic storage, renewal, full recovery-root integration and timer removal remain open.
+|Multi, native local storage, and classic S3, Azure and GCS storage enforce a catalog admission floor and retry trie retirement from installed receipts.
+Classic remote holds use conditional writes and finish after admitted provider work drains.
+Compaction on coordinated storage holds its live inputs through provider drain.
+Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
+Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
+Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.
@@ -123,25 +127,39 @@ Enrolled terminal storage can retire loose files with a write witness and an ins
 Opted-in versioned S3 deployments retire exact oversized replica payloads after a certified directory cut and fsync-backed trim from every known physical journal.
 Normal readers hold those payloads through provider drain.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
-Full recovery closures, compactor reset, terminal pack coverage and live provider qualification remain open.
+The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
+The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
+Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a readable newer pack.
+Full recovery closures, terminal coverage for other mixed packs and live provider qualification remain open.
 
 |6
 |Sealing and the key ledger for every durable unit.
-|Revised design
+|Installed serving objects and independently copied checkpoint members, including their manifests and preparation records, use per-publication slots in the local or S3 key vault.
+Installed replay opens detached payloads under the original serving slot.
+Local checkpoint and serving-prefix retirement fence and withdraw every vault slot in the retired namespace, including slots from interrupted writes.
+S3 checkpoint retirement withdraws its listed slots.
+S3 serving-prefix slot census and retirement, directory-managed and classic stores, and archive and transfer coverage remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
 |The operation-only local archive broker persists scheduled capture-key revocation and attests physical settlement on the original media.
-The live serving and replay paths still require bounded key grants and readable successor roots to make a deadline commitment for SQL erasure.
+Installed serving reads enforce their journal lease through body delivery, and installed payload cryptography bounds each provider operation.
+Installed recovery opens independently sealed checkpoint closures before their publication, then serves and replays from the selected closure.
+SQL erasure still requires ordered closure of affected admissions, a complete survivor rebuild and retiring-key census, bounded plaintext drain, and evidenced provider destruction.
 
 |8
 |Transaction metadata retention.
-|Ordered receipt expiry, historical transaction projection and native logical collection.
-Physical copy closure remains open.
+|Ordered expiry, historical transaction projection and receipt compaction landed.
+New recovery checkpoints omit covered receipt tries, placed intake releases applied records, and new native skip diagnostics omit receipt fields.
+Opted-in hosted directory deployments can retire exact loose receipt L0 versions after a successor and settled journal trim.
+Retirement of every earlier copy remains open.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
-|Planned
+|Fresh snapshot capture retains the exact read index through capture, and hosted exact removal consumes a lineage deletion grant.
+The shared model and replay cover the R1–R8 authority transitions in a bounded residence.
+Multi records scoped native observations for diagnostic validation.
+Full storage-read and recovery-acknowledgement capability coverage, cross-owner native replay and execution evidence remain open.
 |===
 
 == Placed serving and search
@@ -159,7 +177,8 @@ For a parked deployment, an operator who has qualified every eligible serving an
 The engine reports support as `placed_receipt_retirement: true` in `rtdb-multi --build-info`.
 The next activation writes the versioned outcome format, including ordered collection of expired outcome rows.
 The deployment remains pinned to a compatible release.
-Later logical erasure leaves physical copies subject to the exact custody of their source logs, replica logs, checkpoints and archives.
+Receipt compaction removes erased payloads from successor tries.
+Earlier physical copies remain subject to the custody of their source logs, replica logs, checkpoints and archives.
 See link:../../verification/redesign/R8-metadata-retention.md[receipt retention and custody].
 Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
 An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.

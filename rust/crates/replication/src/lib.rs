@@ -21,7 +21,7 @@ pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint,
 pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
 pub use replay_closure::{ReplayBase, ReplayDependencySources, checkpoint_dependencies, tail_dependencies};
-pub use repair::{LocalRepair, PublishedReplayedPrimary, RepairCheckpoint, ReplayedPrimary, RepairedStore, RetainRepairBase, RetainedLocalRepair};
+pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};
 pub use table_replay::RetainedTableReplay;

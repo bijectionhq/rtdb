@@ -40,7 +40,7 @@ pub fn checkpoint_dependencies(catalog: &BlockCatalog, tables: &BTreeMap<TableRe
     for entry in catalog.table_entries()? {
         let table = tables.get(&entry.table).ok_or_else(|| invalid("A checkpoint table has no table block"))?;
         keys.insert(ObjectKey::new(entry.slug.block_key(block)?)?);
-        for file in table.checkpoint_trie_files(&entry.slug, CheckpointContents::Replay)? {
+        for file in table.checkpoint_trie_files(&entry, CheckpointContents::Replay)? {
             keys.insert(ObjectKey::new(file)?);
         }
     }

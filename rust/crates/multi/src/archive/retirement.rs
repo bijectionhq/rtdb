@@ -270,7 +270,11 @@ async fn prepare_capture_retirement_with_intent(
         Ok(())
     })
     .await?;
-    retirement_receipt(&accepted, &archive, capture, manifest)
+    let receipt = retirement_receipt(&accepted, &archive, capture, manifest)?;
+    if let Some(due_at_ms) = receipt.scheduled_revocation_at_ms {
+        observe_scheduled_custody("erasure-obligation", &accepted, capture, &receipt, due_at_ms);
+    }
+    Ok(receipt)
 }
 
 pub(crate) fn capture_retirement_receipt(
@@ -446,7 +450,20 @@ async fn withdraw_capture_key(
         }
         Ok(())
     }).await?;
-    Ok(current.checkpoint_capture_retirements[&capture].clone())
+    let receipt = current.checkpoint_capture_retirements[&capture].clone();
+    if let (Some(due_at_ms), Some(_)) = (receipt.scheduled_revocation_at_ms, receipt.operation_revoked_at_ms) {
+        observe_scheduled_custody("key-revoked", &current, capture, &receipt, due_at_ms);
+    }
+    Ok(receipt)
+}
+
+fn observe_scheduled_custody(event: &'static str, record: &DeploymentRecord, capture: Uuid,
+    receipt: &CheckpointCaptureRetirement, due_at_ms: i64) {
+    crate::residence_trace::record(event, || serde_json::json!({
+        "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation, "epoch": record.log_epoch,
+        "revision": record.version, "capture": capture, "manifest": receipt.manifest_sha256, "due_at_ms": due_at_ms,
+        "authorized_at_ms": receipt.authorized_at_ms, "revoked_at_ms": receipt.operation_revoked_at_ms,
+    }));
 }
 
 fn checked_retirement<'a>(

@@ -2,7 +2,7 @@ use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
 use rtdb_format::{catalog::BlockCatalog, keys::{TrieKey, block_key}};
 use rtdb_s3::{NeverVersionedRetirement, ObservedTerminalObject};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{BlockIndex, PhysicalObjectVersion, Result, StorageEpoch};
+use rtdb_types::{BlockIndex, PhysicalObjectVersion, Result, S3TombstoneCondition, StorageEpoch, TerminalObjectPublication};
 
 use crate::archive::{self, ArchivedCheckpoint};
 use crate::cipher::Cipher;
@@ -120,6 +120,20 @@ async fn covered_pack(
         has_l0 = true;
     }
     Ok(has_l0.then_some(boundary))
+}
+
+pub(super) async fn terminal_pack_index(
+    provider: &NeverVersionedRetirement<'_>, key: &ObjectKey, expected: Option<&TerminalObjectPublication>,
+) -> Result<Option<PackIndex>> {
+    let Some(observed) = ObservedPack::terminal(provider, key).await? else { return Ok(None); };
+    let PackStorage::Terminal { publication, .. } = &observed.storage else { return Ok(None); };
+    if expected.is_some_and(|expected| publication.allocation() != expected.allocation
+        || publication.target().namespace != expected.namespace || publication.target().key != expected.key
+        || publication.target().condition != S3TombstoneCondition::Matches(expected.etag.clone()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(observed.index))
 }
 
 struct ObservedPack<'a> {

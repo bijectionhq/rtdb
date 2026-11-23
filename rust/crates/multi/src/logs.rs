@@ -26,8 +26,6 @@ use crate::cipher::{Cipher, SEALED_OVERHEAD};
 use crate::deployment::LogkeeperLogConfig;
 use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
 
-/// How many already-resolved intake records stay retained behind the holder's read position.
-const INTAKE_RETAINED_BEHIND: i64 = 1024;
 const SCAN_WINDOW: i64 = 256;
 const INTAKE_TIP_WINDOW: i64 = 8;
 const READ_INDEX_WITHIN: Duration = Duration::from_secs(2);
@@ -37,9 +35,12 @@ struct LogletReadIndex { log: Arc<QuorumLog>, epoch: u64 }
 #[async_trait]
 impl ReplicaReadIndex for LogletReadIndex {
     async fn confirm(&self) -> Result<LogOffset> {
-        tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
-            .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))?
-            .map_err(Into::into)
+        let index = tokio::time::timeout(READ_INDEX_WITHIN, self.log.read_index(self.epoch)).await
+            .map_err(|_| Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.multi/read-index-timeout", "Logkeepers did not confirm a read index in time"))??;
+        crate::residence_trace::record("read-index", || serde_json::json!({
+            "stream": index.stream(), "epoch": index.epoch(), "ensemble": index.ensemble(), "through": index.through().0,
+        }));
+        Ok(index.through())
     }
 }
 
@@ -133,9 +134,8 @@ pub(crate) fn frozen_checkpoint(
     let start = end(checkpoint.source)?;
     let intake = Arc::new(IntakeLog {
         log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(start)),
-        consumed: Arc::new(AtomicI64::new(start - 1)),
+        consumed: AtomicI64::new(start - 1),
         start,
-        trim_on_apply: false,
     });
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
         await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
@@ -160,8 +160,7 @@ pub(crate) async fn ordered_opened(
     let next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
     let intake = Arc::new(IntakeLog {
         log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(next)),
-        consumed: Arc::new(AtomicI64::new(next - 1)), start: next,
-        trim_on_apply: true,
+        consumed: AtomicI64::new(next - 1), start: next,
     });
     let trimming = {
         let intake = Arc::clone(&intake);
@@ -266,7 +265,7 @@ impl LogFactory for LogkeeperLogFactory {
             next = next.max(floor);
         }
         if config.transfer_intake_cut.is_some() { SourcePosition::from_epoch_offset(epoch, next)?; }
-        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next, trim_on_apply: false });
+        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: AtomicI64::new(next - 1), start: next });
         let trimming = {
             let intake = Arc::clone(&intake);
             async move {
@@ -457,7 +456,9 @@ impl Log for SealedLog {
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
-        self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+        let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
+        let receipt = self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await?;
+        Ok(observe_attempt(receipt, outcome))
     }
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.inner.enqueue_maintenance(self.cipher.seal(&self.stream, &payload)?, timestamp).await
@@ -466,7 +467,9 @@ impl Log for SealedLog {
         self.inner.available_append_capacity().await
     }
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
-        self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await
+        let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
+        let receipt = self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await?;
+        Ok(observe_attempt(receipt, outcome))
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
     async fn retained_floor(&self) -> rtdb_storage::Result<Option<LogOffset>> { self.inner.retained_floor().await }
@@ -492,6 +495,15 @@ impl Log for SealedLog {
         if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
         Ok(records)
     }
+}
+
+fn observe_attempt(receipt: AppendReceipt, outcome: Option<crate::residence_trace::AttemptOutcome>) -> AppendReceipt {
+    let Some(outcome) = outcome else { return receipt; };
+    AppendReceipt::observed(async move {
+        let metadata = receipt.durable().await?;
+        outcome.observe(metadata);
+        Ok(metadata)
+    })
 }
 
 struct SealedTail {
@@ -556,12 +568,12 @@ impl LogRange for SealedRange {
     }
 }
 
-/// The holder's in-process source log: it remembers how far its reader has got, and drops what lies well behind it.
-pub struct IntakeLog { log: MemoryLog, consumed: Arc<AtomicI64>, start: i64, trim_on_apply: bool }
+/// The holder's in-process source log keeps pending bytes until their replica outcomes are installed.
+pub struct IntakeLog { log: MemoryLog, consumed: AtomicI64, start: i64 }
 
 impl IntakeLog {
     fn trim(&self) {
-        let boundary = self.consumed.load(Ordering::Acquire) + 1 - INTAKE_RETAINED_BEHIND;
+        let boundary = self.consumed.load(Ordering::Acquire).saturating_add(1);
         if boundary > self.log.first_retained().0 { let _ = self.log.truncate_before(LogOffset(boundary)); }
     }
 }
@@ -571,47 +583,15 @@ impl Log for IntakeLog {
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> { self.log.enqueue(payload, timestamp).await }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
     fn record_applied(&self, through: LogOffset) {
-        if self.trim_on_apply {
-            self.consumed.fetch_max(through.0, Ordering::AcqRel);
-        }
+        self.consumed.fetch_max(through.0, Ordering::AcqRel);
     }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
         // Positions below the intake's start were never assigned to it, so a reader asking for them starts at the start; trimmed positions above it still fail as unavailable.
         let after = LogOffset(after.0.max(self.start - 1));
-        let tail = self.log.tail(after).await?;
-        if self.trim_on_apply { return Ok(tail); }
-        Ok(Box::new(IntakeTail { tail, consumed: Arc::clone(&self.consumed) }))
+        self.log.tail(after).await
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> { self.log.range(from, to).await }
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
-}
-
-struct IntakeTail { tail: Box<dyn LogTail>, consumed: Arc<AtomicI64> }
-
-impl IntakeTail {
-    fn delivered(&self, offset: LogOffset) { self.consumed.fetch_max(offset.0, Ordering::AcqRel); }
-}
-
-#[async_trait]
-impl LogTail for IntakeTail {
-    async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
-        let records = self.tail.poll(timeout).await?;
-        if let Some(last) = records.last() { self.delivered(last.metadata.offset); }
-        Ok(records)
-    }
-    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { if self.tail.replay().is_some() { Some(self) } else { None } }
-}
-
-#[async_trait]
-impl LogReplayTail for IntakeTail {
-    async fn poll_head(&mut self, timeout: Duration) -> rtdb_storage::Result<Option<ReplayHead>> {
-        self.tail.replay().expect("checked when replay was offered").poll_head(timeout).await
-    }
-    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
-        let record = self.tail.replay().expect("checked when replay was offered").read_head(head, reservation).await?;
-        self.delivered(record.metadata.offset);
-        Ok(record)
-    }
 }
 
 #[cfg(test)]
@@ -869,15 +849,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_intake_drops_what_lies_well_behind_its_reader() {
-        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: Arc::new(AtomicI64::new(9)), start: 10, trim_on_apply: false };
-        for _ in 0..(INTAKE_RETAINED_BEHIND + 100) { intake.enqueue(Bytes::from_static(b"x"), Timestamp(0)).await.unwrap().durable().await.unwrap(); }
-        let mut tail = intake.tail(LogOffset(9)).await.unwrap();
-        let mut read = 0;
-        while read < INTAKE_RETAINED_BEHIND + 100 { read += tail.poll(Duration::from_millis(10)).await.unwrap().len() as i64; }
-        assert!(intake.tail(LogOffset(-1)).await.is_ok(), "a reader asking for positions from before the intake started begins at its start");
+    async fn the_intake_releases_applied_records_and_keeps_pending_records() {
+        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: AtomicI64::new(9), start: 10 };
+        for payload in [b"applied".as_slice(), b"pending".as_slice()] {
+            intake.enqueue(Bytes::from_static(payload), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        }
+        let mut tail = intake.tail(LogOffset(-1)).await.unwrap();
+        assert_eq!(tail.poll(Duration::from_millis(10)).await.unwrap().len(), 2);
         intake.trim();
-        assert_eq!(intake.log.first_retained(), LogOffset(10 + 100), "everything but the retained window behind the reader is dropped");
-        assert!(intake.tail(LogOffset(50)).await.is_err(), "a trimmed position still fails");
+        assert_eq!(intake.log.first_retained(), LogOffset(10));
+        intake.record_applied(LogOffset(10));
+        intake.trim();
+        assert_eq!(intake.log.first_retained(), LogOffset(11));
+        assert!(intake.tail(LogOffset(9)).await.is_err());
+        let pending = intake.read_range(LogOffset(11), LogOffset(12)).await.unwrap();
+        assert_eq!(pending[0].payload.as_ref(), b"pending");
     }
 }

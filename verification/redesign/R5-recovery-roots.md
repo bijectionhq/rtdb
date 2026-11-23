@@ -27,7 +27,7 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 
 - The L0 guard in `TrieCollector::collect_table` (`rust/crates/maintenance/src/gc.rs`, "L0 recovery files cannot be garbage collected").
 - Retained L0 identities in the trie catalog (`dev/doc/trie-cat.allium` line 9 and the code behind it).
-- `reset_to_l0` in `rust/crates/index/src/partition.rs` and `rust/crates/index/src/trie_catalog.rs`, and the L0 replacement plan in `Node::prepare_compactor_reset` (`rust/crates/node/src/operations.rs`), replaced by a reset from a root.
+- The L0 replacement plan has been removed. The default reset verifies the installed checkpoint's primary inventory and relocates the selected compacted pairs into the replacement epoch.
 - The `rtdb.replication/invalid-trie-removal` restriction on L0 deletions in the replication driver.
 
 ## State on main (2026-11-21)
@@ -59,7 +59,7 @@ After R5, L0 files are ordinary garbage once compaction supersedes them (as in X
 - Multi has recovery holds for the replica suffix (`rust/crates/multi/src/recovery_holds.rs`, peer commit `e298879a0`) and checkpoint-metadata holds (`rust/crates/multi/src/checkpoint_retention.rs`).
 - Models: `verification/tla/{InstalledCheckpoint,RecoveryReplay,Checkpoint,ResidenceRetirement}.tla`, `verification/mcrl2/CheckpointDiscovery.mcrl2`, the AutoHyper two-run check, and the Lean checkpoint-metadata laws.
 - Compactor reset names outputs in a new epoch (R3, `ae7b66e10`), so rebuilding from a root cannot collide with pre-reset names.
-  Reset loads the installed checkpoint's bound table inventories and checks each named L0 pair before preparing publication.
+  Reset loads the installed checkpoint's bound table inventories and checks the live and nascent primary pairs before preparing publication.
 - The offline native `repair-checkpoint` command takes a known-good checkpoint digest and an exact later target digest from the same stopped local journal.
   It verifies the checkpoint publications and base table inventories, replays resolved writes into independent primary storage, and publishes a detached checkpoint with a new digest.
   The native regression takes the base from a snapshot export and removes its original primary inventory and the source's L0 files.
@@ -381,7 +381,11 @@ TLC explored 33 states and reached purge with a delayed completion whose closed 
 An initiation that loses its response before admission can leave an empty upload for provider lifecycle cleanup.
 Hosted qualification must establish conditional multipart completion for a zero-byte payload and confirm that a closed upload cannot publish after whole-residence disposal.
 Enabling this profile in the hosted fleet still needs a matching reaper policy and live provider qualification.
-Retirement of terminal packs and previously unwitnessed files needs its own publication coverage.
+The checkpoint-metadata collector binds terminal releases to the pack's allocation, physical key and strong entity tag.
+It checks a release for every indexed member under that publication and requires a newer readable pack beyond the held metadata floor.
+The selected release marker settles with the pack. Other terminal member markers remain until residence disposal.
+Mixed packs with independent replay coverage use the separate parked-root retirement path.
+Other mixed packs and previously unwitnessed files still need publication coverage.
 [Disposal composition model](../tla/TombstoneDisposal.tla)
 
 ### Shared fork publication and referrer inventories

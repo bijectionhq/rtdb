@@ -35,6 +35,22 @@ message Tx {
     // The intake position comes from the log record's metadata.
     bytes placed_attempt_seed = 9;
     BoundedRetry bounded_retry = 10;
+    // A hosted Proposal's private immutable generation, sealed against tx_ops.
+    PreparedLanding prepared_landing = 11;
+}
+
+message PreparedLanding {
+    int64 predecessor_id = 1;
+    int64 predecessor_micros = 2;
+    int64 block_index = 3;
+    int32 storage_version = 4;
+    int32 storage_epoch = 5;
+    int32 replica_epoch = 6;
+    int64 catalog_through = 7;
+    int64 clock_micros = 8;
+    bytes footprint_sha256 = 9;
+    bool constraint_refused = 10;
+    map<string, bytes> table_data = 11;
 }
 
 message BoundedRetry {

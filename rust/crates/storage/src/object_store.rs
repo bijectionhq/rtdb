@@ -161,6 +161,8 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Whether physical trie retirement waits for an installed receipt and the catalog floor.
     fn defers_trie_releases(&self) -> bool { false }
+    /// The custodian can settle covered receipt L0 after releasing its recovery dependencies.
+    fn releases_receipt_l0(&self) -> bool { false }
     /// Records an installed retirement as a lower bound for new catalog captures.
     /// Returns false while a reader still needs a catalog before the proposed floor.
     async fn advance_catalog_floor(&self, _installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {

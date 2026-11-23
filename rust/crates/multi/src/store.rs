@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, object};
 use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
-use crate::keys::KeyService;
+use crate::keys::{KeyService, UnitLedger, UnitOperation, UnitOutput};
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
 use crate::reference::custody::ReferenceReads;
@@ -284,6 +284,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             }
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
+            serving.releases_receipt_l0 = self.replica_payload_reclamation && matches!(config.storage, CellStorage::S3 { .. });
             serving.catalog_readers = Some(CatalogReaders::new(
                 self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
@@ -1051,33 +1052,70 @@ impl ObjectStore for AudienceObjectStore {
     async fn delete(&self, _: &ObjectKey) -> rtdb_storage::Result<()> { Err(audience_read_only()) }
 }
 
-pub struct EncryptingStore { inner: Arc<dyn ObjectStore>, cipher: Cipher, replica_publications: bool }
+pub struct EncryptingStore {
+    inner: Arc<dyn ObjectStore>,
+    keys: ObjectKeys,
+    replica_publications: bool,
+}
+
+enum ObjectKeys {
+    Deployment(Cipher),
+    Units(UnitLedger),
+}
 
 impl EncryptingStore {
-    pub fn new(inner: Arc<dyn ObjectStore>, key: &[u8]) -> Result<Self> { Ok(Self { inner, cipher: Cipher::new(key)?, replica_publications: false }) }
-    fn seal(&self, key: &ObjectKey, plaintext: &[u8]) -> rtdb_storage::Result<Bytes> { self.cipher.seal_object(key, plaintext) }
-    fn open(&self, key: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> { self.cipher.open_object(key, &sealed) }
+    pub fn new(inner: Arc<dyn ObjectStore>, key: &[u8]) -> Result<Self> {
+        Ok(Self { inner, keys: ObjectKeys::Deployment(Cipher::new(key)?), replica_publications: false })
+    }
 
-    async fn read_frames(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
-        use object::{FRAME_BYTES, FramedObject, SEALED_HEADER_BYTES, sealed_size};
+    pub(crate) fn with_units(inner: Arc<dyn ObjectStore>, ledger: UnitLedger) -> Self {
+        Self { inner, keys: ObjectKeys::Units(ledger), replica_publications: false }
+    }
+
+    async fn crypt(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        match &self.keys {
+            ObjectKeys::Deployment(cipher) => operation.apply(cipher, name),
+            ObjectKeys::Units(ledger) => ledger.operate(name, operation).await,
+        }
+    }
+
+    async fn seal(&self, key: &ObjectKey, plaintext: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.crypt(key, UnitOperation::Seal(plaintext)).await?.bytes()
+    }
+
+    async fn open(&self, key: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> {
+        self.crypt(key, UnitOperation::Open(sealed)).await?.bytes()
+    }
+
+    async fn seal_missing(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<Bytes>> {
+        match self.get_fresh(key).await {
+            Ok(existing) if existing == bytes => Ok(None),
+            Ok(_) => Err(Error::ConflictingObject(key.to_string())),
+            Err(Error::MissingObject(_)) => Ok(Some(self.seal(key, bytes).await?)),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_frames(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+        use object::{FRAME_BYTES, SEALED_HEADER_BYTES, sealed_size};
 
         let head = self.inner.observe_head(key).await?;
         let header = self.inner.observe_range(key, 0..SEALED_HEADER_BYTES as u64).await?;
-        let layout = FramedObject::open_header(&self.cipher, key, &header.value)?;
+        let layout = self.crypt(key, UnitOperation::Header(header.value)).await?.header()?;
         if header.version != head.version || head.value.size != sealed_size(key, layout.length())? as u64 {
             return Err(Error::ConflictingObject(key.to_string()));
         }
         let frames = layout.covering_frames(key, &range)?;
-        if frames.is_empty() { return Ok(Bytes::new()); }
+        if frames.is_empty() { return Ok(ObjectObservation { value: Bytes::new(), version: header.version }); }
         let sealed = self.inner.observe_range(key, layout.physical_range(&frames)).await?;
         if sealed.version != header.version {
             return Err(Error::ConflictingObject(key.to_string()));
         }
-        let plaintext = layout.open_frames(&self.cipher, key, frames, &sealed.value)?;
+        let plaintext = self.crypt(key, UnitOperation::Frames(layout, frames, sealed.value)).await?.bytes()?;
         let start = range.start as usize % FRAME_BYTES;
         let end = start + (range.end - range.start) as usize;
         let bytes = plaintext.get(start..end).ok_or_else(|| Error::ConflictingObject(key.to_string()))?;
-        Ok(Bytes::copy_from_slice(bytes))
+        Ok(ObjectObservation { value: Bytes::copy_from_slice(bytes), version: sealed.version })
     }
 }
 
@@ -1100,6 +1138,7 @@ impl ObjectStore for EncryptingStore {
         self.inner.retain_catalog(cut).await
     }
     fn defers_trie_releases(&self) -> bool { self.inner.defers_trie_releases() }
+    fn releases_receipt_l0(&self) -> bool { self.inner.releases_receipt_l0() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         self.inner.advance_catalog_floor(installed).await
     }
@@ -1130,9 +1169,9 @@ impl ObjectStore for EncryptingStore {
     async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.inner.retirement_publication(key).await
     }
-    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?) }
+    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.open(key, self.inner.get(key).await?).await }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        self.open(key, self.inner.get_fresh(key).await?)
+        self.open(key, self.inner.get_fresh(key).await?).await
     }
     fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         let sealed = object::sealed_size(key, length)?;
@@ -1149,12 +1188,13 @@ impl ObjectStore for EncryptingStore {
         let allocation = self.inner.whole_object_allocation(key, sealed_length)?;
         let source = reservation.take_scratch_read(sealed_length, allocation)?;
         let sealed = reservation.retaining_io(self.inner.get_reserved_object(key, source)).await?;
-        let plaintext = self.cipher.open_object(key, sealed.as_slice())?;
+        let plaintext = reservation
+            .retaining_io(self.crypt(key, UnitOperation::OpenRetained(sealed))).await?.bytes()?;
         reservation.finish(plaintext)
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> {
         let exact = object::sealed_size(key, length)?;
-        self.open(key, self.inner.get_fresh_exact(key, exact).await?)
+        self.open(key, self.inner.get_fresh_exact(key, exact).await?).await
     }
     fn exact_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
         let sealed = object::sealed_size(key, length)?;
@@ -1164,19 +1204,31 @@ impl ObjectStore for EncryptingStore {
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         let exact = object::sealed_size(key, length)?;
         let observed = self.inner.observe_fresh_exact(key, exact).await?;
-        Ok(ObjectObservation { value: self.open(key, observed.value)?, version: observed.version })
+        Ok(ObjectObservation { value: self.open(key, observed.value).await?, version: observed.version })
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+        if object::framed(key) {
+            return Ok(self.observe_range(key, range).await?.value);
+        }
+        let plaintext = self.get(key).await?;
+        let length = plaintext.len() as u64;
+        if range.start > range.end || range.end > length { return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length }); }
+        Ok(plaintext.slice(range.start as usize..range.end as usize))
+    }
+    async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         if object::framed(key) {
             if !self.supports_scan_ranges(key) {
                 return Err(Error::Closed("The encrypted object has no authenticated ranges".into()));
             }
             return self.read_frames(key, range).await;
         }
-        let plaintext = self.get(key).await?;
-        let length = plaintext.len() as u64;
-        if range.start > range.end || range.end > length { return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length }); }
-        Ok(plaintext.slice(range.start as usize..range.end as usize))
+        let length = self.head_fresh(key).await?.size;
+        if range.start > range.end || range.end > length {
+            return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
+        }
+        let exact = usize::try_from(length).map_err(|_| Error::Task("Encrypted object length overflow".into()))?;
+        let observed = self.observe_fresh_exact(key, exact).await?;
+        Ok(ObjectObservation { value: observed.value.slice(range.start as usize..range.end as usize), version: observed.version })
     }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { object::framed(key) && self.inner.supports_observed_scan_ranges(key) }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
@@ -1203,17 +1255,30 @@ impl ObjectStore for EncryptingStore {
         reservation.finish(plaintext)
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
-        // An immutable put retried with identical content is a completed retry; sealing twice gives different bytes, so the retry is recognised before sealing.
-        if let Ok(existing) = self.get_fresh(key).await { return if existing == bytes { Ok(()) } else { Err(Error::Task(format!("{key} already exists with different content"))) }; }
-        self.inner.put(key, self.seal(key, &bytes)?).await
+        let sealed = match self.seal_missing(key, bytes.clone()).await? {
+            Some(sealed) => sealed,
+            None => return Ok(()),
+        };
+        match self.inner.put(key, sealed).await {
+            Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => Ok(()),
+            written => written,
+        }
     }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> {
         let bytes = tokio::fs::read(source).await.map_err(|error| Error::Task(format!("cannot read {}: {error}", source.display())))?;
         self.put(key, Bytes::from(bytes)).await
     }
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
-        match self.inner.put_with_publication(key, self.seal(key, &bytes)?).await {
-            Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => Ok(None),
+        let sealed = if matches!(&self.keys, ObjectKeys::Units(_)) {
+            match self.seal_missing(key, bytes.clone()).await? {
+                Some(sealed) => sealed,
+                None => return self.inner.retirement_publication(key).await,
+            }
+        } else {
+            self.seal(key, bytes.clone()).await?
+        };
+        match self.inner.put_with_publication(key, sealed).await {
+            Err(Error::ConflictingObject(_)) if self.get_fresh(key).await? == bytes => self.inner.retirement_publication(key).await,
             written => written,
         }
     }
@@ -1291,6 +1356,8 @@ enum StoredRelease {
     Terminal {
         record: GarbageRecord,
         terminal: rtdb_types::TerminalObjectPublication,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pack: Option<String>,
     },
     Path(GarbageRecord),
 }
@@ -1312,6 +1379,7 @@ pub struct GarbageStore {
     packing: Option<Arc<crate::packing::PackingStore>>,
     index_pages: Option<HostedIndexPages>,
     catalog_readers: Option<CatalogReaders>,
+    releases_receipt_l0: bool,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeMap<ObjectKey, Vec<PhysicalObjectVersion>>>,
     clock: Clock,
@@ -1323,7 +1391,7 @@ impl GarbageStore {
     pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self::new(inner, clock, None))) }
 
     fn new(inner: Arc<dyn ObjectStore>, clock: Clock, packing: Option<Arc<crate::packing::PackingStore>>) -> Self {
-        Self { inner, packing, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
+        Self { inner, packing, index_pages: None, catalog_readers: None, releases_receipt_l0: false, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
     }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
@@ -1363,7 +1431,7 @@ impl GarbageStore {
             .map_err(|error| Error::Task(error.to_string()))?;
         let release = match (version, terminal) {
             (Some(version), _) => StoredRelease::Exact { record, version: version.clone(), pack: pack.map(ObjectKey::to_string) },
-            (None, Some(terminal)) => StoredRelease::Terminal { record, terminal: terminal.clone() },
+            (None, Some(terminal)) => StoredRelease::Terminal { record, terminal: terminal.clone(), pack: pack.map(ObjectKey::to_string) },
             (None, None) => StoredRelease::Path(record),
         };
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&release).expect("a record serializes"))).await?;
@@ -1378,7 +1446,7 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 }
 
 fn is_collected_trie_file(key: &str) -> bool {
-    if rtdb_format::search_manifest::is_run_key(key) { return true; }
+    if rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) { return true; }
     let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
     name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
         .and_then(|file| file.strip_suffix(".arrow"))
@@ -1431,6 +1499,7 @@ impl ObjectStore for GarbageStore {
         readers.retain(cut).await.map(Some)
     }
     fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
+    fn releases_receipt_l0(&self) -> bool { self.releases_receipt_l0 }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(true); };
         readers.advance(installed).await
@@ -1504,9 +1573,14 @@ impl ObjectStore for GarbageStore {
         }
         if checkpoint_metadata_block(key.as_str()).is_some()
             && let Some(packing) = &self.packing
-            && let Some((pack, version)) = packing.retirement_pack(key).await?
+            && let Some((pack, publication)) = packing.retirement_pack(key).await?
         {
-            return self.write_release_record(key, None, Some(&version), Some(&pack), None).await;
+            return match publication {
+                rtdb_types::PhysicalObjectPublication::Version(version) =>
+                    self.write_release_record(key, None, Some(&version), Some(&pack), None).await,
+                rtdb_types::PhysicalObjectPublication::Terminal(terminal) =>
+                    self.write_release_record(key, None, None, Some(&pack), Some(&terminal)).await,
+            };
         }
         self.write_release(key, None, None).await
     }
@@ -1572,8 +1646,18 @@ enum ReleaseSweep<'a> {
 }
 
 fn recovery_covers_release(owner: &DeploymentRecord, release: &GarbageRecord) -> bool {
-    let Some(floor) = &release.trie_floor else { return true; };
+    let receipt_l0 = rtdb_format::keys::is_receipt_l0_file(&release.key);
+    let Some(floor) = &release.trie_floor else { return !receipt_l0; };
     let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
+    if receipt_l0
+        && !owner.replica_payload_trim.as_ref().is_some_and(|trim| {
+            trim.applied && trim.belongs_to(owner) && trim.through >= through && !trim.journals.is_empty()
+                && owner.replica_journals.iter().chain(&owner.log_copy_servers).chain(owner.move_from.iter().flatten())
+                    .all(|endpoint| endpoint.journal().is_some() && trim.journals.iter().any(|journal| endpoint.journal() == journal.journal()))
+        })
+    {
+        return false;
+    }
     through >= 0 && owner.log_epoch == floor.cut.replica_epoch.0 && owner.recovery_manifest_sha256.is_some()
         && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary >= through)
         && owner.storage_regions.values().all(|region| match region.first_required_replica() {
@@ -2041,6 +2125,52 @@ async fn reap_remote_paths(bucket: &dyn ObjectStore, deployments: &[DeploymentRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receipt_l0_needs_successor_coverage_and_trim_on_every_known_journal() {
+        use rtdb_directory::{CatalogAdmissionFloor, Checkpoint, ReplicaPayloadTrim};
+        use rtdb_types::{CatalogCut, JournalEndpoint, ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let journal = |id: &str| JournalEndpoint::Member {
+            address: id.to_owned(), journal: id.to_owned(),
+        };
+        let first = journal("first");
+        let later = journal("later");
+        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
+        owner.replica_journals.insert(first.clone());
+        owner.checkpoint = Some(Checkpoint {
+            block: 2, boundary: 8, source: 4, system_time: 100, root_sha256: Some([1; 32]),
+        });
+        owner.recovery_manifest_sha256 = Some([2; 32]);
+        let floor = CatalogAdmissionFloor {
+            residence: owner.storage_prefix(),
+            object_namespace: Uuid::new_v4(),
+            cut: CatalogCut {
+                storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0),
+                replica_epoch: StorageEpoch(0), through: ReplicaPosition(6),
+            },
+        };
+        let mut release = GarbageRecord {
+            key: "tables/xt$bounded_retry_receipts/data/l00-rc-b00.arrow".into(),
+            released_at_ms: 0, trie_floor: None,
+        };
+        assert!(!recovery_covers_release(&owner, &release));
+        release.trie_floor = Some(floor);
+        assert!(!recovery_covers_release(&owner, &release));
+        owner.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim {
+            incarnation: owner.incarnation, log_epoch: owner.log_epoch, through: 6,
+            journals: BTreeSet::from([first]), applied: false, candidates: Vec::new(),
+        }));
+        assert!(!recovery_covers_release(&owner, &release));
+        owner.replica_payload_trim.as_mut().unwrap().applied = true;
+        assert!(recovery_covers_release(&owner, &release));
+        owner.replica_journals.insert(later.clone());
+        assert!(!recovery_covers_release(&owner, &release));
+        owner.replica_payload_trim.as_mut().unwrap().journals.insert(later);
+        assert!(recovery_covers_release(&owner, &release));
+        owner.checkpoint.as_mut().unwrap().boundary = 5;
+        assert!(!recovery_covers_release(&owner, &release));
+    }
 
     #[tokio::test]
     async fn a_local_sweep_preserves_a_fork_published_after_the_initial_inventory() {

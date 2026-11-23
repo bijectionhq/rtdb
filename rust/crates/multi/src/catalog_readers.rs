@@ -131,7 +131,14 @@ impl CatalogReaders {
             }
             Ok(())
         }).await?;
-        Ok(self.floor(&record).is_some_and(|floor| floor >= installed.through))
+        let floor = self.floor(&record);
+        if floor == Some(installed.through) {
+            crate::residence_trace::record("advance-floor", || serde_json::json!({
+                "lineage": record.lineage, "installation": self.deployment, "residence": self.residence, "namespace": self.namespaces.objects,
+                "root": self.storage_root, "revision": record.version, "epoch": self.replica_epoch, "through": installed.through,
+            }));
+        }
+        Ok(floor.is_some_and(|floor| floor >= installed.through))
     }
 
     pub async fn trie_release_floor(&self, installed: CatalogCut) -> Result<CatalogAdmissionFloor> {
@@ -222,7 +229,20 @@ impl CatalogReaders {
             if !needs_cas { return Ok(answers); }
             let version = record.version;
             match self.directory.replace_deployment(record, version).await? {
-                Cas::Applied(_) => return Ok(answers),
+                Cas::Applied(stored) => {
+                    for (request, _) in batch.iter().zip(&answers).filter(|(_, answer)| answer.is_ok()) {
+                        let (event, hold, cut) = match request.change {
+                            ReaderChange::Register { reader, cut } => ("catalog-hold", reader, cut),
+                            ReaderChange::Release { reader, .. } => ("catalog-release", reader, None),
+                        };
+                        crate::residence_trace::record(event, || serde_json::json!({
+                            "lineage": stored.lineage, "installation": self.deployment, "residence": self.residence,
+                            "namespace": self.namespaces.objects, "root": self.storage_root, "revision": stored.version,
+                            "epoch": self.replica_epoch, "hold": hold, "through": cut.map(|cut| cut.through),
+                        }));
+                    }
+                    return Ok(answers);
+                }
                 Cas::Conflict(fresh) => current = fresh,
             }
         }

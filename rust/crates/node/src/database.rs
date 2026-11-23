@@ -38,6 +38,7 @@ pub struct Database {
     read_only: bool,
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
+    pub(crate) resolve: Arc<ResolveContext>,
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
@@ -91,25 +92,49 @@ impl Database {
     }
 
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
-        let Some(read_index) = &self.replica_read_index else { return Ok(()); };
-        let behind = || Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
-            format!("This replica of {} could not establish a fresh snapshot", self.name));
+        self.with_confirmed_replica(cancellation, |_| Ok(())).await
+    }
+
+    pub(crate) async fn capture_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
+        self.with_confirmed_replica(cancellation, |confirmed| {
+            let snapshot = self.partition.snapshot();
+            if confirmed.is_some_and(|position| !snapshot.catalog_cut().is_some_and(|cut| {
+                cut.replica_epoch == self.logs.replica_epoch && cut.through >= position
+            })) {
+                return Err(self.replica_behind());
+            }
+            Ok(snapshot)
+        }).await
+    }
+
+    fn replica_behind(&self) -> Anomaly {
+        Anomaly::new(AnomalyCategory::Unavailable, REPLICA_BEHIND,
+            format!("This replica of {} could not establish a fresh snapshot", self.name))
+    }
+
+    async fn with_confirmed_replica<T>(&self, cancellation: &CancellationToken,
+        capture: impl FnOnce(Option<ReplicaPosition>) -> Result<T>,
+    ) -> Result<T> {
+        let Some(read_index) = &self.replica_read_index else { return capture(None); };
         let confirm = async {
-            let barrier = read_index.protect().await.map_err(|error| behind().with_context("cause", error.code.into()))?;
+            let barrier = read_index.protect().await.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
             let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
+            let confirmed = (barrier.offset.0 != -1).then_some(position);
             let mut status = self.watch_status();
             let applied = status.wait_for(|status| status.role == Role::Stopped
-                || barrier.offset.0 == -1
-                || status.installed.is_some_and(|prefix| prefix.replica >= position));
-            let status = tokio::time::timeout(barrier.wait, applied).await.map_err(|_| behind())?.map_err(|_| behind())?;
-            if status.role == Role::Stopped { return Err(behind()); }
+                || confirmed.is_none_or(|position| status.installed.is_some_and(|prefix| prefix.replica >= position)));
+            let status = tokio::time::timeout(barrier.wait, applied).await
+                .map_err(|_| self.replica_behind())?.map_err(|_| self.replica_behind())?;
+            if status.role == Role::Stopped { return Err(self.replica_behind()); }
+            drop(status);
+            let captured = capture(confirmed);
             drop(barrier);
-            Ok(())
+            captured
         };
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
-            _ = self.cancellation.cancelled() => Err(behind()),
+            _ = self.cancellation.cancelled() => Err(self.replica_behind()),
             result = confirm => result,
         }
     }
@@ -347,7 +372,7 @@ impl DatabaseFactory {
             replication_options.may_lead &= !read_only;
             replication_options.external_source = configuration.external_source.is_some();
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
-            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
+            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
                 self.artefact_kinds.iter().map(|kind| {
@@ -408,7 +433,7 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage,
+            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
@@ -642,7 +667,7 @@ impl MaintenanceSupervisor {
             if cancellation.is_cancelled() { break Ok(()); }
             let current = status.borrow_and_update().clone();
             // Keeps the read lease anchor fresh while the log processor applies records, so queries rarely observe the tip themselves.
-            if self.options.replication.enabled {
+            if self.options.replication.enabled && !self.store.defers_trie_releases() {
                 if let Ok(lease) = self.options.garbage.reader_lease_micros() {
                     let observed_at = self.clock.monotonic_micros();
                     let installed = current.installed.map(|prefix| prefix.replica);

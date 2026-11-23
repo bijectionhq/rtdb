@@ -576,6 +576,19 @@ impl StagedWrite {
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
 
+    /// Attach sealed application tables to the order-assigned transaction metadata.
+    /// Their system clock and predecessor were fixed before the source ID was assigned.
+    pub fn install_prepared_generation(&mut self, prepared: Self) -> Result<()> {
+        if prepared.predecessor != self.predecessor || prepared.block_index != self.block_index
+            || prepared.tx_key.system_time != self.tx_key.system_time
+            || prepared.tables.keys().any(|table| self.tables.contains_key(table))
+        {
+            return Err(invalid("Prepared generation differs from the ordered transaction"));
+        }
+        self.tables.extend(prepared.tables);
+        Ok(())
+    }
+
     pub fn assign_event_origins(mut self, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let commit = rtdb_types::EventOrigin::new_commit();
         let block = self.block_index;
@@ -746,7 +759,7 @@ struct WritePosition { events: usize, batches: usize }
 
 enum OwnedCommitPositions {
     Landing(u32),
-    Archive(std::vec::IntoIter<u32>),
+    Archive(std::collections::BTreeSet<u32>),
 }
 
 pub struct TransactionBuffer {
@@ -774,7 +787,7 @@ impl TransactionBuffer {
         {
             return Err(invalid("Archived commit positions must be positive and strictly ordered"));
         }
-        self.select_owned_positions(OwnedCommitPositions::Archive(positions.into_iter()))
+        self.select_owned_positions(OwnedCommitPositions::Archive(positions.into_iter().collect()))
     }
     fn select_owned_positions(&mut self, positions: OwnedCommitPositions) -> Result<()> {
         if self.owned_positions.is_some() || !self.tables.is_empty() {
@@ -785,7 +798,7 @@ impl TransactionBuffer {
     }
     pub fn retains_owned_positions(&self) -> bool { self.owned_positions.is_some() }
     pub fn require_archived_positions_consumed(&self) -> Result<()> {
-        if matches!(&self.owned_positions, Some(OwnedCommitPositions::Archive(remaining)) if remaining.len() != 0) {
+        if matches!(&self.owned_positions, Some(OwnedCommitPositions::Archive(remaining)) if !remaining.is_empty()) {
             return Err(invalid("The archived transaction omitted positioned effects"));
         }
         Ok(())
@@ -841,6 +854,36 @@ impl TransactionBuffer {
         self.stage_event(table, event, 0)
     }
 
+    /// Stage an archived world effect whose ordinal was carried by its own replay frame.
+    pub fn append_archived_world_effect(
+        &mut self,
+        table: &TableRef,
+        event: StoredEvent,
+        position: NonZeroU32,
+    ) -> Result<()> {
+        if !table.is_owned_event_data() || table.owned_world_scope().1.is_none() {
+            return Err(invalid("A positioned archive world effect requires an owned overlay"));
+        }
+        self.require_archived_position(position)?;
+        self.stage_event(table, event, position.get())?;
+        self.consume_owned_position(position.get());
+        Ok(())
+    }
+
+    /// Account for an original overlay excluded by the selected restore scope.
+    pub fn omit_archived_world_effect(&mut self, position: NonZeroU32) -> Result<()> {
+        self.require_archived_position(position)?;
+        self.consume_owned_position(position.get());
+        Ok(())
+    }
+
+    fn require_archived_position(&self, position: NonZeroU32) -> Result<()> {
+        if !matches!(&self.owned_positions, Some(OwnedCommitPositions::Archive(remaining)) if remaining.contains(&position.get())) {
+            return Err(invalid("The archive world effect has an unexpected or repeated position"));
+        }
+        Ok(())
+    }
+
     fn stage_event(&mut self, table: &TableRef, mut event: StoredEvent, position: u32) -> Result<()> {
         if event.entity_key.is_some() != table.is_owned_event_data() {
             return Err(invalid("The transaction event has the wrong physical entity-key layout"));
@@ -869,7 +912,7 @@ impl TransactionBuffer {
                     Some(previous.checked_add(1).ok_or_else(|| invalid("Owned commit position overflow"))?)
                 },
                 Some(OwnedCommitPositions::Archive(remaining)) => {
-                    Some(*remaining.as_slice().first().ok_or_else(|| invalid("The archive contains an extra owned effect"))?)
+                    Some(*remaining.first().ok_or_else(|| invalid("The archive contains an extra owned effect"))?)
                 },
                 None => None,
             }
@@ -881,7 +924,7 @@ impl TransactionBuffer {
     fn consume_owned_position(&mut self, position: u32) {
         match &mut self.owned_positions {
             Some(OwnedCommitPositions::Landing(previous)) => *previous = position,
-            Some(OwnedCommitPositions::Archive(remaining)) => { let _ = remaining.next(); },
+            Some(OwnedCommitPositions::Archive(remaining)) => { remaining.remove(&position); },
             None => unreachable!("only an ordered transaction has an owned position"),
         }
     }
@@ -1210,12 +1253,12 @@ mod chunk_tests {
     use rtdb_types::EntityId;
 
     #[test]
-    fn governed_arrow_puts_consume_positions_in_order_with_row_events() {
+    fn archive_world_effects_claim_their_own_positions_without_advancing_root_effects() {
         let memory = MemoryBudget::new(1 << 24);
         let state = crate::PartitionState::empty(Default::default()).unwrap();
         let key = TransactionKey { tx_id: rtdb_types::TxId(0), system_time: Timestamp(1) };
         let mut transaction = TransactionBuffer::new(state.snapshot(), key, memory).unwrap();
-        transaction.retain_archived_owned_positions(vec![3, 7]).unwrap();
+        transaction.retain_archived_owned_positions(vec![3, 4, 6, 7]).unwrap();
         let table = rtdb_types::OwnedRelation::new("locations").unwrap().table("owner");
         let id = EntityId::String("place".into());
         let row = RecordBatch::try_from_iter([
@@ -1223,18 +1266,25 @@ mod chunk_tests {
             ("location", Arc::new(arrow_array::BinaryArray::from_iter_values([b"location"]))),
         ]).unwrap();
         let header = EventHeader { commit_position: 0, iid: id.iid(), system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put };
-        let put = transaction.append_owned_put(
-            &table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None,
-        ).unwrap();
         let overlay = rtdb_types::OwnedRelation::new("locations").unwrap()
             .in_world(Iid([1; 16])).unwrap().table("owner");
-        transaction.append_unpositioned_replay(&overlay, StoredEvent {
+        let shadow = || StoredEvent {
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: key.system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])),
             recency: None,
-        }).unwrap();
+        };
+        let copied = NonZeroU32::new(6).unwrap();
+        transaction.append_archived_world_effect(&overlay, shadow(), copied).unwrap();
+        assert!(transaction.append_archived_world_effect(&overlay, shadow(), copied).is_err());
+        let omitted = NonZeroU32::new(4).unwrap();
+        transaction.omit_archived_world_effect(omitted).unwrap();
+        assert!(transaction.omit_archived_world_effect(omitted).is_err());
+        transaction.append_unpositioned_replay(&overlay, shadow()).unwrap();
+        let put = transaction.append_owned_put(
+            &table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None,
+        ).unwrap();
         let delete = transaction.append_to(&table, StoredEvent {
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
@@ -1245,7 +1295,11 @@ mod chunk_tests {
         assert_eq!(delete, NonZeroU32::new(7));
         let staged = transaction.stage().unwrap();
         let rebuilt = staged.tables()[&overlay].batch().unwrap();
-        assert_eq!(rebuilt.view().read_event(0).unwrap().header().commit_position, 0);
+        let mut positions = (0..rebuilt.len())
+            .map(|row| rebuilt.view().read_event(row).unwrap().header().commit_position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        assert_eq!(positions, [0, 6]);
         let batch = staged.tables()[&table].batch().unwrap();
         let first = batch.view().read_event(0).unwrap();
         let second = batch.view().read_event(1).unwrap();

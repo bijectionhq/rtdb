@@ -75,6 +75,7 @@ sealed interface SourceMessage {
                             SourceLogMessage.MessageCase.DETACH_DATABASE -> DetachDatabase(msg.detachDatabase.dbName)
 
                             SourceLogMessage.MessageCase.TX -> msg.tx.let {
+                                require(!it.hasPreparedLanding()) { "Prepared Proposal generations require the native resolver" }
                                 Tx(
                                     txOps = it.txOps,
                                     systemTime = if (it.hasSystemTimeMicros()) InstantUtil.fromMicros(it.systemTimeMicros) else null,

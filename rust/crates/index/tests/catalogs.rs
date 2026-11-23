@@ -169,11 +169,13 @@ fn wide_recency_partitions_roundtrip_and_reject_microsecond_overflow() {
 }
 
 #[test]
-fn reset_rebuilds_l0_from_supplied_objects_and_clears_compaction() {
-    let catalog = apply(&[("l01-rc-b01", 10), ("l02-rc-p0-b01", 10)]);
-    let reset = catalog.reset_to_l0(BTreeMap::from([(table(), vec![notification("l00-rc-b00", 10), notification("l00-rc-b01", 10)])])).unwrap();
-    assert_eq!(current(&reset), names(&["l00-rc-b00", "l00-rc-b01"]));
-    assert_eq!(reset.all_tries(&table()).len(), 2);
+fn reset_relocates_the_compacted_primary_from_a_checkpoint() {
+    let before = apply(&[("l00-rc-b00", 10), ("l01-rc-b00", 10)]);
+    let primary = apply(&[("l01-rc-b00", 10)]);
+    let (reset, files_epoch) = before.reset_from_primary(primary, BlockIndex(1), Timestamp(101)).unwrap();
+    assert_eq!(current(&reset), BTreeSet::from([notification("l01-rc-b00", 10).key.with_epoch(files_epoch).to_string()]));
+    assert_eq!(reset.naming_epoch(), 1);
+    assert_eq!(reset.l0_source(&table(), BlockIndex(-1), BlockIndex(0)).count(), 1);
 }
 
 #[test]
@@ -189,10 +191,10 @@ fn a_delayed_notice_removes_or_adopts_only_its_named_incarnation() {
         trie
     };
     let table = table();
-    let state = PartitionState::new(PartitionValue::loaded(
-        TrieCatalog::new(20).unwrap(), TableCatalog::default(), TrieConfig::default(),
-    ).unwrap());
-    state.reset_to_l0(BTreeMap::from([(table.clone(), vec![l0])])).unwrap();
+    let checkpoint = BlockCatalog::from_proto(pb::Block { block_index: Some(0), naming_epoch: Some(1), ..Default::default() }).unwrap();
+    let tables = TableCatalog::load(Some(checkpoint), &BTreeMap::new()).unwrap();
+    let catalog = TrieCatalog::new(20).unwrap().with_tries(table.clone(), [l0], Timestamp(10)).unwrap();
+    let state = PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap());
     let add = |tries| state.add_tries(&BTreeMap::from([(table.clone(), tries)]), Timestamp(10)).unwrap();
     add(vec![old.clone()]);
     assert!(state.value().trie_catalog().trie(&table, &old.key).is_none(), "a delayed publication from before reset must not be adopted");
@@ -212,13 +214,22 @@ fn a_follower_installs_the_naming_epoch_and_exact_catalog_of_a_reset_checkpoint(
     use rtdb_trie::TrieConfig;
 
     let table = table();
-    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
-    let entry = tables.entry(&table).unwrap().clone();
-    let catalog = apply(&[("l00-rc-b00", 10), ("l01-rc-b00", 10)]);
-    let leader = PartitionState::new(PartitionValue::loaded(catalog.clone(), tables.clone(), TrieConfig::default()).unwrap());
-    let follower = PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap());
+    let entry = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap().entry(&table).unwrap().clone();
+    let old = apply(&[("l00-rc-b00", 10), ("l01-rc-b00", 10)]);
+    let table_block = TableBlock::from_parts(BTreeMap::new(), &Default::default(), 0, old.partitions(&table).unwrap()).unwrap();
+    let checkpoint = BlockCatalog::from_proto(pb::Block {
+        block_index: Some(0),
+        tables: vec![entry.to_proto()],
+        latest_completed_tx: Some(pb::TxKey { tx_id: Some(1), system_time: Some(10) }),
+        ..Default::default()
+    }).unwrap();
+    let target = checkpoint.latest_completed_tx().unwrap();
+    let tables = TableCatalog::load(Some(checkpoint), &BTreeMap::from([(table.clone(), table_block)])).unwrap();
+    let leader = PartitionState::new(PartitionValue::loaded(old.clone(), tables.clone(), TrieConfig::default()).unwrap());
+    let follower = PartitionState::new(PartitionValue::loaded(old.clone(), tables, TrieConfig::default()).unwrap());
     let l0 = notification("l00-rc-b00", 10);
-    leader.reset_to_l0(BTreeMap::from([(table.clone(), vec![l0.clone()])])).unwrap();
+    let (reset, _) = old.reset_from_primary(apply(&[("l00-rc-b00", 10)]), BlockIndex(1), Timestamp(10)).unwrap();
+    leader.install_reset_primary(reset, target).unwrap();
 
     let leader_prepared = leader.prepare_block().unwrap();
     let no_new_tries = BTreeMap::new();
@@ -226,6 +237,7 @@ fn a_follower_installs_the_naming_epoch_and_exact_catalog_of_a_reset_checkpoint(
         block_index: Some(leader_prepared.block_index().0),
         tables: vec![entry.to_proto()],
         naming_epoch: Some(1),
+        latest_completed_tx: leader.value().table_catalog().block().unwrap().as_proto().latest_completed_tx.clone(),
         ..Default::default()
     }).unwrap();
     let table_blocks = leader_prepared.table_blocks(&no_new_tries, Timestamp(101)).unwrap();

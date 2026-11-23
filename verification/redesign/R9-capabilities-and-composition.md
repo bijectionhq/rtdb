@@ -79,3 +79,42 @@ See [R7](R7-eraser.md#verification) for the remaining provider obligations.
 ## Open questions
 
 - The trace event schema and where traces are recorded in production (sampled or always).
+
+## Wave 5 implementation
+
+| Increment | Composed transition and current authority |
+| --- | --- |
+| R1 | The ordinary attempt admits a requested system time through its append bound, and the external case clamps a future request in the model's first-append bound. |
+| R2 | An attempt has one original body and terminal outcome. Redemption preserves the outcome, detects a changed body, and gives expiry precedence. |
+| R3 | Installing the bounded successor advances its naming epoch. The trace projection checks the exact key, version and naming epoch; replay tests a substituted publication and reuse of the old epoch. Reset from the adopted primary landed separately. |
+| R4 | Catalog admission and expiry of dependencies drive floor advancement. The trace distinguishes query release from drain of its in-flight provider operation. Directory-managed S3 object and replay-pack retirement require an opaque grant from the exact authorized lineage revision. |
+| R5 | A published checkpoint protects recovery admission and gates model trim and upstream acknowledgement. The existing typed native trim grant carries its observed directory revision and certified anchor into application. |
+| R6 | A revoked old-unit key makes access to its cached page fail under the held view. Installed journal object keys now bind to independently withdrawable immutable units. Directory-managed and classic custody remain subject to the provider coverage in [R6](R6-sealing.md). |
+| R7 | Erasure closes preparation, requires a readable successor before arming, and then revokes the old key. Native archive observations carry the exact capture, manifest and deadline. Live installed SQL erasure still depends on the clean closure and recovery-slot premises in [R7](R7-eraser.md). |
+| R8 | Receipt collection uses the exclusive observed-clock boundary. A lower raw observation after that boundary preserves expiry. Independent recovery checkpoints can exclude covered expired receipt L0. |
+
+An active-loglet read index is constructed in the quorum client after validating the selected ensemble, stream and epoch.
+Fresh implicit session bases keep the protected index alive through partition capture and check that the attachment still names the same database.
+The installed journal continues to supply its own ordered barrier and retained cut.
+The provider adapter for directory-managed exact removal accepts a grant derived from the durable authorized lineage state, including on retry.
+These values are passive evidence, while the existing journal, partition and directory remain the owners of their decisions.
+Rust compile-fail documentation covers minting a fabricated index and retirement grant.
+
+The composed replay uses the same next-state relation as the bounded search.
+The [expanded authored trace](../traces/residence-authorities.json) interleaves a refusal receipt, a superseded loglet, a held old view, key revocation, upstream confirmation, trim, and a fork surviving disposal.
+The projection checks exact residence, loglet, attempt, key-slot and publication identities before converting them to the model's finite vocabulary.
+For a bounded projection with these event shapes, the standalone checker accepts the fixture format with `--tlc PATH --evidence DIR`.
+The runner declares mutation controls for the expanded state and replay, including wrong time clamp, premature collection, rollback of the receipt clock, stale freshness authority, premature erasure or acknowledgement, and accesses after revocation.
+
+Multi can record native observations into one new JSONL file per process via `RTDB_RESIDENCE_TRACE_PATH`.
+Run `python3 verification/residence_trace.py TRACE.jsonl` to check exact retirement and trim correlations, catalog admission floors, read-index identities, scoped replay holds, scheduled archive revocation evidence and observed inline attempt outcomes.
+The sink records decision observations after the owning path returns or observes authority, so directory revision orders catalog CAS observations.
+The production and simulation owners can use the same sink when they run the same Multi machinery.
+The native checker validates correlations within a capture, while composed replay consumes an explicitly projected bounded history.
+Native events can be missing after cancellation, ambiguous responses, opaque or offloaded outcomes, process failure or later enablement.
+Use separate files for separate processes and keep diagnostic capture disabled when measuring strict timing.
+
+Remaining capability boundaries include mandatory held views at every storage and memory answer, current per-unit grants at every cache release, full recovery-closure evidence at every upstream acknowledgement, and general provider deletion through one exact authority.
+The authored projection abstracts plurality of held views, receipt identities and slots, network races, provider timing, and reconstruction from manifest contents.
+Cross-process trace reconstruction, observation of every runtime linearization point, configured-provider evidence and deepest-plan bounded-stack replay remain open.
+The expanded model, replay controls and Rust changes have source review only.

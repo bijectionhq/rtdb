@@ -155,7 +155,10 @@
 -- A grouped owned commit may bound multiple complete declared Binary prefixes at its ordered-present valid instant.
 -- Before applying any mutation, the resolver validates each declared prefix and checks coverage against its ordered relation frontier.
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
--- An exceeded bound aborts the entire group, including the writes and counter deltas.
+-- A checked Proposal settlement binds a count condition to its own world and evaluates the complete counted prefix across the retained parent and final overlay.
+-- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
+-- When a registered decision offers a refusal receipt, a violated count or constraint selects that receipt and its exact attempt in the same order.
+-- The refusal retains the original Proposal settlement receipt without a new overlay root or approval, and charges the retained bytes of the selected business receipt.
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
 -- A replacement outside every current Root capacity predicate does not increase a covered count.
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
@@ -411,7 +414,9 @@ value CommitOpts {
     --                   A later explicit time aborts the transaction with rtdb/future-system-time.
     --                   The engine projects automatic history time strictly forward even at equal or regressed append timestamps.
     --   user_metadata — per-transaction metadata.
-    --                   New source-log submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   New source-log and external submissions project user metadata in xt.txs until the installed receipt clock reaches one hour after admission.
+    --                   A reusable application key has separate stored receipt identities for separate hour buckets.
+    --                   Lookup covers the current and previous buckets and checks the exclusive expiry.
     --                   The installed catalog determines retention even when a query selects an earlier system time.
     --                   A settled retry keeps its original causal coordinate after that metadata expires.
     --                   An idempotency_key field names a retry identity scoped to the database and principal: a same-body retry within the receipt window is answered with the original's outcome, and a different body aborts with rtdb/idempotency-conflict.

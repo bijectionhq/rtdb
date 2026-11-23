@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use ordered_logkeeper::ordered::Placement;
@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::cipher::Cipher;
 
 use super::{
-    KeyService, LocalKeyService, archive::{self, LocalArchiveKey},
+    KeyService, LocalKeyService, archive::{self, LocalArchiveKey}, unit::{self, OPERATION_LIMIT},
 };
 
 /// The payload key survives writer replacement and changes only on rotation.
@@ -78,14 +78,22 @@ impl LocalKeyService {
         io: &Arc<IoRegion>,
         operation: impl FnOnce(&Cipher, &str) -> rtdb_storage::Result<Bytes> + Send + 'static,
     ) -> rtdb_storage::Result<Bytes> {
+        let deadline = Instant::now() + OPERATION_LIMIT;
         let service = self.clone();
-        let vault = io.run_blocking(move || service.archive_vault().map_err(key_error)).await?;
-        let id = key.id();
-        let handle = LocalArchiveKey { vault, id: id.clone(), region: Arc::clone(io) };
-        handle.operate_with(
-            move |material| Ok(operation(&Cipher::new(material)?, &id)?),
-            key_error,
-        ).await
+        tokio::time::timeout_at(deadline.into(), async {
+            let vault = io.run_blocking(move || service.archive_vault().map_err(key_error)).await?;
+            let id = key.id();
+            let handle = LocalArchiveKey { vault, id: id.clone(), region: Arc::clone(io) };
+            let result = handle.operate_with(
+                move |material| {
+                    if Instant::now() >= deadline { return Err(unit::expired().into()); }
+                    Ok(operation(&Cipher::new(material)?, &id)?)
+                },
+                key_error,
+            ).await;
+            if Instant::now() >= deadline { return Err(unit::expired()); }
+            result
+        }).await.map_err(|_| unit::expired())?
     }
 }
 

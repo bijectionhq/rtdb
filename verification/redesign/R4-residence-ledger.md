@@ -119,7 +119,13 @@ The successor can admit that checkpoint before it has applied a known cut in its
 Any opaque or earlier held catalog delays retirement under the new journal.
 An installed successor floor closes new admission from earlier journals.
 An exclusive compactor reset resumes admission at the installed cut of its newly adopted naming epoch.
-Classic remote storage and independent maintenance paths still require their own custody and settlement integration.
+Classic S3, Azure and GCS use one conditional-write head under the classic storage root for reader registration, release and floor advancement.
+The head makes registration and floor advancement one decision and avoids deriving current admission from a possibly stale list of ticket objects.
+Every successful update advances the sequence, including a cancellation that fences a registration with a lost reply.
+The collector checks the stored receipt and the floor in the same residence before deleting immutable trie paths.
+A provider request retains its ticket through cancellation and releases it on drain.
+An abandoned ticket without drain evidence remains in the ledger.
+Independent maintenance and complete recovery-root retention still require custody and settlement integration.
 
 ### Hosted trie release records
 

@@ -3,11 +3,12 @@ EXTENDS ResidenceComposition, ResidenceCompositionEvents, Sequences
 
 VARIABLE cursor
 
-traceVars == <<vars, cursor>>
+traceVars == <<allVars, cursor>>
 TraceInit ==
     /\ cursor = 0
     /\ IF DisposalEffectsOnly
-        THEN /\ head = 0 /\ checkpoint = 0 /\ floor = 0
+        THEN /\ authority = AuthorityInit
+             /\ head = 0 /\ checkpoint = 0 /\ floor = 0
              /\ query = None /\ providerRead = None /\ recovery = None /\ firstRecord = 1
              /\ phase = "disposing" /\ source = Needs(0) /\ forkCopy = {}
              /\ prepared = None /\ fork = 0 /\ stalePublication = FALSE
@@ -19,12 +20,16 @@ ObservedStep(event) ==
     LET kind == event[1]
         cut == event[2]
         publication == event[3]
+        epoch == event[4]
+        outcome == event[5]
+        observedTime == event[6]
     IN
-    CASE kind = "open-query" -> OpenQuery /\ query' = cut
+    CASE kind = "open-query" -> OpenQuery /\ UNCHANGED authority /\ query' = cut
       [] kind = "begin-provider-read" -> BeginProviderRead /\ providerRead' = cut
       [] kind = "close-query" -> CloseQuery /\ query = cut
       [] kind = "drain-provider-read" -> DrainProviderRead /\ providerRead = cut
       [] kind = "install" -> Install /\ head' = cut
+            /\ (~ExtendAuthorities \/ (authority'.namingEpoch = epoch /\ publication = "new"))
       [] kind = "publish-checkpoint" -> PublishCheckpoint /\ checkpoint' = cut
       [] kind = "admit-recovery" -> AdmitRecovery /\ recovery' = cut
       [] kind = "finish-recovery" -> FinishRecovery /\ recovery = cut
@@ -40,6 +45,18 @@ ObservedStep(event) ==
       [] kind = "copy-fork" -> CopyForkPublication(publication) /\ fork = cut
       [] kind = "erase-residence" -> EraseResidencePublication(publication)
       [] kind = "settle-disposal" -> SettleDisposal
+      [] kind = "attempt-outcome" -> AppendAttempt(publication, cut, epoch, outcome) /\ authority'.systemTime = observedTime
+      [] kind = "receipt-clock" -> ObserveReceiptClock(cut) /\ authority'.receiptClock = epoch
+      [] kind = "collect-receipt" -> CollectReceipt /\ authority.receiptClock = cut
+      [] kind = "redeem-receipt" -> RedeemReceipt(publication, outcome)
+      [] kind = "change-loglet" -> ChangeLoglet /\ authority'.loglet = epoch
+      [] kind = "read-index" -> ConfirmReadIndex(epoch, cut)
+      [] kind = "capture-fresh" -> CaptureFresh(cut) /\ authority.indexFor = epoch
+      [] kind = "acknowledge" -> Acknowledge(cut)
+      [] kind = "prepare-erasure" -> PrepareErasure /\ publication = "old"
+      [] kind = "arm-erasure" -> ArmErasure /\ checkpoint = cut /\ publication = "old"
+      [] kind = "revoke-key" -> RevokeKey /\ publication = "old"
+      [] kind = "read-old-cache" -> ReadOldCachedPage(outcome) /\ query = cut /\ publication = "old"
       [] OTHER -> FALSE
 
 Advance ==
@@ -51,6 +68,10 @@ Advance ==
 Complete ==
     /\ cursor = Len(Events)
     /\ source = {} /\ forkCopy = Needs(fork)
+    /\ (~ExtendAuthorities \/
+        /\ authority.confirmed = 1 /\ ~authority.retained /\ authority.clockRegressed
+        /\ authority.redemption = "expired" /\ authority.captured = 1
+        /\ authority.cacheResult = "erased-under-view")
     /\ IF DisposalEffectsOnly
         THEN phase = "disposing" /\ fork = 0
         ELSE phase = "disposed" /\ firstRecord = 2 /\ fork = 1

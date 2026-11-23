@@ -407,7 +407,12 @@ impl OpenTransaction<'_> {
         Ok(())
     }
 
-    pub(super) async fn check_capacity_source(&self, operations: &[Operation]) -> Result<()> {
+    pub(super) async fn check_capacity_source(
+        &self,
+        operations: &[Operation],
+        proposal_overlay: Option<rtdb_types::Iid>,
+        signed_root: bool,
+    ) -> Result<()> {
         if capacity_conditions(operations).next().is_none() {
             return Ok(());
         }
@@ -421,17 +426,19 @@ impl OpenTransaction<'_> {
             else {
                 continue;
             };
-            if at_most < 0
-                || relation.world().is_some()
+            let world = relation.world();
+            if (at_most < 0 && (!signed_root || world.is_some()))
+                || world.is_some_and(|world| Some(world) != proposal_overlay)
                 || relation.is_world_catalog()
                 || !has_deadline
             {
                 return Err(Anomaly::incorrect(
                     "rtdb.owned/count-bound",
-                    "Expected a nonnegative count bound on one owned root prefix with a deadline",
+                    "Expected a count bound on a declared Root or held Proposal prefix with a deadline",
                 ));
             }
-            self.declared_prefix_count(base.clone(), relation, column, prefix)
+            let root = relation.root_relation();
+            self.declared_prefix_count(base.clone(), root.as_ref().unwrap_or(relation), column, prefix)
                 .await?;
         }
         Ok(())

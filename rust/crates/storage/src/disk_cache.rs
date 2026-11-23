@@ -311,6 +311,7 @@ impl ObjectStore for DiskCachedStore {
         self.remote.retain_catalog(cut).await
     }
     fn defers_trie_releases(&self) -> bool { self.remote.defers_trie_releases() }
+    fn releases_receipt_l0(&self) -> bool { self.remote.releases_receipt_l0() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         self.remote.advance_catalog_floor(installed).await
     }

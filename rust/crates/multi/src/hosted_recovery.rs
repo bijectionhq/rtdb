@@ -31,6 +31,15 @@ pub(crate) struct ReplicaTrimGrant {
     stream: StreamConfig,
     through: LogOffset,
     retirement: Option<(String, ReplicaPayloadTrim)>,
+    scope: TrimScope,
+}
+
+struct TrimScope {
+    installation: String,
+    incarnation: u64,
+    log_epoch: i32,
+    revision: rtdb_directory::Version,
+    anchor: [u8; 32],
 }
 
 const REPLICA_PAYLOAD_TRIM_BATCH: i64 = 64;
@@ -126,13 +135,26 @@ impl ReplicaTrimPlan {
             self.record.replica_anchor = Some(Box::new(JournalAnchor { root_incarnation, interval: proof.interval, digest }));
             changed = true;
         }
-        if changed {
+        let stored = if changed {
             let version = self.record.version;
-            if !matches!(directory.replace_deployment(self.record, version).await?, Cas::Applied(_)) {
+            let Cas::Applied(stored) = directory.replace_deployment(self.record, version).await? else {
                 return Ok(None);
-            }
-        }
-        Ok(Some(ReplicaTrimGrant { stream, through: self.through, retirement }))
+            };
+            stored
+        } else {
+            self.record
+        };
+        let Some(anchor) = stored.replica_anchor.as_ref().filter(|anchor| anchor.interval[1] >= self.through.0)
+            else { return Ok(None); };
+        let scope = TrimScope { installation: stored.id.clone(), incarnation: stored.incarnation,
+            log_epoch: stored.log_epoch, revision: stored.version, anchor: anchor.digest };
+        crate::residence_trace::record("authorize-trim", || serde_json::json!({
+            "lineage": stored.lineage, "installation": scope.installation, "incarnation": scope.incarnation,
+            "revision": scope.revision, "stream": stream.stream, "epoch": scope.log_epoch, "through": self.through.0,
+            "anchor": scope.anchor, "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
+            "first_required": stored.required_replica_offsets(rtdb_directory::now_ms()).collect::<Vec<_>>(),
+        }));
+        Ok(Some(ReplicaTrimGrant { stream, through: self.through, retirement, scope }))
     }
 }
 
@@ -161,6 +183,10 @@ impl ReplicaTrimGrant {
         } else {
             rtdb_logkeeper::trim(&self.stream, self.through).await?;
         }
+        crate::residence_trace::record("apply-trim", || serde_json::json!({
+            "installation": self.scope.installation, "incarnation": self.scope.incarnation, "epoch": self.scope.log_epoch,
+            "revision": self.scope.revision, "anchor": self.scope.anchor, "stream": self.stream.stream, "through": self.through.0,
+        }));
         Ok(self.through.0)
     }
 }

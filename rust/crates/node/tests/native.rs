@@ -2037,7 +2037,7 @@ async fn offline_export_has_no_manifest_before_a_completed_block() {
 }
 
 #[tokio::test]
-async fn compactor_reset_preserves_l0_history_and_resumes_retirement_after_reader_drain() {
+async fn compactor_reset_preserves_checkpoint_history_and_resumes_retirement_after_reader_drain() {
     tokio::time::timeout(Duration::from_secs(40), async {
         let directory = tempfile::tempdir().unwrap();
         let store = directory.path().join("store");
@@ -2093,7 +2093,7 @@ async fn compactor_reset_preserves_l0_history_and_resumes_retirement_after_reade
         assert!(!plan.replacement_tries()[&table].iter().any(|try_| try_.key == orphan));
         let compacted = plan.files_to_delete().to_vec();
         assert!(!compacted.is_empty());
-        assert!(plan.replacement_tries().values().flatten().all(|trie| trie.key.level() == 0));
+        assert!(plan.replacement_tries().values().flatten().any(|trie| trie.key.level() > 0));
         assert!(plan.replacement_tries().values().any(|tries| !tries.is_empty()));
         for key in &compacted { assert!(store.join("v06").join(key.as_str()).is_file()); }
         cancellation.cancel();
@@ -2542,7 +2542,9 @@ async fn retained_reset_recovers_compacted_base_and_missing_l0_suffix_in_place()
 
     settings.compaction_threads = 0;
     let (node, driver) = running(settings.clone(), fresh_local_services(&runtime)).await;
-    assert_eq!(node.prepare_compactor_reset("xtdb", &cancel).await.err().unwrap().code, "rtdb.compactor-reset/incomplete-inventory");
+    let installed = node.prepare_compactor_reset("xtdb", &cancel).await.unwrap();
+    assert!(installed.replacement_tries()[&table].iter().all(|trie| trie.key != missing));
+    drop(installed);
     let base_path = detached.join("v06").join(block_key(base.block_index()).unwrap());
     let exact_base = std::fs::read(&base_path).unwrap();
     let mut altered = BlockCatalog::decode(&exact_base).unwrap().as_proto().clone();
@@ -2586,9 +2588,8 @@ async fn compactor_reset_requires_a_completed_transaction() {
     let mut settings = options();
     settings.compaction_threads = 0;
     let (node, driver) = running(settings, services()).await;
-    let plan = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.unwrap();
-    assert!(plan.files_to_delete().is_empty());
-    assert_eq!(plan.apply(&CancellationToken::new()).await.unwrap_err().code, "rtdb.compactor-reset/no-transactions");
+    let error = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.err().unwrap();
+    assert_eq!(error.code, "rtdb.compactor-reset/no-transactions");
     stop(&node, driver).await;
 }
 

@@ -469,7 +469,7 @@ impl NodeAgent {
         self.stop_running(name).await;
         let admission = placement.nominate(&route).await?;
         let opened = async {
-            let config = placement.configuration(admission, self.keys.as_ref()).await?;
+            let config = placement.configuration(admission, &self.keys).await?;
             let database = self.node.database_or_attach(name.to_owned(), config).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined the ordered database attachment"))?;
             self.await_leadership(name, &database).await?;
@@ -648,14 +648,26 @@ impl NodeAgent {
                 return Err(unavailable());
             }
         }
-        require_recovered_checkpoint(&record, database)?;
         match check {
-            HostedReadCheck::Ordinary => self.confirm_holder(name, &id, None).await?,
+            HostedReadCheck::Ordinary => {
+                require_recovered_checkpoint(&record, database)?;
+                self.confirm_holder(name, &id, None).await?;
+            },
             HostedReadCheck::AudienceRoute => {}
             HostedReadCheck::AudienceCapture => {
                 let port = self.options.audience_journal_port.ok_or_else(unavailable)?;
                 self.confirm_holder(name, &id, Some(port)).await?;
             }
+        }
+        // The holder recovers its commissioning checkpoint before it is
+        // installed. Audience captures prove their own pinned catalog and
+        // projected floor, even as the directory's maintenance cut advances.
+        if !matches!(check, HostedReadCheck::Ordinary)
+            && !self.holdings.lock().get(name).is_some_and(|holding|
+                holding.epoch == epoch && holding.linearizable
+                    && std::ptr::eq(holding.database.as_ptr(), database))
+        {
+            return Err(unavailable());
         }
         Ok(id)
     }
@@ -766,7 +778,7 @@ impl NodeAgent {
                 let block = flush_local(&database).await?;
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
-                placement.publish_checkpoint(self.keys.as_ref(), Some((admission, checkpoint)),
+                placement.publish_checkpoint(&self.keys, Some((admission, checkpoint)),
                     &self.options.storage, self.node.memory()).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
@@ -1353,7 +1365,15 @@ impl NodeAgent {
             next.checkpoint = Some(checkpoint);
             next.recovery_manifest_sha256 = Some(digest);
             match self.directory.replace_deployment(next, record.version).await? {
-                Cas::Applied(stored) => return Ok(Some((stored, checkpoint))),
+                Cas::Applied(stored) => {
+                    crate::residence_trace::record("publish-checkpoint", || serde_json::json!({
+                        "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+                        "revision": stored.version, "writer_epoch": stored.epoch, "epoch": stored.log_epoch,
+                        "stream": stored.stream("replica"), "block": checkpoint.block, "through": checkpoint.boundary,
+                        "root": checkpoint.root_sha256, "manifest": digest,
+                    }));
+                    return Ok(Some((stored, checkpoint)));
+                }
                 Cas::Conflict(Some(current)) => record = current,
                 Cas::Conflict(None) => return Err(deposed()),
             }
@@ -1618,14 +1638,14 @@ impl NodeAgent {
         for (name, placement) in self.ordered.custody_placements() {
             let _ = placement.dispose_withdrawn_workers().await;
             let _ = placement.retain_selected().await;
-            let publish = placement.publish_checkpoint(self.keys.as_ref(), offered.remove(name),
+            let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),
                 &self.options.storage, self.node.memory());
             if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
                 let _ = placement.retain_selected().await;
             }
-            let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());
+            let retirement = placement.retire_unheld_checkpoint(&self.keys);
             let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
-            let serving = placement.retire_serving_prefixes(&self.options.storage);
+            let serving = placement.retire_serving_prefixes(&self.options.storage, &self.keys);
             let _ = tokio::time::timeout(self.options.activation_timeout, serving).await;
         }
     }

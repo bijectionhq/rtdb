@@ -58,6 +58,31 @@ pub enum CopyFrom {
 
 pub struct QuorumLog { shared: Arc<Shared> }
 
+/// A fresh bound attested by a write quorum of the selected active loglet.
+///
+/// ```compile_fail
+/// let _ = rtdb_logkeeper::ActiveLogletReadIndex {
+///     stream: "another-stream".into(),
+///     epoch: 1,
+///     ensemble: Default::default(),
+///     through: rtdb_storage::log::LogOffset(0),
+/// };
+/// ```
+#[derive(Debug)]
+pub struct ActiveLogletReadIndex {
+    stream: String,
+    epoch: u64,
+    ensemble: Bytes,
+    through: LogOffset,
+}
+
+impl ActiveLogletReadIndex {
+    pub fn stream(&self) -> &str { &self.stream }
+    pub fn epoch(&self) -> u64 { self.epoch }
+    pub fn ensemble(&self) -> &[u8] { &self.ensemble }
+    pub fn through(&self) -> LogOffset { self.through }
+}
+
 struct Shared {
     ensemble: Arc<Ensemble>,
     /// The first lsn the current loglet holds; lower lsns are read from `earlier`.
@@ -342,8 +367,11 @@ impl QuorumLog {
     }
     /// Bounds writes completed before this call on the exact active ensemble.
     /// The caller must wait for committed application through the returned position.
-    pub async fn read_index(&self, epoch: u64) -> Result<LogOffset> {
+    pub async fn read_index(&self, epoch: u64) -> Result<ActiveLogletReadIndex> {
         let ensemble = &self.shared.ensemble;
+        let confirmed = |through| ActiveLogletReadIndex {
+            stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(through),
+        };
         let quorum = ensemble.config.write_quorum;
         let unavailable = |message: &str| Error::Remote { key: ensemble.config.stream.clone(), message: message.into() };
         if quorum <= ensemble.len() / 2 { return Err(unavailable("read indexes require intersecting write quorums")); }
@@ -375,12 +403,12 @@ impl QuorumLog {
             }
             if held.len() >= quorum {
                 let (maybe_committed, known_committed) = read_index_frontiers(&mut held, published, ensemble.len(), quorum);
-                if maybe_committed == known_committed { return Ok(LogOffset(maybe_committed)); }
+                if maybe_committed == known_committed { return Ok(confirmed(maybe_committed)); }
                 bound = Some(maybe_committed);
                 grace.get_or_insert_with(|| tokio::time::Instant::now() + READ_INDEX_GRACE);
             }
         }
-        bound.map(LogOffset).ok_or_else(|| unavailable("a write quorum did not confirm the active loglet"))
+        bound.map(confirmed).ok_or_else(|| unavailable("a write quorum did not confirm the active loglet"))
     }
 
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.

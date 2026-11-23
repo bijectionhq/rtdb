@@ -907,7 +907,7 @@ async fn a_partitioned_holder_cannot_commit_once_another_member_takes_over() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_activation_parks_a_cold_holding_under_execution_memory_pressure() {
-    let cell = Cell::start(1, None).await;
+    let cell = Cell::start_watching(vec![MemberPool::General], None, Some(Duration::from_secs(60))).await;
     let node = cell.node(0);
     let memory = node.server.node().memory();
     admin::create_deployment(cell.directory.as_ref(), "cold", "acme", 3).await.unwrap();
@@ -915,14 +915,20 @@ async fn an_activation_parks_a_cold_holding_under_execution_memory_pressure() {
     let cold = common::connect(&node.pgwire_address.to_string(), "cold").await;
     cold.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     drop(cold);
+    assert_eq!(cell.holder("cold").await, Some(0));
     admin::create_deployment(cell.directory.as_ref(), "next", "acme", 3).await.unwrap();
     let high_water = memory.limit_bytes() - memory.limit_bytes() / 5;
     let pressure = memory.reserve(high_water).unwrap();
 
-    let refused = node.agent.activate("next").await.unwrap_err();
-    assert_eq!(refused.code, "rtdb.multi/node-under-pressure");
-    assert_eq!(cell.holder("cold").await, None);
-    assert_eq!(cell.holder("next").await, None);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let refused = node.agent.activate("next").await.unwrap_err();
+            assert_eq!(refused.code, "rtdb.multi/node-under-pressure");
+            assert_eq!(cell.holder("next").await, None);
+            if cell.holder("cold").await.is_none() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the cold holding parks during activation retries");
     drop(pressure);
     let next = cell.connect("next").await;
     assert_eq!(cell.holder("next").await, Some(0));
