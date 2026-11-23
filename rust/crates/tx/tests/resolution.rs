@@ -1254,7 +1254,8 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
     };
     let table = TableRef::new("xt", PLACED_ATTEMPT_OUTCOME_TABLE);
     let mut old = Vec::new();
-    for position in 0..2 {
+    let mut future = None;
+    for position in 0..3 {
         let predecessor = state.snapshot().tx_basis();
         let resolved = resolver.resolve_source(
             state.snapshot(), SourcePosition(position), Timestamp(100 + position), placed(1, &context), &context,
@@ -1262,17 +1263,21 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected legacy placed frame"); };
         let attempt = PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).unwrap();
-        old.push(EntityId::String(attempt.outcome_key()).iid());
+        if position < 2 {
+            old.push(EntityId::String(attempt.outcome_key()).iid());
+        } else {
+            future = Some(attempt);
+        }
         let recovered = decode_replica(tx, predecessor, state.snapshot().block_index(), &context.memory).unwrap();
         state.apply(&recovered.writes).unwrap();
         resolver.take_head().unwrap();
     }
 
     let predecessor = state.snapshot().tx_basis();
-    let mut resolver = TxResolver::new(predecessor, SourcePosition(1), None, &context.memory).unwrap();
+    let mut resolver = TxResolver::new(predecessor, SourcePosition(2), None, &context.memory).unwrap();
     context.placed_receipt_retirement = true;
     let resolved = resolver.resolve_source(
-        state.snapshot(), SourcePosition(2), Timestamp(101 + RECEIPT_WINDOW_MICROS), placed(2, &context), &context,
+        state.snapshot(), SourcePosition(3), Timestamp(101 + RECEIPT_WINDOW_MICROS), placed(2, &context), &context,
     ).await.unwrap();
     let attempt = resolved.placed_attempt().unwrap();
     let body = resolved.to_replica_body(&context.memory).unwrap();
@@ -1293,10 +1298,14 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
     }).collect();
     assert_eq!(retired, old.into_iter().collect());
     state.apply(&recovered.writes).unwrap();
-    let mut reopened = TxResolver::new(Some(recovered.result.tx_key()), SourcePosition(2), None, &context.memory).unwrap();
-    let assertion = format!("ASSERT (SELECT COUNT(*) FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME) = 1 AND EXISTS (SELECT 1 FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id = '{}')", attempt.outcome_key());
+    let mut reopened = TxResolver::new(Some(recovered.result.tx_key()), SourcePosition(3), None, &context.memory).unwrap();
+    let assertion = format!(
+        "ASSERT (SELECT COUNT(*) FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME WHERE _id IN ('{}', '{}')) = 2 \
+            AND (SELECT COUNT(*) FROM xt.placed_attempt_outcomes FOR ALL VALID_TIME) = 2",
+        attempt.outcome_key(), future.unwrap().outcome_key(),
+    );
     let read = reopened.resolve_source(
-        state.snapshot(), SourcePosition(3), Timestamp(99), request(vec![sql(&assertion)], &context), &context,
+        state.snapshot(), SourcePosition(4), Timestamp(99), request(vec![sql(&assertion)], &context), &context,
     ).await.unwrap();
     assert!(read.result().committed(), "{:?}", read.result().error());
 }
