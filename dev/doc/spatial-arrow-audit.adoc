@@ -12,6 +12,11 @@ This inventory follows the native geospatial path from Bijection's clear Root in
 New paths index the canonical Binary document field directly.
 Existing declarations keep their original tagged WKB carrier.
 
+| Bijection spatial query admission
+| The host assembled a generic JSON query from the decoded request and parsed that query into the engine's typed plan.
+| It decodes the guest's partition values and predicates directly into the spatial source and its operators.
+The planner keeps the restriction on the source, applies the application filter to candidate rows, and leaves the nearest result limit to the ranker.
+
 | Bijection spatial pagination
 | Every page encoded the same query geometry and canonical scalar partition values and rebuilt Arrow filters.
 | The first page sends the Arrow filter and the held read retains the parsed region.
@@ -75,6 +80,7 @@ The projected reply carries the identity once and associates the document by its
 | A held result was rebuilt as a fact image and then as a complete document before filters or staged effects could reject it.
 | Bijection measures the logical charge directly from the canonical Arrow cells and decodes only the fields each filter reaches.
 The application result materializes after the row is selected.
+The host checks the SDK reply's encoded size with a bounded byte counter.
 
 | Clear Root geometry writes
 | Create and commit converted geometry and partition columns to document maps before rebuilding the source Arrow vectors.
