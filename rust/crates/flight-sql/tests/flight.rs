@@ -1077,12 +1077,22 @@ async fn check_spatial_pages_at_the_original_cut() {
         let mut resumed = StreamReader::try_new(resumed[0].body.as_ref(), None).unwrap();
         let schema = resumed.schema();
         assert_eq!(schema.metadata()["rtdb.owned.present_micros"], valid.to_string());
-        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
-        assert!(!schema.metadata().contains_key("rtdb.owned.spatial_filter"));
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "1");
+        assert_eq!(schema.metadata()["rtdb.owned.spatial_filter"], token.simple().to_string());
         let resumed = resumed.next().unwrap().unwrap();
         assert_eq!(rtdb_columnar::read_entity_id(resumed.schema_ref().field(0), resumed.column(0).as_ref(), 0).unwrap(),
             rtdb_columnar::EntityIdRef::String("b"));
     }
+    let mut last = capability.clone();
+    last.extend_from_slice(&[1, 0, 0, b'b']);
+    let last = client.action("rtdb.owned.SpatialNext.v1", last.into()).await.unwrap();
+    let mut last = StreamReader::try_new(last[0].body.as_ref(), None).unwrap();
+    let schema = last.schema();
+    assert_eq!(schema.metadata()["rtdb.owned.spatial_more"], "0");
+    assert!(!schema.metadata().contains_key("rtdb.owned.spatial_filter"));
+    let last = last.next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(last.schema_ref().field(0), last.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("d"));
     client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
     assert_eq!(client.action("rtdb.owned.SpatialNext.v1", next.into()).await.unwrap_err().code(), tonic::Code::NotFound);
     let mut rank_capability = hold.to_vec();
