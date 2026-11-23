@@ -1114,8 +1114,10 @@ impl Service {
                 .ok_or_else(|| invalid("Truncated refusal fact stream"))?;
             let facts = owned_groups(facts, false, true)?;
             let controls = owned_groups(controls, true, false)?;
-            if facts.len() != 2 || controls.len() != 3 {
-                return Err(invalid("A hosted refusal requires its registered receipt groups"));
+            let continuation = !recheck_at_staging && controls.len() == 1
+                && controls[0].0.name() == "bj_fact_root_admission";
+            if facts.len() != 2 || (!continuation && controls.len() != 3) {
+                return Err(invalid("A hosted refusal requires its original receipt groups"));
             }
             hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
             let mut alternative = Vec::new();

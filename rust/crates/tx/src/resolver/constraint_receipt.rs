@@ -11,6 +11,8 @@ const ROOT_HEAD: &str = "head";
 const RECEIPT_HEAD: &str = "sync_receipt_head";
 const DECISION_PREFIX: &str = "root_decision:";
 const IMPACT_PREFIX: &str = "root_decision_impact:";
+const CLOCK_TASK: &str = "clock-task:";
+const ACTION_PERFORMANCE: &str = "action-performance:";
 const MAX_DECISION_BYTES: usize = 1 << 20;
 
 fn invalid() -> Anomaly {
@@ -29,6 +31,12 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     };
     let primary = &ops[..index];
     let refusal = &ops[index + 1..];
+    if refusal.iter().filter_map(hosted).any(|control| {
+        control.expected().is_some() && continuation_control(control)
+    }) {
+        validate_continuation_choice(primary, refusal, placed)?;
+        return Ok((primary, refusal));
+    }
     let impact_count = refusal.iter().filter_map(hosted).filter(|control| decision_impact(control)).count();
     let receipts = refusal.len() - impact_count;
     if !placed
@@ -159,6 +167,113 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
         return Err(invalid());
     }
     Ok((primary, refusal))
+}
+
+fn continuation_control(control: &HostedControlWrite) -> bool {
+    control.name() == ADMISSION && matches!(control.id(), EntityId::String(id)
+        if id.starts_with(CLOCK_TASK) || id.starts_with(ACTION_PERFORMANCE))
+}
+
+fn validate_continuation_choice(primary: &[Operation], refusal: &[Operation], placed: bool) -> Result<()> {
+    if !placed || !(primary.iter().all(primary_op) || crate::hosted_control::hosted_root_world_reads(primary)) {
+        return Err(invalid());
+    }
+    let original_controls = primary.iter().filter_map(hosted).collect::<Vec<_>>();
+    let attempts = primary.iter().filter(|op| write_relation(op).is_some_and(|relation| relation.name() == ATTEMPTS))
+        .collect::<Vec<_>>();
+    let Some((start, end)) = primary.iter().find_map(|op| match op {
+        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
+            if relation.name() == PUBLICATIONS && marker(documents.rows(), ROOT_HEAD) => Some((valid_from, valid_to)),
+        _ => None,
+    }) else { return Err(invalid()); };
+    if attempts.is_empty() || original_controls.iter().any(|control| !control.is_check() && !continuation_control(control)) {
+        return Err(invalid());
+    }
+    let mut copied_attempts = std::collections::BTreeSet::new();
+    let mut head = None;
+    let mut completion = None;
+    let mut followup = false;
+    for op in refusal {
+        match op {
+            Operation::Public(TxOp::HostedControl(control)) if continuation_control(control) => {
+                let original = original_controls.iter().find(|prior| prior.id() == control.id() && prior.name() == control.name())
+                    .ok_or_else(invalid)?;
+                let EntityId::String(id) = control.id() else { return Err(invalid()); };
+                let replacement = control.replacement().ok_or_else(invalid)?;
+                if control.scope() != original.scope() || control.expected() != original.expected() {
+                    return Err(invalid());
+                }
+                if control.expected().is_some() {
+                    let clock = id.starts_with(CLOCK_TASK);
+                    if completion.replace(clock).is_some() {
+                        return Err(invalid());
+                    }
+                    let offered = original.replacement().ok_or_else(invalid)?;
+                    if !same_binding(offered, replacement, &["admission"]) || !continuation_verdict(offered, replacement, clock) {
+                        return Err(invalid());
+                    }
+                } else {
+                    if followup || !id.starts_with(CLOCK_TASK) || !refused_run_followup(replacement) {
+                        return Err(invalid());
+                    }
+                    followup = true;
+                }
+            }
+            Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to })
+                if relation.name() == ATTEMPTS =>
+            {
+                let original = attempts.iter().position(|op| matches!(op,
+                    Operation::Public(TxOp::OwnedInsertDocs { relation: prior, documents: rows, valid_from: start, valid_to: end })
+                    if prior == relation && rows.rows() == documents.rows() && start == valid_from && end == valid_to
+                )).ok_or_else(invalid)?;
+                if !copied_attempts.insert(original) { return Err(invalid()); }
+            }
+            Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
+                if relation.name() == PUBLICATIONS && valid_from == start && valid_to == end =>
+            {
+                if head.is_some() { return Err(invalid()); }
+                head = Some(marker_id(documents.rows()).ok_or_else(invalid)?);
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    let clock = completion.ok_or_else(invalid)?;
+    if copied_attempts.len() != attempts.len() || followup && !clock
+        || head != Some(if clock { ROOT_HEAD } else { RECEIPT_HEAD })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn admission_json(document: &StructFields<Value>) -> Option<serde_json::Value> {
+    let Some(Value::Binary(body)) = document.get("admission") else { return None; };
+    if body.len() > 64 * 1024 { return None; }
+    serde_json::from_slice(body).ok()
+}
+
+fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<Value>, clock: bool) -> bool {
+    let (Some(mut original), Some(refusal)) = (admission_json(original), admission_json(refusal)) else { return false; };
+    let path = if !clock {
+        "/continuation/completion"
+    } else if original.get("previous_delivery").is_some() && original.get("delivered").is_none() {
+        "/previous_delivery/completion"
+    } else {
+        "/delivered"
+    };
+    let Some(verdict) = original.pointer_mut(path) else { return false; };
+    if verdict.as_str() != Some("delivered") { return false; }
+    *verdict = "constraint_refused".into();
+    original == refusal
+}
+
+fn refused_run_followup(document: &StructFields<Value>) -> bool {
+    admission_json(document).is_some_and(|body| {
+        body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
+            outcome.get("status").and_then(serde_json::Value::as_str) == Some("refused")
+                && outcome.get("reason").and_then(serde_json::Value::as_str) == Some("ConstraintRefused")
+        })
+    })
 }
 
 fn marker(rows: &[StructFields<Value>], name: &str) -> bool {
