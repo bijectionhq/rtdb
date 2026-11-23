@@ -81,6 +81,7 @@ The timeout covers submission and waiting across all targeted databases.
 
 The new module does not invoke Cargo from Gradle and does not build or load a native library during source preparation.
 The binding tests load a separately built native library from `xtdb.native.library`.
+The native CI job builds the library and runs both binding test tasks against it.
 The Clojure suite invokes the original query-tail, duration literal, null-or-missing UNNEST, and declared-column extrema test bodies with a fresh `NativeDatabase`.
 
 === SQL parser errors
