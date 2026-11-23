@@ -767,6 +767,15 @@ refuses the read.
 `rtdb.owned.CommitHostedCounted.v2` prefixes this action with the ordered-present count conditions from Commit.v7.
 The resolver checks the ordinary control observations and every final owned count in the same transaction.
 
+`rtdb.owned.CommitHostedDeciding.v1` begins with a counted-commit byte of zero or one and a big-endian u32 length for the refusal section.
+The refusal section contains a length-prefixed fact group stream followed by the hosted control group stream.
+The remainder is an ordinary or counted hosted commit.
+Its placed live Root owner supplies the same attempt marker, the receipt publication marker, the same dispatch retirement and alternative bodies for the exact business and private execution receipt slots.
+Only uniqueness, capacity and final-count violations found after evaluating the primary candidate select the refusal.
+The resolver discards the candidate buffer and orders the alternative under the same transaction key and the original deadline, point, range and hosted-control guards.
+The successful response identifies the ordered decision revision.
+Read the exact business receipt at that revision to determine which outcome ordered.
+
 This action supports checked replacement and exact absence insertion for hosted controls.
 Other control effects, including arbitrary SQL, computed values, deletes, relabeling and temporal splits, are outside this action.
 

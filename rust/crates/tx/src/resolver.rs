@@ -20,6 +20,7 @@ use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
+mod constraint_receipt;
 mod fixed_range;
 mod ordered_micros;
 mod replay_constraints;
@@ -210,7 +211,18 @@ impl TxResolver {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
         };
-        let outcome = if has_owned_operations
+        let plan = constraint_receipt::split(
+            &request.operations,
+            attempt.is_some() && request.guard.is_none() && request.idempotency_key().is_none(),
+        );
+        let (primary, refusal, plan_error) = match plan {
+            Ok((primary, refusal)) => (primary, refusal, None),
+            Err(error) => (request.operations.as_slice(), &[][..], Some(error)),
+        };
+        let mut constraint_failed = false;
+        let mut outcome = if let Some(error) = plan_error {
+            Err(error)
+        } else if has_owned_operations
             && !request.operations.iter().all(Operation::is_owned)
         {
             Err(Anomaly::incorrect("rtdb.owned/mixed-transaction", "Owned and ordinary writes require separate transactions"))
@@ -243,9 +255,9 @@ impl TxResolver {
                 }
             } else { (None, Ok(())) };
             if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_owned_preconditions(&request.operations, attempt.map(PlacedAttempt::scope)).await;
+                outcome = tx.check_owned_preconditions(primary, attempt.map(PlacedAttempt::scope)).await;
             }
-            for (index, operation) in request.operations.iter().enumerate().take_while(|_| outcome.is_ok()) {
+            for (index, operation) in primary.iter().enumerate().take_while(|_| outcome.is_ok()) {
                 context.check_cancelled()?;
                 if let Err(error) = validate_document_operation(operation, request.options.user.as_deref()) {
                     outcome = Err(error);
@@ -270,7 +282,8 @@ impl TxResolver {
                     break;
                 }
             }
-            if has_owned_operations && outcome.is_ok() {
+            let evaluated = has_owned_operations && outcome.is_ok();
+            if evaluated {
                 outcome = tx.finish_owned_unique().await;
             }
             if has_owned_operations && outcome.is_ok() {
@@ -282,8 +295,9 @@ impl TxResolver {
                 }
             }
             if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_final_capacity(&request.operations).await;
+                outcome = tx.check_final_capacity(primary).await;
             }
+            constraint_failed = evaluated && outcome.as_ref().err().is_some_and(constraint_receipt::may_settle);
             if outcome.is_ok() {
                 outcome = tx.write_owned_changes().await;
             }
@@ -293,6 +307,20 @@ impl TxResolver {
                 (None, None) => Ok(()),
             })
         };
+        let mut settled = false;
+        if constraint_failed && !refusal.is_empty() {
+            drop(tx);
+            tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+            tx.trace_parent = span.as_ref().map(|span| span.context());
+            let _checks = context.memory.reserve(
+                (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
+                    .ok_or_else(overflow)?,
+            )?;
+            let operations = primary.iter().filter(constraint_receipt::shared_check)
+                .chain(refusal).cloned().collect::<Vec<_>>();
+            outcome = tx.apply_constraint_refusal(&operations, attempt.map(PlacedAttempt::scope)).await;
+            settled = outcome.is_ok();
+        }
         let result = match outcome {
             Ok(()) => TransactionResult::Committed { tx_key: key },
             Err(error) if error.is_caller_error() => {
@@ -305,12 +333,13 @@ impl TxResolver {
         };
         tx.write_result(&result, request.options.user_metadata.as_ref())?;
         if let Some(attempt) = attempt {
-            let controls = request.operations.iter().filter_map(|operation| match operation {
+            let selected = if settled { refusal } else { primary };
+            let controls = selected.iter().filter_map(|operation| match operation {
                 Operation::Public(TxOp::HostedControl(control)) if result.committed() && !control.is_check() => Some(control.name()),
                 _ => None,
             }).collect();
             let worlds = if result.committed() {
-                crate::replica::worlds::source_inventory(&request.operations)?
+                crate::replica::worlds::source_inventory(selected)?
             } else {
                 Vec::new()
             };
@@ -699,6 +728,9 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, false).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), true).await,
+            Operation::Public(TxOp::HostedConstraintRefusal) => {
+                Err(Anomaly::incorrect("rtdb.hosted/constraint-receipt", "Unexpected refusal boundary"))
+            }
             Operation::Public(TxOp::HostedControl(control)) => {
                 if self.hosted_replay.as_ref().is_some_and(|replay| replay.is_transient_world_control(control)) {
                     return Ok(());
@@ -952,6 +984,22 @@ impl<'a> OpenTransaction<'a> {
             ("version".into(), Value::I64(self.tx_key().tx_id.0)),
         ]);
         self.buffer.put(catalog, document, Interval::ALL)
+    }
+
+    async fn apply_constraint_refusal(
+        &mut self,
+        operations: &[Operation],
+        scope: Option<rtdb_types::PlacedAttemptScope>,
+    ) -> Result<()> {
+        self.check_owned_preconditions(operations, scope).await?;
+        for operation in operations {
+            self.context.check_cancelled()?;
+            validate_document_operation(operation, self.options.user.as_deref())?;
+            self.apply(operation).await?;
+        }
+        self.finish_owned_unique().await?;
+        self.finish_owned_capacity().await?;
+        self.write_owned_changes().await
     }
 
     async fn check_owned_preconditions(&mut self, operations: &[Operation], source_scope: Option<rtdb_types::PlacedAttemptScope>) -> Result<()> {

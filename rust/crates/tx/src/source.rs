@@ -86,7 +86,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => (Value::document_retained_bytes(record)?.saturating_add(attempt.len()), None, 128),
                 Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => (attempt.len(), None, 128),
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => (relation.name().len(), None, 0),
-                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (0, None, 0),
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => (0, None, 0),
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) =>
@@ -318,7 +318,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedForkWorld { record, attempt, .. }) => Value::document_retained_bytes(record)?.saturating_add(attempt.len() + 128),
                 Operation::Public(TxOp::OwnedPublishRoot { attempt, .. } | TxOp::OwnedPublishWorld { attempt, .. }) => attempt.len() + 128,
                 Operation::Public(TxOp::OwnedCheckWorldPurge { relation, .. }) => relation.name().len(),
-                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => 0,
+                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::HostedConstraintRefusal) => 0,
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
                 Operation::Public(TxOp::OwnedCheckRange { relation, fixed, .. }) => range_evidence_bytes(relation, fixed),
@@ -550,6 +550,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>) -> 
         Operation::Public(TxOp::HostedControl(control)) => {
             body = control.body();
             if control.is_check() { "rtdb-hosted-control-check-v1" } else { "rtdb-hosted-control-v1" }
+        }
+        Operation::Public(TxOp::HostedConstraintRefusal) => {
+            body.insert("version".into(), Value::I64(1));
+            "rtdb-hosted-constraint-refusal-v1"
         }
         Operation::Public(TxOp::OwnedDeadline { until }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -1222,6 +1226,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-path-v1" => &["relation", "name", "columns"],
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => &["relation", "scope", "expected", "document"],
             "rtdb-owned-deadline-v1" => &["until"],
+            "rtdb-hosted-constraint-refusal-v1" => &["version"],
             "rtdb-owned-fixed-range-v1" => &["relation", "rule"],
             "rtdb-owned-root-retained-sibling-v1" => &["registration", "previous", "sibling", "attempt", "fingerprint"],
             "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-root-retained-renewal-v1" | "rtdb-owned-root-proposal-hold-v1" | "rtdb-owned-root-proposal-shorten-v1" | "rtdb-owned-controls-retained-fork-v1"
@@ -1428,6 +1433,12 @@ impl SourceOperationReader<'_> {
                 } else {
                     crate::HostedControlWrite::new(relation, scope, expected, document)?
                 })
+            }
+            "rtdb-hosted-constraint-refusal-v1" => {
+                if value("version")? != Value::I64(1) {
+                    return Err(invalid("Invalid hosted constraint receipt version"));
+                }
+                TxOp::HostedConstraintRefusal
             }
             "rtdb-owned-deadline-v1" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };

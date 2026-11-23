@@ -1356,6 +1356,9 @@ rule ConsumeIntake {
 -- The ordered resolver checks each live world registration and its witness before publishing the Root effects.
 -- A placed Root writer can put an acceptance-relative timestamp into an admitted binary field.
 -- The ordered writer fills declared binary order keys from the same acceptance instant before validating uniqueness and capacity.
+-- On final native uniqueness or capacity refusal, a placed Root owner may settle the original registered dispatch in the same transaction.
+-- The selected refusal publishes its exact receipt and marker using the original guards, deadline and acceptance reading.
+-- No tentative application facts survive the refusal.
 -- The ordered resolver fills each disjoint slot from the transaction reading and checks the completed row against its declared schema.
 -- Committed events and archive replay carry filled values and require no slot metadata.
 -- While a world is retained the archive retirement fence cannot close its capture.

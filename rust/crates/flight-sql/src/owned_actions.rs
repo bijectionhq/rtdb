@@ -41,6 +41,7 @@ pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
+pub(crate) const COMMIT_HOSTED_DECIDING_V1: &str = "rtdb.owned.CommitHostedDeciding.v1";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_HOSTED_WORLD_READS_V2: &str = "rtdb.owned.CommitHostedWorldReads.v2";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
@@ -674,7 +675,7 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8], counted: bool) -> Result<ActionResult, Status> {
-        self.commit_hosted_with_reads(call, body, counted, Vec::new()).await
+        self.commit_hosted_with_reads(call, body, counted, Vec::new(), None).await
     }
 
     pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -708,11 +709,29 @@ impl Service {
             worlds.push(HostedWorldRead { held, witnesses, _reservation: reservation });
             body = tail;
         }
-        self.commit_hosted_with_reads(call, body, counted, worlds).await
+        self.commit_hosted_with_reads(call, body, counted, worlds, None).await
+    }
+
+    pub(crate) async fn commit_hosted_deciding_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<ActionResult, Status> {
+        let ([kind], body) = body.split_first_chunk::<1>()
+            .ok_or_else(|| invalid("Missing hosted constraint decision kind"))?;
+        let counted = match kind {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("Invalid hosted constraint decision kind")),
+        };
+        let (length, body) = body.split_first_chunk::<4>()
+            .ok_or_else(|| invalid("Missing hosted refusal length"))?;
+        let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Truncated hosted refusal"))?;
+        self.commit_hosted_with_reads(call, primary, counted, Vec::new(), Some(refusal)).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
+        refusal: Option<&[u8]>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -762,6 +781,34 @@ impl Service {
         };
         let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
+        let _refusal = if let Some(refusal) = refusal {
+            if replay || !worlds.is_empty() {
+                return Err(invalid("A hosted constraint decision requires live Root custody"));
+            }
+            let (len, body) = refusal.split_first_chunk::<4>()
+                .ok_or_else(|| invalid("Missing refusal fact stream length"))?;
+            let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*len) as usize)
+                .ok_or_else(|| invalid("Truncated refusal fact stream"))?;
+            let facts = owned_groups(facts, false, true)?;
+            let controls = owned_groups(controls, true, false)?;
+            if facts.len() != 2 || controls.len() != 3 {
+                return Err(invalid("A hosted refusal requires its registered receipt groups"));
+            }
+            hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
+            let mut alternative = Vec::new();
+            let (controls, held) = self.decode_hosted_control_groups(
+                call, controls, scope, &mut rows_left, false,
+            )?;
+            let facts = self.decode_owned_commit_groups(
+                call, facts, &mut alternative, &mut rows_left, CommitEffects::Facts,
+            )?;
+            alternative.extend(controls.into_iter().map(TxOp::HostedControl));
+            writes.push(TxOp::HostedConstraintRefusal);
+            writes.extend(alternative);
+            Some((facts, held))
+        } else {
+            None
+        };
         self.owned_write_reply_with_reads(call, writes, witnesses, worlds).await
     }
 
@@ -931,6 +978,8 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
+        let refusal = operations.iter().position(|op| matches!(op, TxOp::HostedConstraintRefusal))
+            .map(|boundary| operations.split_off(boundary));
         if !witnesses.is_empty() {
             let scope = native.placed_history().map_err(status)?;
             operations.try_reserve_exact(witnesses.len())
@@ -953,6 +1002,7 @@ impl Service {
             }
             native.append_hosted_world_read_checks(&mut operations, checks).map_err(status)?;
         }
+        operations.extend(refusal.into_iter().flatten());
         let outcome = native.state_mut().execute_tx(operations, Default::default()).await.map_err(status)?;
         drop(holds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
