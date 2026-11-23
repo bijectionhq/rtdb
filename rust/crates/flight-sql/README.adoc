@@ -509,6 +509,12 @@ The response carries the unchanged world ID followed by the transaction ID and s
 An owned relation with acceptance validity may additionally declare a positive `lifetime_micros` before its first fact.
 Its source accepts immutable creation only, preserving complete identities after expiry so an old identity cannot be re-created.
 One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
+Mode 3 of `rtdb.owned.ReadHeldWorldPoint.v2` reads an ordinary point from the held parent.
+It returns a witness for the original pin and the relation's purge frontier, independent of the world's overlay.
+`rtdb.owned.CommitHostedWorldReads.v1` can order this evidence with Root writes and hosted controls.
+The request prefixes the hosted commit body with a counted-commit byte (0 or 1), a big-endian u16 hold count, and one section per distinct hold.
+Each section has a 16-byte handle, a big-endian u16 witness count, and 16 bytes per witness nonce.
+The commit admits one to eight holds with up to 128 witnesses each.
 A held retained parent point at its original archive basis also checks the live relation lifetime.
 It returns the same cutoff for a live fact, `rtdb.owned/lifetime-expired` for a fact that was visible at the basis and has since expired, and absence when no fact was visible at the basis.
 Live full-key range pages on a covered acceptance-lifetime path use the held present on the valid axis.

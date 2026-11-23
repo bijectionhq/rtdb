@@ -1483,6 +1483,21 @@ impl OwnedReadSession {
     pub async fn world_relation_witnesses<'a>(
         &self, world: rtdb_types::Iid, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
     ) -> Result<Vec<OwnedWorldWitness>> {
+        self.world_relation_checks(world, relations, true).await
+    }
+
+    /// Observe only the parent pin and the relation's purge frontier.
+    pub async fn world_parent_witness(
+        &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation,
+    ) -> Result<OwnedWorldWitness> {
+        self.world_relation_checks(world, [relation], false).await?
+            .pop().ok_or_else(rtdb_types::OwnedWorld::unavailable)
+    }
+
+    async fn world_relation_checks<'a>(
+        &self, world: rtdb_types::Iid, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,
+        include_overlay: bool,
+    ) -> Result<Vec<OwnedWorldWitness>> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let (registered, _charge) = self.world_registration(world).await?
             .filter(|(record, _)| !record.dropped && record.until > self.present.system_time)
@@ -1498,7 +1513,7 @@ impl OwnedReadSession {
             self.check_relation(relation)?;
             if selected.len() == 32 { return Err(unavailable()); }
             let local = relation.in_world(world)?;
-            let local_frontier = registered.mode.is_writable()
+            let local_frontier = (include_overlay && registered.mode.is_writable())
                 .then(|| snapshot.relation_event_frontier(&local.table(&self.owner))).transpose()?;
             selected.push(OwnedWorldWitness {
                 world, pin: registered.pin, relation: local, scope,

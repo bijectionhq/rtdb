@@ -170,7 +170,9 @@ impl HeldCheckpointWorld {
         Ok(WorldPoint { present: self.present(), fact, until: None, shadowed, witness })
     }
 
-    pub async fn parent_point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp) -> Result<WorldPoint> {
+    pub async fn parent_point(
+        &self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool,
+    ) -> Result<WorldPoint> {
         self.check()?;
         let policy = self.open.snapshot.lifetime_point_policy(relation).await?;
         let lifetime = policy.map(|policy| ArchiveLifetimeRead { policy, present: self.present().system_time });
@@ -178,6 +180,14 @@ impl HeldCheckpointWorld {
         if lifetime.is_some() && (self.clock_mode() != WorldClockMode::Retained || valid_at != basis) {
             return Err(OwnedWorld::unavailable());
         }
+        let witness = if observed {
+            if lifetime.is_some() || self.evidence_until() <= self.present().system_time {
+                return Err(OwnedWorld::unavailable());
+            }
+            Some(self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?)
+        } else {
+            None
+        };
         let fact = self.archive_point(relation, id, valid_at, lifetime).await?;
         let until = fact.as_ref().zip(policy).map(|(fact, policy)| {
             let validity = fact.lifetime.filter(|valid| fact.revision <= basis && valid.contains(basis))
@@ -192,7 +202,7 @@ impl HeldCheckpointWorld {
             Ok(expiry)
         }).transpose()?;
         self.check_parent_point(relation, until)?;
-        Ok(WorldPoint { present: self.present(), fact, until, shadowed: false, witness: None })
+        Ok(WorldPoint { present: self.present(), fact, until, shadowed: false, witness })
     }
 
     pub fn check_parent_point(&self, relation: &OwnedRelation, until: Option<Timestamp>) -> Result<()> {
