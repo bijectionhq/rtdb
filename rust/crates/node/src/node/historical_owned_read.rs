@@ -24,6 +24,7 @@ impl OwnedReadSession {
         marker: &EntityId,
         relations: Vec<OwnedRelation>,
     ) -> Result<Option<Self>> {
+        self.require_unscoped_root()?;
         self.admit_read().await?;
         if requested > self.present.system_time
             || !(1..=MAX_SCOPE_RELATIONS).contains(&relations.len())
@@ -99,6 +100,7 @@ impl OwnedReadSession {
             cancellation,
             session_cancellation: self.session_cancellation.clone(),
             attachment: self.attachment.clone(),
+            scoped_root: None,
             historical: Some(Scope {
                 system_time: selected,
                 relations,

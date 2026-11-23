@@ -145,6 +145,7 @@ fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<
 }
 
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
+pub(crate) const OPEN_OWNED_SCOPED_READ_V1: &str = "rtdb.owned.OpenOwnedScopedRead.v1";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
@@ -929,6 +930,30 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
+        self.retain_owned_read(call, snapshot, permit, true)
+    }
+
+    pub(crate) async fn open_owned_scoped_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if call.session.placed_database() != Some(call.database.as_str()) {
+            return Err(Status::permission_denied("A scoped owned read requires its placed owner session"));
+        }
+        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Scoped owned read requires an original hold"))?;
+        let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Scoped owned read requires a relation count"))?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        if !(1..=32).contains(&count) { return Err(invalid("Scoped owned read requires one to 32 relations")); }
+        let _request = call.reserve(count * 512)?;
+        let mut relations = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (relation, tail) = split_relation(body)?;
+            relations.push(relation);
+            body = tail;
+        }
+        if !body.is_empty() { return Err(invalid("Scoped owned read has trailing bytes")); }
+        let original = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
+        let snapshot = original.snapshot.scope_root_read(relations).await.map_err(status)?;
         self.retain_owned_read(call, snapshot, permit, true)
     }
 
@@ -2438,7 +2463,9 @@ impl Service {
             0 => (None, body),
             1 | 2 | 3 | 4 | 5 | 6 | 7 => {
                 let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing original Root hold"))?;
-                (Some(self.owned_read(call, &Bytes::copy_from_slice(handle))?), body)
+                let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+                held.snapshot.require_unscoped_root().map_err(status)?;
+                (Some(held), body)
             }
             _ => return Err(invalid("Invalid Root section kind")),
         };
