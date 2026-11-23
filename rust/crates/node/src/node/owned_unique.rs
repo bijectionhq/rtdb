@@ -15,13 +15,10 @@ impl OwnedReadSession {
         valid: Timestamp,
     ) -> Result<Option<OwnedUniqueHit>> {
         self.admit_read().await?;
-        if relation.world().is_some()
-            || relation.is_world_catalog()
-            || valid != self.present.system_time
-        {
+        if relation.world().is_some() || relation.is_world_catalog() {
             return Err(Anomaly::incorrect(
                 "rtdb.owned/unique-scope",
-                "Unique lookup requires an owned root and the held present valid instant",
+                "Unique lookup requires an owned Root relation",
             ));
         }
         let unavailable = || {
