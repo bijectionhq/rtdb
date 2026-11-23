@@ -3231,10 +3231,10 @@ impl BatchCursor for BatchExpressions {
                 let mut value = self.execution.evaluate(&scope, expression, &rtdb_plan::Schema::default(), &[]).await?;
                 value.admit_expression_dates()?;
                 rtdb_expr::validate_projection_value(&value)?;
-                let bytes = value.retained_bytes()?.saturating_add(std::mem::size_of::<Value>()).checked_mul(batch.len).ok_or_else(size_error)?;
+                let bytes = repeated_cell_bound(&value, batch.len)?;
                 let lease = Arc::get_mut(&mut reservation).expect("batch projection owns its reservation");
                 lease.grow_to(lease.bytes().checked_add(bytes).ok_or_else(size_error)?)?;
-                columns.push(Column::Values(vec![value; batch.len]));
+                columns.push(repeat_cell(&value, batch.len)?);
                 continue;
             }
             if let rtdb_plan::Expr::Call { name, args, .. } = kernel
@@ -3325,6 +3325,28 @@ pub(crate) fn scalar_result(values: &[Value], memory: &Arc<MemoryBudget>) -> Res
         Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn repeated_cell_bound(value: &Value, count: usize) -> Result<usize> {
+    let ty = value.logical_type();
+    let metadata = ty.retained_bytes()?.checked_mul(8).ok_or_else(size_error)?;
+    let builder = rtdb_columnar::estimate_builder_bytes(&ty, std::slice::from_ref(value))?;
+    count.checked_mul(std::mem::size_of::<(usize, usize)>())
+        .and_then(|bytes| bytes.checked_add(builder))
+        .and_then(|bytes| bytes.checked_add(metadata))
+        .and_then(|bytes| bytes.checked_add(4096)).ok_or_else(size_error)
+}
+
+fn repeat_cell(value: &Value, count: usize) -> Result<Column> {
+    let ty = value.logical_type();
+    let (array, field) = (
+        rtdb_columnar::copy_array(&ty, std::slice::from_ref(value))?,
+        Arc::new(rtdb_columnar::to_field("value", &ty)?),
+    );
+    Ok(Column::Selected(SelectedColumn::new(
+        vec![Some((array, field, Some(ty), None))],
+        Arc::new(vec![(0, 0); count]),
+    )))
 }
 
 fn pack_scalar_values(values: &[Value], ty: LogicalType, memory: &Arc<MemoryBudget>) -> Result<(Column, Arc<MemoryReservation>)> {
@@ -3544,7 +3566,7 @@ pub(crate) mod projection {
         let per_row = |bytes: usize| rows.checked_mul(bytes).and_then(|total| total.checked_add(256)).ok_or_else(super::size_error);
         Ok(Some(match expr {
             Expr::Column { id, .. } => match schema.position(*id) { Some(position) => batch.columns[position].retained_bytes()?, None => return Ok(None) },
-            Expr::Literal(value) if literal(value) => per_row(std::mem::size_of::<Value>().checked_add(value.retained_bytes()?).ok_or_else(super::size_error)?)?,
+            Expr::Literal(value) if literal(value) => super::repeated_cell_bound(value, rows)?,
             Expr::Parameter { .. } => 0,
             // The checked path builds `Option<i64>` cells before the array, and each operand may be computed too.
             Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply, left, right } => {
@@ -3640,7 +3662,7 @@ pub(crate) mod projection {
                     Column::Values(values) => Column::Values(values.iter().map(|value| { let mut value = value.clone(); value.admit_expression_dates()?; Ok(value) }).collect::<Result<_>>()?),
                 }))
             }
-            Expr::Literal(value) if literal(value) => Ok(Some(Column::Values(vec![value.clone(); batch.len]))),
+            Expr::Literal(value) if literal(value) => super::repeat_cell(value, batch.len).map(Some),
             Expr::Binary { .. } => arithmetic(expr, schema, &batch.columns, batch.len, Parameters::Values(parameters)),
             Expr::List(items) => {
                 let Some((arrays, logical)) = list_columns(items, schema, batch) else { return Ok(None); };

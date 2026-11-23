@@ -27,7 +27,8 @@
 -- Flight SQL result batches retain the Arrow buffers of columns that already match the declared field, even when other columns require conformance.
 -- Ordinary native SQL and XTQL queries and pgwire result portals retain compatible Arrow query batches while gathering the configured number of output rows.
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
--- A pgwire portal can encode numeric coefficients and structured JSON, JSON-LD, and Transit results from their Arrow cells.
+-- A pgwire portal can encode numeric coefficients, standard PostgreSQL arrays, and structured JSON, JSON-LD, and Transit results from their Arrow cells.
+-- The embedded Transit row cursor writes the typed wire representation from Arrow cell positions.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
 -- The authenticated session and original attachment authorize redemption of its ticket.
@@ -63,7 +64,8 @@
 -- A cosine projection guarded by a simple Boolean CASE reads only the rows selected by its guard.
 -- Score calculation and nullable result construction use Arrow input arrays and output buffers.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
--- Computed UNNEST gathers the original payload from Arrow positions and evaluates only its list operands.
+-- Computed UNNEST gathers both original payload and evaluated child columns by Arrow position.
+-- Its ordinal vector marks the synthetic outer row of an empty list as null.
 -- Query analysis measures a batch-capable operator using its emitted Arrow batches.
 -- A batch join can gather matching payload positions from selected Arrow vectors.
 -- A compatible inner equijoin hashes and compares its Arrow key cells at their build and probe positions.
@@ -75,7 +77,7 @@
 -- Compatible outer equijoins select both sides by position and use null positions for unmatched rows.
 -- A single equijoin fails when more than one build row matches a probe row.
 -- A columnar cross join gathers pairs of positions from its two inputs in left-major order within each batch pair.
--- Correlated Apply retains independent Arrow payload positions and reads the cells the dependent query references.
+-- Correlated Apply retains independent Arrow payload positions and binds direct column arguments as Arrow cells.
 -- Apply can append dependent rows, Boolean marks, records, and lists of records to those positions.
 -- Relation ordinality and unpartitioned ROW_NUMBER with supported ordering append a signed 64-bit ordinal vector to Arrow batch inputs.
 -- Unpartitioned LEAD and LAG gather shifted cells from their ordered Arrow input and append null cells at the window boundary.

@@ -14,7 +14,64 @@ pub struct BoundParameters {
 enum Input {
     Row(OwnedRow),
     Arrow(ArrowRow),
-    Overlay { outer: Arc<BoundParameters>, values: Vec<(usize, Value)> },
+    Overlay { outer: Arc<BoundParameters>, values: Vec<(usize, OverlayValue)> },
+}
+
+pub(crate) enum OverlayValue {
+    Scalar(Value),
+    Arrow(ArrowBinding),
+}
+
+pub(crate) struct ArrowBinding {
+    batch: Arc<crate::columnar::ColumnBatch>,
+    column: usize,
+    row: usize,
+    memory: Arc<MemoryBudget>,
+    scalar: LazyValue,
+}
+
+impl ArrowBinding {
+    pub(crate) fn new(batch: Arc<crate::columnar::ColumnBatch>, column: usize, row: usize, memory: Arc<MemoryBudget>) -> Option<Self> {
+        batch.columns.get(column)?.expression_cell(row)?;
+        Some(Self { batch, column, row, memory, scalar: LazyValue::default() })
+    }
+
+    fn cell(&self) -> Option<rtdb_expr::ArrowParameterCell<'_>> {
+        let rtdb_columnar::ArrowCell { field, array, row } = self.batch.columns[self.column].expression_cell(self.row)?;
+        Some(rtdb_expr::ArrowParameterCell { field, array, row })
+    }
+
+    fn value(&self) -> Result<&Value> {
+        let column = &self.batch.columns[self.column];
+        self.scalar.read(&self.memory, || column.bound(self.row), || {
+            let mut value = column.value(self.row)?;
+            value.admit_expression_dates()?;
+            Ok(value)
+        })
+    }
+}
+
+impl OverlayValue {
+    fn known(&self) -> Option<&Value> {
+        match self {
+            Self::Scalar(value) => Some(value),
+            Self::Arrow(binding) => binding.scalar.value.get().map(|value| &value.value),
+        }
+    }
+
+    fn get(&self) -> Result<&Value> {
+        match self {
+            Self::Scalar(value) => Ok(value),
+            Self::Arrow(binding) => binding.value(),
+        }
+    }
+
+    fn retained_bytes(&self) -> Result<usize> {
+        match self {
+            Self::Scalar(value) => value.retained_bytes(),
+            Self::Arrow(_) => Ok(0),
+        }
+    }
 }
 
 struct ArrowRow {
@@ -32,19 +89,27 @@ struct LazyValue {
 
 struct RetainedValue { value: Value, _reservation: Arc<MemoryReservation> }
 
+impl LazyValue {
+    fn read(&self, memory: &Arc<MemoryBudget>, bound: impl FnOnce() -> Result<usize>, read: impl FnOnce() -> Result<Value>) -> Result<&Value> {
+        if let Some(value) = self.value.get() { return Ok(&value.value); }
+        let _lock = self.lock.lock();
+        if let Some(value) = self.value.get() { return Ok(&value.value); }
+        let mut reservation = memory.reserve(bound()?)?;
+        let value = read()?;
+        Arc::get_mut(&mut reservation).expect("Decoded parameter owns its reservation").shrink_to(value.retained_bytes()?)?;
+        Ok(&self.value.get_or_init(|| RetainedValue { value, _reservation: reservation }).value)
+    }
+}
+
 impl ArrowRow {
     fn value(&self, index: usize) -> Result<Option<&Value>> {
         let Some(cell) = self.values.get(index) else { return Ok(None); };
-        if let Some(value) = cell.value.get() { return Ok(Some(&value.value)); }
-        let _lock = cell.lock.lock();
-        if let Some(value) = cell.value.get() { return Ok(Some(&value.value)); }
         let field = self.batch.batch().schema_ref().field(index);
-        let column = self.batch.batch().column(index);
-        let bytes = rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), self.row)?;
-        let mut reservation = self.memory.reserve(bytes)?;
-        let value = rtdb_columnar::read_execution_value(field, column.as_ref(), self.row)?;
-        Arc::get_mut(&mut reservation).expect("Decoded parameter owns its reservation").shrink_to(value.retained_bytes()?)?;
-        Ok(Some(&cell.value.get_or_init(|| RetainedValue { value, _reservation: reservation }).value))
+        let array = self.batch.batch().column(index).as_ref();
+        cell.read(&self.memory,
+            || rtdb_columnar::estimate_read_value_bytes(field, array, self.row),
+            || rtdb_columnar::read_execution_value(field, array, self.row),
+        ).map(Some)
     }
 }
 
@@ -56,11 +121,21 @@ impl rtdb_expr::ParameterLookup for BoundParameters {
         match &self.input {
             Input::Row(row) => row.values.get(index),
             Input::Arrow(row) => row.values[index].value.get().map(|value| &value.value),
-            Input::Overlay { outer, values } => values.iter().rev().find(|(slot, _)| *slot == index).map(|(_, value)| value)
-                .or_else(|| if index < outer.types.len() { outer.known_value(index) } else { Some(&Value::Null) }),
+            Input::Overlay { outer, values } => match values.iter().rev().find(|(slot, _)| *slot == index) {
+                Some((_, value)) => value.known(),
+                None if index < outer.types.len() => outer.known_value(index),
+                None => Some(&Value::Null),
+            },
         }
     }
     fn arrow_cell(&self, index: usize) -> Option<rtdb_expr::ArrowParameterCell<'_>> {
+        if let Input::Overlay { outer, values } = &self.input {
+            return match values.iter().rev().find(|(slot, _)| *slot == index) {
+                Some((_, OverlayValue::Arrow(binding))) => binding.cell(),
+                Some((_, OverlayValue::Scalar(_))) => None,
+                None => outer.arrow_cell(index),
+            };
+        }
         let (batch, row) = self.arrow_input(index)?;
         Some(rtdb_expr::ArrowParameterCell {
             field: batch.batch().schema_ref().fields()[index].as_ref(),
@@ -115,7 +190,11 @@ impl BoundParameters {
     }
 
     pub fn overlay(self: &Arc<Self>, values: Vec<(usize, Value)>, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let slots = values.capacity().checked_mul(std::mem::size_of::<(usize, Value)>()).ok_or_else(size_error)?;
+        self.overlay_sources(values.into_iter().map(|(slot, value)| (slot, OverlayValue::Scalar(value))).collect(), types, memory)
+    }
+
+    pub(crate) fn overlay_sources(self: &Arc<Self>, values: Vec<(usize, OverlayValue)>, types: Vec<LogicalType>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let slots = values.capacity().checked_mul(std::mem::size_of::<(usize, OverlayValue)>()).ok_or_else(size_error)?;
         let bytes = values.iter().try_fold(type_bytes(&types)?.checked_add(slots).ok_or_else(size_error)?, |bytes, (_, value)| {
             bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error)
         })?;
@@ -129,7 +208,7 @@ impl BoundParameters {
             Input::Row(row) => Ok(row.values.get(index)),
             Input::Arrow(row) => row.value(index),
             Input::Overlay { outer, values } => match values.iter().rev().find(|(slot, _)| *slot == index) {
-                Some((_, value)) => Ok(Some(value)),
+                Some((_, value)) => value.get().map(Some),
                 None => Ok(Some(outer.get(index)?.unwrap_or(&Value::Null))),
             },
         }
@@ -158,6 +237,30 @@ fn size_error() -> rtdb_types::Anomaly { invalid("parameter-size", "Parameter me
 mod tests {
     use super::*;
     use rtdb_types::ScalarType;
+
+    #[test]
+    fn correlated_arrow_parameter_keeps_its_vector_until_a_row_api_requests_it() {
+        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use rtdb_expr::ParameterLookup;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let item = Arc::new(Field::new("$data$", DataType::Float32, false));
+        let shape = DataType::FixedSizeList(item.clone(), 2);
+        let list = FixedSizeListArray::try_new(item, 2, Arc::new(Float32Array::from(vec![0.25, -0.5, 1.0, 2.0])), None).unwrap();
+        let field = Field::new("emb", shape, false);
+        let ty = rtdb_columnar::from_field(&field).unwrap();
+        let record = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(list)]).unwrap();
+        let source = Arc::new(crate::columnar::ColumnBatch::from_owned(OwnedBatch::new(record, &memory).unwrap()).unwrap());
+        let base = Arc::new(BoundParameters::new(vec![], vec![], &memory).unwrap());
+        let binding = ArrowBinding::new(source.clone(), 0, 1, memory.clone()).unwrap();
+        let bound = base.overlay_sources(vec![(0, OverlayValue::Arrow(binding))], vec![ty], &memory).unwrap();
+
+        let cell = bound.arrow_cell(0).unwrap();
+        assert_eq!(cell.row, 1);
+        assert!(bound.known_value(0).is_none());
+        assert_eq!(bound.get(0).unwrap(), Some(&Value::FixedSizeList(rtdb_types::ListValue::from_f32(Float32Array::from(vec![1.0, 2.0])))));
+    }
 
     #[test]
     fn parameter_schema_and_cells_share_one_retained_owner() {

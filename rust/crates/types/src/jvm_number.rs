@@ -139,7 +139,7 @@ impl Number {
         Ok(match self {
             Self::Float(value) => f64::from(*value),Self::Double(value) => *value,
             Self::BigInt(value) => float_integer(value),
-            Self::Decimal { coefficient,scale } => decimal_text(coefficient,*scale).parse().map_err(|_|invalid())?,
+            Self::Decimal { coefficient,scale } => decimal_parts_to_f64(coefficient.clone(), *scale),
             Self::Ratio { numerator,denominator } => {
                 ratio_double(numerator,denominator)?
             }
@@ -215,6 +215,30 @@ fn integer(text: &str) -> Result<BigInt> {
     let value = BigInt::parse_bytes(digits.as_bytes(),10).ok_or_else(invalid)?;
     Ok(if negative { -value } else { value })
 }
+/// Rounds a big-endian two's-complement coefficient times ten to the negated scale to binary64.
+/// Underflow preserves the sign and overflow produces the matching infinity.
+pub fn decimal_bytes_to_f64(coefficient: &[u8], scale: i32) -> f64 {
+    decimal_parts_to_f64(BigInt::from_signed_bytes_be(coefficient), scale)
+}
+
+fn decimal_parts_to_f64(coefficient: BigInt, scale: i32) -> f64 {
+    if coefficient.is_zero() {
+        return 0.0;
+    }
+    let sign = if coefficient.is_negative() { -1.0 } else { 1.0 };
+    if scale < -308 {
+        return sign * f64::INFINITY;
+    }
+    if scale <= 0 {
+        return float_integer(&(coefficient * BigInt::from(10).pow(scale.unsigned_abs())));
+    }
+    if u64::from(scale.unsigned_abs()) * 3 > coefficient.bits().saturating_add(1075) {
+        return sign * 0.0;
+    }
+    let ratio = num_rational::BigRational::new_raw(coefficient, BigInt::from(10).pow(scale.unsigned_abs()));
+    ratio.to_f64().expect("a finite nonzero denominator defines a numeric quotient")
+}
+
 fn float_integer(value: &BigInt) -> f64 { value.to_f64().unwrap_or_else(||if value.is_negative() { f64::NEG_INFINITY } else { f64::INFINITY }) }
 fn ratio_double(numerator: &BigInt,denominator: &BigInt) -> Result<f64> {
     let mut exponent = i64::try_from(numerator.abs().to_string().len()).map_err(|_|invalid())? - i64::try_from(denominator.to_string().len()).map_err(|_|invalid())?;
@@ -284,5 +308,26 @@ mod tests {
         let Number::Float(direct) = Number::cast_primitive(Cast::Float,&source).unwrap() else { panic!() };
         let Number::Float(boxed) = Number::cast(Cast::Float,&source).unwrap() else { panic!() };
         assert_eq!(direct.to_bits(),0x5e80_0001);assert_eq!(boxed.to_bits(),0x5e80_0000);
+    }
+}
+
+
+#[test]
+fn decimal_rounding_matches_binary64_parsing_at_extreme_scales() {
+    let coefficients = [
+        BigInt::from(0),
+        BigInt::from(-1),
+        BigInt::from(1),
+        BigInt::from(5),
+        BigInt::from(9_007_199_254_740_993_i64),
+        (BigInt::from(1) << 255usize) - 1,
+        -(BigInt::from(1) << 255usize),
+    ];
+    for coefficient in coefficients {
+        for scale in [i32::MIN, -309, -308, -292, -1, 0, 1, 17, 308, 324, 325, 400, i32::MAX] {
+            let expected = format!("{coefficient}e{}", -i64::from(scale)).parse::<f64>().unwrap();
+            assert_eq!(decimal_bytes_to_f64(&coefficient.to_signed_bytes_be(), scale).to_bits(), expected.to_bits(),
+                "{coefficient} at scale {scale}");
+        }
     }
 }

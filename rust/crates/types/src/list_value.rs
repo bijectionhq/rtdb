@@ -87,6 +87,13 @@ impl<'a> ListView<'a> {
 }
 
 impl ListValue {
+    /// Builds a list from fallible cells, keeping a packable numeric input in typed storage.
+    pub fn try_from_cells(cells: impl Iterator<Item = Result<Value>>) -> Result<Self> {
+        let mut builder = ListBuilder::with_capacity(cells.size_hint().0);
+        for cell in cells { builder.push(cell?); }
+        Ok(builder.finish())
+    }
+
     pub fn from_f32(values: Float32Array) -> Self { Self(Storage::F32(Arc::new(values))) }
     pub fn from_f64(values: Float64Array) -> Self { Self(Storage::F64(Arc::new(values))) }
 

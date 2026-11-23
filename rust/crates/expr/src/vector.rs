@@ -1,7 +1,7 @@
-use arrow_array::{Array, Float32Array, Float64Array, UnionArray, cast::AsArray, types::{Float16Type, Float32Type, Float64Type}};
+use arrow_array::{Array, cast::AsArray, types::{Float16Type, Float32Type, Float64Type}};
 use arrow_schema::{DataType, Field};
 use rtdb_columnar::ArrowCell;
-use rtdb_types::{Anomaly, ListValue, ListView, Result, Value};
+use rtdb_types::{Anomaly, ListView, Result, Value};
 
 use crate::{compare::nullish, numeric::number};
 
@@ -21,19 +21,30 @@ pub(crate) enum VectorInput<'a> {
 
 impl<'a> VectorInput<'a> {
     pub(crate) fn from_arrow(cell: ArrowCell<'a>) -> Option<Self> {
-        let (field, array, range) = cell.sequence_range()?;
-        if field.metadata().is_empty() {
-            let floats = match array.data_type() {
-                DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().map(ListView::F32),
-                DataType::Float64 => array.as_any().downcast_ref::<Float64Array>().map(ListView::F64),
-                ty if ListValue::supports_float_union(ty) => array.as_any().downcast_ref::<UnionArray>().map(ListView::Union),
-                _ => None,
-            };
-            if let Some(values) = floats {
-                return Some(Self::Floats { values, offset: range.start, len: range.len() });
-            }
+        if let Some((values, range)) = cell.float_list_span() {
+            return Some(Self::Floats { values, offset: range.start, len: range.len() });
         }
+        let (field, array, range) = cell.sequence_range()?;
         Some(Self::Arrow { field, array, offset: range.start, len: range.len() })
+    }
+
+    pub(crate) fn prefix(self, length: usize) -> Option<Self> {
+        if length > self.len() { return None; }
+        Some(match self {
+            Self::Stored(ListView::Values(values)) => Self::Stored(ListView::Values(&values[..length])),
+            Self::Stored(ListView::Numeric(values)) => Self::Arrow { field: values.field(), array: values.array().as_ref(), offset: 0, len: length },
+            Self::Stored(values) => Self::Floats { values, offset: 0, len: length },
+            Self::Floats { values, offset, .. } => Self::Floats { values, offset, len: length },
+            Self::Arrow { field, array, offset, .. } => Self::Arrow { field, array, offset, len: length },
+        })
+    }
+
+    pub(crate) fn float_cells(self) -> Option<(ListView<'a>, usize, usize)> {
+        match self {
+            Self::Stored(values) if values.is_float() => Some((values, 0, values.len())),
+            Self::Floats { values, offset, len } => Some((values, offset, len)),
+            _ => None,
+        }
     }
 
     pub(crate) fn len(self) -> usize {
@@ -151,7 +162,7 @@ fn scale(values: VectorInput<'_>) -> Result<f64> {
 fn component_at(values: ListView<'_>, index: usize) -> Result<f64> {
     match values {
         ListView::Values(values) => return component(&values[index]),
-        ListView::Numeric(_) => return component(values.get(index).as_deref().unwrap_or(&Value::Null)),
+        ListView::Numeric(values) => return packed_number(ArrowCell { field: values.field(), array: values.array().as_ref(), row: index }),
         _ => {}
     }
     let value = values.float_component(index);
@@ -161,6 +172,12 @@ fn component_at(values: ListView<'_>, index: usize) -> Result<f64> {
 
 fn invalid_component() -> Anomaly {
     Anomaly::incorrect("rtdb.vector/component", "Vector components must be finite numbers")
+}
+
+fn packed_number(cell: ArrowCell<'_>) -> Result<f64> {
+    let cell = cell.physical()?;
+    if let Some(value) = cell.integer() { return Ok(value as f64); }
+    arrow_number(cell)
 }
 
 fn arrow_number(cell: ArrowCell<'_>) -> Result<f64> {

@@ -4,6 +4,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, MemoryReservation, Result};
 
+mod arrow_json;
+pub use arrow_json::{write_arrow_json, write_arrow_row_json};
+
 const CACHE_LIMIT: usize = 44 * 44;
 
 pub use rtdb_types::transit_value::{TransitValue, from_json_value, json_value_allocation_bound, to_json_value};

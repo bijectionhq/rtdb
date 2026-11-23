@@ -533,7 +533,7 @@ struct SourceOperation<'a> {
 }
 
 enum SourceOperationBody<'a> {
-    Values(StructFields<Value>),
+    Values { fields: StructFields<Value>, arguments: Option<Cow<'a, RetainedBytes>> },
     Path {
         relation: &'a str,
         name: &'a str,
@@ -618,16 +618,19 @@ fn read_owned_field_presence(value: Value) -> Result<Option<Vec<std::collections
 fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, purpose: SourcePurpose) -> Result<(String, SourceOperation<'a>)> {
     let mut body = StructFields::new();
     let mut docs = None;
+    let mut arguments = None;
     let mut identities = Cow::Borrowed(&[][..]);
     let tag = match operation {
         Operation::Public(TxOp::Sql { sql, args }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
-            body.insert("args".into(), args.as_ref().map(|args| encode_arguments(args, memory).map(|bytes| Value::Binary(bytes.as_slice().to_vec()))).transpose()?.unwrap_or(Value::Null));
+            body.insert("args".into(), Value::Null);
+            arguments = args.as_ref().map(|args| encode_arguments(args, memory).map(Cow::Owned)).transpose()?;
             "sql"
         }
         Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
-            body.insert("args".into(), if arg_bytes.as_slice().is_empty() { Value::Null } else { Value::Binary(arg_bytes.as_slice().to_vec()) });
+            body.insert("args".into(), Value::Null);
+            arguments = (!arg_bytes.as_slice().is_empty()).then_some(Cow::Borrowed(arg_bytes));
             "sql"
         }
         Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, at_most }) => {
@@ -1034,7 +1037,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         }
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
     };
-    Ok((tag.into(), SourceOperation { body: SourceOperationBody::Values(body), iids: identities, documents: docs }))
+    Ok((tag.into(), SourceOperation { body: SourceOperationBody::Values { fields: body, arguments }, iids: identities, documents: docs }))
 }
 
 pub(crate) fn document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
@@ -1086,13 +1089,15 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
     }
     let mut iids = Vec::with_capacity(values.len());
     let mut bodies = Vec::with_capacity(values.len());
+    let mut arguments = Vec::with_capacity(values.len());
     let mut documents = Vec::with_capacity(values.len());
     for value in values {
-        let SourceOperationBody::Values(body) = value.body else {
+        let SourceOperationBody::Values { fields, arguments: sql_arguments } = value.body else {
             return Err(invalid("Transaction operation leg mixes path and value layouts"));
         };
         iids.push(value.iids);
-        bodies.push(body);
+        bodies.push(fields);
+        arguments.push(sql_arguments);
         documents.push(value.documents);
     }
     let values = bodies;
@@ -1107,7 +1112,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
     // The reference's argument vector is non-nullable until an operation without arguments writes it a null.
     if let Some(ty) = types.get_mut("args") {
         let binary = LogicalType::Scalar(ScalarType::Binary);
-        *ty = if *ty == binary { binary } else { binary.maybe() };
+        *ty = if arguments.iter().all(Option::is_some) { binary } else { binary.maybe() };
     }
     let mut fields = Vec::new();
     let mut columns = Vec::new();
@@ -1117,6 +1122,18 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
         let field = Arc::new(to_field(&name, &ty)?);
         let column = if name == "iids" {
             iid_vector(&iids, &field, arrays)?
+        } else if name == "args" {
+            let bytes = arguments.iter().flatten().try_fold(0usize, |bytes, value| {
+                bytes.checked_add(value.as_slice().len()).ok_or_else(overflow)
+            })?;
+            i32::try_from(bytes).map_err(|_| overflow())?;
+            let bound = arguments.len().checked_mul(16).and_then(|size| size.checked_add(bytes.checked_mul(2)?))
+                .and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?;
+            arrays.column(bound, || {
+                let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(arguments.len(), bytes);
+                for args in &arguments { builder.append_option(args.as_ref().map(|bytes| bytes.as_slice())); }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            })?
         } else {
             let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
             let bound = estimate_builder_bytes_refs(&ty, cells())?;
@@ -2580,7 +2597,7 @@ mod tests {
                     documents: None,
                 }], &mut arrays, &memory).unwrap()
             };
-            let expected = operation_array(SourceOperationBody::Values(legacy));
+            let expected = operation_array(SourceOperationBody::Values { fields: legacy, arguments: None });
             let actual = operation_array(SourceOperationBody::Path { relation: "places", name: "by_location", columns, encoding: None });
             assert_eq!(actual.to_data(), expected.to_data());
         }

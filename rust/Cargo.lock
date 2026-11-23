@@ -5004,6 +5004,9 @@ dependencies = [
 name = "rtdb-pg-codec"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
  "bigdecimal",
  "chrono",
  "chrono-tz",
@@ -5464,6 +5467,7 @@ dependencies = [
  "half",
  "indexmap 2.14.2",
  "num-bigint",
+ "num-rational",
  "num-traits",
  "regex",
  "ring",

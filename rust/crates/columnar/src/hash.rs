@@ -134,31 +134,19 @@ fn hash_value_with(value: &Value, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) 
 }
 
 fn decimal_double(value: &DecimalValue) -> Result<f64> {
-    let coefficient = match value.bit_width {
-        32 => i32::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?).to_string(),
-        64 => i64::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?).to_string(),
-        128 => i128::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?).to_string(),
-        256 => arrow_buffer::i256::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?).to_string(),
+    let width = match value.bit_width {
+        32 | 64 | 128 | 256 => usize::from(value.bit_width / 8),
         _ => return Err(decimal_width()),
     };
-    scaled_double(&coefficient, value.scale)
-}
-
-fn scaled_double(coefficient: &str, scale: i32) -> Result<f64> {
-    format!("{coefficient}e{}", -i64::from(scale)).parse().map_err(|_| Anomaly::incorrect("rtdb/decimal-double", "Decimal could not be represented as a floating-point statistic"))
+    if value.unscaled.len() != width { return Err(decimal_width()); }
+    Ok(rtdb_types::jvm_number::decimal_bytes_to_f64(&value.unscaled, value.scale))
 }
 
 pub fn decimal_cell_as_f64(field: &Field, array: &dyn Array, row: usize) -> Result<f64> {
     if row >= array.len() || array.data_type() != field.data_type() { return Err(layout_error()); }
-    let scale = crate::decimal_field_parameters(field)?.ok_or_else(decimal_width)?.scale;
-    let coefficient = match field.data_type() {
-        DataType::Decimal32(..) => downcast::<PrimitiveArray<Decimal32Type>>(array)?.value(row).to_string(),
-        DataType::Decimal64(..) => downcast::<PrimitiveArray<Decimal64Type>>(array)?.value(row).to_string(),
-        DataType::Decimal128(..) => downcast::<PrimitiveArray<Decimal128Type>>(array)?.value(row).to_string(),
-        DataType::Decimal256(..) => downcast::<PrimitiveArray<Decimal256Type>>(array)?.value(row).to_string(),
-        _ => return Err(decimal_width()),
-    };
-    scaled_double(&coefficient, scale)
+    let (parameters, bytes) = (crate::ArrowCell { field, array, row }).decimal_coefficient()?.ok_or_else(decimal_width)?;
+    let width = usize::from(parameters.bit_width / 8);
+    Ok(rtdb_types::jvm_number::decimal_bytes_to_f64(&bytes[bytes.len() - width..], parameters.scale))
 }
 
 fn scalar_hash_with(

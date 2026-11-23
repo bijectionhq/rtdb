@@ -539,10 +539,11 @@ impl Execution {
     }
 
     async fn bind_outer(&self, arguments: &[(usize, rtdb_plan::Expr)], schema: &rtdb_plan::Schema, row: OuterInput) -> Result<Self> {
+        use crate::parameters::{ArrowBinding, OverlayValue};
         let scope = self.scope()?;
         let parameter_count = arguments.iter().try_fold(self.parameters.types().len(), |count, (index, _)| index.checked_add(1).map(|next| count.max(next)).ok_or_else(|| crate::invalid("parameter-count", "Apply parameter index overflow")))?;
         let slots = parameter_count.checked_mul(std::mem::size_of::<rtdb_types::LogicalType>())
-            .and_then(|bytes| bytes.checked_add(arguments.len().checked_mul(std::mem::size_of::<(usize, Value)>())?))
+            .and_then(|bytes| bytes.checked_add(arguments.len().checked_mul(std::mem::size_of::<(usize, OverlayValue)>())?))
             .ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))?;
         let existing = self.parameters.types().iter().try_fold(slots, |bytes, ty| {
             bytes.checked_add(ty.retained_bytes()?).ok_or_else(|| crate::invalid("parameter-count", "Apply parameters exceed addressable memory"))
@@ -554,11 +555,20 @@ impl Execution {
         types.resize(parameter_count, rtdb_types::LogicalType::Null);
         for (index, expression) in arguments {
             types[*index] = self.expression_type(&scope, expression, schema)?;
+            if let OuterInput::Arrow { batch, row } = &row
+                && let rtdb_plan::Expr::Column { id, .. } = expression
+                && let Some(position) = schema.position(*id)
+                && let Some(binding) = ArrowBinding::new(Arc::clone(batch), position, *row, Arc::clone(&self.context.memory))
+            {
+                parameters.push((*index, OverlayValue::Arrow(binding)));
+                continue;
+            }
             let invocation = self.prepare_expression(expression, schema, &scope)?;
-            parameters.push((*index, self.evaluate_invocation_row(&scope, &invocation, row.expression()).await?));
+            let value = self.evaluate_invocation_row(&scope, &invocation, row.expression()).await?;
+            parameters.push((*index, OverlayValue::Scalar(value)));
         }
         let outer = self.outer.prepend(schema, row, &self.context.memory)?;
-        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
+        Ok(Self { context: Arc::clone(&self.context), parameters: Arc::new(self.parameters.overlay_sources(parameters, types, &self.context.memory)?), outer, bindings: self.bindings.clone(), analysis: self.analysis.clone() })
     }
     pub fn in_operator(mut self) -> Self {
         if self.context.operator_root.is_none() && (self.analysis.is_some() || self.context.trace_parent.is_some()) {

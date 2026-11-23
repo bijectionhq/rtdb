@@ -6,6 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
 rtdb-types.workspace = true
 rtdb-columnar.workspace = true
 rtdb-expr.workspace = true

@@ -267,11 +267,8 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 let count = (size - position).min(batch_rows);
                 let scope = crate::EvaluationScope::new(allocation.memory_budget())?;
                 scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
-                if let EvalValue::List(_, reader) = &value
-                    && let ListReader::Stored(items) = reader.as_ref()
-                    && let Some(values) = items.slice_packed(position, count)
-                {
-                    scope.reserve(values.retained_payload_bytes()?)?;
+                let page_context = context.with_allocation(&scope);
+                if let Some(values) = packed_slice(&value, position, count, &page_context)? {
                     if let Some((field, array)) = values.packed_column() {
                         rtdb_columnar::validate_projected_decimals(&field, array.as_ref())?;
                     }
@@ -422,6 +419,55 @@ fn nth<'a>(value: EvalValue<'a>,index: usize,frame: &'a EvaluationFrame<'a>) -> 
     },frame)
 }
 
+fn borrowed_vector<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::VectorInput<'a>> {
+    use crate::vector::VectorInput;
+
+    let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
+    match reader.as_ref() {
+        ListReader::Stored(list) => Some(VectorInput::Stored(list.view())),
+        ListReader::Arrow(cell) => VectorInput::from_arrow(*cell),
+        ListReader::Trim { input, size } => {
+            let size = crate::collection::view_size(*size).ok()?;
+            let vector = borrowed_vector(input)?;
+            if matches!(vector, VectorInput::Stored(rtdb_types::ListView::Numeric(_))) { return None; }
+            vector.prefix(size)
+        }
+        _ => None,
+    }
+}
+
+fn packed_slice(value: &EvalValue<'_>, offset: usize, count: usize, context: &EvalContext<'_>) -> Result<Option<rtdb_types::ListValue>> {
+    let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return Ok(None); };
+    let end = offset.checked_add(count).ok_or_else(overflow)?;
+    match reader.as_ref() {
+        ListReader::Stored(items) if end <= items.len() => {
+            let Some(slice) = items.slice_packed(offset, count) else { return Ok(None); };
+            context.reserve(slice.retained_payload_bytes()?)?;
+            Ok(Some(slice))
+        }
+        ListReader::Arrow(cell) => {
+            let Some((field, array, range)) = cell.sequence_range() else { return Ok(None); };
+            if end > range.len() || !rtdb_types::ListValue::supports_numeric_arrow(field) { return Ok(None); }
+            let rows = (range.start + offset)..(range.start + end);
+            let bound = rows.clone().try_fold(4096usize, |bytes, row| {
+                rtdb_columnar::estimate_copy_cell_bytes(field, array, row)?.checked_mul(4)
+                    .and_then(|size| bytes.checked_add(size))
+                    .and_then(|size| size.checked_add(std::mem::size_of::<(usize, usize)>()))
+                    .ok_or_else(overflow)
+            })?;
+            context.reserve(bound)?;
+            let selection = rows.map(|row| (0, row)).collect::<Vec<_>>();
+            let array = rtdb_columnar::copy_selected_cells(&[array], &selection)?;
+            let values = rtdb_types::ListValue::from_numeric_arrow(Arc::new(field.clone()), array);
+            Ok(values)
+        }
+        ListReader::Trim { input, size } if end <= crate::collection::view_size(*size)? => {
+            packed_slice(input, offset, count, context)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Value>> {
     boxed(async move {
         match value {
@@ -454,6 +500,12 @@ fn materialize<'a>(value: EvalValue<'a>,frame: &'a EvaluationFrame<'a>) -> Resul
                     return rtdb_columnar::read_execution_value(cell.field, cell.array, cell.row);
                 }
                 let size = len(&value)?;
+                if let EvalValue::List(Kind::List, reader) = &value
+                    && matches!(reader.as_ref(), ListReader::Trim { .. })
+                    && let Some(values) = packed_slice(&value, 0, size, frame.context)?
+                {
+                    return Ok(Value::List(values));
+                }
                 frame.context.reserve(size.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
                 if matches!(kind, Kind::Set) {
                     let mut values = Vec::with_capacity(size);

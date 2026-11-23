@@ -602,6 +602,38 @@ async fn unnest_keeps_list_order_and_outer_ordinality_is_null() {
 }
 
 #[tokio::test]
+async fn computed_unnest_preserves_arrow_list_order_and_outer_ordinals() {
+    use arrow_array::{Array, types::Float32Type, cast::AsArray};
+
+    let input = values(0, "xs", LogicalType::list(scalar(ScalarType::F32).maybe()), vec![
+        Value::list(vec![Value::F32(3.75), Value::Null, Value::F32(8.5)]),
+        Value::list(vec![Value::F32(5.0)]),
+    ]);
+    let xs = &input.schema().fields()[0];
+    let expr = Expr::Call {
+        name: "trim_array".into(), args: vec![xs.expression(), Expr::Literal(Value::I64(1))],
+        return_type: xs.data_type.clone(),
+    };
+    let element = field(1, "embedding_component", scalar(ScalarType::F32).maybe());
+    let ordinal = field(2, "n", scalar(ScalarType::I32).maybe());
+    let schema = input.schema().concat(&Schema::new(vec![element.clone(), ordinal.clone()]).unwrap()).unwrap();
+    let plan = Arc::new(Relation::new(schema, RelationNode::Unnest { input, expr, element, ordinality: Some(ordinal), outer: true }).unwrap());
+    let mut cursor = PreparedQuery::new(plan).unwrap().execute_columns(query_context(QueryOptions::default()), vec![]).await.unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().await.unwrap() {
+        let batch = batch.batch();
+        for row in 0..batch.num_rows() {
+            let component = batch.column(1);
+            let value = if component.is_null(row) || component.data_type() == &arrow_schema::DataType::Null { None }
+                else { Some(component.as_primitive::<Float32Type>().value(row)) };
+            let ordinal = rtdb_columnar::read_value(batch.schema_ref().field(2), batch.column(2).as_ref(), row).unwrap();
+            rows.push((value, ordinal));
+        }
+    }
+    assert_eq!(rows, [(Some(3.75), Value::I32(1)), (None, Value::I32(2)), (None, Value::Null)]);
+}
+
+#[tokio::test]
 async fn apply_binds_per_row_parameters_and_scalar_empty_returns_null() {
     let input = numbers(0, "a", &[0, 1]);
     let dependent = numbers(1, "b", &[1]);

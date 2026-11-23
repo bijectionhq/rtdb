@@ -1,7 +1,7 @@
 use rtdb_types::StructFields;
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use arrow_array::{RecordBatch, RecordBatchOptions};
-use arrow_schema::Schema;
+use arrow_array::{Array, NullArray, RecordBatch, RecordBatchOptions};
+use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
 use crate::{Lsn, read_text, wire::{Input, protocol}};
@@ -162,6 +162,15 @@ fn decode_columns<'a>(
             bytes.checked_add(size).ok_or_else(overflow)
         })?;
         let _values = memory.reserve(temporary)?;
+        if let Some(array) = rtdb_pg_codec::read_text_column(*oid, count, |row| cell(row, index))? {
+            let array = if array.null_count() == count { Arc::new(NullArray::new(count)) } else { array };
+            let field = Field::new(name, array.data_type().clone(), count != 0
+                && (array.null_count() != 0 || array.data_type() == &DataType::Null));
+            let bound = array.get_array_memory_size().checked_add(512).ok_or_else(overflow)?;
+            arrays.push(output.column(bound, || Ok(array))?);
+            fields.push(field);
+            continue;
+        }
         let values = (0..count).map(|row| {
             cell(row, index)?.map_or(Ok(Value::Null), |text| read_text(*oid, text))
         }).collect::<Result<Vec<_>>>()?;
@@ -190,4 +199,24 @@ fn snapshot_columns_keep_postgres_types_nulls_and_tuple_order() {
     let note = batch.schema_ref().field(1);
     assert_eq!(rtdb_columnar::read_value(note, batch.column(1).as_ref(), 0).unwrap(), Value::Null);
     assert_eq!(rtdb_columnar::read_value(note, batch.column(1).as_ref(), 1).unwrap(), Value::Utf8("a".into()));
+}
+
+
+#[test]
+fn snapshot_array_columns_match_the_text_reader_for_nulls_and_escaped_values() {
+    let memory = MemoryBudget::new(1 << 20);
+    let columns = [("values".into(), 1007), ("labels".into(), 1009), ("missing".into(), 20)];
+    let tuples = [
+        [Some("{1,NULL,-2}"), Some(r#"{"NULL","a,b","q\"r"}"#), None],
+        [Some("{}"), Some("{}"), None],
+        [None, Some("{NULL}"), None],
+    ];
+    let batch = decode_columns(&columns, tuples.len(), &memory, |row, column| Ok(tuples[row][column])).unwrap();
+    for (position, (_, oid)) in columns.iter().enumerate() {
+        for (row, tuple) in tuples.iter().enumerate() {
+            let expected = tuple[position].map(|text| read_text(*oid, text).unwrap()).unwrap_or(Value::Null);
+            let field = batch.batch().schema_ref().field(position);
+            assert_eq!(rtdb_columnar::read_value(field, batch.batch().column(position).as_ref(), row).unwrap(), expected);
+        }
+    }
 }

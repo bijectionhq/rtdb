@@ -82,15 +82,25 @@ pub fn conform_batch(batch: OwnedBatch, declared: &Schema, memory: &Arc<MemoryBu
         let source_type = input.map(|(field, _)| from_field(field)).transpose()?.unwrap_or(L::Null);
         if input.is_none() && !target.nullable() { return Err(fault("page-missing-non-nullable", "Page lacks a required declared field")); }
         let ty = layout(&target, &source_type)?;
-        if let Some((source_field, array)) = input {
-            let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;
-            if let Ok(_scratch) = memory.reserve(bound)
-                && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field, false) {
-                output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
-                fields.push(physical);
-                arrays.push(retained);
-                continue;
+        let absent;
+        let nulls;
+        let arrow_input = match input {
+            Some(input) => input,
+            None => {
+                absent = arrow_schema::Field::new(field.name(), arrow_schema::DataType::Null, true);
+                nulls = Arc::new(arrow_array::NullArray::new(batch.batch().num_rows())) as ArrayRef;
+                (&absent, &nulls)
             }
+        };
+        let (source_field, array) = arrow_input;
+        let bound = arrow_relayout_bound(array.as_ref(), source_field, field)?;
+        if let Ok(_scratch) = memory.reserve(bound)
+            && let Ok((physical, retained)) = physical::relayout(Arc::clone(array), source_field, field, false)
+        {
+            output.grow_to(add(output.bytes(), retained.get_array_memory_size())?)?;
+            fields.push(physical);
+            arrays.push(retained);
+            continue;
         }
         let rows = batch.batch().num_rows();
         let (column, _scratch) = copy_evaluated_cells(&ty, rows, memory,

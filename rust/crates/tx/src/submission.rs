@@ -207,7 +207,7 @@ fn projected_timed_puts(
     let RelationNode::Values { rows } = values.node() else { return Ok(None); };
     let [row] = rows.as_slice() else { return Ok(None); };
     let schema = first.schema_ref();
-    if !schema.fields().iter().all(|field| plain_scalar_field(field) || field.metadata().is_empty()
+    if !schema.fields().iter().all(|field| static_payload_field(field) || field.metadata().is_empty()
         && matches!(field.data_type(), DataType::Date32 | DataType::Date64 | DataType::Timestamp(..))) {
         return Ok(None);
     }
@@ -232,7 +232,7 @@ fn projected_timed_puts(
             expr.visit(&mut |expr| if let Expr::Parameter { index, .. } = expr { required.insert(*index); });
         } else {
             let Expr::Parameter { index, .. } = expr else { return Ok(None); };
-            let Some(field) = schema.fields().get(*index).filter(|field| plain_scalar_field(field)) else { return Ok(None); };
+            let Some(field) = schema.fields().get(*index).filter(|field| static_payload_field(field)) else { return Ok(None); };
             data.insert(position, (*index, field.as_ref().clone().with_name(name)));
         }
     }
@@ -320,14 +320,10 @@ fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &
     }
 
     let schema = first.schema_ref();
-    if !schema.fields().iter().all(|field| plain_scalar_field(field)) {
-        return Ok(None);
-    }
-
     let projection = || expressions.iter().map(|expr| {
         let Expr::Column { id, .. } = expr.expr else { return None; };
         let Expr::Parameter { index, .. } = row.get(values.schema().position(id)?)? else { return None; };
-        let field = schema.fields().get(*index)?;
+        let field = schema.fields().get(*index).filter(|field| static_payload_field(field))?;
         Some((expr.field.name.as_str(), field, *index))
     });
     let mut bound = 4096usize;
@@ -352,6 +348,15 @@ fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &
     let projection = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
         .map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
     ArrowDocuments::from_record_batch(&projection, memory)
+}
+
+fn static_payload_field(field: &arrow_schema::Field) -> bool {
+    if !field.metadata().is_empty() { return false; }
+    match field.data_type() {
+        DataType::List(child) | DataType::FixedSizeList(child, _) => static_payload_field(child),
+        DataType::Struct(children) => children.iter().all(|child| static_payload_field(child)),
+        _ => plain_scalar_field(field),
+    }
 }
 
 fn infer_document_decimals(value: &mut Value) -> Result<()> {
@@ -491,6 +496,36 @@ mod tests {
             else { panic!("Expected Arrow documents") };
         assert!(Arc::ptr_eq(documents.array().column(1), &shared));
         assert_eq!(projected.encode().unwrap().as_slice(), boxed.encode().unwrap().as_slice());
+    }
+
+    #[test]
+    fn prepared_static_insert_projects_packed_embeddings_into_source_documents() {
+        use arrow_array::{FixedSizeListArray, Float32Array, Int64Array};
+        use arrow_schema::Field;
+        use rtdb_columnar::OwnedBatch;
+
+        let memory = MemoryBudget::new(8 << 20);
+        let element = Arc::new(Field::new("$data$", DataType::Float32, true));
+        let children = Arc::new(Float32Array::from(vec![Some(1.25), None, Some(-0.0), Some(2.0)]));
+        let embedding = FixedSizeListArray::try_new(element, 2, children, None).unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("bound", embedding.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![2, 1])), Arc::new(embedding)]).unwrap();
+        let args = SqlArguments::from_arrow(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let submission = prepare_submission(vec![TxOp::Sql {
+            sql: "INSERT INTO docs (_id, embedding) VALUES ($1, $2)".into(), args: Some(args),
+        }], SubmitOptions::default(), "xtdb", &memory).unwrap();
+        let [Operation::Public(TxOp::PutArrowDocs { documents, .. })] = submission.operations.as_slice() else {
+            panic!("expected Arrow document projection");
+        };
+        let embedding = documents.array().column_by_name("embedding").unwrap();
+        let embedding = embedding.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let values = embedding.values().as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(values.iter().map(|value| value.map(f32::to_bits)).collect::<Vec<_>>(),
+            [Some(1.25_f32.to_bits()), None, Some((-0.0_f32).to_bits()), Some(2.0_f32.to_bits())]);
+        assert!(!submission.encode().unwrap().as_slice().is_empty());
     }
 
     #[test]

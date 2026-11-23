@@ -205,12 +205,36 @@ impl RangeBins {
     }
     pub(crate) fn size(self) -> Result<i32> { i32::try_from(self.size).map_err(|_|overflow()) }
     pub(crate) fn len(self) -> Result<usize> { Ok(self.size()?.max(0) as usize) }
-    pub(crate) fn nth(self,index: usize) -> Value {
+    fn cell(self, index: usize) -> (i64, i64, f64) {
         let from = self.base.wrapping_add((index as i64).wrapping_mul(self.stride));
         let to = self.base.wrapping_add((index as i64).wrapping_add(1).wrapping_mul(self.stride));
         let weight = (to.min(self.to).wrapping_sub(from.max(self.from))) as f64 / self.to.wrapping_sub(self.from) as f64;
+        (from, to, weight)
+    }
+
+    pub(crate) fn nth(self, index: usize) -> Value {
+        let (from, to, weight) = self.cell(index);
         Value::Struct(StructFields::from([("_from".into(),timestamp(from,U::Microsecond,Some("UTC".into()))),("_to".into(),timestamp(to,U::Microsecond,Some("UTC".into()))),("_weight".into(),Value::F64(weight))]))
     }
+
+    pub(crate) fn arrow_column(self, length: usize, scope: &crate::EvaluationScope)
+        -> Result<(arrow_schema::FieldRef, arrow_array::ArrayRef)>
+    {
+        use std::sync::Arc;
+        use arrow_array::{Float64Array, StructArray, TimestampMicrosecondArray};
+        use arrow_schema::DataType;
+
+        scope.reserve(length.checked_mul(24).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        let field = Arc::new(rtdb_columnar::to_field("value", &rtdb_plan::range_bin_element_type())?);
+        let DataType::Struct(children) = field.data_type() else { unreachable!("range bin is a struct") };
+        let from = TimestampMicrosecondArray::from_iter_values((0..length).map(|index| self.cell(index).0)).with_timezone("UTC");
+        let to = TimestampMicrosecondArray::from_iter_values((0..length).map(|index| self.cell(index).1)).with_timezone("UTC");
+        let weight = Float64Array::from_iter_values((0..length).map(|index| self.cell(index).2));
+        let array = StructArray::try_new(children.clone(), vec![Arc::new(from), Arc::new(to), Arc::new(weight)], None)
+            .map_err(|error| rtdb_types::Anomaly::fault("rtdb.expr/range-bin", error.to_string()))?;
+        Ok((field, Arc::new(array)))
+    }
+
     pub(crate) fn reserve(self,context: &EvalContext<'_>) -> Result<Vec<Value>> {
         let length = self.len()?;
         context.reserve(length.checked_mul(4096).ok_or_else(overflow)?)?;

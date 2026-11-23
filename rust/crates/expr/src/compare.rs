@@ -251,6 +251,15 @@ fn interval_order(left: &Value, right: &Value, a: IntervalParts, b: IntervalPart
     Ok(nanos(a).cmp(&nanos(b)))
 }
 
+pub(crate) fn float_order(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.total_cmp(&right),
+    }
+}
+
 pub(crate) fn predicate_order(left: &Value, right: &Value, timezone: &str) -> Result<Ordering> {
     let left_reference = postgres_reference(left).map(Value::I32);
     let right_reference = postgres_reference(right).map(Value::I32);
@@ -290,8 +299,7 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
         return Ok(crate::decimal::compare_parts(&left, ls, &right, rs));
     }
     if let (Some(left), Some(right)) = (number(left), number(right)) {
-        return Ok(if left.is_nan() { if right.is_nan() { Ordering::Equal } else { Ordering::Greater } }
-            else if right.is_nan() { Ordering::Less } else { left.total_cmp(&right) });
+        return Ok(float_order(left, right));
     }
     match (left, right) {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
@@ -308,9 +316,7 @@ pub fn compare_in_timezone(left: &Value, right: &Value, nulls_first: bool, timez
                 let null_first = if nulls_first { Ordering::Less } else { Ordering::Greater };
                 for index in 0..a.len().min(b.len()) {
                     let order = match (a.float_component(index), b.float_component(index)) {
-                        (Some(left), Some(right)) if left.is_nan() => if right.is_nan() { Ordering::Equal } else { Ordering::Greater },
-                        (Some(_), Some(right)) if right.is_nan() => Ordering::Less,
-                        (Some(left), Some(right)) => left.total_cmp(&right),
+                        (Some(left), Some(right)) => float_order(left, right),
                         (None, Some(_)) => null_first,
                         (Some(_), None) => null_first.reverse(),
                         (None, None) => Ordering::Equal,

@@ -169,9 +169,9 @@ pub fn decimal_long_value(value: &DecimalValue) -> i64 {
     i64::from_be_bytes(low)
 }
 
-/// Converts through a bounded decimal representation, retaining signed underflow and IEEE infinities.
+/// Rounds a decimal to binary64, retaining signed underflow and IEEE infinities.
 pub fn decimal_to_f64(value: &DecimalValue) -> f64 {
-    decimal_text(value).parse().unwrap_or_else(|_| if coefficient(value).sign() == Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY })
+    rtdb_types::jvm_number::decimal_bytes_to_f64(&value.unscaled, value.scale)
 }
 
 pub(crate) fn compare_parts(left: &BigInt, left_scale: i64, right: &BigInt, right_scale: i64) -> Ordering {

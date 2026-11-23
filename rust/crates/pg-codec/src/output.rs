@@ -53,8 +53,7 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
     let bytes = match ty {
         PgType::Int2 | PgType::Int4 | PgType::Int8 => {
             let integer = rtdb_expr::integer(value).ok_or_else(|| incompatible(ty, value))?;
-            if binary { match ty { PgType::Int2 => (integer as i16).to_be_bytes().to_vec(), PgType::Int4 => (integer as i32).to_be_bytes().to_vec(), _ => (integer as i64).to_be_bytes().to_vec() } }
-            else { integer.to_string().into_bytes() }
+            integer_bytes(ty, format, integer)
         }
         PgType::Float4 | PgType::Float8 => {
             let number = rtdb_expr::number(value).ok_or_else(|| incompatible(ty, value))?;
@@ -104,26 +103,64 @@ pub fn encode_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Op
     }
 }
 
+fn integer_bytes(ty: PgType, format: Format, integer: i128) -> Vec<u8> {
+    if format == Format::Text { return integer.to_string().into_bytes(); }
+    match ty {
+        PgType::Int2 => (integer as i16).to_be_bytes().to_vec(),
+        PgType::Int4 => (integer as i32).to_be_bytes().to_vec(),
+        _ => (integer as i64).to_be_bytes().to_vec(),
+    }
+}
+
 fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironment) -> Result<Vec<u8>> {
     let values = match value { Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(), _ => return Err(incompatible(ty, value)) };
+    array_payload(ty, format, values.iter(), |element, value| {
+        match value.as_ref() {
+            Value::Null | Value::Undefined => Ok(None),
+            value => encode_value(element, format, value, env).map(Some),
+        }
+    })
+}
+
+fn array_payload<T>(
+    ty: PgType, format: Format, cells: impl ExactSizeIterator<Item = T>,
+    mut encode: impl FnMut(PgType, T) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<u8>> {
     let element = match ty { PgType::Int4s => PgType::Int4, PgType::Int8s => PgType::Int8, _ => PgType::Text };
     if format == Format::Binary {
-        let mut result = Vec::new();
-        for value in [1, 0, element.descriptor().oid, i32::try_from(values.len()).map_err(invalid)?, 1] { result.extend_from_slice(&value.to_be_bytes()); }
-        for value in values.iter() {
-            if matches!(value.as_ref(), Value::Null | Value::Undefined) { if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); } result.extend_from_slice(&(-1i32).to_be_bytes()); }
-            else { let bytes = encode_value(element, format, value.as_ref(), env)?; result.extend_from_slice(&i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes()); result.extend_from_slice(&bytes); }
+        let mut output = Vec::new();
+        for field in [1, 0, element.descriptor().oid, i32::try_from(cells.len()).map_err(invalid)?, 1] {
+            output.extend_from_slice(&field.to_be_bytes());
         }
-        Ok(result)
-    } else {
-        let mut output = String::from("{");
-        for (index, value) in values.iter().enumerate() {
-            if index != 0 { output.push(','); }
-            if matches!(value.as_ref(), Value::Null | Value::Undefined) { output.push_str("NULL"); }
-            else { let bytes = encode_value(element, format, value.as_ref(), env)?; let text = std::str::from_utf8(&bytes).map_err(invalid)?; if ty == PgType::Texts { output.push('"'); for ch in text.chars() { if matches!(ch, '\\' | '"') { output.push('\\'); } output.push(ch); } output.push('"'); } else { output.push_str(text); } }
+        for cell in cells {
+            if let Some(bytes) = encode(element, cell)? {
+                output.extend_from_slice(&i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes());
+                output.extend_from_slice(&bytes);
+            } else {
+                if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); }
+                output.extend_from_slice(&(-1i32).to_be_bytes());
+            }
         }
-        output.push('}'); Ok(output.into_bytes())
+        return Ok(output);
     }
+    let mut output = String::from("{");
+    for (index, cell) in cells.enumerate() {
+        if index != 0 { output.push(','); }
+        let Some(bytes) = encode(element, cell)? else { output.push_str("NULL"); continue; };
+        let text = std::str::from_utf8(&bytes).map_err(invalid)?;
+        if ty == PgType::Texts {
+            output.push('"');
+            for ch in text.chars() {
+                if matches!(ch, '\\' | '"') { output.push('\\'); }
+                output.push(ch);
+            }
+            output.push('"');
+        } else {
+            output.push_str(text);
+        }
+    }
+    output.push('}');
+    Ok(output.into_bytes())
 }
 
 fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> {

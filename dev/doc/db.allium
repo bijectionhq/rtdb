@@ -118,6 +118,7 @@ external entity ExternalSource {
     -- A system outside XTDB that feeds a database by change data capture, e.g. Postgres logical replication.
     -- On assignment it is handed an indexing callback and an opaque resume token to start after, and feeds transactions in directly.
     -- The native PostgreSQL direct mirror stages snapshots and logical changes from Arrow arrays.
+    -- Primitive PostgreSQL text fields and supported text or integer arrays decode directly into Arrow builders.
     -- An external-source database assigns its own monotonically increasing tx_id off the RESOLVED head rather than taking it from the source-log position.
     -- A client submit is rejected for such a database: transactions enter only through the source.
 }
@@ -408,6 +409,7 @@ entity SourceMessage {
 variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
+    -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
     -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
     -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
@@ -417,9 +419,9 @@ variant TxMessage : SourceMessage {
     -- Put and create-only insert replay retain their Arrow document vectors.
     -- Governed Arrow writes fill acceptance-relative binary slots in the selected columns during staging.
     -- A put record without an IID vector derives its IIDs from the document ID cells.
-    -- A static INSERT from compatible positional scalar batches projects Arrow arguments into source document vectors in upload order.
+    -- A static INSERT from compatible positional Arrow batches projects Arrow arguments into source document vectors in upload order, including supported lists and structs.
     -- A static INSERT with per-row valid-time expressions reads the operands of those expressions and gathers compatible payload columns in Arrow.
-    -- Rows are grouped by their evaluated bounds in first-seen order and retain their order within each group.
+    -- The projected document batch carries each row's evaluated validity bounds and keeps the original row order.
     -- A document layout retains its schema and column metadata while releasing translation scratch after construction.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
@@ -2061,6 +2063,7 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
+        -- The reader binds separately framed numeric predicate constants from an Arrow parameter row.
 }
 
 ---- Deferred Specifications

@@ -407,6 +407,38 @@ A `Value` carrying a packed numeric list still has typed components. Component m
 | Exact scoring and index selection | Cosine uses a normalized native query buffer and scalar accumulators. Top-k retains keys and row positions. FTS uses token and posting state, ordered indexes use comparison keys and IIDs, and spatial queries use spatial search state and projected event positions. The logical FTS format writes indexed text token deltas as Arrow IPC and stores posting receipts and revision witnesses separately. Point reads resolve primary Arrow positions before gathering documents, including embeddings. | 7, 18, 27 | [Cosine projection](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/query/src/cosine.rs#L70) · [Ranked selection](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/query/src/sort/batches.rs) · [FTS lane](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/search/src/lane.rs) · [Logical posting runs](rtdb-fts-logical-postings.md) · [Token delta](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/search/src/delta.rs#L41) · [Point payload gather](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/query/src/scan.rs#L1121) · [Ordered key adapter](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/node/src/ordered_index/key.rs#L124) · [Spatial scan](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/query/src/owned_relation.rs#L550) |
 | Experimental ANN fixture and index | HDF5 and NumPy are fixture or training formats. Centroids, posting or range positions, candidate IDs, masks, and heaps are index state. Candidate payload and the exact rerank parameter use typed storage, including a borrowed Float32 view of the Arrow fixture. | 28 | [Experimental index](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/node/examples/support/vector_index.rs#L70) · [Rerank workload](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/node/examples/support/vector_workload.rs) · [Fixture producer](https://github.com/bijectionhq/rtdb/blob/be09139279/rust/crates/node/examples/support/vector_benchmark_data.py) |
 
+### Arrow follow-up implementation
+
+Prepared static inserts project compatible nested list and struct parameters into document columns.
+Timed inserts evaluate their valid-time operands and gather the nested payload by Arrow position.
+The SQL source operation writes retained argument IPC into the binary column directly.
+
+Computed UNNEST appends observed child arrays and gathers its payload and child positions independently.
+It emits typed ordinals and reuses typed columns for integer series and range bins.
+Numeric list slicing, floating-point list equality and ordering, float list group and set keys, and cosine evaluation can work from typed Arrow children.
+Decimals round directly to binary64, including signed underflow and ties to even.
+Direct correlated arguments and delegated numeric predicate parameters retain their Arrow cells until a scalar consumer needs one.
+
+Pgwire emits standard SQL arrays and streams Transit containers from Arrow fields.
+The embedded Transit result cursor writes the same typed row format one Arrow row at a time.
+The PostgreSQL source decodes fixed-type primitive inputs and supported arrays directly into Arrow builders.
+Kafka's numeric arrays feed typed list builders during conversion.
+Result conformance can synthesize absent nullable fields in Arrow.
+
+Generic row plans and the per-cell evaluator still handle expressions and operator shapes outside the supported Arrow paths.
+Generic layout conformance, mixed document conversion, value-dependent connector decoders, and unsupported owned-write layouts still use scalar values.
+Those cases remain open for an end-to-end Arrow implementation.
+PostgreSQL DataRow framing, requested text and opaque terms, compatibility wire formats, durable envelopes, typed buffer ownership, and native index state retain their contracts.
+
+The native library and release benchmark built on the candidate based on RTDB main `c28482fa90`.
+The eight focused Rust regressions and seven workspace doctests passed.
+Gradle ran 3,243 unit tests, 3,348 property tests and 5,629 integration tests successfully, with one PostgreSQL integration skip.
+
+The release workload passed result-order and distance checks over 60 stationary and 20 churn query/filter cases on 100,000 GloVe embeddings.
+The workload also passed five temporal canaries.
+These runs establish correctness across the measured routes.
+The workload ran alongside the test suites, so its latencies are unsuitable for a controlled performance comparison.
+
 ### Pre-integration non-Arrow inventory at `fa969b755`
 
 This source audit covers RTDB vector search at `fa969b755`, from client input and primary storage through exact SQL, the experimental ANN workload, and result export.

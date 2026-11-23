@@ -182,15 +182,7 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
             }
         }
         if name == "cosine_distance" && let [left, right] = values.as_slice() {
-            fn stored_input<'a>(value: &'a EvalValue<'a>) -> Option<crate::vector::VectorInput<'a>> {
-                let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
-                match reader.as_ref() {
-                    ListReader::Stored(list) => Some(crate::vector::VectorInput::Stored(list.view())),
-                    ListReader::Arrow(cell) => crate::vector::VectorInput::from_arrow(*cell),
-                    _ => None,
-                }
-            }
-            if let (Some(left), Some(right)) = (stored_input(left), stored_input(right)) {
+            if let (Some(left), Some(right)) = (borrowed_vector(left), borrowed_vector(right)) {
                 return Ok(scalar(crate::vector::score_pair(left, right)?));
             }
         }

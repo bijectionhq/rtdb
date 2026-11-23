@@ -192,6 +192,32 @@ pub struct EvaluatedList { storage: ListStorage }
 impl EvaluatedList {
     pub fn len(&self) -> usize { match &self.storage { ListStorage::Integer(series) => series.len(), ListStorage::Bins { length,.. } => *length, ListStorage::List(list) => list.len(), ListStorage::Values(values) => values.len() } }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+    /// Borrows scalar cells if present, and returns an empty slice for an empty packed list.
+    pub fn scalar_values(&self) -> Option<&[Value]> {
+        match &self.storage {
+            ListStorage::Values(values) => Some(values),
+            ListStorage::List(list) => list.scalar_values(),
+            _ => None,
+        }
+    }
+
+    /// Exposes packed list cells or writes a generated list directly into Arrow.
+    /// Keep the evaluation scope until the returned column is dropped or admitted separately.
+    pub fn arrow_column(&self, scope: &crate::EvaluationScope) -> Result<Option<(arrow_schema::FieldRef, arrow_array::ArrayRef)>> {
+        use arrow_array::{ArrayRef, Int64Array};
+        use arrow_schema::{DataType, Field};
+        Ok(match &self.storage {
+            ListStorage::List(list) => list.packed_column(),
+            ListStorage::Integer(series) => {
+                scope.reserve(series.len().checked_mul(8).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?)?;
+                let array = Arc::new(Int64Array::from_iter_values((0..series.len()).map(|index| series.at(index)))) as ArrayRef;
+                Some((Arc::new(Field::new("value", DataType::Int64, false)), array))
+            }
+            ListStorage::Bins { reader, length } => Some(reader.arrow_column(*length, scope)?),
+            ListStorage::Values(_) => None,
+        })
+    }
+
     /// Bounds the temporary allocation made by `get`; reserve it before calling and retain it while the returned cell lives.
     pub fn cell_allocation_bound(&self) -> usize { if matches!(self.storage,ListStorage::Bins {..}) { 4096 } else { 0 } }
     /// Returns no cell outside the list; generated cells are owned and stored cells remain borrowed.

@@ -276,7 +276,7 @@ impl Response {
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, request: Request) -> Response;
 
-    async fn fragment_ipc(&self, _name: &str, _fragment: &rtdb_query::ScanFragment, _grant: &str)
+    async fn fragment_ipc(&self, _name: &str, _fragment: &rtdb_query::ScanFragment, _grant: &str, _arguments: Option<rtdb_query::BoundParameters>)
         -> Option<Result<rtdb_query::FragmentBytes>> { None }
 }
 
@@ -320,7 +320,7 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
             let Some(request) = request else { return; };
             let mut startup_probe_overflows = None;
             let response = match request {
-                Ok((envelope, _argument_lease)) => match envelope.request {
+                Ok((envelope, arguments)) => match envelope.request {
                         Request::OpenPgwire => {
                             if let Some(PgwireEndpoint { address, relay_slots: Some(slots), .. }) = pgwire.filter(|_| key.0.is_some()) {
                                 if let Ok(_slot) = slots.try_acquire_owned() {
@@ -339,7 +339,7 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
                         request => {
                             if envelope.fragment_ipc == Some(true)
                                 && let Request::ScanFragment { name, fragment, grant } = &request
-                                && let Some(result) = handler.fragment_ipc(name, fragment, grant).await
+                                && let Some(result) = handler.fragment_ipc(name, fragment, grant, arguments).await
                             {
                                 match result {
                                     Ok(batches) => {
@@ -374,7 +374,7 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
 
 async fn read_request(
     stream: &mut TcpStream, key: &ControlKey,
-) -> Result<(Envelope, Option<Arc<rtdb_columnar::MemoryReservation>>)> {
+) -> Result<(Envelope, Option<rtdb_query::BoundParameters>)> {
     let malformed = |message| Anomaly::incorrect("rtdb.multi/control-request", message);
     let mut reader = BufReader::new(stream.take(MAXIMUM_REQUEST_BYTES));
     let mut line = String::new();
@@ -395,7 +395,7 @@ async fn read_request(
     let memory = MemoryBudget::new(16 << 20);
     let bytes = tokio::time::timeout(Duration::from_secs(5), FragmentBytes::read_from(&mut reader, arguments.length, &memory))
         .await.map_err(|_| malformed("Fragment argument frame timed out"))??;
-    let args = fragment.restore_wire_predicates(arguments.predicates, bytes.as_slice(), &memory)?;
+    let args = fragment.bind_wire_predicates(arguments.predicates, bytes.as_slice(), &memory)?;
     Ok((envelope, Some(args)))
 }
 

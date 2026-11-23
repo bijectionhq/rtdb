@@ -3,14 +3,17 @@ use std::collections::BTreeMap;
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
 use crate::interval::parse as interval;
 
+mod column;
+pub use column::read_text_column;
+
 /// The caller covers decoding allocations and the returned value with its own reservation.
 /// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
 pub fn read_text(oid: u32, text: &str) -> Result<Value> {
     if rtdb_types::PgType::from_oid(oid as i32).is_none() { return Ok(Value::Utf8(text.to_owned())); }
     Ok(match oid {
-        16 => Value::Bool(match text.trim().to_ascii_lowercase().as_str() { "tr" | "yes" | "tru" | "true" | "on" | "ye" | "t" | "y" | "1" => true, "f" | "fa" | "fal" | "fals" | "false" | "no" | "n" | "off" | "0" => false, _ => return Err(invalid("Invalid PostgreSQL boolean")) }),
+        16 => Value::Bool(parse_boolean(text)?),
         21 => Value::I16(text.parse().map_err(invalid)?), 23 => Value::I32(text.parse().map_err(invalid)?), 20 => Value::I64(text.parse().map_err(invalid)?),
-        700 => Value::F32(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }), 701 => Value::F64(float(text)?),
+        700 => Value::F32(float32(text)?), 701 => Value::F64(float(text)?),
         1700 => decimal(text)?,
         17 => Value::Binary(if let Some(hex) = text.strip_prefix("\\x") { if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); } hex.as_bytes().chunks_exact(2).map(|pair| { let text = std::str::from_utf8(pair).map_err(invalid)?; u8::from_str_radix(text, 16).map_err(invalid) }).collect::<Result<_>>()? } else { text.as_bytes().to_vec() }),
         2950 => Value::Uuid(*uuid::Uuid::parse_str(text).map_err(invalid)?.as_bytes()),
@@ -20,7 +23,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         1184 => timestamp(text)?,
         1186 => { let (months, days, nanoseconds) = interval(text)?; if nanoseconds % 1000 != 0 { Value::IntervalMonthDayNano { months, days, nanoseconds } } else if nanoseconds != 0 || days != 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } } else { Value::IntervalYearMonth(months) } },
         11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
-        1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; Value::list(array(text)?.into_iter().map(|value| value.map_or(Ok(Value::Null), |text| read_text(element, &text))).collect::<Result<_>>()?) },
+        1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; let mut list = rtdb_types::ListBuilder::with_capacity(0); visit_array(text, |value| { list.push(value.map_or(Ok(Value::Null), |text| read_text(element, &text))?); Ok(()) })?; Value::List(list.finish()) },
         114 | 3802 => read_json(text)?,
         3910 => {
             let Some(inner) = text.strip_prefix('[').and_then(|text| text.strip_suffix(')')) else { return Ok(Value::Null); };
@@ -33,6 +36,8 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         _ => Value::Utf8(text.to_owned()),
     })
 }
+fn parse_boolean(text: &str) -> Result<bool> { Ok(match text.trim().to_ascii_lowercase().as_str() { "tr" | "yes" | "tru" | "true" | "on" | "ye" | "t" | "y" | "1" => true, "f" | "fa" | "fal" | "fals" | "false" | "no" | "n" | "off" | "0" => false, _ => return Err(invalid("Invalid PostgreSQL boolean")) }) }
+fn float32(text: &str) -> Result<f32> { Ok(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }) }
 fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
 pub(crate) fn decimal(text: &str) -> Result<Value> {
     let decimal = rtdb_expr::parse_decimal(text).map_err(invalid)?;
@@ -52,17 +57,49 @@ fn timestamp(text: &str) -> Result<Value> {
     let Value::Timestamp { value, unit, timezone: Some(zone) } = rtdb_types::parse_sql_timestamp_literal(text)? else { return Err(invalid("Zoned timestamp requires an offset or region")); };
     Ok(Value::Timestamp { value, unit, timezone: Some(rtdb_expr::normalize_timezone(&zone)?) })
 }
-fn array(text: &str) -> Result<Vec<Option<String>>> {
-    let text = text.trim(); if text.is_empty() || text == "{}" { return Ok(Vec::new()); }
-    let inner = text.strip_prefix('{').and_then(|text| text.strip_suffix('}')).ok_or_else(|| invalid("PostgreSQL array must be one-dimensional"))?;
-    let mut result = Vec::new(); let mut value = String::new(); let mut quoted = false; let mut escaped = false; let mut special = false;
-    let finish = |result: &mut Vec<Option<String>>, value: &mut String, special: bool| { let raw = std::mem::take(value); result.push(if special { Some(raw) } else { let raw = raw.trim(); if raw.eq_ignore_ascii_case("NULL") { None } else { Some(raw.to_owned()) } }); };
-    for character in inner.chars() {
-        if escaped { value.push(character); escaped = false; continue; }
-        match character { '\\' => { escaped = true; special = true; }, '"' => { quoted = !quoted; special = true; }, ',' if !quoted => { finish(&mut result, &mut value, special); special = false; }, '{' | '}' if !quoted => return Err(invalid("Nested PostgreSQL arrays are unsupported by the pinned type reader")), value_char => value.push(value_char) }
+fn visit_array<'a>(text: &'a str, mut visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {
+    use std::borrow::Cow;
+
+    let text = text.trim();
+    if text.is_empty() || text == "{}" { return Ok(()); }
+    let inner = text.strip_prefix('{').and_then(|text| text.strip_suffix('}'))
+        .ok_or_else(|| invalid("PostgreSQL array must be one-dimensional"))?;
+    let mut start = 0;
+    let mut copied = 0;
+    let mut decoded: Option<String> = None;
+    let mut quoted = false;
+    let mut escaped = false;
+    let finish = |from: usize, end: usize, copied: usize, decoded: Option<String>| {
+        if let Some(mut decoded) = decoded {
+            decoded.push_str(&inner[copied..end]);
+            return Some(Cow::Owned(decoded));
+        }
+        let raw = inner[from..end].trim();
+        (!raw.eq_ignore_ascii_case("NULL")).then_some(Cow::Borrowed(raw))
+    };
+    for (index, character) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' | '"' => {
+                let buffer = decoded.get_or_insert_with(String::new);
+                buffer.push_str(&inner[copied..index]);
+                copied = index + 1;
+                if character == '"' { quoted = !quoted; } else { escaped = true; }
+            }
+            ',' if !quoted => {
+                visit(finish(start, index, copied, decoded.take()))?;
+                start = index + 1;
+                copied = start;
+            }
+            '{' | '}' if !quoted => return Err(invalid("Nested PostgreSQL arrays are unsupported by the pinned type reader")),
+            _ => {}
+        }
     }
     if quoted || escaped { return Err(invalid("Unterminated PostgreSQL array element")); }
-    finish(&mut result, &mut value, special); Ok(result)
+    visit(finish(start, inner.len(), copied, decoded))
 }
 fn read_json(text: &str) -> Result<Value> {
     use serde_json::value::RawValue;

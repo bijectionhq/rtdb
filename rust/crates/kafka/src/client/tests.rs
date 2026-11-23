@@ -176,7 +176,7 @@ fn native_client_copies_retain_one_tls_snapshot_after_the_log_and_store_file_are
     let producer_config = crate::producer_config(&configuration, &log_options, &Warnings::default(), false);
     let native = producer_config.create_native_config().unwrap();
     let duplicate = native.clone(); drop(native); drop(producer_config);
-    let log = KafkaLog { configuration: crate::LogConfiguration::Common(configuration), options: log_options, progress: Arc::new(crate::Progress::new(-1)), access: crate::Access::ReadOnly };
+    let log = KafkaLog { configuration: crate::LogConfiguration::Common(configuration), options: log_options, progress: Arc::new(crate::Progress::new(-1)), access: crate::Access::ReadOnly, keys: None, topic_id: None };
     let consumer = crate::consumer(&log.configuration, &log.options).unwrap();
     let admin: AdminClient<DefaultClientContext> = log.configuration.prepare(crate::Role::Admin).unwrap().configuration.create().unwrap();
     let producer = Client::new(&ClientConfig::new(), duplicate, RDKafkaType::RD_KAFKA_PRODUCER, DefaultClientContext).unwrap();

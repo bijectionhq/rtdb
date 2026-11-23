@@ -428,7 +428,7 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
         Avro::Array(values) => {
             let Schema::Array(array) = schema else { return Err(error("avro-decode", "Array value lacks its schema")); };
             let element = match &connect.kind { SchemaKind::Array(element) => element.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(error("avro-decode", "Array Connect schema is absent")) };
-            Value::list(values.into_iter().map(|value| convert(&array.items, value, names, unions, element, depth + 1)).collect::<Result<_>>()?)
+            Value::List(rtdb_types::ListValue::try_from_cells(values.into_iter().map(|value| convert(&array.items, value, names, unions, element, depth + 1)))?)
         }
         Avro::Map(values) => {
             let Schema::Map(map) = schema else { return Err(error("avro-decode", "Map value lacks its schema")); };

@@ -70,6 +70,21 @@ impl<'a> ArrowCell<'a> {
         })
     }
 
+    /// Reads an unannotated integer, preserving its physical signedness.
+    /// Nulls and other layouts have no integer value.
+    pub fn integer(self) -> Option<i128> {
+        use arrow_array::{cast::AsArray, types::*};
+
+        if self.array.is_null(self.row) || !self.field.metadata().is_empty() { return None; }
+        Some(match self.field.data_type() {
+            DataType::UInt8 => i128::from(self.array.as_primitive::<UInt8Type>().value(self.row)),
+            DataType::UInt16 => i128::from(self.array.as_primitive::<UInt16Type>().value(self.row)),
+            DataType::UInt32 => i128::from(self.array.as_primitive::<UInt32Type>().value(self.row)),
+            DataType::UInt64 => i128::from(self.array.as_primitive::<UInt64Type>().value(self.row)),
+            _ => i128::from(self.signed_integer()?),
+        })
+    }
+
     /// Bounds the metadata allocated by `observed_type` without charging the selected payload bytes.
     pub fn observed_type_bytes(self) -> Result<usize> {
         fn add_child(bytes: usize, child: ArrowCell<'_>) -> Result<usize> {
@@ -349,6 +364,24 @@ impl<'a> ArrowCell<'a> {
                 _ => return None,
             };
         (from <= to && to <= values.len()).then_some((element, values, from..to))
+    }
+
+    /// Borrows a floating-point list's child array and the positions used by this cell.
+    /// Supports Float32, Float64, and dense unions of those widths with optional nulls.
+    pub fn float_list_span(self) -> Option<(rtdb_types::ListView<'a>, std::ops::Range<usize>)> {
+        use arrow_array::{Float32Array, Float64Array, UnionArray};
+        use rtdb_types::{ListValue, ListView};
+
+        if !matches!(self.sequence_kind()?, ListKind::List | ListKind::FixedSizeList(_)) { return None; }
+        let (field, array, range) = self.sequence_range()?;
+        if !field.metadata().is_empty() { return None; }
+        let values = match field.data_type() {
+            DataType::Float32 => ListView::F32(array.as_any().downcast_ref::<Float32Array>()?),
+            DataType::Float64 => ListView::F64(array.as_any().downcast_ref::<Float64Array>()?),
+            ty if ListValue::supports_float_union(ty) => ListView::Union(array.as_any().downcast_ref::<UnionArray>()?),
+            _ => return None,
+        };
+        Some((values, range))
     }
 
     /// Counts the selected physical payload using only the active children.

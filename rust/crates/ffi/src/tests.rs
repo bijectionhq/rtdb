@@ -897,3 +897,45 @@ fn clojure_result_transit_encodes_doubles_without_precision_loss() {
     assert_eq!(first.to_bits(), value.to_bits());
     assert_eq!(second.to_bits(), (-0.0_f64).to_bits());
 }
+
+
+#[test]
+fn arrow_transit_rows_preserve_nested_types_and_null_omission() {
+    use rtdb_types::Value;
+
+    let row = Value::Struct(StructFields::from([
+        ("^embedding".into(), Value::list(vec![Value::F32(0.2), Value::Null, Value::F64(-0.0)])),
+        ("absent".into(), Value::Null),
+        ("nested".into(), Value::Struct(StructFields::from([
+            ("signed".into(), Value::I16(-3)),
+            ("wire".into(), Value::Utf8("~start".into())),
+        ]))),
+    ]));
+    let ty = row.logical_type();
+    let record = rtdb_columnar::copy_array(&ty, std::slice::from_ref(&row)).unwrap();
+    let record = record.as_any().downcast_ref::<StructArray>().unwrap();
+    let batch = RecordBatch::from(record.clone());
+    let mut direct = Vec::new();
+    rtdb_format::transit::write_arrow_row_json(&mut direct, &batch, 0).unwrap();
+    assert_eq!(direct, transit::encode_row(&row).unwrap());
+}
+
+
+#[test]
+fn arrow_transit_rows_keep_the_last_value_of_a_duplicate_column_name() {
+    use rtdb_types::Value;
+
+    let field = |name| Field::new(name, DataType::Int64, true);
+    let schema = Arc::new(Schema::new(vec![field("x"), field("y"), field("x")]));
+    let record = RecordBatch::try_new(schema, vec![
+        Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
+        Arc::new(Int64Array::from(vec![Some(10), Some(20)])),
+        Arc::new(Int64Array::from(vec![Some(30), None])),
+    ]).unwrap();
+    for (row, last, other) in [(0, Value::I64(30), Value::I64(10)), (1, Value::Null, Value::I64(20))] {
+        let expected = Value::Struct(StructFields::from([("x".into(), last), ("y".into(), other)]));
+        let mut output = Vec::new();
+        rtdb_format::transit::write_arrow_row_json(&mut output, &record, row).unwrap();
+        assert_eq!(output, transit::encode_row(&expected).unwrap());
+    }
+}

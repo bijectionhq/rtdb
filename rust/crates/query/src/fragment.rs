@@ -155,47 +155,49 @@ impl ScanFragment {
         Ok((fragment, predicates, bytes))
     }
 
-    pub fn restore_wire_predicates(
-        &mut self, mut predicates: Vec<(usize, rtdb_plan::Expr)>, bytes: &[u8], memory: &Arc<MemoryBudget>,
-    ) -> Result<Arc<rtdb_columnar::MemoryReservation>> {
+    /// Binds each predicate slot to a matching column in one uploaded IPC row.
+    /// Predicate insertion is atomic and the returned bindings retain the Arrow data.
+    pub fn bind_wire_predicates(
+        &mut self, predicates: Vec<(usize, rtdb_plan::Expr)>, bytes: &[u8], memory: &Arc<MemoryBudget>,
+    ) -> Result<crate::BoundParameters> {
         use rtdb_plan::Expr;
         let malformed = || invalid("fragment-argument", "Invalid delegated predicate argument");
         let stream = rtdb_format::ipc::OwnedStream::read(bytes, memory)?;
         let [page] = stream.pages() else { return Err(malformed()); };
         let batch = page.batch();
-        if batch.num_rows() != 1 { return Err(malformed()); }
-        let mut arguments = Vec::with_capacity(batch.num_columns());
-        let mut reservation = memory.reserve(4096)?;
-        for (field, array) in batch.schema_ref().fields().iter().zip(batch.columns()) {
-            let bound = rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)?;
-            let charge = Arc::get_mut(&mut reservation).expect("Fragment decoder owns its arguments");
-            charge.grow_to(charge.bytes().checked_add(bound).ok_or_else(malformed)?)?;
-            arguments.push(Some(rtdb_columnar::read_value(field, array.as_ref(), 0)?));
-        }
-        for (_, predicate) in &mut predicates {
+        if batch.num_rows() != 1 || self.scan.predicates.iter().any(|predicate| !portable(predicate)) { return Err(malformed()); }
+        let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+        let types = batch.schema_ref().fields().iter().map(|field| rtdb_columnar::from_field(field)).collect::<Result<Vec<_>>>()?;
+        let mut unused = vec![true; batch.num_columns()];
+        for (_, predicate) in &predicates {
             let mut invalid_parameter = false;
-            predicate.rewrite(&mut |expr| {
+            let mut portable_shape = predicate.clone();
+            portable_shape.rewrite(&mut |expr| {
                 if let Expr::Parameter { index, data_type } = expr {
-                    match arguments.get_mut(*index).and_then(Option::take) {
-                        Some(value) if value.logical_type() == *data_type => *expr = Expr::Literal(value),
-                        _ => invalid_parameter = true,
+                    if types.get(*index) == Some(&*data_type) && std::mem::take(&mut unused[*index]) {
+                        *expr = Expr::Literal(Value::Null);
+                    } else {
+                        invalid_parameter = true;
                     }
                 }
             });
-            if invalid_parameter || !portable(predicate) { return Err(malformed()); }
+            if invalid_parameter || !portable(&portable_shape) { return Err(malformed()); }
         }
-        if arguments.iter().any(Option::is_some) { return Err(malformed()); }
+        if unused.into_iter().any(|slot| slot) { return Err(malformed()); }
         let mut previous = None;
-        for (position, predicate) in predicates {
-            if position > self.scan.predicates.len() || previous.is_some_and(|previous| previous >= position) {
+        let original_count = self.scan.predicates.len();
+        for (inserted, (position, _)) in predicates.iter().enumerate() {
+            if *position > original_count + inserted || previous.is_some_and(|previous| previous >= *position) {
                 return Err(malformed());
             }
-            self.scan.predicates.insert(position, predicate);
-            previous = Some(position);
+            previous = Some(*position);
         }
-        Ok(reservation)
+        let arguments = crate::BoundParameters::from_arrow(page.clone(), 0, types, memory)?;
+        for (position, predicate) in predicates {
+            self.scan.predicates.insert(position, predicate);
+        }
+        Ok(arguments)
     }
-
 
     /// The fragment of `scan` under `prefix`: its predicates and temporal filters stay with the coordinator, which filters
     /// the rows that come back, so the fragment carries only the projection and the bounds already evaluated.
@@ -256,20 +258,36 @@ pub async fn evaluate_fragment(context: Arc<QueryContext>, fragment: &ScanFragme
 
 /// Evaluates a fragment and keeps the wire allocation charged while the caller sends it.
 pub async fn evaluate_fragment_retained(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<FragmentBytes> {
+    evaluate_fragment_with_arguments(context, fragment, None).await
+}
+
+/// Evaluates a delegated scan with the bindings paired with its predicates.
+/// Parameter-free fragments need no bindings.
+pub async fn evaluate_fragment_with_arguments(
+    context: Arc<QueryContext>, fragment: &ScanFragment, arguments: Option<crate::BoundParameters>,
+) -> Result<FragmentBytes> {
     let cancellation = context.cancellation.clone();
     let owner = context.owner_cancellation.clone();
-    let work = owner.run_until_cancelled(cancellation.run_until_cancelled(evaluate_retained_fragment(Arc::clone(&context), fragment)));
+    let work = evaluate_retained_fragment(Arc::clone(&context), fragment, arguments);
+    let work = owner.run_until_cancelled(cancellation.run_until_cancelled(work));
     context.reading(async { work.await.flatten().ok_or_else(cancelled)? }).await
 }
 
-async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<FragmentBytes> {
+async fn evaluate_retained_fragment(
+    context: Arc<QueryContext>, fragment: &ScanFragment, arguments: Option<crate::BoundParameters>,
+) -> Result<FragmentBytes> {
     let database = context.catalog.database(fragment.database())?.clone();
     let [snapshot] = database.partitions.as_slice() else { return Err(invalid("fragment-partitions", "A fragment reads a database of one partition")) };
     if snapshot.tx_basis() != Some(fragment.basis) || snapshot.has_overlays() {
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.query/fragment-basis", format!("This node cannot serve the fragment's basis {:?}", fragment.basis)));
     }
     let memory = Arc::clone(&context.memory);
-    let execution = Execution { parameters: Arc::new(crate::parameters::BoundParameters::new(Vec::new(), Vec::new(), &memory)?), outer: OuterRows::empty(&memory)?, context, bindings: None, analysis: None };
+    let mut arguments = match arguments {
+        Some(arguments) => arguments,
+        None => crate::BoundParameters::new(Vec::new(), Vec::new(), &memory)?,
+    };
+    arguments.use_execution_budget(&memory);
+    let execution = Execution { parameters: Arc::new(arguments), outer: OuterRows::empty(&memory)?, context, bindings: None, analysis: None };
     let scan = crate::scan::PartitionScan::fragment(snapshot.clone(), Arc::clone(&database.storage), fragment, execution.clone());
     let mut batches: crate::columnar::BoxBatchCursor = Box::new(FragmentRows(scan));
     if let Some(predicate) = fragment.scan.predicates.iter().cloned().reduce(|left, right| rtdb_plan::Expr::binary(rtdb_plan::BinaryOp::And, left, right)) {
@@ -535,9 +553,16 @@ mod tests {
         assert_eq!(wire.scan.predicates, vec![predicates[0].clone(), predicates[2].clone()]);
         assert_eq!(headers[0].0, 1);
         assert_eq!(headers.len(), 1);
-        let args = wire.restore_wire_predicates(headers, bytes.as_slice(), &memory).unwrap();
+        let args = wire.bind_wire_predicates(headers, bytes.as_slice(), &memory).unwrap();
+        assert_eq!(args.types().len(), 2);
+        assert!(args.arrow_input(0).is_some());
+        assert!(args.arrow_input(1).is_some());
+        for predicate in &mut wire.scan.predicates {
+            predicate.rewrite(&mut |expr| if let Expr::Parameter { index, .. } = expr {
+                *expr = Expr::Literal(args.get(*index).unwrap().unwrap().clone());
+            });
+        }
         assert_eq!(wire.scan.predicates, predicates);
-        assert!(args.bytes() > 0);
         drop((wire, bytes, args));
         assert_eq!(memory.used_bytes(), 0);
     }

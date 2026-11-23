@@ -1432,11 +1432,12 @@ impl NodeAgent {
     /// Reads a fragment of another node's scan of `name`, from the holding or replica this node has of it, opening a replica if it has neither.
     pub async fn scan_fragment(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<Response> {
         use base64::Engine;
-        let batches = self.scan_fragment_payload(name, fragment).await?;
+        let batches = self.scan_fragment_payload(name, fragment, None).await?;
         Ok(Response::Fragment { batches: base64::engine::general_purpose::STANDARD.encode(batches.as_slice()) })
     }
 
-    async fn scan_fragment_payload(&self, name: &str, fragment: &rtdb_query::ScanFragment) -> Result<rtdb_query::FragmentBytes> {
+    async fn scan_fragment_payload(&self, name: &str, fragment: &rtdb_query::ScanFragment,
+        arguments: Option<rtdb_query::BoundParameters>) -> Result<rtdb_query::FragmentBytes> {
         self.require_directory_route(name)?;
         if fragment.database() != name { return Err(Anomaly::incorrect("rtdb.multi/fragment-database", format!("A fragment of {} was sent as one of {name}", fragment.database()))); }
         // A reader without the deployment open refuses at once, so its coordinator reads the slice itself rather than wait on an open; it opens a replica on its next pass, for the scans after.
@@ -1446,7 +1447,7 @@ impl NodeAgent {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-reader-cold", format!("This node is opening a replica of {name}")));
         }
         self.touch(name);
-        let response = self.node.scan_fragment_retained(fragment, self.options.fragments.catch_up, &CancellationToken::new()).await?;
+        let response = self.node.scan_fragment_with_arguments(fragment, arguments, self.options.fragments.catch_up, &CancellationToken::new()).await?;
         // A slice too large to answer in one response is read by its coordinator instead.
         if response.as_slice().len() as u64 > crate::control::MAXIMUM_FRAGMENT_BYTES {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/fragment-too-large", format!("A fragment of {name} is larger than one response carries")));
@@ -1963,10 +1964,10 @@ fn checkpoint_timeout(name: &str) -> Anomaly {
 
 #[async_trait]
 impl Handler for NodeAgent {
-    async fn fragment_ipc(&self, name: &str, fragment: &rtdb_query::ScanFragment, grant: &str)
+    async fn fragment_ipc(&self, name: &str, fragment: &rtdb_query::ScanFragment, grant: &str, arguments: Option<rtdb_query::BoundParameters>)
         -> Option<Result<rtdb_query::FragmentBytes>> {
         Some(match self.check_node_grant(grant, name) {
-            Ok(()) => self.scan_fragment_payload(name, fragment).await,
+            Ok(()) => self.scan_fragment_payload(name, fragment, arguments).await,
             Err(error) => Err(error),
         })
     }

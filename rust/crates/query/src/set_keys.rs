@@ -57,13 +57,15 @@ enum KeyHash {
 
 pub(crate) fn vector_cell_hash(column: &Column, row: usize) -> Option<i32> {
     if let Some(key) = ScalarKey::read(column, row) { return Some(key.hash() as i32); }
-    let (array, field, logical, row) = column.arrow_cell(row)??;
+    let (array, field, logical, offset) = column.arrow_cell(row)??;
     let logical = match logical? { LogicalType::Maybe(inner) => inner.as_ref(), logical => logical };
-    if !matches!(logical, LogicalType::Scalar(_)) { return None; }
+    if !matches!(logical, LogicalType::Scalar(_)) && column.expression_cell(row)?.float_list_span().is_none() {
+        return None;
+    }
     let physical = rtdb_columnar::from_field(field).ok()?;
     let physical = match &physical { LogicalType::Maybe(inner) => inner.as_ref(), physical => physical };
     if physical != logical { return None; }
-    rtdb_columnar::hash_cell(field, array, row, 0).ok()
+    rtdb_columnar::hash_cell(field, array, offset, 0).ok()
 }
 
 impl<'a> Key<'a> {
@@ -76,7 +78,12 @@ impl<'a> Key<'a> {
     ) -> Result<(u32, Self)> {
         let hash = batch.columns.iter().try_fold(0, |hash, column| {
             match hashing {
-                KeyHash::Set => ScalarKey::read(column, row).map(|cell| combine_equality_hash(hash, cell.hash())),
+                KeyHash::Set => ScalarKey::read(column, row).map(|cell| cell.hash())
+                    .or_else(|| {
+                        let cell = column.expression_cell(row)?;
+                        cell.float_list_span()?;
+                        rtdb_columnar::hash_cell(cell.field, cell.array, cell.row, 0).ok().map(|value| value as u32)
+                    }).map(|cell| combine_equality_hash(hash, cell)),
                 KeyHash::Vector => vector_cell_hash(column, row).map(|cell| crate::join_storage::combine_cell_hash(hash, cell)),
             }
         });
@@ -123,9 +130,22 @@ fn direct_equal(left: ArrowKey<'_>, right: ArrowKey<'_>) -> Option<bool> {
     }
     let mut equal = true;
     for (left_column, right_column) in left.batch.columns.iter().zip(&right.batch.columns) {
-        let left = ScalarKey::read(left_column, left.row)?;
-        let right = ScalarKey::read(right_column, right.row)?;
-        equal &= left.equal(right)?;
+        let scalar = ScalarKey::read(left_column, left.row).zip(ScalarKey::read(right_column, right.row));
+        if let Some((left, right)) = scalar {
+            equal &= left.equal(right)?;
+            continue;
+        }
+        let left = left_column.expression_cell(left.row)?;
+        let right = right_column.expression_cell(right.row)?;
+        if std::mem::discriminant(&left.sequence_kind()?) != std::mem::discriminant(&right.sequence_kind()?) {
+            return None;
+        }
+        let (left, a) = left.float_list_span()?;
+        let (right, b) = right.float_list_span()?;
+        equal &= a.len() == b.len() && a.zip(b).all(|(a, b)| match (left.float_component(a), right.float_component(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        });
     }
     Some(equal)
 }

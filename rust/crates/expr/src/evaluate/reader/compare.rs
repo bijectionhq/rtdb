@@ -24,6 +24,19 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
                 let size = len(&left)?;
                 if size != len(&right)? { return Ok(Some(false)); }
                 let mut unknown = false;
+                if !strict
+                    && let Some((left, left_offset, _)) = borrowed_vector(&left).and_then(crate::vector::VectorInput::float_cells)
+                    && let Some((right, right_offset, _)) = borrowed_vector(&right).and_then(crate::vector::VectorInput::float_cells)
+                {
+                    for index in 0..size {
+                        match (left.float_component(left_offset + index), right.float_component(right_offset + index)) {
+                            (Some(left), Some(right)) if left == right => {}
+                            (Some(_), Some(_)) => return Ok(Some(false)),
+                            _ => unknown = true,
+                        }
+                    }
+                    return Ok(if unknown { None } else { Some(true) });
+                }
                 for index in 0..size {
                     let a = nth(clone_value(&left,frame)?,index,frame)?.await?;
                     let b = nth(clone_value(&right,frame)?,index,frame)?.await?;
@@ -64,6 +77,20 @@ pub(super) fn order<'a>(left: EvalValue<'a>,right: EvalValue<'a>,frame: &'a Eval
             (EvalValue::Scalar(a),EvalValue::Scalar(b)) => crate::compare::predicate_order(a,b,frame.context.timezone),
             (EvalValue::List(a,_),EvalValue::List(b,_)) if a == b && *a != Kind::Set => {
                 let (a,b) = (len(&left)?,len(&right)?);
+                if let Some((left, left_offset, _)) = borrowed_vector(&left).and_then(crate::vector::VectorInput::float_cells)
+                    && let Some((right, right_offset, _)) = borrowed_vector(&right).and_then(crate::vector::VectorInput::float_cells)
+                {
+                    for index in 0..a.min(b) {
+                        let order = match (left.float_component(left_offset + index), right.float_component(right_offset + index)) {
+                            (Some(left), Some(right)) => crate::compare::float_order(left, right),
+                            (None, Some(_)) => Ordering::Greater,
+                            (Some(_), None) => Ordering::Less,
+                            (None, None) => Ordering::Equal,
+                        };
+                        if order != Ordering::Equal { return Ok(order); }
+                    }
+                    return Ok(a.cmp(&b));
+                }
                 for index in 0..a.min(b) {
                     let a = nth(clone_value(&left,frame)?,index,frame)?.await?;
                     let b = nth(clone_value(&right,frame)?,index,frame)?.await?;

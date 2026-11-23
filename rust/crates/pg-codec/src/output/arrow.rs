@@ -1,3 +1,5 @@
+use arrow_array::{cast::AsArray, types::{Float32Type, Float64Type}};
+use arrow_schema::DataType;
 use rtdb_columnar::ArrowCell;
 use rtdb_types::{ListKind, LogicalType};
 
@@ -11,7 +13,6 @@ pub fn encode_arrow(
     environment: &SessionEnvironment,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<EncodedValue>> {
-    let decode_bound = rtdb_columnar::estimate_read_cell_bytes(cell.field, cell.array, cell.row)?;
     if cell.is_null()? {
         return Ok(None);
     }
@@ -50,7 +51,9 @@ pub fn encode_arrow(
             .ok_or_else(size_error)?;
         let reservation = memory.reserve(bound)?;
         let bytes = if ty == PgType::Transit {
-            rtdb_format::transit::encode_json(&transit_cell(cell, true, 0)?)?
+            let mut output = Vec::new();
+            rtdb_format::transit::write_arrow_json(&mut output, cell).map_err(translate_output_error)?;
+            output
         } else {
             let mut output = String::new();
             json_cell(cell, ty == PgType::JsonLd, &mut output, 0)?;
@@ -58,7 +61,26 @@ pub fn encode_arrow(
         };
         return settle(bytes, reservation);
     }
-    let _scratch = memory.reserve(decode_bound)?;
+    if matches!(ty, PgType::Int4s | PgType::Int8s | PgType::Texts)
+        && matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_)))
+        && let Some(values) = cell.sequence()
+    {
+        let bound = cell.payload_bytes()?.checked_mul(16).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
+        let reservation = memory.reserve(bound)?;
+        let bytes = array_payload(ty, format, values, |element, cell| {
+            let cell = cell.physical()?;
+            if cell.is_null()? { return Ok(None); }
+            if matches!(element, PgType::Int4 | PgType::Int8) && let Some(value) = cell.integer() {
+                return Ok(Some(integer_bytes(element, format, value)));
+            }
+            if element == PgType::Text && let Some(text) = cell.utf8() {
+                return Ok(Some(text.as_bytes().to_vec()));
+            }
+            encode_value(element, format, &read_leaf(cell)?, environment).map(Some)
+        })?;
+        return settle(bytes, reservation);
+    }
+    let _scratch = memory.reserve(rtdb_columnar::estimate_read_cell_bytes(cell.field, cell.array, cell.row)?)?;
     let value = rtdb_columnar::read_value_as(logical, cell.field, cell.array, cell.row)?;
     encode(ty, format, &value, environment, memory)
 }
@@ -95,6 +117,32 @@ fn json_cell(cell: ArrowCell<'_>, ld: bool, output: &mut String, depth: usize) -
     }
     if let Some(text) = cell.utf8() {
         return json_string(text, output);
+    }
+    if let Some(integer) = cell.integer() {
+        use std::fmt::Write;
+        write!(output, "{integer}").map_err(invalid)?;
+        return Ok(());
+    }
+    if cell.field.metadata().is_empty() {
+        match cell.field.data_type() {
+            DataType::Boolean => {
+                output.push_str(if cell.array.as_boolean().value(cell.row) { "true" } else { "false" });
+                return Ok(());
+            }
+            DataType::Float32 => {
+                let value = cell.array.as_primitive::<Float32Type>().value(cell.row);
+                if !value.is_finite() { return Err(invalid("JSON cannot encode a non-finite number")); }
+                output.push_str(&float_text(f64::from(value), Some(value)));
+                return Ok(());
+            }
+            DataType::Float64 => {
+                let value = cell.array.as_primitive::<Float64Type>().value(cell.row);
+                if !value.is_finite() { return Err(invalid("JSON cannot encode a non-finite number")); }
+                output.push_str(&float_text(value, None));
+                return Ok(());
+            }
+            _ => (),
+        }
     }
     if let Some((parameters, buffer)) = cell.decimal_coefficient()? {
         let coefficient = &buffer[buffer.len() - usize::from(parameters.bit_width / 8)..];
@@ -164,69 +212,6 @@ fn json_cell(cell: ArrowCell<'_>, ld: bool, output: &mut String, depth: usize) -
     Ok(())
 }
 
-fn transit_cell(cell: ArrowCell<'_>, omit_null_fields: bool, depth: usize) -> Result<TransitValue> {
-    if depth > rtdb_types::transit_value::MAX_DEPTH {
-        return Err(size_error());
-    }
-    let cell = cell.physical()?;
-    if cell.is_null()? {
-        return Ok(TransitValue::Null);
-    }
-    if let Some(text) = cell.utf8() {
-        return Ok(TransitValue::String(text.into()));
-    }
-    if let Some(bytes) = cell.binary() {
-        return Ok(TransitValue::Bytes(bytes.to_vec()));
-    }
-    if let Some(children) = cell.structure() {
-        let mut fields = Vec::with_capacity(children.len());
-        for child in children {
-            if omit_null_fields && child.is_null()? {
-                continue;
-            }
-            fields.push((
-                TransitValue::String(child.field.name().clone()),
-                transit_cell(child, omit_null_fields, depth + 1)?,
-            ));
-        }
-        return Ok(TransitValue::Map(fields));
-    }
-    Ok(match cell.sequence_kind() {
-        Some(ListKind::Map { .. }) => {
-            let entries = cell
-                .sequence()
-                .ok_or_else(size_error)?
-                .map(|entry| {
-                    let (key, value) = map_entry(entry)?;
-                    Ok((
-                        transit_cell(key, false, depth + 1)?,
-                        transit_cell(value, omit_null_fields, depth + 1)?,
-                    ))
-                })
-                .collect::<Result<_>>()?;
-            TransitValue::Map(entries)
-        }
-        Some(kind @ (ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set)) => {
-            let values = cell
-                .sequence()
-                .ok_or_else(size_error)?
-                .map(|child| transit_cell(child, omit_null_fields, depth + 1))
-                .collect::<Result<_>>()?;
-            let array = TransitValue::Array(values);
-            if kind == ListKind::Set {
-                TransitValue::Tagged {
-                    tag: "set".into(),
-                    representation: Box::new(array),
-                }
-            } else {
-                array
-            }
-        }
-        _ => rtdb_format::transit::value_to_transit(&read_leaf(cell)?)
-            .map_err(translate_output_error)?,
-    })
-}
-
 fn map_entry(cell: ArrowCell<'_>) -> Result<(ArrowCell<'_>, ArrowCell<'_>)> {
     let mut fields = cell.structure().ok_or_else(size_error)?;
     let key = fields.next().ok_or_else(size_error)?;
@@ -238,6 +223,28 @@ fn map_entry(cell: ArrowCell<'_>) -> Result<(ArrowCell<'_>, ArrowCell<'_>)> {
 mod tests {
     use super::*;
     use rtdb_types::{DecimalValue, EntityId, StructFields};
+
+    #[test]
+    fn arrow_array_codecs_emit_the_reference_row_bytes() {
+        let memory = MemoryBudget::new(1 << 20);
+        let environment = SessionEnvironment::default();
+        let cases = [
+            (PgType::Int4s, Value::list(vec![Value::I32(-4), Value::I32(17)])),
+            (PgType::Texts, Value::list(vec![Value::Utf8("hello, world".into()), Value::Null])),
+            (PgType::Transit, Value::list(vec![Value::F32(0.2), Value::Null, Value::F64(-0.0)])),
+        ];
+        for (ty, value) in cases {
+            let logical = value.logical_type();
+            let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+            let field = rtdb_columnar::to_field("result", &logical).unwrap();
+            let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+            for format in [Format::Text, Format::Binary] {
+                let expected = encode_value(ty, format, &value, &environment).unwrap();
+                let output = encode_arrow(ty, format, &logical, cell, &environment, &memory).unwrap().unwrap();
+                assert_eq!(output.bytes, expected);
+            }
+        }
+    }
 
     #[test]
     fn arrow_json_list_does_not_reserve_row_decoder_scratch_per_item() {

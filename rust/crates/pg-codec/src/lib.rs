@@ -4,7 +4,7 @@ mod output;
 mod text;
 
 pub use output::{Format, SessionEnvironment, encode, encode_arrow, encode_error, encode_timestamp, encode_value, to_transit};
-pub use text::{from_transit, read_text};
+pub use text::{from_transit, read_text, read_text_column};
 
 use std::{mem::size_of, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};

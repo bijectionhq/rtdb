@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::statement::SessionHandle;
 
 pub(crate) fn encode(value: &Value) -> Result<Vec<u8>> { encode_json(&output(value, false)?) }
-/// One row of a cursor page's Transit JSON array; the cursor encodes and charges a page one row at a time.
+#[cfg(test)]
 pub(crate) fn encode_row(row: &Value) -> Result<Vec<u8>> {
     let encoded = encode_json(&T::Array(vec![output(row, true)?]))?;
     Ok(encoded[1..encoded.len() - 1].to_vec())
