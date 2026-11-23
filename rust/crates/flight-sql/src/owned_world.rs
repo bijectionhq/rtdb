@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// authenticated native session and its already admitted database attachment.
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn prepare_world_overlay<'a>(
-        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut,
+        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut, child: Uuid, retain_until: Timestamp,
     ) -> BoxFuture<'a, Result<PreparedWorldOverlay>>;
 
     fn prepare_replay_parent<'a>(
@@ -39,6 +39,7 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
 /// The independently archived overlay position and its bounded preparation lease.
 #[derive(serde::Serialize)]
 pub struct PreparedWorldOverlay {
+    pub child: [u8; 16],
     pub world: [u8; 16],
     pub parent_pin: [u8; 16],
     pub capture: [u8; 16],

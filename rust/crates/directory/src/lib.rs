@@ -572,9 +572,23 @@ impl OrderedIndexStorage {
     }
 }
 
+/// Independent custody of a source world's exact local overlay publication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointWorldAncestor {
+    pub world: uuid::Uuid,
+    pub pin: uuid::Uuid,
+    pub capture: uuid::Uuid,
+    pub suffix: uuid::Uuid,
+    pub manifest_sha256: String,
+    pub basis: rtdb_types::TransactionKey,
+    pub logical: rtdb_types::Timestamp,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointWorldRetention {
     pub world: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ancestor: Option<CheckpointWorldAncestor>,
     pub owner: String,
     pub capture: uuid::Uuid,
     pub manifest_sha256: String,
@@ -586,6 +600,21 @@ pub struct CheckpointWorldRetention {
     pub parent_publication: Option<rtdb_types::Timestamp>,
     pub mode: rtdb_types::WorldClockMode,
     pub until: rtdb_types::Timestamp,
+}
+
+impl CheckpointWorldRetention {
+    pub fn retains_capture(&self, capture: uuid::Uuid, now: rtdb_types::Timestamp) -> bool {
+        self.until > now && (self.capture == capture
+            || self.ancestor.as_ref().is_some_and(|ancestor| ancestor.capture == capture))
+    }
+
+    fn retains_suffix(&self, suffix: uuid::Uuid, pin: &CheckpointSuffixPin, now_ms: i64) -> bool {
+        self.until.0 > now_ms.saturating_mul(1000)
+            && ((self.suffix == Some(suffix) && self.capture == pin.capture)
+                || self.ancestor.as_ref().is_some_and(|ancestor|
+                    ancestor.suffix == suffix && ancestor.capture == pin.capture && ancestor.basis == pin.basis
+                        && ancestor.manifest_sha256 == pin.manifest_sha256))
+    }
 }
 
 pub const MAX_RETAINED_WORLDS: usize = 64;
@@ -878,10 +907,7 @@ impl DeploymentRecord {
                 base.world_replay.is_some() && base.incarnation == pin.incarnation
                     && base.incarnation == self.incarnation
                     && base.log_epoch == pin.log_epoch && base.log_epoch == self.log_epoch))
-            || self.checkpoint_worlds.values().any(|world| {
-                world.capture == pin.capture && world.suffix == Some(suffix)
-                    && world.until.0 > now_ms.saturating_mul(1000)
-            })
+            || self.checkpoint_worlds.values().any(|world| world.retains_suffix(suffix, pin, now_ms))
     }
 
     pub fn is_resident_idle(&self) -> bool {
