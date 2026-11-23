@@ -1,6 +1,6 @@
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
-use rtdb_types::{Anomaly, DecimalValue, PgType, Result, TimeUnit, Value};
+use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::interval::parse as interval;
 
 mod column;
