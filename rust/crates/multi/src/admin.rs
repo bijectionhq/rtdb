@@ -2352,6 +2352,20 @@ mod tests {
         }
     }
 
+    async fn publish_shared_fork_fixture(
+        directory: &MemoryDirectory, bucket: &dyn ObjectStore, keys: &LocalKeyService,
+        source: &DeploymentRecord, name: &str,
+    ) -> DeploymentRecord {
+        let generation = directory.lineage_state(&source.lineage).await.unwrap().open_generation().unwrap();
+        let mut child = DeploymentRecord::new(name, &source.org, Vec::new(), 0);
+        child.parent = Some(source.id.clone());
+        child.lineage.clone_from(&source.lineage);
+        child.storage_namespaces = source.storage_namespaces;
+        crate::reference::fork(bucket, &source.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        keys.install(&child.key_id(), keys.existing(&source.key_id()).await.unwrap()).await.unwrap();
+        directory.publish_fork(child, source.version, Some(super::ForkPublication::Remote { generation })).await.unwrap()
+    }
+
     #[tokio::test]
     async fn local_disposal_records_copy_and_removal_of_each_publication() {
         let data = tempfile::tempdir().unwrap();
@@ -2371,9 +2385,7 @@ mod tests {
             bucket.put(&key, Bytes::from_static(name.as_bytes())).await.unwrap();
         }
 
-        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
-        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
-            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let child = publish_shared_fork_fixture(directory.as_ref(), bucket.as_ref(), &keys, &source, "child").await;
         let fork_store = format!("{}/v06", child.storage_prefix());
         for name in ["old", "shared"] {
             let owned = ObjectKey::new(format!("{fork_store}/{name}")).unwrap();
@@ -2542,10 +2554,24 @@ mod tests {
         let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
         let mut source = DeploymentRecord::new("shop", "acme", vec![], 0);
         source.storage_namespaces = Some(super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
+        let catalog = rtdb_format::catalog::BlockCatalog::from_proto(rtdb_format::block::proto::Block {
+            block_index: Some(0), ..Default::default()
+        }).unwrap();
+        let bytes = catalog.encode();
+        source.checkpoint = Some(rtdb_directory::Checkpoint {
+            block: 0, boundary: -1, source: -1, system_time: i64::MIN,
+            root_sha256: Some(rtdb_format::catalog::publication_digest(&bytes)),
+        });
         let source = directory.create_deployment(source).await.unwrap();
         let key = keys.key(&source.key_id()).await.unwrap();
-        let object = ObjectKey::new(format!("{}/v06/rows", source.storage_prefix())).unwrap();
-        bucket.put(&object, Bytes::from_static(b"data")).await.unwrap();
+        let root = format!("{}/{}", source.storage_prefix(), crate::archive::checkpoint_storage_root().unwrap());
+        let store = crate::store::open_deployment_store(
+            bucket.clone(), &root, crate::packing::PackDiscovery::List, crate::store::wall_clock(),
+        ).await.unwrap();
+        crate::store::check_root(store.as_ref(), &source.id, true).await.unwrap();
+        let store = crate::store::EncryptingStore::new(store, &key).unwrap();
+        let catalog_key = rtdb_format::keys::block_key(rtdb_types::BlockIndex(0)).unwrap();
+        store.put(&ObjectKey::new(catalog_key).unwrap(), bytes.into()).await.unwrap();
 
         let mut updated = source.clone();
         updated.read_width = 2;
@@ -2592,13 +2618,10 @@ mod tests {
         let bytes = Bytes::from_static(b"rows");
         bucket.put(&object, bytes.clone()).await.unwrap();
 
-        let destination = super::ForkDestination { name: "child", org: None, hosted_task: None };
-        let child = super::with_fork_access(directory.as_ref(), &storage, &keys, &source, None, |access|
-            super::fork_with_tail(directory.clone(), &storage, access, &keys, &source, destination, None, Vec::new(), 4 << 20)).await.unwrap();
-        let destination = super::ForkDestination { name: "grandchild", org: None, hosted_task: None };
+        let child = publish_shared_fork_fixture(directory.as_ref(), bucket.as_ref(), &keys, &source, "child").await;
         let old_generation = directory.lineage_state(&child.lineage).await.unwrap().open_generation().unwrap();
         let preparation = super::ForkPublication::Remote { generation: old_generation };
-        let mut staged = DeploymentRecord::new(destination.name, &child.org, Vec::new(), 0);
+        let mut staged = DeploymentRecord::new("grandchild", &child.org, Vec::new(), 0);
         staged.parent = Some(child.id.clone());
         staged.lineage.clone_from(&child.lineage);
         staged.storage_namespaces = child.storage_namespaces;
@@ -2623,8 +2646,7 @@ mod tests {
         let copied = ObjectKey::new(format!("{}/v06/rows", child.storage_prefix())).unwrap();
         assert_eq!(bucket.get(&copied).await.unwrap(), bytes);
 
-        let grandchild = super::with_fork_access(directory.as_ref(), &storage, &keys, &child, None, |access|
-            super::fork_with_tail(directory.clone(), &storage, access, &keys, &child, destination, None, Vec::new(), 4 << 20)).await.unwrap();
+        let grandchild = publish_shared_fork_fixture(directory.as_ref(), bucket.as_ref(), &keys, &child, "grandchild").await;
         let child_store = format!("{}/v06", child.storage_prefix());
         let manifest = crate::reference::Base::load(bucket.as_ref(), &format!("{}/v06", grandchild.storage_prefix())).await.unwrap();
         assert_eq!(manifest.objects.get("rows"), Some(&child_store));
