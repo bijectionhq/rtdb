@@ -327,7 +327,7 @@ impl ReplicaReadIndex for JournalLog {
                     return Ok(ProtectedReadIndex {
                         offset,
                         wait: Duration::from_secs(2),
-                        retention: Some(retention),
+                        retention: Some(Arc::new((proof, retention))),
                         certified_read: None,
                     });
                 }

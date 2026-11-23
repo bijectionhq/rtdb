@@ -375,6 +375,7 @@ fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentR
 }
 
 fn checkpoint_startup_replay(record: &DeploymentRecord) -> Result<Option<i64>> {
+    crate::hosted_recovery::checkpoint_decision(record)?;
     let Some(checkpoint) = record.checkpoint.filter(|checkpoint| checkpoint.root_sha256.is_some()) else { return Ok(None); };
     if checkpoint.boundary < 0 { return Err(storage_region_error("The published checkpoint has an invalid replay boundary")); }
     Ok(Some(crate::hosted_recovery::replay_start(record, checkpoint.boundary)?))

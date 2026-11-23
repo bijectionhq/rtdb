@@ -1367,6 +1367,7 @@ async fn prepare_cell_move(
             .map_or_else(uuid::Uuid::new_v4, |attempt| attempt.generation));
         staged.abandoned_generations.clear();
         staged.recovery_manifest_sha256 = None;
+        staged.checkpoint_decision = None;
         staged.storage_namespaces = Some(target_binding);
         staged.disposal = None;
         staged.moved_at_ms = None;

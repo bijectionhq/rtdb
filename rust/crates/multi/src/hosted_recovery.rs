@@ -22,6 +22,28 @@ pub(crate) fn replay_start(record: &DeploymentRecord, after: i64) -> rtdb_storag
         .ok_or_else(|| Error::Task("Invalid first required replica offset".into()))
 }
 
+/// Restore only checkpoint evidence bound to this adopted catalog and recovery inventory.
+pub(crate) fn checkpoint_decision(record: &DeploymentRecord) -> Result<Option<rtdb_logkeeper::StableDecision>> {
+    let Some(witness) = record.checkpoint_decision.as_ref() else { return Ok(None); };
+    let invalid = || Error::Task("The checkpoint has no matching journal decision".into());
+    if witness.stable.len() > 16 << 10 { return Err(invalid().into()); }
+    let proof = <rtdb_logkeeper::StableDecision as prost::Message>::decode(witness.stable.as_slice())
+        .map_err(|_| invalid())?;
+    let statement = &proof.certificate.statement;
+    if !proof.authentic() || Some(witness.checkpoint) != record.checkpoint
+        || Some(witness.manifest) != record.recovery_manifest_sha256
+        || statement.scope.stream != record.stream("replica") || statement.scope.epoch > record.epoch
+        || statement.prefix.through < witness.checkpoint.boundary
+        || statement.scope.journals.iter().any(|id| {
+            !record.replica_journals.iter().any(|journal| journal.journal() == Some(id.as_str()))
+                && !record.ensemble.iter().any(|member| member.as_str() == id)
+        })
+    {
+        return Err(invalid().into());
+    }
+    Ok(Some(proof))
+}
+
 pub(crate) struct ReplicaTrimPlan {
     record: DeploymentRecord,
     through: LogOffset,
@@ -70,6 +92,16 @@ impl ReplicaTrimPlan {
             write_quorum: write_quorum(servers.len()), servers,
             stream: self.record.stream("replica"), maximum_message_bytes: 4 << 20,
         };
+        if let Some(proof) = checkpoint_decision(&self.record)? {
+            // Keep this decision's exact suffix intact until a subsequent
+            // publication leaves a newer authenticated recovery boundary.
+            self.through.0 = self.through.0.min(proof.certificate.statement.prefix.predecessor);
+            if self.through.0 < 0
+                || self.record.replica_anchor.as_ref().is_some_and(|anchor| self.through.0 < anchor.interval[1])
+            {
+                return Ok(None);
+            }
+        }
         let offloads = matches!(storage, CellStorage::S3 { .. })
             && (enabled || self.record.replica_payload_trim.as_ref().is_some_and(|trim| trim.belongs_to(&self.record)));
         let mut retirement = None;

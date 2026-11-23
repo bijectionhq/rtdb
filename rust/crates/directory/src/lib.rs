@@ -296,6 +296,9 @@ pub struct DeploymentRecord {
     /// Commitment to this checkpoint's recovery inventory in this residence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_manifest_sha256: Option<[u8; 32]>,
+    /// The portable journal publication carried by this exact recovery inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_decision: Option<Box<CheckpointDecision>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_anchor: Option<Box<JournalAnchor>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -891,6 +894,13 @@ pub struct Checkpoint {
     pub root_sha256: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointDecision {
+    pub checkpoint: Checkpoint,
+    pub manifest: [u8; 32],
+    pub stable: Vec<u8>,
+}
+
 /// The digest of an inclusive replica interval, rooted in its first physical residence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalAnchor {
@@ -1041,7 +1051,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
-            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None,
+            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
 
@@ -1583,6 +1593,7 @@ fn prepare_checkpoint_transfer_activation(
     next.replica_journals = replica.journals.iter().cloned().collect();
     next.checkpoint = Some(stage.checkpoint);
     next.recovery_manifest_sha256 = Some(activation.recovery_manifest_sha256);
+    next.checkpoint_decision = None;
     Ok(next)
 }
 

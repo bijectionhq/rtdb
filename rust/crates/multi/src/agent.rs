@@ -1372,6 +1372,11 @@ impl NodeAgent {
             let mut next = record.clone();
             next.checkpoint = Some(checkpoint);
             next.recovery_manifest_sha256 = Some(digest);
+            next.checkpoint_decision = covered.decision().map(|proof| Box::new(rtdb_directory::CheckpointDecision {
+                checkpoint,
+                manifest: digest,
+                stable: prost::Message::encode_to_vec(proof),
+            }));
             match self.directory.replace_deployment(next, record.version).await? {
                 Cas::Applied(stored) => {
                     crate::residence_trace::record("publish-checkpoint", || serde_json::json!({

@@ -1196,6 +1196,7 @@ pub async fn retain_serving_replay(
                     if current.serving_replay_capture != Some(operation) {
                         current.serving_replay_capture = Some(operation);
                         current.recovery_manifest_sha256 = Some(digest);
+                        current.checkpoint_decision = None;
                     }
                     Ok(())
                 }).await?;
@@ -2427,6 +2428,7 @@ pub(crate) async fn restore_checkpoint(
         record.lifecycle = recovery.previous_lifecycle;
         record.compaction_replay_cutoff = Some(cutoff.0);
         record.recovery_manifest_sha256 = None;
+        record.checkpoint_decision = None;
         record.serving_replay_capture = record.serving_replay_capture.map(|_| operation);
         record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
