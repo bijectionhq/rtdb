@@ -130,6 +130,10 @@ impl IoRegion {
         };
         Either::Left(READ_LEASE.scope(lease, work))
     }
+    pub(crate) fn current_read_lease() -> Option<Arc<ReadLease>> {
+        READ_LEASE.try_with(Arc::clone).ok()
+    }
+
     /// Selects the dedicated provider read transport within an audience object read.
     pub async fn audience_object_read<T>(work: impl std::future::Future<Output = T>) -> T {
         AUDIENCE_OBJECT_READ.scope((), work).await
