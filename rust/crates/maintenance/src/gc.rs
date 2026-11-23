@@ -174,10 +174,15 @@ impl TrieCollector {
                 } else {
                     eligible.extend(collection.eligible_l0_artefacts(&entry.table, as_of).cloned());
                 }
-                let (seals, keys): (Vec<_>, Vec<_>) = match self.leased_out(&entry.table, eligible) {
-                    Ok(keys) => keys,
+                let coordinated = self.store.defers_trie_releases();
+                let (due, timed): (Vec<_>, Vec<_>) = eligible.into_iter()
+                    .partition(|key| coordinated && (key.level() > 0 || receipt_l0));
+                let timed = match self.leased_out(&entry.table, timed) {
+                    Ok(ready) => ready,
                     Err(error) => { self.observer.table_failed(Some(&entry.table), &error); return; }
-                }.into_iter().partition(|key| key.level() == 0 && !receipt_l0);
+                };
+                let (seals, keys): (Vec<_>, Vec<_>) = due.into_iter().chain(timed)
+                    .partition(|key| key.level() == 0 && !receipt_l0);
                 let groups = finished_groups(collection.current().trie_catalog(), &entry.table, &keys);
                 let result = IoRegion::retaining(collection.clone(), async {
                     self.collect_table(&entry, &keys, &groups, cut, collection.current().trie_catalog(), &release).await?;

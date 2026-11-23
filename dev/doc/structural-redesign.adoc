@@ -172,11 +172,11 @@ Classic remote holds use conditional writes and finish after admitted provider w
 Compaction and stored artefact builds on coordinated storage hold their input catalogs through provider drain.
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
-The coordinated collector submits the installed receipt to the storage owner, which owns the pending decision and the deletion grant.
+The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
 The approved reachability contract replaces the cutoff for deletion.
 For hosted loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
 Complete claims for other file kinds, classic storage, and all recovery roots remain open.
-Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
+Abandoned remote hold recovery, renewal, full recovery-root integration and the remaining search, fork and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.
