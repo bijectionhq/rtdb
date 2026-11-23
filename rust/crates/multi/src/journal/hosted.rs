@@ -410,6 +410,13 @@ impl Placement {
         loop {
             let current = custodian.route().await?;
             let published = current.checkpoint;
+            if current.preparing.is_some_and(|pending| pending.erasure) {
+                return if requested.is_some() {
+                    Err(invalid("An erasure owner is preparing the next checkpoint"))
+                } else {
+                    Ok(None)
+                };
+            }
             if let Some((_, checkpoint, next)) = requested {
                 if published.cut.next_lsn > next {
                     return Ok(Some(provider.open(published).await?.checkpoint));

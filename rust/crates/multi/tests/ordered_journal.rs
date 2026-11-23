@@ -473,6 +473,7 @@ fn append(view: Route, grant: Grant, class: AppendClass, payload: Bytes) -> Requ
         view,
         Principal::Worker(grant.enrollment),
         Command::Append {
+            references: None,
             grant,
             class,
             expected_next: view.head.next_lsn,
@@ -549,6 +550,7 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
         },
     };
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: selected.cut,
         root: selected.root,
         source: grant,
@@ -640,7 +642,7 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
     }
 
     assert_eq!(
-        custody(Command::PrepareCheckpoint { preparation }).await,
+        custody(Command::PrepareCheckpoint { preparation, references: None }).await,
         Ok(Outcome::CheckpointPrepared(preparation)),
     );
     assert_eq!(
@@ -900,6 +902,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
         [appended, maintained]
     );
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: exact.cut,
         root: exact.root,
         source: replacement,
@@ -914,7 +917,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
             request(
                 view,
                 Principal::Custodian,
-                Command::PrepareCheckpoint { preparation }
+                Command::PrepareCheckpoint { preparation, references: None }
             )
         )
         .await

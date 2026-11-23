@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
-    Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint, Grant, Outcome, Placement,
-    Principal, Receipt, Request, RequestId,
+    Checkpoint, CheckpointPreparation, Command, Cut, Grant, Outcome, Placement, Principal, Receipt,
+    Request, RequestId,
+    service::wire::{Decision, SignedRotationSlots},
 };
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
@@ -43,25 +44,11 @@ pub enum ErasureProgress {
     Committed(ErasureCommit),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RecoverySlotId {
-    A,
-    B,
-}
-
-#[derive(Clone, Copy)]
-pub struct RecoverySlot {
-    pub id: RecoverySlotId,
-    pub placement: Placement,
-    pub durable_image: Fingerprint,
-    pub checkpoint: Checkpoint,
-    pub suffix_key_generation: u64,
-}
-
 pub struct CleanRecoverySlots {
     prepared: PreparedErasure,
     successor: WriterAdmission,
-    slots: [RecoverySlot; 2],
+    receipt: Receipt,
+    slots: SignedRotationSlots,
 }
 
 impl CleanRecoverySlots {
@@ -73,16 +60,19 @@ impl CleanRecoverySlots {
         self.successor
     }
 
-    pub fn slots(&self) -> &[RecoverySlot; 2] {
+    pub fn receipt(&self) -> Receipt {
+        self.receipt
+    }
+
+    pub fn slots(&self) -> &SignedRotationSlots {
         &self.slots
     }
 }
 
 #[async_trait]
 pub trait ErasureCustody: Send + Sync {
-    /// Close copy and new serving admissions and drain the incumbent, including
-    /// pending appends and offloaded writes. Keep the fence through restart
-    /// until commit or durable resolution of an abandoned attempt.
+    /// Stop incumbent writes and await pending appends and offloaded writes.
+    /// Hold the write fence through restart until the attempt is resolved.
     ///
     /// Prepare the exact cut in Logkeeper, stage an independently readable
     /// successor at that cut, and retain the exact prepared tuple before
@@ -92,15 +82,9 @@ pub trait ErasureCustody: Send + Sync {
     /// Re-entry returns the original tuple or the exact committed result.
     async fn prepare(&self, erasure: Erasure) -> Result<ErasureProgress>;
 
-    /// Authenticate durable images for slot A and slot B in that order.
-    /// Recovery must remain fenced against any older selector once this returns.
-    async fn recovery_slots(
-        &self,
-        prepared: PreparedErasure,
-        successor: WriterAdmission,
-    ) -> Result<[RecoverySlot; 2]>;
-
-    /// Make the result and the old generation's irrevocable deadline one
+    /// The journal switch has closed old-root and replay admission. Use the
+    /// signed decision and quorum evidence to establish the custody drain.
+    /// Make the result and the retiring keys' irrevocable deadline one
     /// durable decision. The authority owns the clock, all grants and key
     /// operations in the affected domain. A concurrent or retried commit of
     /// the same operation returns the original receipt and expiry.
@@ -163,8 +147,8 @@ struct Selection {
 #[async_trait]
 trait ErasureJournal: Sync {
     async fn selection(&self) -> Result<Selection>;
-    async fn publish(&self, checkpoint: Checkpoint) -> Result<()>;
-    async fn execute(&self, request: &Request) -> Result<Receipt>;
+    async fn reopen(&self, checkpoint: Checkpoint) -> Result<()>;
+    async fn execute(&self, request: &Request) -> Result<Decision>;
 }
 
 #[async_trait]
@@ -179,15 +163,13 @@ impl ErasureJournal for ErasureCoordinator<'_> {
         })
     }
 
-    async fn publish(&self, checkpoint: Checkpoint) -> Result<()> {
-        let route = self.custodian.route().await?;
-        self.provider
-            .publish(self.custodian, &route, checkpoint)
-            .await
+    async fn reopen(&self, checkpoint: Checkpoint) -> Result<()> {
+        self.provider.open(checkpoint).await?;
+        Ok(())
     }
 
-    async fn execute(&self, request: &Request) -> Result<Receipt> {
-        Ok(self.worker.execute(request).await?.receipt)
+    async fn execute(&self, request: &Request) -> Result<Decision> {
+        self.custodian.execute(request).await
     }
 }
 
@@ -235,32 +217,31 @@ async fn coordinate(
                 "The clean checkpoint is outside the quiesced journal head",
             ));
         }
-        if selected.checkpoint != checkpoint {
-            if !selected.preparing.is_some_and(|entry| {
-                entry.source == old
-                    && entry.base == selected.checkpoint
-                    && entry.checkpoint == checkpoint.cut
-                    && entry.root == checkpoint.root
-                    && entry.custody == checkpoint.custody
-            }) {
-                return Err(invalid(
-                    "The clean checkpoint lacks its exact ordered preparation",
-                ));
-            }
-            journal.publish(checkpoint).await?;
+        if !selected.preparing.is_some_and(|entry| {
+            entry.erasure
+                && entry.source == old
+                && entry.base == selected.checkpoint
+                && entry.checkpoint == checkpoint.cut
+                && entry.root == checkpoint.root
+                && entry.custody == checkpoint.custody
+        }) {
+            return Err(invalid(
+                "The clean checkpoint lacks its exact ordered erasure preparation",
+            ));
         }
     }
+    journal.reopen(checkpoint).await?;
 
     let request = Request {
         id: prepared.rotation,
         placement: erasure.placement,
-        principal: Principal::Worker(old.enrollment),
-        command: Command::RotateKey {
+        principal: Principal::Custodian,
+        command: Command::PublishAndRotate {
             grant: old,
             checkpoint,
         },
     };
-    let receipt = journal.execute(&request).await?;
+    let decision = journal.execute(&request).await?;
     let successor = validate_rotation(
         &request,
         checkpoint,
@@ -269,10 +250,9 @@ async fn coordinate(
             epoch,
             key_generation: generation,
         },
-        receipt,
+        decision.receipt,
     )?;
-    let slots = custody.recovery_slots(prepared, successor).await?;
-    let ready = require_clean_slots(prepared, successor, slots)?;
+    let ready = require_clean_slots(prepared, successor, decision)?;
     validate_commit(prepared, custody.commit_and_arm(ready).await?)
 }
 
@@ -315,26 +295,16 @@ fn validate_rotation(
 fn require_clean_slots(
     prepared: PreparedErasure,
     successor: WriterAdmission,
-    slots: [RecoverySlot; 2],
+    decision: Decision,
 ) -> Result<CleanRecoverySlots> {
-    if !slots
-        .iter()
-        .zip([RecoverySlotId::A, RecoverySlotId::B])
-        .all(|(slot, id)| {
-            slot.id == id
-                && slot.placement == prepared.erasure.placement
-                && slot.durable_image != [0; 32]
-                && slot.checkpoint == prepared.checkpoint
-                && slot.suffix_key_generation == successor.grant.key_generation
-        })
-    {
-        return Err(invalid(
-            "Both recovery slots must bind the clean checkpoint and successor generation",
-        ));
-    }
+    let slots = decision
+        .rotation
+        .filter(|proof| proof.evidence.covers(decision.receipt))
+        .ok_or_else(|| invalid("Both recovery slots require authenticated quorum readback"))?;
     Ok(CleanRecoverySlots {
         prepared,
         successor,
+        receipt: decision.receipt,
         slots,
     })
 }

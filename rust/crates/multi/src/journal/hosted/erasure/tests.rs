@@ -1,7 +1,11 @@
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use ordered_logkeeper::ordered::{AppendClass, Custody, Hold, Limits, Refusal, State, Window};
+use ordered_logkeeper::ordered::{
+    AppendClass, Custody, Hold, Limits, Refusal, State, Window,
+    replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
+    service::wire::Signature,
+};
 use rtdb_storage::IoRegion;
 
 use super::*;
@@ -13,7 +17,7 @@ struct Journal {
     state: State,
     preparing: Option<CheckpointPreparation>,
     lose_rotation_reply: bool,
-    append_after_publish: bool,
+    append_before_switch: bool,
 }
 
 struct CustodyFixture {
@@ -50,6 +54,7 @@ impl Journal {
                 expected_next,
                 timestamp: 1,
                 payload,
+                references: None,
             },
         )
         .outcome
@@ -128,7 +133,7 @@ impl Fixture {
             state,
             preparing: None,
             lose_rotation_reply: false,
-            append_after_publish: false,
+            append_before_switch: false,
         };
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path())?;
@@ -217,17 +222,10 @@ impl ErasureJournal for CustodyFixture {
         })
     }
 
-    async fn publish(&self, checkpoint: Checkpoint) -> Result<()> {
+    async fn reopen(&self, _: Checkpoint) -> Result<()> {
         let mut journal = self.journal.lock().unwrap();
-        let incumbent = journal.preparing.unwrap().source;
-        assert_eq!(
-            journal
-                .apply(Principal::Custodian, Command::Publish { checkpoint })
-                .outcome,
-            Ok(Outcome::Published(checkpoint))
-        );
-        journal.preparing = None;
-        if journal.append_after_publish {
+        if std::mem::take(&mut journal.append_before_switch) {
+            let incumbent = journal.preparing.unwrap().source;
             assert!(matches!(
                 journal.append(incumbent, Bytes::from_static(b"old suffix")),
                 Ok(Outcome::Appended(_))
@@ -236,7 +234,7 @@ impl ErasureJournal for CustodyFixture {
         Ok(())
     }
 
-    async fn execute(&self, request: &Request) -> Result<Receipt> {
+    async fn execute(&self, request: &Request) -> Result<Decision> {
         let mut journal = self.journal.lock().unwrap();
         let position = journal.state.position() + 1;
         let time = journal.state.time();
@@ -244,10 +242,65 @@ impl ErasureJournal for CustodyFixture {
             .state
             .apply(position, time, request.clone())
             .unwrap();
+        let rotation = match receipt.outcome {
+            Ok(Outcome::Granted { grant, recovery }) => {
+                journal.preparing = None;
+                // This fixture supplies structural evidence. The installed journal
+                // verifies the transport issuer before returning the actual decision.
+                let mut images = [
+                    SlotImage {
+                        generation: 2,
+                        digest: [2; 32],
+                    },
+                    SlotImage {
+                        generation: 3,
+                        digest: [3; 32],
+                    },
+                ];
+                if let Some(index) = self.stale_slot {
+                    images[index].digest = [0; 32];
+                }
+                if self.duplicate_slot {
+                    images[1] = images[0];
+                }
+                Some(SignedRotationSlots {
+                    evidence: RotationSlots {
+                        group: [1; 32],
+                        cohort_size: 3,
+                        ballot: Ballot {
+                            round: 1,
+                            nonce: Uuid::from_u128(1),
+                        },
+                        prefix: [6; 32],
+                        position,
+                        checkpoint: recovery.checkpoint,
+                        key_generation: grant.key_generation,
+                        voters: [1, 2]
+                            .map(|id| VoterSlots {
+                                voter: Uuid::from_u128(id),
+                                slots: SlotPair {
+                                    selected: 1,
+                                    images,
+                                },
+                            })
+                            .into(),
+                    },
+                    signature: Signature {
+                        issuer: [5; 32],
+                        proof: [7; 64],
+                    },
+                })
+            }
+            _ => None,
+        };
         if std::mem::take(&mut journal.lose_rotation_reply) {
             return Err(lost_reply());
         }
-        Ok(receipt)
+        Ok(Decision {
+            receipt,
+            barrier: None,
+            rotation,
+        })
     }
 }
 
@@ -277,6 +330,7 @@ impl ErasureCustody for CustodyFixture {
             },
         };
         let preparation = CheckpointPreparation {
+            erasure: true,
             checkpoint: cut,
             root: checkpoint.root,
             source: erasure.incumbent,
@@ -285,16 +339,21 @@ impl ErasureCustody for CustodyFixture {
             usable_bytes: 64,
             descriptor: [5; 32],
         };
-        assert_eq!(
-            journal
-                .apply(
-                    Principal::Custodian,
-                    Command::PrepareCheckpoint { preparation }
-                )
-                .outcome,
-            Ok(Outcome::CheckpointPrepared(preparation))
-        );
-        journal.preparing = Some(preparation);
+        if !self.use_boundary {
+            assert_eq!(
+                journal
+                    .apply(
+                        Principal::Custodian,
+                        Command::PrepareCheckpoint {
+                            preparation,
+                            references: None
+                        }
+                    )
+                    .outcome,
+                Ok(Outcome::CheckpointPrepared(preparation))
+            );
+            journal.preparing = Some(preparation);
+        }
         let prepared = PreparedErasure {
             erasure,
             checkpoint,
@@ -302,27 +361,6 @@ impl ErasureCustody for CustodyFixture {
         };
         *attempt = Some(ErasureProgress::Prepared(prepared));
         Ok(ErasureProgress::Prepared(prepared))
-    }
-
-    async fn recovery_slots(
-        &self,
-        prepared: PreparedErasure,
-        successor: WriterAdmission,
-    ) -> Result<[RecoverySlot; 2]> {
-        let mut slots = [RecoverySlotId::A, RecoverySlotId::B].map(|id| RecoverySlot {
-            id,
-            placement: prepared.erasure.placement,
-            durable_image: [6; 32],
-            checkpoint: prepared.checkpoint,
-            suffix_key_generation: successor.grant.key_generation,
-        });
-        if let Some(index) = self.stale_slot {
-            slots[index].checkpoint.root = [1; 32];
-        }
-        if self.duplicate_slot {
-            slots[1] = slots[0];
-        }
-        Ok(slots)
     }
 
     async fn commit_and_arm(&self, ready: CleanRecoverySlots) -> Result<ErasureCommit> {
@@ -396,7 +434,7 @@ async fn exact_head_rotation_survives_lost_rotation_and_commit_replies() -> Resu
 }
 
 #[tokio::test]
-async fn an_ordinary_boundary_cut_and_an_append_after_publication_prevent_rotation() -> Result<()> {
+async fn an_ordinary_boundary_cut_and_a_racing_append_prevent_the_switch() -> Result<()> {
     let mut boundary = Fixture::new().await?;
     boundary.custody.use_boundary = true;
     let failure = boundary.commit().await.unwrap_err();
@@ -419,13 +457,13 @@ async fn an_ordinary_boundary_cut_and_an_append_after_publication_prevent_rotati
         .journal
         .get_mut()
         .unwrap()
-        .append_after_publish = true;
+        .append_before_switch = true;
     assert_eq!(
         racing.commit().await.unwrap_err().code,
         "rtdb.multi/ordered-stale-grant"
     );
     let journal = racing.custody.journal.get_mut().unwrap();
-    assert_eq!(journal.state.checkpoint().cut.next_lsn, 3);
+    assert_eq!(journal.state.checkpoint().cut.next_lsn, 0);
     assert_eq!(journal.state.head().next_lsn, 4);
     assert_eq!(
         journal.state.writer_state().grant,

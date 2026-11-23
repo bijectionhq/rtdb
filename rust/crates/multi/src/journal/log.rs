@@ -203,6 +203,7 @@ impl JournalLog {
             expected_next: writer.head.next_lsn,
             timestamp: timestamp.0,
             payload,
+            references: None,
         };
         writer.pending = Some(
             self.reads
@@ -411,6 +412,9 @@ impl Cursor {
         if self.end == Some(self.next) {
             return Ok(());
         }
+        if self.next < view.erasure_floor {
+            return Err(Error::ErasedUnderView);
+        }
         if self.next < view.floor.next_lsn {
             return Err(Error::UnavailableLogRange {
                 requested: i64::try_from(self.next).unwrap_or(i64::MAX),
@@ -421,7 +425,15 @@ impl Cursor {
             .end
             .map_or(view.head.next_lsn, |end| end.min(view.head.next_lsn));
         if self.next < through {
-            let held = self.reads.acquire(&view, self.next, through).await?;
+            let held = match self.reads.acquire(&view, self.next, through).await {
+                Ok(held) => held,
+                Err(error) => {
+                    if self.next < self.reads.route().await?.erasure_floor {
+                        return Err(Error::ErasedUnderView);
+                    }
+                    return Err(error);
+                }
+            };
             self.from = Some(held.hold.start);
             self.held = Some(held);
         }

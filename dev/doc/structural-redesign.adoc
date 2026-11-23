@@ -213,7 +213,8 @@ Directory-managed Multi, Classic sealed-log retirement and Kafka logs, remote re
 |The operation-only local archive broker persists scheduled capture-key revocation and attests physical settlement on the original media.
 Installed serving reads enforce their journal lease through body delivery, and installed payload cryptography bounds each provider operation.
 Installed recovery opens independently sealed checkpoint closures before their publication, then serves and replays from the selected closure.
-SQL erasure still requires ordered closure of affected admissions, a complete survivor rebuild and retiring-key census, bounded plaintext drain, and evidenced provider destruction.
+The installed journal orders clean checkpoint publication, key rotation, and old-root and replay admission closure together. Its accepting quorum reads back both durable voter slots and the installed RTDB custodian verifies the signed evidence before it asks for a deadline.
+Production SQL erasure still requires a complete survivor rebuild and retiring-key census, bounded plaintext and egress drain, and evidenced provider destruction.
 
 |8
 |Transaction metadata retention.

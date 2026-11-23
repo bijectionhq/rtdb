@@ -402,7 +402,13 @@ impl InstalledJournal {
         route: &Route,
         preparation: CheckpointPreparation,
     ) -> Result<()> {
-        let request = self.request(route, Command::PrepareCheckpoint { preparation })?;
+        let request = self.request(
+            route,
+            Command::PrepareCheckpoint {
+                preparation,
+                references: None,
+            },
+        )?;
         let decision = self.execute(&request).await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::CheckpointPrepared(chosen) if chosen == preparation => Ok(()),

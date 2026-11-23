@@ -79,6 +79,7 @@ impl Preparation {
             bytes.copy_from_slice(&field.to_be_bytes());
         }
         Ok(CheckpointPreparation {
+            erasure: false,
             checkpoint: self.through,
             root,
             source: self.writer,
