@@ -939,6 +939,9 @@ fn audience_read_only() -> Error { Error::Closed("The audience object view admit
 
 #[async_trait]
 impl ObjectStore for AudienceObjectStore {
+    fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
+        self.0.index_page_lifecycle()
+    }
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.0.retain_catalog(cut).await
     }
