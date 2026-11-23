@@ -206,6 +206,7 @@ pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPa
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
 pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V2: &str = "rtdb.owned.PrepareHeldWorldOverlay.v2";
+pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
@@ -1298,7 +1299,7 @@ impl Service {
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World version has no held handle"))?;
         let (group, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("World version has no group time"))?;
         let group = Timestamp(i64::from_be_bytes(*group));
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow_bytes) = split_relation(request)?;
         let batch = request_batch(call, arrow_bytes)?;
         let batch = batch.batch();
@@ -1341,7 +1342,7 @@ impl Service {
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World path touch has no held handle"))?;
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
         let [prior, accepted] = held.snapshot.path_touch(&relation, &path, &id, before, group, valid, images).await.map_err(status)?;
         let prior = self.world_point_reply(call, prior, valid, None)?;
@@ -1571,8 +1572,8 @@ impl Service {
         Ok(vec![Ok(prior), Ok(accepted)])
     }
 
-    pub(crate) async fn held_world_parent_changes_action(
-        &self, call: &Call, body: &[u8],
+    pub(crate) async fn archived_world_changes_action(
+        &self, call: &Call, body: &[u8], ancestor: bool,
     ) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent changes require a held world"))?;
@@ -1590,10 +1591,14 @@ impl Service {
         if !tail.is_empty() { return Err(invalid("Earlier parent changes have trailing bytes")); }
         let selected = Timestamp(i64::from_be_bytes(*selected));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-        let (page, witness) = held.snapshot.parent_changes_at(
-            &relation, selected, Timestamp(i64::from_be_bytes(*after)),
-            Timestamp(i64::from_be_bytes(*through)), usize::from(u16::from_be_bytes(*limit)), reverse,
-        ).await.map_err(status)?;
+        let after = Timestamp(i64::from_be_bytes(*after));
+        let through = Timestamp(i64::from_be_bytes(*through));
+        let limit = usize::from(u16::from_be_bytes(*limit));
+        let (page, witness) = if ancestor {
+            held.snapshot.ancestor_changes(&relation, selected, after, through, limit, reverse).await
+        } else {
+            held.snapshot.parent_changes_at(&relation, selected, after, through, limit, reverse).await
+        }.map_err(status)?;
         let nonce = held.remember(call, witness, false)?;
         let reply = self.owned_merged_changes_reply(&page, selected, reverse, Some(nonce))?;
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -2584,7 +2589,7 @@ impl Service {
             return Err(invalid("Historical world scope has repeated relations or trailing bytes"));
         }
         let handle = Bytes::copy_from_slice(handle);
-        let held = if matches!(selection, WorldCutSelection::AsOfParent) {
+        let held = if !matches!(selection, WorldCutSelection::AsOfLocal) {
             self.owned_world_resource(call, &handle)?
         } else {
             self.owned_world_read(call, &handle)?
@@ -2600,6 +2605,7 @@ impl Service {
         let mode = match held.snapshot.clock_mode() {
             rtdb_types::WorldClockMode::Held { .. } => 1,
             rtdb_types::WorldClockMode::Proposal => 2,
+            rtdb_types::WorldClockMode::Retained if held.snapshot.ancestor().is_some() => 1,
             rtdb_types::WorldClockMode::Retained => return Err(status(rtdb_types::OwnedWorld::unavailable())),
         };
         let selected = if matches!(selection, WorldCutSelection::AsOfLocal) {

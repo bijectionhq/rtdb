@@ -721,13 +721,14 @@ impl OwnedReadSession {
     }
 }
 
-/// Read whole accepted groups from the original pinned Root archive.
+/// Read whole accepted groups from a pinned Root or world relation archive.
 pub async fn archived_changes_at_cut(
     context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
     after: Timestamp, through: Timestamp, limit: usize, reverse: bool,
 ) -> Result<OwnedMergedChanges> {
     let present = context.current_time.as_micros()?;
-    if !relation.is_root_data() || after > through || through > present
+    let root = relation.root_relation().unwrap_or_else(|| relation.clone());
+    if !root.is_root_data() || after > through || through > present
         || !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
     {
         return Err(change_feed_uncovered());
@@ -792,7 +793,7 @@ pub async fn archived_changes_at_cut(
         page._reservations.push(reservation);
         page.commits.push(OwnedChangeCommit {
             revision: header.committed_at,
-            changes: vec![OwnedRelationChanges { relation: relation.clone(), sequence: seq as u64, touches }],
+            changes: vec![OwnedRelationChanges { relation: root.clone(), sequence: seq as u64, touches }],
         });
     }
     page.complete = page.commits.len() == count;
@@ -807,7 +808,8 @@ pub async fn archived_path_touch_at_cut(
 ) -> Result<Vec<String>> {
     if before.next()? != group || group > selected { return Err(change_feed_uncovered()); }
     let page = archived_changes_at_cut(Arc::clone(&context), owner, relation, before, group, 1, false).await?;
-    require_path_touch(&page, relation, id, group, valid)?;
+    let root = relation.root_relation().unwrap_or_else(|| relation.clone());
+    require_path_touch(&page, &root, id, group, valid)?;
     let prior = context.with_owned_system_cut(before, &context.cancellation)?;
     let accepted = context.with_owned_system_cut(group, &context.cancellation)?;
     let selected = context.with_owned_system_cut(selected, &context.cancellation)?;
