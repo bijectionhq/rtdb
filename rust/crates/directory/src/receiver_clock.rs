@@ -2,6 +2,7 @@
 use rtdb_types::{Anomaly, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use crate::receiver_clock_step::{advances_frontier, keeps_epoch, sample_is_fresh};
 
 /// The publisher must advance the clock within this interval to retain its epoch.
 const LEASE_MICROS: i64 = 3_000_000;
@@ -21,7 +22,7 @@ pub struct ReceiverClockSample {
 
 impl ReceiverClockSample {
     pub fn admits(self, domain: Uuid, elapsed: Timestamp) -> bool {
-        self.domain == domain && self.instant <= elapsed && elapsed < self.expires
+        self.domain == domain && sample_is_fresh(self.instant.0, elapsed.0, self.expires.0)
     }
 
     pub(crate) fn advance(
@@ -32,10 +33,11 @@ impl ReceiverClockSample {
         }
         let (epoch, sequence) = match previous {
             Some(last) => {
-                if observed <= last.instant || publisher != last.publisher && observed < last.expires {
+                let same_publisher = publisher == last.publisher;
+                if !advances_frontier(last.instant.0, last.expires.0, same_publisher, observed.0) {
                     return Ok(None);
                 }
-                let epoch = if publisher == last.publisher && observed < last.expires {
+                let epoch = if keeps_epoch(last.expires.0, same_publisher, observed.0) {
                     last.epoch
                 } else {
                     last.epoch.checked_add(1).ok_or_else(exhausted)?

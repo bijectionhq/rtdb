@@ -45,7 +45,7 @@ async fn a_static_insert_preserves_interleaved_assertion_order_for_one_identity(
 }
 
 #[tokio::test]
-async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_same_time() {
+async fn ordinary_sql_orders_at_a_tied_history_coordinate_after_a_regression() {
     use rtdb_format::envelope::SourceMessage;
 
     let context = context();
@@ -67,20 +67,36 @@ async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_sa
         resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(previous), request(vec![], &context), &context).await.unwrap();
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
         let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(90), replay(), &context).await.unwrap();
-        assert_eq!(result.result().tx_key().system_time, Timestamp(previous + 1));
-        if previous == 101 {
-            assert_eq!(result.result().error().unwrap().code, "xtdb/assert-failed");
-            assert!(!result.writes().tables().contains_key(&table()));
-            continue;
-        }
+        assert_eq!(result.result().tx_key().system_time, Timestamp(previous));
+        assert_eq!(result.result().tx_key().tx_id.0, 1);
         assert!(result.result().committed(), "{:?}", result.result().error());
         let event = result.writes().tables()[&table()].batch().unwrap().view().read_event(0).unwrap();
-        assert_eq!(event.valid_time, Interval::from_micros(2_000_101, 3_000_101).unwrap());
+        assert_eq!(event.valid_time, Interval::from_micros(2_000_000 + previous, 3_000_000 + previous).unwrap());
         let StoredOperation::Put(row) = event.operation else { panic!("Expected a put"); };
         let Value::Utf8(id) = &row["_id"] else { panic!("Expected an encoded key"); };
-        let expected = Timestamp(1_000_101);
+        let expected = Timestamp(1_000_000 + previous);
         assert_eq!(rtdb_types::parse_sql_timestamp_instant(id.strip_prefix("at-").unwrap(), "UTC").unwrap().as_micros().unwrap(), expected);
         assert_eq!(rtdb_expr::timestamp_micros(&row["v"], "UTC").unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn explicit_system_time_may_tie_and_never_leads_its_original_append() {
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![], &context), &context).await.unwrap();
+    state.apply(first.writes()).unwrap();
+    resolver.take_head().unwrap();
+    for (position, appended, committed) in [(1, 100, true), (2, 99, false)] {
+        let options = SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() };
+        let request = SourceTransaction::new(vec![], options, &context.memory).unwrap();
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), request, &context).await.unwrap();
+        assert_eq!(resolved.result().committed(), committed);
+        assert_eq!(resolved.result().tx_key().system_time, Timestamp(100));
+        if !committed { assert_eq!(resolved.result().error().unwrap().code, "rtdb/future-system-time"); }
+        state.apply(resolved.writes()).unwrap();
+        resolver.take_head().unwrap();
     }
 }
 

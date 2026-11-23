@@ -290,7 +290,7 @@ mod tests {
 
         let key = |name: &str| ObjectKey::new(format!("tables/public$docs/{name}")).unwrap();
         assert!(framed(&key(
-            "artefacts/l00-rc-b00/entity-history/headers-1-v1.bin"
+            "artefacts/l00-rc-b00/entity-history/headers-2-v2.bin"
         )));
         assert!(framed(&key(
             "artefacts/l00-rc-b00/search/docs_body~a1f16w-v1.bin"

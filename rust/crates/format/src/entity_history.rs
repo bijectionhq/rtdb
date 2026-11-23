@@ -4,15 +4,15 @@ use arrow_array::{Array, FixedSizeBinaryArray, Int64Array, RecordBatch, UInt8Arr
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}, cast::AsArray, types::{Int64Type, UInt8Type, UInt32Type}};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, Iid, Interval, Result, Timestamp};
+use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, Result, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::{data::{EncodedEvent, EventBatch, origin_array}, keys::{TableSlug, TrieKey}};
 
 pub const KIND: &str = "entity-history";
-pub const ID: &str = "headers-1";
-pub const VERSION: i64 = 1;
-const ROOT_MAGIC: &[u8; 8] = b"RTDBHST1";
+pub const ID: &str = "headers-2";
+pub const VERSION: i64 = 2;
+const ROOT_MAGIC: &[u8; 8] = b"RTDBHST2";
 const ENTRY_BYTES: usize = 88;
 const ROWS_PER_RANGE: usize = 2048;
 const MAX_ROOT_BYTES: usize = 4 << 20;
@@ -28,6 +28,7 @@ fn schema() -> &'static SchemaRef {
         Field::new("commit_position", DataType::UInt32, false),
         Field::new("origin", DataType::FixedSizeBinary(EventOrigin::WIDTH), true),
         Field::new("entity_key", DataType::Binary, true),
+        Field::new("position", DataType::FixedSizeBinary(EventPosition::WIDTH), true),
     ])));
     &SCHEMA
 }
@@ -171,7 +172,9 @@ impl HistoryPage {
             0 => EventOp::Put, 1 => EventOp::Delete, 2 => EventOp::Erase, 3 => EventOp::Redacted,
             _ => return Err(invalid("Entity history contains an unknown operation")),
         };
-        Ok((EventHeader { position: None, iid: self.iid(row), system_from: time(1), valid_time: Interval::new(time(2), time(3))?,
+        let positions = self.0.column(8).as_any().downcast_ref::<FixedSizeBinaryArray>().expect("history position layout");
+        let position = positions.is_valid(row).then(|| EventPosition::from_bytes(positions.value(row).try_into().expect("history position width")));
+        Ok((EventHeader { position, iid: self.iid(row), system_from: time(1), valid_time: Interval::new(time(2), time(3))?,
             commit_position: self.0.column(5).as_primitive::<UInt32Type>().value(row), op }, origin))
     }
 }
@@ -240,9 +243,14 @@ impl<W: Write> HistoryWriter<W> {
             if headers.windows(2).any(|pair| pair[0].iid > pair[1].iid) { return Err(invalid("Primary page must be sorted by IID")); }
             let mut iids = FixedSizeBinaryBuilder::with_capacity(end - first, 16);
             let mut keys = BinaryBuilder::new();
+            let mut positions = FixedSizeBinaryBuilder::with_capacity(end - first, EventPosition::WIDTH);
             for (row, header) in (first..end).zip(&headers) {
                 iids.append_value(header.iid.0).map_err(invalid)?;
                 keys.append_option(events.entity_key(row)?);
+                match header.position {
+                    Some(position) => positions.append_value(position.to_bytes()).map_err(invalid)?,
+                    None => positions.append_null(),
+                }
             }
             let origins = (first..end).map(|row| events.origin(row)).collect::<Result<Vec<_>>>()?;
             let batch = RecordBatch::try_new(Arc::clone(schema()), vec![
@@ -256,6 +264,7 @@ impl<W: Write> HistoryWriter<W> {
                 Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))),
                 Arc::new(origin_array(origins)?),
                 Arc::new(keys.finish()),
+                Arc::new(positions.finish()),
             ]).map_err(invalid)?;
             self.write_range(page, first, headers[0].iid, headers[headers.len() - 1].iid, &batch)?;
         }

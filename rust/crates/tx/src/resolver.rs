@@ -273,7 +273,7 @@ impl TxResolver {
         context.check_cancelled()?;
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
-        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.history_time(log_time) };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
         let error = crate::RetainedAnomaly::new(reason, &context.memory)?;
@@ -307,8 +307,8 @@ impl TxResolver {
         }
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
-        let default_time = self.smooth(log_time)?;
         let has_owned_operations = request.operations.iter().any(Operation::is_owned);
+        let default_time = if has_owned_operations { self.owned_publication_time(log_time)? } else { self.history_time(log_time) };
         let attempt = request.placed_attempt(position)?;
         let decision = match &context.decision_clock {
             Some(clock) => Some(clock.observe().await?),
@@ -407,7 +407,7 @@ impl TxResolver {
         } else if let Err(rejection) = selected_time {
             let (requested, error) = match rejection {
                 TimeRejection::BehindHistory(requested) => (requested,
-                    Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+                    Anomaly::incorrect("invalid-system-time", "specified system-time precedes the current history")
                         .with_context("latest-completed-tx", tx_key_context(self.resolved_head.expect("a nonadvancing time has a predecessor"))?)),
                 TimeRejection::AheadOfAppend(requested) => (requested,
                     Anomaly::incorrect("rtdb/future-system-time", "specified system-time is later than the source-log timestamp")
@@ -553,7 +553,10 @@ impl TxResolver {
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
         let id = self.resolved_head.map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
-        let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.map_or(now, |time| Timestamp(time.0.min(now.0))))? };
+        let system_time = system_time.filter(|requested| crate::system_time::admits_historical_time(
+            self.previous_system_time(), requested.0, now.0,
+        )).unwrap_or_else(|| self.history_time(now));
+        let key = TransactionKey { tx_id: TxId(id), system_time };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base.clone(), key, &options, context)?;
         let (result, metadata) = match writer.write(&mut tx).await? {
@@ -574,7 +577,7 @@ impl TxResolver {
     pub async fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
-        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.history_time(log_time) };
         let (result, operation) = match verdict {
             Ok(()) => (TransactionResult::Committed { tx_key: key }, Some(operation)),
             Err(error) if error.is_caller_error() => (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, None),
@@ -590,7 +593,11 @@ impl TxResolver {
         self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
     }
 
-    fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {
+    fn history_time(&self, appended: Timestamp) -> Timestamp {
+        Timestamp(crate::system_time::historical_time(self.previous_system_time(), appended.0))
+    }
+
+    fn owned_publication_time(&self, candidate: Timestamp) -> Result<Timestamp> {
         crate::system_time::automatic_time(self.previous_system_time(), candidate.0)
             .map(Timestamp)
             .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))
@@ -612,8 +619,8 @@ impl TxResolver {
         if self.resolved_head.is_some_and(|head| head.tx_id >= key.tx_id) {
             return Err(Anomaly::fault("rtdb.tx/transaction-order", "Resolved transaction position does not advance its predecessor"));
         }
-        if resolved.writes.tx_key() != key || !crate::system_time::advances(self.previous_system_time(), key.system_time.0) {
-            return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction does not advance its predecessor's system time"));
+        if resolved.writes.tx_key() != key || key.system_time < self.history_time(key.system_time) {
+            return Err(Anomaly::fault("rtdb.tx/system-time", "Resolved transaction moves behind its predecessor's system time"));
         }
         let next_token_charge = resolved.external_token.as_ref().map(|token| self.memory.reserve(token.capacity().checked_add(512).ok_or_else(overflow)?)).transpose()?;
         if self.queue.len() == self.queue.capacity() {
@@ -766,7 +773,7 @@ impl<'a> OpenTransaction<'a> {
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
 
     pub async fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let context = self.context.query_context(self.snapshot()?, self.decision_time(), &self.options.default_tz, self.trace_parent)?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let query = {
             let _syntax = admit_sql_syntax(sql, &context.memory)?;
@@ -786,7 +793,7 @@ impl<'a> OpenTransaction<'a> {
         self.context.check_cancelled()?;
         // A statement whose plan reads no table can't see the transaction's own writes, so it skips extending the snapshot with them.
         let snapshot = if planned.as_ref().is_some_and(|planned| !planned.reads) { self.buffer.base_snapshot() } else { self.snapshot()? };
-        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+        let context = self.context.query_context(snapshot, self.decision_time(), &self.options.default_tz, self.trace_parent)?;
         let parameter_types = match arguments {
             Some(BoundArgumentRow::Values { types: Some(types), .. } | BoundArgumentRow::Arrow { types, .. }) =>
                 types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),

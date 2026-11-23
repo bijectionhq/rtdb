@@ -41,6 +41,29 @@ pub(crate) fn automatic_time(previous: Option<i64>, candidate: i64) -> Option<i6
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == match previous {
+        Some(last) if logged < last => last,
+        _ => logged,
+    },
+))]
+pub(crate) fn historical_time(previous: Option<i64>, logged: i64) -> i64 {
+    match previous {
+        Some(last) if logged < last => last,
+        _ => logged,
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (match previous {
+        Some(last) => last <= requested,
+        None => true,
+    } && requested <= logged),
+))]
+pub(crate) fn admits_historical_time(previous: Option<i64>, requested: i64, logged: i64) -> bool {
+    historical_time(previous, requested) == requested && requested <= logged
+}
+
 #[cfg(not(verus_keep_ghost))]
 pub fn clock_slot_reading(tick: rtdb_types::Timestamp) -> Option<rtdb_types::Timestamp> {
     tick.0.checked_add(500_000).map(rtdb_types::Timestamp)
@@ -84,10 +107,13 @@ impl SourceTime {
     ) -> std::result::Result<i64, TimeRejection> {
         match self {
             Self::Automatic => Ok(automatic),
-            Self::ExactSystem { requested, .. } if !advances(previous, requested) => {
+            Self::ExactSystem { requested, .. } if requested < historical_time(previous, requested) => {
                 Err(TimeRejection::BehindHistory(requested))
             }
             Self::ExactSystem { requested, require_current_append } => {
+                if !admits_historical_time(previous, requested, appended) {
+                    return Err(TimeRejection::AheadOfAppend(requested));
+                }
                 require_append_bound(requested, appended, require_current_append)?;
                 Ok(requested)
             }

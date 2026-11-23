@@ -1324,6 +1324,7 @@ pub use lineage::{ExactRetirementGrant, ForkPreparation, ForkPublication, Lineag
 use lineage::{StoredLineage, lineage_busy};
 
 mod receiver_clock;
+mod receiver_clock_step;
 pub use receiver_clock::ReceiverClockSample;
 use receiver_clock::CLOCK_PREFIX;
 
