@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
-use rtdb_storage::{log::{LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
+use rtdb_storage::{log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -19,7 +19,7 @@ use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, Pro
 use crate::admission::AdmittedReplica;
 use crate::appender::{Applied, AppenderHandle, CommitLagBasis, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
-use crate::logs::{DecodedReplica, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
+use crate::logs::{APPEND_CAPACITY, DecodedReplica, STRICT_DISPATCH_CUTOFF, STRICT_DISPATCH_UNAVAILABLE, replica_decode_bound};
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::matching_present_integer;
 use crate::state::fail_pending;
@@ -114,11 +114,13 @@ impl ReplicationHandle {
     }
     pub async fn submit_source(&self, message: &SourceMessage, timestamp: Timestamp) -> Result<SourcePosition> {
         if self.cancellation.is_cancelled() { return Err(stopped()); }
+        self.logs.require_data_intake()?;
         self.logs.append_source(message, timestamp).await
     }
     /// The payload includes its format header; its `Bytes` owner retains the producer's reservation through durability.
     pub async fn submit_source_encoded(&self, payload: Bytes, timestamp: Timestamp) -> Result<SourcePosition> {
         if self.cancellation.is_cancelled() { return Err(stopped()); }
+        self.logs.require_data_intake()?;
         self.logs.append_source_encoded(payload, timestamp).await
     }
     pub async fn await_tx(&self, id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> { self.progress.await_tx(id, cancellation).await }
@@ -387,6 +389,8 @@ pub struct ReplicationDriver {
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
     leader: Option<LeaderState>, commands: mpsc::Receiver<Command>, status: watch::Sender<DriverStatus>, flush_timer: FlushTimer,
+    required_append_bytes: Option<u64>,
+    deferred_cut: bool,
 }
 impl ReplicationDriver {
     pub fn new(config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition, progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken) -> Result<(ReplicationHandle, Self)> {
@@ -426,7 +430,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, required_append_bytes: None, deferred_cut: false }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -474,20 +478,28 @@ impl ReplicationDriver {
         self.replica_tail = Some(tail);
         self.publish_status(self.role());
         if self.config.may_lead && self.fence.highest_term() == Term(0) { self.start_claim()?; }
+        let capacity_interval = self.config.assertion_interval.clamp(Duration::from_millis(1), Duration::from_secs(1));
+        let mut capacity_poll = tokio::time::interval(capacity_interval);
+        capacity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
             self.prepare_polls();
-            enum Event { ReplicaBatch(Box<dyn LogTail>, Result<TailPoll>), Replica, SourceBatch(Box<dyn LogTail>, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>) }
+            enum Event { ReplicaBatch(Box<dyn LogTail>, Result<TailPoll>), Replica, SourceBatch(Box<dyn LogTail>, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>), Capacity }
             let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
-            let accept_commands = self.leader.as_ref().is_none_or(|leader| leader.accepting_commands() || leader.deferred_commands.len() < 128);
+            let waiting_for_checkpoint = self.waiting_for_checkpoint();
+            let accept_commands = self.leader.as_ref().is_none_or(|leader| {
+                (!waiting_for_checkpoint && leader.accepting_commands()) || leader.deferred_commands.len() < 128
+            });
+            let check_capacity = waiting_for_checkpoint && self.pending_block.is_none()
+                && self.leader.as_ref().is_some_and(|leader| leader.confirmed && leader.accepting());
             let mut empty_poll = None;
             let mut empty_job = None;
             let mut empty_resolution = None;
             let mut empty_production = None;
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let ready_source = leader.ready_source();
-                    let ready_deferred = leader.accepting_commands() && !leader.deferred_commands.is_empty();
+                    let ready_source = !waiting_for_checkpoint && leader.ready_source();
+                    let ready_deferred = !waiting_for_checkpoint && leader.accepting_commands() && !leader.deferred_commands.is_empty();
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
                 }
                 None => (&mut empty_poll, &mut empty_job, &mut empty_resolution, &mut empty_production, false, false),
@@ -504,6 +516,7 @@ impl ReplicationDriver {
                 _ = async {}, if ready_source => Event::Source,
                 _ = async {}, if ready_deferred => Event::Deferred,
                 command = self.commands.recv(), if accept_commands => Event::Command(command),
+                _ = capacity_poll.tick(), if check_capacity => Event::Capacity,
             };
             match event {
                 Event::ReplicaBatch(tail, records) => {
@@ -541,12 +554,27 @@ impl ReplicationDriver {
                 }
                 Event::Command(Some(command)) => self.command(command).await?,
                 Event::Command(None) => return Ok(()),
+                Event::Capacity => {
+                    if let Ok(Some(capacity)) = self.logs.available_append_capacity().await {
+                        self.advance_capacity_checkpoint(capacity).await?;
+                    }
+                }
                 Event::Appender(result) => {
                     if let Some(leader) = &mut self.leader { leader.job = None; }
                     match result {
                         Err(error) if matches!(error.code.as_str(), STRICT_DISPATCH_CUTOFF | STRICT_DISPATCH_UNAVAILABLE) => {
                             // Drop the speculative suffix before the source can be resolved again.
                             for held in self.demote().await? { self.apply_admitted(held).await?; }
+                            self.start_claim()?;
+                        }
+                        Err(error) if error.code == APPEND_CAPACITY => {
+                            let required_bytes = error.context.get("required-bytes").and_then(|value| value.as_u64())
+                                .ok_or_else(|| invalid("Ordinary append refusal has no byte charge"))?;
+                            // The refusal is ordered and the rejected append never entered replay.
+                            // Reuse the same journal grant and rebuild the local term from its applied prefix.
+                            self.logs.suspend_data(true);
+                            for held in self.demote().await? { self.apply_admitted(held).await?; }
+                            self.required_append_bytes = Some(required_bytes);
                             self.start_claim()?;
                         }
                         Err(error) => return Err(error),
@@ -557,6 +585,36 @@ impl ReplicationDriver {
             }
         }
     }
+    fn waiting_for_checkpoint(&self) -> bool {
+        self.deferred_cut || self.required_append_bytes.is_some()
+    }
+
+    fn adopted_boundary(&self) -> Option<LogOffset> {
+        let partition = self.partition.value();
+        let boundary = partition.table_catalog().block()?.boundary_replica_position()?;
+        Some(LogOffset(boundary.after_offset(self.logs.replica_epoch)))
+    }
+
+    async fn advance_capacity_checkpoint(&mut self, capacity: AppendCapacity) -> Result<()> {
+        let adopted = self.adopted_boundary();
+        if let Some(required) = self.required_append_bytes
+            && capacity.last_data.is_none_or(|last| adopted.is_some_and(|boundary| boundary >= last))
+        {
+            if capacity.available_bytes >= required {
+                let tail = self.logs.source_tail(self.progress.current().source_position).await?;
+                self.leader.as_mut().ok_or_else(term_ended)?.source_tail = Some(tail);
+                self.required_append_bytes = None;
+                self.logs.suspend_data(false);
+            }
+            return Ok(());
+        }
+        // A chosen block owns its maintenance records until its catalog is published.
+        if adopted.is_none_or(|boundary| boundary <= capacity.published_through) {
+            self.enqueue_checkpoint_cut()?;
+        }
+        Ok(())
+    }
+
     async fn prove_historical_confirmations(&mut self) -> Result<VecDeque<RecoveredBlockConfirmation>> {
         let Some(selected) = &self.recovered_confirmation else { return Ok(VecDeque::new()); };
         let selected = &selected.catalog;
@@ -642,7 +700,7 @@ impl ReplicationDriver {
                 self.replica_poll = Some(start_poll(tail, timeout));
             }
         }
-        if let Some(leader) = &mut self.leader {
+        if !self.waiting_for_checkpoint() && let Some(leader) = &mut self.leader {
             if leader.can_poll_source() && leader.waiting_strict_source.is_none()
                 && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
                 if let Some(tail) = leader.source_tail.take() { leader.source_poll = Some(start_poll(tail, self.config.assertion_interval)); }
@@ -692,7 +750,7 @@ impl ReplicationDriver {
         self.flush_timer = FlushTimer::new((self.clock)(), persisted, self.config.flush_timeout)?;
         let cancellation = self.cancellation.child_token();
         // An inherited block's adopt advances applied progress to the position its boundary covers, so the source opens there.
-        let source_tail = if self.pending_block.is_some() { None } else { Some(self.logs.source_tail(progress.source_position).await?) };
+        let source_tail = if self.pending_block.is_some() || self.waiting_for_checkpoint() { None } else { Some(self.logs.source_tail(progress.source_position).await?) };
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         let pump = match self.resolve.execution_observer.clone() {
@@ -717,6 +775,7 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn demote(&mut self) -> Result<VecDeque<AdmittedReplica>> {
+        self.deferred_cut = false;
         if let Some(mut leader) = self.leader.take() {
             leader.cancellation.cancel();
             drop(leader.compactor_reset.take());
@@ -761,7 +820,9 @@ impl ReplicationDriver {
                     through,
                 })?;
             }
-            self.installed = Some(InstalledPrefix { replica: through, source: self.progress.current().source_position });
+            let source = self.progress.current().source_position;
+            self.logs.record_source_applied(source);
+            self.installed = Some(InstalledPrefix { replica: through, source });
             if let Some(leader) = &mut self.leader
                 && let Some(reset) = leader.compactor_reset.as_ref()
                 && self.partition.value().table_catalog().block_index() == Some(reset.block)
@@ -1101,10 +1162,11 @@ impl ReplicationDriver {
         }
         if adopted {
             let progress = self.progress.current();
+            let waiting_for_checkpoint = self.waiting_for_checkpoint();
             if let Some(leader) = &mut self.leader {
                 if leader.resolver()?.staged_rows()? != 0 { return Err(invalid("A block adoption retained unresolved transaction writes")); }
                 leader.resolver = Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?);
-                if self.pending_block.is_none() && leader.source_tail.is_none() && leader.source_poll.is_none() {
+                if !waiting_for_checkpoint && self.pending_block.is_none() && leader.source_tail.is_none() && leader.source_poll.is_none() {
                     leader.source_tail = Some(self.logs.source_tail(progress.source_position).await?);
                 }
             }
@@ -1345,6 +1407,24 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn cut(&mut self) -> Result<()> {
+        if let Some(boundary) = self.adopted_boundary() {
+            match self.logs.available_append_capacity().await {
+                Ok(Some(capacity)) if boundary > capacity.published_through => {
+                    self.deferred_cut = true;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.deferred_cut = true;
+                    return Ok(());
+                }
+                Ok(_) => {}
+            }
+        }
+        self.enqueue_checkpoint_cut()
+    }
+
+    fn enqueue_checkpoint_cut(&mut self) -> Result<()> {
+        self.deferred_cut = false;
         let block = self.partition.value().live().block_index();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.cut()?;
@@ -1353,13 +1433,14 @@ impl ReplicationDriver {
     }
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        if self.leader.as_ref().is_some_and(LeaderState::accepting_commands) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
+        if !self.waiting_for_checkpoint() && self.leader.as_ref().is_some_and(LeaderState::accepting_commands) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
+        let waiting_for_checkpoint = self.waiting_for_checkpoint();
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
-        if !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }
+        if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
             Command::ResetCompactor { expected, expected_block, replacement, reservations, completion, .. } => {
                 let value = self.partition.value();

@@ -270,6 +270,13 @@ impl InstalledJournal {
         Ok(result)
     }
 
+    pub async fn checkpoint_cut(&self, grant: Grant, next: u64) -> Result<Cut> {
+        match self.call(Operation::CheckpointCut { grant, next }).await? {
+            Reply::CheckpointCut(cut) if cut.next_lsn == next => Ok(cut),
+            _ => Err(mismatch("The peer selected a different checkpoint cut")),
+        }
+    }
+
     pub async fn prepare_checkpoint(
         &self,
         route: &Route,

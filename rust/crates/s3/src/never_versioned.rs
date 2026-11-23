@@ -385,6 +385,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn checkpoint_fence_requires_exact_tombstone_and_resumes_after_a_racing_write() {
+        const OLD: &str = "Content-Length: 9\r\nETag: \"original\"\r\n";
+        const MARKER: &str =
+            "Content-Length: 0\r\nx-amz-meta-rtdb-retirement: 00000000000000000000000000000001\r\n";
+        let replace = |status, body| Exchange {
+            method: "PUT",
+            path: KEY_PATH,
+            conditions: &[
+                ("if-match", "\"original\""),
+                (
+                    "x-amz-meta-rtdb-retirement",
+                    "00000000000000000000000000000001",
+                ),
+            ],
+            status,
+            headers: "",
+            body,
+        };
+        let (inventory, server) = fixture(vec![
+            profile(BUCKET_CHECK),
+            head("200 OK", OLD),
+            replace(
+                "412 Precondition Failed",
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            ),
+            head("200 OK", OLD),
+            head("200 OK", OLD),
+            replace("200 OK", ""),
+            head("200 OK", MARKER),
+            profile(BUCKET_CHECK),
+            head("200 OK", MARKER),
+        ])
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let effects = inventory.never_versioned_retirement().await.unwrap();
+            let key = ObjectKey::new("owner/data").unwrap();
+            let token = Uuid::from_u128(1);
+            assert!(effects.fence_create_only(&key, token).await.is_err());
+            effects.fence_create_only(&key, token).await.unwrap();
+            effects.fence_create_only(&key, token).await.unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     fn reserve() -> Exchange<'static> {
         Exchange {
             method: "POST",

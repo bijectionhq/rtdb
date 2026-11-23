@@ -342,7 +342,6 @@ impl Placement {
         admission: WriterAdmission,
         offered: Option<RtdbCheckpoint>,
         serving: &crate::deployment::CellStorage,
-        tasks: &TaskTracker,
     ) -> Result<Option<RtdbCheckpoint>> {
         let _publication = self.publication.lock().await;
         let custodian = self
@@ -401,11 +400,11 @@ impl Placement {
             let origin = match (current.preparing, requested) {
                 (Some(chosen), _) => Preparation::recover(chosen, reservation)?,
                 (None, Some((checkpoint, next))) => {
-                    let through = self.hold_cut(&current, grant, next, tasks).await?;
+                    let through = custodian.checkpoint_cut(grant, next).await?;
                     let origin = Preparation {
                         writer: grant,
                         base: admission.recovery.checkpoint,
-                        through: through.scope().through,
+                        through,
                         checkpoint,
                     };
                     let source =
@@ -474,24 +473,6 @@ impl Placement {
             .settle_checkpoint(&current, retired.checkpoint, disposition)
             .await?;
         Ok(())
-    }
-
-    async fn hold_cut(
-        &self,
-        current: &Route,
-        grant: Grant,
-        next_lsn: u64,
-        tasks: &TaskTracker,
-    ) -> Result<Arc<Held>> {
-        let intent = self.worker.request(
-            current,
-            Command::ProtectRange {
-                grant,
-                from: next_lsn,
-                through: next_lsn,
-            },
-        )?;
-        Held::acquire(&self.worker, intent, tasks).await
     }
 
     async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {
@@ -618,6 +599,7 @@ impl LogFactory for Logs {
                 &self.releases,
             ),
             max_frame,
+            placement.journal_window_bytes,
             self.releases.clone(),
         )
         .await?;

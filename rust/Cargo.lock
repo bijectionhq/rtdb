@@ -3167,7 +3167,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=6ce4b6ac78fd9c647aa7a7b545141607f87dd488#6ce4b6ac78fd9c647aa7a7b545141607f87dd488"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=d96113d7710484062886839061f67a9f097e1975#d96113d7710484062886839061f67a9f097e1975"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -4886,6 +4886,7 @@ dependencies = [
  "hyper 1.12.0",
  "hyper-util",
  "logkeeper",
+ "openssl",
  "parking_lot",
  "prost",
  "prost-types",

@@ -150,6 +150,14 @@ pub trait LogReplayTail: Send {
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord>;
 }
 
+/// An installed journal's current ordinary budget and selected checkpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct AppendCapacity {
+    pub available_bytes: u64,
+    pub published_through: LogOffset,
+    pub last_data: Option<LogOffset>,
+}
+
 #[async_trait]
 pub trait Log: Send + Sync {
     /// The reopened journal retains its synced prefix, and reads expose only that durable history.
@@ -161,6 +169,14 @@ pub trait Log: Send + Sync {
     fn maximum_guarded_append_bytes(&self) -> Option<usize> { None }
     /// Fixes append order before returning; the receipt reports whether those bytes became durable.
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
+    /// Appends a recovery record through reserved maintenance capacity when the provider has it.
+    async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.enqueue(payload, timestamp).await
+    }
+    /// The ordinary journal bytes currently available, measured using the provider's charge in AppendCapacity.
+    async fn available_append_capacity(&self) -> Result<Option<AppendCapacity>> { Ok(None) }
+    /// In-process source owners can release bytes through this durably applied position.
+    fn record_applied(&self, _through: LogOffset) {}
     /// Fixes append order only if the provider's final admission sample is inside the guard.
     async fn enqueue_guarded(&self, _payload: Bytes, _guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
         Err(Error::GuardedAppendUnsupported)

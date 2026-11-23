@@ -438,6 +438,16 @@ impl NodeAgent {
         let turn = self.turn(name);
         let _turn = turn.lock().await;
         let route = placement.worker.route().await?;
+        // Budget an older upload, a possible in-flight pair, and an
+        // additional claim/completion before the custodian can trim.
+        const MINIMUM_MAINTENANCE_BYTES: u64 = 5 * (
+            crate::process::MAXIMUM_LOG_MESSAGE_BYTES as u64
+                + ordered_logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES
+        );
+        if route.maintenance_limit < MINIMUM_MAINTENANCE_BYTES {
+            return Err(Anomaly::incorrect("rtdb.multi/unfunded-checkpoint-progress",
+                format!("The journal must prepay at least {MINIMUM_MAINTENANCE_BYTES} maintenance bytes")));
+        }
         let observed = crate::control::OrderedPredecessor {
             epoch: route.writer.epoch,
             enrollment: route.writer.grant.map(|grant| grant.enrollment),
@@ -758,7 +768,7 @@ impl NodeAgent {
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
                 placement.publish_checkpoint(self.keys.as_ref(), admission, Some(checkpoint),
-                    &self.options.storage, &self.ordered_releases).await?.ok_or_else(||
+                    &self.options.storage).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
             }).await.map_err(|_| checkpoint_timeout(name))??;
             return Ok(Response::Flushed { checkpoint });
@@ -1590,7 +1600,7 @@ impl NodeAgent {
                         .and_then(|block| checkpoint_for_block(&block, placement.worker.log_epoch()))
                         .filter(|checkpoint| u64::try_from(checkpoint.boundary).is_ok_and(|boundary| boundary >= route.checkpoint.cut.next_lsn));
                     let publish = placement.publish_checkpoint(self.keys.as_ref(), admission, checkpoint,
-                        &self.options.storage, &self.ordered_releases);
+                        &self.options.storage);
                     let _ = tokio::time::timeout(self.options.activation_timeout, publish).await;
                 }
                 let retirement = placement.retire_unheld_checkpoint(self.keys.as_ref());

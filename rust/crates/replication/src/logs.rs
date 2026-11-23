@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key};
-use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::readback_identity::{ReplicaFingerprint, fingerprint};
 
+pub(crate) const APPEND_CAPACITY: &str = "rtdb.storage/append-capacity";
 pub(crate) const STRICT_DISPATCH_CUTOFF: &str = "rtdb.replication/strict-dispatch-cutoff";
 pub(crate) const STRICT_DISPATCH_UNAVAILABLE: &str = "rtdb.replication/strict-dispatch-unavailable";
 
@@ -54,6 +55,7 @@ pub struct PartitionLogs {
     pub source_epoch: StorageEpoch, pub replica_epoch: StorageEpoch,
     pub storage_version: StorageVersion, pub storage_epoch: StorageEpoch,
     store: Arc<dyn ObjectStore>, cache: Arc<BufferPool>, memory: Arc<MemoryBudget>,
+    data_suspended: AtomicBool,
 }
 impl PartitionLogs {
     pub fn new(source: Arc<dyn Log>, replica: Arc<dyn Log>, source_epoch: StorageEpoch, replica_epoch: StorageEpoch,
@@ -61,7 +63,7 @@ impl PartitionLogs {
         if Arc::ptr_eq(&source, &replica) { return Err(Anomaly::incorrect("rtdb.replication/aliased-logs", "Source and replica logs must be distinct")); }
         SourcePosition::from_epoch_offset(source_epoch, -1)?;
         ReplicaPosition::from_epoch_offset(replica_epoch, -1)?;
-        Ok(Arc::new(Self { source, replica, source_epoch, replica_epoch, storage_version, storage_epoch, store, cache, memory }))
+        Ok(Arc::new(Self { source, replica, source_epoch, replica_epoch, storage_version, storage_epoch, store, cache, memory, data_suspended: AtomicBool::new(false) }))
     }
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
@@ -141,6 +143,20 @@ impl PartitionLogs {
         }
         self.enqueue_replica_with(envelope, block, || now, true, None, |_| Ok(())).await
     }
+    pub(crate) fn data_suspended(&self) -> bool { self.data_suspended.load(Ordering::Acquire) }
+    pub(crate) fn suspend_data(&self, suspend: bool) { self.data_suspended.store(suspend, Ordering::Release); }
+    pub(crate) fn require_data_intake(&self) -> Result<()> {
+        if self.data_suspended() {
+            return Err(Anomaly::new(AnomalyCategory::Busy, APPEND_CAPACITY, "The replica journal is freeing ordinary write capacity"));
+        }
+        Ok(())
+    }
+    pub(crate) async fn available_append_capacity(&self) -> Result<Option<AppendCapacity>> {
+        Ok(self.replica.available_append_capacity().await?)
+    }
+    pub(crate) fn record_source_applied(&self, position: SourcePosition) {
+        self.source.record_applied(LogOffset(position.after_offset(self.source_epoch)));
+    }
     pub(crate) fn replica_guarded_append_limit(&self) -> Option<usize> { self.replica.maximum_guarded_append_bytes() }
     pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
         allow_offload: bool, journal_before: Option<Timestamp>, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
@@ -161,7 +177,18 @@ impl PartitionLogs {
         }
         if journal_before.is_some() { return Err(Anomaly::fault("rtdb.replication/journal-cutoff", "The journal deadline has no prepared acceptance stage")); }
         let now = clock();
-        let receipt = match self.replica.enqueue(payload.clone(), now).await {
+        // Only the term's initial claim and the block close can consume reserved journal space.
+        // Keep that class when a large block upload is represented by an offload reference.
+        let maintenance = match &envelope.message {
+            ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,
+            ReplicaBody::NoOp(message) => envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none(),
+            _ => false,
+        };
+        let enqueue = |payload| async move {
+            if maintenance { self.replica.enqueue_maintenance(payload, now).await }
+            else { self.replica.enqueue(payload, now).await }
+        };
+        let receipt = match enqueue(payload.clone()).await {
             Ok(receipt) => receipt,
             Err(StorageError::MessageTooLarge { .. }) if allow_offload => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
@@ -171,7 +198,7 @@ impl PartitionLogs {
                     proxy.bind_offload_publication(version)?;
                 }
                 let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
-                self.replica.enqueue(payload, now).await?
+                enqueue(payload).await?
             }
             Err(error) => return Err(error.into()),
         };

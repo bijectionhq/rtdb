@@ -135,6 +135,7 @@ pub(crate) fn frozen_checkpoint(
         log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(start)),
         consumed: Arc::new(AtomicI64::new(start - 1)),
         start,
+        trim_on_apply: false,
     });
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
         await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
@@ -160,6 +161,7 @@ pub(crate) async fn ordered_opened(
     let intake = Arc::new(IntakeLog {
         log: MemoryLog::starting_at(maximum_message_bytes, LogOffset(next)),
         consumed: Arc::new(AtomicI64::new(next - 1)), start: next,
+        trim_on_apply: true,
     });
     let trimming = {
         let intake = Arc::clone(&intake);
@@ -264,7 +266,7 @@ impl LogFactory for LogkeeperLogFactory {
             next = next.max(floor);
         }
         if config.transfer_intake_cut.is_some() { SourcePosition::from_epoch_offset(epoch, next)?; }
-        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next });
+        let intake = Arc::new(IntakeLog { log: MemoryLog::starting_at(self.maximum_message_bytes, LogOffset(next)), consumed: Arc::new(AtomicI64::new(next - 1)), start: next, trim_on_apply: false });
         let trimming = {
             let intake = Arc::clone(&intake);
             async move {
@@ -451,6 +453,12 @@ impl Log for SealedLog {
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
         self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await
     }
+    async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+        self.inner.enqueue_maintenance(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+    }
+    async fn available_append_capacity(&self) -> rtdb_storage::Result<Option<rtdb_storage::log::AppendCapacity>> {
+        self.inner.available_append_capacity().await
+    }
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
         self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await
     }
@@ -543,7 +551,7 @@ impl LogRange for SealedRange {
 }
 
 /// The holder's in-process source log: it remembers how far its reader has got, and drops what lies well behind it.
-pub struct IntakeLog { log: MemoryLog, consumed: Arc<AtomicI64>, start: i64 }
+pub struct IntakeLog { log: MemoryLog, consumed: Arc<AtomicI64>, start: i64, trim_on_apply: bool }
 
 impl IntakeLog {
     fn trim(&self) {
@@ -556,10 +564,17 @@ impl IntakeLog {
 impl Log for IntakeLog {
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> { self.log.enqueue(payload, timestamp).await }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+    fn record_applied(&self, through: LogOffset) {
+        if self.trim_on_apply {
+            self.consumed.fetch_max(through.0, Ordering::AcqRel);
+        }
+    }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
         // Positions below the intake's start were never assigned to it, so a reader asking for them starts at the start; trimmed positions above it still fail as unavailable.
         let after = LogOffset(after.0.max(self.start - 1));
-        Ok(Box::new(IntakeTail { tail: self.log.tail(after).await?, consumed: Arc::clone(&self.consumed) }))
+        let tail = self.log.tail(after).await?;
+        if self.trim_on_apply { return Ok(tail); }
+        Ok(Box::new(IntakeTail { tail, consumed: Arc::clone(&self.consumed) }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> { self.log.range(from, to).await }
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.log.read_range(from, to).await }
@@ -849,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_intake_drops_what_lies_well_behind_its_reader() {
-        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: Arc::new(AtomicI64::new(9)), start: 10 };
+        let intake = IntakeLog { log: MemoryLog::starting_at(1 << 20, LogOffset(10)), consumed: Arc::new(AtomicI64::new(9)), start: 10, trim_on_apply: false };
         for _ in 0..(INTAKE_RETAINED_BEHIND + 100) { intake.enqueue(Bytes::from_static(b"x"), Timestamp(0)).await.unwrap().durable().await.unwrap(); }
         let mut tail = intake.tail(LogOffset(9)).await.unwrap();
         let mut read = 0;

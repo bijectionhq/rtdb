@@ -5,14 +5,15 @@ use super::{InstalledJournal, WriterAdmission, latest};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    Command, Cut, Grant, Hold, Outcome, Refusal, Request, service::Route,
+    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, Outcome, Refusal, Request,
+    service::Route,
 };
 use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
 use rtdb_storage::{
     Error, Result,
     log::{
-        AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange, LogRecord,
-        LogReplayTail, LogTail, ReplayHead,
+        AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange,
+        LogRecord, LogReplayTail, LogTail, ReplayHead,
     },
     object_store::ReadReservation,
 };
@@ -34,6 +35,7 @@ const MAX_RANGE_BYTES: usize = 32 << 20;
 
 pub(crate) struct JournalLog {
     reads: Arc<Reads>,
+    maximum_data_message: usize,
     writer: Mutex<Writer>,
     recovery: Mutex<Option<Arc<Held>>>,
 }
@@ -122,6 +124,7 @@ impl JournalLog {
         admission: WriterAdmission,
         recovery: Arc<Held>,
         maximum_message_bytes: usize,
+        configured_window: Option<u64>,
         tasks: TaskTracker,
     ) -> Result<Arc<Self>> {
         let current = journal.route().await.map_err(storage)?;
@@ -131,6 +134,13 @@ impl JournalLog {
         {
             return Err(deposed(admission.grant, &current));
         }
+        let paid_window = configured_window
+            .unwrap_or(current.ordinary_limit)
+            .min(current.ordinary_limit);
+        let maximum_data_message =
+            usize::try_from(paid_window.saturating_sub(APPEND_RECORD_CHARGE_BYTES))
+                .unwrap_or(usize::MAX)
+                .min(maximum_message_bytes);
         let reads = Arc::new(Reads {
             journal,
             tip: AtomicI64::new(latest(current.head).map_err(storage)?.0),
@@ -146,6 +156,7 @@ impl JournalLog {
         });
         Ok(Arc::new(Self {
             reads,
+            maximum_data_message,
             writer,
             recovery: Mutex::new(Some(recovery)),
         }))
@@ -153,13 +164,18 @@ impl JournalLog {
 
     async fn enqueue_at(
         &self,
+        class: AppendClass,
         payload: Bytes,
         sample: impl FnOnce() -> Result<Timestamp> + Send,
     ) -> Result<AppendReceipt> {
-        if payload.len() > self.reads.maximum {
+        let maximum = match class {
+            AppendClass::Data => self.maximum_data_message,
+            AppendClass::Maintenance => self.reads.maximum,
+        };
+        if payload.len() > maximum {
             return Err(Error::MessageTooLarge {
                 size: payload.len(),
-                maximum: self.reads.maximum,
+                maximum,
             });
         }
         let mut writer = self.writer.lock().await;
@@ -172,6 +188,7 @@ impl JournalLog {
         }
         let timestamp = sample()?;
         let command = Command::Append {
+            class,
             grant: writer.grant,
             expected_next: writer.head.next_lsn,
             timestamp: timestamp.0,
@@ -193,8 +210,10 @@ impl JournalLog {
             .as_ref()
             .ok_or_else(|| Error::Task("No pending ordered append".into()))?;
         let Command::Append {
+            class,
             expected_next,
             timestamp,
+            payload,
             ..
         } = &request.command
         else {
@@ -209,12 +228,19 @@ impl JournalLog {
                 .await
                 .map_err(storage)?,
             Err(error) if error.code == "rtdb.multi/ordered-capacity" => {
+                let capacity = (*class == AppendClass::Data).then(|| Error::AppendCapacity {
+                    required_bytes: (payload.len() as u64)
+                        .saturating_add(APPEND_RECORD_CHARGE_BYTES),
+                });
                 writer.pending = None;
-                return Err(storage(error));
+                return Err(capacity.unwrap_or_else(|| storage(error)));
             }
             Err(error) => return Err(storage(error)),
         };
-        if result.lsn != *expected_next || result.lsn != writer.head.next_lsn {
+        if result.class != *class
+            || result.lsn != *expected_next
+            || result.lsn != writer.head.next_lsn
+        {
             return Err(Error::Task(
                 "The ordered append receipt addresses a different record".into(),
             ));
@@ -544,14 +570,24 @@ impl Log for JournalLog {
         true
     }
     fn maximum_append_bytes(&self) -> Option<usize> {
-        Some(self.reads.maximum)
+        Some(self.maximum_data_message)
     }
     fn maximum_guarded_append_bytes(&self) -> Option<usize> {
         self.maximum_append_bytes()
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, || Ok(timestamp)).await
+        self.enqueue_at(AppendClass::Data, payload, || Ok(timestamp))
+            .await
+    }
+
+    async fn enqueue_maintenance(
+        &self,
+        payload: Bytes,
+        timestamp: Timestamp,
+    ) -> Result<AppendReceipt> {
+        self.enqueue_at(AppendClass::Maintenance, payload, || Ok(timestamp))
+            .await
     }
 
     async fn enqueue_guarded(
@@ -559,7 +595,21 @@ impl Log for JournalLog {
         payload: Bytes,
         guard: GuardedAppend<'_>,
     ) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, || guard.sample()).await
+        self.enqueue_at(AppendClass::Data, payload, || guard.sample())
+            .await
+    }
+
+    async fn available_append_capacity(&self) -> Result<Option<AppendCapacity>> {
+        let current = self.reads.route().await?;
+        let grant = self.writer.lock().await.grant;
+        if current.writer.grant != Some(grant) {
+            return Err(deposed(grant, &current));
+        }
+        Ok(Some(AppendCapacity {
+            available_bytes: current.window.bytes - current.window_spent,
+            published_through: latest(current.checkpoint.cut).map_err(storage)?,
+            last_data: current.last_data.map(latest).transpose().map_err(storage)?,
+        }))
     }
 
     fn latest(&self) -> Result<LogOffset> {

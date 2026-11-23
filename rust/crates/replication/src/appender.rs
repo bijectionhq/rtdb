@@ -143,7 +143,7 @@ impl ReplicaAppender {
                 receipt = receipts.next(), if !receipts.is_empty() => {
                     if let Some(Err(error)) = receipt { break Err(error); }
                 },
-                _ = timer.tick(), if self.heartbeat && !start_with_confirmation => {
+                _ = timer.tick(), if self.heartbeat && !start_with_confirmation && !self.logs.data_suspended() => {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
