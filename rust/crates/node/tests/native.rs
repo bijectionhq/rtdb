@@ -147,7 +147,7 @@ async fn an_implicit_basis_checks_the_replica_index_before_capturing_applied_his
     assert!(futures::poll!(&mut pending).is_pending());
     let system_time = Timestamp(100);
     for (sequence, message) in [
-        ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }),
+        ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }),
         ReplicaBody::ResolvedTx(proto::ResolvedTx {
             tx_id: Some(0), system_time_micros: Some(system_time.0), committed: Some(true), src_msg_id: Some(0), ..Default::default()
         }),

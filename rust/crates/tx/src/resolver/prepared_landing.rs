@@ -36,6 +36,19 @@ fn stale() -> Anomaly {
 }
 
 impl SourceTransaction {
+    /// Reads the authored clock target from the bounded command envelope.
+    pub fn proposal_generation_reading(&self) -> Result<Option<Timestamp>> {
+        if !is_landing(&self.operations) { return Ok(None); }
+        let mut ticks = self.operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
+            _ => None,
+        });
+        let tick = ticks.next().ok_or_else(invalid)?;
+        let time = crate::system_time::clock_slot_reading(tick.system_time).ok_or_else(invalid)?;
+        if ticks.next().is_some() { return Err(invalid()); }
+        Ok(Some(time))
+    }
+
     /// Lowers both the approved effects and the chosen constraint outcome on one
     /// private snapshot. Its provisional transaction ID is used only by the
     /// buffer. The admitted landing operations use the offered system reading.
@@ -59,15 +72,11 @@ impl SourceTransaction {
         let scope = self.placed_attempt(SourcePosition(provisional_id))?.map(PlacedAttempt::scope)
             .filter(|scope| Some(*scope) == context.owned_witness_scope).ok_or_else(invalid)?;
 
-        let mut ticks = operations.operations.iter().filter_map(|operation| match operation {
+        let time = self.proposal_generation_reading()?.ok_or_else(invalid)?;
+        let tick = operations.operations.iter().find_map(|operation| match operation {
             Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
             _ => None,
-        });
-        let tick = ticks.next().ok_or_else(invalid)?;
-        let time = crate::system_time::clock_slot_reading(tick.system_time).ok_or_else(invalid)?;
-        if ticks.next().is_some() {
-            return Err(invalid());
-        }
+        }).ok_or_else(invalid)?;
         crate::system_time::clock_slot_time(tick, Some(predecessor), time).ok_or_else(|| {
             Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable")
         })?;

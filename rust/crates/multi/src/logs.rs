@@ -372,13 +372,16 @@ async fn next_source_offset_from_cut(
 
 enum Scanned { Position(i64), MayConsume, Consumes }
 
-/// What one replica record says about the source positions consumed up to it.
+/// What one replica record says about source positions allocated up to it.
 /// A claim or heartbeat (a no-op naming no source position) and a leader's own deletion notice consume none; anything else whose position it does not name may have consumed one.
 fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
     let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(Scanned::MayConsume); };
     let position = match &envelope.message {
         ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
-        ReplicaBody::NoOp(noop) => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
+        ReplicaBody::NoOp(noop) => match noop.placed_slot_reservation.as_deref() {
+            Some(wire) => Some(rtdb_types::PlacedReservation::decode(wire)?.attempt.position().0),
+            None => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
+        },
         ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
         ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
         ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => return Ok(Scanned::Consumes),
@@ -437,6 +440,7 @@ pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Resul
         tx.tx_id = Some(position);
         tx.src_msg_id = Some(position);
         tx.placed_attempt = None;
+        tx.placed_slot_terminal = None;
         tx.acceptance_stage = None;
         tx.table_data.remove(&attempt_table);
     }
@@ -872,11 +876,11 @@ mod tests {
     async fn the_intake_starts_beyond_every_source_position_the_replica_stream_may_hold() {
         let replica = MemoryLog::new(1 << 20);
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 0, "a fresh deployment starts at 0");
-        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;
         append(&replica, ReplicaBody::ResolvedTx(proto::ResolvedTx { src_msg_id: Some(41), ..Default::default() })).await;
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42);
         for _ in 0..INTAKE_TIP_WINDOW {
-            append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+            append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;
         }
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42, "a claim consumes no source position");
         append(&replica, ReplicaBody::TriesAdded(Default::default())).await;
@@ -891,7 +895,7 @@ mod tests {
         let cut = TransferIntakeCut { replica_through: 501, source_through: 1000 };
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1001);
         append(&replica, ReplicaBody::OversizedMessage(proto::OversizedMessage::default())).await;
-        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1002);
         let earlier = TransferIntakeCut { replica_through: 499, ..cut };
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(earlier)).await.unwrap(), 1004);

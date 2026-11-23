@@ -31,7 +31,13 @@ Each placed intake has a local byte limit before it accepts provisional work.
 That credit remains with its payload through trim and any outstanding source readers.
 Replica installation checks that the terminal witness agrees with the envelope's exact identity, transaction key and disposition.
 Redemption checks the installed original disposition before mapping any retry to an earlier command result.
-Durable reservation, fencing and succession are implementation and proof obligations for the receiver slot contract.
+The placed driver reserves one open slot per database before resolution and waits for exact replica read-back before it exposes admission.
+A checkpoint boundary waits for the current slot's terminal record.
+Promotion reconstructs the open slot from the authenticated suffix, settles it through the successor term's reserved fence path, and then opens fresh processing.
+A fence publishes an aborted transaction and its original placed witness with zero business effects.
+Acknowledged admission can survive lost provisional bytes because the successor can settle without those bytes.
+Independent writable histories need an authenticated transfer of original post-cut obligations before enabling admission.
+The installed same-history path remains unexecuted.
 
 Current source paths are [Multi intake](../../rust/crates/multi/src/logs.rs), [node submit and await](../../rust/crates/node/src/node.rs), [session basis](../../rust/crates/node/src/session.rs), and [installed progress](../../rust/crates/replication/src/driver.rs).
 

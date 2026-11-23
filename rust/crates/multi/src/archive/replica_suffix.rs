@@ -234,7 +234,7 @@ pub(crate) async fn capture(
                                         // Fenced frames do not contribute any replay effects.
                                         let mut envelope = ReplicaFrame::decode(&entry.payload)?
                                             .into_envelope().ok_or_else(suffix_unavailable)?;
-                                        envelope.message = ReplicaBody::NoOp(NoOp { src_msg_id: None });
+                                        envelope.message = ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() });
                                         entry.payload = envelope.encode().into();
                                     }
                                     continue;
@@ -246,6 +246,9 @@ pub(crate) async fn capture(
                                     (envelope, None)
                                 };
                                 if held {
+                                    if let ReplicaBody::NoOp(noop) = &mut resolved.message {
+                                        noop.placed_slot_reservation = None;
+                                    }
                                     if let ReplicaBody::ResolvedTx(message) = &mut resolved.message {
                                         rtdb_replication::project_held_replica(
                                             message, progress.tx, BlockIndex(progress.replay.installed.block), memory,
@@ -822,7 +825,7 @@ pub(super) fn transfer_control(
     };
     Ok(Some(ReplicaEnvelope {
         term: envelope.term, term_sequence: envelope.term_sequence,
-        message: ReplicaBody::NoOp(NoOp { src_msg_id }),
+        message: ReplicaBody::NoOp(NoOp { src_msg_id, ..Default::default() }),
     }.encode().into()))
 }
 
@@ -840,6 +843,9 @@ pub(super) fn admit_record(
     let admitted = fence.admit(envelope.term, envelope.term_sequence)?;
     if admitted.opens_term() && !matches!(&envelope.message,
         ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none())
+        && !matches!(&envelope.message, ReplicaBody::ResolvedTx(tx)
+            if tx.placed_slot_terminal.as_deref().and_then(|wire| rtdb_types::PlacedTerminal::decode(wire).ok())
+                .is_some_and(|terminal| terminal.fenced))
     {
         return Err(suffix_unavailable());
     }
@@ -867,7 +873,7 @@ mod custody_tests {
             admit_record(&entry, &mut fence, &mut writer, 3)
         };
         let offloaded = || ReplicaBody::OversizedMessage(OversizedMessage::default());
-        let claim = || ReplicaBody::NoOp(NoOp { src_msg_id: None });
+        let claim = || ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() });
         assert!(admit(1, 1, 1, offloaded())?.is_none());
         assert!(admit(2, 5, 1, offloaded())?.is_none());
         assert!(admit(2, 7, 2, offloaded())?.is_none());
@@ -901,14 +907,14 @@ mod custody_tests {
         let proof = JournalDigest::from_digest_bytes(record.stream("replica"), [9, 9], [7; 32]);
         let payloads = ServingPayloads::new(&record, region, &proof, &storage, &keys, io, &memory)?;
         let original = ReplicaEnvelope {
-            term: Term(2), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(17) }),
+            term: Term(2), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(17), ..Default::default() }),
         };
         let body = original.encode();
         let proxy = original.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "payload".into(), &body);
         let path = key(&proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap())?;
         assert!(payloads.resolve_verified(8, &proxy).await.is_err());
         assert!(payloads.resolve_verified(9, &proxy).await.is_err());
-        let wrong = ReplicaEnvelope { message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(18) }), ..original.clone() };
+        let wrong = ReplicaEnvelope { message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(18), ..Default::default() }), ..original.clone() };
         objects.put(&path, wrong.encode().into()).await?;
         assert_eq!(payloads.resolve_verified(9, &proxy).await.err().unwrap().code, "rtdb.format/oversized-payload-mismatch");
         objects.delete(&path).await?;

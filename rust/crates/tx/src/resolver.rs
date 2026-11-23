@@ -203,7 +203,7 @@ impl ResolvedTx {
             tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
             table_data: tables.into_iter().collect(),
             db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position().0),
-            placed_attempt, acceptance_stage, search_delta: None,
+            placed_attempt, acceptance_stage, search_delta: None, placed_slot_terminal: None,
         });
         Ok(OwnedReplicaBody { body, _reservation: reservation, _table_reservations: table_reservations })
     }
@@ -257,6 +257,17 @@ impl TxResolver {
 
     /// Stages the skipped transaction outcome after its source payload has been persisted for inspection.
     pub async fn resolve_skipped(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, attempt: Option<PlacedAttempt>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let reason = Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped");
+        self.resolve_source_abort(durable, position, log_time, attempt, context, reason, false).await
+    }
+
+    pub async fn resolve_placed_fence(&mut self, durable: Snapshot, attempt: PlacedAttempt, log_time: Timestamp, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let reason = Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb/attempt-fenced",
+            "The receiver closed the original attempt before it could apply");
+        self.resolve_source_abort(durable, attempt.position(), log_time, Some(attempt), context, reason, true).await
+    }
+
+    pub async fn resolve_source_abort(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, attempt: Option<PlacedAttempt>, context: &ResolveContext, reason: Anomaly, fenced: bool) -> Result<Arc<ResolvedTx>> {
         let _span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(0))]);
         context.check_cancelled()?;
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
@@ -264,14 +275,14 @@ impl TxResolver {
         let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
-        let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
+        let error = crate::RetainedAnomaly::new(reason, &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
         let clock = tx.observe_retention_clock(log_time).await?;
         let receipt_time = clock.time;
-        tx.retire_expired_receipts(clock).await?;
+        if !fenced { tx.retire_expired_receipts(clock).await?; }
         tx.write_result(&result, None, Some(log_time), receipt_time)?;
         if let Some(attempt) = attempt {
-            tx.retire_placed_outcomes(clock).await?;
+            if !fenced { tx.retire_placed_outcomes(clock).await?; }
             tx.write_attempt_outcome(attempt, &result, log_time, Default::default(), Vec::new(), false)?;
         }
         let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {

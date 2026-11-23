@@ -31,6 +31,7 @@ pub fn project_held_replica(message: &mut ResolvedTx, predecessor: TransactionKe
     decode_replica(message, Some(predecessor), block, memory)?;
     message.table_data.retain(|name, _| !receipt_table(name));
     message.placed_attempt = None;
+    message.placed_slot_terminal = None;
     // The strict acceptance witness is bound to that same placed attempt.
     // Original journal admission checked it before this projection.
     message.acceptance_stage = None;
@@ -41,7 +42,7 @@ pub fn project_held_replica(message: &mut ResolvedTx, predecessor: TransactionKe
 /// passed the full replica decoder. Placement-dependent checks ran before the
 /// receipt witness was removed. This decoder is private to archived replay.
 pub fn decode_held_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
-    if message.placed_attempt.is_some() || message.table_data.keys().any(|name| receipt_table(name)) {
+    if message.placed_attempt.is_some() || message.placed_slot_terminal.is_some() || message.table_data.keys().any(|name| receipt_table(name)) {
         return Err(invalid("Held business replay contains expiring transaction metadata"));
     }
     decode(message, predecessor, block, memory, true)
@@ -52,6 +53,16 @@ fn receipt_table(name: &str) -> bool {
 }
 
 fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>, held: bool) -> Result<ReplayedTransaction> {
+    if let Some(wire) = message.placed_slot_terminal.as_deref() {
+        let terminal = rtdb_types::PlacedTerminal::decode(wire)?;
+        if message.placed_attempt.is_none() || (terminal.fenced && (
+            message.committed != Some(false) || message.db_op.is_some() || message.acceptance_stage.is_some()
+            || message.external_source_token.is_some() || message.search_delta.is_some()
+            || message.table_data.keys().any(|table| table != "xt/txs" && table != "xt/placed_attempt_outcomes")
+        )) {
+            return Err(invalid("A placed receiver fence cannot publish effects"));
+        }
+    }
     let placed = if let Some(placed) = message.placed_attempt.as_deref() {
         let (attempt, retirement) = decode_replica_outcome_attempt(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
         let position = Some(attempt.position().0);

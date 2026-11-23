@@ -189,13 +189,16 @@ impl PartitionLogs {
             return Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch });
         }
         let now = clock();
-        // Only the term's initial claim and the block close can consume reserved journal space.
+        // Claims, checkpoint closure and inherited receiver fences use reserved journal space.
         // Keep that class when a large block upload is represented by an offload reference.
         // A journal that fences writer terms has no claims, so its sequence-zero no-op is ordinary data.
         let maintenance = match &envelope.message {
             ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,
             ReplicaBody::NoOp(message) => !self.fences_writer_terms()
-                && envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none(),
+                && envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none()
+                && message.placed_slot_reservation.is_none(),
+            ReplicaBody::ResolvedTx(tx) => tx.placed_slot_terminal.as_deref()
+                .map(rtdb_types::PlacedTerminal::decode).transpose()?.is_some_and(|terminal| terminal.fenced),
             _ => false,
         };
         let enqueue = |payload| async move {

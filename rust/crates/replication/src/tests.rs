@@ -202,7 +202,7 @@ async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head()
 #[tokio::test]
 async fn replay_admission_refusal_keeps_the_read_position_and_reports_the_budget_error() {
     let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
-    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }));
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }));
     fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
     fixture.driver.consume(opening).await.unwrap();
     let read_position = fixture.handle.status().replica_position;
@@ -245,7 +245,7 @@ async fn admitted_replica_fault_reaches_an_unmet_waiter_and_preserves_the_applie
     let handle = fixture.handle.clone();
     let driver = tokio::spawn(fixture.driver.run());
     let cancellation = CancellationToken::new();
-    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None });
+    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() });
     for record in [raw(0, 1, 0, claim), raw(1, 1, 1, resolved(0, 0))] {
         fixture.replica.enqueue(record.payload, record.metadata.timestamp).await.unwrap().durable().await.unwrap();
     }
@@ -396,7 +396,7 @@ async fn catalog_cut_cannot_cross_an_unrecognized_replica_body() {
 async fn catalog_cut_advances_when_resolution_releases_deferred_records() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, external_source: true, ..Default::default() }, 1 << 27).await;
     let partition = Arc::clone(&fixture.driver.partition);
-    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     fixture.driver.promote().await.unwrap();
     let receipt = fixture.handle.term().unwrap()
         .submit_external(Box::new(CommitExternal), Some(Timestamp(100)), None).await.unwrap();
@@ -423,7 +423,7 @@ async fn catalog_cut_advances_when_resolution_releases_deferred_records() {
 
 async fn queued_trie_removal(key: &str) -> (Fixture, TableRef, rtdb_format::keys::TrieKey, oneshot::Receiver<Result<Applied>>, LogRecord) {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
-    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }));
+    let opening = raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }));
     fixture.replica.enqueue(opening.payload.clone(), opening.metadata.timestamp).await.unwrap().durable().await.unwrap();
     fixture.driver.consume(opening).await.unwrap();
     fixture.driver.promote().await.unwrap();
@@ -592,7 +592,7 @@ async fn hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary() {
     // The first recovered checkpoint loses its log suffix while its replacement becomes visible.
     for sequence in [2, 3] {
         let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)),
-            message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+            message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
         fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
     }
     fixture.replica.truncate_before(LogOffset(3)).unwrap();
@@ -645,7 +645,7 @@ async fn a_receipted_checkpoint_accepts_only_a_directory_admitted_successor() {
         block: BlockIndex(0), boundary: ReplicaPosition(1), root_sha256: catalog.publication_sha256(),
     });
     let mut writer = produce_newer_memory_checkpoint(&fixture).await;
-    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     let (later, _) = fixture.blocks.load(BlockIndex(1)).await.unwrap();
     let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0), admitted)
         .await.expect("an unadmitted stored successor cannot replace the receipt");
@@ -670,7 +670,7 @@ async fn hosted_checkpoint_recovery_can_use_a_later_boundary_after_prefix_collec
     let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
         BlockDiscovery::FromPublished(published)).await.unwrap();
     let mut writer = produce_newer_memory_checkpoint(&fixture).await;
-    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 2, 2, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     fixture.replica.truncate_before(LogOffset(4)).unwrap();
     let selected = fixture.blocks.recover_for_replay(recovered, &fixture.logs, TrieConfig::default(),
         Timestamp(0), &CancellationToken::new()).await.unwrap();
@@ -779,7 +779,7 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
     assert!(matches!(ReplicaEnvelope::decode(&record.payload).unwrap().unwrap().message, ReplicaBody::OversizedMessage(_)));
     fixture.driver.consume(record).await.unwrap();
     assert_eq!(fixture.driver.fence.position(), TermPosition::Expecting(TermSequence(1)));
-    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()), ..Default::default() });
     fixture.driver.consume(raw(2, 1, 1, missing)).await.unwrap();
     assert_eq!(fixture.driver.read_position, rtdb_types::ReplicaPosition(2));
@@ -913,7 +913,7 @@ async fn staged_leader_and_decoding_follower_publish_the_same_transaction_prefix
     let mut leader = fixture(config.clone(), 1 << 27).await;
     let mut follower = fixture(config, 1 << 27).await;
     let claim = ReplicaEnvelope {
-        term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }),
+        term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }),
     };
     leader.logs.enqueue_replica(&claim, BlockIndex(0), Timestamp(99)).await.unwrap().durable().await.unwrap();
     let mut tail = leader.logs.replica_tail(leader.driver.read_position).await.unwrap();
@@ -1129,7 +1129,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
         let after = if legacy_suffix {
             let legacy = submit_recovery_row(&old_handle, &old.resolve.memory, 10, 200).await;
             for (seq, message) in [
-                (0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })),
+                (0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })),
                 (1, ReplicaBody::ResolvedTx(proto::ResolvedTx {
                     tx_id: Some(legacy.0), system_time_micros: Some(200), committed: Some(true),
                     src_msg_id: Some(legacy.0), ..Default::default()
@@ -1267,7 +1267,7 @@ async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_su
 
 async fn produced_memory_checkpoint(sequenced: bool) -> Fixture {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 20).await;
-    for (seq, message) in [(0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })), (1, boundary(0, -1))] {
+    for (seq, message) in [(0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })), (1, boundary(0, -1))] {
         let envelope = ReplicaEnvelope { term: Term(1), term_sequence: sequenced.then_some(TermSequence(seq)), message };
         fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(0)).await.unwrap().durable().await.unwrap();
         fixture.driver.consume(raw_with_envelope(seq, &envelope)).await.unwrap();
@@ -1374,7 +1374,7 @@ async fn a_recovered_checkpoint_uses_only_matching_admitted_confirmation_and_acc
 async fn a_recovered_checkpoint_reannounces_when_an_older_term_upload_was_fenced() {
     let fixture = produced_memory_checkpoint(true).await;
     let (_handle, mut restarted) = reopen_memory_checkpoint(&fixture).await;
-    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None });
+    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() });
     for (index, term, sequence, message) in [(2, 2, 0, claim.clone()), (3, 1, 2, upload(0, -1)), (4, 3, 0, claim)] {
         let envelope = ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message };
         fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
@@ -1399,7 +1399,7 @@ async fn a_recovered_checkpoint_reannounces_when_an_older_term_upload_was_fenced
 async fn a_recovered_checkpoint_does_not_replace_missing_required_replica_records_with_a_claim() {
     let fixture = produced_memory_checkpoint(true).await;
     for sequence in [2, 3] {
-        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
         fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(1)).await.unwrap().durable().await.unwrap();
     }
     fixture.replica.truncate_before(LogOffset(3)).unwrap();
@@ -1421,7 +1421,7 @@ async fn produce_newer_memory_checkpoint(fixture: &Fixture) -> ReplicationDriver
     let (_, mut prior) = reopen_memory_checkpoint_with_config(fixture, ReplicationConfig {
         may_lead: false, ..Default::default()
     }).await;
-    deliver_checkpoint_record(fixture, &mut prior, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(fixture, &mut prior, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     deliver_checkpoint_record(fixture, &mut prior, 2, 1, boundary(1, -1)).await.unwrap();
     let pending = prior.pending_block.as_ref().unwrap();
     let selected = prior.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
@@ -1449,7 +1449,7 @@ async fn promotion_ignores_a_deleted_historical_catalog_still_present_in_the_dis
     fixture.store.delete(&old_catalog).await.unwrap();
     assert!(cached.head(&old_catalog).await.is_ok());
     writer.claim = Some(rtdb_types::ReplicaPosition(4));
-    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     assert!(writer.historical_confirmations.is_empty());
     assert_eq!(writer.role(), Role::Following);
     let mut tail = fixture.replica.tail(LogOffset(4)).await.unwrap();
@@ -1471,7 +1471,7 @@ async fn recovery_confirms_a_later_anchor_when_the_oldest_catalog_precedes_the_l
     let (_, mut last) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
         may_lead: false, ..Default::default()
     }).await;
-    deliver_checkpoint_record(&fixture, &mut last, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut last, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     deliver_checkpoint_record(&fixture, &mut last, 3, 1, boundary(2, -1)).await.unwrap();
     let pending = last.pending_block.as_ref().unwrap();
     let latest = last.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
@@ -1491,7 +1491,7 @@ async fn recovery_confirms_a_later_anchor_when_the_oldest_catalog_precedes_the_l
     assert_eq!(handle.progress().current().tx_key, progress.tx_key);
 
     writer.claim = Some(rtdb_types::ReplicaPosition(6));
-    deliver_checkpoint_record(&fixture, &mut writer, 4, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 4, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     let mut tail = fixture.replica.tail(LogOffset(6)).await.unwrap();
     for (index, sequence) in [(1, 1), (2, 2)] {
         assert_eq!(writer.role(), Role::Following);
@@ -1515,7 +1515,7 @@ async fn historical_confirmation_recovers_an_older_block_at_a_legacy_selected_bo
         may_lead: false, ..Default::default()
     }).await;
     let mut legacy_tail = fixture.replica.tail(LogOffset(1)).await.unwrap();
-    for message in [ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }), boundary(1, -1)] {
+    for message in [ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }), boundary(1, -1)] {
         let envelope = ReplicaEnvelope { term: Term(2), term_sequence: None, message };
         fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
         prior.consume(next_local_record(legacy_tail.as_mut()).await).await.unwrap();
@@ -1676,7 +1676,7 @@ async fn recovered_confirmation_survives_a_failed_later_block_start_and_the_next
         assertion_interval: Duration::from_secs(3600), ..Default::default()
     }).await;
     restarted.effects = Arc::new(FailFirstInheritedProduction(std::sync::atomic::AtomicBool::new(true)));
-    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None });
+    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() });
     deliver_checkpoint_record(&fixture, &mut restarted, 2, 0, claim.clone()).await.unwrap();
     deliver_checkpoint_record(&fixture, &mut restarted, 2, 1, boundary(1, -1)).await.unwrap();
     restarted.claim = Some(rtdb_types::ReplicaPosition(4));
@@ -1745,9 +1745,9 @@ async fn higher_term_drops_an_inflight_external_writer_and_replays_held_prefix_b
         tokio::select! { _ = super::pending_resolution(resolution) => panic!("waiting writer completed"), _ = tokio::task::yield_now() => {} }
     }
     receiver.await.unwrap();
-    fixture.driver.consume(raw(0, 1, 1, ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(0) }))).await.unwrap();
+    fixture.driver.consume(raw(0, 1, 1, ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(0), ..Default::default() }))).await.unwrap();
     assert_eq!(fixture.handle.progress().current().source_position, SourcePosition(-1));
-    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1) }))).await.unwrap();
+    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1), ..Default::default() }))).await.unwrap();
     assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(result.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert_eq!(fixture.handle.progress().current().source_position, SourcePosition(1));
@@ -1761,7 +1761,7 @@ async fn demotion_fails_queued_gc_publication_without_failing_the_progress_monit
     fixture.driver.promote().await.unwrap();
     let (completion, result) = tokio::sync::oneshot::channel();
     fixture.driver.command(super::Command::Delete { term: Term(1), table: TableRef::new("public", "docs"), keys: vec!["l01-rc-b00".parse().unwrap()], completion }).await.unwrap();
-    fixture.driver.consume(raw(0, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.consume(raw(0, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     assert_eq!(result.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
 }
@@ -1783,7 +1783,7 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
     assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
     assert!(fixture.driver.leader.as_ref().unwrap().compactor_reset.is_some());
     assert_eq!(fixture.driver.partition.open_snapshot(None).catalog_cut(), None);
-    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     assert_eq!(receipt.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
     assert_eq!(fixture.driver.partition.snapshot().catalog_cut(), None);
@@ -1794,7 +1794,7 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
 async fn retained_leader_does_not_claim_again_while_confirmed_or_producing_an_inherited_block() {
     for pending_block in [false, true] {
         let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
-        let body = if pending_block { boundary(0, 0) } else { ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        let body = if pending_block { boundary(0, 0) } else { ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
         fixture.driver.consume(raw(0, 1, 0, body)).await.unwrap();
         fixture.driver.promote().await.unwrap();
         assert_eq!(fixture.driver.role(), if pending_block { Role::Following } else { Role::Leading(Term(1)) });
@@ -1814,7 +1814,7 @@ async fn stalled_claim_keeps_replica_admission_and_shutdown_live() {
     fixture.driver.claiming = Some(super::Claim { term: Term(1), observed: None, future: Box::pin(futures::future::pending()) });
     let handle = fixture.handle.clone();
     let driver = tokio::spawn(fixture.driver.run());
-    fixture.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1) }) }, BlockIndex(0), Timestamp(1)).await.unwrap().durable().await.unwrap();
+    fixture.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1), ..Default::default() }) }, BlockIndex(0), Timestamp(1)).await.unwrap().durable().await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), handle.await_source(SourcePosition(1), &CancellationToken::new())).await.unwrap().unwrap();
     assert_eq!(handle.status().highest_term, Term(2));
     handle.shutdown();
@@ -1825,7 +1825,7 @@ async fn stalled_claim_keeps_replica_admission_and_shutdown_live() {
 async fn claim_read_back_before_durability_promotes_only_after_its_matching_receipt() {
     let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
     fixture.driver.claiming = Some(super::Claim { term: Term(1), observed: None, future: Box::pin(futures::future::pending()) });
-    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     assert!(fixture.driver.leader.is_none());
     fixture.driver.claim_finished(Ok(ReplicaMetadata { position: rtdb_types::ReplicaPosition(0), timestamp: Timestamp(1) })).await.unwrap();
     assert_eq!(fixture.driver.role(), Role::Leading(Term(1)));
@@ -1836,8 +1836,8 @@ async fn claim_read_back_before_durability_promotes_only_after_its_matching_rece
 async fn losing_same_term_claim_never_promotes_after_durability() {
     let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
     fixture.driver.claiming = Some(super::Claim { term: Term(1), observed: None, future: Box::pin(futures::future::pending()) });
-    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
-    fixture.driver.consume(raw(1, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    fixture.driver.consume(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
+    fixture.driver.consume(raw(1, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }))).await.unwrap();
     fixture.driver.claim_finished(Ok(ReplicaMetadata { position: rtdb_types::ReplicaPosition(1), timestamp: Timestamp(1) })).await.unwrap();
     assert!(fixture.driver.leader.is_none());
 }
@@ -1912,10 +1912,17 @@ async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies
     assert!(!leader.accepting_commands());
 
     wall.store(200, Ordering::Relaxed);
+    let prior_record_offset = prior_record.metadata.offset;
     fixture.driver.consume(prior_record).await.unwrap();
     assert!(matches!(prior_applied.await.unwrap().unwrap(), Applied::Transaction(_)));
     assert!(fixture.driver.leader.as_ref().unwrap().ready_source());
+    let after = prior_record_offset;
     fixture.driver.resolve_next_source().await.unwrap();
+    assert!(fixture.driver.leader.as_ref().unwrap().resolution.is_none());
+    let mut tail = fixture.replica.tail(after).await.unwrap();
+    let reservation = tail.poll(Duration::from_secs(1)).await.unwrap().pop().unwrap();
+    fixture.driver.consume(reservation).await.unwrap();
+    fixture.driver.drive_placed_slot().unwrap();
     let (resolver, result) = super::pending_resolution(&mut fixture.driver.leader.as_mut().unwrap().resolution).await;
     assert_eq!(result.as_ref().unwrap().result().error().unwrap().code, "rtdb.owned/expired");
     fixture.driver.resolution_finished(resolver, result).await.unwrap();
@@ -1923,7 +1930,7 @@ async fn a_strict_source_samples_the_clock_after_the_older_replica_write_applies
 }
 
 #[tokio::test]
-async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source() {
+async fn a_successor_fences_a_durably_admitted_write_that_missed_dispatch() {
     let wall = Arc::new(AtomicI64::new(110));
     let clock: ReplicationClock = {
         let wall = Arc::clone(&wall);
@@ -1934,7 +1941,7 @@ async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source()
     let scope = rtdb_types::PlacedAttemptScope::new("test-replica", 1).unwrap();
     Arc::get_mut(&mut fixture.driver.resolve).unwrap().owned_witness_scope = Some(scope);
     let claim = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)),
-        message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
     fixture.logs.enqueue_replica(&claim, BlockIndex(0), Timestamp(100)).await.unwrap().durable().await.unwrap();
     let claim_record = fixture.replica.read_range(LogOffset(0), LogOffset(1)).await.unwrap().pop().unwrap();
     fixture.driver.consume(claim_record).await.unwrap();
@@ -1949,6 +1956,10 @@ async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source()
         LogMetadata { offset: LogOffset(source.0), timestamp: Timestamp(100) }, payload,
     ));
     fixture.driver.resolve_next_source().await.unwrap();
+    let mut tail = fixture.replica.tail(LogOffset(0)).await.unwrap();
+    let admission = tail.poll(Duration::from_secs(1)).await.unwrap().pop().unwrap();
+    fixture.driver.consume(admission).await.unwrap();
+    fixture.driver.drive_placed_slot().unwrap();
     let leader = fixture.driver.leader.as_mut().unwrap();
     let (resolver, result) = super::pending_resolution(&mut leader.resolution).await;
     assert!(result.as_ref().unwrap().staging_clock_upper().is_some());
@@ -1959,14 +1970,15 @@ async fn a_strict_write_expired_before_dispatch_resolves_again_from_its_source()
     let driver = tokio::spawn(fixture.driver.run());
     tokio::time::timeout(Duration::from_secs(1), fixture.handle.await_source(source, &CancellationToken::new()))
         .await.unwrap().unwrap();
-    let records = fixture.replica.read_range(LogOffset(0), LogOffset(3)).await.unwrap();
-    assert_eq!(records.len(), 3);
-    let resolved = ReplicaEnvelope::decode(&records[2].payload).unwrap().unwrap();
+    let records = fixture.replica.read_range(LogOffset(0), LogOffset(4)).await.unwrap();
+    assert_eq!(records.len(), 4);
+    let resolved = ReplicaEnvelope::decode(&records[3].payload).unwrap().unwrap();
     assert_eq!(resolved.term, Term(2));
     let ReplicaBody::ResolvedTx(tx) = resolved.message else { panic!("Expected an ordered refusal"); };
     assert_eq!(tx.src_msg_id, Some(source.0));
     assert_eq!(tx.committed, Some(false));
     assert!(tx.acceptance_stage.is_none());
+    assert!(rtdb_types::PlacedTerminal::decode(tx.placed_slot_terminal.as_deref().unwrap()).unwrap().fenced);
     fixture.handle.shutdown();
     tokio::time::timeout(Duration::from_secs(1), driver).await.unwrap().unwrap().unwrap();
 }
@@ -2136,7 +2148,7 @@ async fn control_readback_cannot_replace_a_pending_transaction() {
         let (_, mut receipt, mut readback) = queued_attach_readback(&mut fixture, &operation, SourcePosition(0)).await;
         let before = fixture.driver.partition.value();
         let mut envelope = ReplicaEnvelope::decode(&readback.payload).unwrap().unwrap();
-        envelope.message = ReplicaBody::NoOp(proto::NoOp { src_msg_id });
+        envelope.message = ReplicaBody::NoOp(proto::NoOp { src_msg_id, ..Default::default() });
         readback.payload = envelope.encode().into();
 
         let error = fixture.driver.consume(readback).await.unwrap_err();
@@ -2339,7 +2351,7 @@ async fn one_clock_stamps_the_boot_claim_external_transaction_and_source_flush()
         let claim = ReplicaEnvelope::decode(&claim.payload).unwrap().unwrap();
         assert_eq!(claim.term, Term(1));
         assert_eq!(claim.term_sequence, Some(TermSequence(0)));
-        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })));
+        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, placed_slot_reservation: None })));
 
         time.store(3_000_000, Ordering::SeqCst);
         let result = observer.term().unwrap()
@@ -2552,7 +2564,7 @@ async fn placed_driver(replica: Arc<MemoryLog>, config: ReplicationConfig) -> (R
 async fn a_placed_holder_claims_without_an_election_wait_and_an_idle_term_appends_nothing() {
     let replica = Arc::new(MemoryLog::new(1 << 20));
     // A previous term exists, so the claim is not the first-ever one that ClaimWhenNoTermHasLed makes at once.
-    replica.enqueue(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).payload, Timestamp(0)).await.unwrap().durable().await.unwrap();
+    replica.enqueue(raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).payload, Timestamp(0)).await.unwrap().durable().await.unwrap();
     let config = ReplicationConfig { assertion_interval: Duration::from_secs(3600), claim_wait: Some(Duration::from_millis(10)), idle_heartbeat: false, ..Default::default() };
     let (handle, driver) = placed_driver(Arc::clone(&replica), config).await;
     let task = tokio::spawn(driver.run());
@@ -2603,7 +2615,7 @@ async fn a_promotion_that_inherits_a_flushed_block_resumes_the_source_after_the_
     let flush = fixture.logs.append_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(-1) })), Timestamp(200)).await.unwrap();
     // The previous leader read back its transaction and cut the flush's boundary, then died before uploading the block.
     for record in [
-        raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })),
+        raw(0, 1, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })),
         raw(1, 1, 1, resolved(first.0, first.0)),
         raw(2, 1, 2, boundary(0, flush.0)),
     ] {
@@ -2666,7 +2678,7 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
     let (_, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
         may_lead: false, ..Default::default()
     }).await;
-    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await.unwrap();
     deliver_checkpoint_record(&fixture, &mut writer, 3, 1, boundary(2, -1)).await.unwrap();
     let pending = writer.pending_block.as_ref().unwrap();
     let later = writer.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_tx::TransactionResult;
-use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttempt, PlacedDecision, Result, SourcePosition, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttempt, PlacedDecision, PlacedReservation, Result, SourcePosition, Timestamp, TransactionKey, TxId};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +47,7 @@ pub(crate) struct DriverRestart;
 #[derive(Clone, Debug)]
 struct ProgressState {
     applied: AppliedProgress,
+    placed: Option<PlacedReservation>,
     fault: Option<Anomaly>,
     stopped: bool,
     restart: Option<Arc<DriverRestart>>,
@@ -63,10 +64,27 @@ impl ProgressState {
 pub struct ProgressMonitor { state: watch::Sender<ProgressState> }
 impl ProgressMonitor {
     pub fn new(applied: AppliedProgress) -> Arc<Self> {
-        Arc::new(Self { state: watch::channel(ProgressState { applied, fault: None, stopped: false, restart: None }).0 })
+        Arc::new(Self { state: watch::channel(ProgressState { applied, placed: None, fault: None, stopped: false, restart: None }).0 })
     }
     pub fn current(&self) -> AppliedProgress { self.state.borrow().applied.clone() }
     pub fn fault(&self) -> Option<Anomaly> { self.state.borrow().fault.clone() }
+
+    pub(crate) fn reserved(&self, reservation: PlacedReservation) -> Result<()> {
+        let mut conflict = false;
+        self.state.send_if_modified(|state| {
+            if state.placed == Some(reservation) { return false; }
+            if state.placed.is_some() {
+                conflict = true;
+                return false;
+            }
+            state.placed = Some(reservation);
+            true
+        });
+        if conflict {
+            return Err(Anomaly::fault("rtdb.replication/placed-slot-conflict", "A different receiver slot is still open"));
+        }
+        Ok(())
+    }
 
     /// Publishes source, transaction, result, and resume token together after their effects apply.
     pub fn applied(&self, source: Option<SourcePosition>, result: Option<AppliedTransaction>, token: Option<Vec<u8>>) -> Result<()> {
@@ -81,6 +99,15 @@ impl ProgressMonitor {
             if result.as_ref().is_some_and(|result| result.result.tx_key().tx_id <= state.applied.tx_id()) {
                 failure = Some(Anomaly::fault("rtdb.replication/tx-regression", "Applied transaction ID did not advance"));
                 return;
+            }
+            if let Some(placed) = state.placed
+                && source.is_some_and(|source| source >= placed.attempt.position())
+            {
+                if result.as_ref().is_none_or(|result| result.attempt != Some(placed.attempt)) {
+                    failure = Some(Anomaly::fault("rtdb.replication/placed-slot-bypass", "Applied source progress bypassed its receiver slot"));
+                    return;
+                }
+                state.placed = None;
             }
             if let Some(source) = source { state.applied.source_position = source; }
             if let Some(result) = result { state.applied.tx_key = Some(result.result.tx_key()); state.applied.latest_result = Some(result); }
@@ -142,12 +169,12 @@ impl ProgressMonitor {
         });
     }
 
-    async fn until(&self, ready: impl Fn(&AppliedProgress) -> bool + Send, cancellation: &CancellationToken) -> Result<AppliedProgress> {
+    async fn until(&self, ready: impl Fn(&ProgressState) -> bool + Send, cancellation: &CancellationToken) -> Result<AppliedProgress> {
         let mut state = self.state.subscribe();
         loop {
             {
                 let state = state.borrow_and_update();
-                if ready(&state.applied) { return Ok(state.applied.clone()); }
+                if ready(&state) { return Ok(state.applied.clone()); }
                 if let Some(error) = &state.fault { return Err(error.clone()); }
                 if state.stopped { return Err(stopped()); }
             }
@@ -160,14 +187,36 @@ impl ProgressMonitor {
 
     /// Returns the result only when the requested ID is still the most recent applied transaction.
     pub async fn await_tx(&self, tx_id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> {
-        let progress = self.until(|progress| progress.tx_id() >= tx_id, cancellation).await?;
+        let progress = self.until(|state| state.applied.tx_id() >= tx_id, cancellation).await?;
         Ok(progress.latest_result.map(|completed| completed.result).filter(|result| result.tx_key().tx_id == tx_id))
     }
     pub async fn await_source(&self, source: SourcePosition, cancellation: &CancellationToken) -> Result<()> {
-        self.until(|progress| progress.source_position >= source, cancellation).await.map(|_| ())
+        self.until(|state| state.applied.source_position >= source, cancellation).await.map(|_| ())
+    }
+    /// Waits until this exact slot is admitted or progress has moved beyond it.
+    /// In the latter case the caller can redeem the retained decision.
+    pub async fn await_placed_admission(&self, attempt: PlacedAttempt, submitted_at: Timestamp, cancellation: &CancellationToken) -> Result<bool> {
+        let mut receiver = self.state.subscribe();
+        loop {
+            {
+                let state = receiver.borrow_and_update();
+                if state.placed.is_some_and(|slot| slot.attempt == attempt && slot.submitted_at == submitted_at)
+                    || state.applied.placed_outcome(attempt).is_some()
+                {
+                    return Ok(true);
+                }
+                if state.applied.source_position >= attempt.position() { return Ok(false); }
+                if let Some(error) = &state.fault { return Err(error.clone()); }
+                if state.stopped { return Err(stopped()); }
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(cancelled()),
+                result = receiver.changed() => if result.is_err() { return Err(stopped()); },
+            }
+        }
     }
     pub async fn await_system_time(&self, time: Timestamp, cancellation: &CancellationToken) -> Result<AppliedProgress> {
-        self.until(|progress| progress.tx_key.is_some_and(|key| key.system_time >= time), cancellation).await
+        self.until(|state| state.applied.tx_key.is_some_and(|key| key.system_time >= time), cancellation).await
     }
 }
 

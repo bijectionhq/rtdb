@@ -677,13 +677,11 @@ impl Node {
         let seed = authority.map(|authority| authority.scope().issue());
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
             .with_placed_seed(seed);
-        let (mut source, submitted_at) = match replay {
+        let (source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),
         };
-        let prepared_clock = cancellation.run_until_cancelled(
-            source.prepare_proposal_generation(|| database.snapshot(), &database.resolve)
-        ).await.ok_or_else(cancelled)??;
+        let prepared_clock = source.proposal_generation_reading()?;
         let payload = source.encode()?.into_bytes();
         drop(source);
         if let Some(reading) = prepared_clock {
@@ -704,10 +702,19 @@ impl Node {
             let mut latest = admission.lock();
             *latest = (*latest).max(Some(position));
         }
-        let placed_receipt = authority.zip(seed).map(|(authority, seed)| {
-            let attempt = seed.identify(position, identity.user())?;
-            PlacedToken::Pending { attempt, submitted_at: append_time }.seal(authority)
-        }).transpose()?;
+        let placed_receipt = match authority.zip(seed) {
+            Some((authority, seed)) => {
+                let attempt = seed.identify(position, identity.user())?;
+                if !database.progress().await_placed_admission(attempt, append_time, cancellation).await?
+                    && self.placed_outcome(database.name(), attempt, identity, placement, cancellation).await?.is_none()
+                {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/attempt-unresolved",
+                        "The receiver could not confirm admission of the original transaction"));
+                }
+                Some(PlacedToken::Pending { attempt, submitted_at: append_time }.seal(authority)?)
+            }
+            None => None,
+        };
         Ok(SubmittedTx { tx_id: TxId(position.0), placed_receipt })
     }
 

@@ -1215,7 +1215,8 @@ rule CommitWriting {
 }
 
 -- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
--- A volatile intake receipt identifies a provisional offer.
+-- The holder's bounded memory intake contains provisional offers.
+-- A placed submit acknowledges only after observing the exact ordered reservation or its terminal witness.
 -- Covered effectful admission reserves the original slot and funds its terminal witness under the exact request binding.
 -- Exact retry redeems the original slot, and a retired issuance namespace excludes recreation.
 -- The effect or refusal and the receiver's exact terminal witness occupy one ordered record.

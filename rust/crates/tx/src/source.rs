@@ -218,7 +218,7 @@ impl SourceTransaction {
         self
     }
 
-    pub(crate) fn placed_attempt(&self, position: SourcePosition) -> Result<Option<PlacedAttempt>> {
+    pub fn placed_attempt(&self, position: SourcePosition) -> Result<Option<PlacedAttempt>> {
         self.placed_seed.map(|seed| seed.identify(position, self.options.user.as_deref())).transpose()
     }
 
