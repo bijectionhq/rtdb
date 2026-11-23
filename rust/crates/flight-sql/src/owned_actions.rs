@@ -2116,7 +2116,11 @@ impl Service {
         }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held range has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
-        let held = self.owned_read(call, &handle)?;
+        let held = if audience {
+            self.retained_owned_read(call, &handle)?
+        } else {
+            self.owned_read(call, &handle)?
+        };
         if let Err(error) = held.snapshot.check() {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
