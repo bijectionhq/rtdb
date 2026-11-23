@@ -135,14 +135,17 @@ impl<P: Payload> StreamState<P> {
         self.entries.get_mut((lsn - self.trim - 1) as usize)
     }
 
+    pub(super) fn held(&self, lsn: i64) -> Option<&Held<P>> {
+        if lsn <= self.trim { return None; }
+        self.entries.get((lsn - (self.trim + 1)) as usize)
+    }
+
     pub(super) fn guarded_at_seal(&self, epoch: u64, lsn: i64) -> bool {
-        self.promised == epoch && lsn > self.trim && self.entries.get((lsn - (self.trim + 1)) as usize)
-            .is_some_and(|held| held.guarded && held.epoch < epoch)
+        self.promised == epoch && self.held(lsn).is_some_and(|held| held.guarded && held.epoch < epoch)
     }
 
     pub(super) fn sync_observation(&self, lsn: i64) -> Option<Arc<OnceLock<i64>>> {
-        if lsn <= self.trim { return None; }
-        self.entries.get((lsn - (self.trim + 1)) as usize)?.observed_sync.clone()
+        self.held(lsn)?.observed_sync.clone()
     }
 
     pub(super) fn track_sync(&mut self, lsn: i64, observation: Arc<OnceLock<i64>>) -> bool {
@@ -243,6 +246,13 @@ impl<P: Payload> StreamState<P> {
         let own = |held: &Held<P>| held.epoch == epoch;
         if from <= self.last() && (self.synced == Some(epoch) || self.entries.iter().skip((from - self.trim - 1) as usize).any(own)) {
             return invalid(format!("an overwrite at epoch {epoch} from {from} would drop entries its own writer placed, up to {}", self.last()));
+        }
+        // The same entry already held here is never repaired by replacing it.
+        // That would turn this journal's original append into a copy.
+        if from <= self.last() && entries.iter().any(|entry| {
+            self.held(entry.lsn).is_some_and(|held| held.epoch == entry.epoch && held.observed_sync.is_some())
+        }) {
+            return invalid("an overwrite would replace the original guarded append with a copy");
         }
         let mut events = Vec::new();
         if epoch > self.promised { events.push(Event::Promise(epoch)); }

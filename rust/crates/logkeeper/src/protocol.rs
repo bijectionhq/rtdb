@@ -298,6 +298,9 @@ pub struct PageDigest {
     pub digest: Bytes,
     #[prost(sfixed64, optional, tag = "3")]
     pub synced_clock_upper_micros: Option<i64>,
+    /// For an exact guarded probe at a durable seal, this journal's local origin.
+    #[prost(bool, optional, tag = "4")]
+    pub original_append: Option<bool>,
 }
 
 /// Confirms only the promised writer. It conveys no append or commit position.

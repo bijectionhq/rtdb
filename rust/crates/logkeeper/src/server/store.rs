@@ -308,7 +308,7 @@ impl Store {
         };
         let Ok(_page) = self.digest_pages.try_acquire() else { return failed("history proof capacity exhausted"); };
         let Some(slot) = self.existing(&page.stream) else { return failed("the stream was not found"); };
-        let (window, durable, observation) = {
+        let (window, durable, observation, original_append) = {
             let state = slot.state.lock();
             let admitted = match page.sealed_epoch {
                 None => page.through_lsn <= state.commit,
@@ -321,12 +321,13 @@ impl Store {
             let window = self.select(&state, page.from_lsn, page.through_lsn, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES);
             let observation = (page.from_lsn == page.through_lsn)
                 .then(|| state.sync_observation(page.from_lsn)).flatten();
+            let original_append = page.sealed_epoch.map(|_| observation.is_some());
             let (done, durable) = oneshot::channel();
             // A selected commit can still be queued for fsync. The barrier is ordered after that commit.
             if self.queue.send(Work { write: Write::Events(Arc::clone(&slot), Vec::new()), done, _admission: None, authority_revision: None, observed_append: None }).is_err() {
                 return failed("the journal has stopped");
             }
-            (window, durable, observation)
+            (window, durable, observation, original_append)
         };
         if !matches!(durable.await, Ok(Ok(()))) { return failed("the digest interval was not made durable"); }
         let journal = Arc::clone(&self.journal);
@@ -344,7 +345,7 @@ impl Store {
             }
             ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn,
                 digest: Bytes::copy_from_slice(&chain.bytes()),
-                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()) })
+                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()), original_append })
         }).await {
             Ok(reply) => reply,
             Err(error) => failed(error.to_string()),

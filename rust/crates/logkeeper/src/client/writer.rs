@@ -4,7 +4,7 @@ use super::connection::CALL_TIMEOUT;
 use super::ensemble::{Ack, Ensemble, MAXIMUM_BATCH_ENTRIES};
 use super::CopyFrom;
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Append, Commit, Entry, RequestBody, Sealed};
+use crate::protocol::{Accepted, Append, Commit, Entry, PageDigest, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -294,6 +294,29 @@ fn winning_seal(replies: &[(usize, Sealed)]) -> &(usize, Sealed) {
 
 enum TailDecision { Keep, Discard, Unknown }
 
+struct GuardedEvidence {
+    possible: usize,
+    observed: usize,
+}
+
+impl GuardedEvidence {
+    fn record_exact(&mut self, proof: &PageDigest) {
+        match (proof.original_append, proof.synced_clock_upper_micros) {
+            (Some(true), Some(upper)) if upper > 0 => self.observed += 1,
+            (Some(false), None) => self.possible -= 1,
+            // An original that survived without its post-sync sample still
+            // may have synced before the cutoff. An incomplete probe is open.
+            _ => {}
+        }
+    }
+
+    fn decision(&self, quorum: usize) -> TailDecision {
+        if self.observed >= quorum { TailDecision::Keep }
+        else if self.possible < quorum { TailDecision::Discard }
+        else { TailDecision::Unknown }
+    }
+}
+
 async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, history: &Holding, replies: &[(usize, Sealed)]) -> Result<TailDecision> {
     let offset = history.last;
     let unknown = || Error::Remote { key: ensemble.stream(), message: format!("guarded tail at position {offset} has an unknown outcome") };
@@ -314,21 +337,19 @@ async fn settle_guarded_tail(ensemble: &Ensemble, epoch: u64, source: usize, his
     }
     let quorum = ensemble.config.write_quorum;
     if possible < quorum { return Ok(TailDecision::Discard); }
-    if holding.len() < quorum { return Ok(TailDecision::Unknown); }
 
     let Ok(exact) = ensemble.guarded_digest(source, offset, epoch).await else { return Ok(TailDecision::Unknown); };
     if exact.through_lsn != offset || exact.digest.len() != 32 { return Ok(TailDecision::Unknown); }
-    let mut observed = usize::from(exact.synced_clock_upper_micros.is_some());
+    let mut evidence = GuardedEvidence { possible, observed: 0 };
+    evidence.record_exact(&exact);
     let mut pending: FuturesUnordered<_> = holding.into_iter().filter(|server| *server != source)
         .map(|server| ensemble.guarded_digest(server, offset, epoch)).collect();
-    while observed < quorum && let Some(reply) = pending.next().await {
-        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest
-            && proof.synced_clock_upper_micros.is_some()
-        {
-            observed += 1;
+    while matches!(evidence.decision(quorum), TailDecision::Unknown) && let Some(reply) = pending.next().await {
+        if let Ok(proof) = reply && proof.through_lsn == offset && proof.digest == exact.digest {
+            evidence.record_exact(&proof);
         }
     }
-    Ok(if observed >= quorum { TailDecision::Keep } else { TailDecision::Unknown })
+    Ok(evidence.decision(quorum))
 }
 
 /// An unsettled guarded flight is exclusive at the tip. Unlike an ordinary
@@ -981,7 +1002,7 @@ mod tests {
         }
 
         for (stream, originals, copies, expected) in [
-            ("minority", 1, 0, Some(-1)), ("quorum", 2, 0, Some(0)), ("copied", 1, 1, None),
+            ("minority", 1, 0, -1), ("quorum", 2, 0, 0), ("copied", 1, 1, -1),
         ] {
             let ensemble = Ensemble::new(StreamConfig { servers: endpoints.clone(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
             let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true };
@@ -1002,20 +1023,19 @@ mod tests {
                     deposed_by(2, ensemble.overwrite(server, 2, 0, vec![entry.clone()], false).await.unwrap()).unwrap();
                 }
             }
-            let settled = Writer::seal_recover_committed(&ensemble, 3).await;
-            match expected {
-                Some(tip) => assert_eq!(settled.unwrap(), tip),
-                None => {
-                    assert!(matches!(settled, Err(Error::Remote { message, .. }) if message.contains("unknown outcome")));
-                    for server in 0..3 {
-                        assert_eq!(ensemble.seal(server, 3).await.unwrap().commit_lsn, -1);
-                    }
-                }
-            }
+            assert_eq!(Writer::seal_recover_committed(&ensemble, 3).await.unwrap(), expected);
         }
 
         cancellation.cancel();
         for server in servers { server.await.unwrap().unwrap(); }
         drop(directories);
+    }
+
+    #[test]
+    fn an_original_without_a_sample_is_possible_but_has_no_positive_vote() {
+        let mut evidence = GuardedEvidence { possible: 2, observed: 0 };
+        evidence.record_exact(&PageDigest { original_append: Some(true), synced_clock_upper_micros: Some(10), ..Default::default() });
+        evidence.record_exact(&PageDigest { original_append: Some(true), ..Default::default() });
+        assert!(matches!(evidence.decision(2), TailDecision::Unknown));
     }
 }

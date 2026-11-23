@@ -472,6 +472,7 @@ contract LogService {
         -- Only committed records are acknowledged to a writer, applied visibly, or served to a reader.
 
     @invariant GuardedSyncObservationsFollowTheOriginalAppend
+        -- A guarded record's durable frame records whether it was originally appended here or copied.
         -- A journal samples its clock after the durable sync containing an original guarded append.
         -- It persists the sample with that exact retained entry before replying.
         -- Compaction preserves the sample and a replacement or copied entry starts without one.
@@ -483,6 +484,7 @@ contract LogService {
         -- Copies preserve the admission kind but supply no original reply or observation.
         -- A sealed tip can be recovered from a durable commit witness or original observations for the exact record on a write quorum.
         -- Recovery drops the guarded tip only if surviving and unobserved holders combined could not have supplied a quorum.
+        -- A journal proved to hold only an exact copy is excluded from that upper bound. An original with a missing sample is still possible.
         -- If neither decision follows from the evidence, the successor remains closed and the outcome stays unknown.
 
     @invariant SealIsAPromise
