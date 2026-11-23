@@ -198,8 +198,8 @@ impl Service {
                                 if matches!(value.value, Some(protocol::OptionValue::String(value)) if value.is_empty() || value == call.database) { None } else { Some(2) }
                             }
                             "catalog" => match value.value {
-                                Some(protocol::OptionValue::String(value)) if value.is_empty() => { call.session.select_catalog(None, &self.0.node)?; None }
-                                Some(protocol::OptionValue::String(value)) => { if self.admit_database(&value).await? { call.session.select_catalog(Some(value), &self.0.node)?; None } else { Some(2) } }
+                                Some(protocol::OptionValue::String(value)) if value.is_empty() => { call.session.select_catalog(None)?; None }
+                                Some(protocol::OptionValue::String(value)) => { if self.admit_database(&value).await? { call.session.select_catalog(Some(value))?; None } else { Some(2) } }
                                 _ => Some(2),
                             },
                             "schema" => if matches!(value.value, Some(protocol::OptionValue::String(value)) if value == "public") { None } else { Some(2) },

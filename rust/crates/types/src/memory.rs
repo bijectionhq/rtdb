@@ -10,6 +10,7 @@ pub struct MemoryBudget {
     used_bytes: AtomicUsize,
     peak_bytes: AtomicUsize,
     parent: Option<Arc<MemoryBudget>>,
+    funding: Option<Arc<MemoryReservation>>,
     /// For a quantized budget, the bytes its parent has admitted for it, which cover its used bytes in whole quanta.
     quantized: Option<Quantized>,
 }
@@ -20,7 +21,7 @@ struct Quantized { quantum: usize, granted: std::sync::Mutex<usize> }
 impl MemoryBudget {
     /// Creates a root budget with a byte limit; zero permits only zero-byte reservations.
     pub fn new(limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: None, quantized: None })
+        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: None, funding: None, quantized: None })
     }
 
     /// Tracks a region's retained and peak bytes while charging every reservation to the shared parent limit.
@@ -32,15 +33,33 @@ impl MemoryBudget {
     /// Opens a child with its own byte ceiling and the parent's existing admission limits.
     /// The effective ceiling cannot exceed this budget's byte limit.
     pub fn scope_with_limit(self: &Arc<Self>, limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: limit_bytes.min(self.limit_bytes), used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)), quantized: None })
+        Arc::new(Self { limit_bytes: limit_bytes.min(self.limit_bytes), used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)), funding: None, quantized: None })
     }
 
     /// A child that admits its reservations against this budget a `quantum` of bytes at a time, so that its many small
     /// reservations touch this budget, and the ancestors it shares with other children, only once per quantum.
     /// This budget sees whole quanta: up to two quanta more than the child uses, which it returns as it frees them.
     pub fn quantized(self: &Arc<Self>, quantum: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: self.limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)),
+        Arc::new(Self { limit_bytes: self.limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)), funding: None,
             quantized: Some(Quantized { quantum: quantum.max(1), granted: std::sync::Mutex::new(0) }) })
+    }
+
+    /// Pays for a separate budget in full before it can admit work.
+    /// Retained reservations keep the funding alive, even after the owner closes.
+    pub fn prepay(self: &Arc<Self>, bytes: usize) -> Result<Arc<Self>> {
+        let funding = self.reserve(bytes)?;
+        Ok(Arc::new(Self {
+            limit_bytes: bytes,
+            used_bytes: AtomicUsize::new(0),
+            peak_bytes: AtomicUsize::new(0),
+            parent: None,
+            funding: Some(funding),
+            quantized: None,
+        }))
+    }
+
+    pub fn prepaid_by(&self, budget: &Arc<Self>) -> bool {
+        self.funding.as_ref().is_some_and(|funding| Arc::ptr_eq(funding.budget(), budget))
     }
 
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::{Arc, Mutex, Weak, atomic::{AtomicBool, Ordering}}};
 use bytes::Bytes;
 use rtdb_auth::Principal;
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_node::{Database, NativeSession, Node};
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -53,6 +53,7 @@ impl Session {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self { id, caller, audience_source, placement, state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None }), _reservation: reservation }
     }
+    pub fn memory(&self) -> &Arc<MemoryBudget> { self._reservation.budget() }
     pub fn closed(&self) -> bool { matches!(*self.state.lock().expect("session lock"), SessionState::Closed) }
     pub fn placed_database(&self) -> Option<&str> { self.placement.as_ref().map(|placement| placement.name.as_str()) }
     pub fn owner(&self) -> ResourceOwner {
@@ -79,13 +80,18 @@ impl Session {
         let attachment = self.require_database(database, node)?;
         Ok((database.into(), attachment))
     }
-    pub fn select_catalog(&self, name: Option<String>, node: &Node) -> Result<(), Status> {
-        let selection = name.map(|name| Ok::<_, Status>(CatalogSelection { _reservation: node.memory().reserve(name.capacity() + 128).map_err(status)?, name })).transpose()?;
+    pub fn select_catalog(&self, name: Option<String>) -> Result<(), Status> {
+        let selection = name.map(|name| Ok::<_, Status>(CatalogSelection { _reservation: self.memory().reserve(name.capacity() + 128).map_err(status)?, name })).transpose()?;
         match &mut *self.state.lock().expect("session lock") { SessionState::Open { catalog, .. } => { *catalog = selection; Ok(()) }, SessionState::Closed => Err(Status::not_found("session closed")) }
     }
     pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
         self.require_database(database, node)?;
-        let native = node.session(database, self.caller.principal.clone()).map_err(status)?;
+        let identity = self.caller.principal.clone();
+        let native = if self.audience_source.is_some() {
+            node.session_with_prepaid_memory(database, identity, Arc::clone(self.memory()))
+        } else {
+            node.session(database, identity)
+        }.map_err(status)?;
         self.require_database(database, node)?;
         Ok(native)
     }
@@ -94,7 +100,7 @@ impl Session {
         let mut state = self.state.lock().expect("session lock");
         let SessionState::Open { connections, .. } = &mut *state else { return Err(Status::not_found("session closed")); };
         if let Some((connection, _)) = connections.get(database) { return Ok(Arc::clone(connection)); }
-        let charge = node.memory().reserve(database.len() + 512).map_err(status)?;
+        let charge = self.memory().reserve(database.len() + 512).map_err(status)?;
         let connection = ConnectionResource::new(self.open_native(database, node)?);
         connections.insert(database.into(), (Arc::clone(&connection), charge)); Ok(connection)
     }

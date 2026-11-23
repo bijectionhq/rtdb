@@ -269,10 +269,13 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder.
-The authenticated hosted owner sends that value as `x-rtdb-audience-flight` during the handshake.
+The authenticated hosted owner sends that value as `x-rtdb-audience-flight-v2` during the handshake.
 The gateway and holder must acknowledge the exact source and turn count.
 The sealed route then uses its own gateway call permits, backend connection pool, holder call permits and retained-read permits.
 Each pool has two permits per turn and two for preparation and cleanup.
+Before serving, the holder reserves an execution pool of 16 MiB per permit. It refuses startup if the node cannot fund the pool.
+Audience sessions and held reads have their own registries. Their budget charges cover native session state, decoded action bodies, pinned query contexts, output encoding and retained replies.
+Handshake routing and authentication use ordinary admission. Socket buffers, storage service, and scheduling still need their own capacity.
 The reservation admits applied open and confirmation, held point and historical point reads, hosted control reads, and held close.
 The gateway routes only action RPCs on a reserved session.
 

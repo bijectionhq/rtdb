@@ -33,7 +33,7 @@ impl ServerDriver {
         let address = listener.local_addr().map_err(network)?;
         let cancellation = node.cancellation().child_token();
         let (sender, receiver) = watch::channel(ServerStatus::default());
-        let service = Service::new(node, authenticator, config, clock, cancellation.clone(), sender);
+        let service = Service::new(node, authenticator, config, clock, cancellation.clone(), sender)?;
         Ok((ServerHandle { address, cancellation, status: receiver }, Self { listener: Some(listener), service }))
     }
     pub async fn run(mut self) -> Result<()> {

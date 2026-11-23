@@ -105,18 +105,20 @@ impl Service {
                     metadata.insert("rtdb.owned.receipt_tx_id".into(), tx_id.to_string());
                     schema = schema.with_metadata(metadata);
                 }
-                self.owned_point_reply(
+                self.owned_point_reply_in(
+                    call.memory(),
                     &schema,
                     Some(&row),
                     present,
                     Timestamp(0),
                     Some(revision),
+                    None,
                 )?
             }
             None => {
-                let schema = wire::plan_schema(point.schema.schema(), self.memory())?;
+                let schema = wire::plan_schema(point.schema.schema(), call.memory())?;
                 let schema = schema.project(&fields(&schema)).map_err(arrow)?;
-                self.owned_point_reply(&schema, None, present, Timestamp(0), None)?
+                self.owned_point_reply_in(call.memory(), &schema, None, present, Timestamp(0), None, None)?
             }
         };
         held.snapshot.check().map_err(status)?;

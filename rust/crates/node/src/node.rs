@@ -90,10 +90,10 @@ impl NodeServices {
 }
 
 #[derive(Clone, Copy)]
-enum CatalogReadCut {
+enum CatalogReadCut<'a> {
     Current,
     Reserved(TransactionKey),
-    HostedApplied { minimum: TransactionKey, history: uuid::Uuid },
+    HostedApplied { minimum: TransactionKey, history: uuid::Uuid, memory: &'a Arc<MemoryBudget> },
 }
 
 fn covers_transaction(selected: TransactionKey, floor: TransactionKey) -> bool {
@@ -256,12 +256,23 @@ impl Node {
     }
 
     pub fn session(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>) -> Result<NativeSession> {
+        self.session_in_memory(database.into(), identity, Arc::clone(self.memory()))
+    }
+
+    /// Opens a native session backed by bytes already admitted by this node.
+    pub fn session_with_prepaid_memory(&self, database: impl Into<String>, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>) -> Result<NativeSession> {
+        if !memory.prepaid_by(self.memory()) {
+            return Err(Anomaly::incorrect("rtdb.node/unfunded-session", "The session budget must be prepaid by this node"));
+        }
+        self.session_in_memory(database.into(), identity, memory)
+    }
+
+    fn session_in_memory(&self, database: String, identity: Arc<dyn SessionIdentity>, memory: Arc<MemoryBudget>) -> Result<NativeSession> {
         self.ensure_open()?;
-        let database = database.into();
         identity.authorize_database(&database, DatabaseAccess::Read)?;
         let local = self.catalog.database(&database)?;
         let placement = self.catalog.is_placed().then(|| Arc::downgrade(&local));
-        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement });
+        let service = Arc::new(NativeSessionService { node: self.clone(), identity, database: database.clone(), placement, memory });
         let state = Session::new(service.clone(), database, &self.factory.options.default_timezone, &self.cancellation)?;
         Ok(NativeSession { state, service })
     }
@@ -381,7 +392,7 @@ impl Node {
         self.query_context_in_placement(database, basis, identity, None, CatalogReadCut::Current, cancellation).await
     }
 
-    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cut: CatalogReadCut, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
+    async fn query_context_in_placement(&self, database: &str, basis: &QueryBasis, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cut: CatalogReadCut<'_>, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let placed = self.catalog.is_placed();
         let held = (placed || !matches!(cut, CatalogReadCut::Current)).then(|| self.attached_database(database, placement)).transpose()?;
@@ -472,7 +483,11 @@ impl Node {
             .with_ordered_indexes(Arc::new(crate::ordered_index::Inventory))
             .with_fragmenter(self.scan_fragmenter.clone(), fragment_residence);
         if let Some(lease) = lease { catalog = catalog.with_read_lease(lease); }
-        QueryContext::with_owner(catalog, self.factory.options.query.query_memory(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+        let memory = match cut {
+            CatalogReadCut::HostedApplied { memory, .. } => Arc::clone(memory),
+            _ => self.factory.options.query.query_memory(&self.factory.memory),
+        };
+        QueryContext::with_owner(catalog, memory, basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
             .with_accelerators(Arc::clone(&self.factory.accelerators))
             .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
             .map(|context| context.with_query_cpu(query_cpu))
@@ -2892,7 +2907,7 @@ impl NativeSession {
         let database = self.state.database().to_owned();
         let owner = self.state.user().filter(|owner| !owner.is_empty()).map(str::to_owned)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
-        let charge = node.memory().reserve(database.capacity().checked_add(owner.capacity()).and_then(|bytes| bytes.checked_add(2048))
+        let charge = self.service.memory.reserve(database.capacity().checked_add(owner.capacity()).and_then(|bytes| bytes.checked_add(2048))
             .ok_or_else(|| Anomaly::incorrect("rtdb.owned/read-size", "Retained read allocation overflow"))?)?;
         let attached = node.attached_database(&database, self.service.placement.as_ref())?;
         let attached_scope = match &attached.await_authority {
@@ -2901,8 +2916,12 @@ impl NativeSession {
         };
         let applied_scope = applied_floor.map(|_| attached_scope.ok_or_else(hosted_source_unavailable)).transpose()?;
         let attached = Arc::downgrade(&attached);
+        let applied_memory;
         let (reserved, cut) = match applied_floor {
-            Some(floor) => (None, floor.cut(None)?),
+            Some(floor) => {
+                applied_memory = node.factory.options.query.query_memory(&self.service.memory);
+                (None, floor.cut(None, &applied_memory)?)
+            }
             None => {
                 let present = self.reserve_ordered_present().await?;
                 (Some(present.system_time), CatalogReadCut::Reserved(present))
@@ -3003,6 +3022,7 @@ pub(crate) struct NativeSessionService {
     pub(crate) identity: Arc<dyn SessionIdentity>,
     pub(crate) database: String,
     placement: Option<Weak<Database>>,
+    memory: Arc<MemoryBudget>,
 }
 
 impl NativeSessionService {
@@ -3065,7 +3085,7 @@ impl NativeSessionService {
 }
 #[async_trait]
 impl SessionService for NativeSessionService {
-    fn memory(&self) -> &Arc<MemoryBudget> { self.node.memory() }
+    fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
     fn execution_observer(&self) -> Option<Arc<dyn rtdb_plan::ExecutionObserver>> { self.node.factory.execution_observer.clone() }
     fn user(&self) -> Option<&str> { self.identity.user() }
     fn check_open(&self) -> Result<()> {

@@ -14,7 +14,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::{MemoryReservation, OwnedBatch};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
@@ -539,7 +539,7 @@ fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status>
 }
 
 fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
-    let mut stream = OwnedStream::read(arrow, call.service.memory()).map_err(status)?.into_pages();
+    let mut stream = OwnedStream::read(arrow, call.memory()).map_err(status)?.into_pages();
     let [batch] = stream.as_slice() else {
         return Err(invalid("Owned action requires exactly one Arrow record batch"));
     };
@@ -658,7 +658,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, arrow)?;
-        let (mut rows, _decoded) = upload::owned_documents(batch.batch(), self)?;
+        let (mut rows, _decoded) = upload::owned_documents(batch.batch(), call.memory())?;
         for row in &mut rows { strip_owned_absence(row)?; }
         let operation = TxOp::OwnedInsertDocs {
             relation, documents: Documents::new(rows, self.memory()).map_err(status)?,
@@ -884,7 +884,7 @@ impl Service {
             *rows_left = rows_left.checked_sub(rows).ok_or_else(|| invalid("Hosted commit exceeds its total row limit"))?;
             let reservation = call.reserve(wire::mul(rows, std::mem::size_of::<TxOp>() + 512)?)?;
             controls.try_reserve_exact(rows).map_err(|_| Status::resource_exhausted("Hosted control allocation failed"))?;
-            let (rows, documents) = upload::owned_documents(batch.batch(), self)?;
+            let (rows, documents) = upload::owned_documents(batch.batch(), call.memory())?;
             for mut row in rows {
                 strip_owned_absence(&mut row)?;
                 let expected = match row.remove("_expected_micros") {
@@ -945,7 +945,7 @@ impl Service {
             let operations_charge = call.reserve(wire::mul(operations, std::mem::size_of::<TxOp>() + 512)?)?;
             writes.try_reserve_exact(operations)
                 .map_err(|_| Status::resource_exhausted("Owned commit operation allocation failed"))?;
-            let (rows, documents_charge) = upload::owned_documents(batch.batch(), self)?;
+            let (rows, documents_charge) = upload::owned_documents(batch.batch(), call.memory())?;
             self.append_owned_commit_group(writes, &relation, rows, effects)?;
             retained.push((operations_charge, documents_charge));
         }
@@ -1188,7 +1188,7 @@ impl Service {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             witnesses: Mutex::default(), _permit: permit, _reservation: reservation,
         });
-        self.0.owned_reads.insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
+        call.owned_reads().insert(Bytes::copy_from_slice(handle.as_bytes()), held, READ_IDLE, READ_IDLE, false, 16).map_err(status)?;
         Ok(ActionResult { body: wire::retain(reply, reply_charge) })
     }
 
@@ -1201,7 +1201,7 @@ impl Service {
     }
 
     fn retained_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
-        let entry = found(self.0.owned_reads.lookup(handle, false), "owned read")?;
+        let entry = found(call.owned_reads().lookup(handle, false), "owned read")?;
         if entry.session != call.session.id || entry.database != call.database || !call.session.owns(&entry.owner) {
             return Err(Status::not_found("unknown owned read"));
         }
@@ -1214,7 +1214,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.retained_owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, id, valid, _identity) = point_request(call, request, if with_valid { PointTime::Optional } else { PointTime::Default })?;
@@ -1230,7 +1230,7 @@ impl Service {
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Optional)?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-        let reply = self.finish_owned_point(system, valid, &id, cursor, None).await?;
+        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -1245,7 +1245,7 @@ impl Service {
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
         let cursor = held.snapshot.open_historical_position_point(&relation, &id, system, valid, mask).await.map_err(status)?;
-        let reply = self.finish_owned_point(system, valid, &id, cursor, None).await?;
+        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -1341,7 +1341,7 @@ impl Service {
         let mut replies = Vec::with_capacity(2);
         for system in [before, group] {
             let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(system, valid, &id, cursor, None, Some(&columns), |_| Ok(None)).await?;
+            let reply = self.finish_owned_point_inner(call.memory(), system, valid, &id, cursor, None, Some(&columns), |_| Ok(None)).await?;
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -1358,7 +1358,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (mask, request) = if positioned {
@@ -1616,7 +1616,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, id, request, _identity) = self.owned_versions_request(call, request)?;
@@ -1714,7 +1714,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, arrow) = split_relation(request)?;
@@ -1790,7 +1790,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, arrow_bytes) = split_relation(request)?;
@@ -1923,7 +1923,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (valid, request) = request.split_first_chunk::<8>()
@@ -2159,7 +2159,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (relation, cursor) = split_relation(request)?;
@@ -2221,7 +2221,7 @@ impl Service {
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_read(call, &handle)?;
         if let Err(error) = held.snapshot.check() {
-            if let Lookup::Found(entry) = self.0.owned_reads.take(&handle) { entry.close(); }
+            if let Lookup::Found(entry) = call.owned_reads().take(&handle) { entry.close(); }
             return Err(status(error));
         }
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
@@ -2340,7 +2340,7 @@ impl Service {
         if body.len() != 16 { return Err(invalid("Owned read close requires one 16-byte handle")); }
         let handle = Bytes::copy_from_slice(body);
         self.retained_owned_read(call, &handle)?;
-        let entry = found(self.0.owned_reads.take(&handle), "owned read")?;
+        let entry = found(call.owned_reads().take(&handle), "owned read")?;
         entry.close();
         Ok(())
     }
@@ -3207,7 +3207,7 @@ impl Service {
                 .ok_or_else(|| invalid("Owned world commit exceeds its total row limit"))?;
             let charge = call.reserve(wire::mul(batch.num_rows(), std::mem::size_of::<OwnedWorldWrite>() + 512)?)?;
             writes.try_reserve_exact(batch.num_rows()).map_err(|_| Status::resource_exhausted("Owned world commit allocation failed"))?;
-            let (rows, decoded) = upload::owned_documents(batch, self)?;
+            let (rows, decoded) = upload::owned_documents(batch, call.memory())?;
             reservations.extend([charge, decoded]);
             for mut row in rows {
                 let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.entity_id().map_err(status)?;
@@ -3267,23 +3267,24 @@ impl Service {
             let evidence = snapshot.scoped_point_witness(relation, expiry).map_err(status)?;
             evidence.map(|evidence| held.remember(call, relation, evidence)).transpose()
         }).transpose().map(Option::flatten);
-        let reply = self.finish_owned_point_inner(present, valid.unwrap_or(present), id, cursor, lifetime, None, witness).await?;
+        let memory = origin.map_or(self.memory(), |(call, _)| call.memory());
+        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
-    async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
-        self.finish_owned_point_inner(present, valid, id, result, lifetime, None, |_| Ok(None)).await
+    async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
+        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, |_| Ok(None)).await
     }
 
     async fn finish_owned_point_inner(
-        &self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
+        &self, memory: &Arc<MemoryBudget>, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
         lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
         witness: impl FnOnce(Option<Timestamp>) -> Result<Option<Uuid>, Status>,
     ) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
             let schema = with_point_witness(&Schema::empty(), witness(None)?);
-            return self.owned_point_reply(&schema, None, present, valid, None);
+            return self.owned_point_reply_in(memory, &schema, None, present, valid, None, None);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -3294,7 +3295,7 @@ impl Service {
             result = Some(batch);
         }
         if let Some(batch) = result {
-            let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, self.memory()).map_err(status)?;
+            let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, memory).map_err(status)?;
             let until = lifetime.map(|lifetime| {
                 let (created, expires) = rtdb_query::owned_row_lifetime(batch.batch(), 0, revision, lifetime.duration).map_err(status)?;
                 if created <= lifetime.expired_created_through || revision > present || present >= expires {
@@ -3317,16 +3318,16 @@ impl Service {
             } else { None };
             let rows = projected.as_ref().unwrap_or_else(|| batch.batch());
             let schema = with_point_witness(rows.schema_ref(), witness(until)?);
-            let reply = self.owned_point_reply_until(&schema, Some(rows), present, valid, Some(revision), until)?;
+            let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
             }
             Ok(reply)
         } else {
             let schema = if path_columns.is_some() { Schema::empty() }
-                else { wire::plan_schema(cursor.runtime_schema(), self.memory())? };
+                else { wire::plan_schema(cursor.runtime_schema(), memory)? };
             let schema = with_point_witness(&schema, witness(None)?);
-            self.owned_point_reply(&schema, None, present, valid, None)
+            self.owned_point_reply_in(memory, &schema, None, present, valid, None, None)
         }
     }
 
@@ -3335,7 +3336,14 @@ impl Service {
     }
 
     fn owned_point_reply_until(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>) -> Result<ActionResult, Status> {
-        let _metadata = self.memory().reserve(wire::schema_bound(schema)?).map_err(status)?;
+        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, until)
+    }
+
+    fn owned_point_reply_in(
+        &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
+        present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
+    ) -> Result<ActionResult, Status> {
+        let _metadata = memory.reserve(wire::schema_bound(schema)?).map_err(status)?;
         let mut metadata = schema.metadata().clone();
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
         metadata.insert(OWNED_VALID.into(), valid.0.to_string());
@@ -3347,7 +3355,7 @@ impl Service {
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))
             .transpose().map_err(arrow)?;
-        self.owned_action_reply(&schema, batch.as_ref())
+        self.owned_stream_reply_in(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default())
     }
 
     fn owned_action_reply(&self, schema: &Schema, batch: Option<&RecordBatch>) -> Result<ActionResult, Status> {
@@ -3355,15 +3363,19 @@ impl Service {
     }
 
     fn owned_stream_reply(&self, schema: &Schema, pages: &[RecordBatch]) -> Result<ActionResult, Status> {
+        self.owned_stream_reply_in(self.memory(), schema, pages)
+    }
+
+    fn owned_stream_reply_in(&self, memory: &Arc<MemoryBudget>, schema: &Schema, pages: &[RecordBatch]) -> Result<ActionResult, Status> {
         let bytes = pages.iter().try_fold(0, |bytes, batch| wire::add(bytes, batch.get_array_memory_size()))?;
         let bound = wire::add(wire::schema_bound(schema)?, wire::mul(bytes, 8)?)?;
-        let _encoding = self.memory().reserve(bound).map_err(status)?;
+        let _encoding = memory.reserve(bound).map_err(status)?;
         let bytes = write_arrow_stream(schema, pages, IpcWriteOptions::default()).map_err(status)?;
         let reply = ActionResult { body: bytes.into() };
         if reply.encoded_len() > self.0.config.maximum_message_bytes {
             return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
         }
-        let retained = self.memory().reserve(reply.body.len()).map_err(status)?;
+        let retained = memory.reserve(reply.body.len()).map_err(status)?;
         Ok(ActionResult { body: wire::retain(reply.body, retained) })
     }
 }

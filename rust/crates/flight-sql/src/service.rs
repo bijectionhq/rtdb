@@ -34,12 +34,15 @@ pub(crate) struct Inner {
 pub(crate) struct AudienceAdmission {
     calls: Arc<Semaphore>,
     pub holds: Arc<Semaphore>,
+    memory: Arc<MemoryBudget>,
+    sessions: Registry<String, Session>,
+    owned_reads: Registry<Bytes, crate::owned_actions::OwnedReadResource>,
 }
 
 #[derive(Clone, Copy)]
 enum CallKind { Ordinary, Handshake, Action }
 pub(crate) struct Call {
-    pub service: Service,
+    service: Service,
     pub session: Arc<Session>,
     pub minted: bool,
     pub database: String,
@@ -55,7 +58,7 @@ impl Admission {
 }
 impl Drop for Admission { fn drop(&mut self) { self.permit.take(); self.service.0.status.send_modify(|status| status.active_calls -= 1); self.service.publish(); } }
 struct AcquiredSession { service: Service, session: Arc<Session> }
-impl Drop for AcquiredSession { fn drop(&mut self) { self.service.0.sessions.release(&self.session.id); self.service.publish(); } }
+impl Drop for AcquiredSession { fn drop(&mut self) { self.service.sessions(self.session.audience_source.is_some()).release(&self.session.id); self.service.publish(); } }
 impl Drop for Call {
     fn drop(&mut self) { self.cancellation.cancel(); self._lease.take(); }
 }
@@ -75,26 +78,62 @@ impl Call {
         }
         Ok(response)
     }
-    pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.service.0.node.memory().reserve(bytes).map_err(status) }
+    pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
+    pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
+    pub fn owned_reads(&self) -> &Registry<Bytes, crate::owned_actions::OwnedReadResource> {
+        if self.session.audience_source.is_some() {
+            &self.service.0.audience.as_ref().expect("reserved session has an installed audience").owned_reads
+        } else {
+            &self.service.0.owned_reads
+        }
+    }
     pub fn error(&self, mut error: Status) -> Status {
         if let Ok(response) = self.response(()) { for key in ["set-cookie", "authorization"] { if let Some(value) = response.metadata().get(key) { error.metadata_mut().insert(key, value.clone()); } } }
         error
     }
 }
 impl Service {
-    pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>) -> Self {
+    pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>) -> rtdb_types::Result<Self> {
         let memory = Arc::clone(node.memory());
-        let audience = config.audience.map(|audience| AudienceAdmission {
-            calls: Arc::new(Semaphore::new(audience.permits())),
-            holds: Arc::new(Semaphore::new(audience.permits())),
-        });
-        Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status }))
+        let audience = if let Some(profile) = config.audience {
+            let memory = memory.prepay(profile.execution_bytes())?;
+            Some(AudienceAdmission {
+                calls: Arc::new(Semaphore::new(profile.permits())),
+                holds: Arc::new(Semaphore::new(profile.permits())),
+                sessions: Registry::new(clock.clone(), memory.clone()),
+                owned_reads: Registry::new(clock.clone(), memory.clone()),
+                memory,
+            })
+        } else { None };
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
-    pub fn sweep(&self) { self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep(); self.publish(); }
-    pub fn close(&self) { self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close(); self.publish(); }
+    fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
+        if reserved {
+            &self.0.audience.as_ref().expect("reserved session has an installed audience").sessions
+        } else {
+            &self.0.sessions
+        }
+    }
+    pub fn sweep(&self) {
+        if let Some(audience) = &self.0.audience {
+            audience.sessions.sweep();
+            audience.owned_reads.sweep();
+        }
+        self.0.sessions.sweep(); self.0.transactions.sweep(); self.0.prepared.sweep(); self.0.owned_reads.sweep(); self.0.owned_world_reads.sweep();
+        self.publish();
+    }
+    pub fn close(&self) {
+        if let Some(audience) = &self.0.audience {
+            audience.owned_reads.close();
+            audience.sessions.close();
+        }
+        self.0.owned_world_reads.close(); self.0.owned_reads.close(); self.0.prepared.close(); self.0.transactions.close(); self.0.sessions.close();
+        self.publish();
+    }
     pub fn publish(&self) {
-        let counts = (self.0.sessions.len(), self.0.transactions.len(), self.0.prepared.len());
+        let reserved = self.0.audience.as_ref().map_or(0, |audience| audience.sessions.len());
+        let counts = (self.0.sessions.len() + reserved, self.0.transactions.len(), self.0.prepared.len());
         self.0.status.send_if_modified(|status| {
             let changed = (status.sessions, status.transactions, status.prepared_statements) != counts;
             (status.sessions, status.transactions, status.prepared_statements) = counts;
@@ -117,17 +156,18 @@ impl Service {
         if sources.next().is_some() || audience_source.is_some() && matches!(kind, CallKind::Ordinary) {
             return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
         }
-        let permits = match (audience_source, kind) {
-            (Some(_), CallKind::Action) => &self.0.audience.as_ref().ok_or_else(unsupported)?.calls,
-            _ => &self.0.permits,
-        };
+        let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
+        let sessions = self.sessions(audience.is_some());
+        let reserved_call = audience.filter(|_| matches!(kind, CallKind::Action));
+        let permits = reserved_call.map_or(&self.0.permits, |audience| &audience.calls);
         let permit = Arc::clone(permits).try_acquire_owned().map_err(|_| Status::resource_exhausted("Flight concurrent-call limit reached"))?;
         let admission = Admission::new(self.clone(), permit);
         let header_bytes = request.metadata().iter().try_fold(4096usize, |bytes, entry| {
             let size = match entry { tonic::metadata::KeyAndValueRef::Ascii(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())?, tonic::metadata::KeyAndValueRef::Binary(key, value) => wire::add(key.as_str().len(), value.as_encoded_bytes().len())? };
             wire::add(bytes, wire::mul(size, 16)?)
         })?;
-        let reservation = self.memory().reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
+        let request_memory = reserved_call.map_or(self.memory(), |audience| &audience.memory);
+        let reservation = request_memory.reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
         let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let credentials = Credentials::parse(request)?;
@@ -137,7 +177,7 @@ impl Service {
             if forwarded_peer.is_some() {
                 return Err(auth::unauthenticated("Forwarded peer proof is for a new session"));
             }
-            let session = match self.0.sessions.lookup(&id.to_owned(), true) {
+            let session = match sessions.lookup(&id.to_owned(), true) {
                 Lookup::Found(session) => session,
                 Lookup::Expired(after) => return Err(session_error(bearer.is_some(), format!("session expired after {} idle", crate::lease::duration(after)))),
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
@@ -150,7 +190,7 @@ impl Service {
                 if session.caller.mac.is_none_or(|mac| !auth::equal(&mac, &self.0.auth.mac(raw))) { return Err(auth::unauthenticated("these credentials aren't the ones the session was authenticated with")); }
             }
             let verified = self.0.cancellation.run_until_cancelled(session.caller.principal.revalidate(self.0.node.now())).await.ok_or_else(cancelled)?;
-            if let Err(error) = verified { if let Lookup::Found(removed) = self.0.sessions.take(&session.id) { removed.close(); } return Err(auth::auth_error(error)); }
+            if let Err(error) = verified { if let Lookup::Found(removed) = sessions.take(&session.id) { removed.close(); } return Err(auth::auth_error(error)); }
             (session, false, lease)
         } else {
             if audience_source.is_some() && (!matches!(kind, CallKind::Handshake) || forwarded_peer.is_none()) {
@@ -181,8 +221,9 @@ impl Service {
                 return Err(Status::permission_denied("An audience session requires the installed hosted principal"));
             }
             let capacity = 1024 + placement.as_ref().map_or(0, |database| database.name().len());
-            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_source, self.memory().reserve(capacity).map_err(status)?));
-            self.0.sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
+            let memory = audience.map_or(self.memory(), |audience| &audience.memory);
+            let session = Arc::new(Session::new(Uuid::new_v4().to_string(), caller, placement.as_ref(), audience_source, memory.reserve(capacity).map_err(status)?));
+            sessions.insert(session.id.clone(), Arc::clone(&session), self.0.config.session_idle_timeout, self.0.config.session_unclaimed_timeout, true, session.id.len()).map_err(status)?;
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };

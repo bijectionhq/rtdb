@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rtdb_columnar::MemoryBudget;
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
 
@@ -35,12 +36,12 @@ impl AppliedReadFloor {
 
     pub fn history(&self) -> uuid::Uuid { self.history }
 
-    pub(super) fn cut(&self, original: Option<TransactionKey>) -> Result<CatalogReadCut> {
+    pub(super) fn cut<'a>(&self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>) -> Result<CatalogReadCut<'a>> {
         let minimum = match original {
             Some(original) => confirmation_floor(original, self.minimum)?,
             None => self.minimum,
         };
-        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history })
+        Ok(CatalogReadCut::HostedApplied { minimum, history: self.history, memory })
     }
 
     pub(super) async fn require_transactions(
@@ -263,7 +264,7 @@ impl OwnedReadSession {
         };
         let current = self.node.query_context_in_placement(
             &self.database, &basis, self.identity.as_ref(), Some(&self.attachment),
-            floor.cut(Some(self.present))?, &self.cancellation,
+            floor.cut(Some(self.present), &self.context.memory)?, &self.cancellation,
         ).await?;
         let database = current.catalog.database(&self.database)?;
         let [captured] = database.partitions.as_slice() else {

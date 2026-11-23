@@ -3,7 +3,7 @@ use rtdb_node::Database;
 use rtdb_types::{Anomaly, Result};
 
 pub const FORWARDED_PEER_HEADER: &str = "x-rtdb-flight-peer";
-pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight";
+pub const AUDIENCE_FLIGHT_HEADER: &str = "x-rtdb-audience-flight-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudienceFlightConfig {
@@ -28,6 +28,9 @@ impl AudienceFlightConfig {
 
     pub fn source(self) -> uuid::Uuid { self.source }
     pub fn permits(self) -> usize { 2 * (self.turns + 1) }
+
+    /// The installed byte pool includes both the active round and its replacement.
+    pub(crate) fn execution_bytes(self) -> usize { self.permits() * (16 << 20) }
 }
 
 pub trait FlightPeerVerifier: std::fmt::Debug + Send + Sync {
