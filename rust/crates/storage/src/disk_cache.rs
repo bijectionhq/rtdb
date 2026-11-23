@@ -394,6 +394,15 @@ impl ObjectStore for DiskCachedStore {
             Ok(Some(crate::LocalFile::new(file, Some(lease))))
         }).await
     }
+    async fn cached_local_file(&self, key: &ObjectKey) -> Result<Option<crate::LocalFile>> {
+        let scope = self.io.admit()?;
+        let operation = self.cache.begin_operation()?.and(scope);
+        let Some(lease) = self.cache.cached_file(&self.key(key)?) else { return Ok(None) };
+        IoRegion::run_admitted(operation, move || {
+            let file = lease.open().map_err(|error| Error::io(lease.path(), error))?;
+            Ok(Some(crate::LocalFile::new(file, Some(lease))))
+        }).await
+    }
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;

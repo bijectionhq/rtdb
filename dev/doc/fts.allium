@@ -101,7 +101,9 @@ entity SearchJob {
 ------------------------------------------------------------
 
 config {
-    -- See: server config `search: {enabled, threads}`, NodeOptions.artefact_threads / scan_acceleration.
+    -- See: server config `search: {enabled, threads, writeFormat}` and NodeOptions.
+    -- The configured format determines which files new jobs write.
+    write_format: Integer = 11
     -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
     enabled: Boolean = true
     threads: Integer = 1
@@ -164,7 +166,8 @@ rule SearchJobRuns {
 }
 
 rule RetireSearchFiles {
-    -- A search file is retired once its definition leaves force: dropped, redefined, or superseded by a new analyzer or format version.
+    -- A search file is retired once its logical definition or analyzer version leaves force.
+    -- A reader retains files in every supported format for the same definition version.
     -- A retired definition is one neither in force nor made after the snapshot's basis, so a definition newer than the snapshot is never retired.
     -- The lane appends ArtefactsRemoved for the retired records on the table's live tries, and once it is applied deletes their objects.
     -- It deletes as well every unrecorded object of kind `search` under a live trie for a retired definition: one a builder uploaded and failed to record.
@@ -173,7 +176,6 @@ rule RetireSearchFiles {
     -- GC collects an artefact under a retired trie or under a group with no remaining members.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.
     -- A builder on another node may still record an object a retiring lane deleted; its own lane retires that record at its next look.
-    -- While nodes run different analyzer or format versions, a newer node retires an older version's files and an older node builds them again; the churn ends with the upgrade.
     when: DefinitionsInForceChanged(table)
 
     ensures:
@@ -220,7 +222,8 @@ rule RepairUnreadableSearchFile {
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.
 --   4. Every live segment contributes the IIDs of its matching rows under the same rule, with recency ∞.
---      A node keeps postings per live segment and column, extending them by the batches appended since, so a growing live index is tokenised once.
+--      A node publishes immutable postings for a prefix of the live batches under their table, column and snapshot lineage.
+--      A query uses whole pages within the prefix in its own snapshot and reads the remaining rows directly.
 --      A document is cut by the events of its entity in the partition's other selected tries and live segments, as CutByLaterEvents says, and contributes only if a rectangle it keeps meets the bounds.
 --   5. The scan runs restricted to the union, resolving each candidate's full history in every selected trie and live segment.
 --   6. MATCH is evaluated on each resolved row, as MatchEvaluatedByTheScan says.
@@ -238,14 +241,20 @@ rule RepairUnreadableSearchFile {
 --      A search file's documents are scored a batch of windows at a time, best window bound first, and a window is scored only once its bound may exceed every event already scored.
 --      Where an earlier selection supplies an IID scope, file and live events outside that scope are discarded before scoring.
 --      Resolution reads the full history of each selected IID.
---      A window adds the upper bounds for each term in scoring order. Each term uses the window's maximum frequency and minimum stored length with binary64 roundoff covered before addition.
+--      A window adds the upper bounds for each term in scoring order.
+--      A bound uses the maximum canonical unit score when available, or maximum frequency and minimum stored length with binary64 roundoff covered before addition.
+--      For ascending integer identity ties, a window may also carry the smallest possible identity at its score ceiling.
 --   2. IIDs in the scan's selected IID scope are taken best bound first, in batches.
 --      A document left exactly visible by CutByLaterEvents counts as verified when the scan's only predicate is the MATCH used to narrow candidates.
 --      The rest, live rows, documents a tie left inexact, and every IID where the scan has other predicates, are verified by running the scan itself over the partition restricted to them, with its own predicates.
---   3. Verification can stop early only when n verified rows score strictly above both sources: already-scored candidates and unread windows.
---      Either source can be empty. Equal bounds, including the two signed zeroes, keep verification going.
+--   3. Verification can stop early only when the n-th verified rank key is strictly ahead of every remaining bound.
+--      A remaining bound represents a scored candidate or unread work.
+--      A tie is ordered by identity only when both bounds prove its order.
+--      The two signed zeroes have the same score rank.
 --      An invalid score or bound supplied to this decision also keeps verification going.
---   4. The scan is restricted to the IIDs of verified rows scoring at least the n-th, ties included, and the sort above keeps the first n as it would have.
+--   4. The scan hands on every verified row that may be in the first n.
+--      A ranked point scan may emit projected rows retained by its verifier at the same snapshot.
+--      If the gather exceeds available memory, the scan releases the retained payload and streams from the narrowed IID selection.
 --
 -- The visible row of an IID is one of its matching events, so its bound is never below its score, and no IID left out can hold one of the first n rows.
 -- An IID's history lies in one partition, so the first n rows overall are among the first n of some partition, and the sort above picks them from the union.
@@ -301,6 +310,18 @@ contract SearchFileLayout {
         -- A search file's bytes are a deterministic function of the owner's data files, its definition and the job's identity.
         -- Every node that runs the same job writes the same object.
 
+    @invariant BoundedArrowDirectory
+        -- The format 14 artefact record locates a bounded Arrow root by byte range and SHA-256 digest.
+        -- The root describes independently addressable term, posting, document and IID visibility trees.
+        -- A term directory records short rank summaries inline and refers to rank pages for larger postings.
+        -- Each rank branch bounds the scores of its descendant windows and may prove the first identity at its exact maximum.
+        -- Each directory edge authenticates its child byte range.
+        -- A negative discovery synopsis excludes term nominations; IID visibility can still read the same file.
+        -- Per-storage cache entries hold authenticated immutable pages and share concurrent reads.
+        -- Readers with prepaid cache allocations hold search range leases within those allocations.
+        -- Coalesced remote reads retain only the selected ranges in the decoded page cache.
+        -- A sparse query can read visibility for an IID in a source that did not nominate it.
+
     @invariant OneDocPerRun
         -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
         -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
@@ -340,7 +361,8 @@ contract SearchCorrectness {
     -- What narrowing may and may not change about a query.
 
     @invariant RankedLimitKeepsTheFirstRows
-        -- Under a ranked LIMIT, the rows the scan hands on include every row among the first n by SEARCH_SCORE, ties at the n-th included.
+        -- Under a ranked LIMIT, the scan hands on every row among the first n by the SQL ordering.
+        -- A tie at the cutoff remains eligible until the optimizer can prove its position.
 
     @invariant ResultIndependentOfSearchFiles
         -- A query's rows are the same whichever search files exist, are readable, or are missing, including none.

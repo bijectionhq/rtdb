@@ -1,7 +1,8 @@
 = Bitemporal full-text search: implementation plan
 
 Full-text search over a table's documents, answered at any valid time and system time.
-The behavioural specification is link:fts.allium[fts.allium]; this file is the implementation plan and the map of where the code lives.
+The behavioural specification is link:fts.allium[fts.allium].
+The link:rtdb-fts-improvement-plan.md[RTDB FTS improvement plan] describes the Arrow migration and ranked query design.
 
 == Shape
 
@@ -59,17 +60,21 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
   A `MATCH` with a constant query in a scan predicate becomes a column the scan evaluates: from the search file of the row's data file, null included, and from the row's value where there is none.
 * *A missing search file is never an error.*
   The accelerator treats it as absent and builds the trie's search file itself from the immutable data file, which is what makes deleting one always safe.
-* *Tokens are ours, postings are tantivy's.*
-  `rtdb-text` analyses text (Unicode word split, lowercasing); the search file feeds tantivy pre-tokenized strings, so the residual check and the index agree token for token.
-* *Byte-deterministic search files.*
-  Segment ids derive from the artefact owner and definition, the writer is single-threaded with no merges, and the bundle orders its files by name.
-  Two builders of one job write identical bytes to one key.
+* *One analyzer feeds every format.*
+  `rtdb-text` produces pre-tokenized text for Tantivy format 11 and Arrow formats 12 through 14.
+  The residual predicate uses the same analyzer.
+* *The artefact record locates the Arrow root.*
+  Format 14 puts paths to term, posting, document and IID visibility pages in that root.
+  Each directory authenticates the child ranges it references.
+  Ranked point scans use one frontier for persisted windows, covered live posting pages and pending candidates.
+  The verifier can hand off the projected winning rows from that same snapshot.
+* *Canonical inputs produce deterministic files.*
+  A retry produces the same bytes for the same owner, input files and definition.
+  The lane repairs supported historical formats without changing their definition version.
 * *Definitions are documents.*
   `xt.search_indexes` is written by the indexer, so the definitions in force are a function of log position and readable as of any basis.
 
 == Where it lives
-
-Each piece landed as its own commit on `docs/fts-spec`, with its tests.
 
 [cols="1,2,2"]
 |===

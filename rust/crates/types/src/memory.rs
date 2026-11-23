@@ -58,6 +58,8 @@ impl MemoryBudget {
         }))
     }
 
+    pub fn is_prepaid(&self) -> bool { self.funding.is_some() }
+
     pub fn prepaid_by(&self, budget: &Arc<Self>) -> bool {
         self.funding.as_ref().is_some_and(|funding| Arc::ptr_eq(funding.budget(), budget))
     }

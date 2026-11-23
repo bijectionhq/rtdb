@@ -8,7 +8,7 @@ mod tiered_publication;
 mod trie_catalog;
 
 pub use catalog::{TableCatalog, TableMeta, absent_type, declare_column_types, merge_column_types};
-pub use live::{BlockPages, IndexBatch, LiveIndex, LiveTable, LocatedRows, RowSource, StagedWrite, TableWrite, TransactionBuffer};
+pub use live::{BlockPages, IndexBatch, LiveIndex, LiveRowLineage, LiveRowProof, LiveTable, LocatedRows, RowSource, StagedWrite, TableWrite, TransactionBuffer};
 pub use partition::{BlockPreparation, PartitionState, PartitionValue, TrieCollection};
 pub use rtdb_types::CatalogCut;
 pub use snapshot::Snapshot;

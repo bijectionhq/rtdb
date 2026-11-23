@@ -166,7 +166,7 @@ impl ServerDriver {
             for (protobuf_type, factory) in placed.storage_factories { resources = resources.register_storage(protobuf_type, factory)?; }
         }
         let mut services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter,
-            ..NodeServices::local(authority, metrics.clone(), auth.clone(), metrics.clone()) };
+            ..NodeServices::local_with_search_format(authority, metrics.clone(), auth.clone(), metrics.clone(), config.search.write_format) };
         if !config.search.enabled { services.scan_accelerators.clear(); }
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;
         let cancellation = CancellationToken::new();

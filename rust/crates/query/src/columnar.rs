@@ -1,6 +1,7 @@
 //! Column-at-a-time pages: a scan gathers the cells its visible rows resolve to into one column per output field,
 //! so filters and aggregates can read whole columns, and rows are materialised only for operators that need them.
 mod patch;
+pub(crate) mod search;
 
 use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
@@ -2243,6 +2244,12 @@ pub(crate) async fn predicate_mask(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
 ) -> Result<Vec<bool>> {
     execution.context.check_cancelled()?;
+    if search::shaped(predicate)
+        && let Some(Column::Arrow { array, .. }) = search::column(predicate, schema, batch, execution.parameters.evaluator(), &execution.context)?
+        && let Some(values) = array.as_any().downcast_ref::<arrow_array::BooleanArray>()
+    {
+        return Ok(values.iter().map(|value| value == Some(true)).collect());
+    }
     let truth = kernel::truth(predicate, schema, batch, execution.parameters.evaluator())
         .or_else(|| crate::vector::truth(predicate, schema, batch, execution.parameters.evaluator()));
     if let Some(truth) = truth {
@@ -3184,6 +3191,12 @@ impl BatchCursor for BatchExpressions {
         let mut columns = Vec::with_capacity(self.expressions.len());
         let mut reservation = self.execution.context.memory.reserve(256)?;
         for (expression, kernel) in self.expressions.iter().zip(clocked) {
+            if let Some(column) = search::column(kernel, &self.schema, &batch, parameters, &self.execution.context)? {
+                let lease = Arc::get_mut(&mut reservation).expect("Batch projection owns its reservation");
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+                continue;
+            }
             // An ordinal such as 0::BIGINT is shared by every row of a probe.
             if batch.len != 0 && matches!(expression, rtdb_plan::Expr::Cast { expr, .. } if matches!(expr.as_ref(), rtdb_plan::Expr::Literal(_))) {
                 let scope = self.execution.scope()?;
@@ -3481,6 +3494,7 @@ pub(crate) mod projection {
             Expr::Call { name, args, .. } if name == "coalesce" => args.iter().all(shaped),
             Expr::Call { name, args, .. } if name == "_patch" => args.iter().all(|arg| matches!(arg, Expr::Column { .. })),
             Expr::Call { name, args, .. } if clock(name, args) => true,
+            call if super::search::shaped(call) => true,
             Expr::Cast { expr: inner, target: CastTarget::Fixed(_) } if shaped(inner) => true,
             expr => crate::vector::lowerable(expr),
         }

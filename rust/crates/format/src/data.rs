@@ -3,12 +3,17 @@ mod columns;
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, NullArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt32Array, UnionArray,
-    builder::BinaryBuilder, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_array::{Array, ArrayRef, BinaryArray, NullArray, RecordBatch, StructArray, TimestampMicrosecondArray, UInt32Array, UnionArray,
+    builder::BinaryBuilder};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, Timestamp, Value};
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
+
+#[cfg(test)]
+use arrow_array::{StringArray, cast::AsArray};
+#[cfg(test)]
+use rtdb_types::ScalarType;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredOperation {
@@ -148,11 +153,7 @@ pub struct EventRef<'a> {
     entity_key: Option<&'a [u8]>,
 }
 
-pub enum PutText<'a> {
-    Missing,
-    Utf8(&'a str),
-    Other,
-}
+pub use rtdb_columnar::TextCell as PutText;
 
 impl<'a> EventRef<'a> {
     pub fn validate_document(&self, memory: &Arc<MemoryBudget>) -> Result<()> {
@@ -171,60 +172,16 @@ impl<'a> EventRef<'a> {
         let Some(put) = self.put else { return Ok(PutText::Missing); };
         let Some(position) = put.position(name) else { return Ok(PutText::Missing); };
         let logical = put.field_type(position)?;
-        text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
+        rtdb_columnar::text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
     }
-}
 
-fn text_cell<'a>(logical: &LogicalType, field: &Field, array: &'a dyn Array, row: usize) -> Result<PutText<'a>> {
-    match field.data_type() {
-        DataType::Union(legs, UnionMode::Dense) => {
-            let union = array.as_union();
-            let tag = union.type_id(row);
-            let child = legs.iter().find_map(|(id, child)| (id == tag).then_some(child)).ok_or_else(|| invalid("Put union type has no leg"))?;
-            let derived;
-            let logical = match logical {
-                LogicalType::Union(types) => types.iter().find(|ty| rtdb_columnar::leg_name(ty).is_ok_and(|name| name == *child.name())),
-                _ => None,
-            };
-            let logical = match logical {
-                Some(logical) => logical,
-                None => {
-                    derived = rtdb_columnar::from_field(child)?;
-                    &derived
-                }
-            };
-            text_cell(logical, child, union.child(tag).as_ref(), union.value_offset(row))
+    pub fn physical_entity_key(&self) -> Option<&'a [u8]> { self.entity_key }
+
+    pub fn put_identity(&self) -> Result<Option<rtdb_columnar::EntityIdRef<'a>>> {
+        match self.put.map(|put| put.column("_id")) {
+            Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::read_entity_id(field, array, row).map(Some),
+            _ => Ok(None),
         }
-        DataType::RunEndEncoded(ends, child) => {
-            let derived;
-            let logical = match logical {
-                LogicalType::RunEndEncoded { value, .. } => value.as_ref(),
-                _ => {
-                    derived = rtdb_columnar::from_field(child)?;
-                    &derived
-                }
-            };
-            macro_rules! in_run {
-                ($ty:ty) => {{
-                    let runs = array.as_run::<$ty>();
-                    text_cell(logical, child, runs.values().as_ref(), runs.get_physical_index(row))
-                }};
-            }
-            match ends.data_type() {
-                DataType::Int16 => in_run!(Int16Type),
-                DataType::Int32 => in_run!(Int32Type),
-                DataType::Int64 => in_run!(Int64Type),
-                _ => Err(invalid("Put run ends have an unsupported layout")),
-            }
-        }
-        _ if array.is_null(row) => Ok(PutText::Missing),
-        _ => match logical {
-            LogicalType::Null | LogicalType::Nothing => Ok(PutText::Missing),
-            LogicalType::Maybe(inner) => text_cell(inner, field, array, row),
-            LogicalType::Scalar(ScalarType::Utf8) => array.as_any().downcast_ref::<StringArray>()
-                .map(|strings| PutText::Utf8(strings.value(row))).ok_or_else(|| invalid("Put text has an unsupported Arrow array")),
-            _ => Ok(PutText::Other),
-        },
     }
 }
 

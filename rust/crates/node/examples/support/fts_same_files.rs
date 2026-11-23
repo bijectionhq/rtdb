@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, atomic::AtomicI64};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, Ordering}};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -7,7 +7,7 @@ use rtdb_columnar::read_value;
 use rtdb_index::Snapshot;
 use rtdb_node::{Database, NativeSession, Node};
 use rtdb_plan::{Scan, TableBinding, QualifiedTable, Expr, TemporalFilter};
-use rtdb_query::{CandidateVerifier, ConstantEvaluator, MatchAnswers, ScanAccelerator, ScanRequest};
+use rtdb_query::{CandidateVerifier, ConstantEvaluator, MatchAnswers, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_search::{SearchAccelerator, SearchRuntime, accelerate::experiment::{Fallback, PointRanking, Ranking, Work}};
 use rtdb_text::Query;
 use rtdb_tx::{Documents, TxOp};
@@ -21,16 +21,28 @@ use super::corpus_checkpoint::{as_of, id};
 struct Inspection {
     search: Arc<SearchAccelerator>,
     narrowed: Mutex<Option<Option<usize>>>,
+    score_only: AtomicBool,
 }
 
 #[async_trait]
 impl ScanAccelerator for Inspection {
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        let iids = self.search.candidate_iids(request).await?;
+        self.search.candidate_iids(request).await
+    }
+
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+        let mut score_only = request.scan.clone();
+        let request = if self.score_only.load(Ordering::Relaxed) {
+            if let Some(top_k) = &mut score_only.top_k { top_k.ascending_id = None; }
+            ScanRequest { scan: &score_only, ..*request }
+        } else {
+            ScanRequest { ..*request }
+        };
+        let selection = self.search.select_candidates(&request).await?;
         if request.scan.top_k.is_some() {
-            *self.narrowed.lock().unwrap() = Some(iids.as_ref().map(BTreeSet::len));
+            *self.narrowed.lock().unwrap() = Some(selection.as_ref().map(|selection| selection.iids.len()));
         }
-        Ok(iids)
+        Ok(selection)
     }
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
@@ -49,7 +61,7 @@ impl ConstantEvaluator for LiteralOnly {
 
 #[async_trait]
 impl CandidateVerifier for LiteralOnly {
-    async fn visible(&self, _: BTreeSet<Iid>, _: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+    async fn score_visible(&self, _: BTreeSet<Iid>, _: rtdb_plan::ColumnId, _: Option<rtdb_plan::ColumnId>, _: &rtdb_text::Scorer) -> Result<rtdb_query::CandidateScores> {
         panic!("Point ranker must fall back before needing ordinary scan verification")
     }
 
@@ -213,11 +225,28 @@ async fn stress_versions(fixture: &Fixture<'_>, session: &mut NativeSession, ran
     json!({ "live_fallback": true, "persisted_probes": probes })
 }
 
+async fn populate(node: &Node, session: &mut NativeSession, table: &TableRef, documents: i64) -> Timestamp {
+    let mut basis = commit(session, vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")]).await;
+    for start in (0..documents).step_by(4000) {
+        let rows = (start..(start + 4000).min(documents)).map(|id| StructFields::from([
+            ("_id".into(), Value::I64(id)),
+            ("body".into(), Value::Utf8(text(id).into())),
+            ("department".into(), Value::I64(id % 137)),
+        ])).collect();
+        basis = commit(session, vec![TxOp::PutDocs { table: table.clone(),
+            documents: Documents::new(rows, node.memory()).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None,
+        }]).await;
+        if (start + 4000) % 20_000 == 0 { flush(node).await; }
+    }
+    flush(node).await;
+    basis
+}
+
 pub(super) async fn run(documents: i64, iterations: usize) {
     assert!(documents >= 4000 && iterations > 0);
     let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
     let runtime = SearchRuntime::new(768 << 20);
-    let scan = Arc::new(Inspection { search: runtime.accelerator(), narrowed: Mutex::default() });
+    let scan = Arc::new(Inspection { search: runtime.accelerator(), narrowed: Mutex::default(), score_only: AtomicBool::new(false) });
     let mut services = bench_services(&clock);
     services.artefact_kinds = vec![runtime.artefacts()];
     services.scan_accelerators = vec![scan.clone()];
@@ -229,19 +258,7 @@ pub(super) async fn run(documents: i64, iterations: usize) {
     let table = TableRef::new("public", "docs");
     let database = node.catalog().database("xtdb").unwrap();
     let fixture = Fixture { node: &node, database: &database, inspection: &scan, table: table.clone() };
-    let mut basis = commit(&mut session, vec![sql("CREATE SEARCH INDEX docs_body ON docs (body)")]).await;
-    for start in (0..documents).step_by(4000) {
-        let rows = (start..(start + 4000).min(documents)).map(|id| StructFields::from([
-            ("_id".into(), Value::I64(id)),
-            ("body".into(), Value::Utf8(text(id).into())),
-            ("department".into(), Value::I64(id % 137)),
-        ])).collect();
-        basis = commit(&mut session, vec![TxOp::PutDocs { table: table.clone(),
-            documents: Documents::new(rows, node.memory()).unwrap(), valid_from: Some(Timestamp(0)), valid_to: None,
-        }]).await;
-        if (start + 4000) % 20_000 == 0 { flush(&node).await; }
-    }
-    flush(&node).await;
+    let basis = populate(&node, &mut session, &table, documents).await;
     let build_start = Instant::now();
     database.compaction().unwrap().compact_all().await.unwrap();
     node.sync_all(Duration::from_secs(60), &CancellationToken::new()).await.unwrap();
@@ -266,18 +283,20 @@ pub(super) async fn run(documents: i64, iterations: usize) {
             &snapshot, (basis, basis), case).await;
         let first_tie = sample(elapsed(cold), &work, fallback);
         assert_eq!(first, expected, "{} first tie rank", case.name);
-        let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+        let mut samples = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for iteration in 0..iterations {
-            for position in 0..3 {
-                let index = (iteration + position) % 3;
+            for position in 0..4 {
+                let index = (iteration + position) % 4;
                 let start = Instant::now();
-                let (actual, timing) = if index == 0 {
+                let (actual, timing) = if index <= 1 {
+                    scan.score_only.store(index == 1, Ordering::Relaxed);
                     let rows = query(&mut session, &limited).await;
+                    scan.score_only.store(false, Ordering::Relaxed);
                     let elapsed = elapsed(start);
                     let narrowed = scan.narrowed.lock().unwrap().take().expect("optimizer reached ranked scan");
                     (rows, json!({"ms": elapsed, "candidate_iids": narrowed, "fallback": narrowed.is_none()}))
                 } else {
-                    let ranking = if index == 1 { Ranking::ScoreOnly } else { Ranking::ScoreAndId };
+                    let ranking = if index == 2 { Ranking::ScoreOnly } else { Ranking::ScoreAndId };
                     let (rows, work, fallback) = fixture.ranked(&mut session, &mut ranker, ranking,
                         &snapshot, (basis, basis), case).await;
                     (rows, sample(elapsed(start), &work, fallback))
@@ -286,13 +305,211 @@ pub(super) async fn run(documents: i64, iterations: usize) {
                 samples[index].push(timing);
             }
         }
-        let [sql, direct, ties] = samples;
+        let [sql, sql_score_only, direct, ties] = samples;
         results.push(json!({"case": case.name, "limit": case.limit, "result_rows": expected.len(),
-            "first_tie": first_tie, "sql": sql, "direct": direct, "tie_bounds": ties}));
+            "first_tie": first_tie, "sql": sql, "sql_score_only": sql_score_only, "direct": direct, "tie_bounds": ties}));
     }
     let churn = if documents <= 100_000 { Some(stress_versions(&fixture, &mut session, &mut ranker, basis).await) } else { None };
     println!("{}", json!({"documents": documents, "tries": tries, "build_ms": build_ms, "id_capture_ms": id_capture_ms, "iterations": iterations,
         "queries": results, "churn": churn}));
+    node.shutdown();
+    tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
+}
+
+struct InterleavedSearch {
+    accelerator: Arc<SearchAccelerator>,
+    baseline: AtomicBool,
+    diagnostics: Mutex<Option<Json>>,
+}
+
+#[async_trait]
+impl ScanAccelerator for InterleavedSearch {
+    async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
+        self.accelerator.candidate_iids(request).await
+    }
+
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+        use rtdb_search::accelerate::experiment::workload::Policy;
+        let policy = if self.baseline.load(Ordering::Relaxed) { Policy::Baseline } else { Policy::Current };
+        let (selection, diagnostics) = self.accelerator.workload_selection(request, policy).await?;
+        if request.scan.top_k.is_some() { *self.diagnostics.lock().unwrap() = Some(diagnostics); }
+        Ok(selection)
+    }
+
+    async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
+        self.accelerator.match_answers(request, column, query).await
+    }
+}
+
+fn sql_bench_storage(directory: &std::path::Path) -> rtdb_format::database::proto::database_config::Storage {
+    use rtdb_format::database::proto::{LocalStorage, database_config};
+    match std::env::var("RTDB_FTS_AZURE_EMULATOR") {
+        Ok(endpoint) => {
+            #[cfg(feature = "azure")]
+            {
+                use prost::Message;
+                use rtdb_format::database::proto::RemoteStorage;
+                let mut azure = rtdb_azure::AzureConfig::new(
+                    std::env::var("RTDB_FTS_AZURE_ACCOUNT").expect("benchmark emulator account"),
+                    "fts-benchmark",
+                );
+                azure.storage_account_endpoint = Some(endpoint);
+                azure.storage_account_key = Some(std::env::var("RTDB_FTS_AZURE_KEY").expect("benchmark emulator key"));
+                azure.prefix = Some(format!("qualification/{}", uuid::Uuid::new_v4()));
+                database_config::Storage::RemoteStorage(RemoteStorage {
+                    epoch: Some(0),
+                    object_store: Some(prost_types::Any {
+                        type_url: "type.googleapis.com/xtdb.azure.proto.AzureBlobStorageConfig".into(),
+                        value: azure.to_proto().unwrap().encode_to_vec(),
+                    }),
+                })
+            }
+            #[cfg(not(feature = "azure"))]
+            {
+                let _ = endpoint;
+                panic!("Build with the azure feature to use an Azure emulator");
+            }
+        }
+        Err(_) => database_config::Storage::LocalStorage(LocalStorage {
+            path: Some(directory.join("store").to_string_lossy().into_owned()),
+            epoch: Some(0),
+        }),
+    }
+}
+
+fn sql_bench_services(clock: &Arc<TickClock>, remote: bool, cache: &std::path::Path) -> rtdb_node::NodeServices {
+    let services = bench_services(clock);
+    if !remote { return services; }
+    #[cfg(feature = "azure")]
+    {
+        let mut services = services;
+        let disk = rtdb_storage::disk_cache::DiskCache::open(cache, 2 << 30, rtdb_columnar::MemoryBudget::new(256 << 20)).unwrap();
+        let clock = Arc::clone(clock);
+        services.resources = Arc::new(rtdb_node::NativeResources::default()
+            .with_log_clock(Arc::new(move || Ok(rtdb_node::Clock::now(&*clock))))
+            .with_azure(Arc::new(BTreeMap::<String, rtdb_azure::AzureCredentials>::new())).unwrap()
+            .with_disk_cache(disk));
+        services
+    }
+    #[cfg(not(feature = "azure"))]
+    {
+        let _ = cache;
+        unreachable!("remote benchmark storage requires Azure")
+    }
+}
+
+pub(super) async fn run_ranked_sql(documents: i64, iterations: usize) {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, database_config};
+    use rtdb_node::Membership;
+    assert!(documents >= 4000 && iterations > 0);
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| Some(directory.path().join(name).to_string_lossy().into_owned());
+    let mut options = bench_options();
+    options.cache_bytes = 768 << 20;
+    let storage = sql_bench_storage(directory.path());
+    let remote = matches!(storage, database_config::Storage::RemoteStorage(_));
+    options.membership = Membership::Durable {
+        primary: DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: path("log"), epoch: Some(0) })),
+            storage: Some(storage),
+            ..Default::default()
+        },
+        skipped: Default::default(),
+    };
+    let table = TableRef::new("public", "docs");
+    let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    let fixture = |phase: &str| sql_bench_services(&clock, remote, &directory.path().join(phase));
+    let basis = {
+        let runtime = SearchRuntime::new(768 << 20);
+        let mut services = fixture("v13");
+        services.artefact_kinds = vec![runtime.artefacts()];
+        services.scan_accelerators = vec![runtime.accelerator()];
+        let (node, driver) = Node::open(options.clone(), services).await.unwrap();
+        let driver = tokio::spawn(driver.run());
+        let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
+        let basis = populate(&node, &mut session, &table, documents).await;
+        let database = node.catalog().database("xtdb").unwrap();
+        database.compaction().unwrap().compact_all().await.unwrap();
+        node.sync_all(Duration::from_secs(60), &CancellationToken::new()).await.unwrap();
+        database.build_artefacts().await.unwrap();
+        drop(session);
+        drop(database);
+        node.shutdown();
+        tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
+        basis
+    };
+    let tree_build_ms = {
+        let mut services = fixture("v14");
+        let runtime = SearchRuntime::with_tree_files(768 << 20);
+        services.artefact_kinds = vec![runtime.artefacts()];
+        services.scan_accelerators = vec![runtime.accelerator()];
+        let (node, driver) = Node::open(options.clone(), services).await.unwrap();
+        let driver = tokio::spawn(driver.run());
+        node.sync_all(Duration::from_secs(60), &CancellationToken::new()).await.unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        let build = Instant::now();
+        database.build_artefacts().await.unwrap();
+        let runtime = elapsed(build);
+        drop(database);
+        node.shutdown();
+        tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
+        runtime
+    };
+    let mut services = fixture("read");
+    let runtime = SearchRuntime::with_tree_files(768 << 20);
+    let scan = Arc::new(InterleavedSearch { accelerator: runtime.accelerator(), baseline: AtomicBool::new(false), diagnostics: Mutex::new(None) });
+    services.artefact_kinds = vec![runtime.artefacts()];
+    services.scan_accelerators = vec![scan.clone()];
+    let (node, driver) = Node::open(options, services).await.unwrap();
+    let driver = tokio::spawn(driver.run());
+    let database = node.catalog().database("xtdb").unwrap();
+    node.sync_all(Duration::from_secs(60), &CancellationToken::new()).await.unwrap();
+    let catalog = database.trie_catalog();
+    let tries = catalog.current_tries(&table);
+    assert!(tries.iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f14"))));
+    assert!(tries.iter().any(|trie| trie.artefacts.iter().any(|record| record.definition_id().ends_with("f13"))));
+    let mut session = node.session("xtdb", Arc::new(Identity)).unwrap();
+    let cold_case = CASES[3];
+    let cold_base = cold_case.statement(basis, basis);
+    let cold_sql = format!("{cold_base} LIMIT {}", cold_case.limit);
+    let start = Instant::now();
+    let cold = query(&mut session, &cold_sql).await;
+    let cold_ms = elapsed(start);
+    let cold_diagnostics = scan.diagnostics.lock().unwrap().take().expect("the cold SQL query produces a ranked scan");
+    assert_eq!(cold, oracle(&mut session, &cold_base, cold_case.limit).await);
+    let mut cases = Vec::new();
+    for case in CASES {
+        let base = case.statement(basis, basis);
+        let sql = format!("{base} LIMIT {}", case.limit);
+        let expected = oracle(&mut session, &base, case.limit).await;
+        let mut samples = [Vec::new(), Vec::new()];
+        let mut diagnostics = [Json::Null, Json::Null];
+        for iteration in 0..=iterations {
+            for position in 0..2 {
+                let variant = (iteration + position) % 2;
+                scan.baseline.store(variant == 0, Ordering::Relaxed);
+                let start = Instant::now();
+                let actual = query(&mut session, &sql).await;
+                let ms = elapsed(start);
+                assert_eq!(actual, expected, "{} format {}", case.name, 13 + variant);
+                let profile = scan.diagnostics.lock().unwrap().take().expect("the SQL query produces a ranked scan");
+                if iteration > 0 { samples[variant].push(ms); }
+                diagnostics[variant] = profile;
+            }
+        }
+        if case.name == "phrase" {
+            assert_eq!(diagnostics[1]["tree"]["decline"], "phrase-paged");
+        } else {
+            assert!(diagnostics[1]["tree"]["opened_roots"].as_u64().unwrap() > 0);
+            assert_eq!(diagnostics[1]["tree"]["retained_rows"].as_u64(), Some(case.limit as u64));
+        }
+        let [v13, v14] = samples;
+        cases.push(json!({"case": case.name, "limit": case.limit, "format13_ms": v13, "format14_ms": v14, "diagnostics": diagnostics}));
+    }
+    println!("{}", json!({"documents": documents, "warm_samples_per_format": iterations, "tree_build_ms": tree_build_ms,
+        "storage": if remote { "azure-emulator" } else { "local" }, "tries": tries.len(), "cases": cases,
+        "cold": {"case": cold_case.name, "milliseconds": cold_ms, "diagnostics": cold_diagnostics}}));
+    drop(session);
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(30), driver).await.unwrap().unwrap().unwrap();
 }

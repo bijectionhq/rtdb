@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryBudget, read_value};
+use arrow_array::{BooleanArray, Int64Array};
+use rtdb_columnar::{MemoryBudget, TextCell, from_field, selected_cell, text_cell, utf8_list};
 use rtdb_index::Snapshot;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::cache::BufferPool;
-use rtdb_types::{Anomaly, Instant, LogicalType, Result, TableRef, Value};
+use rtdb_types::{Anomaly, Instant, LogicalType, Result, TableRef};
 use tokio_util::sync::CancellationToken;
 
 /// One version of a search index definition, as `xt.search_indexes` holds it (fts.allium: SearchIndexDefinition).
@@ -13,8 +14,12 @@ use tokio_util::sync::CancellationToken;
 pub struct SearchDefinition { pub name: String, pub table: TableRef, pub columns: Vec<String>, pub version: i64, pub history: bool }
 
 impl SearchDefinition {
-    /// The artefact definition id names the analyzer and file format versions, so a change to either builds new search files rather than reading old ones.
-    pub fn artefact_id(&self) -> String { format!("{}~a{}f{}", self.name, rtdb_text::ANALYZER_VERSION, crate::file::FORMAT_VERSION) }
+    /// The artefact ID for the preferred reader format and the current analyzer.
+    pub fn artefact_id(&self) -> String { self.artefact_id_for(crate::file::FORMAT_VERSION) }
+
+    pub(crate) fn artefact_id_for(&self, format: i32) -> String {
+        format!("{}~a{}f{}", self.name, rtdb_text::ANALYZER_VERSION, format)
+    }
 }
 
 pub const DEFINITIONS: (&str, &str) = ("xt", "search_indexes");
@@ -86,28 +91,44 @@ async fn read_definitions(
     let mut definitions = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
-        let schema = batch.schema();
+        let schema = batch.schema_ref();
         for row in 0..batch.num_rows() {
-            let cell = |column: usize| read_value(schema.field(column), batch.column(column).as_ref(), row);
-            let text = |value: Value| match value { Value::Utf8(text) => Ok(text), other => Err(malformed(&other)) };
-            let columns = match cell(3)? { Value::List(values) => values.into_iter().map(text).collect::<Result<Vec<_>>>()?, other => return Err(malformed(&other)) };
-            let version = match cell(4)? { Value::I64(version) => version, other => return Err(malformed(&other)) };
-            // A definition written before the option existed covers history.
-            let table = TableRef::new(text(cell(1)?)?, text(cell(2)?)?);
+            let cell = |column: usize| (schema.field(column), batch.column(column).as_ref());
+            let text = |column| {
+                let (field, array) = cell(column);
+                let logical = from_field(field)?;
+                match text_cell(&logical, field, array, row)? {
+                    TextCell::Utf8(text) => Ok(text),
+                    _ => Err(malformed(field.name())),
+                }
+            };
+            let (field, array) = cell(3);
+            let columns = utf8_list(field, array, row)?.ok_or_else(|| malformed("columns"))?
+                .map(|text| text.map(str::to_owned)).collect::<Result<Vec<_>>>()?;
+            let (field, array) = cell(4);
+            let (_, version, position) = selected_cell(field, array, row)?.ok_or_else(|| malformed("version"))?;
+            let version = version.as_any().downcast_ref::<Int64Array>().ok_or_else(|| malformed("version"))?.value(position);
+            let table = TableRef::new(text(1)?, text(2)?);
             let history = if let Some(catalog) = owned_catalog {
                 if !catalog.owns_path_target(&table) || columns.len() != 1 {
                     return Err(Anomaly::fault("rtdb.search/malformed-owned-definition", "Owned search definition does not describe one column of a relation in its namespace"));
                 }
                 true
             } else {
-                // A public definition written before the option existed covers history.
-                match cell(5)? { Value::Bool(history) => history, Value::Null => true, other => return Err(malformed(&other)) }
+                let (field, array) = cell(5);
+                match selected_cell(field, array, row)? {
+                    None => true,
+                    Some((_, history, position)) => history.as_any().downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| malformed("history"))?.value(position),
+                }
             };
-            definitions.push(SearchDefinition { name: text(cell(0)?)?, table, columns, version, history });
+            definitions.push(SearchDefinition { name: text(0)?.to_owned(), table, columns, version, history });
         }
     }
     definitions.sort();
     Ok(definitions)
 }
 
-fn malformed(value: &Value) -> Anomaly { Anomaly::fault("rtdb.search/malformed-definition", format!("Malformed search index definition value: {value:?}")) }
+fn malformed(column: &str) -> Anomaly {
+    Anomaly::fault("rtdb.search/malformed-definition", format!("Malformed search index definition in {column}"))
+}

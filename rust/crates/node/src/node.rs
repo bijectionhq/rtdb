@@ -77,9 +77,18 @@ pub(crate) struct HostedSourceReceipt {
     pub(crate) history: String,
     pub(crate) applied: Option<TransactionKey>,
 }
-fn default_search() -> SearchServices {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchFileFormat { Tantivy, Arrow, Paged, Tree }
+
+fn default_search(_format: SearchFileFormat) -> SearchServices {
     #[cfg(feature = "search")] {
-        let runtime = rtdb_search::SearchRuntime::new(256 << 20);
+        let bytes = 256 << 20;
+        let runtime = match _format {
+            SearchFileFormat::Tantivy => rtdb_search::SearchRuntime::with_tantivy_files(bytes),
+            SearchFileFormat::Arrow => rtdb_search::SearchRuntime::with_paged_files(bytes, false),
+            SearchFileFormat::Paged => rtdb_search::SearchRuntime::with_paged_files(bytes, true),
+            SearchFileFormat::Tree => rtdb_search::SearchRuntime::with_tree_files(bytes),
+        };
         SearchServices { artefact_kinds: vec![runtime.artefacts()], scan_accelerators: vec![runtime.accelerator()] }
     }
     #[cfg(not(feature = "search"))] { SearchServices { artefact_kinds: Vec::new(), scan_accelerators: Vec::new() } }
@@ -87,7 +96,12 @@ fn default_search() -> SearchServices {
 struct SearchServices { artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>, scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>> }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        let search = default_search();
+        Self::local_with_search_format(authorization, observer, users, metrics, SearchFileFormat::Paged)
+    }
+
+    pub fn local_with_search_format(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>,
+        users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>, format: SearchFileFormat) -> Self {
+        let search = default_search(format);
         Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
             compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
             artefact_kinds: search.artefact_kinds, scan_accelerators: search.scan_accelerators }

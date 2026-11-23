@@ -255,6 +255,11 @@ impl BufferPool {
         Self::open(store, budget, Some(metadata))
     }
 
+    /// The reader's prepaid metadata allocation for a scoped cache.
+    pub fn prepaid_metadata_budget(&self) -> Option<&Arc<MemoryBudget>> {
+        self.metadata.as_ref().filter(|memory| memory.is_prepaid())
+    }
+
     pub fn retained_bytes(&self) -> usize { self.budget.retained_bytes() }
     pub fn budget(&self) -> &Arc<CacheBudget> { &self.budget }
 
@@ -354,11 +359,20 @@ impl BufferPool {
     }
 
     pub async fn scan_range(&self, key: &ObjectKey, range: Range<u64>, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
+        self.fetch_scan_range(key, range, |length| self.reserve(length).or_else(|_| reserve_from(fallback, length))).await
+    }
+
+    /// Fetches a range without populating the disk cache with the whole object and charges the shared pool.
+    pub async fn get_scan_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<CacheLease> {
+        self.fetch_scan_range(key, range, |length| self.reserve(length)).await
+    }
+
+    async fn fetch_scan_range(&self, key: &ObjectKey, range: Range<u64>, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
         if let Some(lease) = self.held_range(key, &range) { return Ok(lease); }
         let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
             .ok_or_else(|| Error::Task("Scan range is inverted or exceeds addressable memory".into()))?;
         let allocation = self.store.scan_range_allocation(key, length)?;
-        let reservation = reserve_read(length, allocation, |bytes| self.reserve(bytes).or_else(|_| reserve_from(fallback, bytes)))?;
+        let reservation = reserve_read(length, allocation, reserve)?;
         let allocation = Arc::new(self.store.get_reserved_scan_range(key, range, reservation).await?);
         Ok(CacheLease { allocation, range: 0..length })
     }

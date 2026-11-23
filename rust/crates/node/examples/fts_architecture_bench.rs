@@ -190,6 +190,11 @@ async fn main() {
         return;
     }
     #[cfg(feature = "fts-experiments")]
+    if workload == "ranked-sql" {
+        same_files::run_ranked_sql(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap()).await;
+        return;
+    }
+    #[cfg(feature = "fts-experiments")]
     if workload == "workload" || workload == "ranked-filter" {
         workload::run(args.next().unwrap().parse().unwrap(), args.next().unwrap().parse().unwrap(),
             workload == "ranked-filter").await;

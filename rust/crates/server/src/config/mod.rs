@@ -44,7 +44,7 @@ pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub ro
 pub struct CompactorSettings { pub threads: usize, pub run_end_encoded_iids: bool, pub within_file_recency_branching: bool }
 /// Full-text search's index lane; with it off, `MATCH` is still answered, by scanning.
 #[derive(Clone, Debug)]
-pub struct SearchSettings { pub enabled: bool, pub threads: usize }
+pub struct SearchSettings { pub enabled: bool, pub threads: usize, pub write_format: rtdb_node::SearchFileFormat }
 #[derive(Clone, Debug)]
 pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration, pub reader_lease: Duration, pub reader_lease_margin: Duration }
 #[derive(Clone, Debug)]
@@ -243,7 +243,15 @@ fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
 }
 fn search(value: Option<Yaml>) -> Result<SearchSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "search")?;
-    let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), threads: positive(fields.integer("threads")?.unwrap_or(1) as i64, "threads")? };
+    let write_format = match fields.integer("writeFormat")?.unwrap_or(11) {
+        11 => rtdb_node::SearchFileFormat::Tantivy,
+        12 => rtdb_node::SearchFileFormat::Arrow,
+        13 => rtdb_node::SearchFileFormat::Paged,
+        14 => rtdb_node::SearchFileFormat::Tree,
+        _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.config/search-format", "search.writeFormat must be 11, 12, 13, or 14")),
+    };
+    let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true),
+        threads: positive(fields.integer("threads")?.unwrap_or(1) as i64, "threads")?, write_format };
     fields.finish()?;
     Ok(result)
 }

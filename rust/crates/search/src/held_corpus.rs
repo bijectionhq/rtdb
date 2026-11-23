@@ -7,9 +7,9 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp};
 
-use crate::{OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
+use crate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
 
 /// Resolve a declared single-column search path on its admitted archive cut.
 pub async fn owned_text_column(
@@ -160,19 +160,17 @@ impl HeldTextCorpus {
             let (text_column, text_field) = schema.column_with_name(&column).ok_or_else(corpus_limit)?;
             let ids = batch.column(id_column).as_ref();
             let text = batch.column(text_column).as_ref();
+            let logical = rtdb_columnar::from_field(text_field)?;
             for row in 0..batch.num_rows() {
                 context.check_cancelled_at(row)?;
                 let id_bytes = rtdb_columnar::estimate_read_value_bytes(id_field, ids, row)?;
                 let _identity = self.memory.reserve(id_bytes.saturating_mul(2))?;
-                let id = rtdb_columnar::read_value(id_field, ids, row)?.entity_id()?;
+                let id = rtdb_columnar::read_entity_id(id_field, ids, row)?.into_owned();
                 if shadows.contains(&id) { continue; }
-                let bytes = rtdb_columnar::estimate_read_value_bytes(text_field, text, row)?;
-                let _text = self.memory.reserve(bytes)?;
-                let value = rtdb_columnar::read_value(text_field, text, row)?;
-                let value = match &value {
-                    Value::Utf8(text) => Some(text.as_str()),
-                    Value::Null | Value::Undefined => None,
-                    _ => return Err(corpus_limit()),
+                let value = match rtdb_columnar::text_cell(&logical, text_field, text, row)? {
+                    rtdb_columnar::TextCell::Utf8(text) => Some(text),
+                    rtdb_columnar::TextCell::Missing => None,
+                    rtdb_columnar::TextCell::Other => return Err(corpus_limit()),
                 };
                 self.shadow(partition, id, value)?;
             }
@@ -212,13 +210,17 @@ impl HeldTextCorpus {
     }
 
     pub fn finish(self, offset: usize, limit: usize) -> Result<OwnedSearchPage> {
+        self.finish_batch(offset, limit)?.into_page()
+    }
+
+    pub fn finish_batch(self, offset: usize, limit: usize) -> Result<OwnedSearchBatch> {
         if offset > 4096 || !(1..=128).contains(&limit) {
             return Err(corpus_limit());
         }
         let scorer = Scorer::new(self.query.clone(), Some(&self.corpus));
         let mut window = OwnedRankWindow::new(&self.memory, offset, limit)?;
         self.rank(&scorer, &mut window)?;
-        Ok(window.finish())
+        window.finish_batch()
     }
 }
 

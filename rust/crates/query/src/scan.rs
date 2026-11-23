@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray, cast::AsArray};
+use arrow_array::{builder::{BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder}, cast::AsArray};
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{ipc::{PageDecoder, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{data::PutText, ipc::{PageDecoder, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
@@ -34,7 +34,7 @@ struct OpenedLayout {
 }
 
 impl DataFile {
-    async fn decode_page(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+    async fn open(&mut self, memory: &Arc<MemoryBudget>) -> Result<&OpenedLayout> {
         if self.opened.is_none() {
             let whole = if self.storage.object_store().supports_scan_ranges(&self.key) {
                 None
@@ -44,6 +44,11 @@ impl DataFile {
             let (layout, opening) = self.open_layout(whole.as_ref(), memory).await?;
             self.opened = Some(OpenedLayout { layout, _opening: opening, whole });
         }
+        Ok(self.opened.as_ref().expect("the data file is open"))
+    }
+
+    async fn decode_page(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
         let reader = &opened.layout.decoder;
         let bytes = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
@@ -225,6 +230,14 @@ impl Ord for Head {
 }
 impl PartialOrd for Head { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
 
+#[derive(Clone)]
+struct RankProjection {
+    output: rtdb_plan::ColumnId,
+    source: String,
+    scorer: Option<Arc<rtdb_text::Scorer>>,
+    verified: Option<crate::CandidateScores>,
+}
+
 pub(crate) struct PartitionScan {
     snapshot: Snapshot,
     storage: Arc<BufferPool>,
@@ -249,6 +262,8 @@ pub(crate) struct PartitionScan {
     page_test: Option<crate::page_metadata::PageTest>,
     /// Parallel to the scan's matches: the query (`None` where it is null, so MATCH is too), and an accelerator's answers for some of the partition's data files.
     matches: Vec<(Option<rtdb_text::Query>, Option<crate::MatchAnswers>)>,
+    ranking: Option<RankProjection>,
+    candidate_iids: Option<crate::CandidateIids>,
     /// Parallel to the scan's columns: the match each evaluates, if any.
     slots: Vec<Option<usize>>,
 }
@@ -394,7 +409,7 @@ fn intersect(left: Option<(Iid, Iid)>, right: Option<(Iid, Iid)>) -> std::result
     }
 }
 /// One source of a scan's rows: a partition this node reads, or a fragment of one that another node may read for it.
-enum Part { Local(PartitionScan), Fragment(Fragment) }
+enum Part { Local(PartitionScan), Fragment(Fragment), Resolved(Option<crate::columnar::ColumnBatch>) }
 
 /// A fragment dispatched to the node it belongs to, read here instead when that node is this one or does not answer.
 struct Fragment { request: Arc<ScanFragment>, fallback: PartitionScan, state: FragmentState }
@@ -451,6 +466,7 @@ impl ScanCursor {
             return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
         }
         let fixed_iids = scan.iids.is_some();
+        let accelerate = accelerate && execution.context.catalog.owned_position_mask.is_none();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.evaluator()); }
         let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
             match id_interval(&scan, execution.parameters.evaluator()) {
@@ -474,21 +490,64 @@ impl ScanCursor {
             queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
         }
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
+        let ranking = if let Some(top) = scan.top_k.as_ref()
+            && let Some(output) = top.score
+            && let Some(source) = scan.columns.iter().find(|field| field.id == top.column)
+        {
+            let constants = crate::accelerate::ExecutionConstants(&execution);
+            let scorer = match crate::ConstantEvaluator::constant(&constants, &top.query).await? {
+                Some(Value::Utf8(query)) => Some(Arc::new(rtdb_text::Scorer::new(rtdb_text::Query::parse(&query), None))),
+                _ => None,
+            };
+            Some(RankProjection { output, source: source.name.clone(), scorer, verified: None })
+        } else { None };
         let fragmenter = execution.context.catalog.fragmenter.clone();
         let mut parts = VecDeque::new();
+        let mut verified_counts = ScanCounts::default();
         for snapshot in database_partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             let mut narrowed = scan.clone();
-            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage, canonical_entity_iids };
+            let mut ranking = ranking.clone();
+            let mut candidate_iids = None;
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition: snapshot, storage, canonical_entity_iids, counts: Default::default() };
             for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids) {
                 let request = crate::ScanRequest { database: &name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                     current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(&execution),
                     verifier: &verifier, partitions: database_partitions };
-                if let Some(mut candidates) = accelerator.candidate_iids(&request).await? {
-                    // `path_matches` stops consulting pushdowns once `iids` is set, so they are applied to the candidates here.
-                    if let Some(filters) = &pushdowns { candidates.retain(|iid| filters.iid_matches(&scan.columns, *iid, canonical_entity_iids)); }
-                    let iids = match narrowed.iids.take() { Some(existing) => existing.intersection(&candidates).copied().collect(), None => candidates };
-                    narrowed.iids = Some(iids);
+                let selection = accelerator.select_candidates(&request).await?;
+                if let Some(crate::ScanSelection { iids: mut candidates, scores }) = selection {
+                    if pushdowns.is_some() || narrowed.iids.is_some() {
+                        candidates = match candidates.retain(|iid| {
+                            pushdowns.as_ref().is_none_or(|filters| filters.iid_matches(&scan.columns, iid, canonical_entity_iids))
+                                && narrowed.iids.as_ref().is_none_or(|existing| existing.contains(&iid))
+                        }, &execution.context.memory) {
+                            Err(error) if error.code == "rtdb/memory-budget-exceeded" => continue,
+                            result => result?,
+                        };
+                    }
+                    if let Some(ranking) = &mut ranking
+                        && scores.is_some()
+                    {
+                        ranking.verified = scores;
+                    }
+                    narrowed.iids = Some(candidates.iter().collect());
+                    candidate_iids = Some(candidates);
+                }
+            }
+            verified_counts.add(*verifier.counts.lock());
+            if database_partitions.len() == 1 && bounds.valid_time.is_point() && bounds.system_time.is_point()
+                && let (Some(iids), Some(projected_rank)) = (candidate_iids.as_ref(), ranking.as_ref())
+                && let Some(scores) = projected_rank.verified.as_ref() {
+                match retained_ranked_batch(&scan, projected_rank.output, iids, scores, &execution.context.memory) {
+                    Ok(Some(batch)) => {
+                        parts.push_back(Part::Resolved(Some(batch)));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.code == "rtdb/memory-budget-exceeded" => {
+                        if let Some(rank) = &mut ranking && let Some(scores) = &mut rank.verified { scores.release_rows(); }
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             let mut matches = Vec::with_capacity(scan.matches.len());
@@ -504,9 +563,11 @@ impl ScanCursor {
                 }
                 matches.push((query.as_deref().map(rtdb_text::Query::parse), answers));
             }
+            let mut local_scan = narrowed.clone();
+            if candidate_iids.is_some() { local_scan.iids = None; }
             let partition = |confined, matches| PartitionScan {
-                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches,
-                slots: slots.clone(), scan: narrowed.clone(), execution: execution.clone(), bounds,
+                snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, ranking: ranking.clone(), candidate_iids: candidate_iids.clone(),
+                slots: slots.clone(), scan: local_scan.clone(), execution: execution.clone(), bounds,
                 initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(),
                 tasks: None, loaded: BTreeMap::new(), output: VecDeque::new(),
                 output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(),
@@ -514,7 +575,7 @@ impl ScanCursor {
             };
             // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
             let split = match (&fragmenter, snapshot.tx_basis()) {
-                (Some(fragmenter), Some(basis)) if order.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
+                (Some(fragmenter), Some(basis)) if order.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && ranking.is_none() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
                     fragmenter.depth(&name, &scan.table.name.table, persisted_bytes(snapshot)).map(|depth| (depth, basis)),
                 _ => None,
             };
@@ -531,7 +592,7 @@ impl ScanCursor {
             }
         }
         let fragmenter = fragmenter.filter(|_| parts.iter().any(|part| matches!(part, Part::Fragment(_))));
-        Ok(Self { parts, fragmenter, completed: ScanCounts::default(), database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
+        Ok(Self { parts, fragmenter, completed: verified_counts, database: name, source, memory: Arc::clone(&execution.context.memory), _reservation: reservation })
     }
 }
 
@@ -544,7 +605,7 @@ impl PartitionScan {
             scan.iids = Some(Default::default());
             fragment
         });
-        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
+        Self { snapshot, storage, scan, execution, bounds, matches: Vec::new(), ranking: None, candidate_iids: None, slots, initialized: false, files: FileDescriptors::default(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
             output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns, canonical_entity_iids, confined, order: None, page_test: None }
     }
     /// The scan another node asked this one for: its fragment's rows within the bounds that node evaluated.
@@ -560,7 +621,8 @@ impl ScanCursor {
             for part in &mut self.parts { if let Part::Fragment(fragment) = part { fragment.dispatch(&fragmenter); } }
         }
         while let Some(part) = self.parts.front_mut() {
-            let batch = match part { Part::Local(partition) => partition.next_batch().await?, Part::Fragment(fragment) => fragment.next_batch(&self.memory).await? };
+            let batch = match part { Part::Local(partition) => partition.next_batch().await?, Part::Fragment(fragment) => fragment.next_batch(&self.memory).await?,
+                Part::Resolved(batch) => batch.take() };
             if let Some(batch) = batch { return Ok(Some(batch)); }
             self.completed.add(part.counts());
             self.parts.pop_front();
@@ -571,12 +633,31 @@ impl ScanCursor {
 
 #[cfg(test)]
 impl ScanCursor {
-    fn front_partition(&self) -> Option<&PartitionScan> { self.parts.front().map(|part| match part { Part::Local(partition) => partition, Part::Fragment(fragment) => &fragment.fallback }) }
-    fn front_partition_mut(&mut self) -> Option<&mut PartitionScan> { self.parts.front_mut().map(|part| match part { Part::Local(partition) => partition, Part::Fragment(fragment) => &mut fragment.fallback }) }
+    fn front_partition(&self) -> Option<&PartitionScan> { self.parts.front().and_then(|part| match part { Part::Local(partition) => Some(partition), Part::Fragment(fragment) => Some(&fragment.fallback), Part::Resolved(_) => None }) }
+    fn front_partition_mut(&mut self) -> Option<&mut PartitionScan> { self.parts.front_mut().and_then(|part| match part { Part::Local(partition) => Some(partition), Part::Fragment(fragment) => Some(&mut fragment.fallback), Part::Resolved(_) => None }) }
 }
 
 impl Part {
-    fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts } }
+    fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts, Self::Resolved(_) => ScanCounts::default() } }
+}
+
+fn retained_ranked_batch(scan: &Scan, score: rtdb_plan::ColumnId, iids: &crate::CandidateIids,
+    scores: &crate::CandidateScores, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
+    if iids.is_empty() { return Ok(None); }
+    let Some(position) = scan.columns.iter().position(|field| field.id == score) else { return Ok(None); };
+    let Some(rows) = iids.iter().map(|iid| scores.row(iid).zip(scores.score(iid))).collect::<Option<Vec<_>>>() else { return Ok(None); };
+    let slots = (0..rows.len()).zip(rows.iter().map(|(row, _)| row.row)).collect::<Vec<_>>();
+    let sources: Vec<_> = rows.iter().map(|(row, _)| Arc::clone(&row.batch)).collect();
+    let columns: Vec<_> = (0..scan.columns.len() - 1).collect();
+    let mut output = crate::columnar::ColumnBatch::take_rows(&sources, &slots, &columns, memory)?;
+    let reservation = memory.reserve(256 + rows.len() * 8)?;
+    output.append_column(crate::columnar::Column::Arrow {
+        array: Arc::new(arrow_array::Float64Array::from_iter_values(rows.into_iter().map(|(_, score)| score))),
+        field: Arc::new(arrow_schema::Field::new("search_score", DataType::Float64, true)),
+        logical: Some(rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::F64).maybe()),
+    }, reservation, memory)?;
+    output.columns[position..].rotate_right(1);
+    Ok(Some(output))
 }
 
 async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usize>, projection: &[usize]) -> Result<Option<crate::OrderedScan>> {
@@ -587,7 +668,7 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
     let database = context.catalog.database(&scan.table.name.database)?;
     let [snapshot] = database.partitions.as_slice() else { return Ok(None); };
     let storage = &database.storage;
-    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false };
+    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false, counts: Default::default() };
     let bounds = bounds(scan, snapshot, execution).await?;
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
@@ -818,27 +899,42 @@ impl crate::columnar::BatchCursor for OrderedPayload {
 }
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
-struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool }
+struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
 
 #[async_trait]
 impl crate::CandidateVerifier for ScanVerifier<'_> {
-    async fn visible(&self, mut iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId) -> Result<Vec<(Iid, Value)>> {
+    fn permits_search_witness(&self) -> bool {
+        self.pushdowns.is_none()
+    }
+
+    async fn score_visible(&self, mut iids: BTreeSet<Iid>, column: rtdb_plan::ColumnId, ascending_id: Option<rtdb_plan::ColumnId>, scorer: &rtdb_text::Scorer) -> Result<crate::CandidateScores> {
         if let Some(pushdowns) = &self.pushdowns {
             iids.retain(|iid| pushdowns.iid_matches(&self.scan.columns, *iid, self.canonical_entity_iids));
         }
-        if iids.is_empty() { return Ok(Vec::new()); }
+        let memory = &self.execution.context.memory;
+        let mut reservation = memory.reserve(256)?;
+        let mut selected = FixedSizeBinaryBuilder::with_capacity(0, 16);
+        let mut scores = Float64Builder::with_capacity(0);
+        if iids.is_empty() { return Ok(crate::CandidateScores::new(selected.finish(), scores.finish(), reservation)); }
         let mut scan = self.scan.clone();
+        if let Some(score) = scan.top_k.as_ref().and_then(|top| top.score) {
+            scan.columns.retain(|field| field.id != score);
+        }
         scan.top_k = None;
         scan.ordered_top_k = None;
         scan.iids = Some(iids);
         let iid_at = include_iid(&mut scan)?;
         let position = scan.columns.iter().position(|field| field.id == column)
             .ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"))?;
+        let id_position = ascending_id.and_then(|id| scan.columns.iter().position(|field| field.id == id));
+        let mut ranked_ids = id_position.map(|_| arrow_array::builder::Int64Builder::new());
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         let mut cursor = ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(), std::slice::from_ref(self.partition), self.storage, false, None).await?;
-        let mut visible = Vec::new();
+        let mut selected_rows = 0usize;
+        let mut retained = BTreeMap::new();
         while let Some(batch) = cursor.next_batch().await? {
+            let batch = Arc::new(batch);
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
                 return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
             };
@@ -848,12 +944,29 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
                 None => None,
             };
             for row in 0..batch.len {
-                if mask.as_ref().is_none_or(|mask| mask[row]) {
-                    visible.push((iids.get(row)?, batch.columns[position].value(row)?));
+                if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
+                let PutText::Utf8(text) = crate::columnar::search::text(&batch.columns[position], row)? else { continue; };
+                let _scratch = memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                selected_rows += 1;
+                let lease = Arc::get_mut(&mut reservation).expect("Verification owns its output reservation");
+                lease.grow_to(256usize.saturating_add(selected_rows.saturating_mul(48)))?;
+                let iid = iids.get(row)?;
+                selected.append_value(iid.0).map_err(|error| invalid("verifier-iid", error))?;
+                retained.insert(iid, crate::SnapshotRow { batch: Arc::clone(&batch), row });
+                scores.append_value(scorer.bm25_arrow(&rtdb_text::analyze(text)));
+                if let Some((position, ids)) = id_position.zip(ranked_ids.as_mut()) {
+                    let value = batch.columns[position].value(row)?;
+                    let id = match value.entity_id() {
+                        Ok(rtdb_types::EntityId::Integer(id)) => Some(id),
+                        _ => None,
+                    };
+                    ids.append_option(id);
                 }
             }
         }
-        Ok(visible)
+        if let Some(counts) = cursor.scan_counts() { self.counts.lock().add(counts); }
+        Ok(crate::CandidateScores::new(selected.finish(), scores.finish(), reservation)
+            .with_ids(ranked_ids.map(|mut ids| ids.finish())).with_rows(retained))
     }
 }
 
@@ -877,14 +990,19 @@ impl PageCursor for ScanCursor {
 
 impl PartitionScan {
     fn pruning(&self) -> PruningOptions {
+        let iid = match &self.candidate_iids {
+            Some(iids) if iids.len() == 1 => iids.iter().next(),
+            _ => self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()),
+        };
         PruningOptions { bounds: self.bounds, projects_temporal_columns: self.scan.columns.iter().any(|field| matches!(field.name.as_str(), "_valid_from" | "_valid_to" | "_system_from" | "_system_to")),
             clamp_valid_time: self.scan.clamp_valid_time,
             bypass_temporal_pruning: self.execution.context.options.bypass_temporal_pruning
                 || self.execution.context.catalog.owned_position_mask.is_some(),
-            iid: self.scan.iids.as_ref().filter(|iids| iids.len() == 1).and_then(|iids| iids.first().copied()) }
+            iid }
     }
     fn path_matches(&self, lower: Iid, upper: Iid) -> bool {
         if self.confined.is_some_and(|(first, last)| upper < first || last < lower) { return false; }
+        if let Some(iids) = &self.candidate_iids { return iids.intersects(lower, upper); }
         match &self.scan.iids {
             Some(iids) => iids.range(lower..=upper).next().is_some(),
             None => self.pushdowns.as_ref().is_none_or(|filters| filters.path_matches(&self.scan.columns, lower, upper, self.canonical_entity_iids)),
@@ -892,7 +1010,8 @@ impl PartitionScan {
     }
     async fn initialize(&mut self) -> Result<()> {
         self.execution.context.check_cancelled()?;
-        if self.scan.iids.as_ref().is_some_and(|iids| iids.is_empty()) || self.bounds.valid_time.is_empty() || self.bounds.system_time.is_empty() {
+        if self.candidate_iids.as_ref().is_some_and(crate::CandidateIids::is_empty)
+            || self.scan.iids.as_ref().is_some_and(BTreeSet::is_empty) || self.bounds.valid_time.is_empty() || self.bounds.system_time.is_empty() {
             self.initialized = true;
             return Ok(());
         }
@@ -1252,15 +1371,18 @@ impl PartitionScan {
                 Some(following) => { heads.push(following); heads.pop() }
                 None => heads.pop(),
             };
-            if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
-            if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
+            if let Some(iids) = &self.candidate_iids {
+                if !iids.contains(head.header.iid) { continue; }
+            } else if let Some(iids) = &self.scan.iids {
+                if !iids.contains(&head.header.iid) { continue; }
+            } else if self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns, head.header.iid, self.canonical_entity_iids)) {
+                continue;
+            }
             if position_mask.is_some_and(|(commit, from)| {
                 head.header.system_from == commit
                     && head.header.commit_position >= from
                     && head.header.op != EventOp::Erase
-            }) {
-                continue;
-            }
+            }) { continue; }
             let (slot, batch, row) = rows.batch(head.ordinal)?;
             let resolver = if keyed {
                 let key = batch.view().entity_key(row as usize)?.ok_or_else(|| {
@@ -1309,6 +1431,11 @@ impl PartitionScan {
         self.output = groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()).map(|(group, rows)| {
             let page = &self.pages.entries[selected[group]].source;
             crate::columnar::gather(rows, &batches, &self.scan.columns, &self.execution.context.memory, |position| {
+                if let Some(ranking) = &self.ranking
+                    && self.scan.columns[position].id == ranking.output
+                {
+                    return self.rank_column(ranking, rows, &batches).map(Some);
+                }
                 self.slots[position].map(|slot| self.match_column(slot, page, rows, &batches)).transpose()
             })
         }).collect::<Result<_>>()?;
@@ -1318,43 +1445,79 @@ impl PartitionScan {
     }
 
     fn match_column(&self, evaluated: usize, source: &PageSource, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
-        let (Some(query), answers) = &self.matches[evaluated] else {
-            return Ok(crate::columnar::Column::Values(vec![Value::Null; rows.len()]));
-        };
+        let (query, answers) = &self.matches[evaluated];
         let page_answers = match (answers, source) {
             (Some(answers), PageSource::File { file, page }) => answers.file(&self.files.entries[*file].key).map(|matches| (matches, *page)),
             _ => None,
         };
+        let mut values = BooleanBuilder::with_capacity(rows.len());
         let name = &self.scan.matches[evaluated].column;
-        rows.iter().map(|row| {
-            let position = row.source.1 as usize;
-            if let Some((matches, page)) = page_answers {
-                if let Ok(value) = matches.value(page, position) {
-                    return Ok(value.map_or(Value::Null, Value::Bool));
-                }
-            }
-            let value = match name.as_str() {
-                "_valid_to" if row.valid_time.upper() == Timestamp::MAX => Value::Null,
-                "_system_to" if row.system_time.upper() == Timestamp::MAX => Value::Null,
-                "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => return Ok(Value::Bool(false)),
-                _ => read_match_input(&batches[row.source.0 as usize], position, name)?,
+        for row in rows {
+            let Some(query) = query else {
+                values.append_null();
+                continue;
             };
-            Ok(rtdb_expr::match_value(&value, query))
-        }).collect::<Result<_>>().map(crate::columnar::Column::Values)
+            let position = row.source.1 as usize;
+            if let Some((matches, page)) = page_answers
+                && let Ok(value) = matches.value(page, position)
+            {
+                values.append_option(value);
+                continue;
+            }
+            let text = resolved_text(name, row, batches)?;
+            values.append_option(match text {
+                PutText::Missing => None,
+                PutText::Other => Some(false),
+                PutText::Utf8(text) => {
+                    let _tokens = self.execution.context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                    Some(query.matches_arrow(&rtdb_text::analyze(text)))
+                }
+            });
+        }
+        Ok(crate::columnar::Column::Arrow {
+            array: Arc::new(values.finish()),
+            field: Arc::new(arrow_schema::Field::new(name, DataType::Boolean, true)),
+            logical: Some(rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe()),
+        })
+    }
+
+    fn rank_column(&self, ranking: &RankProjection, rows: &[ResolvedRow<(u32, u32)>], batches: &[Arc<IndexBatch>]) -> Result<crate::columnar::Column> {
+        let mut values = Float64Builder::with_capacity(rows.len());
+        let empty = arrow_array::StringArray::from(Vec::<&str>::new());
+        for row in rows {
+            let Some(scorer) = &ranking.scorer else {
+                values.append_null();
+                continue;
+            };
+            let iid = batches[row.source.0 as usize].header(row.source.1 as usize)?.iid;
+            if let Some(score) = ranking.verified.as_ref().and_then(|verified| verified.score(iid)) {
+                values.append_value(score);
+                continue;
+            }
+            values.append_option(match resolved_text(&ranking.source, row, batches)? {
+                PutText::Missing => None,
+                PutText::Other => Some(scorer.bm25_arrow(&empty)),
+                PutText::Utf8(text) => {
+                    let _tokens = self.execution.context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
+                    Some(scorer.bm25_arrow(&rtdb_text::analyze(text)))
+                }
+            });
+        }
+        Ok(crate::columnar::Column::Arrow {
+            array: Arc::new(values.finish()),
+            field: Arc::new(arrow_schema::Field::new("search_score", DataType::Float64, true)),
+            logical: Some(rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::F64).maybe()),
+        })
     }
 }
 
-fn read_match_input(batch: &IndexBatch, row: usize, name: &str) -> Result<Value> {
-    let op = batch.view().operations()?;
-    let put = op.child(op.type_id(row)).as_any().downcast_ref::<StructArray>()
-        .ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
-    let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema", "Put has no struct fields")); };
-    let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null) };
-    let (field, array, offset) = (&fields[index], put.column(index).as_ref(), op.value_offset(row));
-    match batch.put_field_type(index) {
-        Some(logical) => rtdb_columnar::read_execution_value_as(logical, field, array, offset),
-        None => rtdb_columnar::read_execution_value(field, array, offset),
-    }
+fn resolved_text<'a>(name: &str, row: &ResolvedRow<(u32, u32)>, batches: &'a [Arc<IndexBatch>]) -> Result<PutText<'a>> {
+    Ok(match name {
+        "_valid_to" if row.valid_time.upper() == Timestamp::MAX => PutText::Missing,
+        "_system_to" if row.system_time.upper() == Timestamp::MAX => PutText::Missing,
+        "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => PutText::Other,
+        _ => batches[row.source.0 as usize].view().borrow_event(row.source.1 as usize)?.put_text(name)?,
+    })
 }
 
 async fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {

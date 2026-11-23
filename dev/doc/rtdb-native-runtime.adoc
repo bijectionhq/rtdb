@@ -54,6 +54,10 @@ A scan with `MATCH` uses those files to narrow the candidates it resolves.
 The node option `search: {enabled: false}` turns off the lane and acceleration.
 `MATCH` still returns the same rows.
 `search: {threads: N}` sizes the lane per database.
+`search: {writeFormat: 14}` enables authenticated Arrow search files for newly indexed tries.
+The server defaults to format 11 for rolling upgrades.
+Upgrade all readers and maintenance lanes that share the database before enabling Arrow writes.
+Upgraded nodes can read and repair retained format 11, 12, 13 and 14 files.
 Accelerated queries score against the column values visible at the snapshot.
 The search accelerator can prune a ranked limit over the two-argument score and a `MATCH` on the same column.
 The five-argument score uses the ordinary SQL sort and limit.

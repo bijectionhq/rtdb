@@ -3,28 +3,40 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use arrow_array::{Array, StringArray, builder::StringBuilder};
 
 pub const SIMPLE_ANALYZER: &str = "simple";
 
 /// Bumped whenever tokenisation changes, so that search files built by an earlier analyzer are never read by a later one.
 pub const ANALYZER_VERSION: i32 = 2;
 
-/// The longest token a search index holds, in bytes: tantivy drops longer ones, so a longer run of alphanumerics is split into tokens of at most this many.
+/// The maximum UTF-8 byte length of one token for this analyzer version.
 pub const MAX_TOKEN_BYTES: usize = 65_530;
+
+fn visit_tokens(text: &str, mut append: impl FnMut(String)) {
+    for word in text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()) {
+        let word = word.to_lowercase();
+        if word.len() <= MAX_TOKEN_BYTES { append(word); continue; }
+        let mut piece = String::new();
+        for character in word.chars() {
+            if piece.len() + character.len_utf8() > MAX_TOKEN_BYTES { append(std::mem::take(&mut piece)); }
+            piece.push(character);
+        }
+        append(piece);
+    }
+}
 
 pub fn tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    for word in text.split(|character: char| !character.is_alphanumeric()).filter(|token| !token.is_empty()) {
-        let word = word.to_lowercase();
-        if word.len() <= MAX_TOKEN_BYTES { tokens.push(word); continue; }
-        let mut piece = String::new();
-        for character in word.chars() {
-            if piece.len() + character.len_utf8() > MAX_TOKEN_BYTES { tokens.push(std::mem::take(&mut piece)); }
-            piece.push(character);
-        }
-        tokens.push(piece);
-    }
+    visit_tokens(text, |word| tokens.push(word));
     tokens
+}
+
+/// Analyzes a document into an Arrow string vector in token order.
+pub fn analyze(text: &str) -> StringArray {
+    let mut tokens = StringBuilder::new();
+    visit_tokens(text, |word| tokens.append_value(word));
+    tokens.finish()
 }
 
 /// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
@@ -47,8 +59,21 @@ impl Query {
     pub fn phrases(&self) -> &[Vec<String>] { &self.phrases }
     /// A query with no terms matches nothing.
     pub fn matches(&self, document: &[String]) -> bool {
-        !self.terms.is_empty() && self.terms.iter().all(|term| document.contains(term))
-            && self.phrases.iter().all(|phrase| document.windows(phrase.len()).any(|window| window == phrase.as_slice()))
+        self.matches_cells(document.len(), |index| document[index].as_str())
+    }
+
+    /// Tests the terms and phrases against an analyzer's Arrow token vector.
+    pub fn matches_arrow(&self, document: &StringArray) -> bool {
+        self.matches_cells(document.len(), |index| document.value(index))
+    }
+
+    fn matches_cells<'a>(&self, length: usize, get: impl Fn(usize) -> &'a str) -> bool {
+        !self.terms.is_empty() && self.terms.iter().all(|term| (0..length).any(|index| get(index) == term))
+            && self.phrases.iter().all(|phrase| {
+                length.checked_sub(phrase.len()).is_some_and(|last| {
+                    (0..=last).any(|start| phrase.iter().enumerate().all(|(offset, term)| get(start + offset) == term))
+                })
+            })
     }
 }
 
@@ -67,7 +92,7 @@ impl Corpus {
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
-/// A document length as the search index stores it: rounded down to one of 256 values, the same lossy encoding tantivy's field norms use.
+/// The document length used for BM25 normalization, rounded down on the analyzer's 256-value grid.
 pub fn stored_length(tokens: usize) -> u32 {
     let tokens = u32::try_from(tokens).unwrap_or(u32::MAX);
     LENGTHS[LENGTHS.binary_search(&tokens).unwrap_or_else(|index| index - 1)]
@@ -92,16 +117,19 @@ const LENGTHS: [u32; 256] = [
     536_870_936, 603_979_800, 671_088_664, 738_197_528, 805_306_392, 872_415_256, 939_524_120, 1_006_632_984, 1_073_741_848, 1_207_959_576, 1_342_177_304, 1_476_395_032, 1_610_612_760, 1_744_830_488, 1_879_048_216, 2_013_265_944,
 ];
 
-fn inverse_frequency(term: &str, corpus: Option<&Corpus>) -> f64 {
-    corpus.and_then(|corpus| corpus.frequencies.get(term).map(|df| (corpus.documents as f64, *df as f64)))
-        .map_or(1.0, |(documents, df)| (1.0 + (documents - df + 0.5) / (df + 0.5)).ln())
+fn inverse_frequency(documents: u64, frequency: u64) -> f64 {
+    let (documents, frequency) = (documents as f64, frequency as f64);
+    (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln()
 }
 
 fn rounded_term_score(frequency: u32, length: u32, average: Option<f64>, idf: f64) -> f64 {
     let (frequency, length) = (f64::from(frequency), f64::from(length));
-    let average = average.unwrap_or(length);
-    let norm = if average > 0.0 { 1.0 - B + B * length / average } else { 1.0 };
+    let norm = average.filter(|average| *average > 0.0).map_or(1.0, |average| 1.0 - B + B * length / average);
     idf * frequency * (K1 + 1.0) / (frequency + K1 * norm)
+}
+
+pub fn unit_term_score(frequency: u32) -> f64 {
+    rounded_term_score(frequency, 0, None, 1.0)
 }
 
 /// BM25 parameters fixed once for the scan and the SQL expressions that score its rows.
@@ -115,11 +143,28 @@ impl Scorer {
     pub fn new(query: Query, corpus: Option<&Corpus>) -> Self {
         let average = corpus.filter(|corpus| corpus.documents > 0 && corpus.tokens > 0)
             .map(|corpus| corpus.tokens as f64 / corpus.documents as f64);
-        let idfs: Vec<f64> = query.terms.iter().map(|term| inverse_frequency(term, corpus)).collect();
+        let idfs = query.terms.iter().map(|term| {
+            corpus.and_then(|corpus| corpus.frequencies.get(term).map(|&frequency| inverse_frequency(corpus.documents, frequency))).unwrap_or(1.0)
+        }).collect();
+        Self { query, average, idfs }
+    }
+
+    /// Uses document frequencies in the query's own term order.
+    pub fn from_frequencies(query: Query, documents: u64, tokens: u64, frequencies: &[u64]) -> Self {
+        let average = (documents > 0 && tokens > 0).then(|| tokens as f64 / documents as f64);
+        let idfs = (0..query.terms.len()).map(|term| frequencies.get(term).map_or(1.0, |&frequency| {
+            inverse_frequency(documents, frequency)
+        })).collect();
         Self { query, average, idfs }
     }
 
     pub fn query(&self) -> &Query { &self.query }
+
+    pub fn uses_length_normalization(&self) -> bool { self.average.is_some() }
+
+    pub fn uses_unit_term_scores(&self) -> bool {
+        self.average.is_none() && self.idfs.iter().all(|&idf| idf == 1.0)
+    }
 
     /// The document's score from its stored length and frequencies in query-term order.
     pub fn score(&self, frequencies: &[u32], length: u32) -> f64 {
@@ -138,6 +183,14 @@ impl Scorer {
         self.score(&frequencies, stored_length(document.len()))
     }
 
+    /// Scores an analyzer's Arrow token vector with the same term order and length normalization as the index.
+    pub fn bm25_arrow(&self, document: &StringArray) -> f64 {
+        let frequencies: Vec<u32> = self.query.terms.iter().map(|term| {
+            document.iter().filter(|&token| token == Some(term.as_str())).count() as u32
+        }).collect();
+        self.score(&frequencies, stored_length(document.len()))
+    }
+
     pub fn for_ranking(self: &Arc<Self>) -> Option<RankScorer> {
         if self.idfs.iter().any(|&idf| idf != 0.0 && !(f64::EPSILON / 4096.0..=64.0).contains(&idf)) {
             return None;
@@ -147,6 +200,7 @@ impl Scorer {
 }
 
 /// A scorer whose weights are in the domain of the window bound.
+#[derive(Clone)]
 pub struct RankScorer(Arc<Scorer>);
 
 impl RankScorer {

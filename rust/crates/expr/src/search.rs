@@ -1,7 +1,8 @@
 use crate::EvalContext;
 use crate::compare::nullish;
 use crate::numeric::integer;
-use rtdb_text::{Corpus, Query, Scorer, stored_length, tokens};
+use arrow_array::{Array, StringArray};
+use rtdb_text::{Corpus, Query, Scorer, analyze, stored_length};
 use rtdb_types::{Anomaly, Result, Value, text_pair_fingerprint};
 
 /// Only the UTF-8 leg of a column is indexed, so any other value matches nothing and scores nothing.
@@ -39,17 +40,17 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
             }
             ("match", [text, Value::Utf8(query)]) => {
                 let tokens = tokens_of(text, context)?;
-                Ok(Value::Bool(Query::parse(query).matches(&tokens)))
+                Ok(Value::Bool(Query::parse(query).matches_arrow(&tokens)))
             }
             ("search_score", [text, Value::Utf8(query)]) => {
                 let tokens = tokens_of(text, context)?;
-                Ok(Value::F64(Scorer::new(Query::parse(query), None).bm25(&tokens)))
+                Ok(Value::F64(Scorer::new(Query::parse(query), None).bm25_arrow(&tokens)))
             }
             ("search_score", [text, Value::Utf8(query), documents, total, frequencies]) => {
                 let query = parse_query(query, context)?;
                 let tokens = tokens_of(text, context)?;
                 let corpus = explicit_corpus(&query, documents, total, frequencies)?;
-                Ok(Value::F64(Scorer::new(query, Some(&corpus)).bm25(&tokens)))
+                Ok(Value::F64(Scorer::new(query, Some(&corpus)).bm25_arrow(&tokens)))
             }
             _ => Ok(Value::Null),
         }
@@ -63,22 +64,16 @@ fn invalid_documents() -> Anomaly {
     )
 }
 
-fn tokens_of(value: &Value, context: &EvalContext<'_>) -> Result<Vec<String>> {
+fn tokens_of(value: &Value, context: &EvalContext<'_>) -> Result<StringArray> {
     match value {
         Value::Utf8(text) => document_tokens(text, context),
-        _ => Ok(Vec::new()),
+        _ => Ok(StringArray::from(Vec::<&str>::new())),
     }
 }
 
-fn document_tokens(text: &str, context: &EvalContext<'_>) -> Result<Vec<String>> {
-    let tokens = tokens(text);
-    context.reserve(
-        tokens
-            .iter()
-            .map(|token| token.len() + 32)
-            .sum::<usize>()
-            .saturating_add(256),
-    )?;
+fn document_tokens(text: &str, context: &EvalContext<'_>) -> Result<StringArray> {
+    let tokens = analyze(text);
+    context.reserve(tokens.get_array_memory_size().saturating_add(256))?;
     Ok(tokens)
 }
 
@@ -129,13 +124,4 @@ fn explicit_corpus(
         tokens,
         frequencies,
     })
-}
-
-/// MATCH of a value against a parsed query: null where the value is null or absent, and false for a value that is not text.
-pub fn match_value(value: &Value, query: &Query) -> Value {
-    match value {
-        value if nullish(value) => Value::Null,
-        Value::Utf8(text) => Value::Bool(query.matches(&tokens(text))),
-        _ => Value::Bool(false),
-    }
 }

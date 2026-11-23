@@ -5110,8 +5110,14 @@ dependencies = [
 name = "rtdb-search"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
  "async-trait",
  "bytes",
+ "futures",
  "memmap2",
  "parking_lot",
  "rtdb-columnar",
@@ -5262,6 +5268,9 @@ dependencies = [
 [[package]]
 name = "rtdb-text"
 version = "0.1.0"
+dependencies = [
+ "arrow-array",
+]
 
 [[package]]
 name = "rtdb-tls"

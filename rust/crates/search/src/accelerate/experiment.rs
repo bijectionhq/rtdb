@@ -70,11 +70,12 @@ impl PointRanking {
         }
         if limit == 0 { return Ok((Ok(Vec::new()), work)); }
         let Some(definition) = accelerator.definition(request, column).await? else { return Ok((Err(Fallback::IndexCoverage), work)) };
-        let TrieFiles::Complete(Found { files, skipped }) = accelerator.trie_files(request, &definition).await?
+        let scoring = Query::parse(scoring);
+        let TrieFiles::Complete(Found { files, skipped }) = accelerator.trie_files(request, &definition, column, &[matching, &scoring], super::LoadSearch::Match, None).await?
             else { return Ok((Err(Fallback::IndexCoverage), work)) };
-        let scoring = Arc::new(rtdb_text::Scorer::new(Query::parse(scoring), None));
+        let scoring = Arc::new(rtdb_text::Scorer::new(scoring, None));
         let Some(rank_scorer) = scoring.for_ranking() else { return Ok((Err(Fallback::ScoreDomain), work)); };
-        let cutter = Cutter::new(&files, &skipped, request, &accelerator.runtime);
+        let cutter = Cutter::new(&files, &skipped, request);
         let mut cursors = Vec::new();
         let tie_bounds = ranking == Ranking::ScoreAndId;
         for group in by_file(&files) {

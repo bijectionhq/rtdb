@@ -246,6 +246,8 @@ pub trait ObjectStore: Send + Sync {
     async fn forget(&self, _key: &ObjectKey) -> Result<()> { Ok(()) }
     /// The object as a file on this node's disk, for a reader that maps it rather than holding its bytes; `None` where the store keeps no local file.
     async fn local_file(&self, _key: &ObjectKey) -> Result<Option<LocalFile>> { Ok(None) }
+    /// Opens an existing local copy while leaving storage untouched on a cache miss.
+    async fn cached_local_file(&self, key: &ObjectKey) -> Result<Option<LocalFile>> { self.local_file(key).await }
 
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         self.put(destination, self.get(source).await?).await

@@ -145,6 +145,18 @@ fn search_is_on_by_default_and_switches_off_without_touching_other_settings() {
 }
 
 #[test]
+fn search_write_format_defaults_to_tantivy_and_accepts_only_supported_versions() {
+    use rtdb_node::SearchFileFormat;
+    let configured = |yaml| decode(yaml).unwrap().search.write_format;
+    assert_eq!(configured("{}"), SearchFileFormat::Tantivy);
+    assert_eq!(configured("search: {writeFormat: 12}"), SearchFileFormat::Arrow);
+    assert_eq!(configured("search: {writeFormat: 13}"), SearchFileFormat::Paged);
+    assert_eq!(configured("search: {writeFormat: 14}"), SearchFileFormat::Tree);
+    assert!(decode("search: {writeFormat: 15}").is_err());
+}
+
+
+#[test]
 fn an_out_of_range_listener_port_is_the_reference_illegal_argument() {
     for (yaml, port) in [("server: {port: 99999}", 99999), ("flightSql: {port: -2}", -2), ("healthz: {port: 65536}", 65536)] {
         let error = decode(yaml).unwrap_err();

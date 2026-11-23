@@ -1,11 +1,11 @@
 use rtdb_types::{OrderedSet, StructFields};
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
 use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch};
-use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
+use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
 use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
@@ -150,11 +150,96 @@ impl RowSource {
 }
 
 #[derive(Clone, Debug)]
+pub struct LiveRowLineage {
+    generation: Arc<()>,
+    revision: Option<Arc<LiveRowRevision>>,
+}
+
+#[derive(Clone)]
+pub struct LiveRowProof {
+    generation: Weak<()>,
+    revision: Option<Weak<LiveRowRevision>>,
+}
+
+impl LiveRowProof {
+    pub fn admits(&self, lineage: &LiveRowLineage) -> bool {
+        self.descends_from(lineage) || self.is_prefix_of(lineage)
+    }
+
+    pub fn is_prefix_of(&self, lineage: &LiveRowLineage) -> bool {
+        if !std::ptr::eq(self.generation.as_ptr(), Arc::as_ptr(&lineage.generation)) { return false; }
+        match &self.revision {
+            None => true,
+            Some(revision) => revision.upgrade().is_some_and(|prefix| is_prefix(&prefix, lineage.revision.as_ref())),
+        }
+    }
+
+    pub fn descends_from(&self, lineage: &LiveRowLineage) -> bool {
+        if !std::ptr::eq(self.generation.as_ptr(), Arc::as_ptr(&lineage.generation)) { return false; }
+        let Some(prefix) = lineage.revision.as_ref() else { return true; };
+        let current = self.revision.as_ref().and_then(Weak::upgrade);
+        is_prefix(prefix, current.as_ref())
+    }
+}
+
+fn is_prefix(prefix: &Arc<LiveRowRevision>, mut current: Option<&Arc<LiveRowRevision>>) -> bool {
+    while let Some(revision) = current {
+        if revision.rows <= prefix.rows { return Arc::ptr_eq(revision, prefix); }
+        current = revision.parent.as_ref();
+    }
+    false
+}
+
+struct LiveRowRevision {
+    rows: u32,
+    parent: Option<Arc<LiveRowRevision>>,
+    depth: u16,
+}
+
+impl std::fmt::Debug for LiveRowRevision {
+    fn fmt(&self, format: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format.debug_struct("LiveRowRevision").field("rows", &self.rows).finish_non_exhaustive()
+    }
+}
+
+impl Drop for LiveRowRevision {
+    fn drop(&mut self) {
+        let mut parent = self.parent.take();
+        while let Some(mut revision) = parent {
+            let Some(unique) = Arc::get_mut(&mut revision) else { break; };
+            parent = unique.parent.take();
+        }
+    }
+}
+
+impl LiveRowLineage {
+    fn empty() -> Self { Self { generation: Arc::new(()), revision: None } }
+
+    fn append(&mut self, rows: u32) {
+        const MAX_REVISIONS: u16 = 4096;
+        let depth = self.revision.as_ref().map_or(0, |revision| revision.depth + 1);
+        if depth == MAX_REVISIONS {
+            *self = Self::empty();
+        }
+        let parent = self.revision.take();
+        let depth = parent.as_ref().map_or(0, |revision| revision.depth + 1);
+        self.revision = Some(Arc::new(LiveRowRevision { rows, parent, depth }));
+    }
+
+    pub fn generation_address(&self) -> usize { Arc::as_ptr(&self.generation) as usize }
+
+    pub fn proof(&self) -> LiveRowProof {
+        LiveRowProof { generation: Arc::downgrade(&self.generation), revision: self.revision.as_ref().map(Arc::downgrade) }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct LiveTable {
     table: TableRef,
     block_index: BlockIndex,
     chunks: Vec<(u32, Arc<IndexBatch>)>,
     row_count: u32,
+    lineage: LiveRowLineage,
     column_types: StructFields<LogicalType>,
     trie: MemoryHashTrie,
     last_system_time: Option<Timestamp>,
@@ -174,7 +259,7 @@ impl Clone for LocatedLeaves { fn clone(&self) -> Self { Self::default() } }
 
 impl LiveTable {
     pub fn new(table: TableRef, block_index: BlockIndex, config: TrieConfig) -> Self {
-        Self { table, block_index, chunks: Vec::new(), row_count: 0, column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
+        Self { table, block_index, chunks: Vec::new(), row_count: 0, lineage: LiveRowLineage::empty(), column_types: StructFields::new(), trie: MemoryHashTrie::new(config), last_system_time: None, canonical_entity_iids: true, located: LocatedLeaves::default() }
     }
     pub fn table(&self) -> &TableRef { &self.table }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
@@ -183,7 +268,8 @@ impl LiveTable {
     pub fn trie(&self) -> &MemoryHashTrie { &self.trie }
     pub(crate) fn has_canonical_entity_iids(&self) -> bool { self.canonical_entity_iids }
     pub fn batches(&self) -> impl Iterator<Item = &Arc<IndexBatch>> { self.chunks.iter().map(|(_, batch)| batch) }
-    /// The chunk holding `row`, and the row's position within it.
+    pub fn row_lineage(&self) -> &LiveRowLineage { &self.lineage }
+
     /// The unconsumed batches and the prefix to skip in the first one.
     /// A live table preserves row addresses when it merges its Arrow chunks.
     pub fn batches_from(&self, row: u32) -> impl Iterator<Item = (&Arc<IndexBatch>, usize)> {
@@ -255,6 +341,28 @@ impl LiveTable {
         let (index, offset) = self.locate_row(row)?;
         Ok(RowSource { batch: Arc::clone(&self.chunks[index].1), row: offset as usize })
     }
+
+    /// Returns the stored headers for an IID in the live snapshot's history order.
+    pub fn iid_headers(&self, iid: Iid) -> Result<impl Iterator<Item = EventHeader>> {
+        let mut node = self.trie.root().as_ref();
+        let leaf = loop {
+            match node {
+                TrieNode::Leaf(leaf) => break Some(leaf),
+                TrieNode::Branch { path, children } => {
+                    let bucket = Bucketer::DEFAULT.bucket(iid, path.len())? as usize;
+                    let Some(child) = &children[bucket] else { break None; };
+                    node = child;
+                }
+            }
+        };
+        let rows = leaf.map(|leaf| self.located_rows(leaf)).transpose()?;
+        let (first, end) = rows.as_ref().map_or((0, 0), |rows| {
+            let first = rows.headers.partition_point(|header| header.iid < iid);
+            let end = first + rows.headers[first..].partition_point(|header| header.iid == iid);
+            (first, end)
+        });
+        Ok((first..end).map(move |row| rows.as_ref().expect("nonempty history has a leaf").headers[row]))
+    }
     pub fn append(&self, write: &TableWrite, system_time: Timestamp) -> Result<Self> {
         if self.last_system_time.is_some_and(|previous| previous > system_time) { return Err(invalid("Live table system time moved backwards")); }
         let mut next = self.clone();
@@ -289,6 +397,7 @@ impl LiveTable {
             next.row_count = crate::row_address::append_chunk(&mut next.chunks, start, count, Arc::clone(batch))
                 .ok_or_else(|| invalid("Live table exceeds u32 row address space"))?;
             next.trie = self.trie.add_range(&next, start, count)?;
+            if count > 0 { next.lineage.append(next.row_count); }
             next.merge_small_chunks()?;
         }
         next.last_system_time = Some(system_time);

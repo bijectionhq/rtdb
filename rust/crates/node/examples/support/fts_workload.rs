@@ -48,7 +48,13 @@ impl ScanAccelerator for ObservedSearch {
             Mode::SkipRetry => Policy::SkipRetry,
             Mode::Estimate => Policy::Estimate,
         };
-        let (picked, plan) = self.0.workload_candidates(request, policy).await?;
+        let mut scan = request.scan.clone();
+        if matches!(mode, Mode::Baseline | Mode::SkipRetry | Mode::Estimate)
+            && let Some(top_k) = &mut scan.top_k {
+            top_k.ascending_id = None;
+        }
+        let request = ScanRequest { scan: &scan, ..*request };
+        let (picked, plan) = self.0.workload_candidates(&request, policy).await?;
         OBSERVATION.with(|observation| observation.plans.borrow_mut().push(plan));
         Ok(picked)
     }
@@ -278,7 +284,7 @@ async fn replay(node: &Node, read: &mut NativeSession, old: Timestamp, waves: us
             readers.push(tokio::spawn(async move {
                 start.wait().await;
                 let began = Instant::now();
-                let (rows, plans) = query(&context, &statement, Mode::Baseline).await;
+                let (rows, plans) = query(&context, &statement, Mode::Current).await;
                 let ended = Instant::now();
                 (name, statement, rows, plans, began, ended)
             }));

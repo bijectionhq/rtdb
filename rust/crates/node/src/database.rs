@@ -365,7 +365,9 @@ impl DatabaseFactory {
             } };
             let mut artefact_drivers = Vec::new();
             let mut artefacts = Vec::new();
+            let mut live_artefacts = Vec::new();
             for (kind, builder) in builders {
+                if builder.builds_live_pages() { live_artefacts.push(Arc::clone(&builder)); }
                 let publisher = Arc::new(PublishArtefacts { replication: replication.clone(), cancellation: cancellation.clone() });
                 let (driver, handle) = ArtefactDriver::new(Arc::clone(&snapshots), builder, publisher, (resources.storage_version, resources.storage_epoch), kind.name(), Arc::clone(&resources.store),
                     self.options.artefact_threads, self.options.command_capacity, self.options.automatic_artefacts)?;
@@ -390,7 +392,8 @@ impl DatabaseFactory {
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
-            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, artefacts: artefact_drivers, supervisor, logs: opened_logs.drivers, log_cancellation };
+            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor,
+                artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };
         let opened = match checkpoint_metadata {
@@ -407,6 +410,7 @@ pub(crate) struct DatabaseDriver {
     replication: ReplicationDriver,
     compactor: Option<CompactionDriver>,
     artefacts: Vec<ArtefactDriver>,
+    live_artefacts: Vec<Arc<dyn rtdb_maintenance::ArtefactBuilder>>,
     supervisor: MaintenanceSupervisor,
     logs: Vec<ResourceDriver>,
     log_cancellation: CancellationToken,
@@ -420,6 +424,27 @@ impl DatabaseDriver {
         tasks.spawn(self.replication.run());
         if let Some(compactor) = self.compactor { tasks.spawn(compactor.run(self.database.cancellation.clone())); }
         for lane in self.artefacts { tasks.spawn(lane.run(self.database.cancellation.clone())); }
+        if !self.live_artefacts.is_empty() {
+            let database = Arc::clone(&self.database);
+            let builders = self.live_artefacts;
+            tasks.spawn(async move {
+                let mut applied = database.replication.watch_status();
+                loop {
+                    if database.cancellation.is_cancelled() { return Ok(()); }
+                    let partition = database.partition.value();
+                    for builder in &builders {
+                        if let Err(error) = builder.build_live_pages(&partition, &database.cancellation).await
+                            && !database.cancellation.is_cancelled() {
+                            eprintln!("{} live search coverage: {error}", database.name);
+                        }
+                    }
+                    tokio::select! {
+                        _ = database.cancellation.cancelled() => return Ok(()),
+                        result = applied.changed() => if result.is_err() { return Ok(()); },
+                    }
+                }
+            });
+        }
         tasks.spawn(self.supervisor.run(self.database.cancellation.clone()));
         let failure = tokio::select! {
             biased;

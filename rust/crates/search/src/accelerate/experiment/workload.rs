@@ -22,6 +22,22 @@ impl SearchAccelerator {
     pub async fn workload_candidates(
         &self, request: &ScanRequest<'_>, policy: Policy<'_>,
     ) -> Result<(Option<BTreeSet<Iid>>, Json)> {
+        self.workload_narrow(request, policy).await.map(|(iids, _, report)| (iids, report))
+    }
+
+    pub async fn workload_selection(
+        &self, request: &ScanRequest<'_>, policy: Policy<'_>,
+    ) -> Result<(Option<rtdb_query::ScanSelection>, Json)> {
+        let (iids, scores, report) = self.workload_narrow(request, policy).await?;
+        let selected = iids.map(|iids| Ok::<_, rtdb_types::Anomaly>(rtdb_query::ScanSelection {
+            iids: rtdb_query::CandidateIids::from_set(iids, request.memory)?, scores,
+        })).transpose()?;
+        Ok((selected, report))
+    }
+
+    async fn workload_narrow(
+        &self, request: &ScanRequest<'_>, policy: Policy<'_>,
+    ) -> Result<(Option<BTreeSet<Iid>>, Option<rtdb_query::CandidateScores>, Json)> {
         let options = match policy {
             Policy::Current => Narrowing::default(),
             Policy::Baseline => Narrowing { baseline: true, ..Default::default() },
@@ -39,6 +55,9 @@ impl SearchAccelerator {
         else if options.scope.is_some() && picked.is_some() { "filter-scope" }
         else if picked.is_some() { "match-narrowing" }
         else { "scan" };
+        let page_reads = work.tree_io.by_kind().map(|(kind, reads)| {
+            (kind.to_owned(), json!({"requests": reads.requests, "bytes": reads.bytes}))
+        }).collect::<serde_json::Map<_, _>>();
         let report = json!({
             "route": route, "tried_ranking": work.tried_ranking, "rank_decline": work.decline,
             "match_decline": work.plain_decline, "score_evaluations": work.score_evaluations,
@@ -46,7 +65,10 @@ impl SearchAccelerator {
             "verifier_iids": work.verifier_rows, "unranked_events": work.plain_events,
             "estimated_postings": work.estimated_postings, "candidate_iids": picked.as_ref().map(BTreeSet::len),
             "filter_scope": work.filter_scope, "retry_redundant": work.retry_redundant,
+            "tree": {"opened_roots": work.tree_roots, "expansions": work.tree_expansions, "decline": work.tree_decline,
+                "range_requests": work.tree_io.requests, "range_bytes": work.tree_io.bytes, "page_cache_hits": work.tree_io.cache_hits,
+                "requests_by_kind": page_reads, "uncovered_live_rows": work.uncovered_live_rows, "retained_rows": work.retained_rank_rows},
         });
-        Ok((picked, report))
+        Ok((picked, work.scores, report))
     }
 }

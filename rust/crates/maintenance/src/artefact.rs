@@ -46,8 +46,14 @@ pub enum ArtefactSource<'a> { Local { data: &'a std::path::Path, size: u64 }, St
 
 #[async_trait]
 pub trait ArtefactBuilder: Send + Sync {
+    fn builds_live_pages(&self) -> bool { false }
+
+    async fn build_live_pages(&self, _snapshot: &Arc<PartitionValue>, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
+
     /// The definitions in force as of the snapshot; jobs are a function of these and the snapshot's catalog.
     async fn definitions(&self, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<Vec<ArtefactDefinition>>;
+    /// Includes compatible formats that remain readable while only the active format receives new build jobs.
+    fn retained_definitions(&self, definitions: &[ArtefactDefinition]) -> Vec<ArtefactDefinition> { definitions.to_vec() }
     /// Uploads the artefact under its key and returns its record; an existing identical object is not an error.
     async fn build(&self, job: &ArtefactJob, source: ArtefactSource<'_>, snapshot: &Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<ArtefactRecord>;
     /// Jobs for artefacts already recorded whose files need building again, taken ahead of the snapshot's ordinary jobs.
@@ -267,7 +273,7 @@ impl ArtefactDriver {
         let snapshot = self.snapshots.snapshot();
         let mut jobs = self.builder.repairs(&snapshot, cancellation).await?;
         let definitions = self.builder.definitions(&snapshot, cancellation).await?;
-        if idle { self.retirement.retire(&snapshot, &definitions).await; }
+        if idle { self.retirement.retire(&snapshot, &self.builder.retained_definitions(&definitions)).await; }
         jobs.extend(available_artefact_jobs(snapshot.trie_catalog(), &definitions));
         Ok(jobs)
     }
