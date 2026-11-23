@@ -148,11 +148,12 @@ impl Session {
     pub fn open_native(&self, database: &str, node: &Node) -> Result<NativeSession, Status> {
         self.require_database(database, node)?;
         let identity = self.caller.principal.clone();
-        let native = if let Some(audience) = &self.audience {
+        let mut native = if let Some(audience) = &self.audience {
             node.audience_session(database, identity, audience.source, Arc::clone(self.memory()), Arc::clone(&audience.cache))
         } else {
             node.session(database, identity)
         }.map_err(status)?;
+        native.state_mut().set_application_name("XTDB Flight SQL").map_err(status)?;
         self.require_database(database, node)?;
         Ok(native)
     }

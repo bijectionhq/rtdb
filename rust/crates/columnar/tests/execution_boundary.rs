@@ -44,14 +44,14 @@ fn execution_types_retain_nested_layouts_and_merge_collapsed_union_legs() {
         ("values".into(), V::FixedSizeList(vec![V::U64(u64::MAX), V::Null])),
         ("encoded".into(), V::U8(255)),
     ]));
-    admit_execution_value(&mut value);
+    admit_execution_value(&mut value).unwrap();
     assert_eq!(value, V::Struct(StructFields::from([
         ("values".into(), V::FixedSizeList(vec![V::I64(-1), V::Null])),
         ("encoded".into(), V::I8(-1)),
     ])));
     let mut map = V::Map { entries: vec![(V::U16(u16::MAX), V::Set(vec![V::U32(u32::MAX)]))], sorted: true };
     let capacity = match &map { V::Map { entries, .. } => entries.capacity(), _ => unreachable!() };
-    admit_execution_value(&mut map);
+    admit_execution_value(&mut map).unwrap();
     assert_eq!(map, V::Map { entries: vec![(V::I16(-1), V::Set(vec![V::I32(-1)]))], sorted: true });
     assert!(matches!(map, V::Map { entries, .. } if entries.capacity() == capacity));
 }

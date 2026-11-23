@@ -191,7 +191,7 @@ impl<'a> AtomRef<'a> {
             DataType::Utf8 => Self::Text(value!(StringArray)),
             DataType::Binary => Self::Binary(value!(BinaryArray)),
             DataType::Date32 => Self::Day(value!(Date32Array).into()),
-            DataType::Date64 => Self::Day(value!(Date64Array) / 86_400_000),
+            DataType::Date64 => Self::Day(value!(Date64Array).div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
             DataType::Timestamp(ArrowTimeUnit::Microsecond, Some(_)) => {
                 Self::InstantMicros(value!(TimestampMicrosecondArray))
             }

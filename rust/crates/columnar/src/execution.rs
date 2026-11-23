@@ -24,18 +24,19 @@ pub fn execution_field_type(field: &Field) -> Result<LogicalType> { Ok(execution
 /// Admits a domain value to execution in place, preserving allocations and integer bits.
 /// Apply at external-vector or parameter boundaries; execution-owned unsigned identities are not domain values.
 /// Calendar objects are first narrowed by the vector object writer's storage rules.
-pub fn admit_execution_value(value: &mut Value) {
+pub fn admit_execution_value(value: &mut Value) -> Result<()> {
     match value {
-        Value::Date(date) => *value = date.object_value(),
+        Value::Date(date) => *value = date.object_value()?,
         Value::U8(raw) => *value = Value::I8(*raw as i8),
         Value::U16(raw) => *value = Value::I16(*raw as i16),
         Value::U32(raw) => *value = Value::I32(*raw as i32),
         Value::U64(raw) => *value = Value::I64(*raw as i64),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter_mut().for_each(admit_execution_value),
-        Value::Struct(fields) => fields.values_mut().for_each(admit_execution_value),
-        Value::Map { entries, .. } => for (key, value) in entries { admit_execution_value(key); admit_execution_value(value); },
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter_mut().try_for_each(admit_execution_value)?,
+        Value::Struct(fields) => fields.values_mut().try_for_each(admit_execution_value)?,
+        Value::Map { entries, .. } => for (key, value) in entries { admit_execution_value(key)?; admit_execution_value(value)?; },
         _ => (),
     }
+    Ok(())
 }
 
 /// Decodes one domain cell with opened-vector semantics; raw `read_value` remains lossless.
@@ -43,12 +44,12 @@ pub fn admit_execution_value(value: &mut Value) {
 /// `read_execution_value` for a caller that has derived `logical` from `field` once, for many cells of the column.
 pub fn read_execution_value_as(logical: &LogicalType, field: &Field, array: &dyn Array, index: usize) -> Result<Value> {
     let mut value = crate::read_value_as(logical, field, array, index)?;
-    admit_execution_value(&mut value);
+    admit_execution_value(&mut value)?;
     Ok(value)
 }
 
 pub fn read_execution_value(field: &Field, array: &dyn Array, index: usize) -> Result<Value> {
     let mut value = crate::read_value(field, array, index)?;
-    admit_execution_value(&mut value);
+    admit_execution_value(&mut value)?;
     Ok(value)
 }

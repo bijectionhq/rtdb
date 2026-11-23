@@ -85,6 +85,19 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
     @Override public void setCurrentCatalog(String catalog) throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment text = NativeAbi.text(arena, catalog); abi.call("session_set_catalog", handle(), text, text.byteSize()); this.catalog = catalog; }
     }
+    public void setApplicationName(String name) throws AdbcException {
+        if (!abi.supports("session_set_application_name")) {
+            String literal = name.replace("\\", "\\\\").replace("'", "''");
+            try (var statement = createStatement("SET application_name = E'" + literal + "'")) {
+                statement.executeUpdate();
+            }
+            return;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment text = NativeAbi.text(arena, name);
+            abi.call("session_set_application_name", handle(), text, text.byteSize());
+        }
+    }
     @Override public ArrowReader getInfo(int[] codes) throws AdbcException {
         String values = codes == null ? "null" : Arrays.stream(codes).mapToObj(Integer::toUnsignedString).collect(Collectors.joining(",", "[", "]"));
         return metadata("{\"kind\":0,\"info_codes\":" + values + "}");

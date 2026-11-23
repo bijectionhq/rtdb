@@ -23,7 +23,7 @@ fn basis_bound(basis: &TimeBasis) -> Result<usize> {
 
 fn catalog_bound(catalog: &CatalogSnapshot) -> Result<usize> {
     let mut bytes = 4096usize.checked_add(catalog.default_database.len()).ok_or_else(size_error)?;
-    for (name, database) in &catalog.databases {
+    for (name, database) in catalog.databases.iter() {
         bytes = bytes.checked_add(name.len().checked_mul(8).ok_or_else(size_error)?).and_then(|bytes| database.partitions.len().checked_mul(512).and_then(|size| bytes.checked_add(size))).ok_or_else(size_error)?;
         for partition in &database.partitions { bytes = bytes.checked_add(partition.clone_allocation_bound()?.checked_mul(4).ok_or_else(size_error)?).ok_or_else(size_error)?; }
     }
@@ -60,7 +60,7 @@ impl QueryContext {
         let charge = self.memory.reserve(basis_bound(&times)?.checked_add(catalog_bound(&self.catalog)?)
             .ok_or_else(size_error)?)?;
         let mut context = (*self).clone();
-        let database = context.catalog.databases.get_mut(&context.catalog.default_database)
+        let database = Arc::make_mut(&mut context.catalog.databases).get_mut(&context.catalog.default_database)
             .ok_or_else(|| invalid("owned-system-cut", "An owned historical read requires its captured database"))?;
         database.partitions[0] = snapshot.clone().with_system_time_cap(Some(system_time))?;
         context.current_time = system_time.into();
@@ -105,7 +105,7 @@ impl QueryContext {
         if let Some(cap) = snapshot_time { times = times.map(|times| times.capped_at(cap.into())); }
         let token = times.as_ref().map(rtdb_format::basis::encode_time_basis);
         let mut catalog = self.catalog.clone();
-        for (name, database) in &mut catalog.databases {
+        for (name, database) in Arc::make_mut(&mut catalog.databases) {
             for (index, partition) in database.partitions.iter_mut().enumerate() {
                 let cap = times.as_ref().and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten().map(|time| time.as_micros()).transpose()?;
                 let visible = cap.zip(partition.tx_basis()).map(|(cap, head)| cap.min(head.system_time));
@@ -147,7 +147,7 @@ fn captured_caps(catalog: &CatalogSnapshot) -> Option<TimeBasis> {
 }
 
 fn validate_basis(basis: Option<&TimeBasis>, catalog: &CatalogSnapshot) -> Result<()> {
-    for (name, database) in &catalog.databases {
+    for (name, database) in catalog.databases.iter() {
         for (index, snapshot) in database.partitions.iter().enumerate() {
             if let Some(requested) = basis.and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten() {
                 if snapshot.tx_basis().is_none_or(|head| requested > head.system_time.into()) {

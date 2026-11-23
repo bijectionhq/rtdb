@@ -195,8 +195,8 @@ fn decimal_hash_uses_java_double_value_at_full_scale_limits() {
 }
 
 #[test]
-fn date_millisecond_hash_truncates_to_days_before_seconds_conversion() {
-    for (millis, day) in [(-86_400_001, -1), (-86_400_000, -1), (-1, 0), (0, 0), (86_400_001, 1)] {
+fn date_millisecond_hash_uses_the_containing_day() {
+    for (millis, day) in [(-86_400_001, -2), (-86_400_000, -1), (-1, -1), (0, 0), (86_400_001, 1)] {
         assert_eq!(rtdb_columnar::hash_value(&Value::DateMilli(millis), 0).unwrap(), rtdb_columnar::hash_value(&Value::DateDay(day), 0).unwrap());
     }
 }

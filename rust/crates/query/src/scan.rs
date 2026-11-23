@@ -246,23 +246,26 @@ pub(crate) struct PartitionScan {
 use crate::analysis::ScanCounts;
 
 /// The IIDs an `_id` predicate selects, as the reference's scan narrows to them: `_id = v`, or an OR of such, with every
-/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name one IID — `_id = 7.0` still
+/// `v` a literal or parameter of an ID type. `None` where some `v` can't be proven to name known IIDs — `_id = 7.0` still
 /// matches the integer ID 7 — so the scan reads every IID; the predicate itself is applied either way.
 fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<std::collections::BTreeSet<Iid>> {
     let id = scan.columns.iter().find(|field| field.name == "_id")?.id;
-    let eid = |expr: &Expr| -> Option<Iid> {
-        if let Some(uuid) = uuid_constant(expr, parameters) { return Some(Iid(uuid)); }
+    let eid = |expr: &Expr| -> Option<(Iid, Option<Iid>)> {
+        if let Some(uuid) = uuid_constant(expr, parameters) { return Some((Iid(uuid), None)); }
         let value = match expr {
             Expr::Literal(value) => value,
             Expr::Parameter { index, .. } => {
-                if let Some(cell) = parameters.arrow_cell(*index) { return arrow_parameter_iid(cell); }
+                if let Some(cell) = parameters.arrow_cell(*index) { return arrow_parameter_iids(cell); }
                 parameters.known(*index)?
             }
             _ => return None,
         };
-        value.entity_id().ok().map(|entity| entity.iid())
+        match value {
+            Value::Keyword(value) => Some(keyword_iids(value.as_str())),
+            _ => value.entity_id().ok().map(|entity| (entity.iid(), None)),
+        }
     };
-    let equality = |expr: &Expr| -> Option<Iid> {
+    let equality = |expr: &Expr| {
         let Expr::Binary { op: rtdb_plan::BinaryOp::Eq, left, right } = expr else { return None };
         match (left.as_ref(), right.as_ref()) {
             (Expr::Column { id: column, .. }, value) | (value, Expr::Column { id: column, .. }) if *column == id => eid(value),
@@ -275,7 +278,13 @@ fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<st
     scan.predicates.iter().filter(|predicate| predicate.referenced_columns() == std::collections::BTreeSet::from([id])).find_map(|predicate| {
         let mut clauses = Vec::new();
         disjuncts(predicate, &mut clauses);
-        clauses.into_iter().map(equality).collect::<Option<std::collections::BTreeSet<_>>>()
+        let mut iids = std::collections::BTreeSet::new();
+        for clause in clauses {
+            let (iid, legacy) = equality(clause)?;
+            iids.insert(iid);
+            iids.extend(legacy);
+        }
+        Some(iids)
     })
 }
 /// The order of a scan's rows by IID.
@@ -318,13 +327,17 @@ fn uuid_constant(expr: &Expr, parameters: rtdb_expr::Parameters<'_>) -> Option<[
     match value { Value::Uuid(bytes) => Some(*bytes), _ => None }
 }
 
-fn arrow_parameter_iid(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<Iid> {
+fn keyword_iids(name: &str) -> (Iid, Option<Iid>) {
+    (EntityId::keyword_iid(name), Some(EntityId::legacy_keyword_iid(name)))
+}
+
+fn arrow_parameter_iids(cell: rtdb_expr::ArrowParameterCell<'_>) -> Option<(Iid, Option<Iid>)> {
     if cell.array.is_null(cell.row) { return None; }
     let extension = cell.field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str);
     match (cell.field.data_type(), extension) {
-        (DataType::Utf8, None) => Some(EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row))),
-        (DataType::Utf8, Some("xt/clj-keyword")) => Some(EntityId::keyword_iid(cell.array.as_string::<i32>().value(cell.row))),
-        _ => cell.signed_integer().map(|value| EntityId::Integer(value).iid()),
+        (DataType::Utf8, None) => Some((EntityId::string_iid(cell.array.as_string::<i32>().value(cell.row)), None)),
+        (DataType::Utf8, Some("xt/clj-keyword")) => Some(keyword_iids(cell.array.as_string::<i32>().value(cell.row))),
+        _ => cell.signed_integer().map(|value| (EntityId::Integer(value).iid(), None)),
     }
 }
 /// The inclusive IID interval that `_id` range predicates select: the conjuncts comparing `_id` with a UUID literal or
@@ -709,8 +722,8 @@ impl crate::columnar::BatchCursor for CoveredBatches {
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
-        span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Boolean(true));
+        span.attribute("scan_ordered_covered", rtdb_plan::TraceValue::Boolean(true));
         self.batches.trace_attributes(span);
     }
 }
@@ -802,8 +815,8 @@ impl crate::columnar::BatchCursor for OrderedPayload {
     }
 
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
-        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Unsigned(1));
-        span.attribute("scan_ordered_payload_batches", rtdb_plan::TraceValue::Unsigned(1));
+        span.attribute("scan_ordered_seek", rtdb_plan::TraceValue::Boolean(true));
+        span.attribute("scan_ordered_payload_batches", rtdb_plan::TraceValue::Boolean(true));
     }
 }
 
@@ -1447,7 +1460,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
-    fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_one_iid() {
+    fn an_id_equality_or_disjunction_narrows_the_scan_only_when_every_value_names_known_iids() {
         let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
         let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
         let scan = |predicate: Expr| Scan { table: table.clone(), columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
@@ -1462,6 +1475,25 @@ mod tests {
         assert_eq!(id_selection(&scan(either), rtdb_expr::Parameters::Values(&[Value::Null])), None);
         let range = Expr::binary(rtdb_plan::BinaryOp::Lt, id.expression(), Expr::Literal(Value::I64(7)));
         assert_eq!(id_selection(&scan(range), rtdb_expr::Parameters::Values(&[])), None);
+    }
+
+    #[test]
+    fn keyword_id_equality_includes_both_persisted_digests() {
+        let id = Field { id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::Keyword) };
+        let literal = Expr::Literal(Value::Keyword(rtdb_types::Keyword::from_name("solo")));
+        let table = rtdb_plan::TableBinding { name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") }, oid: None, columns: Default::default() };
+        let scan = Scan { table, columns: vec![id.clone()], valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: vec![Expr::binary(rtdb_plan::BinaryOp::Eq, id.expression(), literal)],
+            top_k: None, ordered_top_k: None, matches: Vec::new() };
+        let canonical: Iid = "e5c907a6fac1f49cb3f8599a43a7cbf9".parse().unwrap();
+        let legacy: Iid = "cf1a1098ce21209264ea9942c920ee6a".parse().unwrap();
+        assert_eq!(id_selection(&scan, rtdb_expr::Parameters::Values(&[])), Some([canonical, legacy].into()));
+
+        let field = arrow_schema::Field::new("?_0", DataType::Utf8, false)
+            .with_metadata([(rtdb_columnar::EXTENSION_NAME_KEY.into(), "xt/clj-keyword".into())].into());
+        let array = arrow_array::StringArray::from(vec!["solo"]);
+        let cell = rtdb_expr::ArrowParameterCell { field: &field, array: &array, row: 0 };
+        assert_eq!(arrow_parameter_iids(cell), Some((canonical, Some(legacy))));
     }
 
     #[test]
@@ -2228,7 +2260,7 @@ mod tests {
             name: "mod".into(), args: vec![value.expression(), Expr::Literal(Value::I64(2))],
             return_type: LogicalType::Scalar(ScalarType::I64),
         };
-        assert!(!crate::columnar::projection::shaped(&remainder));
+        assert!(crate::columnar::projection::shaped(&remainder));
         let named = |id, name: &str, expr: Expr| NamedExpr {
             field: Field { id: ColumnId(id), name: name.into(), data_type: expr.data_type(), ..value.clone() },
             expr,
@@ -2247,6 +2279,8 @@ mod tests {
             assert!(matches!(batch.columns[0], crate::columnar::Column::Arrow { .. }));
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[1] else { panic!("Expected an Arrow list"); };
             assert!(array.as_any().is::<arrow_array::ListArray>());
+            let crate::columnar::Column::Arrow { array, .. } = &batch.columns[2] else { panic!("Expected an Arrow remainder"); };
+            assert!(array.as_any().is::<arrow_array::Int64Array>());
             let page = baseline.next_page().await.unwrap().unwrap();
             assert_eq!(page.len(), batch.len);
             for (row, expected) in page.rows().iter().enumerate() {
@@ -2715,17 +2749,21 @@ mod tests {
         }).unwrap());
         let relation = Arc::new(Relation::new(schema, RelationNode::Let { binding, body }).unwrap());
         let runtime = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, &[], &memory).unwrap();
-        let mut cursor = crate::operators::build_columns(runtime, execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
-        assert!(execution.context.spill_bytes() > 0);
-        let mut values = Vec::new();
-        while let Some(batch) = cursor.next_batch().await.unwrap() {
-            let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow IPC output"); };
-            let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
-            values.extend(array.values().iter().copied());
+        for (row_threshold, expect_spill) in [(100, false), (2, true)] {
+            let mut execution = execution.clone();
+            Arc::make_mut(&mut execution.context).options.materialized_spill_rows = row_threshold;
+            let mut cursor = crate::operators::build_columns(Arc::clone(&runtime), execution.clone()).await.unwrap().expect("Expected Arrow CTE execution");
+            assert_eq!(execution.context.spill_bytes() > 0, expect_spill);
+            let mut values = Vec::new();
+            while let Some(batch) = cursor.next_batch().await.unwrap() {
+                let [crate::columnar::Column::Arrow { array, .. }] = batch.columns.as_slice() else { panic!("Expected Arrow output"); };
+                let array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+                values.extend(array.values().iter().copied());
+            }
+            assert_eq!(values, [1, 2, 3, 1, 2, 3]);
+            drop(cursor);
+            assert_eq!(execution.context.spill_bytes(), 0);
         }
-        assert_eq!(values, [1, 2, 3, 1, 2, 3]);
-        drop(cursor);
-        assert_eq!(execution.context.spill_bytes(), 0);
 
         let mut field = relation.schema().fields()[0].clone();
         let expr = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(Value::I64(1)));

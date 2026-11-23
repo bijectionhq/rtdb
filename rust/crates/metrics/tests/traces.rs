@@ -11,7 +11,11 @@ async fn bounded_queue_preserves_parentage_attributes_and_payload_lease_after_re
     let mut parent = recorder.start(None, "xtdb.query", &[("query.text", TraceValue::Text("SELECT 1"))]).unwrap();
     let parent_context = parent.context();
     let child = recorder.start(Some(parent_context), "query.cursor.output", &[("cursor.page_count", TraceValue::Unsigned(1))]).unwrap();
-    drop(child); parent.attribute("query.peak_memory_bytes", TraceValue::Unsigned(120)); drop(parent);
+    drop(child);
+    parent.attribute("query.peak_memory_bytes", TraceValue::Unsigned(120));
+    parent.attribute("signed", TraceValue::Integer(-4));
+    parent.attribute("spill", TraceValue::Boolean(true));
+    drop(parent);
     drop(recorder.start(None, "overflow", &[]).unwrap());
     assert_eq!(recorder.stats().dropped, 1);
     recorder.close();
@@ -24,7 +28,10 @@ async fn bounded_queue_preserves_parentage_attributes_and_payload_lease_after_re
     let encoded = &json["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
     assert_eq!(encoded["name"], "xtdb.query");
     assert_eq!(encoded["traceId"].as_str().unwrap().len(), 32);
-    assert_eq!(encoded["attributes"][1]["value"]["stringValue"], "120");
+    assert_eq!(encoded["attributes"][0]["value"]["stringValue"], "SELECT 1");
+    assert_eq!(encoded["attributes"][1]["value"]["intValue"], "120");
+    assert_eq!(encoded["attributes"][2]["value"]["intValue"], "-4");
+    assert_eq!(encoded["attributes"][3]["value"]["boolValue"], true);
     assert!(receiver.next().await.is_none());
     drop(child); drop(parent); drop(receiver); drop(recorder);
     assert!(memory.used_bytes() > 0);

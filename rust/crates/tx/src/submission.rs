@@ -137,9 +137,9 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
                 let bytes = input.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
                 row_scope.reserve(bytes)?;
                 values = input.iter().cloned().map(|mut value| {
-                    rtdb_columnar::admit_execution_value(&mut value);
-                    value
-                }).collect::<Vec<_>>();
+                    rtdb_columnar::admit_execution_value(&mut value)?;
+                    Ok(value)
+                }).collect::<Result<Vec<_>>>()?;
                 rtdb_expr::Parameters::Values(&values)
             }
         };
@@ -240,7 +240,7 @@ fn projected_timed_puts(
                 let array = page.column(*index).as_ref();
                 row_scope.reserve(rtdb_columnar::estimate_read_cell_bytes(schema.field(*index), array, row)?)?;
                 let mut value = reader.read(array, row)?;
-                rtdb_columnar::admit_execution_value(&mut value);
+                rtdb_columnar::admit_execution_value(&mut value)?;
                 parameters[*index] = value;
             }
             let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(),

@@ -4599,10 +4599,13 @@ impl rtdb_plan::TraceSpan for BatchSortTrace {
         rtdb_plan::SpanContext { trace_id: [1; 16], span_id: [1; 8] }
     }
     fn attribute(&mut self, name: &str, value: rtdb_plan::TraceValue<'_>) {
-        if let rtdb_plan::TraceValue::Unsigned(value) = value {
-            let mut trace = self.0.lock().unwrap();
-            trace.entry(name.into()).and_modify(|old| *old = (*old).max(value)).or_insert(value);
-        }
+        let value = match value {
+            rtdb_plan::TraceValue::Unsigned(value) => value,
+            rtdb_plan::TraceValue::Boolean(value) => u64::from(value),
+            _ => return,
+        };
+        let mut trace = self.0.lock().unwrap();
+        trace.entry(name.into()).and_modify(|old| *old = (*old).max(value)).or_insert(value);
     }
     fn end_at(&mut self, _: std::time::SystemTime) {}
 }

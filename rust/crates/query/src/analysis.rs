@@ -19,7 +19,7 @@ impl ScanCounts {
 }
 
 #[derive(Default)]
-struct Counts { total: Duration, first: Option<Duration>, pages: i32, rows: i64, scan: ScanCounts, pushdowns: Option<MeasuredPushdowns> }
+struct Counts { peak_memory: usize, total: Duration, first: Option<Duration>, pages: i32, rows: i64, scan: ScanCounts, pushdowns: Option<MeasuredPushdowns> }
 struct MeasuredPushdowns { value: Value, _reservation: Arc<MemoryReservation> }
 enum Attributes { None, Scan { database: String, source: String } }
 
@@ -28,8 +28,9 @@ pub(crate) struct AnalysisNode {
     _reservation: Arc<MemoryReservation>,
 }
 impl AnalysisNode {
-    fn observe(&self, elapsed: Duration, rows: Option<usize>, scan: Option<ScanCounts>) -> Result<()> {
+    fn observe(&self, elapsed: Duration, rows: Option<usize>, scan: Option<ScanCounts>, peak_memory: usize) -> Result<()> {
         let mut counts = self.counts.lock().map_err(|_| invalid("analysis-state", "Analysis counters were poisoned"))?;
+        counts.peak_memory = counts.peak_memory.max(peak_memory);
         counts.total = counts.total.saturating_add(elapsed);
         if let Some(rows) = rows {
             counts.first.get_or_insert(elapsed);
@@ -79,7 +80,7 @@ impl AnalysisNode {
         };
         rows.push(vec![Value::Utf8(format!("{}->", "  ".repeat(depth))), Value::Keyword(Keyword::from_name(self.op)), attributes,
             duration(micros(counts.total)), duration(micros(counts.total).saturating_sub(child_time)), counts.first.map_or(Value::Null, |time| duration(micros(time))),
-            Value::I64(i64::from(counts.pages)), Value::I64(counts.rows), counts.pushdowns.as_ref().map_or(Value::Null, |pushdowns| pushdowns.value.clone()), integer(peak as u64)]);
+            Value::I64(i64::from(counts.pages)), Value::I64(counts.rows), counts.pushdowns.as_ref().map_or(Value::Null, |pushdowns| pushdowns.value.clone()), integer(counts.peak_memory as u64), integer(peak as u64)]);
         drop(counts);
         for child in &self.children { child.append_rows(depth + 1, peak, rows)?; }
         Ok(())
@@ -115,34 +116,34 @@ pub(crate) fn operator(relation: &Relation) -> &'static str {
         RelationNode::PatchGaps { .. } => "patch-gaps",
     }
 }
-pub(crate) fn wrap(input: BoxPageCursor, node: Option<Arc<AnalysisNode>>) -> BoxPageCursor {
-    match node { Some(node) => Box::new(Measured { input, node }), None => input }
+pub(crate) fn wrap(input: BoxPageCursor, node: Option<Arc<AnalysisNode>>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> BoxPageCursor {
+    match node { Some(node) => Box::new(Measured { input, node, memory: Arc::clone(memory) }), None => input }
 }
-struct Measured { input: BoxPageCursor, node: Arc<AnalysisNode> }
+struct Measured { input: BoxPageCursor, node: Arc<AnalysisNode>, memory: Arc<rtdb_columnar::MemoryBudget> }
 #[async_trait]
 impl PageCursor for Measured {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         let started = Instant::now();
         let result = self.input.next_page().await;
-        self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|page| page.as_ref()).map(OwnedPage::len), self.input.scan_counts())?;
+        self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|page| page.as_ref()).map(OwnedPage::len), self.input.scan_counts(), self.memory.peak_bytes())?;
         result
     }
     fn scan_counts(&self) -> Option<ScanCounts> { self.input.scan_counts() }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
 }
 
-pub(crate) fn wrap_batches(input: crate::columnar::BoxBatchCursor, node: Option<Arc<AnalysisNode>>) -> crate::columnar::BoxBatchCursor {
-    match node { Some(node) => Box::new(MeasuredBatches { input, node }), None => input }
+pub(crate) fn wrap_batches(input: crate::columnar::BoxBatchCursor, node: Option<Arc<AnalysisNode>>, memory: &Arc<rtdb_columnar::MemoryBudget>) -> crate::columnar::BoxBatchCursor {
+    match node { Some(node) => Box::new(MeasuredBatches { input, node, memory: Arc::clone(memory) }), None => input }
 }
 
-struct MeasuredBatches { input: crate::columnar::BoxBatchCursor, node: Arc<AnalysisNode> }
+struct MeasuredBatches { input: crate::columnar::BoxBatchCursor, node: Arc<AnalysisNode>, memory: Arc<rtdb_columnar::MemoryBudget> }
 
 #[async_trait]
 impl crate::columnar::BatchCursor for MeasuredBatches {
     async fn next_batch(&mut self) -> Result<Option<crate::columnar::ColumnBatch>> {
         let started = Instant::now();
         let result = self.input.next_batch().await;
-        self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|batch| batch.as_ref()).map(|batch| batch.len), self.input.scan_counts())?;
+        self.node.observe(started.elapsed(), result.as_ref().ok().and_then(|batch| batch.as_ref()).map(|batch| batch.len), self.input.scan_counts(), self.memory.peak_bytes())?;
         result
     }
     fn skip_complete_pages(&mut self, rows: u64) -> Result<u64> {

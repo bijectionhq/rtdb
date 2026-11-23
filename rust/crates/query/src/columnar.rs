@@ -520,6 +520,16 @@ impl ColumnBatch {
         if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
         Ok(Self { columns, len, reservation, appended: Vec::new() })
     }
+    pub(crate) fn duplicate_for_replay(&self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let base = self.columns.len().checked_mul(size_of::<Column>())
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+        let bytes = self.columns.iter().try_fold(base, |bytes, column| {
+            bytes.checked_add(column.retained_bytes()?).ok_or_else(size_error)
+        })?;
+        let reservation = memory.reserve(bytes)?;
+        Self::settled(self.columns.iter().map(Column::duplicate).collect(), self.len, reservation)
+    }
+
     fn charged(&self) -> usize { self.appended.iter().fold(self.reservation.bytes(), |bytes, lease| bytes.saturating_add(lease.bytes())) }
 
     pub(crate) fn validate_readable(&self, context: &crate::QueryContext) -> Result<()> {
@@ -2599,7 +2609,7 @@ mod tests {
         let modulo = Expr::binary(BinaryOp::Modulo, schema.fields()[0].expression(), Expr::Literal(Value::I64(3)));
         let mut cursor = BatchExpressions::new(Box::new(Input(Some(batch))), schema, vec![modulo], execution);
         let page = cursor.next_batch().await.unwrap().unwrap();
-        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected the evaluator's modulo results in Arrow"); };
+        let [Column::Arrow { array, .. }] = page.columns.as_slice() else { panic!("Expected typed Arrow modulo results"); };
         assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().values().as_ref(), &[1, 2]);
     }
 

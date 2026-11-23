@@ -33,13 +33,15 @@
     (shutdown [_] (CompletableResultCode/ofSuccess))))
 
 (defn- bool-ify-peak-memory-bytes
-  "query.peak_memory_bytes varies with Arrow's allocation strategy, so these span-shape
+  "Peak memory varies with Arrow's allocation strategy, so these span-shape
    assertions check only that it's present, the same way api_test.clj's exact-match
    assertions treat it."
   [span]
   (cond-> span
     (contains? (:attributes span) "query.peak_memory_bytes")
     (update-in [:attributes "query.peak_memory_bytes"] some?)
+    (contains? (:attributes span) "cursor.peak_memory_bytes")
+    (update-in [:attributes "cursor.peak_memory_bytes"] some?)
     (seq (:children span)) (update :children #(mapv bool-ify-peak-memory-bytes %))))
 
 (defn build-span-tree [spans]
@@ -73,16 +75,19 @@
 
         (t/is (= [{:name "xtdb.query"
                    :attributes {"query.text" "SELECT 1"
-                                "query.peak_memory_bytes" true}
+                                "query.peak_memory_bytes" true
+                                "application.name" "XTDB Clojure API"}
                    :children
                    [{:name "query.cursor.project"
-                     :attributes {"cursor.page_count" "1"
-                                  "cursor.row_count" "1"
+                     :attributes {"cursor.page_count" 1
+                                  "cursor.peak_memory_bytes" true
+                                  "cursor.row_count" 1
                                   "cursor.type" "project"}
                      :children []}
                     {:name "query.cursor.table"
-                     :attributes {"cursor.page_count" "1"
-                                  "cursor.row_count" "1"
+                     :attributes {"cursor.page_count" 1
+                                  "cursor.peak_memory_bytes" true
+                                  "cursor.row_count" 1
                                   "cursor.type" "table"}
                      :children []}]}]
                  (mapv bool-ify-peak-memory-bytes (build-span-tree @!spans))))))))
@@ -105,20 +110,73 @@
           (Thread/sleep 100)
 
           (t/is (= [{:name "xtdb.query"
+                     ;; pgjdbc sends "PostgreSQL JDBC Driver" as application_name when the
+                     ;; client doesn't set one - see test-query-span-includes-application-name
+                     ;; for a client-supplied value.
                      :attributes {"query.text" "SELECT 1"
-                                  "query.peak_memory_bytes" true}
+                                  "query.peak_memory_bytes" true
+                                  "application.name" "PostgreSQL JDBC Driver"}
                      :children
                      [{:name "query.cursor.project"
-                       :attributes {"cursor.page_count" "1"
-                                    "cursor.row_count" "1"
+                       :attributes {"cursor.page_count" 1
+                                    "cursor.peak_memory_bytes" true
+                                    "cursor.row_count" 1
                                     "cursor.type" "project"}
                        :children []}
                       {:name "query.cursor.table"
-                       :attributes {"cursor.page_count" "1"
-                                    "cursor.row_count" "1"
+                       :attributes {"cursor.page_count" 1
+                                    "cursor.peak_memory_bytes" true
+                                    "cursor.row_count" 1
                                     "cursor.type" "table"}
                        :children []}]}]
                    (mapv bool-ify-peak-memory-bytes (build-span-tree @!spans)))))))))
+
+(t/deftest test-query-span-includes-application-name
+  (t/testing "a pgwire connection's application_name becomes an attribute on its query span"
+    (let [!spans (atom [])
+          exporter (test-span-exporter !spans)
+          span-processor (SimpleSpanProcessor/create exporter)]
+      (with-open [node (xtn/start-node {:tracer {:enabled? true
+                                                 :service-name "xtdb-test"
+                                                 :span-processor span-processor}})]
+        (binding [pgw-test/*port* (.getServerPort node)
+                  pgw-test/*server* node]
+          (with-open [conn (pgw-test/jdbc-conn {"ApplicationName" "bench-tool"})
+                      stmt (.createStatement conn)
+                      rs (.executeQuery stmt "SELECT 1")]
+            (t/is (= [{"_column_1" 1}] (pgw-test/rs->maps rs)))
+
+            ;; Give spans a moment to be exported
+            (Thread/sleep 100)
+
+            (t/is (= ["bench-tool"]
+                     (->> @!spans
+                          (filter #(= (:name %) "xtdb.query"))
+                          (mapv #(get-in % [:attributes "application.name"])))))))))))
+
+(t/deftest test-set-application-name-updates-the-query-span
+  (t/testing "a mid-session SET application_name updates the connection's own tag, not just the startup value"
+    (let [!spans (atom [])
+          exporter (test-span-exporter !spans)
+          span-processor (SimpleSpanProcessor/create exporter)]
+      (with-open [node (xtn/start-node {:tracer {:enabled? true
+                                                 :service-name "xtdb-test"
+                                                 :span-processor span-processor}})]
+        (binding [pgw-test/*port* (.getServerPort node)
+                  pgw-test/*server* node]
+          (with-open [conn (pgw-test/jdbc-conn {})
+                      stmt (.createStatement conn)]
+            (.execute stmt "SET application_name = 'Metabase'")
+            (with-open [rs (.executeQuery stmt "SELECT 1")]
+              (t/is (= [{"_column_1" 1}] (pgw-test/rs->maps rs))))
+
+            ;; Give spans a moment to be exported
+            (Thread/sleep 100)
+
+            (t/is (= ["Metabase"]
+                     (->> @!spans
+                          (filter #(= (:name %) "xtdb.query"))
+                          (mapv #(get-in % [:attributes "application.name"])))))))))))
 
 (t/deftest EXPLAIN_works_with_tracer_enabled__issue-5091
   (let [!spans (atom [])
@@ -154,7 +212,35 @@
               scan-span (first scan-spans)] 
           (t/is (= "query.cursor.scan.foo" (:name scan-span)))
           (t/is (= "public.foo" (get-in scan-span [:attributes "scan_source"])))
-          (t/is (= "xtdb" (get-in scan-span [:attributes "scan_db"]))))))))
+          (t/is (= "xtdb" (get-in scan-span [:attributes "scan_db"])))
+          (t/is (every? int? (map (:attributes scan-span) ["scan_files_pruned" "scan_files_used"
+                                                           "scan_pages_pruned" "scan_pages_used"
+                                                           "scan_rows_read"]))
+                "the scan counters export as long attributes"))))))
+
+(t/deftest an-operator-span-reports-its-own-peak-memory-not-its-inputs
+  (let [!spans (atom [])
+        span-processor (SimpleSpanProcessor/create (test-span-exporter !spans))]
+    (with-open [node (xtn/start-node {:tracer {:enabled? true
+                                               :service-name "xtdb-test"
+                                               :span-processor span-processor}})]
+      (xt/submit-tx node [(into [:put-docs :docs] (for [i (range 1000)] {:xt/id i, :v (str "value-" i)}))])
+      (xt/q node "SELECT v FROM docs ORDER BY v")
+      (Thread/sleep 100)
+
+      (let [query-span (->> (build-span-tree @!spans)
+                            (filter #(= "xtdb.query" (:name %)))
+                            first)
+            spans (tree-seq (comp seq :children) :children query-span)
+            peak (fn [cursor-type]
+                   (some (fn [{:keys [attributes]}]
+                           (when (= cursor-type (get attributes "cursor.type"))
+                             (get attributes "cursor.peak_memory_bytes")))
+                         spans))]
+        (t/is (pos? (peak "sort")) "the sort buffers its input")
+        (t/is (< (peak "project") (peak "sort")) "the project above the sort doesn't count the sort's buffers")
+        (t/is (<= (peak "sort") (get-in query-span [:attributes "query.peak_memory_bytes"]))
+              "the query's peak still covers every operator")))))
 
 (defn- without-scan-metrics
   "The scan's runtime metrics ride on its span as tags but vary with storage layout,
@@ -200,11 +286,11 @@
                    (mapv :name tx-child-spans)))
           (let [[put-tx update-tx _patch-tx _delete-tx _erase-tx] tx-spans]
             (t/is (= {:name "xtdb.transaction"
-                      :attributes {"operations.count" "1"}
+                      :attributes {"operations.count" 1}
                       :children []}
                      put-tx))
             (t/is (= {:name "xtdb.transaction"
-                      :attributes {"operations.count" "1"}
+                      :attributes {"operations.count" 1}
                       :children
                       [{:name "xtdb.transaction.sql"
                         :attributes {"query.text" "UPDATE users SET foo='bar' WHERE name='alice'"},
@@ -214,18 +300,19 @@
                                        "query.peak_memory_bytes" true},
                           :children
                           [{:name "query.cursor.project"
-                            :attributes {"cursor.page_count" "0" "cursor.row_count" "0" "cursor.type" "project"},
+                            :attributes {"cursor.page_count" 0 "cursor.peak_memory_bytes" true "cursor.row_count" 0 "cursor.type" "project"},
                             :children []}
                            {:name "query.cursor.rename"
-                            :attributes {"cursor.page_count" "0" "cursor.row_count" "0" "cursor.type" "rename"},
+                            :attributes {"cursor.page_count" 0 "cursor.peak_memory_bytes" true "cursor.row_count" 0 "cursor.type" "rename"},
                             :children []}
                            {:name "query.cursor.select"
-                            :attributes {"cursor.page_count" "0" "cursor.row_count" "0" "cursor.type" "select"},
+                            :attributes {"cursor.page_count" 0 "cursor.peak_memory_bytes" true "cursor.row_count" 0 "cursor.type" "select"},
                             :children []}
                            {:name "query.cursor.scan.users"
                             :attributes
-                            {"cursor.page_count" "0",
-                             "cursor.row_count" "0",
+                            {"cursor.page_count" 0,
+                             "cursor.peak_memory_bytes" true,
+                             "cursor.row_count" 0,
                              "cursor.type" "scan",
                              "scan_db" "xtdb",
                              "scan_source" "public.users"},
@@ -252,7 +339,7 @@
         (let [span-tree (build-span-tree @!spans)
               tx-span (first (filter #(= (:name %) "xtdb.transaction") span-tree))]
           (t/is (= {:name "xtdb.transaction"
-                    :attributes {"operations.count" "3"}
+                    :attributes {"operations.count" 3}
                     :children []}
                    tx-span)))))))
 
