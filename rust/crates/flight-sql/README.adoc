@@ -301,7 +301,7 @@ The connection and frame sizes are bounded. Each success confirms the exact jour
 A pending fence change refuses immediately until it is durable. Ordinary append and history-read queues do not carry these authority checks.
 Closing a local hold or session only releases resources. The directory, journal quorum, network, object storage, and scheduler still have service obligations.
 
-Before its first open, a reserved session must call `rtdb.owned.PrepareAppliedRead.v1`. The body is the same source and exact transaction floor as an applied open, without the generation. The action returns an empty stream after registering the captured catalog in the directory.
+Before its first open, a reserved session must call `rtdb.owned.PrepareAppliedRead.v2`. The body is the same source and exact transaction floor as an applied open, without the generation. After registering the captured catalog in the directory, the action returns one unsigned eight-byte big-endian remaining catalog lifetime in microseconds. Anchor this duration to the start of the preparation request on the caller's monotonic clock to reserve a conservative full observation window.
 The registration is session-bound and expires after 180 monotonic seconds. A read or confirmation shares it only for a catalog at or after the registered cut in the same attachment, storage version, storage epoch and replica epoch.
 An older registration keeps the retirement floor from passing this cut. In-flight snapshots keep their own references until reads and provider I/O drain.
 A changed or expired preparation requires a new session. Opening and confirming a hold never falls back to a new registration on a reserved session.

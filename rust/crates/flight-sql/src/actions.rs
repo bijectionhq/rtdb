@@ -10,13 +10,13 @@ use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Lea
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V1, READ_HELD_HOSTED_CONTROL_V2};
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_HISTORICAL_POINT_V1, HELD_OWNED_POINT_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V2, READ_HELD_HOSTED_CONTROL_V2};
         let work = async {
             let action_type = action.r#type.as_str();
             if let Some(source) = call.session.audience_source() {
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
-                    PREPARE_APPLIED_READ_V1 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
+                    PREPARE_APPLIED_READ_V2 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
                     HELD_OWNED_POINT_V2 | HELD_OWNED_HISTORICAL_POINT_V1 | READ_HELD_HOSTED_CONTROL_V2 => {
                         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
                         let attachment = attachment.ok_or_else(unsupported)?;
@@ -57,10 +57,7 @@ impl Service {
                 crate::owned_actions::SPATIAL_HELD_OWNED_V1 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V1).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V2).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V3 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V3).await?)]),
-                PREPARE_APPLIED_READ_V1 => {
-                    self.prepare_applied_read_action(&call, &action.body).await?;
-                    Ok(Vec::new())
-                }
+                PREPARE_APPLIED_READ_V2 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),

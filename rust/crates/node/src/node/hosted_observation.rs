@@ -42,6 +42,12 @@ impl PreparedAppliedCatalog {
 
     pub(super) fn storage(&self) -> &Arc<BufferPool> { &self.storage }
 
+    pub(super) fn remaining_micros(&self) -> Result<u64> {
+        self.check_live()?;
+        let remaining = self.expires_at.saturating_duration_since(tokio::time::Instant::now()).as_micros();
+        u64::try_from(remaining).ok().filter(|remaining| *remaining != 0).ok_or_else(unavailable)
+    }
+
     pub(super) fn check_live(&self) -> Result<()> {
         if tokio::time::Instant::now() >= self.expires_at {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/applied-preparation-expired",

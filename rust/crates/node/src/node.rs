@@ -3140,13 +3140,15 @@ impl NativeSession {
         self.retain_owned_read(None, None).await
     }
     /// Enrolls one nonrenewable lower catalog pin for a prepaid session before use.
-    pub async fn prepare_applied_owned_reads(&mut self, floor: &AppliedReadFloor) -> Result<()> {
+    pub async fn prepare_applied_owned_reads(&mut self, floor: &AppliedReadFloor) -> Result<u64> {
         if self.service.audience_storage.is_none() || self.applied_preparation.is_some() {
             return Err(hosted_source_unavailable());
         }
         let read = self.retain_owned_read(Some(floor), None).await?;
-        self.applied_preparation = Some(Arc::new(PreparedAppliedCatalog::from_read(&read, &self.service.memory)?));
-        Ok(())
+        let preparation = PreparedAppliedCatalog::from_read(&read, &self.service.memory)?;
+        let remaining = preparation.remaining_micros()?;
+        self.applied_preparation = Some(Arc::new(preparation));
+        Ok(remaining)
     }
     /// Retains the already-applied catalog from the current recovered hosted holder.
     pub async fn open_applied_owned_read(&mut self, floor: &AppliedReadFloor) -> Result<OwnedReadSession> {
