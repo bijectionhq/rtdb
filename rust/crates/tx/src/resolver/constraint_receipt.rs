@@ -26,7 +26,11 @@ pub(super) fn split(ops: &[Operation], placed: bool) -> Result<(&[Operation], &[
     };
     let primary = &ops[..index];
     let refusal = &ops[index + 1..];
-    if !placed || !primary.iter().all(primary_op) || refusal.len() != 6 {
+    if !placed
+        || refusal.len() != 6
+        || !(primary.iter().all(primary_op)
+            || crate::hosted_control::hosted_root_world_reads(primary))
+    {
         return Err(invalid());
     }
 
@@ -245,7 +249,11 @@ fn primary_op(op: &Operation) -> bool {
 pub(super) fn shared_check(op: &&Operation) -> bool {
     match op {
         Operation::Public(
-            TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedCheckRange { .. },
+            TxOp::OwnedDeadline { .. }
+            | TxOp::OwnedCheck { .. }
+            | TxOp::OwnedCheckRange { .. }
+            | TxOp::OwnedCheckWorldScope { .. }
+            | TxOp::OwnedCheckWorldPurge { .. },
         ) => true,
         Operation::Public(TxOp::HostedControl(control)) => control.is_check(),
         _ => false,
@@ -380,6 +388,65 @@ mod tests {
         let slot = ops.len() - 1;
         ops[slot] = ops[slot - 1].clone();
         assert!(split(&ops, true).is_err());
+    }
+
+    #[test]
+    fn selection_keeps_the_entire_retained_world_guard() -> Result<()> {
+        use rtdb_types::{Iid, OwnedRelation, PlacedAttemptScope, Timestamp};
+
+        let world = Iid([1; 16]);
+        let relation = OwnedRelation::new("fact_row")?.in_world(world)?;
+        let scope = PlacedAttemptScope::new("installed-replica", 1)?;
+        let mut ops = publications(ROOT_HEAD);
+        ops.push(delete_row("fact_first"));
+        ops.extend(
+            [
+                TxOp::OwnedDeadline {
+                    until: Timestamp(8),
+                },
+                TxOp::OwnedCheckWorldScope { scope },
+                TxOp::OwnedCheckWorldPurge {
+                    relation: relation.clone(),
+                    pin: Iid([2; 16]),
+                    frontier: 0,
+                    local_frontier: None,
+                },
+                TxOp::OwnedCheck {
+                    relation: relation.clone(),
+                    id: EntityId::String("row".into()),
+                    valid_at: Timestamp(4),
+                    expected: None,
+                },
+            ]
+            .into_iter()
+            .map(Operation::Public),
+        );
+        ops.push(Operation::Public(TxOp::HostedConstraintRefusal));
+        ops.extend(publications(RECEIPT_HEAD));
+        let (primary, refusal) = split(&ops, true)?;
+        let selected = primary
+            .iter()
+            .filter(shared_check)
+            .chain(refusal)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(crate::hosted_control::hosted_root_world_reads(&selected));
+        assert_eq!(selected.len(), 4 + refusal.len());
+
+        ops.swap(9, 10);
+        assert!(split(&ops, true).is_err());
+        ops.swap(9, 10);
+        ops.insert(
+            10,
+            Operation::Public(TxOp::OwnedDelete {
+                relation,
+                id: EntityId::String("row".into()),
+                valid_from: None,
+                valid_to: None,
+            }),
+        );
+        assert!(split(&ops, true).is_err());
+        Ok(())
     }
 
     #[test]

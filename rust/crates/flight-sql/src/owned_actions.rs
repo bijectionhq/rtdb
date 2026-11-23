@@ -681,15 +681,22 @@ impl Service {
 
     pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
-        if self.0.config.owned_world_host.is_none() {
-            return Err(unsupported());
-        }
         let ([kind], body) = body.split_first_chunk::<1>().ok_or_else(|| invalid("Missing hosted root commit kind"))?;
         let counted = match kind {
             0 => false,
             1 => true,
             _ => return Err(invalid("Invalid hosted root commit kind")),
         };
+        let (worlds, body) = self.hosted_world_read_prefix(call, body)?;
+        self.commit_hosted_with_reads(call, body, counted, worlds, None).await
+    }
+
+    fn hosted_world_read_prefix<'a>(
+        &self, call: &Call, body: &'a [u8],
+    ) -> Result<(Vec<HostedWorldRead>, &'a [u8]), Status> {
+        if self.0.config.owned_world_host.is_none() {
+            return Err(unsupported());
+        }
         let (count, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing held world count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
         if !(1..=8).contains(&count) {
@@ -710,24 +717,29 @@ impl Service {
             worlds.push(HostedWorldRead { held, witnesses, _reservation: reservation });
             body = tail;
         }
-        self.commit_hosted_with_reads(call, body, counted, worlds, None).await
+        Ok((worlds, body))
     }
 
     pub(crate) async fn commit_hosted_deciding_action(
         &self, call: &Call, body: &[u8],
     ) -> Result<ActionResult, Status> {
-        let ([kind], body) = body.split_first_chunk::<1>()
-            .ok_or_else(|| invalid("Missing hosted constraint decision kind"))?;
-        let counted = match kind {
-            0 => false,
-            1 => true,
-            _ => return Err(invalid("Invalid hosted constraint decision kind")),
-        };
+        self.hosted_control_policy(call)?;
+        let ([flags], body) = body.split_first_chunk::<1>()
+            .ok_or_else(|| invalid("Missing hosted constraint decision flags"))?;
+        if *flags & !0b11 != 0 {
+            return Err(invalid("Invalid hosted constraint decision flags"));
+        }
+        let counted = *flags & 1 != 0;
         let (length, body) = body.split_first_chunk::<4>()
             .ok_or_else(|| invalid("Missing hosted refusal length"))?;
         let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
             .ok_or_else(|| invalid("Truncated hosted refusal"))?;
-        self.commit_hosted_with_reads(call, primary, counted, Vec::new(), Some(refusal)).await
+        let (worlds, primary) = if *flags & 0b10 != 0 {
+            self.hosted_world_read_prefix(call, primary)?
+        } else {
+            (Vec::new(), primary)
+        };
+        self.commit_hosted_with_reads(call, primary, counted, worlds, Some(refusal)).await
     }
 
     async fn commit_hosted_with_reads(
@@ -783,7 +795,7 @@ impl Service {
         let _facts = self.decode_owned_commit_groups(call, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
         let _refusal = if let Some(refusal) = refusal {
-            if replay || !worlds.is_empty() {
+            if replay {
                 return Err(invalid("A hosted constraint decision requires live Root custody"));
             }
             let (len, body) = refusal.split_first_chunk::<4>()
