@@ -15,10 +15,18 @@ use crate::config::{NodeConfiguration, RemoteConfig};
 /// - Errors: credential resolution and local disk-cache initialization can fail with a provider or configuration anomaly.
 pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBudget>, metrics: &Arc<Registry>) -> Result<(NativeResources, ExternalSources, Vec<rtdb_metrics::MetricRegistration>)> {
     let mut resources = NativeResources::default().with_local_log_clock(Arc::new(rtdb_node::SystemClock), config.local_log_uses_clock);
+    let classic_vault = std::env::var_os("RTDB_CLASSIC_KEY_VAULT")
+        .map(|path| rtdb_storage::sealing::ClassicKeyVault::open(std::path::Path::new(&path))).transpose()?;
+    if let Some(vault) = &classic_vault {
+        resources = resources.with_classic_key_vault(vault.clone());
+    }
     let mut sources = ExternalSources::new();
     let mut registrations = Vec::new();
     if let Some(settings) = &config.disk_cache {
         std::fs::create_dir_all(&settings.path).map_err(disk_error)?;
+        if let Some(vault) = &classic_vault {
+            vault.require_separate_path(&settings.path)?;
+        }
         let capacity = match settings.maximum_bytes {
             Some(bytes) => bytes,
             None => (fs2::total_space(&settings.path).map_err(disk_error)? as f64 * settings.maximum_ratio) as u64,

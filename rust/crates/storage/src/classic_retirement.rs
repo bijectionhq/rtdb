@@ -7,7 +7,8 @@ use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_receipt_l0_file, s
 use rtdb_types::{Anomaly, Result, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
-    log::{LogOffset, local::{prefix_end, settle_prefix}}};
+    log::{LogOffset, local::{prefix_end, settle_prefix}}, sealing::ObjectCipher};
+
 
 struct TrieDeletionGrant<'a> {
     store: &'a dyn ObjectStore,
@@ -47,9 +48,14 @@ impl<'a> TrieDeletionGrant<'a> {
         Ok(Some(Self { store, files, recovery_gate }))
     }
 
-    async fn erase(self) -> Result<()> {
+    async fn erase(self, keys: Option<&dyn ObjectCipher>) -> Result<()> {
         let erase = async {
-            for file in self.files { self.store.delete(&file).await?; }
+            for file in self.files {
+                if let Some(keys) = keys {
+                    keys.withdraw(&file).await?;
+                }
+                self.store.delete(&file).await?;
+            }
             Ok(())
         };
         match self.recovery_gate {
@@ -133,7 +139,13 @@ pub(crate) async fn retire_log_prefixes(store: &LocalStore, anchor: LocalRepairA
 }
 
 pub(crate) async fn retire(store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
+    retire_with_keys(store, receipt, contents, None).await
+}
+
+pub(crate) async fn retire_with_keys(
+    store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes, keys: Option<&dyn ObjectCipher>,
+) -> Result<bool> {
     let Some(grant) = TrieDeletionGrant::authorize(store, receipt, contents).await? else { return Ok(false); };
-    grant.erase().await?;
+    grant.erase(keys).await?;
     Ok(true)
 }

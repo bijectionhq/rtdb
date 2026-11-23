@@ -188,7 +188,7 @@ impl CheckpointCustody {
     }
 
     fn remote_store(&self, custody: Custody) -> EncryptingStore {
-        EncryptingStore::with_units(Arc::clone(&self.bucket), self.ledger(custody, Arc::clone(&self.io)))
+        EncryptingStore::with_units(Arc::clone(&self.bucket), Arc::new(self.ledger(custody, Arc::clone(&self.io))))
     }
 
     async fn reader(&self, custody: Custody) -> Result<Arc<dyn ObjectStore>> {

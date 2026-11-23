@@ -12,7 +12,7 @@ mod cell_attempt;
 pub mod cells;
 mod checkpoint_copy_budget;
 mod checkpoint_retention;
-pub mod cipher;
+pub use rtdb_storage::sealing::cipher;
 pub mod control;
 pub mod deployment;
 pub mod flight_gateway;

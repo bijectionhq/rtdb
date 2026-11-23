@@ -3,20 +3,18 @@
 use std::{
     fs::{self, File},
     io::ErrorKind,
-    ops::Range,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use ring::digest::{Context, SHA256, digest};
-use rtdb_storage::{Error, IoRegion, ObjectKey, RetainedBytes};
+use rtdb_storage::{Error, IoRegion, ObjectKey, sealing::ObjectCipher};
 use rtdb_types::{Anomaly, Result};
 
 use crate::cipher::Cipher;
 
-use super::{FramedObject, KEY_BYTES, KeyService, LocalKeyService, journal::key_error};
+use super::{KEY_BYTES, KeyService, LocalKeyService, UnitOperation, UnitOutput, journal::key_error};
 
 pub(super) const SLOT_PREFIX: &str = "unit-";
 const NAMESPACE_CLOSED: &[u8] = b"RTDB-unit-namespace-closed-v1";
@@ -83,65 +81,6 @@ impl UnitSlot {
     }
 }
 
-pub enum UnitOperation {
-    Seal(Bytes),
-    Open(Bytes),
-    OpenRetained(RetainedBytes),
-    Header(Bytes),
-    Frames(FramedObject, Range<usize>, Bytes),
-    SealValue(String, Bytes),
-    OpenValue(String, Bytes),
-}
-
-impl UnitOperation {
-    pub(super) fn provisions(&self) -> bool {
-        matches!(self, Self::Seal(_) | Self::SealValue(..))
-    }
-
-    pub(crate) fn apply(self, key: &Cipher, name: &ObjectKey) -> rtdb_storage::Result<UnitOutput> {
-        match self {
-            Self::Seal(body) => key.seal_object(name, &body).map(UnitOutput::Bytes),
-            Self::Open(sealed) => key.open_object(name, &sealed).map(UnitOutput::Bytes),
-            Self::OpenRetained(sealed) => key
-                .open_object(name, sealed.as_slice())
-                .map(UnitOutput::Bytes),
-            Self::Header(sealed) => {
-                FramedObject::open_header(key, name, &sealed).map(UnitOutput::Header)
-            }
-            Self::Frames(layout, frames, sealed) => layout
-                .open_frames(key, name, frames, &sealed)
-                .map(UnitOutput::Bytes),
-            Self::SealValue(associated, body) => key
-                .seal_deterministic(&associated, &body)
-                .map(UnitOutput::Bytes),
-            Self::OpenValue(associated, sealed) => {
-                key.open(&associated, &sealed).map(UnitOutput::Bytes)
-            }
-        }
-    }
-}
-
-pub enum UnitOutput {
-    Bytes(Bytes),
-    Header(FramedObject),
-}
-
-impl UnitOutput {
-    pub(crate) fn bytes(self) -> rtdb_storage::Result<Bytes> {
-        match self {
-            Self::Bytes(bytes) => Ok(bytes),
-            Self::Header(_) => Err(Error::Task("Expected unit bytes".into())),
-        }
-    }
-
-    pub(crate) fn header(self) -> rtdb_storage::Result<FramedObject> {
-        match self {
-            Self::Header(header) => Ok(header),
-            Self::Bytes(_) => Err(Error::Task("Expected a sealed unit header".into())),
-        }
-    }
-}
-
 /// The immutable object namespace selects the slot. The key service retains
 /// material and tombstones separately from object storage and its backups.
 #[derive(Clone)]
@@ -205,6 +144,13 @@ impl UnitLedger {
         self.keys
             .withdraw_unit_key(self.scope.slot(name), &self.io)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectCipher for UnitLedger {
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        UnitLedger::operate(self, name, operation).await
     }
 }
 
@@ -368,6 +314,7 @@ impl LocalKeyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use crate::store::EncryptingStore;
     use rtdb_storage::{MemoryStore, ObjectStore};
     use uuid::Uuid;
@@ -390,8 +337,8 @@ mod tests {
         let original_media: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         let successor_media: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         let original =
-            EncryptingStore::with_units(Arc::clone(&original_media), original_ledger.clone());
-        let successor = EncryptingStore::with_units(Arc::clone(&successor_media), successor_ledger);
+            EncryptingStore::with_units(Arc::clone(&original_media), Arc::new(original_ledger.clone()));
+        let successor = EncryptingStore::with_units(Arc::clone(&successor_media), Arc::new(successor_ledger));
         let erased = ObjectKey::new("tables/docs/data/l00-rc-b00.arrow")?;
         let survivor = ObjectKey::new("tables/docs/data/l00-rc-b01.arrow")?;
         let body = Bytes::from_static(b"retained document");
@@ -409,7 +356,7 @@ mod tests {
             original_scope,
             Arc::clone(&io),
         );
-        let reopened = EncryptingStore::with_units(original_media, reopened);
+        let reopened = EncryptingStore::with_units(original_media, Arc::new(reopened));
         assert!(matches!(
             reopened.get(&erased).await,
             Err(Error::ErasedUnderView)

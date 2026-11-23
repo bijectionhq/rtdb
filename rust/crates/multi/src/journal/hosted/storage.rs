@@ -235,7 +235,7 @@ impl RemoteStorageFactory for StoreFactory {
             &prefix,
             Arc::clone(&io),
         );
-        let upper: Arc<dyn ObjectStore> = Arc::new(EncryptingStore::with_units(upper, ledger));
+        let upper: Arc<dyn ObjectStore> = Arc::new(EncryptingStore::with_units(upper, Arc::new(ledger)));
         let store = Arc::new(ServingStore {
             lower,
             upper,
@@ -394,7 +394,7 @@ impl ReplicaObjects {
                 "The replica object namespace has a different owner".into(),
             ));
         }
-        Ok(Arc::new(EncryptingStore::with_units(bucket, ledger)))
+        Ok(Arc::new(EncryptingStore::with_units(bucket, Arc::new(ledger))))
     }
 }
 
@@ -425,7 +425,7 @@ pub(super) async fn reopen_source(
     );
     let upper = Arc::new(crate::reference::PrefixedStore::new(bucket, prefix));
     crate::store::check_root(upper.as_ref(), &placement.record.id, false).await?;
-    let upper = Arc::new(EncryptingStore::with_units(upper, ledger));
+    let upper = Arc::new(EncryptingStore::with_units(upper, Arc::new(ledger)));
     let lower = if genesis(origin.base) {
         None
     } else {

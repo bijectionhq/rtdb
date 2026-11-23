@@ -63,7 +63,11 @@ Local and S3 checkpoint captures use separate slots for their objects and replic
 Capture cryptography combines the slot with an indispensable capture authority secret, so withdrawing the capture also disables any retained slot.
 An ordered checkpoint transfer stores the verified manifest, segments and detached payloads under the destination's slot namespace before seeding its live journal.
 Directory-managed Multi objects, primary staged objects, and live journal seeding still use coarser keys or share encrypted bytes.
-Classic storage and deployment-wide collection of installed unit slots remain open.
+Classic local, S3, Azure and GCS object stores can enroll in the same sealed format with a private filesystem vault supplied through `RTDB_CLASSIC_KEY_VAULT`.
+The vault directory must already exist and belong to the original installation outside payload and disk-cache backup roots.
+The immutable provider marker selects the vault lineage and refuses enrollment over existing unsealed data.
+The local trie release authority authenticates the installed receipt and drains the eligible root before it asks the vault to withdraw the selected slots.
+Classic log segments, remote exact key retirement and deployment-wide collection of installed unit slots remain open.
 Provider verification includes ranged reads, object naming, lost create replies, redundant compaction jobs, independent-copy isolation, cache fencing, and nonce uniqueness.
 
 [Current cipher](../../rust/crates/multi/src/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

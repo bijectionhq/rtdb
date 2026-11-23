@@ -200,7 +200,9 @@ Full recovery closures, terminal coverage for other mixed packs and live provide
 Installed replay opens detached payloads under the original serving slot.
 Local and S3 checkpoint and serving-prefix retirement fence and withdraw the vault namespace census, including slots registered before interrupted writes.
 Local and S3 checkpoint captures and ordered transfer manifests, segments, and detached payloads hold independent slots within their capture or destination authority.
-Directory-managed and classic stores, primary staged files and copied live journal coverage remain open.
+Classic object roots may enroll a separate key vault for local and built-in remote providers.
+Local Classic trie retirement withdraws slots behind its exact release authority.
+Directory-managed Multi, Classic log segments and remote retirement, primary staged files, and copied live journals remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

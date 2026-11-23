@@ -1,0 +1,304 @@
+//! File-backed key custody for an explicitly enrolled Classic object root.
+
+use std::{
+    fs::{self, File},
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use bytes::Bytes;
+use ring::{
+    digest::{SHA256, digest},
+    rand::{SecureRandom, SystemRandom},
+};
+use rtdb_types::{Anomaly, Result};
+use uuid::Uuid;
+
+use super::{EncryptingStore, ObjectCipher, UnitOperation, UnitOutput, cipher::Cipher};
+use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
+
+const OWNER: &str = "~rtdb-classic-key-lineage";
+const KEY_BYTES: usize = 32;
+
+#[derive(Clone)]
+pub struct ClassicKeyVault(Arc<Path>);
+
+impl ClassicKeyVault {
+    /// The vault path belongs to the original key owner and is excluded from payload backups.
+    pub fn open(path: &Path) -> Result<Self> {
+        let path = path.canonicalize().map_err(io(path))?;
+        let metadata = fs::metadata(&path).map_err(io(&path))?;
+        if !metadata.is_dir() {
+            return Err(invalid("The Classic key vault is not a directory"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(invalid("The Classic key vault directory must be private"));
+            }
+        }
+        Ok(Self(path.into()))
+    }
+
+    pub fn require_separate_path(&self, payload: &Path) -> Result<()> {
+        let payload = payload.canonicalize().map_err(io(payload))?;
+        if payload.starts_with(self.0.as_ref()) || self.0.starts_with(payload) {
+            return Err(invalid(
+                "The Classic key vault must be outside the payload tree",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn require_unenrolled(store: &dyn ObjectStore) -> Result<()> {
+        let marker = ObjectKey::new(OWNER)?;
+        match store.head_fresh(&marker).await {
+            Err(Error::MissingObject(_)) => Ok(()),
+            Ok(_) => Err(invalid("The Classic root requires its original key vault")),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn units(
+        &self,
+        store: &dyn ObjectStore,
+        region: Arc<IoRegion>,
+        allow_enrollment: bool,
+    ) -> Result<Arc<ClassicObjectKeys>> {
+        let marker = ObjectKey::new(OWNER)?;
+        let anchor = match store.get_fresh_exact(&marker, 16).await {
+            Ok(bytes) => bytes,
+            Err(Error::MissingObject(_)) if allow_enrollment => {
+                let objects = store.list(None).await?;
+                if objects.iter().any(|object| object.key != marker) {
+                    return Err(invalid(
+                        "Existing Classic data has no immutable key lineage",
+                    ));
+                }
+                let vault = self.clone();
+                let proposal = region
+                    .run_blocking(move || {
+                        let id = Uuid::new_v4();
+                        let scope = vault.0.join(id.simple().to_string());
+                        fs::create_dir(&scope).map_err(io(&scope))?;
+                        sync_directory(&vault.0).map_err(io(&vault.0))?;
+                        Ok(id)
+                    })
+                    .await?;
+                let publication = store
+                    .put(&marker, Bytes::copy_from_slice(proposal.as_bytes()))
+                    .await;
+                match store.get_fresh_exact(&marker, 16).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        publication?;
+                        return Err(error.into());
+                    }
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let id = Uuid::from_slice(&anchor)
+            .map_err(|_| invalid("The Classic key lineage is malformed"))?;
+        let path = self.0.join(id.simple().to_string());
+        if !path.is_dir() {
+            return Err(invalid("The original Classic key authority is unavailable"));
+        }
+        Ok(Arc::new(ClassicObjectKeys {
+            path: path.into(),
+            region,
+        }))
+    }
+
+    pub fn wrap(
+        store: Arc<dyn ObjectStore>,
+        keys: Arc<ClassicObjectKeys>,
+    ) -> Result<EncryptingStore> {
+        Ok(EncryptingStore::with_units(store, keys).with_classic_control(ObjectKey::new(OWNER)?))
+    }
+}
+
+pub struct ClassicObjectKeys {
+    path: Arc<Path>,
+    region: Arc<IoRegion>,
+}
+
+impl ClassicObjectKeys {
+    fn name(&self, key: &ObjectKey) -> PathBuf {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let digest = digest(&SHA256, key.as_str().as_bytes());
+        self.path.join(URL_SAFE_NO_PAD.encode(digest.as_ref()))
+    }
+
+    /// Settles the slot at the original vault after the residence has excluded all uses.
+    pub async fn withdraw(&self, key: &ObjectKey) -> crate::Result<()> {
+        if key.as_str() == OWNER {
+            return Err(Error::InvalidKey(key.to_string()));
+        }
+        let path = self.name(key);
+        self.region
+            .run_blocking(move || {
+                let _lock = lock(&path)?;
+                let fence = path.with_extension("closed");
+                match File::options().write(true).create_new(true).open(&fence) {
+                    Ok(file) => crate::sync_file(&file).map_err(io(&fence))?,
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(io(&fence)(error)),
+                }
+                let parent = path.parent().expect("the slot has its vault directory");
+                sync_directory(parent).map_err(io(parent))?;
+                for file in [&path, &path.with_extension("pending")] {
+                    match fs::remove_file(file) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(io(file)(error)),
+                    }
+                }
+                sync_directory(parent).map_err(io(parent))
+            })
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectCipher for ClassicObjectKeys {
+    async fn withdraw(&self, key: &ObjectKey) -> crate::Result<()> {
+        ClassicObjectKeys::withdraw(self, key).await
+    }
+
+    async fn operate(
+        &self,
+        key: &ObjectKey,
+        operation: UnitOperation,
+    ) -> crate::Result<UnitOutput> {
+        if key.as_str() == OWNER {
+            return Err(Error::InvalidKey(key.to_string()));
+        }
+        let path = self.name(key);
+        let key = key.clone();
+        self.region
+            .run_blocking(move || {
+                let _lock = lock(&path)?;
+                if path
+                    .with_extension("closed")
+                    .try_exists()
+                    .map_err(io(&path))?
+                {
+                    return Err(Error::ErasedUnderView);
+                }
+                let mut material: [u8; KEY_BYTES] = match fs::read(&path) {
+                    Ok(bytes) => bytes
+                        .try_into()
+                        .map_err(|_| Error::Task("Invalid Classic unit key".into()))?,
+                    Err(error) if error.kind() == ErrorKind::NotFound && operation.provisions() => {
+                        create(&path)?
+                    }
+                    Err(error) => return Err(io(&path)(error)),
+                };
+                let cipher = Cipher::new(&material).map_err(|error| Error::Task(error.to_string()));
+                material.fill(0);
+                operation.apply(&cipher?, &key)
+            })
+            .await
+    }
+}
+
+fn lock(path: &Path) -> crate::Result<File> {
+    let lock = path.with_extension("lock");
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)
+        .map_err(io(&lock))?;
+    file.lock().map_err(io(&lock))?;
+    Ok(file)
+}
+
+fn create(path: &Path) -> crate::Result<[u8; KEY_BYTES]> {
+    let mut material = [0; KEY_BYTES];
+    SystemRandom::new()
+        .fill(&mut material)
+        .map_err(|_| Error::Task("No randomness for the Classic unit key".into()))?;
+    let temporary = path.with_extension("pending");
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(io(&temporary)(error)),
+    }
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(io(&temporary))?;
+    file.write_all(&material).map_err(io(&temporary))?;
+    crate::sync_file(&file).map_err(io(&temporary))?;
+    drop(file);
+    fs::rename(&temporary, path).map_err(io(path))?;
+    let parent = path.parent().expect("the slot has its vault directory");
+    sync_directory(parent).map_err(io(parent))?;
+    Ok(material)
+}
+
+fn invalid(message: &str) -> Anomaly {
+    Anomaly::incorrect("rtdb.storage/classic-key-vault", message)
+}
+
+fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
+    |source| Error::Io {
+        path: path.to_owned(),
+        source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryStore;
+
+    #[tokio::test]
+    async fn an_enrolled_root_requires_its_original_vault_and_a_withdrawn_slot_stays_closed()
+    -> Result<()> {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [root.path(), other.path()] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let vault = ClassicKeyVault::open(root.path())?;
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+        let io = IoRegion::new();
+        let units = vault.units(store.as_ref(), Arc::clone(&io), true).await?;
+        let sealed = ClassicKeyVault::wrap(Arc::clone(&store), Arc::clone(&units))?;
+        let key = ObjectKey::new("blocks/root")?;
+        let body = Bytes::from_static(b"root");
+        sealed.put(&key, body.clone()).await?;
+        assert_ne!(store.get(&key).await?, body);
+        assert_eq!(sealed.get(&key).await?, body);
+        assert!(
+            ClassicKeyVault::open(other.path())?
+                .units(store.as_ref(), Arc::clone(&io), true)
+                .await
+                .is_err()
+        );
+        units.withdraw(&key).await?;
+        assert!(matches!(
+            sealed.get(&key).await,
+            Err(Error::ErasedUnderView)
+        ));
+        assert!(matches!(
+            sealed.put(&key, body).await,
+            Err(Error::ErasedUnderView)
+        ));
+        Ok(())
+    }
+}
