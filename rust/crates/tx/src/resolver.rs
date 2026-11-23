@@ -875,7 +875,7 @@ impl<'a> OpenTransaction<'a> {
         if declaration.is_none() && !snapshot.contains_table(&target) {
             return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires a declared or stored relation"));
         }
-        let declared_type = |name: &str| declaration.as_ref().and_then(|(schema, _)| schema.column_type(name));
+        let declared_type = |name: &str| declaration.as_ref().and_then(|(schema, _)| schema.path_column_type(name));
         let available = snapshot.column_names(&target);
         if search {
             let [column] = columns else { return Err(invalid_search_path_column()); };

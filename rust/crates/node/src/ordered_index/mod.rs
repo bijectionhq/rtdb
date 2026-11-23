@@ -307,7 +307,7 @@ pub(crate) async fn owned_total_at(
             rtdb_query::read_owned_relation_schema(Arc::clone(&context), owner, relation)
                 .await?.ok_or_else(uncovered_owned_range)?;
         if identity != "_id"
-            || schema.column_logical_type(measure) != Some(LogicalType::Scalar(ScalarType::I64))
+            || schema.path_column_logical_type(measure) != Some(LogicalType::Scalar(ScalarType::I64))
         {
             return Err(uncovered_owned_range());
         }
@@ -359,7 +359,7 @@ async fn owned_projection(
                 // supplies a concrete type for an empty compound page.
                 identity.clone()
             } else {
-                declaration.column_logical_type(name).ok_or_else(uncovered_owned_range)?
+                declaration.path_column_logical_type(name).ok_or_else(uncovered_owned_range)?
             };
             types.insert(name.clone(), ty);
         }

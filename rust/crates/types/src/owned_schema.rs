@@ -122,6 +122,7 @@ enum Kind {
     F64 {},
     Utf8 {},
     Binary {},
+    OpaqueBinary {},
     DateDay {},
     Instant {},
     Uuid {},
@@ -149,7 +150,7 @@ impl Kind {
             Self::F32 {} => ScalarType::F32,
             Self::F64 {} => ScalarType::F64,
             Self::Utf8 {} => ScalarType::Utf8,
-            Self::Binary {} => ScalarType::Binary,
+            Self::Binary {} | Self::OpaqueBinary {} => ScalarType::Binary,
             Self::DateDay {} => ScalarType::DateDay,
             Self::Uuid {} => ScalarType::Uuid,
             Self::Instant {} => ScalarType::Timestamp {
@@ -265,12 +266,13 @@ impl OwnedSchema {
                 .sum::<usize>()
     }
 
-    pub fn column_type(&self, name: &str) -> Option<ScalarType> {
-        self.field(name).map(|field| field.kind.scalar())
+    /// Only declared clear fields may contribute to an ordered or derived path.
+    pub fn path_column_type(&self, name: &str) -> Option<ScalarType> {
+        self.path_field(name).map(|field| field.kind.scalar())
     }
 
-    pub fn column_logical_type(&self, name: &str) -> Option<LogicalType> {
-        self.field(name).map(|field| {
+    pub fn path_column_logical_type(&self, name: &str) -> Option<LogicalType> {
+        self.path_field(name).map(|field| {
             let ty = LogicalType::Scalar(field.kind.scalar());
             if field.optional || field.nullable {
                 ty.maybe()
@@ -337,8 +339,8 @@ impl OwnedSchema {
         Ok(())
     }
 
-    fn field(&self, name: &str) -> Option<&Field> {
-        self.0.fields.iter().find(|field| field.name == name)
+    fn path_field(&self, name: &str) -> Option<&Field> {
+        self.0.fields.iter().find(|field| field.name == name && !matches!(field.kind, Kind::OpaqueBinary {}))
     }
 
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
