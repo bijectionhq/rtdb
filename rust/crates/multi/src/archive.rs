@@ -85,7 +85,7 @@ pub(crate) use writable_world::retain_replayed_checkpoint_world;
 pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::{WorldFact, WorldPoint};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
-pub(crate) use retirement::{capture_retirement_receipt, commit_capture_revocation, prepare_capture_retirement, finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, retire_world_suffix};
+pub(crate) use retirement::{capture_retirement_receipt, commit_capture_revocation, prepare_capture_retirement, finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, schedule_capture_revocation, retire_world_suffix};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
 

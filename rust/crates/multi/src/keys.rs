@@ -71,6 +71,10 @@ pub trait KeyService: Send + Sync {
 
     async fn archive_key_is_operation_only(&self, _id: &str) -> Result<bool> { Ok(false) }
 
+    async fn schedule_archive_key(&self, _id: &str, _due_at_ms: i64) -> Result<bool> {
+        Err(Anomaly::unsupported("rtdb.multi/archive-vault", "The archive vault does not own scheduled revocation"))
+    }
+
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         self.destroy(id).await?;
         Ok(ArchiveKeyWithdrawal::Vault)
@@ -177,12 +181,11 @@ impl LocalKeyService {
         if self.is_brokered(&id)? || provision && self.provision_archive_keys && !path.try_exists().map_err(io)? {
             let vault = self.archive_vault()?;
             let vault_path = vault.path(&id)?;
-            if provision {
-                vault.key_at(&vault_path, None)?;
-            } else {
-                let _lock = vault.lock_key(&vault_path)?;
-                read_key(&vault_path, fs::read(&vault_path).map_err(io)?)?;
+            let _lock = vault.lock_key(&vault_path)?;
+            if archive::expire_locked(&vault, &vault_path)?.is_some() {
+                return Err(archive::revoked());
             }
+            vault.read_or_create_key(&vault_path, provision)?;
             return Ok(Arc::new(archive::LocalArchiveKey { vault, id }));
         }
         let material = if provision {
@@ -240,13 +243,17 @@ impl LocalKeyService {
     fn key_at(&self, path: &Path, raw_id: Option<&str>) -> Result<[u8; KEY_BYTES]> {
         let _lock = self.lock_key(path)?;
         if let Some(id) = raw_id { self.require_raw_key(id)?; }
+        self.read_or_create_key(path, true)
+    }
+
+    fn read_or_create_key(&self, path: &Path, provision: bool) -> Result<[u8; KEY_BYTES]> {
         match fs::read(path) {
             Ok(bytes) => {
                 let key = read_key(path, bytes)?;
                 self.sync_directory()?;
                 Ok(key)
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+            Err(error) if provision && error.kind() == ErrorKind::NotFound => {
                 let key = new_key()?;
                 self.publish(path, &key)?;
                 Ok(key)
@@ -328,6 +335,23 @@ impl KeyService for LocalKeyService {
         self.is_brokered(id)
     }
 
+    async fn schedule_archive_key(&self, id: &str, due_at_ms: i64) -> Result<bool> {
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            service.require_service_root()?;
+            let raw_path = service.path(&id)?;
+            let _raw_lock = service.lock_key(&raw_path)?;
+            if !service.is_brokered(&id)? {
+                return Err(Anomaly::unsupported("rtdb.multi/archive-vault", "This archive key exports its material"));
+            }
+            let vault = service.archive_vault()?;
+            let path = vault.path(&id)?;
+            let _lock = vault.lock_key(&path)?;
+            archive::schedule_locked(&vault, &path, due_at_ms)
+        }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
+    }
+
     async fn withdraw_archive_key(&self, id: &str) -> Result<ArchiveKeyWithdrawal> {
         let vault = self.clone();
         let id = id.to_owned();
@@ -344,7 +368,7 @@ impl KeyService for LocalKeyService {
                 return Ok(ArchiveKeyWithdrawal::Vault);
             };
             let _lock = authority.lock_key(&path)?;
-            authority.publish(&path, DESTROYED)?;
+            archive::withdraw_locked(&authority, &path)?;
             Ok(ArchiveKeyWithdrawal::OperationAuthority)
         }).await.map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
     }

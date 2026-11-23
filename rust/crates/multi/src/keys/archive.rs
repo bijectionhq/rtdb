@@ -1,15 +1,15 @@
 //! Operation-only custody for a checkpoint archive and its dependent suffix.
 
-use std::sync::Arc;
+use std::{fs, io::ErrorKind, path::Path, sync::Arc};
 
 use bytes::Bytes;
 use ring::hmac;
 use rtdb_storage::Error;
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 use crate::cipher::Cipher;
 
-use super::{KEY_BYTES, LocalKeyService};
+use super::{DESTROYED, KEY_BYTES, LocalKeyService, io, is_destroyed, malformed, read_key};
 
 #[async_trait::async_trait]
 pub trait ArchiveKey: Send + Sync {
@@ -61,12 +61,79 @@ impl LocalArchiveKey {
         tokio::task::spawn_blocking(move || {
             let path = vault.path(&id)?;
             let _lock = vault.lock_key(&path)?;
-            let key = super::read_key(&path, std::fs::read(&path).map_err(super::io)?)?;
-            operation(&key)
+            if expire_locked(&vault, &path)?.is_some() {
+                return Err(revoked());
+            }
+            let key = read_key(&path, fs::read(&path).map_err(io)?)?;
+            let output = operation(&key)?;
+            if expire_locked(&vault, &path)?.is_some() {
+                return Err(revoked());
+            }
+            Ok(output)
         })
         .await
         .map_err(|error| Anomaly::fault("rtdb.multi/archive-vault-task", error.to_string()))?
     }
+}
+
+fn schedule_conflict() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/archive-vault", "The archive has another revocation schedule")
+}
+
+pub(super) fn revoked() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/archive-revoked", "The archive key has been revoked")
+}
+
+fn read_schedule(path: &Path) -> Result<Option<i64>> {
+    match fs::read(path.with_extension("expires")) {
+        Ok(bytes) => {
+            let due_at_ms = i64::from_be_bytes(bytes.try_into().map_err(|_| malformed())?);
+            if due_at_ms <= 0 { return Err(malformed()); }
+            Ok(Some(due_at_ms))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io(error)),
+    }
+}
+
+pub(super) fn schedule_locked(vault: &LocalKeyService, path: &Path, due_at_ms: i64) -> Result<bool> {
+    if due_at_ms <= 0 {
+        return Err(Anomaly::incorrect("rtdb.multi/archive-vault", "The archive revocation date must be positive"));
+    }
+    match read_schedule(path)? {
+        Some(prior) if prior != due_at_ms => return Err(schedule_conflict()),
+        Some(_) => vault.sync_directory()?,
+        None => {
+            read_key(path, fs::read(path).map_err(io)?)?;
+            vault.publish(&path.with_extension("expires"), &due_at_ms.to_be_bytes())?;
+        }
+    }
+    Ok(expire_locked(vault, path)?.is_some())
+}
+
+pub(super) fn withdraw_locked(vault: &LocalKeyService, path: &Path) -> Result<()> {
+    if read_schedule(path)?.is_some() {
+        if expire_locked(vault, path)?.is_some() {
+            return Ok(());
+        }
+        return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/archive-vault",
+            "The archive authority is waiting for its scheduled revocation"));
+    }
+    vault.publish(path, DESTROYED)
+}
+
+pub(super) fn expire_locked(vault: &LocalKeyService, path: &Path) -> Result<Option<i64>> {
+    let Some(due_at_ms) = read_schedule(path)? else { return Ok(None); };
+    let material = fs::read(path).map_err(io)?;
+    if is_destroyed(&material) {
+        vault.sync_directory()?;
+        return Ok(Some(due_at_ms));
+    }
+    if rtdb_directory::now_ms() < due_at_ms {
+        return Ok(None);
+    }
+    vault.publish(path, DESTROYED)?;
+    Ok(Some(due_at_ms))
 }
 
 fn archive_io(error: Anomaly) -> Error {

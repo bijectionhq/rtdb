@@ -64,6 +64,10 @@ enum Action {
     CheckpointCaptureDiscardStatus {
         manifest_sha256: Option<String>,
     },
+    ScheduleCheckpointCaptureRevocation {
+        manifest_sha256: String,
+        due_at_ms: i64,
+    },
     CommitCheckpointCaptureRevocation {
         manifest_sha256: String,
     },
@@ -160,7 +164,17 @@ enum Reply {
         capture: Uuid,
         manifest_sha256: Option<String>,
         authorized_at_ms: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scheduled_revocation_at_ms: Option<i64>,
         key_withdrawn_at_ms: Option<i64>,
+    },
+    CaptureRevocationScheduled {
+        name: String,
+        authority: Uuid,
+        capture: Uuid,
+        manifest_sha256: String,
+        authorized_at_ms: i64,
+        due_at_ms: i64,
     },
     CaptureRevocationCommitted {
         name: String,
@@ -412,6 +426,7 @@ impl RecoveryService {
             Action::DiscardCheckpointCapture { .. }
             | Action::PrepareCheckpointCaptureDiscard { .. }
             | Action::CheckpointCaptureDiscardStatus { .. }
+            | Action::ScheduleCheckpointCaptureRevocation { .. }
             | Action::CommitCheckpointCaptureRevocation { .. }
             | Action::SettleCheckpointCaptureDiscard { .. } => unreachable!("dispatched separately"),
             Action::RecoverCheckpoint { manifest_sha256 } => {
@@ -714,7 +729,8 @@ impl RecoveryService {
             | Action::PrepareCheckpointCaptureDiscard { manifest_sha256, .. }
             | Action::CheckpointCaptureDiscardStatus { manifest_sha256 }
             | Action::SettleCheckpointCaptureDiscard { manifest_sha256 } => Some(manifest_sha256.as_deref()),
-            Action::CommitCheckpointCaptureRevocation { manifest_sha256 } => Some(Some(manifest_sha256.as_str())),
+            Action::ScheduleCheckpointCaptureRevocation { manifest_sha256, .. }
+            | Action::CommitCheckpointCaptureRevocation { manifest_sha256 } => Some(Some(manifest_sha256.as_str())),
             _ => None,
         };
         if let Some(manifest) = capture_discard
@@ -744,6 +760,20 @@ impl RecoveryService {
                     &installation, &self.archive, request.capture, manifest_sha256.as_deref(),
                 )?;
                 Ok(self.capture_discard_reply(installation.name, request.authority, request.capture, release))
+            }
+            Action::ScheduleCheckpointCaptureRevocation { manifest_sha256, due_at_ms } => {
+                let release = archive::schedule_capture_revocation(
+                    directory.as_ref(), &installation, &self.archive, self.keys.as_ref(),
+                    request.capture, &manifest_sha256, due_at_ms,
+                ).await?;
+                Ok(Reply::CaptureRevocationScheduled {
+                    name: installation.name,
+                    authority: request.authority,
+                    capture: request.capture,
+                    manifest_sha256,
+                    authorized_at_ms: release.authorized_at_ms,
+                    due_at_ms,
+                })
             }
             Action::CommitCheckpointCaptureRevocation { manifest_sha256 } => {
                 archive::capture_retirement_receipt(
@@ -799,6 +829,7 @@ impl RecoveryService {
             _ => Reply::CaptureDiscardPrepared {
                 name, authority, capture, manifest_sha256: release.manifest_sha256,
                 authorized_at_ms: release.authorized_at_ms, key_withdrawn_at_ms: release.key_withdrawn_at_ms,
+                scheduled_revocation_at_ms: release.scheduled_revocation_at_ms,
             },
         }
     }
@@ -808,6 +839,7 @@ impl RecoveryService {
             Action::DiscardCheckpointCapture { .. }
             | Action::PrepareCheckpointCaptureDiscard { .. }
             | Action::CheckpointCaptureDiscardStatus { .. }
+            | Action::ScheduleCheckpointCaptureRevocation { .. }
             | Action::CommitCheckpointCaptureRevocation { .. }
             | Action::SettleCheckpointCaptureDiscard { .. } => self.dispatch_capture_discard(directory, request).await,
             _ => Box::pin(self.dispatch(directory, request)).await,
@@ -1002,6 +1034,94 @@ async fn write_reply(socket: &mut (impl AsyncWrite + Unpin), reply: &Reply) -> s
 mod tests {
     use super::*;
     use rtdb_directory::MemoryDirectory;
+
+    #[tokio::test]
+    async fn scheduled_capture_revocation_survives_reopening_the_key_authority() -> Result<()> {
+        let temporary = tempfile::tempdir().unwrap();
+        let key_root = temporary.path().join("keys");
+        let keys = Arc::new(crate::keys::LocalKeyService::with_archive_broker(&key_root)?);
+        let directory = MemoryDirectory::new();
+        let mut installation = DeploymentRecord::new("tenant", "cell", Vec::new(), rtdb_directory::now_ms());
+        let authority = Uuid::parse_str(&installation.id).unwrap();
+        let capture = Uuid::new_v4();
+        let token = "c".repeat(64);
+        let mut service = RecoveryService {
+            hosted_task: None,
+            control: ControlKey::default(),
+            memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
+            token: Token::new(&token).unwrap(),
+            org: "cell".into(),
+            storage: CellStorage::Local { root: temporary.path().join("serving") },
+            archive: CellStorage::Local { root: temporary.path().join("archive") },
+            keys: keys.clone(),
+        };
+        let checkpoint = rtdb_directory::Checkpoint {
+            block: 1, boundary: 2, source: 2, system_time: 10, root_sha256: Some([9; 32]),
+        };
+        let manifest = URL_SAFE_NO_PAD.encode([4; 32]);
+        installation.checkpoint_captures.insert(capture, rtdb_directory::CheckpointCapture {
+            archive: serde_json::to_string(&service.archive).unwrap(),
+            key_namespace: Some(keys.namespace_id().await?),
+            incarnation: installation.incarnation,
+            log_epoch: installation.log_epoch,
+            checkpoint,
+            automatic_fork: false,
+            world_replay: None,
+            media_bound: true,
+            manifest_sha256: Some(manifest.clone()),
+            remote_disposal: None,
+        });
+        let reader = Uuid::new_v4();
+        let witness = keys.hold_local_storage_region(reader)?.unwrap();
+        installation.storage_regions.insert(reader, rtdb_directory::StorageRegion::Local {
+            archive: Some(capture), checkpoint_suffix: None, repair_archive: None,
+            tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        });
+        let key_id = format!("checkpoint-{authority}-{}-{capture}", installation.incarnation);
+        let retained = keys.archive_key(&key_id, true).await?;
+        let plaintext = bytes::Bytes::from_static(b"held archive");
+        let ciphertext = retained.seal("member", plaintext.clone()).await?;
+        directory.create_deployment(installation).await?;
+        let request = |action: serde_json::Value| {
+            serde_json::from_value(serde_json::json!({
+                "token": token, "name": "tenant", "authority": authority, "capture": capture, "action": action,
+            })).unwrap()
+        };
+        let due_at_ms = rtdb_directory::now_ms() + 400;
+        let schedule = |due_at_ms: i64| request(serde_json::json!({
+            "operation": "schedule_checkpoint_capture_revocation", "manifest_sha256": manifest, "due_at_ms": due_at_ms,
+        }));
+        let commit = || request(serde_json::json!({
+            "operation": "commit_checkpoint_capture_revocation", "manifest_sha256": manifest,
+        }));
+        assert!(matches!(service.handle(directory.clone(), schedule(due_at_ms)).await,
+            Reply::CaptureRevocationScheduled { due_at_ms: accepted, .. } if accepted == due_at_ms));
+        assert!(matches!(service.handle(directory.clone(), schedule(due_at_ms + 1)).await, Reply::Refused));
+        assert!(matches!(service.handle(directory.clone(), commit()).await, Reply::Deferred));
+
+        drop(keys);
+        let reopened = Arc::new(crate::keys::LocalKeyService::new(&key_root)?);
+        service.keys = reopened.clone();
+        assert!(matches!(service.handle(directory.clone(), schedule(due_at_ms)).await,
+            Reply::CaptureRevocationScheduled { due_at_ms: accepted, .. } if accepted == due_at_ms));
+        let remaining = due_at_ms.saturating_sub(rtdb_directory::now_ms());
+        if remaining > 50 {
+            assert_eq!(retained.open("member", ciphertext.clone()).await?, plaintext);
+        }
+        tokio::time::sleep(Duration::from_millis(remaining.max(0) as u64 + 5)).await;
+        assert!(reopened.archive_key(&key_id, false).await.is_err());
+        assert!(retained.open("member", ciphertext).await.is_err());
+        assert!(matches!(service.handle(directory.clone(), commit()).await, Reply::Deferred));
+
+        drop(witness);
+        assert!(matches!(service.handle(directory.clone(), commit()).await,
+            Reply::CaptureRevocationCommitted { operation_revoked_at_ms, .. } if operation_revoked_at_ms >= due_at_ms));
+        let settle = request(serde_json::json!({
+            "operation": "settle_checkpoint_capture_discard", "manifest_sha256": manifest,
+        }));
+        assert!(matches!(service.handle(directory, settle).await, Reply::CaptureDiscarded { .. }));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn capture_discard_separates_admission_drain_key_withdrawal_and_settlement() {

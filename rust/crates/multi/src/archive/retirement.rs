@@ -146,7 +146,7 @@ pub(crate) async fn retire_obsolete_fork_input(
     let archive: CellStorage = serde_json::from_str(&registration.archive)
         .map_err(|_| inconsistent("Invalid retained automatic capture custody"))?;
     prepare_capture_retirement_with_intent(
-        directory, record, &archive, capture, registration.manifest_sha256.as_deref(), true,
+        directory, record, &archive, capture, registration.manifest_sha256.as_deref(), DiscardIntent::ObsoleteFork,
     ).await?;
     finish_capture_retirement(directory, storage, keys, &record.id, capture).await?;
     Ok(())
@@ -159,7 +159,42 @@ pub(crate) async fn prepare_capture_retirement(
     capture: Uuid,
     manifest: Option<&str>,
 ) -> Result<CheckpointCaptureRetirement> {
-    prepare_capture_retirement_with_intent(directory, installation, archive, capture, manifest, false).await
+    prepare_capture_retirement_with_intent(directory, installation, archive, capture, manifest, DiscardIntent::Operator).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscardIntent {
+    Operator,
+    ObsoleteFork,
+    Scheduled(i64),
+}
+
+pub(crate) async fn schedule_capture_revocation(
+    directory: &dyn Directory,
+    installation: &DeploymentRecord,
+    archive: &CellStorage,
+    keys: &dyn KeyService,
+    capture: Uuid,
+    manifest: &str,
+    due_at_ms: i64,
+) -> Result<CheckpointCaptureRetirement> {
+    let registration = installation.checkpoint_captures.get(&capture)
+        .filter(|value| value.media_bound && value.key_namespace.is_some())
+        .ok_or_else(|| inconsistent("The capture has no enrolled archive key"))?;
+    if due_at_ms <= 0 || !matches!(archive, CellStorage::Local { .. }) {
+        return Err(inconsistent("Scheduled revocation requires a positive time and a local archive"));
+    }
+    require_archive_key_authority(keys, registration).await?;
+    let deployment = Uuid::parse_str(&installation.id).map_err(|_| inconsistent("Invalid capture owner"))?;
+    let key = archive_key_id(&capture_point(installation, deployment, capture, &archive_binding(archive)?)?);
+    if !keys.archive_key_is_operation_only(&key).await? {
+        return Err(inconsistent("The archive key has no operation-only schedule authority"));
+    }
+    let accepted = prepare_capture_retirement_with_intent(
+        directory, installation, archive, capture, Some(manifest), DiscardIntent::Scheduled(due_at_ms),
+    ).await?;
+    keys.schedule_archive_key(&key, due_at_ms).await?;
+    Ok(accepted)
 }
 
 async fn prepare_capture_retirement_with_intent(
@@ -168,15 +203,20 @@ async fn prepare_capture_retirement_with_intent(
     archive: &CellStorage,
     capture: Uuid,
     manifest: Option<&str>,
-    require_obsolete_fork: bool,
+    intent: DiscardIntent,
 ) -> Result<CheckpointCaptureRetirement> {
     let archive = archive_binding(archive)?;
     let accepted = update_installation(directory, &installation.id, |record| {
         let sampled_at = now_ms();
         if let Some(prior) = record.checkpoint_capture_retirements.get(&capture) {
+            if let DiscardIntent::Scheduled(due_at_ms) = intent
+                && prior.scheduled_revocation_at_ms != Some(due_at_ms)
+            {
+                return Err(inconsistent("The capture already has another discard intent"));
+            }
             return require_same_release(prior, &archive, manifest);
         }
-        if require_obsolete_fork && !obsolete_fork_input(record, capture) {
+        if intent == DiscardIntent::ObsoleteFork && !obsolete_fork_input(record, capture) {
             return Err(unavailable("The automatic fork input remains retained"));
         }
         require_capture_open(record, capture)?;
@@ -224,6 +264,10 @@ async fn prepare_capture_retirement_with_intent(
                 key_withdrawn_at_ms: None,
                 operation_revoked_at_ms: None,
                 observed_empty_at_ms: None,
+                scheduled_revocation_at_ms: match intent {
+                    DiscardIntent::Scheduled(due_at_ms) => Some(due_at_ms),
+                    _ => None,
+                },
             },
         );
         Ok(())
@@ -360,6 +404,13 @@ async fn withdraw_capture_key(
             return Err(inconsistent("The capture has no enrolled operation-only key authority"));
         }
     }
+    if let Some(due_at_ms) = accepted.scheduled_revocation_at_ms {
+        let key = key.as_deref().filter(|_| enrolled)
+            .ok_or_else(|| inconsistent("The scheduled capture has no enrolled archive key"))?;
+        if !keys.schedule_archive_key(key, due_at_ms).await? {
+            return Err(unavailable("The archive authority is waiting for its scheduled revocation"));
+        }
+    }
     if has_capture_region(&record, capture) {
         reconcile_storage_regions(directory, storage, keys, &record).await?;
         record = load().await?;
@@ -378,7 +429,8 @@ async fn withdraw_capture_key(
     if require_operation_authority && !operation_only {
         return Err(inconsistent("The authority returned an exporting-vault withdrawal"));
     }
-    let withdrawal_observed_at = now_ms().max(accepted.authorized_at_ms);
+    let withdrawal_observed_at = now_ms().max(accepted.authorized_at_ms)
+        .max(accepted.scheduled_revocation_at_ms.unwrap_or(i64::MIN));
     let current = update_installation(directory, id, |current| {
         if has_capture_region(current, capture)
             || current.checkpoint_captures.get(&capture).filter(|value| value.media_bound) != registered.as_ref()
@@ -405,6 +457,7 @@ fn checked_retirement<'a>(
             value.authorized_at_ms == accepted.authorized_at_ms
                 && value.archive == accepted.archive
                 && value.manifest_sha256 == accepted.manifest_sha256
+                && value.scheduled_revocation_at_ms == accepted.scheduled_revocation_at_ms
         })
         .ok_or_else(|| inconsistent("The physical release lost its capture fence"))
 }

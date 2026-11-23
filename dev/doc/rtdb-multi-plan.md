@@ -201,6 +201,13 @@ All processes handling an enrolled archive must use a broker-aware binary and th
 Vault custody assumes the vault directory has exclusive access and that retained backups cannot recover its withdrawn material.
 After preparation, `commit_checkpoint_capture_revocation` requires the exact manifest and reports a pending operation until admitted regions drain.
 The vault commits withdrawal before the service records `capture_revocation_committed`; a lost response can be recovered from the same vault and exact preparation.
+The optional `schedule_checkpoint_capture_revocation` action prepares the exact capture and returns the due time only after the local vault durably records it.
+Retries use the original absolute `due_at_ms` and manifest digest.
+On an observation at or after the due time, vault operations permanently close the key even through an already-issued handle or after reopening the vault.
+A bounded wall-time guarantee requires a separately qualified time source.
+Provider work checks the schedule before and after cryptography.
+The directory reaper can resume the scheduled revocation and waits for admitted regions before removing ciphertext.
+
 Physical cleanup then settles independently.
 This contract covers the enrolled archive's ability to decrypt, which is revoked by the time the commitment is recorded.
 The capture protocol's deadline request requires a qualified provider and active-reader policy, and remains unavailable with these providers.

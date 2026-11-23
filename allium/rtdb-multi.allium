@@ -2716,6 +2716,20 @@ rule PrepareCheckpointCaptureDiscard {
         RetainCaptureDiscardPreparation(capture)
 }
 
+rule ScheduleCheckpointCaptureRevocation {
+    -- The original operation authority preserves the due time across restart.
+    -- A due schedule closes further cryptographic operations, including through already issued handles.
+    when: AuthenticatedCaptureRevocationScheduled(operator, authority, capture, due_at)
+
+    requires: ExactOriginalOperationOnlyKeyAuthority(authority, capture)
+              and NoRetainedWorldOrRepairDependsOn(capture)
+              and NoLiveSuffixPinDependsOn(capture)
+
+    ensures:
+        CommitCaptureAdmissionFence(capture)
+        RecordExactAuthorityRevocationSchedule(capture, due_at)
+}
+
 rule CommitCheckpointCaptureRevocation {
     -- A brokered handle invokes the original authority every time it opens or seals protected bytes.
     -- Revocation serializes with broker operations and fences later calls through already issued handles.
@@ -3279,6 +3293,7 @@ surface CheckpointArchiveDisposal {
     provides:
         AuthenticatedCaptureDiscard(operator, authority, capture)
         AuthenticatedCaptureRevocationContinued(operator, authority, capture)
+        AuthenticatedCaptureRevocationScheduled(operator, authority, capture, due_at)
         CheckpointCaptureDiscardContinued(capture)
 
     contracts:
