@@ -73,6 +73,12 @@ def verify_native(events):
                 require(invocation not in reads and event["epoch"] > 0 and event["through"] >= -1,
                         "ordered read index reused its invocation or has an invalid cut")
                 reads.add(invocation)
+            elif kind == "hosted-recovery-closure":
+                require(digest(event["root"]) and digest(event["manifest"]) and event["through"] >= 0,
+                        "hosted confirmation has no exact recovery closure")
+            elif kind == "ordered-recovery-closure":
+                require(digest(event["root"]) and event["revision"] > 0 and event["through"] >= 0,
+                        "ordered confirmation has no selected recovery closure")
             elif kind == "publish-checkpoint":
                 require(digest(event["root"]) and digest(event["manifest"]), "checkpoint lacks its root or manifest digest")
             elif kind in {"admit-recovery", "finish-recovery"}:

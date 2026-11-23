@@ -27,6 +27,7 @@ pub(crate) struct RecoveryAdmission {
     deployment: String,
     stream: String,
     log_epoch: i32,
+    writer_epoch: u64,
 }
 
 pub(crate) struct ReplayHold {
@@ -50,7 +51,7 @@ impl ReplayHold {
 
 impl RecoveryAdmission {
     pub fn new(holds: Arc<RecoveryHolds>, config: &LogkeeperLogConfig) -> Self {
-        Self { holds, deployment: config.deployment.clone(), stream: config.replica_stream.clone(), log_epoch: config.log_epoch }
+        Self { holds, deployment: config.deployment.clone(), stream: config.replica_stream.clone(), log_epoch: config.log_epoch, writer_epoch: config.epoch }
     }
 
     pub async fn hold(&self, after: LogOffset, through: LogOffset) -> Result<Option<ReplayHold>> {
@@ -117,6 +118,21 @@ impl RecoveryAdmission {
             record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
         }
         Ok(())
+    }
+
+    pub(crate) async fn confirms_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
+        let (record, _) = self.checked_record(through).await?;
+        if record.epoch != self.writer_epoch || record.holder.is_none() { return Ok(false); }
+        let (Some(checkpoint), Some(manifest)) = (record.checkpoint, record.recovery_manifest_sha256) else { return Ok(false); };
+        if checkpoint.block != block || checkpoint.boundary != through.0 || checkpoint.root_sha256 != Some(root) {
+            return Ok(false);
+        }
+        crate::residence_trace::record("hosted-recovery-closure", || serde_json::json!({
+            "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
+            "epoch": record.log_epoch, "stream": self.stream, "revision": record.version,
+            "block": block, "through": through.0, "root": root, "manifest": manifest,
+        }));
+        Ok(true)
     }
 
     pub(crate) async fn check_start(&self, after: LogOffset) -> Result<()> {

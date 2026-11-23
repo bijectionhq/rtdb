@@ -168,6 +168,22 @@ impl TermHandle {
             None
         }
     }
+    /// Obtains the adopted source token only once the hosted recovery owner has installed its root.
+    pub async fn recoverable_external_checkpoint(&self) -> Option<RecoverableExternalToken> {
+        let catalog = {
+            let status = self.handle.status.borrow();
+            if status.role != Role::Leading(self.term) { return None; }
+            status.adopted_block.clone()?
+        };
+        let bytes = catalog.external_source_token()?;
+        if !self.handle.logs.confirms_recovery_checkpoint(&catalog).await
+            || self.handle.status.borrow().role != Role::Leading(self.term)
+        {
+            return None;
+        }
+        Some(RecoverableExternalToken(Arc::from(bytes)))
+    }
+
     /// Replaces a quiescent catalog and returns after its new block has been adopted in this term.
     /// The caller must exclusively operate the database with compaction and GC disabled.
     /// A failed receipt never permits deletion of the old catalog's files.

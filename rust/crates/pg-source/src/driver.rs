@@ -111,7 +111,7 @@ impl SourceDriver {
         Ok(lsn)
     }
     async fn stream(&self, term: &TermHandle, resume: Lsn, blocks: &mut watch::Receiver<DriverStatus>) -> Result<()> {
-        let mut confirmation = ConfirmationState::new(resume, durable(blocks)?);
+        let mut confirmation = ConfirmationState::new(resume, durable(term, blocks).await?);
         recoverable_token(term, &mut confirmation)?;
         let mut pending = Pending::new(); let mut failures = 0u32; let mut random = uuid::Uuid::new_v4().as_u128() as u64;
         loop {
@@ -130,7 +130,7 @@ impl SourceDriver {
                     },
                     change = blocks.changed() => {
                         change.map_err(|_| stopped())?;
-                        confirmation.adopted(durable(blocks)?);
+                        confirmation.adopted(durable(term, blocks).await?);
                     }
                 }
             };
@@ -174,8 +174,11 @@ impl SourceDriver {
                         false
                     },
                     Event::Applied(None) => false,
-                    Event::Durable(change) => { change.map_err(|_| stopped())?; confirmation.adopted(durable(blocks)?); false },
-                    Event::Tick => true,
+                    Event::Durable(change) => { change.map_err(|_| stopped())?; confirmation.adopted(durable(term, blocks).await?); false },
+                    Event::Tick => {
+                        confirmation.adopted(durable(term, blocks).await?);
+                        true
+                    },
                 };
                 let permit = confirmation.acknowledgement();
                 if force || permit.through() > confirmation.confirmed() {
@@ -201,10 +204,11 @@ fn commit_lag_seconds(now_millis: i64, commit: Timestamp) -> f64 { now_millis.wr
 fn applied(receipt: ExternalReceipt, events: usize, commit_time: Option<Timestamp>) -> BoxFuture<'static, Result<Applied>> {
     Box::pin(async move { receipt.applied().await?; Ok(Applied { events, commit_time }) })
 }
-fn durable(blocks: &mut watch::Receiver<DriverStatus>) -> Result<Option<Lsn>> {
-    let token = blocks.borrow_and_update().adopted_block.as_ref()
-        .and_then(|block| block.external_source_token()).map(ResumeToken::decode).transpose()?;
-    Ok(token.filter(|token| token.snapshot_completed).map(|token| token.lsn))
+async fn durable(term: &TermHandle, blocks: &mut watch::Receiver<DriverStatus>) -> Result<Option<Lsn>> {
+    drop(blocks.borrow_and_update());
+    let Some(recoverable) = term.recoverable_external_checkpoint().await else { return Ok(None); };
+    let token = ResumeToken::decode(recoverable.as_bytes())?;
+    Ok(token.snapshot_completed.then_some(token.lsn))
 }
 fn recoverable_token(term: &TermHandle, confirmation: &mut ConfirmationState) -> Result<()> {
     if let Some(recoverable) = term.recoverable_external_token() {

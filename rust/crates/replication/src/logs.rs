@@ -76,6 +76,12 @@ impl PartitionLogs {
         crate::BlockStore::new(Arc::clone(&self.store), Arc::clone(&self.cache), Arc::clone(&self.memory), file_size_target)
     }
     pub(crate) fn requires_checkpoint_digest(&self) -> bool { self.replica.requires_checkpoint_digest() }
+    pub(crate) async fn confirms_recovery_checkpoint(&self, catalog: &rtdb_format::catalog::BlockCatalog) -> bool {
+        if !self.replica.needs_published_recovery_checkpoint() { return true; }
+        let (Some(boundary), Some(root)) = (catalog.boundary_replica_position(), catalog.publication_sha256()) else { return false; };
+        let through = LogOffset(boundary.after_offset(self.replica_epoch));
+        through.0 >= 0 && self.replica.confirms_recovery_checkpoint(catalog.block_index().0, through, root).await.unwrap_or(false)
+    }
     pub(crate) fn fences_writer_terms(&self) -> bool { self.replica.fences_writer_terms() }
     pub(crate) async fn holds_writer_grant(&self) -> Result<bool> { Ok(self.replica.holds_writer_grant().await?) }
     pub(crate) fn retains_recovery_history(&self) -> bool {

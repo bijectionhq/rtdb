@@ -583,6 +583,24 @@ impl AsRef<[u8]> for Delivery {
 
 #[async_trait]
 impl Log for JournalLog {
+    fn needs_published_recovery_checkpoint(&self) -> bool { true }
+
+    async fn confirms_recovery_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
+        let grant = self.writer.lock().await.grant;
+        let route = self.reads.route().await?;
+        let checkpoint = route.checkpoint;
+        if route.writer.grant != Some(grant) || checkpoint.root != root || latest(checkpoint.cut).map_err(storage)? != through {
+            return Ok(false);
+        }
+        crate::residence_trace::record("ordered-recovery-closure", || serde_json::json!({
+            "deployment": route.placement.deployment, "incarnation": route.placement.incarnation,
+            "group": route.placement.group, "generation": route.placement.generation,
+            "epoch": grant.epoch, "revision": checkpoint.custody.revision,
+            "block": block, "through": through.0, "root": root,
+        }));
+        Ok(true)
+    }
+
     fn requires_checkpoint_digest(&self) -> bool {
         true
     }
