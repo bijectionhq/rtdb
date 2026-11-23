@@ -1137,6 +1137,44 @@ mod retained_release_tests {
     }
 
     #[test]
+    fn landing_orders_task_intents_with_their_dispatch_reservation() -> Result<()> {
+        let scope = PlacedAttemptScope::new("proposal-landing-tasks", 1)?;
+        let admission = OwnedRelation::new("bj_fact_root_admission")?;
+        let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let insert = |slot: String| HostedControlWrite::new(admission.clone(), scope, None, row(&slot));
+        let mut controls = vec![
+            HostedControlWrite::check(admission.clone(), scope, Some(Timestamp(1)), row("installed"))?,
+            HostedControlWrite::new(admission.clone(), scope, Some(Timestamp(2)), row(&format!("root_proposal_head:{}", "a".repeat(64))))?,
+            insert(format!("root_proposal_landing:{}", "b".repeat(64)))?,
+            insert(format!("root_proposal_landing_proof:{}", "c".repeat(64)))?,
+        ];
+        assert!(proposal_land_controls(&controls));
+
+        controls.push(insert(format!("clock-task:{}", "d".repeat(64)))?);
+        assert!(proposal_land_controls(&controls));
+        controls.push(insert(format!("action-task:{}", "k".repeat(32)))?);
+        assert!(!proposal_land_controls(&controls), "an action intent needs its reservation carrier");
+        controls.push(insert(format!("task-acceptance:{}", "e".repeat(64)))?);
+        assert!(proposal_land_controls(&controls));
+        controls.push(insert(format!("action-task:{}", "m".repeat(32)))?);
+        assert!(!proposal_land_controls(&controls), "one landing admits one dispatched action");
+        controls.pop();
+        controls.push(insert(format!("task-acceptance:{}", "f".repeat(64)))?);
+        assert!(!proposal_land_controls(&controls), "one landing carries one reservation batch");
+        controls.pop();
+        controls.push(HostedControlWrite::new(admission.clone(), scope, Some(Timestamp(3)), row(&format!("clock-task:{}", "0".repeat(64))))?);
+        assert!(!proposal_land_controls(&controls), "a landing cannot replace an existing task");
+        controls.pop();
+        for index in 0..MAX_PROPOSAL_LAND_TASKS - 2 {
+            controls.push(insert(format!("clock-task:{index:064x}"))?);
+        }
+        assert!(proposal_land_controls(&controls));
+        controls.push(insert(format!("clock-task:{}", "f".repeat(64)))?);
+        assert!(!proposal_land_controls(&controls));
+        Ok(())
+    }
+
+    #[test]
     fn finite_period_landing_requires_the_original_starts_and_both_windows() -> Result<()> {
         let scope = PlacedAttemptScope::new("proposal-period-landing", 1)?;
         let world = Iid([1; 16]);
@@ -1346,12 +1384,22 @@ pub(crate) fn proposal_overlay_write(
     })
 }
 
+/// Fresh native task records a landing may order with its receipt.
+pub const MAX_PROPOSAL_LAND_TASKS: usize = 16;
+
 /// A landing settles its replay head, receipt, and proof locator together.
+/// The reviewed command's task intents publish in the same commit: fresh
+/// clock tasks, and at most one dispatched action task whose dispatch
+/// reservation carrier is inserted beside it, so the intent exists exactly
+/// when the landing receipt does.
 pub fn proposal_land_controls<'a>(controls: impl IntoIterator<Item = &'a HostedControlWrite>) -> bool {
     let mut checks = 0;
     let mut head = false;
     let mut receipt = false;
     let mut proof = false;
+    let mut carrier = false;
+    let mut action = false;
+    let mut tasks = 0;
     for control in controls {
         if control.is_check() {
             checks += 1;
@@ -1363,11 +1411,29 @@ pub fn proposal_land_controls<'a>(controls: impl IntoIterator<Item = &'a HostedC
             Some(_) if landing_control_id(id, "root_proposal_head:") => &mut head,
             None if landing_control_id(id, "root_proposal_landing:") => &mut receipt,
             None if landing_control_id(id, "root_proposal_landing_proof:") => &mut proof,
+            None if landing_control_id(id, "task-acceptance:") => &mut carrier,
+            None if landing_action_task_id(id) => {
+                tasks += 1;
+                &mut action
+            }
+            None if landing_control_id(id, "clock-task:") => {
+                tasks += 1;
+                if tasks > MAX_PROPOSAL_LAND_TASKS { return false; }
+                continue;
+            }
             _ => return false,
         };
         if std::mem::replace(slot, true) { return false; }
     }
-    checks > 0 && head && receipt && proof
+    checks > 0 && head && receipt && proof && carrier == action && tasks <= MAX_PROPOSAL_LAND_TASKS
+}
+
+/// `action-task:` followed by the occurrence's encoded document id.
+fn landing_action_task_id(id: &str) -> bool {
+    id.strip_prefix("action-task:").is_some_and(|occurrence| {
+        (16..=64).contains(&occurrence.len())
+            && occurrence.bytes().all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+    })
 }
 
 fn landing_control_id(id: &str, prefix: &str) -> bool {
