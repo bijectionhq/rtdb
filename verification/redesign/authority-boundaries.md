@@ -29,6 +29,7 @@ The progress monitor publishes the applied prefix and wakes waiters.
 The current placed outcome implementation and the [serving authority](../tla/PlacedServingAuthority.tla) and [frozen cut](../tla/FrozenReceiptCut.tla) models cover provisional receipt identity and terminal redemption.
 Each placed intake has a local byte limit before it accepts provisional work.
 That credit remains with its payload through trim and any outstanding source readers.
+Replica installation checks that the terminal witness agrees with the envelope's exact identity, transaction key and disposition.
 Durable reservation, fencing and succession are implementation and proof obligations for the receiver slot contract.
 
 Current source paths are [Multi intake](../../rust/crates/multi/src/logs.rs), [node submit and await](../../rust/crates/node/src/node.rs), [session basis](../../rust/crates/node/src/session.rs), and [installed progress](../../rust/crates/replication/src/driver.rs).

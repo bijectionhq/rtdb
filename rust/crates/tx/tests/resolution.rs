@@ -1637,6 +1637,12 @@ async fn a_versioned_placed_outcome_retires_expired_receipts_and_replays_its_cur
     let body = resolved.to_replica_body(&context.memory).unwrap();
     let ReplicaBody::ResolvedTx(tx) = body.body() else { panic!("expected versioned placed frame"); };
     assert!(PlacedAttempt::decode(tx.placed_attempt.as_deref().unwrap()).is_err());
+    let mut wrong_decision = tx.clone();
+    wrong_decision.committed = tx.committed.map(|committed| !committed);
+    assert!(decode_replica(&wrong_decision, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+    wrong_decision.committed = None;
+    assert!(decode_replica(&wrong_decision, predecessor, state.snapshot().block_index(), &context.memory).is_err());
+
     let mut unmarked = tx.clone();
     unmarked.placed_attempt = Some(attempt.encode().to_vec());
     assert!(decode_replica(&unmarked, predecessor, state.snapshot().block_index(), &context.memory).is_err());

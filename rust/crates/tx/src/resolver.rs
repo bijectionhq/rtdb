@@ -271,7 +271,7 @@ impl TxResolver {
         tx.write_result(&result, None, Some(log_time), receipt_time)?;
         if let Some(attempt) = attempt {
             tx.retire_placed_outcomes(clock).await?;
-            tx.write_attempt_outcome(attempt, log_time, Default::default(), Vec::new(), false)?;
+            tx.write_attempt_outcome(attempt, &result, log_time, Default::default(), Vec::new(), false)?;
         }
         let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
             attempt, retirement: context.placed_receipt_retirement,
@@ -687,7 +687,7 @@ impl<'a> OpenTransaction<'a> {
             let worlds = if result.committed() { crate::replica::worlds::source_inventory(selected)? } else { Vec::new() };
             self.retire_placed_outcomes(clock).await?;
             let archive_replay = result.committed() && self.hosted_replay.is_some();
-            self.write_attempt_outcome(attempt, log_time, controls, worlds, archive_replay)?;
+            self.write_attempt_outcome(attempt, &result, log_time, controls, worlds, archive_replay)?;
         }
         let mut writes = self.buffer.stage()?;
         if let Some(prepared) = prepared {
@@ -818,12 +818,13 @@ impl<'a> OpenTransaction<'a> {
     }
 
     fn write_attempt_outcome(
-        &mut self, attempt: PlacedAttempt, log_time: Timestamp,
+        &mut self, attempt: PlacedAttempt, result: &TransactionResult, log_time: Timestamp,
         controls: std::collections::BTreeSet<&str>, worlds: Vec<Value>, archive_replay: bool,
     ) -> Result<()> {
         let key = self.tx_key();
         let mut document = StructFields::from([
             ("_id".into(), Value::Utf8(attempt.outcome_key())),
+            ("committed".into(), Value::Bool(result.committed())),
             ("tx_id".into(), Value::I64(key.tx_id.0)),
             ("tx_system_time".into(), time_value(key.system_time)),
         ]);

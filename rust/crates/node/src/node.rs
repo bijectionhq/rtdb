@@ -762,7 +762,7 @@ impl Node {
                 if epoch == current {
                     db.await_installed(|prefix| prefix.source >= attempt.position(), cancellation).await?
                 } else {
-                    // Only the recovered end of the closed epoch authorizes a negative outcome.
+                    // Search the authentic closed prefix before reporting an unresolved attempt.
                     let offset = cancellation.run_until_cancelled(recovery.confirm()).await.ok_or_else(cancelled)?
                         .map_err(|error| receipt_replica_behind(db.name()).with_context("cause", error.code.into()))?;
                     let recovered = ReplicaPosition::from_epoch_offset(db.logs.replica_epoch, offset.0)?;
