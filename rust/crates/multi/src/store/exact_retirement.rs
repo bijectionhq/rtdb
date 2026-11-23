@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use rtdb_directory::{DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
-use rtdb_format::keys::block_key;
+use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget, TerminalObjectPublication};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget, StorageEpoch, TerminalObjectPublication};
 use uuid::Uuid;
 
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release, recovery_covers_release};
@@ -41,7 +41,9 @@ impl ReleaseWitness {
     }
 
     fn permits(&self, owner: &DeploymentRecord, store: &str) -> bool {
-        if let Some(replica) = &self.replica { return replica.permits(owner, store); }
+        if let Some(replica) = &self.replica {
+            return self.version.as_ref().is_some_and(|version| replica.permits(owner, store, version));
+        }
         permits_release(owner, store, &self.record) && recovery_covers_release(owner, &self.record)
             && super::oversized_payload_collectable(owner, &self.record.key, rtdb_directory::now_ms())
     }
@@ -123,6 +125,7 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
     }
     if !can_reap(candidate) { return Ok(()); }
     if state.preparations().next().is_some() || state.open_generation().is_none() { return Ok(()); }
+    publish_settled_replica_candidates(directory, bucket, provider, candidate).await?;
     let source = candidate.storage_prefix();
     for store in stores(bucket, &source).await? {
         let markers = ObjectKey::new(format!("{store}/{GARBAGE_DIRECTORY}"))?;
@@ -216,7 +219,56 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
     // An already-authorized legacy attempt can settle its data version. The
     // release remains for a new pass to identify and settle by exact version.
     settle(directory, lineage, deployment, retirement).await?;
+    if let RetirementWork::S3 { version, .. } = &retirement.work {
+        forget_settled_replica_candidate(directory, deployment, &target, version).await?;
+    }
     Ok(true)
+}
+
+fn replica_payload_store(owner: &DeploymentRecord) -> Result<String> {
+    let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
+    Ok(format!("{}/{root}", owner.storage_prefix()))
+}
+
+async fn publish_settled_replica_candidates(directory: &dyn Directory, bucket: &dyn ObjectStore,
+    provider: &dyn RetirementProvider, owner: &DeploymentRecord) -> Result<()> {
+    let Some(plan) = owner.replica_payload_trim.as_ref().filter(|plan| plan.applied && plan.belongs_to(owner))
+        else { return Ok(()); };
+    let store = replica_payload_store(owner)?;
+    for candidate in &plan.candidates {
+        let release = super::ReplicaPayloadRelease {
+            record: super::GarbageRecord { key: candidate.key.clone(), released_at_ms: 0, trie_floor: None },
+            incarnation: plan.incarnation, log_epoch: plan.log_epoch, position: candidate.position,
+        };
+        if !release.permits(owner, &store, &candidate.version) { continue; }
+        let target = ObjectKey::new(format!("{store}/{}", candidate.key))?;
+        if provider.absent(&target, &candidate.version).await? {
+            forget_settled_replica_candidate(directory, &owner.id, &target, &candidate.version).await?;
+        } else {
+            super::publish_replica_payload_release(bucket, owner, candidate.key.clone(), candidate.position, candidate.version.clone()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn forget_settled_replica_candidate(directory: &dyn Directory, deployment: &str,
+    target: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()> {
+    let Some(owner) = directory.deployment(deployment).await? else { return Ok(()); };
+    let store = replica_payload_store(&owner)?;
+    let Some(relative) = target.as_str().strip_prefix(&format!("{store}/"))
+        .filter(|key| key.starts_with("oversized/")) else { return Ok(()); };
+    let Some(plan) = owner.replica_payload_trim.as_ref().filter(|plan| plan.applied && plan.belongs_to(&owner)) else { return Ok(()); };
+    if !plan.candidates.iter().any(|candidate| candidate.key == relative && &candidate.version == version) { return Ok(()); }
+    crate::admin::update_installation(directory, deployment, |record| {
+        if replica_payload_store(record)? == store
+            && let Some(plan) = record.replica_payload_trim.as_mut().filter(|plan| plan.applied
+                && plan.incarnation == owner.incarnation && plan.log_epoch == owner.log_epoch)
+        {
+            plan.candidates.retain(|candidate| candidate.key != relative || &candidate.version != version);
+        }
+        Ok(())
+    }).await?;
+    Ok(())
 }
 
 async fn settle(directory: &dyn Directory, lineage: &str, deployment: &str, retirement: &LineageRetirement) -> Result<()> {
@@ -506,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_certified_replica_payload_requires_settled_trim_and_retries_the_exact_version() {
-        use rtdb_directory::{Checkpoint, JournalAnchor, ReplicaPayloadTrim};
+        use rtdb_directory::{Checkpoint, JournalAnchor, ReplicaPayloadCandidate, ReplicaPayloadTrim};
 
         let state = tempfile::tempdir().unwrap();
         MemoryDirectory::initialize(state.path()).unwrap();
@@ -519,8 +571,7 @@ mod tests {
         record.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim { incarnation: record.incarnation, log_epoch: record.log_epoch,
             through: 6, journals: [rtdb_types::JournalEndpoint::Member {
                 address: "127.0.0.1:1".into(), journal: Uuid::new_v4().to_string(),
-            }].into(), applied: false }));
-        let record = directory.create_deployment(record).await.unwrap();
+            }].into(), applied: false, candidates: Vec::new() }));
         let relative = "oversized/b00-published.binpb";
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
         let target = ObjectKey::new(format!("{}/{root}/{relative}", record.storage_prefix())).unwrap();
@@ -529,7 +580,16 @@ mod tests {
             namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
             key: format!("cell/{target}"), version: "retired".into(),
         }, attempts: AtomicUsize::new(0), markers: AtomicUsize::new(0) };
+        record.replica_payload_trim.as_mut().unwrap().candidates.push(ReplicaPayloadCandidate {
+            key: relative.into(), position: 6, version: provider.version.clone(),
+        });
+        let record = directory.create_deployment(record).await.unwrap();
         super::super::publish_replica_payload_release(&bucket, &record, relative.into(), 6, provider.version.clone()).await.unwrap();
+        let future = "oversized/b01-future.binpb";
+        let future_key = ObjectKey::new(format!("{}/{root}/{future}", record.storage_prefix())).unwrap();
+        bucket.put(&future_key, Bytes::from_static(b"still referenced")).await.unwrap();
+        let forged = PhysicalObjectVersion { key: format!("cell/{future_key}"), ..provider.version.clone() };
+        super::super::publish_replica_payload_release(&bucket, &record, future.into(), 6, forged).await.unwrap();
 
         reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
         assert_eq!(provider.attempts.load(Ordering::Relaxed), 0);
@@ -552,6 +612,9 @@ mod tests {
         reap(directory.as_ref(), &bucket, &provider, &record, 0, None, None).await.unwrap();
         assert_eq!(provider.attempts.load(Ordering::Relaxed), 2);
         assert_eq!(bucket.get(&target).await.unwrap().as_ref(), b"another version");
+        let record = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(record.replica_payload_trim.unwrap().candidates.is_empty());
+        assert_eq!(bucket.get(&future_key).await.unwrap().as_ref(), b"still referenced");
     }
 
     #[tokio::test]

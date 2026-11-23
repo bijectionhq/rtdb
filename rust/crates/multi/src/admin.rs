@@ -1230,6 +1230,7 @@ async fn prepare_cell_move(
         let mut staged = source.clone();
         staged.org = arrival.org;
         staged.incarnation = arrival.incarnation;
+        staged.replica_payload_trim = None;
         staged.ensemble = arrival.ensemble;
         staged.storage_generation = Some(uuid::Uuid::new_v4());
         staged.recovery_manifest_sha256 = None;
@@ -1726,7 +1727,7 @@ async fn finish_disposal_with_lock(
     deleted.disposal.map(|receipt| *receipt).ok_or_else(|| Anomaly::fault("rtdb.multi/disposal-receipt", format!("Installation {id} lacks a disposal receipt")))
 }
 
-fn retirement_journals(
+pub(crate) fn retirement_journals(
     inventory: Vec<JournalEndpoint>, members: &BTreeMap<MemberId, MemberRecord>,
 ) -> Result<Vec<JournalEndpoint>> {
     let mut journals = BTreeMap::<String, JournalEndpoint>::new();

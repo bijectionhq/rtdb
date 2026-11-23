@@ -52,7 +52,8 @@ pub(crate) fn belongs_to_ordered_index(name: &str) -> bool {
 pub(crate) fn stays_in_source_residence(name: &str) -> bool {
     belongs_to_ordered_index(name) || rtdb_format::keys::is_trie_retirement_object(name)
         || name.strip_prefix(GARBAGE_DIRECTORY)
-            .is_some_and(|record| record.starts_with('/') && record.ends_with(TRIE_RETIREMENT_RELEASE))
+            .is_some_and(|record| record.starts_with("/0-replica-")
+                || (record.starts_with('/') && record.ends_with(TRIE_RETIREMENT_RELEASE)))
 }
 
 const SEALED_OVERHEAD: u64 = OVERHEAD as u64;
@@ -1064,7 +1065,7 @@ struct ReplicaPayloadRelease {
 }
 
 impl ReplicaPayloadRelease {
-    fn permits(&self, owner: &DeploymentRecord, store: &str) -> bool {
+    fn permits(&self, owner: &DeploymentRecord, store: &str, version: &PhysicalObjectVersion) -> bool {
         let Ok(root) = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0)) else { return false; };
         let now = rtdb_directory::now_ms();
         self.incarnation == owner.incarnation && self.log_epoch == owner.log_epoch && self.position >= 0
@@ -1075,12 +1076,14 @@ impl ReplicaPayloadRelease {
             && owner.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] >= self.position)
             && owner.replica_payload_trim.as_ref().is_some_and(|trim| trim.belongs_to(owner)
                 && trim.applied && !trim.journals.is_empty() && trim.through >= self.position
-                && trim.journals.iter().all(|endpoint| endpoint.journal().is_some()))
+                && trim.journals.iter().all(|endpoint| endpoint.journal().is_some())
+                && trim.candidates.iter().any(|candidate| candidate.position == self.position
+                    && candidate.key == self.record.key && &candidate.version == version))
             && owner.required_replica_offsets(now).all(|from| from > self.position)
     }
 }
 
-pub(crate) async fn publish_replica_payload_release(bucket: &dyn ObjectStore, owner: &DeploymentRecord, relative: String,
+async fn publish_replica_payload_release(bucket: &dyn ObjectStore, owner: &DeploymentRecord, relative: String,
     position: i64, version: PhysicalObjectVersion) -> Result<()> {
     let root = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0))?.key();
     let hash = ring::digest::digest(&ring::digest::SHA256, relative.as_bytes());

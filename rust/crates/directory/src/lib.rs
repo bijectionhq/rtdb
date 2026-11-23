@@ -781,6 +781,14 @@ pub struct ReplicaPayloadTrim {
     pub through: i64,
     pub journals: BTreeSet<JournalEndpoint>,
     pub applied: bool,
+    pub candidates: Vec<ReplicaPayloadCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaPayloadCandidate {
+    pub key: String,
+    pub position: i64,
+    pub version: rtdb_types::PhysicalObjectVersion,
 }
 
 impl ReplicaPayloadTrim {
