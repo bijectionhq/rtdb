@@ -573,10 +573,23 @@ pub(crate) mod tests {
         ranges: std::sync::atomic::AtomicUsize,
         change_on_range: std::sync::atomic::AtomicUsize,
         heads: std::sync::atomic::AtomicUsize,
+        maximum_read: std::sync::atomic::AtomicU64,
         pub(crate) change_on_exact: std::sync::atomic::AtomicBool,
     }
 
     impl VersionedPacks {
+        pub(crate) fn limit_read_size(&self, bytes: u64) {
+            self.maximum_read.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn require_read_size(&self, key: &ObjectKey, bytes: u64) -> rtdb_storage::Result<()> {
+            let maximum = self.maximum_read.load(std::sync::atomic::Ordering::Relaxed);
+            if maximum > 0 && bytes > maximum {
+                return Err(Error::PermissionDenied { key: key.to_string(), message: "test provider refused a larger read".into() });
+            }
+            Ok(())
+        }
+
         pub(crate) fn head_observations(&self) -> usize {
             self.heads.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -597,8 +610,14 @@ pub(crate) mod tests {
             self.heads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(ObjectObservation { value: self.head(key).await?, version: Some(self.version(key)) })
         }
-        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.inner.get(key).await }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            if self.maximum_read.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                self.require_read_size(key, self.inner.head(key).await?.size)?;
+            }
+            self.inner.get(key).await
+        }
         async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
+            self.require_read_size(key, length as u64)?;
             let value = self.inner.get_fresh_exact(key, length).await?;
             let mut version = self.version(key);
             if self.change_on_exact.load(std::sync::atomic::Ordering::SeqCst) {
@@ -606,7 +625,10 @@ pub(crate) mod tests {
             }
             Ok(ObjectObservation { value, version: Some(version) })
         }
-        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+            self.require_read_size(key, range.end.saturating_sub(range.start))?;
+            self.inner.get_range(key, range).await
+        }
         async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
             use std::sync::atomic::Ordering::SeqCst;
             let value = self.get_range(key, range).await?;

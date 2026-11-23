@@ -2258,7 +2258,9 @@ mod tests {
     async fn retained_archive_serves_an_authenticated_trie_range_with_its_manifest() -> Result<()> {
         use crate::cipher::object::FRAME_BYTES;
 
-        let raw: Arc<dyn ObjectStore> = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let provider = Arc::new(crate::packing::tests::VersionedPacks::default());
+        provider.limit_read_size((2 * (FRAME_BYTES + crate::cipher::SEALED_OVERHEAD)) as u64);
+        let raw: Arc<dyn ObjectStore> = provider;
         let name = key("tables/orders/data/l00-rc-b00.arrow")?;
         let plaintext = vec![5; FRAME_BYTES * 4 + 19];
         let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
@@ -2281,6 +2283,7 @@ mod tests {
         let store = read(archived.clone())?;
         let received = store.get_range(&name, range.start as u64..range.end as u64).await?;
         assert_eq!(received.as_ref(), &plaintext[range.clone()]);
+        assert!(matches!(store.get(&name).await, Err(Error::PermissionDenied { .. })));
 
         let substituted = ArchivedObject { frame_header_sha256: Some("different".into()), ..archived };
         let store = read(substituted)?;
