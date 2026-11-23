@@ -310,9 +310,10 @@ impl TrieCatalog {
     }
     pub fn without_tries(&self, table: &TableRef, keys: &BTreeSet<TrieKey>) -> Self {
         let mut next = self.clone();
+        let expiring_metadata = table.stores_expiring_transaction_metadata();
         if let Some(table) = next.tables.get_mut(table) {
             for key in keys {
-                if key.level() == 0 { continue; }
+                if key.level() == 0 && !expiring_metadata { continue; }
                 if let Some(shard) = table.shards.get_mut(&Shard::of(key)) {
                     if shard.tries.get(&key.block_index()).is_some_and(|trie| trie.key == *key && matches!(trie.state, TrieState::Garbage { .. })) {
                         shard.tries.remove(&key.block_index());

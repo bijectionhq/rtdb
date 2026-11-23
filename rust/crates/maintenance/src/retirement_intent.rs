@@ -132,8 +132,10 @@ impl PendingRetirement {
 
     fn keys(&self) -> Result<Vec<TrieKey>> {
         let keys = self.plan.tries.iter().map(|key| key.parse()).collect::<Result<Vec<TrieKey>>>()?;
-        if keys.is_empty() || keys.iter().any(|key| key.level() == 0) {
-            return Err(crate::invalid("A trie retirement intent must name at least one non-L0 trie and no L0 trie"));
+        if keys.is_empty() || (keys.iter().any(|key| key.level() == 0)
+            && !self.plan.table.stores_expiring_transaction_metadata())
+        {
+            return Err(crate::invalid("Only receipt tables can include L0 in a trie retirement intent"));
         }
         Ok(keys)
     }

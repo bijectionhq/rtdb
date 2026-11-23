@@ -120,6 +120,15 @@ impl TrieCollection {
             .map(|trie| trie.key.clone()).collect()
     }
 
+    pub fn eligible_receipt_l0(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &TrieKey> {
+        self.current.trie_catalog().iter_tries(table).filter(move |trie| {
+            table.stores_expiring_transaction_metadata() && trie.key.level() == 0
+                && trie.published_files.is_some()
+                && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)
+                && !self.protected(table, &trie.key)
+        }).map(|trie| &trie.key)
+    }
+
     pub fn eligible_l0_artefacts(&self, table: &TableRef, as_of: Timestamp) -> impl Iterator<Item = &TrieKey> {
         self.current.trie_catalog().iter_tries(table).filter(move |trie| {
             trie.key.level() == 0 && matches!(trie.state, TrieState::Garbage { as_of: time } if time <= as_of)

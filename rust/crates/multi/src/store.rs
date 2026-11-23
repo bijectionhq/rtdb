@@ -284,6 +284,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             }
             let serving = Arc::get_mut(&mut opened).expect("the new store has one owner");
             serving.index_pages = Some(pages);
+            serving.releases_receipt_l0 = self.replica_payload_reclamation && matches!(config.storage, CellStorage::S3 { .. });
             serving.catalog_readers = Some(CatalogReaders::new(
                 self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
@@ -1137,6 +1138,7 @@ impl ObjectStore for EncryptingStore {
         self.inner.retain_catalog(cut).await
     }
     fn defers_trie_releases(&self) -> bool { self.inner.defers_trie_releases() }
+    fn releases_receipt_l0(&self) -> bool { self.inner.releases_receipt_l0() }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         self.inner.advance_catalog_floor(installed).await
     }
@@ -1377,6 +1379,7 @@ pub struct GarbageStore {
     packing: Option<Arc<crate::packing::PackingStore>>,
     index_pages: Option<HostedIndexPages>,
     catalog_readers: Option<CatalogReaders>,
+    releases_receipt_l0: bool,
     loaded_releases: tokio::sync::OnceCell<()>,
     released: Mutex<BTreeMap<ObjectKey, Vec<PhysicalObjectVersion>>>,
     clock: Clock,
@@ -1388,7 +1391,7 @@ impl GarbageStore {
     pub async fn open_with_clock(inner: Arc<dyn ObjectStore>, clock: Clock) -> Result<Arc<Self>> { Ok(Arc::new(Self::new(inner, clock, None))) }
 
     fn new(inner: Arc<dyn ObjectStore>, clock: Clock, packing: Option<Arc<crate::packing::PackingStore>>) -> Self {
-        Self { inner, packing, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
+        Self { inner, packing, index_pages: None, catalog_readers: None, releases_receipt_l0: false, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
     }
 
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
@@ -1443,7 +1446,7 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 }
 
 fn is_collected_trie_file(key: &str) -> bool {
-    if rtdb_format::search_manifest::is_run_key(key) { return true; }
+    if rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) { return true; }
     let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
     name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
         .and_then(|file| file.strip_suffix(".arrow"))
@@ -1496,6 +1499,7 @@ impl ObjectStore for GarbageStore {
         readers.retain(cut).await.map(Some)
     }
     fn defers_trie_releases(&self) -> bool { self.catalog_readers.is_some() }
+    fn releases_receipt_l0(&self) -> bool { self.releases_receipt_l0 }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(true); };
         readers.advance(installed).await
@@ -1642,8 +1646,18 @@ enum ReleaseSweep<'a> {
 }
 
 fn recovery_covers_release(owner: &DeploymentRecord, release: &GarbageRecord) -> bool {
-    let Some(floor) = &release.trie_floor else { return true; };
+    let receipt_l0 = rtdb_format::keys::is_receipt_l0_file(&release.key);
+    let Some(floor) = &release.trie_floor else { return !receipt_l0; };
     let through = floor.cut.through.after_offset(floor.cut.replica_epoch);
+    if receipt_l0
+        && !owner.replica_payload_trim.as_ref().is_some_and(|trim| {
+            trim.applied && trim.belongs_to(owner) && trim.through >= through && !trim.journals.is_empty()
+                && owner.replica_journals.iter().chain(&owner.log_copy_servers).chain(owner.move_from.iter().flatten())
+                    .all(|endpoint| endpoint.journal().is_some() && trim.journals.iter().any(|journal| endpoint.journal() == journal.journal()))
+        })
+    {
+        return false;
+    }
     through >= 0 && owner.log_epoch == floor.cut.replica_epoch.0 && owner.recovery_manifest_sha256.is_some()
         && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary >= through)
         && owner.storage_regions.values().all(|region| match region.first_required_replica() {
@@ -2111,6 +2125,52 @@ async fn reap_remote_paths(bucket: &dyn ObjectStore, deployments: &[DeploymentRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receipt_l0_needs_successor_coverage_and_trim_on_every_known_journal() {
+        use rtdb_directory::{CatalogAdmissionFloor, Checkpoint, ReplicaPayloadTrim};
+        use rtdb_types::{CatalogCut, JournalEndpoint, ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let journal = |id: &str| JournalEndpoint::Member {
+            address: id.to_owned(), journal: id.to_owned(),
+        };
+        let first = journal("first");
+        let later = journal("later");
+        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
+        owner.replica_journals.insert(first.clone());
+        owner.checkpoint = Some(Checkpoint {
+            block: 2, boundary: 8, source: 4, system_time: 100, root_sha256: Some([1; 32]),
+        });
+        owner.recovery_manifest_sha256 = Some([2; 32]);
+        let floor = CatalogAdmissionFloor {
+            residence: owner.storage_prefix(),
+            object_namespace: Uuid::new_v4(),
+            cut: CatalogCut {
+                storage_version: StorageVersion(6), storage_epoch: StorageEpoch(0),
+                replica_epoch: StorageEpoch(0), through: ReplicaPosition(6),
+            },
+        };
+        let mut release = GarbageRecord {
+            key: "tables/xt$bounded_retry_receipts/data/l00-rc-b00.arrow".into(),
+            released_at_ms: 0, trie_floor: None,
+        };
+        assert!(!recovery_covers_release(&owner, &release));
+        release.trie_floor = Some(floor);
+        assert!(!recovery_covers_release(&owner, &release));
+        owner.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim {
+            incarnation: owner.incarnation, log_epoch: owner.log_epoch, through: 6,
+            journals: BTreeSet::from([first]), applied: false, candidates: Vec::new(),
+        }));
+        assert!(!recovery_covers_release(&owner, &release));
+        owner.replica_payload_trim.as_mut().unwrap().applied = true;
+        assert!(recovery_covers_release(&owner, &release));
+        owner.replica_journals.insert(later.clone());
+        assert!(!recovery_covers_release(&owner, &release));
+        owner.replica_payload_trim.as_mut().unwrap().journals.insert(later);
+        assert!(recovery_covers_release(&owner, &release));
+        owner.checkpoint.as_mut().unwrap().boundary = 5;
+        assert!(!recovery_covers_release(&owner, &release));
+    }
 
     #[tokio::test]
     async fn a_local_sweep_preserves_a_fork_published_after_the_initial_inventory() {

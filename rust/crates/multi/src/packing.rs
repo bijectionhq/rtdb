@@ -66,9 +66,10 @@ pub fn pack_block(pack: &str) -> Option<i64> {
     rtdb_format::keys::block_index_from_key(&format!("{stem}.binpb")).ok().map(|block| block.0)
 }
 
-/// Whether a flush writes `key` before its block catalog: a level-0 trie file or a per-table block file.
+/// Whether to hold a flush object for its block pack.
 pub fn held_back(key: &str) -> bool {
     key.starts_with("tables/") && (key.contains("/data/l00-") || key.contains("/meta/l00-") || key.contains("/blocks/b"))
+        && !rtdb_format::keys::is_receipt_l0_file(key)
 }
 
 fn is_catalog(key: &str) -> bool { key.starts_with("blocks/b") && key.ends_with(".binpb") }

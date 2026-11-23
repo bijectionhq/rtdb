@@ -1494,9 +1494,21 @@ impl ReplicationDriver {
                 self.cut().await
             }
             Command::Delete { table, keys, completion, .. } => {
-                if keys.is_empty() || keys.iter().any(|key| key.level() == 0) {
-                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "A trie removal requires at least one non-L0 trie and contains no L0 trie")));
+                if keys.is_empty() || (keys.iter().any(|key| key.level() == 0)
+                    && !(self.resolve.storage.object_store().releases_receipt_l0() && table.stores_expiring_transaction_metadata()))
+                {
+                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "The requested trie batch is empty or contains an ineligible L0 file")));
                     return Ok(());
+                }
+                if keys.iter().any(|key| key.level() == 0) {
+                    let collection = self.partition.trie_collection();
+                    let eligible: BTreeSet<_> = collection.eligible_receipt_l0(&table, Timestamp::MAX).cloned().collect();
+                    if keys.iter().any(|key| key.level() == 0 && collection.current().retains_trie(&table, key)
+                        && !eligible.contains(key))
+                    {
+                        let _ = completion.send(Err(Anomaly::incorrect("rtdb.replication/invalid-trie-removal", "A receipt L0 file still belongs to an admitted view")));
+                        return Ok(());
+                    }
                 }
                 let message = proto::TriesDeleted { table_name: Some(table.schema_and_table()), trie_keys: keys.into_iter().map(|key| key.to_string()).collect() };
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesDeleted(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)
