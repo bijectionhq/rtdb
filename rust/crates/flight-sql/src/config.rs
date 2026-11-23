@@ -14,13 +14,9 @@ pub(crate) const AUDIENCE_HOLDER_TRANSPORT_BYTES: usize = 12 << 20;
 pub(crate) const AUDIENCE_REQUEST_BYTES: usize = 512 << 10;
 pub(crate) const AUDIENCE_REPLY_BYTES: usize = 2 << 20;
 
-pub(crate) const AUDIENCE_READ_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
-    provider_requests: 256,
-    provider_bytes: 32 << 20,
-    provider_metadata_bytes: 4 << 20,
-    scan_items: 65_536,
-    decode_bytes: 64 << 20,
-};
+mod audience_limits;
+pub(crate) use audience_limits::AUDIENCE_READ_LIMITS;
+
 pub(crate) const AUDIENCE_TURN_ACTIONS: usize = 64;
 pub(crate) const AUDIENCE_TURN_LIMITS: rtdb_storage::audience_work::Limits = rtdb_storage::audience_work::Limits {
     provider_requests: 4096,

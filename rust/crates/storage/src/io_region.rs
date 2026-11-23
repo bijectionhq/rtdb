@@ -152,11 +152,12 @@ impl IoRegion {
         let audience = Self::requires_audience_transport();
         let budget = crate::audience_work::current();
         tokio::spawn(async move {
-            let operation = operation;
-            let work = crate::audience_work::inherit(budget, work);
-            let result = if audience { Self::audience_object_read(work).await } else { work.await };
-            drop(sender.send(result));
-            drop(operation);
+            let custody = (operation, budget.clone());
+            crate::audience_work::hold_provider_custody(custody, async move {
+                let work = crate::audience_work::inherit(budget, work);
+                let result = if audience { Self::audience_object_read(work).await } else { work.await };
+                drop(sender.send(result));
+            }).await;
         }).await.map_err(|error| Error::Task(error.to_string()))?;
         receiver.await.map_err(|error| Error::Task(error.to_string()))?
     }

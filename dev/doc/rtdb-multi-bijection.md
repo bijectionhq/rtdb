@@ -153,6 +153,23 @@ Usher terminates Flight SQL and routes by basis:
 
 This replaces Bijection's separate Flight SQL gateway.
 
+#### Audience action work
+
+Each audience Flight action allows 256 object-store requests, 32 MiB of requested bodies, 4 MiB of provider metadata envelopes, 65,536 scan items and 64 MiB of decoding.
+An exact object read spends its request, requested body and 16 KiB metadata envelope before dispatch, including a zero-body HEAD.
+Exhaustion closes that ledger and refuses the operation.
+Actions against one applied hold also spend that hold's shared allowance.
+Nested work and detached provider attempts carry the same action ledger.
+An independently admitted Flight action starts its own action ledger and continues to spend the original hold's aggregate when it uses that hold.
+Cleanup closes use independent call capacity.
+
+On 2026-11-23, Verus 0.2026.11.20.9da409b checked 14 items and rejected all 11 controls in the [audience action ceilings area](../../verification/verus/audience_action_ceilings/area.json).
+It checked the shipped action limits, requested-work charges, closed-ledger and retry decisions, and the detached worker's retention of its original allowance and permit owner through its final poll.
+Source inspection traced the allowance through the task-local scope and the provider charge before object dispatch.
+The Flight request can finish before its admitted provider operation, so the worker holds the original call and seat permits, placement pin and request reservation until its result is handed off or disposed.
+The proof relies on Tokio's detached-task behavior, mutex and scope semantics, the bounded query paths applying the charge calls, and the dedicated provider transport keeping internal retries disabled.
+Provider completion time remains a premise.
+
 ### Subscriptions, watches and exports
 
 These read the deployment's log through `subscribe`, the RTDB counterpart of the `WorldStore` `changes` feed.

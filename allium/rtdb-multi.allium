@@ -1887,6 +1887,7 @@ rule BecomeIdle {
     -- The directory retains the published checkpoint and the time of the last activity.
     -- A move reservation takes precedence over the idle transition.
     -- A Flight SQL call keeps the placement active until its stream closes or the caller cancels.
+    -- An audience object read admitted before cancellation extends the placement pin and its original call reservation until the read drains.
     when: ResidentIdleDeadlineReached(holding)
 
     requires: holding.residency = active

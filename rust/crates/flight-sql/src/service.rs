@@ -69,7 +69,7 @@ pub(crate) struct Call {
     pub cancellation: CancellationToken,
     admission: Arc<Admission>,
     _lease: Option<AcquiredSession>,
-    _active_call: Option<Box<dyn Send + Sync>>,
+    _active_call: Option<Arc<dyn Send + Sync>>,
     _reservation: Arc<MemoryReservation>,
 }
 struct Admission { service: Service, permit: Option<OwnedSemaphorePermit> }
@@ -85,7 +85,12 @@ impl Drop for Call {
 impl Call {
     pub(crate) fn audience_io_owner(&self) -> Option<Arc<dyn Send + Sync>> {
         self.session.audience_source()?;
-        Some(Arc::new((Arc::clone(&self.admission), Arc::clone(&self.session))))
+        Some(Arc::new((
+            Arc::clone(&self.admission),
+            Arc::clone(&self.session),
+            self._active_call.clone(),
+            Arc::clone(&self._reservation),
+        )))
     }
 
     pub fn response<T>(&self, value: T) -> Result<Response<T>, Status> {
@@ -369,7 +374,7 @@ impl Service {
                 }
             }
         };
-        let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment));
+        let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
         let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
         self.publish(); Ok(call)

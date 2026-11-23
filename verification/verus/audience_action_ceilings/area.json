@@ -1,0 +1,221 @@
+{
+  "summary": "Checks the shipped Flight action ceiling, closed-ledger and retry decisions, and the detached storage worker's custody decision. Tokio task-local and mutex behavior, call-site ordering, and provider behavior are source correspondence.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "decision",
+    "--verify-module",
+    "drain",
+    "--verify-module",
+    "audience_limits",
+    "--verify-module",
+    "laws",
+    "--verify-root"
+  ],
+  "min_verified_functions": 14,
+  "controls": {
+    "charge_after_dispatch": {
+      "defect": "A provider request gets permission to dispatch with its request credit still available.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "provider_requests: remaining.provider_requests.checked_sub(cost.provider_requests)?,",
+          "replace": "provider_requests: remaining.provider_requests,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "release_before_drain": {
+      "defect": "A pending worker releases the operation and the original allowance.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/drain.rs",
+          "find": "if drained { None } else { owner }\n}",
+          "replace": "if drained { None } else { None }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/drain.rs",
+          "function": "retain_until_drained",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "retry_with_fresh_allowance": {
+      "defect": "A nested retry creates a fresh per-action ledger.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "if active { None } else { limits }\n}",
+          "replace": "limits\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "new_action",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "reopen_exhaustion": {
+      "defect": "An exhausted ledger admits zero work by reopening with a cleared balance.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "let remaining = remaining?;",
+          "replace": "let remaining = remaining.unwrap_or(cost);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "skip_scan_debit": {
+      "defect": "Traversing an item never spends its scan credit.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "scan_items: remaining.scan_items.checked_sub(cost.scan_items)?,",
+          "replace": "scan_items: remaining.scan_items,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "skip_decode_debit": {
+      "defect": "Decoding bytes never spends its decoding credit.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "decode_bytes: remaining.decode_bytes.checked_sub(cost.decode_bytes)?,",
+          "replace": "decode_bytes: remaining.decode_bytes,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "unmetered_provider_body": {
+      "defect": "A provider read asks for body bytes without including them in its charge.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "(1, bytes, PROVIDER_METADATA_BYTES, 0, 0)",
+          "replace": "(1, 0, PROVIDER_METADATA_BYTES, 0, 0)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "cost",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "allow_unpaid_action": {
+      "defect": "An applied hold can admit another action with zero action credits.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "    actions.checked_sub(1)\n",
+          "replace": "    Some(actions.saturating_sub(1))\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "admit_action",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "increase_body_ceiling": {
+      "defect": "An action gets twice its installed provider body ceiling.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/config/audience_limits.rs",
+          "find": "provider_bytes: 33_554_432,",
+          "replace": "provider_bytes: 67_108_864,"
+        },
+        {
+          "file": "rust/crates/flight-sql/src/config/audience_limits.rs",
+          "find": "AUDIENCE_READ_LIMITS.provider_bytes == 33_554_432,",
+          "replace": "AUDIENCE_READ_LIMITS.provider_bytes == 67_108_864,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/audience_action_ceilings/laws.rs",
+          "function": "action_boundaries",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "unmetered_scan_items": {
+      "defect": "Work charged as scan items can request a zero debit.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "Work::Scan(items) => (0, 0, 0, items, 0)",
+          "replace": "Work::Scan(items) => (0, 0, 0, 0, 0)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "cost",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    },
+    "unmetered_decode_bytes": {
+      "defect": "Work charged as decode bytes can request a zero debit.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "find": "Work::Decode(bytes) => (0, 0, 0, 0, bytes)",
+          "replace": "Work::Decode(bytes) => (0, 0, 0, 0, 0)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/storage/src/audience_work/decision.rs",
+          "function": "cost",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 13
+    }
+  }
+}

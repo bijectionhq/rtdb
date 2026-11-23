@@ -2202,7 +2202,7 @@ mod tests {
         let store = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let (mut scan, execution, _) = descriptor_scan(snapshot, table, store);
         scan.system_time = TemporalFilter::Default;
-        let limits = audience_work::Limits { provider_requests: 0, provider_bytes: 0, scan_items: 2300, decode_bytes: 0 };
+        let limits = audience_work::Limits { provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 2300, decode_bytes: 0 };
         let mut values = audience_work::within(Some(limits), async {
             let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
             let mut values = Vec::new();

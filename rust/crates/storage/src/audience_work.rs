@@ -7,16 +7,14 @@ use parking_lot::Mutex;
 
 use crate::{Error, Result};
 
-pub const PROVIDER_METADATA_BYTES: usize = 16 << 10;
+mod decision;
+#[cfg(any(feature = "remote", test))]
+mod drain;
 
-#[derive(Clone, Copy)]
-pub struct Limits {
-    pub provider_requests: usize,
-    pub provider_bytes: usize,
-    pub provider_metadata_bytes: usize,
-    pub scan_items: usize,
-    pub decode_bytes: usize,
-}
+use decision::Work;
+pub use decision::{Limits, PROVIDER_METADATA_BYTES};
+#[cfg(any(feature = "remote", test))]
+pub(crate) use drain::hold_provider_custody;
 
 type Allowance = Arc<Mutex<Option<Limits>>>;
 
@@ -33,7 +31,7 @@ impl TurnAllowance {
 
     pub fn admit_action(&self) -> Result<()> {
         let mut actions = self.actions.lock();
-        *actions = actions.checked_sub(1).ok_or(Error::AudienceWorkLimit)?;
+        *actions = decision::admit_action(*actions).ok_or(Error::AudienceWorkLimit)?;
         Ok(())
     }
 }
@@ -53,9 +51,11 @@ pub async fn within<T>(limits: Option<Limits>, work: impl Future<Output = T>) ->
 }
 
 pub async fn within_turn<T>(limits: Option<Limits>, turn: Option<TurnAllowance>, work: impl Future<Output = T>) -> T {
-    let budget = current().or_else(|| limits.map(|limits| Budget {
-        action: Arc::new(Mutex::new(Some(limits))), turn,
-    }));
+    let existing = current();
+    let budget = match decision::new_action(existing.is_some(), limits) {
+        Some(limits) => Some(Budget { action: Arc::new(Mutex::new(Some(limits))), turn }),
+        None => existing,
+    };
     inherit(budget, work).await
 }
 
@@ -74,15 +74,13 @@ pub(crate) async fn inherit<T>(budget: Option<Budget>, work: impl Future<Output 
     }
 }
 
-fn charge(update: impl Fn(&mut Limits) -> Option<()>) -> Result<()> {
+fn charge(work: Work) -> Result<()> {
     CURRENT.try_with(|budget| {
+        let cost = decision::cost(work);
         let debit = |allowance: &Allowance| {
             let mut available = allowance.lock();
-            if available.as_mut().and_then(&update).is_none() {
-                *available = None;
-                return Err(Error::AudienceWorkLimit);
-            }
-            Ok(())
+            *available = decision::debit(*available, cost);
+            available.as_ref().map(|_| ()).ok_or(Error::AudienceWorkLimit)
         };
         debit(&budget.action)?;
         if let Some(turn) = &budget.turn {
@@ -93,28 +91,17 @@ fn charge(update: impl Fn(&mut Limits) -> Option<()>) -> Result<()> {
 }
 
 pub(crate) fn provider_read(bytes: usize) -> Result<()> {
-    charge(|remaining| {
-        remaining.provider_requests = remaining.provider_requests.checked_sub(1)?;
-        remaining.provider_bytes = remaining.provider_bytes.checked_sub(bytes)?;
-        remaining.provider_metadata_bytes = remaining.provider_metadata_bytes.checked_sub(PROVIDER_METADATA_BYTES)?;
-        Some(())
-    })
+    charge(Work::ProviderRead(bytes))
 }
 
 /// Charges catalog, trie, and row traversal before doing the counted work.
 pub fn scan_items(count: usize) -> Result<()> {
-    charge(|remaining| {
-        remaining.scan_items = remaining.scan_items.checked_sub(count)?;
-        Some(())
-    })
+    charge(Work::Scan(count))
 }
 
 /// Charges the validated maximum size of decoding and inspecting input buffers.
 pub fn decode_bytes(bytes: usize) -> Result<()> {
-    charge(|remaining| {
-        remaining.decode_bytes = remaining.decode_bytes.checked_sub(bytes)?;
-        Some(())
-    })
+    charge(Work::Decode(bytes))
 }
 
 #[cfg(test)]
