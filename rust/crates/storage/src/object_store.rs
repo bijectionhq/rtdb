@@ -58,7 +58,7 @@ pub struct ReadReservation {
     length: usize,
     retention: Arc<dyn Send + Sync>,
     retained_bytes: usize,
-    scratch: Option<Arc<rtdb_types::MemoryReservation>>,
+    scratch: Option<(usize, Arc<rtdb_types::MemoryReservation>)>,
 }
 
 impl ReadReservation {
@@ -67,14 +67,28 @@ impl ReadReservation {
         Self { length, retention: Arc::new(retention), retained_bytes: 0, scratch: None }
     }
 
-    pub(crate) fn funded(length: usize, retained: Arc<rtdb_types::MemoryReservation>, scratch: Option<Arc<rtdb_types::MemoryReservation>>) -> Self {
+    /// Holds separate budget reservations for the returned bytes and temporary buffers.
+    pub fn funded(length: usize, retained: Arc<rtdb_types::MemoryReservation>, scratch: Option<Arc<rtdb_types::MemoryReservation>>) -> Self {
         let retained_bytes = retained.bytes();
+        let scratch = scratch.map(|charge| (charge.bytes(), charge));
         Self { length, retention: retained, retained_bytes, scratch }
     }
 
     pub fn covers(&self, allocation: &ObjectReadAllocation) -> bool {
         self.retained_bytes >= allocation.retained_bytes
-            && self.scratch.as_ref().map_or(0, |scratch| scratch.bytes()) >= allocation.scratch_bytes
+            && self.scratch.as_ref().map_or(0, |(bytes, _)| *bytes) >= allocation.scratch_bytes
+    }
+
+    /// Transfers scratch capacity to a nested read whose bytes are temporary to this read.
+    pub fn take_scratch_read(&mut self, length: usize, allocation: ObjectReadAllocation) -> Result<Self> {
+        let required = allocation.retained_bytes.checked_add(allocation.scratch_bytes)
+            .filter(|_| allocation.retained_bytes >= length);
+        if required.is_none_or(|required| self.scratch.as_ref().is_none_or(|(bytes, _)| *bytes < required)) {
+            return Err(Error::Closed("Nested read exceeds its scratch reservation".into()));
+        }
+        let (_, charge) = self.scratch.take().ok_or_else(|| Error::Closed("The read has no scratch reservation".into()))?;
+        let scratch = (allocation.scratch_bytes > 0).then(|| (allocation.scratch_bytes, Arc::clone(&charge)));
+        Ok(Self { length, retention: charge, retained_bytes: allocation.retained_bytes, scratch })
     }
 
     pub fn length(&self) -> usize { self.length }
@@ -89,7 +103,7 @@ impl ReadReservation {
     /// Keeps output and temporary charges alive in provider tasks admitted while polling this read.
     pub async fn retaining_io<T>(&self, work: impl std::future::Future<Output = T>) -> T {
         let owner: Arc<dyn Send + Sync> = match &self.scratch {
-            Some(scratch) => Arc::new((Arc::clone(&self.retention), Arc::clone(scratch))),
+            Some((_, scratch)) => Arc::new((Arc::clone(&self.retention), Arc::clone(scratch))),
             None => Arc::clone(&self.retention),
         };
         crate::IoRegion::retaining(owner, work).await
@@ -200,6 +214,8 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Whether a scan can read a slice without repeatedly loading the whole object.
     fn supports_scan_ranges(&self, _key: &ObjectKey) -> bool { true }
+    /// Whether a codec can read bounded, format-aligned ranges through `observe_range`.
+    fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool { self.supports_scan_ranges(key) }
     /// Retains the allocation charge during the read and with the returned bytes.
     /// Implementations that offload work beyond this future must move the reservation into that work.
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {

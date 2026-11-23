@@ -211,7 +211,7 @@ impl Drop for EmptyEntryCleanup<'_> {
     }
 }
 
-fn reserve_read(length: usize, allocation: ObjectReadAllocation, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<ReadReservation> {
+pub(crate) fn reserve_read(length: usize, allocation: ObjectReadAllocation, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<ReadReservation> {
     let retained = reserve(allocation.retained_bytes)?;
     let scratch = (allocation.scratch_bytes > 0).then(|| reserve(allocation.scratch_bytes)).transpose()?;
     Ok(ReadReservation::funded(length, retained, scratch))
@@ -330,10 +330,11 @@ impl BufferPool {
         (start <= end && end <= allocation.len()).then(|| CacheLease { allocation: allocation.clone(), range: start..end })
     }
 
-    async fn fetch(&self, key: &ObjectKey, range: Range<u64>, reserve: impl FnOnce(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
+    async fn fetch(&self, key: &ObjectKey, range: Range<u64>, reserve: impl Fn(usize) -> Result<Arc<MemoryReservation>>) -> Result<CacheLease> {
         let length = range.end.checked_sub(range.start).and_then(|length| usize::try_from(length).ok())
             .ok_or_else(|| Error::Task("Object range is inverted or exceeds addressable memory".into()))?;
-        let reservation = ReadReservation::new(length, reserve(length)?);
+        let allocation = self.store.scan_range_allocation(key, length)?;
+        let reservation = reserve_read(length, allocation, reserve)?;
         let allocation = Arc::new(self.store.get_reserved_range(key, range, reservation).await?);
         Ok(CacheLease { allocation, range: 0..length })
     }

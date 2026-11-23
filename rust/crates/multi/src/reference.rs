@@ -151,6 +151,9 @@ impl PrefixedStore {
 #[async_trait]
 impl ObjectStore for PrefixedStore {
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.full(key).is_ok_and(|key| self.bucket.supports_scan_ranges(&key)) }
+    fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool {
+        self.full(key).is_ok_and(|key| self.bucket.supports_observed_scan_ranges(&key))
+    }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head(&self.full(key)?).await?.size }) }
     async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { Ok(StoredObject { key: key.clone(), size: self.bucket.head_fresh(&self.full(key)?).await?.size }) }
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> { self.bucket.get_fresh(&self.full(key)?).await }

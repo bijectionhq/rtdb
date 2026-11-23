@@ -156,12 +156,21 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
 pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
     let object = store.head(key).await?;
     let mut file = create_file(path)?;
+    let ranges = store.supports_scan_ranges(key);
     let mut position = 0;
     while position < object.size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
-        let count = usize::try_from((object.size - position).min(1024 * 1024)).map_err(crate::invalid)?;
-        let reservation = ReadReservation::new(count, memory.reserve(count)?);
-        let bytes = store.get_reserved_range(key, position..position + count as u64, reservation).await?;
+        let remaining = object.size - position;
+        let count = usize::try_from(if ranges { remaining.min(1024 * 1024) } else { remaining }).map_err(crate::invalid)?;
+        let allocation = if ranges { store.scan_range_allocation(key, count)? } else { store.whole_object_allocation(key, count)? };
+        let retained = memory.reserve(allocation.retained_bytes)?;
+        let scratch = (allocation.scratch_bytes > 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
+        let reservation = ReadReservation::funded(count, retained, scratch);
+        let bytes = if ranges {
+            store.get_reserved_scan_range(key, position..position + count as u64, reservation).await?
+        } else {
+            store.get_reserved_object(key, reservation).await?
+        };
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }
@@ -451,6 +460,47 @@ mod tests {
     use rtdb_format::data::StoredOperation;
     use rtdb_format::data::{StoredEvent, build_event_batch};
     use rtdb_types::Iid;
+
+    struct WholeInput(bytes::Bytes);
+
+    #[async_trait]
+    impl ObjectStore for WholeInput {
+        fn supports_scan_ranges(&self, _: &ObjectKey) -> bool { false }
+
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> {
+            Ok(rtdb_storage::StoredObject { key: key.clone(), size: self.0.len() as u64 })
+        }
+
+        fn whole_object_allocation(&self, _: &ObjectKey, length: usize) -> rtdb_storage::Result<rtdb_storage::ObjectReadAllocation> {
+            Ok(rtdb_storage::ObjectReadAllocation { retained_bytes: length, scratch_bytes: length })
+        }
+
+        async fn get_reserved_object(&self, key: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<rtdb_storage::RetainedBytes> {
+            assert!(reservation.covers(&self.whole_object_allocation(key, self.0.len())?));
+            reservation.finish(self.0.clone())
+        }
+
+        async fn get(&self, _: &ObjectKey) -> rtdb_storage::Result<bytes::Bytes> { unreachable!() }
+        async fn get_range(&self, _: &ObjectKey, _: std::ops::Range<u64>) -> rtdb_storage::Result<bytes::Bytes> { unreachable!() }
+        async fn put(&self, _: &ObjectKey, _: bytes::Bytes) -> rtdb_storage::Result<()> { unreachable!() }
+        async fn put_file(&self, _: &ObjectKey, _: &Path) -> rtdb_storage::Result<()> { unreachable!() }
+        async fn list(&self, _: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<rtdb_storage::StoredObject>> { unreachable!() }
+        async fn delete(&self, _: &ObjectKey) -> rtdb_storage::Result<()> { unreachable!() }
+    }
+
+    #[tokio::test]
+    async fn compaction_downloads_whole_only_inputs_under_a_complete_reservation() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.arrow");
+        let input = WholeInput(bytes::Bytes::from(vec![7; 2 << 20]));
+        let memory = MemoryBudget::new(4 << 20);
+        let mut file = download(&input, &memory, &ObjectKey::new("input.arrow")?, &path, &CancellationToken::new()).await?;
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).map_err(crate::invalid)?;
+        assert_eq!(body.as_slice(), input.0.as_ref());
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
 

@@ -3,13 +3,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
-    ops::Range,
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use bytes::Bytes;
 use prost_types::Any;
 use rtdb_columnar::MemoryBudget;
 use rtdb_directory::{CheckpointStage, DeploymentRecord, Directory, HostedTask, Lifecycle};
@@ -17,7 +15,7 @@ use rtdb_format::{catalog::CheckpointContents, database::proto::database_config}
 use rtdb_node::{Database, LogAccess, LogFactory, OpenedLogs, ReadFence, RemoteStorageFactory};
 use rtdb_replication::BlockDiscovery;
 use rtdb_server::{PlacedOptions, ServerDriver, config::NodeConfiguration};
-use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, object_store::StoredObject};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch};
 use serde::Serialize;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
@@ -26,8 +24,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ArchivedObject, CapturePoint, checkpoint_objects, checkpoint_storage_root, digest, encode,
-    inconsistent, read, read_object,
+    CapturePoint, checkpoint_objects, checkpoint_storage_root, digest, encode,
+    inconsistent, read,
+    read_world::CapturedObjects,
     stage::{STAGED_MANIFEST, StageInventory, with_region},
     unavailable,
 };
@@ -181,6 +180,7 @@ pub(super) async fn admit_transfer_destination(
         if verified.contents != CheckpointContents::Replay {
             return Err(inconsistent("Terminal transfer requires a complete replay checkpoint"));
         }
+        verified.require_serving_envelope()?;
         Ok(authority.stage)
     }).await
 }
@@ -300,6 +300,16 @@ impl ReadFence for StageReadAuthority {
 struct VerifiedStage {
     store: Arc<dyn ObjectStore>,
     contents: CheckpointContents,
+    legacy_trie_data: bool,
+}
+
+impl VerifiedStage {
+    fn require_serving_envelope(&self) -> Result<()> {
+        if self.legacy_trie_data {
+            return Err(unavailable("Checkpoint transfer requires framed trie data in the staged installation"));
+        }
+        Ok(())
+    }
 }
 
 async fn open_inventory(
@@ -364,10 +374,8 @@ async fn open_inventory(
         .existing_key(&record.key_id())
         .await?
         .ok_or_else(|| unavailable("The staged checkpoint key is unavailable"))?;
-    let plaintext = Arc::new(EncryptingStore::new(
-        Arc::new(StageObjects { files, objects }),
-        &material,
-    )?);
+    let legacy_trie_data = objects.iter().any(|(name, object)| object.is_legacy_trie(name));
+    let plaintext = Arc::new(CapturedObjects { files, objects, cipher: crate::keys::legacy_archive_key(&material)? });
     let extras = observed.difference(&expected).cloned().collect::<BTreeSet<_>>();
     if !extras.is_empty() {
         let serving = EncryptingStore::new(Arc::new(PrefixedStore::new(Arc::clone(&bucket), root)), &material)?;
@@ -388,79 +396,7 @@ async fn open_inventory(
             "The staged object inventory differs from the checkpoint closure",
         ));
     }
-    Ok(VerifiedStage { store: plaintext, contents })
-}
-
-struct StageObjects {
-    files: PrefixedStore,
-    objects: BTreeMap<ObjectKey, ArchivedObject>,
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for StageObjects {
-    fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.files.supports_scan_ranges(key) }
-    async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        self.objects
-            .get(key)
-            .map(|object| StoredObject {
-                key: key.clone(),
-                size: object.bytes,
-            })
-            .ok_or_else(|| Error::MissingObject(key.to_string()))
-    }
-
-    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
-        let expected = self.head(key).await?;
-        if self.files.head_fresh(key).await?.size != expected.size {
-            return Err(Error::ConflictingObject(key.to_string()));
-        }
-        Ok(expected)
-    }
-
-    async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
-        let object = self
-            .objects
-            .get(key)
-            .ok_or_else(|| Error::MissingObject(key.to_string()))?;
-        read_object(&self.files, key, object).await
-    }
-
-    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
-        let bytes = self.get(key).await?;
-        if range.start > range.end || range.end > bytes.len() as u64 {
-            return Err(Error::InvalidRange {
-                key: key.to_string(),
-                start: range.start,
-                end: range.end,
-                length: bytes.len() as u64,
-            });
-        }
-        Ok(bytes.slice(range.start as usize..range.end as usize))
-    }
-
-    async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
-        Ok(self
-            .objects
-            .iter()
-            .filter(|(key, _)| directory.is_none_or(|root| key.is_under(root)))
-            .map(|(key, object)| StoredObject {
-                key: key.clone(),
-                size: object.bytes,
-            })
-            .collect())
-    }
-
-    async fn put(&self, key: &ObjectKey, _: Bytes) -> rtdb_storage::Result<()> {
-        Err(Error::ReadOnlyLog(PathBuf::from(key.as_str())))
-    }
-
-    async fn put_file(&self, key: &ObjectKey, _: &std::path::Path) -> rtdb_storage::Result<()> {
-        Err(Error::ReadOnlyLog(PathBuf::from(key.as_str())))
-    }
-
-    async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
-        Err(Error::ReadOnlyLog(PathBuf::from(key.as_str())))
-    }
+    Ok(VerifiedStage { store: plaintext, contents, legacy_trie_data })
 }
 
 struct StageStorage {
@@ -687,36 +623,30 @@ async fn monitor(authority: &StageReadAuthority, stop: &CancellationToken) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{ArchivedObject, Cipher};
+    use bytes::Bytes;
+    use rtdb_storage::Error;
 
     #[tokio::test]
     async fn kept_stage_objects_disallow_writes_and_substituted_bytes() -> Result<()> {
         let files = PrefixedStore::new(Arc::new(rtdb_storage::MemoryStore::default()), "stage");
-        let selected = key("selected")?;
-        let substitute = key("substitute")?;
-        let unsigned = key("unsigned")?;
+        let selected = key("tables/t/data/selected.arrow")?;
+        let substitute = key("tables/t/data/substitute.arrow")?;
+        let unsigned = key("tables/t/data/unsigned.arrow")?;
         let bytes = Bytes::from_static(b"accepted");
-        files.put(&selected, bytes.clone()).await?;
-        files
-            .put(&substitute, Bytes::from_static(b"replaced"))
-            .await?;
-        files.put(&unsigned, bytes.clone()).await?;
-        let store = StageObjects {
-            files,
-            objects: [selected.clone(), substitute.clone()]
-                .into_iter()
-                .map(|key| {
-                    (
-                        key.clone(),
-                        ArchivedObject {
-                            name: key.to_string(),
-                            bytes: bytes.len() as u64,
-                            sha256: digest(&bytes),
-                            frame_header_sha256: None,
-                        },
-                    )
-                })
-                .collect(),
-        };
+        let material = [3; crate::keys::KEY_BYTES];
+        let cipher = Cipher::new(&material)?;
+        let mut objects = BTreeMap::new();
+        for name in [&selected, &substitute] {
+            let sealed = cipher.seal_deterministic(name.as_str(), &bytes)?;
+            objects.insert(name.clone(), ArchivedObject {
+                name: name.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None,
+            });
+            let stored = if name == &substitute { cipher.seal_deterministic(name.as_str(), b"replaced")? } else { sealed };
+            files.put(name, stored).await?;
+        }
+        files.put(&unsigned, cipher.seal_deterministic(unsigned.as_str(), &bytes)?).await?;
+        let store = CapturedObjects { files, objects, cipher: crate::keys::legacy_archive_key(&material)? };
         assert_eq!(store.get(&selected).await?, bytes);
         assert!(matches!(
             store.get(&substitute).await,
@@ -728,6 +658,8 @@ mod tests {
         ));
         assert!(store.put(&selected, bytes).await.is_err());
         assert!(store.delete(&selected).await.is_err());
+        let stage = VerifiedStage { store: Arc::new(store), contents: CheckpointContents::Replay, legacy_trie_data: true };
+        assert!(stage.require_serving_envelope().is_err());
         Ok(())
     }
 }

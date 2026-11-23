@@ -147,6 +147,8 @@ Only the physical original pack is erased, so the archive continues to serve the
 An in-place restore of an archive-backed installation must adopt a complete replay capture.
 A parked installation can advance its serving archive after restore and preserves the earlier restore receipt.
 The old repair capture becomes eligible for retirement after selection advances and its admitted readers drain.
+[ArchiveEnvelopeReads](../tla/ArchiveEnvelopeReads.tla) checks that older archive envelopes can supply the same logical objects under a whole-object reservation and a current cache namespace.
+Accepted framed members support authenticated range observations independently of the disk cache fill plan.
 The [checkpoint-metadata Verus proofs](../verus/checkpoint_metadata/laws.rs) check the pack and journal bounds and exclude new admissions of the old metadata.
 [LocalReplayPackRetirement](../tla/LocalReplayPackRetirement.tla) checks that new readers can open after erasure and detects weakened guards for original readers, raw copies, descendants, the journal and restore.
 Hosted versioned and unversioned storage still require provider-specific retirement authority for mixed packs.

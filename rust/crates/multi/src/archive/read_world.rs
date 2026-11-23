@@ -11,7 +11,7 @@ use rtdb_query::{
 };
 use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint};
 use rtdb_storage::{
-    Error, ObjectKey, ObjectStore, StoredObject,
+    Error, ObjectKey, ObjectObservation, ObjectReadAllocation, ObjectStore, ReadReservation, RetainedBytes, StoredObject,
     cache::{BufferPool, CacheBudget},
 };
 use rtdb_types::{
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::{
     ArchiveKey, ArchivedObject, CellStorage, KeyService, PrefixedStore, archive_witness,
-    capture_receipt, inconsistent, key, read, read_object, replica_suffix, require_capture_open, stage,
+    capture_receipt, inconsistent, key, observe_archive_object, read, read_object, replica_suffix, require_capture_open, stage,
     read_archive_lifetime_floors, unavailable, verified_archive,
 };
 
@@ -433,7 +433,27 @@ impl ObjectStore for CapturedObjects {
         })
     }
 
-    async fn observe_head(&self, name: &ObjectKey) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<StoredObject>> {
+    async fn head_fresh(&self, name: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+        Ok(self.observe_head(name).await?.value)
+    }
+
+    fn whole_object_allocation(&self, name: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
+        let object = self.object(name)?;
+        if object.plaintext_bytes(name)? != length as u64 { return Err(Error::ConflictingObject(name.to_string())); }
+        let scratch_bytes = usize::try_from(object.bytes).ok().and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| Error::Task("Checkpoint object allocation size overflow".into()))?;
+        Ok(ObjectReadAllocation { retained_bytes: length, scratch_bytes })
+    }
+
+    async fn get_reserved_object(&self, name: &ObjectKey, reservation: ReadReservation) -> rtdb_storage::Result<RetainedBytes> {
+        if !reservation.covers(&self.whole_object_allocation(name, reservation.length())?) {
+            return Err(Error::Closed("Checkpoint object read has no scratch reservation".into()));
+        }
+        let plaintext = reservation.retaining_io(self.get(name)).await?;
+        reservation.finish(plaintext)
+    }
+
+    async fn observe_head(&self, name: &ObjectKey) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         let object = self.object(name)?;
         let mut observed = self.files.observe_head(name).await?;
         if observed.value.size != object.bytes {
@@ -443,14 +463,14 @@ impl ObjectStore for CapturedObjects {
         Ok(observed)
     }
 
-    async fn observe_fresh_exact(&self, name: &ObjectKey, length: usize) -> rtdb_storage::Result<rtdb_storage::ObjectObservation<Bytes>> {
+    async fn observe_fresh_exact(&self, name: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
         let object = self.object(name)?;
         if object.plaintext_bytes(name)? != length as u64 {
             return Err(Error::ConflictingObject(name.to_string()));
         }
-        let observed = super::observe_archive_object(&self.files, name, object).await?;
+        let observed = observe_archive_object(&self.files, name, object).await?;
         let value = object.open(self.cipher.as_ref(), name, observed.value).await?;
-        Ok(rtdb_storage::ObjectObservation { value, version: observed.version })
+        Ok(ObjectObservation { value, version: observed.version })
     }
 
     async fn get(&self, name: &ObjectKey) -> rtdb_storage::Result<Bytes> {

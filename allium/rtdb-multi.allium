@@ -2850,6 +2850,10 @@ rule RetainServingReplayArchive {
     -- A parked root can select an independently verified replay capture of its exact current checkpoint.
     -- The installation publishes the capture and the recovery inventory digest observed in its archive custody together.
     -- A new region opens that source under its own admission before rechecking the published inventory.
+    -- A retained capture preserves its accepted manifest and envelope for each object.
+    -- A capture with whole-object authenticated trie data supplies the same logical contents through a bounded whole-object read after framed writes begin.
+    -- The source retains its residence while its selected capture still requires an envelope conversion for cell transfer.
+    -- A held stage can serve whole-object reads before conversion, and requires the current serving envelope before terminal transfer.
     -- Later captures can inherit the admitted source and a newer verified checkpoint can replace it.
     -- A completed restore can advance to a newer replay capture after the root parks at that checkpoint.
     -- A superseded archive stays available to readers admitted under its identity until their work drains.

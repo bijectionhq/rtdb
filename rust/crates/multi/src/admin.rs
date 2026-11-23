@@ -1229,6 +1229,12 @@ async fn prepare_cell_move(
         return Err(Anomaly::incorrect("rtdb.multi/shared-cell-journal", "Cell moves require independent replica journals"));
     }
 
+    let serving_archive = if current.lifecycle == Lifecycle::Live {
+        Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.keys, &current, hosted_task.as_ref())).await?
+    } else {
+        crate::archive::serving_archive_operation(&current)?
+    };
+
     let source = update_installation(from.directory.as_ref(), &current.id, |record| {
         if record.lifecycle == Lifecycle::Moving && intent_matches(record, intent) && same_media(record) {
             return Ok(());
@@ -1239,6 +1245,7 @@ async fn prepare_cell_move(
             || record.ensemble != current.ensemble || record.replica_journals != current.replica_journals
             || record.log_copy_servers != current.log_copy_servers || record.log_epoch != current.log_epoch
             || record.engine_pin != current.engine_pin || record.move_from.is_some()
+            || crate::archive::serving_archive_operation(record)? != serving_archive
         {
             return Err(conflict());
         }

@@ -4,6 +4,7 @@
 -- Merges small tries into larger ones for better query performance.
 -- The consumer of this work is the scan operator.
 -- It reads the trie catalog to understand which files it has to read for a given query.
+-- Native compaction reserves the temporary buffers for each authenticated input range or for a whole-object input before downloading it.
 --
 -- This assumes understanding of the "Building a Bitemporal Index" trilogy:
 -- https://xtdb.com/blog/building-a-bitemp-index-1-taxonomy
