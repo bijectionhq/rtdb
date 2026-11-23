@@ -82,7 +82,7 @@ pub use owned_relation::{
 };
 pub use owned_relation::{
     open_owned_lifetime_point, open_owned_point_with_position_mask, open_owned_valid_during_with_position_mask, open_owned_world_constraint_projection,
-    owned_row_lifetime, read_owned_point_revision,
+    owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
 };
 
 mod owned_journal;

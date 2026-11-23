@@ -4,7 +4,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_directory::{CheckpointWorldRetention, DeploymentRecord, Directory, HostedTask, MAX_RETAINED_WORLDS, now_ms};
 use rtdb_node::{NativeSession, OwnedReadSession, OwnedWorldWitness, TransactionStatus};
 use rtdb_types::{
-    EntityId, Iid, Interval, OwnedRelation, OwnedWorld, PlacedAttemptScope, Result, StructFields,
+    EntityId, Iid, Interval, OwnedRelation, OwnedWorld, OwnedWorldAssertion, PlacedAttemptScope, Result, StructFields,
     Timestamp, TransactionKey, Value, WorldClockMode, WorldSchemas, WorldShadow,
 };
 use uuid::Uuid;
@@ -1128,6 +1128,7 @@ pub struct WorldPoint {
 pub struct WorldFact {
     row: StructFields<Value>,
     revision: Timestamp,
+    assertion: Option<OwnedWorldAssertion>,
     lifetime: Option<Interval>,
     _reservation: Arc<MemoryReservation>,
 }
@@ -1137,8 +1138,21 @@ impl WorldFact {
         &self.row
     }
 
-    pub(crate) fn into_parts(self) -> (StructFields<Value>, Timestamp, Arc<MemoryReservation>) {
-        (self.row, self.revision, self._reservation)
+    pub(crate) fn into_parts(self) -> (StructFields<Value>, Timestamp, Option<OwnedWorldAssertion>, Arc<MemoryReservation>) {
+        (self.row, self.revision, self.assertion, self._reservation)
+    }
+
+    fn into_shadow(mut self, line: Iid) -> Result<Option<Self>> {
+        match WorldShadow::from_record(self.row)? {
+            WorldShadow::Deleted => Ok(None),
+            WorldShadow::Present(row) => {
+                self.row = row;
+                if let Some(assertion) = &mut self.assertion {
+                    assertion.line = Some(line);
+                }
+                Ok(Some(self))
+            }
+        }
     }
 }
 
@@ -1156,6 +1170,8 @@ fn decode_point(
                 return Err(OwnedWorld::unavailable());
             }
             let revision = rtdb_query::owned_row_revision(batch, row, id, memory)?;
+            let assertion = rtdb_query::owned_row_assertion_ordinal(batch, row)?
+                .map(|ordinal| OwnedWorldAssertion { line: None, ordinal });
             let lifetime = lifetime.map(|duration| {
                 let (created, expires) = rtdb_query::owned_row_lifetime(batch, row, revision, duration)?;
                 Interval::new(created, expires)
@@ -1166,7 +1182,7 @@ fn decode_point(
                     .fields()
                     .iter()
                     .zip(batch.columns())
-                    .filter(|(field, _)| field.name() != "_system_from"
+                    .filter(|(field, _)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal")
                         && !(lifetime.is_some() && matches!(field.name().as_str(), "_valid_from" | "_valid_to")))
             };
             let charge = columns().try_fold(4096usize, |bound, (field, column)| {
@@ -1192,6 +1208,7 @@ fn decode_point(
             found = Some(WorldFact {
                 row: fields,
                 revision,
+                assertion,
                 lifetime,
                 _reservation: reservation,
             });
@@ -1220,11 +1237,31 @@ impl OpenWorld {
         let Some(fact) = decode_point(read.row.into_iter().collect(), id, memory, None)? else {
             return Ok((None, read.witness));
         };
-        let visible = match WorldShadow::from_record(fact.row)? {
-            WorldShadow::Deleted => None,
-            WorldShadow::Present(row) => Some(WorldFact { row, revision: fact.revision, lifetime: None, _reservation: fact._reservation }),
-        };
+        let visible = fact.into_shadow(self.record.id)?;
         Ok((Some(visible), read.witness))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_shadow_keeps_the_winning_ordinal_on_its_authoring_line() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let id = EntityId::String("item".into());
+        let row = WorldShadow::Present(StructFields::from([("_id".into(), id.as_value())])).record(&id)?;
+        let ordinal = std::num::NonZeroU32::new(3).unwrap();
+        let fact = WorldFact {
+            row, revision: Timestamp(20), assertion: Some(OwnedWorldAssertion { line: None, ordinal }),
+            lifetime: None, _reservation: memory.reserve(4096)?,
+        };
+        let line = Iid([7; 16]);
+        let fact = fact.into_shadow(line)?.unwrap();
+        assert_eq!(fact.revision, Timestamp(20));
+        assert_eq!(fact.assertion, Some(OwnedWorldAssertion { line: Some(line), ordinal }));
+        assert_eq!(fact.row.len(), 1);
+        Ok(())
     }
 }
 

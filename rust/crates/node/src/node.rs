@@ -1683,8 +1683,8 @@ impl OwnedReadSession {
         let relation = root.in_world(world)?;
         let mut row = None;
         let mut local_revision = None;
-        if let Some(mut cursor) = rtdb_query::open_owned_point(
-            Arc::clone(&context), &self.owner, &relation, id, Some(valid), None,
+        if let Some(mut cursor) = rtdb_query::open_owned_assertion_point(
+            Arc::clone(&context), &self.owner, &relation, id, Some(valid), false,
         ).await? {
             while let Some(batch) = cursor.next_batch().await? {
                 if batch.batch().num_rows() == 0 { continue; }

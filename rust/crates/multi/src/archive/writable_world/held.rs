@@ -385,12 +385,7 @@ impl HeldCheckpointWorld {
             }
             let shadowed = local.is_some();
             let mut fact = match local {
-                Some(fact) => match WorldShadow::from_record(fact.row)? {
-                    WorldShadow::Deleted => None,
-                    WorldShadow::Present(row) => Some(WorldFact {
-                        row, revision: fact.revision, lifetime: None, _reservation: fact._reservation,
-                    }),
-                },
+                Some(fact) => fact.into_shadow(self.open.record.id)?,
                 None => self.archive_point(relation, id, valid, None).await?,
             };
             if let Some(fact) = &mut fact {
@@ -687,12 +682,7 @@ impl HeldCheckpointWorld {
         let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
         let shadowed = local.is_some();
         let fact = match local {
-            Some(fact) => match WorldShadow::from_record(fact.row)? {
-                WorldShadow::Deleted => None,
-                WorldShadow::Present(row) => Some(WorldFact {
-                    row, revision: fact.revision, lifetime: None, _reservation: fact._reservation,
-                }),
-            },
+            Some(fact) => fact.into_shadow(self.open.record.id)?,
             None => self.archive_point_checked(relation, id, valid, None, Some(schema)).await?,
         };
         if let Some(fact) = &fact {
@@ -1190,12 +1180,7 @@ impl HeldCheckpointWorld {
             let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
             let shadowed = local.is_some();
             let fact = match local {
-                Some(fact) => match WorldShadow::from_record(fact.row)? {
-                    WorldShadow::Deleted => None,
-                    WorldShadow::Present(row) => Some(WorldFact {
-                        row, revision: fact.revision, lifetime: None, _reservation: fact._reservation,
-                    }),
-                },
+                Some(fact) => fact.into_shadow(self.open.record.id)?,
                 None => self.archive_point(relation, id, window[0], None).await?,
             };
             if let Some(fact) = fact {
@@ -1572,8 +1557,8 @@ impl<'a> InheritedRelation<'a> {
     async fn shadow(&self, id: &EntityId, valid: Interval) -> Result<Option<Option<WorldFact>>> {
         let unavailable = OwnedWorld::unavailable;
         let mut shadow = None;
-        if let Some(mut rows) = rtdb_query::open_owned_point(
-            Arc::clone(&self.overlay), self.owner, &self.shadow, id, Some(valid), None,
+        if let Some(mut rows) = rtdb_query::open_owned_assertion_point(
+            Arc::clone(&self.overlay), self.owner, &self.shadow, id, Some(valid), false,
         ).await? {
             while let Some(batch) = rows.next_batch().await? {
                 if batch.batch().num_rows() == 0 { continue; }
@@ -1584,13 +1569,10 @@ impl<'a> InheritedRelation<'a> {
         self.overlay.check_cancelled()?;
         if let Some(shadow) = shadow {
             if shadow.revision > self.overlay_basis { return Err(unavailable()); }
-            let fact = match WorldShadow::from_record(shadow.row)? {
-                WorldShadow::Deleted => None,
-                WorldShadow::Present(row) => {
-                    self.schema.validate_row(&row)?;
-                    Some(WorldFact { row, revision: shadow.revision, lifetime: None, _reservation: shadow._reservation })
-                }
-            };
+            let fact = shadow.into_shadow(self.world)?;
+            if let Some(fact) = &fact {
+                self.schema.validate_row(&fact.row)?;
+            }
             return Ok(Some(fact));
         }
         Ok(None)

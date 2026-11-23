@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU32};
 
 use sha2::{Digest, Sha256};
 
@@ -76,6 +76,13 @@ pub enum WorldClockMode {
     Retained,
     Held { start: Timestamp },
     Proposal,
+}
+
+/// The winning event's line and ordinal at the returned physical revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnedWorldAssertion {
+    pub line: Option<Iid>,
+    pub ordinal: NonZeroU32,
 }
 
 impl WorldClockMode {

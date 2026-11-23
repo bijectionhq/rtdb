@@ -7,7 +7,7 @@ use rtdb_directory::{Directory, HostedTask};
 use rtdb_node::NodeOptions;
 use rtdb_plan::Catalog;
 use rtdb_query::{
-    CatalogSnapshot, DatabaseSnapshot, QueryContext, open_owned_point, owned_row_revision,
+    CatalogSnapshot, DatabaseSnapshot, QueryContext, open_owned_assertion_point, owned_row_revision,
 };
 use rtdb_replication::{BlockDiscovery, BlockStore, PublishedCheckpoint};
 use rtdb_storage::{
@@ -128,7 +128,7 @@ pub(super) async fn read_checkpoint_point_in_context(
         let valid = point.valid.ok_or_else(|| inconsistent("The archived lifetime requires an exact valid instant"))?;
         rtdb_query::open_owned_lifetime_point(context, point.owner, point.relation, point.id, valid).await?
     } else {
-        open_owned_point(context, point.owner, point.relation, point.id, point.valid, None).await?
+        open_owned_assertion_point(context, point.owner, point.relation, point.id, point.valid, false).await?
     };
     let Some(mut cursor) = cursor else { return Ok(None); };
     let mut batches = Vec::new();

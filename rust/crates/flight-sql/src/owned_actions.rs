@@ -313,6 +313,7 @@ const OWNED_SEARCH_WITNESSES: &str = "rtdb.owned.search_witnesses";
 const OWNED_VERSION_TIME: &str = "rtdb.owned.version_micros";
 const OWNED_REVISION: &str = "rtdb.owned.revision_micros";
 const OWNED_ASSERTION_ORDINAL: &str = "rtdb.owned.assertion_ordinal";
+const OWNED_ASSERTION_LINE: &str = "rtdb.owned.assertion_line";
 const OWNED_ASSERTION_ORDINALS: &str = "rtdb.owned.assertion_ordinals";
 const OWNED_CHANGE_COVERAGE: &str = "rtdb.owned.change_coverage_micros";
 
@@ -3648,7 +3649,12 @@ impl Service {
             metadata.insert(WORLD_POINT_WITNESS.into(), nonce.simple().to_string());
         }
         if let Some(row) = result.row {
-            let crate::WorldPointRow { fields: row, revision, reservation: _retained } = row;
+            let crate::WorldPointRow { fields: row, revision, assertion, reservation: _retained } = row;
+            if let Some(assertion) = assertion {
+                metadata.insert(OWNED_ASSERTION_LINE.into(),
+                    Uuid::from_bytes(assertion.line.map_or([0; 16], |line| line.0)).simple().to_string());
+                metadata.insert(OWNED_ASSERTION_ORDINAL.into(), assertion.ordinal.to_string());
+            }
             let bytes = Value::document_retained_bytes(&row).map_err(status)?;
             let _encoding = call.reserve(wire::add(4096, wire::mul(bytes, 8)?)?)?;
             let mut fields = Vec::with_capacity(row.len());
@@ -4408,12 +4414,11 @@ impl Service {
         metadata.insert(OWNED_VALID.into(), valid.0.to_string());
         if let Some(revision) = revision { metadata.insert(OWNED_REVISION.into(), revision.0.to_string()); }
         if let Some(until) = until { metadata.insert("rtdb.owned.until_micros".into(), until.0.to_string()); }
-        if let Some(ordinal) = batch.and_then(|batch| batch.column_by_name("_assertion_ordinal")) {
-            let ordinal = ordinal.as_any().downcast_ref::<Int64Array>()
-                .filter(|ordinal| ordinal.len() == 1 && ordinal.is_valid(0))
-                .ok_or_else(|| Status::internal("Owned point has an invalid assertion ordinal"))?
-                .value(0);
-            if ordinal > 0 {
+        if let Some(batch) = batch.filter(|batch| batch.column_by_name("_assertion_ordinal").is_some()) {
+            if batch.num_rows() != 1 {
+                return Err(Status::internal("Owned point has an invalid assertion ordinal"));
+            }
+            if let Some(ordinal) = rtdb_query::owned_row_assertion_ordinal(batch, 0).map_err(status)? {
                 metadata.insert(OWNED_ASSERTION_ORDINAL.into(), ordinal.to_string());
             }
         }

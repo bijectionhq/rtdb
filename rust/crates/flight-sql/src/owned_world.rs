@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
 use rtdb_node::{Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Interval, OwnedRelation, Result, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
+use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorldAssertion, Result, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -90,6 +90,7 @@ pub struct WorldPointResult {
 pub struct WorldPointRow {
     pub fields: StructFields<Value>,
     pub revision: Timestamp,
+    pub assertion: Option<OwnedWorldAssertion>,
     pub reservation: Arc<MemoryReservation>,
 }
 

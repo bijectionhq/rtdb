@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, Value};
@@ -63,7 +63,7 @@ pub async fn open_owned_lifetime_point(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
 ) -> Result<Option<QueryCursor>> {
     if owner.is_empty() || !relation.is_root_data() || valid.is_empty() { return Err(address_unavailable()); }
-    open_owned_table_point_with_edges(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true, false).await
+    open_owned_table_point_with_edges(context, relation.table(owner), id.iid(), Some(id), Some(valid), None, false, true, true).await
 }
 
 /// Revalidates an immutable artefact's nominated row with its complete key.
@@ -762,6 +762,17 @@ pub fn owned_row_revision(
         Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } => Ok(Timestamp(value)),
         _ => Err(Anomaly::fault("rtdb.owned/row-revision", "Owned row revision is not a microsecond timestamp")),
     }
+}
+
+pub fn owned_row_assertion_ordinal(batch: &arrow_array::RecordBatch, row: usize) -> Result<Option<NonZeroU32>> {
+    use arrow_array::{Array, Int64Array};
+
+    let Some(column) = batch.column_by_name("_assertion_ordinal") else { return Ok(None); };
+    let invalid = || Anomaly::fault("rtdb.owned/assertion-ordinal", "Owned read returned an invalid assertion ordinal");
+    let array = column.as_any().downcast_ref::<Int64Array>()
+        .filter(|array| row < array.len() && array.is_valid(row)).ok_or_else(invalid)?;
+    let position = u32::try_from(array.value(row)).map_err(|_| invalid())?;
+    Ok(NonZeroU32::new(position))
 }
 
 #[derive(Clone, Copy)]

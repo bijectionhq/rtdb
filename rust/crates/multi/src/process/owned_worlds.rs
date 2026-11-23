@@ -427,16 +427,16 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
 fn path_touch_result(present: Timestamp, (fact, shadowed): (Option<crate::archive::WorldFact>, bool)) -> WorldPointResult {
     let row = fact.map(|fact| {
-        let (fields, revision, reservation) = fact.into_parts();
-        WorldPointRow { fields, revision, reservation }
+        let (fields, revision, assertion, reservation) = fact.into_parts();
+        WorldPointRow { fields, revision, assertion, reservation }
     });
     WorldPointResult { present, row, until: None, shadowed, witness: None }
 }
 
 fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
     let row = read.fact.map(|fact| {
-        let (fields, revision, reservation) = fact.into_parts();
-        WorldPointRow { fields, revision, reservation }
+        let (fields, revision, assertion, reservation) = fact.into_parts();
+        WorldPointRow { fields, revision, assertion, reservation }
     });
     WorldPointResult { present: read.present.system_time, row, until: read.until, shadowed: read.shadowed, witness: read.witness }
 }
