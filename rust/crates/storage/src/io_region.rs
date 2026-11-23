@@ -210,13 +210,14 @@ impl IoRegion {
         Self::reading(view, self.run(move || work(&selection.0, &selection.1))).await
     }
 
-    pub(crate) async fn admit_read<O, A>(&self, owner: Arc<O>, target: A) -> Result<IoAdmission>
+    pub(crate) fn admit_read<O, A>(&self, owner: Arc<O>, target: A) -> Result<IoAdmission>
     where
         O: Send + Sync + 'static,
         A: Send + Sync + 'static,
     {
-        let view = HeldView::recovery(Arc::new((owner, target)));
-        Self::reading(view, async { self.admit() }).await
+        let mut operation = self.admit()?;
+        operation.lifetimes.push(HeldView::recovery(Arc::new((owner, target))));
+        Ok(operation)
     }
 
     /// Admits a provider read of the selected object, range, or prefix.

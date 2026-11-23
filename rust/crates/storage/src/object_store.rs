@@ -503,7 +503,7 @@ impl LocalStore {
     /// Missing sources return MissingObject, different destination bytes return ConflictingObject, and either closed region returns Closed.
     /// An I/O or synchronization error can occur after the destination has been published.
     pub async fn copy_to(&self, source: &ObjectKey, destination: &LocalStore, key: &ObjectKey) -> Result<()> {
-        let admission = self.io.admit_read(self.root.clone(), source.clone()).await?;
+        let admission = self.io.admit_read(self.root.clone(), source.clone())?;
         let file = open_object(&self.path(source), source)?;
         destination.publish_file(key, AdmittedFile { file, _admission: admission }).await
     }

@@ -245,25 +245,25 @@ impl LocalLog {
     pub fn open_with_key_slots(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
         reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        let _operation = reads.admit()?;
-        let path = path.as_ref();
+        let path = Arc::new(path.as_ref().to_path_buf());
+        let _operation = reads.admit_read(path.clone(), ())?;
+        let file_path = path.as_path();
         if keys.is_none() {
-            ClassicKeyVault::require_unsealed_log(path).map_err(|error| Error::Task(error.to_string()))?;
+            ClassicKeyVault::require_unsealed_log(file_path).map_err(|error| Error::Task(error.to_string()))?;
         }
         let maximum = physical_maximum(options.maximum_message_bytes, keys.is_some())?;
         if options.queue_capacity == 0 || options.maximum_message_bytes > i32::MAX as usize {
             return Err(Error::Task("local log requires a positive queue and an i32 payload limit".into()));
         }
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?; }
-        let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)
-            .map_err(|error| Error::io(path, error))?;
-        file.try_lock_exclusive().map_err(|error| Error::io(path, error))?;
-        let latest = inspect(&mut file, path, maximum, keys.is_some())?;
-        crate::sync_file(&file).map_err(|error| Error::io(path, error))?;
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = file_path.parent() { fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?; }
+        let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(file_path)
+            .map_err(|error| Error::io(file_path, error))?;
+        file.try_lock_exclusive().map_err(|error| Error::io(file_path, error))?;
+        let latest = inspect(&mut file, file_path, maximum, keys.is_some())?;
+        crate::sync_file(&file).map_err(|error| Error::io(file_path, error))?;
+        if let Some(parent) = file_path.parent() {
             crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
         }
-        let path = Arc::new(path.to_path_buf());
         let progress = Arc::new(Progress::new(latest));
         let (send, queue) = mpsc::channel(options.queue_capacity);
         let log = Arc::new(Self { path: path.clone(), queue: send, progress: progress.clone(), maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads });
@@ -373,7 +373,7 @@ impl Log for LocalLog {
 
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
         let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
-        super::read_only::file_range(Arc::clone(&self.path), maximum, from, to, Some(self.progress.latest()?), self.keys.clone())
+        super::read_only::file_range(self.reads.clone(), self.path.clone(), maximum, from, to, Some(self.progress.latest()?), self.keys.clone())
     }
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         if payload.len() > self.maximum_message_bytes {
@@ -396,12 +396,11 @@ impl Log for LocalLog {
             return Err(Error::UnavailableLogRange { requested: after.0, first_retained: 0 });
         }
         let next = if after.0 < 0 { 0 } else {
-            let path = path.clone();
-            self.reads.run(move || {
-                let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
-                file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
-                inspect_record(&mut file, &path, maximum)?;
-                file.stream_position().map_err(|error| Error::io(path.as_ref(), error))
+            self.reads.read(path.clone(), after, move |path, &after| {
+                let mut file = File::open(path.as_path()).map_err(|error| Error::io(path.as_path(), error))?;
+                file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(path.as_path(), error))?;
+                inspect_record(&mut file, path, maximum)?;
+                file.stream_position().map_err(|error| Error::io(path.as_path(), error))
             }).await?
         };
         Ok(Box::new(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() }))
@@ -410,30 +409,29 @@ impl Log for LocalLog {
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
         let latest = self.progress.latest()?;
         let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
-        let path = self.path.clone();
         let keys = self.keys.clone();
         if from.0 < 0 { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         if to < from { return Err(Error::Task("log range end precedes its start".into())); }
-        self.reads.run(move || {
-            let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
+        self.reads.read(self.path.clone(), (from, to, latest), move |path, &(from, to, latest)| {
+            let mut file = File::open(path.as_path()).map_err(|error| Error::io(path.as_path(), error))?;
             if from > latest {
                 let end = if latest.0 < 0 { 0 } else {
-                    file.seek(SeekFrom::Start(latest.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
-                    read_record(&mut file, &path, maximum, keys.as_deref())?;
-                    file.stream_position().map_err(|error| Error::io(path.as_ref(), error))? as i64
+                    file.seek(SeekFrom::Start(latest.0 as u64)).map_err(|error| Error::io(path.as_path(), error))?;
+                    read_record(&mut file, path, maximum, keys.as_deref())?;
+                    file.stream_position().map_err(|error| Error::io(path.as_path(), error))? as i64
                 };
                 if from.0 != end { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
                 return Ok(Vec::new());
             }
-            file.seek(SeekFrom::Start(from.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
-            let first = read_record(&mut file, &path, maximum, keys.as_deref())?;
+            file.seek(SeekFrom::Start(from.0 as u64)).map_err(|error| Error::io(path.as_path(), error))?;
+            let first = read_record(&mut file, path, maximum, keys.as_deref())?;
             let mut result = Vec::new();
             if from < to { result.push(first); }
             else { return Ok(result); }
             loop {
-                let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))? as i64;
+                let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))? as i64;
                 if next >= to.0 || next > latest.0 { break; }
-                result.push(read_record(&mut file, &path, maximum, keys.as_deref())?);
+                result.push(read_record(&mut file, path, maximum, keys.as_deref())?);
             }
             Ok(result)
         }).await
@@ -450,25 +448,25 @@ impl LocalTail {
     async fn poll_with_payload_limit(&mut self, timeout: Duration, payload_limit: usize) -> Result<Vec<LogRecord>> {
         let tip = await_tip(&self.progress, self.after, timeout).await?;
         if tip <= self.after { return Ok(Vec::new()); }
-        let (path, maximum, next) = (self.path.clone(), self.maximum, self.next);
+        let maximum = self.maximum;
         let keys = self.keys.clone();
         let payload_limit = payload_limit.max(maximum);
-        let (records, next) = self.reads.run(move || {
-            let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
-            file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path.as_ref(), error))?;
+        let (records, next) = self.reads.read(self.path.clone(), (self.next, tip), move |path, &(next, tip)| {
+            let mut file = File::open(path.as_path()).map_err(|error| Error::io(path.as_path(), error))?;
+            file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path.as_path(), error))?;
             let mut records = Vec::new();
             let mut payload_bytes = 0usize;
-            while file.stream_position().map_err(|error| Error::io(path.as_ref(), error))? <= tip.0 as u64 {
+            while file.stream_position().map_err(|error| Error::io(path.as_path(), error))? <= tip.0 as u64 {
                 if records.len() == MAXIMUM_POLL_RECORDS
                     || payload_bytes.checked_add(maximum).is_none_or(|bytes| bytes > payload_limit)
                 {
                     break;
                 }
-                let record = read_record(&mut file, &path, maximum, keys.as_deref())?;
+                let record = read_record(&mut file, path, maximum, keys.as_deref())?;
                 payload_bytes += record.payload.len();
                 records.push(record);
             }
-            let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))?;
+            let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))?;
             Ok::<_, Error>((records, next))
         }).await?;
         let last = records.last().ok_or_else(|| corrupt(&self.path, self.next, "durable tip yielded no record"))?;
@@ -500,10 +498,10 @@ impl LogReplayTail for LocalTail {
         if tip <= self.after { return Ok(None); }
         if self.next > tip.0 as u64 { return Err(corrupt(&self.path, self.next, "durable tip yielded no record")); }
 
-        let (path, maximum, next) = (Arc::clone(&self.path), self.maximum, self.next);
-        self.reads.run(move || {
-            let mut file = open_at(&path, next)?;
-            Ok(Some(read_record_header(&mut file, &path, maximum)?.replay_head()))
+        let maximum = self.maximum;
+        self.reads.read(self.path.clone(), self.next, move |path, &next| {
+            let mut file = open_at(path, next)?;
+            Ok(Some(read_record_header(&mut file, path, maximum)?.replay_head()))
         }).await
     }
 
@@ -515,19 +513,19 @@ impl LogReplayTail for LocalTail {
         if head.metadata.offset > tip {
             return Err(Error::Task("log replay head exceeds the durable tip".into()));
         }
-        let (path, maximum, next) = (Arc::clone(&self.path), self.maximum, self.next);
+        let maximum = self.maximum;
         let keys = self.keys.clone();
-        let (record, next) = self.reads.run(move || {
-            let mut file = open_at(&path, next)?;
-            let header = read_record_header(&mut file, &path, maximum)?;
+        let (record, next) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
+            let mut file = open_at(path, next)?;
+            let header = read_record_header(&mut file, path, maximum)?;
             if header.replay_head() != head {
-                return Err(corrupt(&path, next, "log replay head changed before delivery"));
+                return Err(corrupt(path, next, "log replay head changed before delivery"));
             }
             if reservation.length() < head.allocation_bound {
                 return Err(Error::Task("log read reservation is too small".into()));
             }
-            let record = read_record_body(&mut file, &path, header, keys.as_deref())?.retain(reservation)?;
-            let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))?;
+            let record = read_record_body(&mut file, path, header, keys.as_deref())?.retain(reservation)?;
+            let next = file.stream_position().map_err(|error| Error::io(path.as_path(), error))?;
             Ok((record, next))
         }).await?;
         self.after = record.metadata.offset;

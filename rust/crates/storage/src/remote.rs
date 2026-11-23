@@ -159,7 +159,7 @@ impl RemoteStore {
         if !Arc::ptr_eq(&self.objects.client, &destination.objects.client) {
             return Err(Error::Remote { key: key.to_string(), message: "object copy requires a shared provider client".into() });
         }
-        let admission = self.io.admit_read(self.objects.clone(), source.clone()).await?
+        let admission = self.io.admit_read(self.objects.clone(), source.clone())?
             .and(destination.io.admit()?);
         let (objects, destination_objects, source, key) = (Arc::clone(&self.objects), Arc::clone(&destination.objects), source.clone(), key.clone());
         if destination.cell {
