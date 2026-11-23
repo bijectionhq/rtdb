@@ -1443,18 +1443,7 @@ impl<'a> OpenTransaction<'a> {
 
     async fn read_owned_revision(&self, owner: &str, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId, valid: Interval) -> Result<Option<Timestamp>> {
         let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let columns = ["_id", "_system_from"];
-        let Some(mut cursor) = rtdb_query::open_owned_point(context, owner, relation, id, Some(valid), Some(&columns)).await? else {
-            return Ok(None);
-        };
-        let mut latest = None;
-        while let Some(batch) = cursor.next_batch().await? {
-            for row in 0..batch.batch().num_rows() {
-                let revision = rtdb_query::owned_row_revision(batch.batch(), row, id, &self.context.memory)?;
-                latest = Some(latest.map_or(revision, |previous: Timestamp| previous.max(revision)));
-            }
-        }
-        Ok(latest)
+        rtdb_query::read_owned_point_revision(context, owner, relation, id, valid).await
     }
 
     async fn require_proposal_create_absence(

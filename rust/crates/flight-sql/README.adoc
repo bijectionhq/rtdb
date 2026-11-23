@@ -265,11 +265,14 @@ The selected transaction must equal that floor or advance both coordinates in th
 The node uses its maintained catalog lease and refuses an unapplied floor or expired lease without waiting for a new log position.
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
-`rtdb.owned.ConfirmAppliedHosted.v1` takes the 16-byte original held handle, the two floor coordinates above, an exclusive signed big-endian i64 Unix microsecond cutoff, and the normal hosted control groups.
+`rtdb.owned.ConfirmAppliedHosted.v2` takes the 16-byte original held handle, the two floor coordinates above, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
+The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
+An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.
 Every control must be a check from the placed attachment's installed allowlist.
-The node checks the supplied revisions and absences in the original hold and in one newly captured applied catalog at or above both floors.
+The point must be an ordinary Root point at the original held valid instant.
+The node checks the supplied control and point revisions and absences in the original hold and in one newly captured applied catalog at or above both floors.
 Success returns the newly captured transaction ID and time as two signed big-endian i64 values.
-A changed control returns one zero byte.
+A changed control or point returns one zero byte.
 The node refuses unproven cuts and checks the physical clock again before returning.
 This action appends no transaction and authorizes no write.
 

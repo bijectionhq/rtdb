@@ -23,6 +23,30 @@ pub async fn open_owned_point(
     open_owned_table_point(context, relation.table(owner), id.iid(), Some(id), valid, columns, false).await
 }
 
+/// Read the winning revision or exact absence for an owned point.
+pub async fn read_owned_point_revision(
+    context: Arc<QueryContext>,
+    owner: &str,
+    relation: &OwnedRelation,
+    id: &EntityId,
+    valid: Interval,
+) -> Result<Option<Timestamp>> {
+    let columns = ["_id", "_system_from"];
+    let Some(mut cursor) = open_owned_point(
+        Arc::clone(&context), owner, relation, id, Some(valid), Some(&columns),
+    ).await? else {
+        return Ok(None);
+    };
+    let mut latest = None;
+    while let Some(batch) = cursor.next_batch().await? {
+        for row in 0..batch.batch().num_rows() {
+            let revision = owned_row_revision(batch.batch(), row, id, &context.memory)?;
+            latest = Some(latest.map_or(revision, |previous: Timestamp| previous.max(revision)));
+        }
+    }
+    Ok(latest)
+}
+
 /// Project the original validity endpoints along with a live lifetime point.
 pub async fn open_owned_lifetime_point(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,

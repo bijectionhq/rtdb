@@ -1,6 +1,7 @@
 mod historical_owned_read;
 mod hosted_control;
 mod hosted_observation;
+pub use hosted_observation::AppliedOwnedPoint;
 mod owned_changes;
 mod owned_usage;
 pub use owned_usage::OwnedStorageUsage;
@@ -441,7 +442,8 @@ impl Node {
                 return Err(rtdb_query::unindexed_tx(requested, snapshot.tx_basis()));
             }
             let cap = requested.map(|time| time.as_micros()).transpose()?;
-            let cap = match (cap, basis.snapshot_time) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
+            let upper = applied.map(|selected| selected.system_time).or(basis.snapshot_time);
+            let cap = match (cap, upper) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };
             let snapshot = rtdb_query::retain_catalog_snapshot(snapshot.with_system_time_cap(cap)?, &database.storage).await?;
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) });
         }

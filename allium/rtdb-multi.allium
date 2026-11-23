@@ -2123,11 +2123,12 @@ rule OpenHostedAppliedRead {
             Replied(session, unavailable: true)
 }
 
-rule ConfirmHostedAppliedControls {
-    when: HostedAppliedConfirmationRequested(holding, session, original, floor, controls, cutoff)
+rule ConfirmHostedAppliedRead {
+    when: HostedAppliedConfirmationRequested(holding, session, original, floor, controls, point, cutoff)
 
     requires: original.session = session
     requires: controls.all(CheckFromInstalledAllowlist)
+    requires: point = null or OrdinaryRootPointAt(point, original.basis)
 
     ensures:
         let current = CaptureAppliedCatalog(holding)
@@ -2136,6 +2137,7 @@ rule ConfirmHostedAppliedControls {
            and CoversTransaction(current.basis, floor)
            and MatchesControls(original, controls)
            and MatchesControls(current, controls)
+           and (point = null or (MatchesPoint(original, point) and MatchesPoint(current, point)))
            and Clock.now < cutoff:
             HostedAppliedControlsConfirmed(session, basis: current.basis)
         else:

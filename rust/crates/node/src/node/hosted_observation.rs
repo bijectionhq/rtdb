@@ -1,10 +1,18 @@
 use std::sync::Arc;
 
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttemptScope, Result, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, OwnedRelation, PlacedAttemptScope, Result, Timestamp, TransactionKey};
 
 use super::{CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction};
 use rtdb_query::QueryContext;
+
+/// Exact original ordinary Root point condition. Absence is a condition.
+pub struct AppliedOwnedPoint {
+    pub relation: OwnedRelation,
+    pub id: EntityId,
+    pub valid_at: Timestamp,
+    pub expected: Option<Timestamp>,
+}
 
 fn unavailable() -> Anomaly {
     Anomaly::new(
@@ -147,14 +155,15 @@ impl OwnedReadSession {
         Ok(Some(head.system_time))
     }
 
-    /// Validate a held read's original controls on one newly captured
+    /// Validate a held read's original checks on one newly captured
     /// applied catalog of the same recovered hosted attachment.
-    pub async fn confirm_applied_hosted_controls(
+    pub async fn confirm_applied_hosted_read(
         &self,
         scope: PlacedAttemptScope,
         floor: TransactionKey,
         until: Timestamp,
         controls: &[HostedControlWrite],
+        point: Option<&AppliedOwnedPoint>,
     ) -> Result<Option<TransactionKey>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
@@ -171,6 +180,15 @@ impl OwnedReadSession {
         };
         if original.tx_basis() != Some(self.present) {
             return Err(unavailable());
+        }
+        let purge_guard = point.map(|point| {
+            if !point.relation.is_root_data() || point.valid_at != self.present.system_time {
+                return Err(unavailable());
+            }
+            self.relation_release_guard([&point.relation])
+        }).transpose()?;
+        if let Some(guard) = &purge_guard {
+            guard()?;
         }
         let attachment = self.node.attached_database(&self.database, Some(&self.attachment))?;
         if attachment.await_authority.codec().map(|codec| codec.scope()) != Some(scope) {
@@ -193,7 +211,25 @@ impl OwnedReadSession {
         };
         let head = captured.tx_basis().filter(|head| head.system_time < until)
             .ok_or_else(unavailable)?;
-        let matches = compare_controls(&self.context, &current, controls).await?;
+        let mut matches = compare_controls(&self.context, &current, controls).await?;
+        if let Some(point) = point {
+            let valid = Interval::at(point.valid_at)?;
+            let observed = rtdb_query::read_owned_point_revision(
+                Arc::clone(&self.context), &self.owner, &point.relation, &point.id, valid,
+            ).await?;
+            if observed != point.expected {
+                return Err(unavailable());
+            }
+            if matches {
+                let observed = rtdb_query::read_owned_point_revision(
+                    Arc::clone(&current), &self.owner, &point.relation, &point.id, valid,
+                ).await?;
+                matches = observed == point.expected;
+            }
+        }
+        if let Some(guard) = &purge_guard {
+            guard()?;
+        }
         self.check()?;
         current.check_cancelled()?;
         if self.node.now() >= until {
