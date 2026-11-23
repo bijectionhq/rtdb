@@ -503,7 +503,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
                 "rtdb-owned-check-range-v1"
             }
         }
-        Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, attempt, fingerprint, root }) => {
+        Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, attempt, fingerprint, root }) => {
             body.insert("registration".into(), Value::Struct(record.clone()));
             body.insert("previous".into(), previous.map_or(Value::Null, |pin| Value::Uuid(pin.0)));
             body.insert("attempt".into(), Value::Utf8(attempt.clone()));
@@ -511,7 +511,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             if let Some(sibling) = sibling {
                 body.insert("sibling".into(), Value::Uuid(sibling.0));
             }
+            if let Some((world, pin)) = overlay_source {
+                body.insert("overlay_world".into(), Value::Uuid(world.0));
+                body.insert("overlay_pin".into(), Value::Uuid(pin.0));
+            }
             match root {
+                crate::OwnedForkRoot::None if overlay_source.is_some() => "rtdb-owned-fork-overlay-v1",
                 crate::OwnedForkRoot::None => "rtdb-owned-fork-world-v2",
                 crate::OwnedForkRoot::Writes => "rtdb-owned-root-retained-fork-v1",
                 crate::OwnedForkRoot::WritesAdvance => "rtdb-owned-root-retained-advance-v1",
@@ -1377,7 +1382,7 @@ impl SourceOperationReader<'_> {
         parsed_fields.grow_to(bound)?;
         let value = |name| struct_cell(body, name, offset);
         let operation = match name.as_str() {
-            "rtdb-owned-root-retained-sibling-v1" | "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-root-retained-renewal-v1" | "rtdb-owned-root-proposal-hold-v1" | "rtdb-owned-root-proposal-shorten-v1" | "rtdb-owned-controls-retained-fork-v1"
+            "rtdb-owned-fork-overlay-v1" | "rtdb-owned-root-retained-sibling-v1" | "rtdb-owned-fork-world-v2" | "rtdb-owned-root-retained-fork-v1" | "rtdb-owned-root-retained-advance-v1" | "rtdb-owned-root-retained-renewal-v1" | "rtdb-owned-root-proposal-hold-v1" | "rtdb-owned-root-proposal-shorten-v1" | "rtdb-owned-controls-retained-fork-v1"
             | "rtdb-owned-controls-proposal-fork-v1" | "rtdb-owned-root-proposal-fork-v1" => {
                 let (Value::Struct(record), Value::Utf8(attempt), Value::Binary(fingerprint)) =
                     (value("registration")?, value("attempt")?, value("fingerprint")?) else {
@@ -1391,6 +1396,14 @@ impl SourceOperationReader<'_> {
                 };
                 TxOp::OwnedForkWorld {
                     record, previous, attempt, fingerprint,
+                    overlay_source: if name == "rtdb-owned-fork-overlay-v1" {
+                        let (Value::Uuid(world), Value::Uuid(pin)) = (value("overlay_world")?, value("overlay_pin")?) else {
+                            return Err(invalid("Retained overlay has no original source and pin"));
+                        };
+                        Some((Iid(world), Iid(pin)))
+                    } else {
+                        None
+                    },
                     sibling: if name == "rtdb-owned-root-retained-sibling-v1" {
                         let Value::Uuid(sibling) = value("sibling")? else { return Err(invalid("Retained fork has no sibling source")); };
                         Some(Iid(sibling))

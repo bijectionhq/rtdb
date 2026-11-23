@@ -2422,7 +2422,7 @@ impl Service {
         let (child, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a child identity"))?;
         let retain_until = Timestamp(i64::from_be_bytes(rest.try_into().map_err(|_| invalid("Overlay preparation requires a retention deadline"))?));
         let system = Timestamp(i64::from_be_bytes(*system));
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let connection = self.connection(call, &call.database).await?;
@@ -2847,7 +2847,7 @@ impl Service {
         if child == &[0; 16] || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
             return Err(invalid("Invalid retained child identity or attempt"));
         }
-        let held = self.owned_world_read(call, &Bytes::copy_from_slice(handle))?;
+        let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let scope = self.hosted_control_scope(call).await?;
         let cut = held.snapshot.prepare_overlay_cut(scope, Timestamp(i64::from_be_bytes(*system))).await.map_err(status)?;
         let policy = self.hosted_control_policy(call)?;

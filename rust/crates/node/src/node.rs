@@ -1264,13 +1264,19 @@ impl OwnedReadSession {
     ) -> Result<OwnedForkCut> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let mut cut = self.fork_cut(scope).await?;
-        if !matches!(world.mode, rtdb_types::WorldClockMode::Held { .. }) || cut.live.is_none() {
+        if cut.live.is_none() {
             return Err(unavailable());
         }
         if !(1..=32).contains(&world.schemas.relations().count()) { return Err(unavailable()); }
         let relations = world.schemas.relations().map(|(name, _)| rtdb_types::OwnedRelation::new(name))
             .collect::<Result<Vec<_>>>()?;
-        let clock = self.certify_world_accepted_scope(world, &relations, system).await?;
+        let clock = match &world.ancestor {
+            Some(ancestor) if world.mode == rtdb_types::WorldClockMode::Retained
+                && ancestor.basis.system_time == system && system < self.present.system_time => ancestor.logical,
+            None if matches!(world.mode, rtdb_types::WorldClockMode::Held { .. }) =>
+                self.certify_world_accepted_scope(world, &relations, system).await?,
+            _ => return Err(unavailable()),
+        };
         for relation in &relations {
             if self.world_parent_witness(world.id, relation).await?.purge_frontier() != 0 {
                 return Err(unavailable());
@@ -2647,10 +2653,10 @@ impl NativeSession {
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()))
             .saturating_add(fork.root.as_ref().and_then(|section| section.publication.as_ref()).map_or(0, |root| root.writes.len() + 1))
             .saturating_add(3 + usize::from(requires_tip));
-        let archive_basis = match (&record.ancestor, fork.cut.overlay()) {
+        let overlay_source = fork.cut.overlay();
+        let archive_basis = match (&record.ancestor, overlay_source) {
             (None, None) => record.basis,
-            (Some(ancestor), Some((world, pin, clock))) if ancestor.world == world.0
-                && ancestor.pin == pin.0 && ancestor.logical == clock
+            (Some(ancestor), Some((source, _, clock))) if record.id != source && ancestor.logical == clock
                 && root == OwnedForkRoot::None && fork.previous.is_none() && fork.sibling.is_none()
                 && requested == rtdb_types::WorldClockMode::Retained => ancestor.basis,
             _ => return Err(rtdb_types::OwnedWorld::unavailable()),
@@ -2706,6 +2712,7 @@ impl NativeSession {
             });
         }
         ops.push(TxOp::OwnedForkWorld { record: record.record(), previous: fork.previous, sibling: fork.sibling,
+            overlay_source: overlay_source.map(|(world, pin, _)| (world, pin)),
             attempt: fork.attempt, fingerprint: fork.fingerprint, root });
         self.state.execute_tx(ops, Default::default()).await
     }

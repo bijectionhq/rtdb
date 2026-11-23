@@ -1351,6 +1351,8 @@ rule ConsumeIntake {
 -- A world point checks the complete local identity at the requested valid instant.
 -- If no local version exists at that instant the point reads its archived parent at the same valid instant.
 -- A retained point view of an exact Held publication independently pins its original Root archive and the certified Held overlay.
+-- A child of that retained view pins the same Root and Held positions under its own retention.
+-- Ordering checks the immediate source's standing and unchanged archive binding.
 -- The ordered registration checks the source Held generation and binds both prepared positions to the new child.
 -- A point on the retained child reads the archived Held replacement or tombstone first and consults the pinned Root only for an unshadowed identity.
 -- Point release validates the child's registration and the current Root purge frontier.

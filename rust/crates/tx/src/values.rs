@@ -1174,7 +1174,11 @@ pub enum TxOp {
     HostedConstraintRefusal,
     OwnedDeadline { until: Timestamp, recheck_at_staging: bool },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope },
-    OwnedForkWorld { record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>, attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot },
+    OwnedForkWorld {
+        record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,
+        overlay_source: Option<(rtdb_types::Iid, rtdb_types::Iid)>,
+        attempt: String, fingerprint: [u8; 32], root: OwnedForkRoot,
+    },
     OwnedPublishRoot { attempt: String, fingerprint: [u8; 32] },
     OwnedPublishWorld { world: rtdb_types::Iid, attempt: String, fingerprint: [u8; 32], expected: Option<Timestamp>, advance_to: Option<Timestamp>, drop_world: bool, settlement_pin: Option<rtdb_types::Iid>, land_root: Option<rtdb_types::Iid>, delete_root: Option<rtdb_types::Iid> },
     OwnedCheckWorldPurge { relation: rtdb_types::OwnedRelation, pin: rtdb_types::Iid, frontier: i64, local_frontier: Option<i64> },

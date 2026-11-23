@@ -877,7 +877,7 @@ impl<'a> OpenTransaction<'a> {
                 }
                 Ok(())
             }
-            Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, attempt, fingerprint, root }) => {
+            Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, attempt, fingerprint, root, .. }) => {
                 self.reserve_owned_attempt(attempt, *fingerprint).await?;
                 let documents = crate::Documents::new(vec![record.clone()], &self.context.memory)?;
                 let relation = rtdb_types::OwnedRelation::world_catalog();
@@ -1335,7 +1335,7 @@ impl<'a> OpenTransaction<'a> {
                             && checked_tip.is_none() => {
                         checked_tip = Some((*valid_at, *expected));
                     }
-                    Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, .. }) => {
+                    Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
                         if world.dropped || world.basis.system_time >= self.tx_key().system_time
                             || deadline.is_none_or(|until| until > world.until)
@@ -1354,19 +1354,16 @@ impl<'a> OpenTransaction<'a> {
                             {
                                 return Err(unavailable());
                             }
+                            let (source_id, source_pin) = overlay_source.ok_or_else(unavailable)?;
                             let base = self.buffer.base_snapshot();
                             let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                            let (source, _charge) = rtdb_query::read_owned_world(context, owner, Iid(ancestor.world))
+                            let (source, _charge) = rtdb_query::read_owned_world(context, owner, source_id)
                                 .await?.ok_or_else(unavailable)?;
-                            if source.pin.0 != ancestor.pin || source.dropped || source.ancestor.is_some()
-                                || !matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
-                                || source.until < world.until
-                                || source.capture != world.capture || source.suffix != world.suffix
-                                || source.basis != world.basis || source.manifest != world.manifest
-                                || source.parent_publication != world.parent_publication || source.schemas != world.schemas
-                            {
+                            if source.pin != source_pin || !source.can_retain_overlay(&world) {
                                 return Err(unavailable());
                             }
+                        } else if overlay_source.is_some() {
+                            return Err(unavailable());
                         }
                         if let Some(previous) = previous {
                             let base = self.buffer.base_snapshot();
