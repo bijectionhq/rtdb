@@ -999,11 +999,11 @@ async fn retire_world_pins(
 pub(crate) async fn validate_checkpoint_world(
     directory: &dyn Directory, archive: &CellStorage, session: &mut NativeSession,
     deployment: Uuid, id: Uuid, checks: Vec<OwnedWorldWitness>,
-    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
+    controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>,
 ) -> Result<TransactionKey> {
     let OpenWorld { snapshot, record, _schema_charge, .. } = open_world(directory, archive, session, deployment, id).await?;
     drop(snapshot);
-    let outcome = session.validate_owned_world(&record, checks, controls, deadline).await?;
+    let outcome = session.validate_owned_world(&record, checks, controls, deadline, clock).await?;
     if !outcome.committed() {
         return Err(outcome.error().cloned().unwrap_or_else(OwnedWorld::unavailable));
     }

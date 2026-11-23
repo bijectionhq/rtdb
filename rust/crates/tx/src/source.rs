@@ -564,9 +564,16 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("local_frontier".into(), local_frontier.map_or(Value::Null, Value::I64));
             "rtdb-owned-check-world-purge-v3"
         }
-        Operation::Public(TxOp::OwnedCheckWorldScope { scope }) => {
+        Operation::Public(TxOp::OwnedCheckWorldScope { scope, clock }) => {
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
-            "rtdb-owned-check-world-scope-v1"
+            if let Some(clock) = clock {
+                body.insert("world".into(), Value::Uuid(clock.world.0));
+                body.insert("pin".into(), Value::Uuid(clock.pin.0));
+                body.insert("before".into(), Value::I64(clock.before.0));
+                "rtdb-owned-check-world-clock-v1"
+            } else {
+                "rtdb-owned-check-world-scope-v1"
+            }
         }
         Operation::Public(TxOp::HostedControl(control)) => {
             body = control.body();
@@ -1542,9 +1549,16 @@ impl SourceOperationReader<'_> {
                     } else { None },
                 }
             }
-            "rtdb-owned-check-world-scope-v1" => {
+            "rtdb-owned-check-world-scope-v1" | "rtdb-owned-check-world-clock-v1" => {
                 let Value::Binary(scope) = value("scope")? else { return Err(invalid("Owned world witness has no placement scope")); };
-                TxOp::OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope::decode(&scope)? }
+                let clock = if name == "rtdb-owned-check-world-clock-v1" {
+                    let (Value::Uuid(world), Value::Uuid(pin), Value::I64(before)) =
+                        (value("world")?, value("pin")?, value("before")?) else {
+                            return Err(invalid("World clock condition has no exact world, pin, or deadline"));
+                        };
+                    Some(rtdb_types::WorldClockLimit { world: Iid(world), pin: Iid(pin), before: Timestamp(before) })
+                } else { None };
+                TxOp::OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope::decode(&scope)?, clock }
             }
             "rtdb-hosted-control-v1" | "rtdb-hosted-control-check-v1" => {
                 let (Value::Utf8(relation), Value::Binary(scope), expected, Value::Struct(document)) =

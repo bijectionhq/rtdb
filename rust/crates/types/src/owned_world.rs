@@ -97,6 +97,19 @@ pub struct OwnedWorldAncestor {
     pub logical: Timestamp,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct WorldClockLimit {
+    pub world: Iid,
+    pub pin: Iid,
+    pub before: Timestamp,
+}
+
+impl WorldClockLimit {
+    pub fn admits(self, world: &OwnedWorld, reading: Timestamp) -> bool {
+        self.world == world.id && self.pin == world.pin && !world.dropped && reading < self.before
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedWorld {
     pub id: Iid,
@@ -461,12 +474,17 @@ mod tests {
         assert_eq!(child.initial_clock(), Timestamp(150));
 
         assert_eq!(child.inherited_basis().system_time, Timestamp(200));
+        let limit = WorldClockLimit { world: child.id, pin: child.pin, before: Timestamp(175) };
+        assert!(limit.admits(&child, Timestamp(150)));
+        assert!(limit.admits(&child, Timestamp(174)));
+        assert!(!limit.admits(&child, Timestamp(175)));
 
         let mut descendant = child.clone();
         descendant.id = Iid([6; 16]);
         descendant.pin = descendant.id;
         descendant.until = Timestamp(250);
         assert!(child.can_retain_overlay(&descendant));
+        assert!(!limit.admits(&descendant, Timestamp(150)));
         assert_eq!(descendant.ancestor, child.ancestor);
         descendant.ancestor.as_mut().unwrap().suffix = [7; 16];
         assert!(!child.can_retain_overlay(&descendant));

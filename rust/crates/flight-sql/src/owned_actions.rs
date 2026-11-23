@@ -229,7 +229,7 @@ pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V1: &str = "rtdb.owned.PublishHeld
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const COMMIT_HELD_WORLDS_V4: &str = "rtdb.owned.CommitHeldWorlds.v4";
-pub(crate) const COMMIT_WORLD_V3: &str = "rtdb.owned.CommitWorld.v3";
+pub(crate) const COMMIT_WORLD_V4: &str = "rtdb.owned.CommitWorld.v4";
 const MAX_WORLD_WITNESSES: usize = 128;
 const WORLD_POINT_WITNESS: &str = "rtdb.owned.world_point_witness";
 const WORLD_RANGE_WITNESS: &str = "rtdb.owned.world_range_witness";
@@ -3318,18 +3318,24 @@ impl Service {
         let (deadline, groups) = groups.split_first_chunk::<8>()
             .ok_or_else(|| invalid("Owned world validation has no deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
+        let (clock, groups) = groups.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Owned world validation has no clock bound"))?;
+        let clock = Timestamp(i64::from_be_bytes(*clock));
         let (handle, rest) = groups.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned world commit has no held handle"))?;
         let (count, rest) = rest.split_first_chunk::<2>()
             .ok_or_else(|| invalid("Owned world commit has no witness count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
-        if !(1..=MAX_WORLD_WITNESSES).contains(&count) {
-            return Err(invalid("Owned world commit requires one to 128 point witnesses"));
+        if count > MAX_WORLD_WITNESSES || (count == 0 && clock == Timestamp::MAX) {
+            return Err(invalid("Owned world validation requires a clock bound or at least one point witness"));
         }
         let (nonces, groups) = rest.split_at_checked(count * 16)
             .ok_or_else(|| invalid("Owned world point witness list is truncated"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (checks, _condition_charge) = held.conditions(call, world, nonces)?;
+        let clock = (clock != Timestamp::MAX).then(|| rtdb_types::WorldClockLimit {
+            world: rtdb_types::Iid(*world.as_bytes()), pin: held.snapshot.parent_pin(), before: clock,
+        });
         let _framing = call.reserve(MAX_COMMIT_GROUPS * 512)?;
         let policy = self.hosted_control_policy(call)?;
         let control_groups = owned_groups(groups, true, false)?;
@@ -3347,7 +3353,7 @@ impl Service {
         held.snapshot.check().map_err(status)?;
         let committed = host.validate_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            world, checks, control_checks, deadline,
+            world, checks, control_checks, deadline, clock,
         ).await.map_err(status)?;
         self.owned_tx_reply(committed)
     }

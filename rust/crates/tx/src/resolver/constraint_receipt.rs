@@ -420,7 +420,7 @@ mod tests {
         ops.extend(
             [
                 TxOp::owned_deadline(Timestamp(8)),
-                TxOp::OwnedCheckWorldScope { scope },
+                TxOp::OwnedCheckWorldScope { scope, clock: None },
                 TxOp::OwnedCheckWorldPurge {
                     relation: relation.clone(),
                     pin: Iid([2; 16]),

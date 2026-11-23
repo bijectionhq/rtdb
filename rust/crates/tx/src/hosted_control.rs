@@ -765,7 +765,7 @@ mod world_read_tests {
             TxOp::owned_deadline(Timestamp(8)),
             TxOp::HostedControl(owner),
             TxOp::OwnedDelete { relation: root, id: id.clone(), valid_from: None, valid_to: None },
-            TxOp::OwnedCheckWorldScope { scope },
+            TxOp::OwnedCheckWorldScope { scope, clock: None },
             purge,
             point,
         ].into_iter().map(Operation::Public).collect::<Vec<_>>();
@@ -917,7 +917,7 @@ mod retained_release_tests {
         let world = Iid([1; 16]);
         let mut operations = [
             TxOp::owned_deadline(Timestamp(8)),
-            TxOp::OwnedCheckWorldScope { scope },
+            TxOp::OwnedCheckWorldScope { scope, clock: None },
             TxOp::HostedControl(check),
             TxOp::HostedControl(replacement(Some(Timestamp(2)))?),
             drop(world),

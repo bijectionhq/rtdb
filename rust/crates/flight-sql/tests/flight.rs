@@ -838,7 +838,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
     let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
     for action in [
         "rtdb.owned.PublishWorldCut.v1", "rtdb.owned.PublishWorldCut.v2",
-        "rtdb.owned.CommitHeldWorlds.v4", "rtdb.owned.CommitWorld.v3",
+        "rtdb.owned.CommitHeldWorlds.v4", "rtdb.owned.CommitWorld.v4",
         "rtdb.owned.OpenWorldRead.v4", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
         "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",

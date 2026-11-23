@@ -1226,6 +1226,18 @@ impl<'a> OpenTransaction<'a> {
         let retained_release = crate::hosted_control::retained_release_world(operations);
         let proposal_overlay = crate::hosted_control::hosted_proposal_overlay(operations);
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations);
+        let mut clock_limits = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedCheckWorldScope { clock: Some(clock), .. }) => Some(clock),
+            _ => None,
+        });
+        if let Some(clock) = clock_limits.next() {
+            if clock_limits.next().is_some() || !publications.is_empty()
+                || admitted.iter().any(|world| *world != clock.world)
+            {
+                return Err(unavailable());
+            }
+            admitted.insert(clock.world);
+        }
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
         }
@@ -1565,12 +1577,26 @@ impl<'a> OpenTransaction<'a> {
         self.check_hosted_controls(operations, source_scope, replay).await?;
         self.check_capacity_source(operations).await?;
         for operation in operations {
-            if let Operation::Public(TxOp::OwnedCheckWorldScope { scope }) = operation {
+            if let Operation::Public(TxOp::OwnedCheckWorldScope { scope, clock }) = operation {
                 if self.owned_worlds.is_empty() || deadline.is_none()
                     || Some(*scope) != source_scope || Some(*scope) != self.context.owned_witness_scope
                 {
                     return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-witness-unavailable",
                         "Owned world point witness is no longer admissible"));
+                }
+                if let Some(clock) = clock {
+                    let (world, _) = self.owned_worlds.get(&clock.world).ok_or_else(unavailable)?;
+                    if world.pin != clock.pin { return Err(unavailable()); }
+                    use rtdb_types::WorldClockMode;
+                    let reading = match world.mode {
+                        WorldClockMode::Retained => world.initial_clock(),
+                        WorldClockMode::Held { .. } => self.owned_world_clock(owner, world.id).await?.unwrap_or(world.initial_clock()),
+                        WorldClockMode::Proposal => self.tx_key().system_time,
+                    };
+                    if !clock.admits(world, reading) {
+                        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/world-clock-expired",
+                            "The owned world reached its exclusive clock bound"));
+                    }
                 }
                 continue;
             }
