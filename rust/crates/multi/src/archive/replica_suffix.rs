@@ -3,11 +3,12 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use prost::Message;
-use rtdb_directory::{CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
+use rtdb_directory::{Checkpoint, CheckpointSuffixPin, DeploymentRecord, Directory, HostedTask, Lifecycle, now_ms};
 use rtdb_format::{
     catalog::BlockCatalog,
     envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame},
     keys::block_key,
+    log::proto::NoOp,
     CURRENT_STORAGE_VERSION,
 };
 use rtdb_logkeeper::{ArchivedReplicaEntry, JournalDigest};
@@ -317,13 +318,20 @@ impl TerminalReplicaCipher {
 pub(super) struct TerminalReplayProgress {
     writer_epoch: Option<u64>,
     last_offset: i64,
-    source: i64,
+    replay: LogicalReplay,
 }
 
 impl TerminalReplayProgress {
-    pub(super) fn new(fence: &rtdb_directory::CheckpointTransferFence) -> Self {
+    pub(super) fn new(
+        fence: &rtdb_directory::CheckpointTransferFence,
+        recovered: &rtdb_replication::RecoveredPartition,
+    ) -> Result<Self> {
         let checkpoint = fence.destination.checkpoint;
-        Self { writer_epoch: None, last_offset: checkpoint.boundary, source: checkpoint.source }
+        let catalog = recovered.block.as_ref().ok_or_else(suffix_unavailable)?;
+        Ok(Self {
+            writer_epoch: None, last_offset: checkpoint.boundary,
+            replay: LogicalReplay::new(checkpoint, fence.destination.source_log_epoch, catalog),
+        })
     }
 
     pub(super) fn admit(
@@ -341,34 +349,30 @@ impl TerminalReplayProgress {
     }
 
     pub(super) fn apply(
-        &mut self, envelope: ReplicaEnvelope, fence: &rtdb_directory::CheckpointTransferFence,
+        &mut self, envelope: ReplicaEnvelope,
         recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
-        let checkpoint = fence.destination.checkpoint;
-        let log_epoch = StorageEpoch(fence.destination.source_log_epoch);
         match envelope.message {
             ReplicaBody::ResolvedTx(message) => {
-                let next = message.src_msg_id.map(SourcePosition)
-                    .map(|position| position.after_offset(log_epoch))
-                    .filter(|offset| *offset > self.source)
-                    .ok_or_else(suffix_unavailable)?;
+                let next = self.replay.transaction_source(message.src_msg_id)?;
                 recovered.apply_archived_transaction(&message, memory)?;
-                self.source = next;
+                self.replay.source = next;
             }
-            ReplicaBody::BlockUploaded(upload) if upload.block_index == Some(checkpoint.block)
-                && upload.storage_epoch == Some(fence.destination.source_log_epoch)
-                && upload.latest_processed_msg_id.map(SourcePosition)
-                    .map(|pos| pos.after_offset(log_epoch)) == Some(checkpoint.source)
-                && upload.external_source_token.is_none() => (),
-            ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none() => (),
-            _ => return Err(suffix_unavailable()),
+            control => {
+                let prior = self.replay.source;
+                self.replay.apply_control(ReplayControl::read(&control)?)?;
+                if self.replay.source > prior {
+                    recovered.progress.source_position =
+                        SourcePosition::from_epoch_offset(self.replay.epoch, self.replay.source)?;
+                }
+            }
         }
         Ok(())
     }
 
     pub(super) fn finish(self, through: i64) -> Result<i64> {
         if self.last_offset != through { return Err(suffix_unavailable()); }
-        Ok(self.source)
+        Ok(self.replay.source)
     }
 }
 
@@ -379,7 +383,7 @@ pub(super) async fn replay_certified_terminal(
     certificate: Option<&JournalDigest>, fence: &rtdb_directory::CheckpointTransferFence, through: i64,
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
 ) -> Result<i64> {
-    let mut progress = TerminalReplayProgress::new(fence);
+    let mut progress = TerminalReplayProgress::new(fence, recovered)?;
     let first = fence.destination.checkpoint.boundary.checked_add(1).ok_or_else(suffix_unavailable)?;
     if stream.stream != source.stream("replica") {
         return Err(suffix_unavailable());
@@ -404,7 +408,7 @@ pub(super) async fn replay_certified_terminal(
                 } else {
                     envelope
                 };
-                progress.apply(envelope, fence, recovered, memory)?;
+                progress.apply(envelope, recovered, memory)?;
             }
         }
     }
@@ -477,9 +481,7 @@ pub(super) fn decode(mut bytes: Bytes) -> Result<Vec<ArchivedReplicaEntry>> {
 struct SuffixProgress {
     next: i64,
     tx: TransactionKey,
-    source: i64,
-    block: i64,
-    block_source: i64,
+    replay: LogicalReplay,
     writer_epoch: Option<u64>,
     fence: rtdb_replication::TermFence,
 }
@@ -495,8 +497,8 @@ impl SuffixProgress {
             return Err(suffix_unavailable());
         }
         Ok(Self {
-            next: pin.journal_interval[0], tx, source: pin.checkpoint.source,
-            block: pin.checkpoint.block, block_source: pin.checkpoint.source, writer_epoch: None,
+            next: pin.journal_interval[0], tx,
+            replay: LogicalReplay::new(pin.checkpoint, pin.log_epoch, catalog), writer_epoch: None,
             fence: rtdb_replication::TermFence::from_catalog(catalog)?,
         })
     }
@@ -514,50 +516,160 @@ impl SuffixProgress {
         &mut self, body: ReplicaEnvelope, pin: &CheckpointSuffixPin,
         apply: impl FnOnce(&rtdb_format::log::proto::ResolvedTx) -> Result<()>,
     ) -> Result<()> {
-        let log_epoch = StorageEpoch(pin.log_epoch);
         match body.message {
             ReplicaBody::ResolvedTx(row) if row.db_op.is_none() && row.external_source_token.is_none() => {
                 let id = row.tx_id.ok_or_else(suffix_unavailable)?;
                 let time = Timestamp(row.system_time_micros.ok_or_else(suffix_unavailable)?);
-                let source = SourcePosition(row.src_msg_id.ok_or_else(suffix_unavailable)?).after_offset(log_epoch);
-                if id <= self.tx.tx_id.0 || time <= self.tx.system_time || source <= self.source
+                let source = self.replay.transaction_source(row.src_msg_id)?;
+                if id <= self.tx.tx_id.0 || time <= self.tx.system_time
                     || id > pin.basis.tx_id.0 || time > pin.basis.system_time || source > pin.source_through
                 {
                     return Err(suffix_unavailable());
                 }
                 apply(&row)?;
                 self.tx = TransactionKey { tx_id: TxId(id), system_time: time };
-                self.source = source;
+                self.replay.source = source;
             }
-            ReplicaBody::BlockBoundary(boundary)
-                if boundary.block_index.is_some_and(|block| block >= self.block) => (),
-            ReplicaBody::BlockUploaded(upload) if upload.storage_epoch == Some(pin.log_epoch)
-                && upload.external_source_token.is_none() => {
-                let block = upload.block_index.ok_or_else(suffix_unavailable)?;
-                let source = upload.latest_processed_msg_id.map(SourcePosition)
-                    .map(|pos| pos.after_offset(log_epoch)).ok_or_else(suffix_unavailable)?;
-                if block < self.block || source < self.block_source || source > self.source
-                    || (block == self.block && source != self.block_source)
-                {
-                    return Err(suffix_unavailable());
-                }
-                self.block = block;
-                self.block_source = source;
-            }
-            ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none() => (),
-            _ => return Err(suffix_unavailable()),
+            control => self.replay.apply_control(ReplayControl::read(&control)?)?,
         }
         Ok(())
     }
 
     fn finish(self, pin: &CheckpointSuffixPin) -> Result<()> {
         if self.next.checked_sub(1) != Some(pin.replica_through)
-            || self.tx != pin.basis || self.source != pin.source_through
+            || self.tx != pin.basis || self.replay.source != pin.source_through
         {
             return Err(suffix_unavailable());
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BlockCut {
+    block: i64,
+    source: i64,
+}
+
+enum ReplayControl {
+    Boundary(BlockCut),
+    Upload(BlockCut),
+    Advance(Option<i64>),
+}
+
+impl ReplayControl {
+    fn read(body: &ReplicaBody) -> Result<Self> {
+        Ok(match body {
+            ReplicaBody::BlockBoundary(row) if row.external_source_token.is_none() => Self::Boundary(BlockCut {
+                block: row.block_index.ok_or_else(suffix_unavailable)?,
+                source: row.latest_processed_msg_id.ok_or_else(suffix_unavailable)?,
+            }),
+            ReplicaBody::BlockUploaded(row) if row.external_source_token.is_none()
+                && row.storage_version == Some(CURRENT_STORAGE_VERSION.0)
+                && row.storage_epoch.unwrap_or_default() == 0 => Self::Upload(BlockCut {
+                    block: row.block_index.ok_or_else(suffix_unavailable)?,
+                    source: row.latest_processed_msg_id.ok_or_else(suffix_unavailable)?,
+                }),
+            ReplicaBody::NoOp(row) => Self::Advance(row.src_msg_id),
+            ReplicaBody::TriesAdded(row) => Self::Advance(row.source_msg_id),
+            ReplicaBody::ArtefactsAdded(row) => Self::Advance(row.source_msg_id),
+            ReplicaBody::ArtefactsRemoved(row) => Self::Advance(row.source_msg_id),
+            ReplicaBody::TriesDeleted(_) => Self::Advance(None),
+            _ => return Err(suffix_unavailable()),
+        })
+    }
+}
+
+struct LogicalReplay {
+    epoch: StorageEpoch,
+    source: i64,
+    installed: BlockCut,
+    pending: Option<BlockCut>,
+}
+
+impl LogicalReplay {
+    fn new(checkpoint: Checkpoint, epoch: i32, catalog: &BlockCatalog) -> Self {
+        Self {
+            epoch: StorageEpoch(epoch), source: checkpoint.source,
+            installed: BlockCut {
+                block: checkpoint.block,
+                source: catalog.latest_source_position().map_or(-1, |position| position.0),
+            },
+            pending: None,
+        }
+    }
+
+    fn source_offset(&self, position: i64) -> Result<i64> {
+        let offset = SourcePosition(position).after_offset(self.epoch);
+        if offset < 0 && position != SourcePosition::from_epoch_offset(self.epoch, -1)?.0 {
+            return Err(suffix_unavailable());
+        }
+        Ok(offset)
+    }
+
+    fn transaction_source(&self, position: Option<i64>) -> Result<i64> {
+        let next = self.source_offset(position.ok_or_else(suffix_unavailable)?)?;
+        if self.pending.is_some() || next <= self.source {
+            return Err(suffix_unavailable());
+        }
+        Ok(next)
+    }
+
+    fn apply_control(&mut self, control: ReplayControl) -> Result<()> {
+        match control {
+            ReplayControl::Boundary(cut) => {
+                if self.pending.is_some() || self.installed.block.checked_add(1) != Some(cut.block)
+                    || self.source_offset(cut.source)? < self.source
+                {
+                    return Err(suffix_unavailable());
+                }
+                self.pending = Some(cut);
+            }
+            ReplayControl::Upload(cut) => {
+                // A restarted writer can confirm earlier retained blocks.
+                if cut == self.installed || (cut.block < self.installed.block
+                    && cut.source <= SourcePosition::from_epoch_offset(self.epoch, self.source)?.0)
+                {
+                    return Ok(());
+                }
+                if self.pending != Some(cut) {
+                    return Err(suffix_unavailable());
+                }
+                self.source = self.source_offset(cut.source)?;
+                self.installed = cut;
+                self.pending = None;
+            }
+            ReplayControl::Advance(Some(position)) => {
+                let next = self.source_offset(position)?;
+                if self.pending.is_some() && next > self.source {
+                    return Err(suffix_unavailable());
+                }
+                self.source = self.source.max(next);
+            }
+            ReplayControl::Advance(None) => (),
+        }
+        Ok(())
+    }
+}
+
+/// The transfer artifact authenticates the original source envelopes. The
+/// destination journal carries the same offsets and terms over its own media.
+pub(super) fn transfer_control(
+    envelope: &ReplicaEnvelope, checkpoint: Checkpoint,
+) -> Result<Option<Bytes>> {
+    if matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::NoOp(_)) {
+        return Ok(None);
+    }
+    let src_msg_id = match ReplayControl::read(&envelope.message)? {
+        ReplayControl::Upload(cut) if cut.block == checkpoint.block => return Ok(None),
+        ReplayControl::Upload(cut) => Some(cut.source),
+        ReplayControl::Advance(position) => position,
+        ReplayControl::Boundary(_) => None,
+    };
+    Ok(Some(ReplicaEnvelope {
+        term: envelope.term, term_sequence: envelope.term_sequence,
+        message: ReplicaBody::NoOp(NoOp { src_msg_id }),
+    }.encode().into()))
 }
 
 fn admit_record(
