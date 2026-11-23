@@ -459,6 +459,7 @@ pub(crate) fn integer_sql_id(event: &EventRef<'_>) -> Option<i64> {
 pub(crate) fn test_row(row: IndexedRow<'_>) -> Result<SearchRow> {
     let IndexedRow { header, key, values, .. } = row;
     Ok(SearchRow {
+        position: header.position,
         identity: key.as_deref().map(EntityIdRef::from_handle_bytes).transpose()?.map(EntityIdRef::into_owned),
         iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
         valid_to: header.valid_time.upper().0, op: header.op,
@@ -492,7 +493,7 @@ impl SearchPage for ArrowSearchPage {
         }
         let origin = event.origin();
         let mut indexed = search_row(event, columns, self.with_identity, self.seal.as_ref(), self.mode)?;
-        if self.mode == crate::file::BuildMode::Postings {
+        if self.mode == crate::file::BuildMode::Postings && indexed.header.position.is_none() {
             indexed.header.commit_position = logical::posting_position(indexed.header, origin, row)?;
         }
         Ok(indexed)
@@ -623,6 +624,7 @@ mod tests {
                 Some(_) => Some(vec![]),
             }).collect();
             SearchRow {
+                position: header.position,
                 identity: Some(identities[row].clone()),
                 iid: header.iid.0, system_from: header.system_from.0, valid_from: header.valid_time.lower().0,
                 valid_to: header.valid_time.upper().0, op: header.op, values,

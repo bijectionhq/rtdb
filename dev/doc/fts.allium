@@ -59,7 +59,7 @@ value SearchIndexDefinition {
 
     -- Derived
     -- The artefact definition id names the analyzer and search file format versions, so a change to either builds new search files rather than reading old ones.
-    artefact_id: "{name}~a{analyzer_version}f{format_version}"
+    artefact_id: "{name}~a{analyzer_version}p{event_layout_version}f{format_version}"
 }
 
 value SearchDoc {
@@ -84,7 +84,8 @@ value SearchRowVersion {
     -- The temporal order of an event within a captured table.
     iid: Bytes
     system_from: Instant
-    commit_position: Integer
+    original_transaction_position: Integer
+    original_event_ordinal: Integer
 }
 
 value AcceptedEventOrigin {

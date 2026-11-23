@@ -844,7 +844,7 @@ mod tests {
         let store = Arc::new(LocalStore::open(directory.path()).unwrap());
         let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
         let columns = vec!["body".to_string()];
-        let rows = vec![crate::SearchRow { identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens("an overdue invoice"))] }];
+        let rows = vec![crate::SearchRow { position: None, identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens("an overdue invoice"))] }];
         let key = ObjectKey::new("tables/docs/artefacts/l01-rc-b00/search/docs~a2f3-v1.bin").unwrap();
         store.put(&key, crate::build_search_file(&columns, &rows, "job").unwrap().into()).await.unwrap();
         let runtime = SearchRuntime::new(1 << 20);
@@ -891,7 +891,7 @@ mod tests {
         use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
         let store = Arc::new(MemoryStore::default());
         let columns = vec!["body".to_string()];
-        let rows: Vec<_> = (0..3000).map(|index| crate::SearchRow { identity: None, iid: [(index / 12) as u8; 16], system_from: -(index as i64), valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put,
+        let rows: Vec<_> = (0..3000).map(|index| crate::SearchRow { position: None, identity: None, iid: [(index / 12) as u8; 16], system_from: -(index as i64), valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put,
             values: vec![Some(rtdb_text::tokens(&format!("word{index} another{} overdue", index * 7)))] }).collect();
         let bytes = crate::build_search_file(&columns, &rows, "job").unwrap();
         let pool = Arc::new(BufferPool::new(store.clone(), bytes.len() * 2 + bytes.len() / 2));

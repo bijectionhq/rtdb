@@ -9,11 +9,11 @@ use arrow_array::{
 };
 use rtdb_columnar::MemoryReservation;
 use rtdb_text::stored_length;
-use rtdb_types::{Anomaly, EntityId, EventHeader, Iid, Result};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventPosition, Iid, Result};
 
 use super::{
     FORMAT_VERSION, TREE_FORMAT_VERSION, PACKED_FORMAT_VERSION, NO_DOC, NULL_DOC, IndexedRow, Section, SearchPage, TextRevision, STORED_IMPACTS, artefact_digest,
-    fault, lifespan, op_code, sections_array,
+    fault, lifespan, op_code, sections_array, SearchPosition, event_positions, search_position,
     layout::{Table, Writer, item_of, list},
     paged::PostingPlan,
     postings::{POSTING_TERMS, PostingBuilder, posting_table},
@@ -31,13 +31,14 @@ pub(super) struct Events {
     operation: Vec<u8>,
     keys: BinaryBuilder,
     positions: Vec<u32>,
+    event_positions: Vec<Option<EventPosition>>,
 }
 
 impl Events {
     pub fn new() -> Self {
         Self {
             iid: FixedSizeBinaryBuilder::new(16), system_from: Vec::new(),
-            valid_from: Vec::new(), valid_to: Vec::new(), operation: Vec::new(), keys: BinaryBuilder::new(), positions: Vec::new(),
+            valid_from: Vec::new(), valid_to: Vec::new(), operation: Vec::new(), keys: BinaryBuilder::new(), positions: Vec::new(), event_positions: Vec::new(),
         }
     }
 
@@ -49,6 +50,7 @@ impl Events {
         self.operation.push(op_code(header.op));
         self.keys.append_option(key);
         self.positions.push(header.commit_position);
+        self.event_positions.push(header.position);
         Ok(())
     }
 
@@ -57,6 +59,7 @@ impl Events {
             Arc::new(self.iid.finish()), Arc::new(Int64Array::from(self.system_from)),
             Arc::new(Int64Array::from(self.valid_from)), Arc::new(Int64Array::from(self.valid_to)),
             Arc::new(UInt8Array::from(self.operation)), Arc::new(self.keys.finish()),
+            Arc::new(event_positions(self.event_positions)?),
         ])?;
         Ok((events, self.positions))
     }
@@ -137,8 +140,8 @@ struct Builder {
     doc_columns: Vec<u32>,
     doc_revisions: FixedSizeBinaryBuilder,
     doc_tokens: arrow_array::builder::LargeListBuilder<StringBuilder>,
-    doc_positions: Vec<(rtdb_types::Timestamp, u32)>,
-    erases: BTreeMap<Iid, (rtdb_types::Timestamp, u32)>,
+    doc_positions: Vec<SearchPosition>,
+    erases: BTreeMap<Iid, SearchPosition>,
 }
 
 impl Builder {
@@ -183,8 +186,8 @@ impl Builder {
         }
         self.reserve_row(&row)?;
         if self.mode == BuildMode::Postings && row.header.op == rtdb_types::EventOp::Erase {
-            self.erases.entry(row.header.iid).and_modify(|position| *position = (*position).max(row.header.system_position()))
-                .or_insert_with(|| row.header.system_position());
+            self.erases.entry(row.header.iid).and_modify(|position| *position = (*position).max(search_position(row.header)))
+                .or_insert_with(|| search_position(row.header));
         }
         if self.mode == BuildMode::History {
             if row.revisions.len() != self.revisions.len() { return Err(fault("History revisions do not cover its fields")); }
@@ -219,7 +222,7 @@ impl Builder {
         if self.mode == BuildMode::Postings {
             for (index, (_, header, _)) in entity.rows.iter().enumerate() {
                 if header.op == rtdb_types::EventOp::Put
-                    && self.erases.get(&iid).is_none_or(|position| header.system_position() >= *position) {
+                    && self.erases.get(&iid).is_none_or(|position| search_position(*header) >= *position) {
                     visible[index].push([i64::MIN, i64::MAX, i64::MIN, i64::MAX]);
                 }
             }
@@ -268,7 +271,7 @@ impl Builder {
                     let revision = revision.ok_or_else(|| fault("Search document has no logical text revision"))?;
                     self.doc_columns.push(column_index as u32);
                     self.doc_revisions.append_value(revision).map_err(fault)?;
-                    self.doc_positions.push(members.iter().map(|&index| entity.rows[index].1.system_position())
+                    self.doc_positions.push(members.iter().map(|&index| search_position(entity.rows[index].1))
                         .max().expect("a posting has at least one original event"));
                     for token in tokens.iter().flatten() { self.doc_tokens.values().append_value(token); }
                     self.doc_tokens.append(true);
@@ -348,14 +351,16 @@ impl Builder {
                     Some(Table::TokenSequences.array(vec![Arc::new(UInt32Array::from(self.doc_columns)), Arc::new(self.doc_revisions.finish()),
                         list(tokens.values().clone(), (0..tokens.len()).map(|row| tokens.value_length(row) as usize),
                             item_of(&Table::TokenSequences.fields()[2]))?,
-                        Arc::new(Int64Array::from_iter_values(self.doc_positions.iter().map(|(timestamp, _)| timestamp.0))),
-                        Arc::new(UInt32Array::from_iter_values(self.doc_positions.iter().map(|(_, position)| *position)))])?)
+                        Arc::new(Int64Array::from_iter_values(self.doc_positions.iter().map(|(timestamp, _, _)| timestamp.0))),
+                        Arc::new(UInt32Array::from_iter_values(self.doc_positions.iter().map(|(_, _, ordinal)| *ordinal))),
+                        Arc::new(event_positions(self.doc_positions.iter().map(|(_, position, _)| *position))?)])?)
                 } else { None };
                 let erases = if !self.erases.is_empty() {
                     Some(Table::Erases.array(vec![
                         Arc::new(arrow_array::FixedSizeBinaryArray::try_from_iter(self.erases.keys().map(|iid| iid.0)).map_err(fault)?),
-                        Arc::new(Int64Array::from_iter_values(self.erases.values().map(|(time, _)| time.0))),
-                        Arc::new(UInt32Array::from_iter_values(self.erases.values().map(|(_, position)| *position))),
+                        Arc::new(Int64Array::from_iter_values(self.erases.values().map(|(time, _, _)| time.0))),
+                        Arc::new(UInt32Array::from_iter_values(self.erases.values().map(|(_, _, ordinal)| *ordinal))),
+                        Arc::new(event_positions(self.erases.values().map(|(_, position, _)| *position))?),
                     ])?)
                 } else { None };
                 super::tree_file::write(&mut writer, directory, visibility, plan,
@@ -490,10 +495,10 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
                         previous_time = None;
                     }
                 }
-                if previous_time.is_some_and(|previous| previous < row.header.system_from) {
+                if previous_time.is_some_and(|previous| previous < row.header.precedence()) {
                     return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in system-time-descending order"));
                 }
-                previous_time = Some(row.header.system_from);
+                previous_time = Some(row.header.precedence());
                 member_iid = Some(iid);
                 builder.put(&mut entities, row)?;
             }

@@ -187,10 +187,6 @@ pub struct EventHeader {
 }
 
 impl EventHeader {
-    pub fn system_position(self) -> (Timestamp, u32) {
-        (self.system_from, self.commit_position)
-    }
-
     pub fn precedence(self) -> (Timestamp, i128) {
         let order = self.position.map_or_else(
             || i128::MIN + i128::from(self.commit_position),
@@ -200,7 +196,7 @@ impl EventHeader {
     }
 
     pub fn version(self) -> RowVersion {
-        RowVersion { iid: self.iid, system_from: self.system_from, commit_position: self.commit_position }
+        RowVersion { iid: self.iid, system_from: self.system_from, position: self.position, commit_position: self.commit_position }
     }
 }
 
@@ -209,6 +205,7 @@ impl EventHeader {
 pub struct RowVersion {
     pub iid: Iid,
     pub system_from: Timestamp,
+    pub position: Option<EventPosition>,
     pub commit_position: u32,
 }
 

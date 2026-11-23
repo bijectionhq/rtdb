@@ -18,7 +18,7 @@ impl SearchDefinition {
     pub fn artefact_id(&self) -> String { self.artefact_id_for(crate::file::FORMAT_VERSION) }
 
     pub(crate) fn artefact_id_for(&self, format: i32) -> String {
-        format!("{}~a{}f{}", self.name, rtdb_text::ANALYZER_VERSION, format)
+        format!("{}~a{}p2f{}", self.name, rtdb_text::ANALYZER_VERSION, format)
     }
 }
 

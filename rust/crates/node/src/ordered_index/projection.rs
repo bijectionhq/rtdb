@@ -91,8 +91,8 @@ impl RevisionRoots {
                 if matches!(order, EventOrder::OldestFirst) {
                     events.reverse();
                 }
-                if events.iter().any(|event| event.header.commit_position != 0) {
-                    events.sort_by_key(|event| std::cmp::Reverse(event.header.commit_position));
+                if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
+                    events.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
                 }
                 let before = tree.spans(&root, &address).await?;
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);

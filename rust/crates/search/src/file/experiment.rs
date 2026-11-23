@@ -110,6 +110,7 @@ mod tests {
         let columns = ["body".to_string()];
         let ids: std::collections::BTreeMap<_, _> = (-512..512).map(|id| (EntityId::Integer(id).iid(), id)).collect();
         let rows: Vec<_> = ids.keys().map(|iid| SearchRow {
+            position: None,
             identity: None, iid: iid.0,
             system_from: 0,
             valid_from: 0,
