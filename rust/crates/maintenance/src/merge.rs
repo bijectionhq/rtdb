@@ -271,6 +271,10 @@ impl<'a, State> EntityStates<'a, State> {
     }
 }
 
+fn same_time_key(event: &PageEvent) -> (Iid, Option<Vec<u8>>, Timestamp) {
+    (event.iid, event.entity_key().map(<[u8]>::to_vec), event.system_from)
+}
+
 struct SameTimeState {
     calculator: AdmittedPolygonCalculator,
     system_from: Option<Timestamp>,
@@ -288,17 +292,18 @@ fn resolve_same_time(events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result
         })?;
         if state.erased { continue; }
         let header = event.header();
+        if state.system_from != Some(event.system_from) {
+            state.calculator.reset();
+            state.system_from = Some(event.system_from);
+        }
         if header.op == EventOp::Erase {
+            state.calculator.visit(&header, |_| Ok(()))?;
             state.erased = true;
             charges.push(memory.reserve(row_bytes(event)?.checked_mul(2).ok_or_else(|| crate::invalid("Resolved row allocation overflow"))?)?);
             let mut marker = event.clone();
             marker.valid_time = Interval::ALL;
             result.push(marker);
             continue;
-        }
-        if state.system_from != Some(event.system_from) {
-            state.calculator.reset();
-            state.system_from = Some(event.system_from);
         }
         state.calculator.visit(&header, |polygon| {
             if header.position.is_some() || header.commit_position != 0 || header.op == EventOp::Redacted {
@@ -412,14 +417,18 @@ impl SegmentCompactor {
                 events.retain(|event| planner::matches_path(event.iid, path));
                 if job.recency_mode == RecencyMode::Partition {
                     for event in events.iter().filter(|event| event.header().op == EventOp::Erase) {
-                        if let std::collections::btree_map::Entry::Vacant(entry) = erase_times.entry((event.iid, event.system_from)) {
-                            entry.insert(self.memory.reserve(512)?);
+                        if let std::collections::btree_map::Entry::Vacant(entry) = erase_times.entry(same_time_key(event)) {
+                            entry.insert((self.memory.reserve(512)?, 0usize));
                         }
                     }
                 }
                 charges.push(event_reservation(&self.memory, &events, 2)?);
                 rows.push(planner::PageRows { source_precedence: source_precedence[page.segment], events });
             }
+            for event in rows.iter().flat_map(|page| &page.events) {
+                if let Some((_, events)) = erase_times.get_mut(&same_time_key(event)) { *events += 1; }
+            }
+            erase_times.retain(|_, (_, events)| *events > 1);
             let mut heap = planner::RowHeap::new(&rows, tie_order)?;
             let mut states = EntityStates::new();
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
@@ -447,7 +456,7 @@ impl SegmentCompactor {
                     continue;
                 }
                 // Splitting an erase from same-time events lets trie precedence override operation order.
-                if erase_times.contains_key(&(event.iid, event.system_from)) {
+                if erase_times.contains_key(&same_time_key(event)) {
                     recency = Timestamp::MAX;
                 } else if event.position.is_some() || event.commit_position != 0 || event.op == EventOp::Redacted {
                     recency = recency.max(event.system_from);
