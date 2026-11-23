@@ -93,7 +93,7 @@ impl ScanAccelerator for SearchAccelerator {
         let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching, Query::parse(&scoring),
             top.ascending_id, limit, Narrowing::default()).await;
         match result {
-            Ok(source) => Ok(source.map(|source| Box::new(source) as Box<dyn rtdb_query::RankSource + 'a>)),
+            Ok(source) => Ok(source.map(|source| source as Box<dyn rtdb_query::RankSource + 'a>)),
             Err(error) if optional_build_refused(&error) => Ok(None),
             Err(error) => Err(error),
         }
@@ -981,10 +981,10 @@ impl SearchAccelerator {
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
         let scoring_query = Query::parse(&text);
         if !options.estimate_first && !options.baseline {
-            let (ranked, io) = crate::file::observe_tree_io(async {
+            let (ranked, io) = crate::file::observe_tree_io(Box::pin(async {
                 let ranking = rtdb_query::QueryRanking::new(std::num::NonZeroUsize::new(limit).expect("nonempty prefix"), 1, request.memory)?;
-                let source = tree::PartitionRankSource::open(self, *request, definition.clone(), column, top_k.column, matching.clone(),
-                    scoring_query.clone(), top_k.ascending_id, limit, options);
+                let source = Box::pin(tree::PartitionRankSource::open(self, *request, definition.clone(), column, top_k.column, matching.clone(),
+                    scoring_query.clone(), top_k.ascending_id, limit, options));
                 let Some(source) = rtdb_query::run_rank_partition(&ranking, 0, source, request.cancellation).await?
                     else { return Ok(None); };
                 let tried_ranking = work.tried_ranking;
@@ -994,7 +994,7 @@ impl SearchAccelerator {
                 work.filter_scope = filter_scope;
                 let Some(mut ranked) = ranking.winners() else { return Ok(None); };
                 request.ranked_selection(ranked.take_partition(0)).await
-            }).await;
+            })).await;
             work.tree_io = io;
             if let Some(selection) = ranked? {
                 let iids = selection.iids.iter().collect();

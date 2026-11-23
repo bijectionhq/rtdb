@@ -442,6 +442,7 @@ contract SearchCorrectness {
     @invariant RankedLimitKeepsTheFirstRows
         -- The scan hands on every row in the prefix the SQL sort needs, including OFFSET and LIMIT.
         -- One query cutoff accounts for all unopened, queued, claimed and pending-verification work across the pinned partitions.
+        -- Tree postings and older search files can contribute candidates to the same ranked point scan.
         -- Work with unknown rank has an unbounded ceiling until the query has stronger evidence.
         -- A worker replaces its claimed bound with its child bounds and verified rows in one publication.
         -- Every cutoff row is a resolved version whose primary payload satisfies the scan's predicates and supplies its score.

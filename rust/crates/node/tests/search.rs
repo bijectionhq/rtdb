@@ -1224,8 +1224,24 @@ async fn compatible_writers_keep_both_search_formats_through_restart() {
     }
 }
 
-#[tokio::test]
-async fn a_ranked_snapshot_combines_a_tree_and_an_older_search_format() {
+#[test]
+fn a_ranked_snapshot_combines_a_tree_and_an_older_search_format() {
+    std::thread::Builder::new()
+        .name("mixed-format ranked query".into())
+        .stack_size(2 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(verify_ranked_snapshot_with_mixed_search_formats());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn verify_ranked_snapshot_with_mixed_search_formats() {
     use rtdb_index::{LiveIndex, Snapshot};
     use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext};
 

@@ -266,7 +266,7 @@ pub(super) struct PartitionRankSource<'a> {
 impl<'a> PartitionRankSource<'a> {
     pub(super) async fn open(search: &'a SearchAccelerator, request: ScanRequest<'a>, definition: SearchDefinition, column: &str,
         column_id: ColumnId, matching: Query, scoring: Query, ascending_id: Option<ColumnId>, limit: usize, options: Narrowing<'a>)
-        -> Result<Option<Self>> {
+        -> Result<Option<Box<Self>>> {
         if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point()
             || definition.table.is_owned_event_data() || TableRef::owned_schema(&definition.table.schema) {
             return Ok(None);
@@ -327,12 +327,12 @@ impl<'a> PartitionRankSource<'a> {
         let logical_seed = seed_logical(runs, directory);
         let segments = request.snapshot.iter_segments(&request.scan.table.name.table).collect();
         let reservation = request.memory.reserve(4096)?;
-        Ok(Some(Self {
+        Ok(Some(Box::new(Self {
             search, request, definition, column: column.into(), column_id, column_index, matching, ranking,
             ascending_id: ascending_id.filter(|_| integer || uuid), order, verification_batch: limit.clamp(16, 128),
             scope, sources, ranks, legacy, logical, logical_ranks, logical_seed, coverage,
             gap_queued, segments, visibility, points, checked: BTreeSet::new(), nominated: 0, reservation, work: NarrowingWork::default(),
-        }))
+        })))
     }
 
     fn nominate(&mut self, mut nominations: Vec<Nomination>, more: &mut Vec<RankWork>) -> Result<bool> {
