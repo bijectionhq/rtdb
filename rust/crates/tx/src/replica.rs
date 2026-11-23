@@ -21,6 +21,37 @@ pub struct ReplayedTransaction {
 
 /// Decodes the complete transaction for atomic application by the caller.
 pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
+    decode(message, predecessor, block, memory, false)
+}
+
+/// The held-world writer calls this after authenticating the original journal
+/// frame. Validate all its effects, then keep the original business table
+/// bytes and omit retry state, including the placed lookup witness.
+pub fn project_held_replica(message: &mut ResolvedTx, predecessor: TransactionKey, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<()> {
+    decode_replica(message, Some(predecessor), block, memory)?;
+    message.table_data.retain(|name, _| !receipt_table(name));
+    message.placed_attempt = None;
+    // The strict acceptance witness is bound to that same placed attempt.
+    // Original journal admission checked it before this projection.
+    message.acceptance_stage = None;
+    Ok(())
+}
+
+/// The authenticated held-world manifest attests projection of frames that
+/// passed the full replica decoder. Placement-dependent checks ran before the
+/// receipt witness was removed. This decoder is private to archived replay.
+pub fn decode_held_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
+    if message.placed_attempt.is_some() || message.table_data.keys().any(|name| receipt_table(name)) {
+        return Err(invalid("Held business replay contains expiring transaction metadata"));
+    }
+    decode(message, predecessor, block, memory, true)
+}
+
+fn receipt_table(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(schema, table)| TableRef::new(schema, table).stores_expiring_transaction_metadata())
+}
+
+fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>, held: bool) -> Result<ReplayedTransaction> {
     let placed = if let Some(placed) = message.placed_attempt.as_deref() {
         let (attempt, retirement) = decode_replica_outcome_attempt(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
         let position = Some(attempt.position().0);
@@ -79,6 +110,9 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
             }
         }
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
+    }
+    if held {
+        return Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: None });
     }
     let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, &result, memory)).transpose()?;
     let proof = outcome.as_ref().map(|(proof, _)| proof);

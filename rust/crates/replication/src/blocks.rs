@@ -37,6 +37,20 @@ impl RecoveredPartition {
     pub fn apply_archived_transaction(
         &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
     ) -> Result<()> {
+        self.apply_archive(message, memory, rtdb_tx::decode_replica)
+    }
+
+    /// Apply a business projection authenticated by a held-world manifest.
+    pub fn apply_held_transaction(
+        &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
+    ) -> Result<()> {
+        self.apply_archive(message, memory, rtdb_tx::decode_held_replica)
+    }
+
+    fn apply_archive(
+        &mut self, message: &proto::ResolvedTx, memory: &Arc<MemoryBudget>,
+        decode: impl FnOnce(&proto::ResolvedTx, Option<rtdb_types::TransactionKey>, BlockIndex, &Arc<MemoryBudget>) -> Result<rtdb_tx::ReplayedTransaction>,
+    ) -> Result<()> {
         let source = message.src_msg_id.map(SourcePosition).ok_or_else(|| invalid("Archived transaction has no source position"))?;
         if message.db_op.is_some() || message.external_source_token.is_some() || source <= self.progress.source_position {
             return Err(invalid("Archived transaction has unsupported effects or source order"));
@@ -44,7 +58,7 @@ impl RecoveredPartition {
         let value = self.partition.value();
         let latest = value.live().latest_completed_tx();
         let rtdb_tx::ReplayedTransaction { writes, result, .. } =
-            rtdb_tx::decode_replica(message, latest, value.live().block_index(), memory)?;
+            decode(message, latest, value.live().block_index(), memory)?;
         if latest.is_some_and(|previous| result.tx_key().tx_id <= previous.tx_id
             || result.tx_key().system_time < previous.system_time)
         {
@@ -229,7 +243,17 @@ impl BlockStore {
             _ => None,
         };
         let selected = self.load_selected_checkpoint(discovery, None, published).await?;
-        self.restore(config, source_floor, now, discovery, published, selected)
+        self.restore(config, source_floor, now, discovery, published, selected, false)
+    }
+
+    /// Restore an exact published business checkpoint without opening its receipt tables.
+    pub async fn recover_held(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, checkpoint: PublishedCheckpoint) -> Result<RecoveredPartition> {
+        let block = self.load_fresh_catalog(checkpoint.block).await?;
+        if checkpoint.root_sha256.is_none() || block.publication_sha256() != checkpoint.root_sha256 || !checkpoint.accepts(&block) {
+            return Err(invalid("The held checkpoint does not match its exact published root"));
+        }
+        let tables = self.load_tables_at_view(&block, true).await?;
+        self.restore(config, source_floor, now, BlockDiscovery::AtPublished(checkpoint), Some(checkpoint), Some((block, tables)), true)
     }
 
     /// Admits an ordinary latest checkpoint with the same cursor the driver will consume.
@@ -259,7 +283,7 @@ impl BlockStore {
                 let Some(replacement) = self.load_selected_checkpoint(BlockDiscovery::List, previous, published).await? else {
                     return Err(gap.into());
                 };
-                recovered = self.restore(config, source_floor, now, BlockDiscovery::List, published, Some(replacement))?;
+                recovered = self.restore(config, source_floor, now, BlockDiscovery::List, published, Some(replacement), false)?;
             }
         };
         cancellation.run_until_cancelled(work).await.ok_or_else(crate::progress::cancelled)?
@@ -267,7 +291,7 @@ impl BlockStore {
 
     fn restore(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery,
         published: Option<PublishedCheckpoint>,
-        selected: Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>) -> Result<RecoveredPartition> {
+        selected: Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>, held: bool) -> Result<RecoveredPartition> {
         let compaction_replay_cutoff = match discovery {
             BlockDiscovery::FromRestored { compaction_cutoff, .. } => Some(compaction_cutoff),
             _ => None,
@@ -276,7 +300,11 @@ impl BlockStore {
             Some((catalog, tables)) => (Some(catalog), tables),
             None => (None, BTreeMap::new()),
         };
-        let tables = TableCatalog::load(block.clone(), &table_blocks)?.with_system_tables()?;
+        let tables = if held {
+            TableCatalog::load_held(block.clone().ok_or_else(|| invalid("The held view has no checkpoint"))?, &table_blocks)?
+        } else {
+            TableCatalog::load(block.clone(), &table_blocks)?
+        }.with_system_tables()?;
         let tries = TrieCatalog::load(&table_blocks, self.file_size_target, now)?;
         let partition = Arc::new(PartitionState::new(PartitionValue::loaded(tries, tables, config)?));
         let progress = AppliedProgress {
@@ -483,9 +511,14 @@ impl BlockStore {
     }
 
     async fn load_tables(&self, block: &BlockCatalog) -> Result<BTreeMap<rtdb_types::TableRef, TableBlock>> {
+        self.load_tables_at_view(block, false).await
+    }
+
+    async fn load_tables_at_view(&self, block: &BlockCatalog, held: bool) -> Result<BTreeMap<rtdb_types::TableRef, TableBlock>> {
         let index = block.block_index();
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
+            if held && entry.table.stores_expiring_transaction_metadata() { continue; }
             let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
             if !block.matches_table_block(entry.oid, &rtdb_format::catalog::publication_digest(lease.as_slice())) {
                 return Err(invalid(format!("The stored table block for {} does not match its checkpoint manifest", entry.table.schema_and_table())));

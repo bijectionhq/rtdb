@@ -888,6 +888,12 @@ impl Capture {
         prefix: &str,
         cipher: &Arc<dyn ArchiveKey>,
     ) -> Result<()> {
+        self.verify_members(bucket, prefix, cipher, false).await.map(drop)
+    }
+
+    async fn verify_members(
+        &self, bucket: Arc<dyn ObjectStore>, prefix: &str, cipher: &Arc<dyn ArchiveKey>, held: bool,
+    ) -> Result<CheckpointObjects> {
         let mut bytes = 0u64;
         let objects = self.objects.iter()
             .map(|object| {
@@ -902,17 +908,17 @@ impl Capture {
             objects: objects.iter().map(|(name, object)| (name.clone(), (*object).clone())).collect(),
             cipher: Arc::clone(cipher),
         };
-        let closure = checkpoint_objects(&plaintext, &self.point, self.format).await?;
-        if objects.len() != self.objects.len() || objects.keys().ne(closure.keys()) {
+        let closure = checkpoint_objects_at_view(&plaintext, &self.point, self.format, held).await?;
+        if objects.len() != self.objects.len() || (!held && objects.keys().ne(closure.keys())) {
             return Err(inconsistent(
                 "The archive object list differs from the checkpoint closure",
             ));
         }
-        for name in objects.keys() {
+        for (name, expected) in &closure {
             let bytes = plaintext.get(name).await?;
-            require_bound_metadata(closure[name], &bytes)?;
+            require_bound_metadata(*expected, &bytes)?;
         }
-        Ok(())
+        Ok(closure)
     }
 }
 
@@ -1075,9 +1081,21 @@ async fn verified_archive(
     keys: &dyn KeyService,
     region: Arc<IoRegion>,
 ) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
+    verified_archive_at_view(bucket, point, manifest, keys, region, false).await
+}
+
+async fn verified_held_archive(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService, region: Arc<IoRegion>,
+) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
+    verified_archive_at_view(bucket, point, manifest, keys, region, true).await
+}
+
+async fn verified_archive_at_view(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService, region: Arc<IoRegion>, held: bool,
+) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
     let prefix = format!("checkpoint-captures/{}/{}", point.deployment, point.operation);
     let metadata = PrefixedStore::new(bucket.clone(), &prefix);
-    let capture = read::<Capture>(&metadata, &key("capture.json")?).await?
+    let mut capture = read::<Capture>(&metadata, &key("capture.json")?).await?
         .ok_or_else(|| unavailable("The captured manifest is unavailable"))?;
     if &capture.point != point
         || capture.manifest_sha256()? != manifest
@@ -1086,7 +1104,12 @@ async fn verified_archive(
         return Err(inconsistent("The archive differs from its accepted capture"));
     }
     let cipher = archive_key(keys, point, region).await?;
-    capture.verify(bucket, &prefix, &cipher).await?;
+    if held {
+        let members = capture.verify_members(bucket, &prefix, &cipher, true).await?;
+        capture.objects.retain(|object| key(&object.name).is_ok_and(|name| members.contains_key(&name)));
+    } else {
+        capture.verify(bucket, &prefix, &cipher).await?;
+    }
     Ok((capture, cipher))
 }
 
@@ -1249,17 +1272,26 @@ fn require_bound_metadata(expected: Option<[u8; 32]>, bytes: &[u8]) -> Result<()
 }
 
 async fn checkpoint_objects(plaintext: &dyn ObjectStore, point: &CapturePoint, contents: CheckpointContents) -> Result<CheckpointObjects> {
+    checkpoint_objects_at_view(plaintext, point, contents, false).await
+}
+
+async fn checkpoint_objects_at_view(plaintext: &dyn ObjectStore, point: &CapturePoint, contents: CheckpointContents, held: bool) -> Result<CheckpointObjects> {
     let catalog_key = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&catalog_key).await?)?;
     verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
-    catalog_objects(plaintext, &catalog, contents).await
+    catalog_objects_at_view(plaintext, &catalog, contents, held).await
 }
 
 async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents) -> Result<CheckpointObjects> {
+    catalog_objects_at_view(plaintext, catalog, contents, false).await
+}
+
+async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents, held: bool) -> Result<CheckpointObjects> {
     let block = catalog.block_index();
     let root_digest = catalog.publication_sha256().ok_or_else(|| inconsistent("Checkpoint root bytes were not observed"))?;
     let mut closure = BTreeMap::from([(key(&block_key(block)?)?, Some(root_digest))]);
     for table in catalog.table_entries()? {
+        if held && table.table.stores_expiring_transaction_metadata() { continue; }
         let path = key(&table.slug.block_key(block)?)?;
         let bytes = plaintext.get_fresh(&path).await?;
         let observed = publication_digest(&bytes);

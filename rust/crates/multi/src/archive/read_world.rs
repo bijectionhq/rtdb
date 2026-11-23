@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::{
     ArchiveKey, ArchivedObject, CellStorage, KeyService, PrefixedStore, archive_witness,
     capture_receipt, inconsistent, key, observe_archive_object, read, read_object, replica_suffix, require_capture_open, stage,
-    read_archive_lifetime_floors, unavailable, verified_archive,
+    read_archive_lifetime_floors, unavailable, verified_archive, verified_held_archive,
 };
 
 /// Reopenable locator for one independently retained published cut.
@@ -276,8 +276,13 @@ where
                         "The archive belongs to another captured checkpoint",
                     ));
                 }
-                let (manifest, cipher) =
-                    verified_archive(bucket.clone(), &capture, selected.manifest, keys, Arc::clone(&region)).await?;
+                let held = !selected.require_replay && terminal.is_none()
+                    && suffix.as_ref().is_none_or(|pin| pin.custody == rtdb_directory::CheckpointSuffixCustody::World);
+                let (manifest, cipher) = if held {
+                    verified_held_archive(bucket.clone(), &capture, selected.manifest, keys, Arc::clone(&region)).await?
+                } else {
+                    verified_archive(bucket.clone(), &capture, selected.manifest, keys, Arc::clone(&region)).await?
+                };
                 if selected.require_replay {
                     if manifest.format != rtdb_format::catalog::CheckpointContents::Replay {
                         return Err(inconsistent("An installation serving from a replay archive requires a complete replay restore"));
@@ -318,14 +323,12 @@ where
                     root_sha256: capture.checkpoint.root_sha256,
                 };
                 let source_floor = SourcePosition::from_epoch_offset(epoch, capture.checkpoint.source)?;
-                let mut recovered = blocks
-                    .recover(
-                        resources.node.trie,
-                        source_floor,
-                        rtdb_types::Timestamp(capture.checkpoint.system_time),
-                        BlockDiscovery::AtPublished(checkpoint),
-                    )
-                    .await?;
+                let now = Timestamp(capture.checkpoint.system_time);
+                let mut recovered = if held {
+                    blocks.recover_held(resources.node.trie, source_floor, now, checkpoint).await?
+                } else {
+                    blocks.recover(resources.node.trie, source_floor, now, BlockDiscovery::AtPublished(checkpoint)).await?
+                };
                 let base_snapshot = recovered.partition.snapshot();
                 let base_basis = base_snapshot.tx_basis()
                     .filter(|basis| basis.system_time.0 == capture.checkpoint.system_time)

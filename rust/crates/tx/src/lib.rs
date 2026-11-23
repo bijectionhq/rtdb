@@ -19,7 +19,7 @@ pub use values::*;
 pub use guard_attribution::attributed_historical_guard_original;
 pub use source::SourceTransaction;
 pub use resolver::*;
-pub use replica::{ReplayedTransaction, decode_replica};
+pub use replica::{ReplayedTransaction, decode_held_replica, decode_replica, project_held_replica};
 
 pub use idempotency_window::expiration as idempotency_expiration;
 pub use replay_submission::{ReplaySubmission, private_replay_original};

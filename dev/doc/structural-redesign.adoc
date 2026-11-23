@@ -221,7 +221,8 @@ New recovery checkpoints omit covered receipt tries, placed intake releases appl
 Directory deployments can retire loose receipt L0 through their custodian after successor publication and certified replay exclusion.
 An exact record erase co-orders erasure of transaction metadata explicitly associated with that record.
 Classic local repair-base maintenance settles covered log payloads and skip diagnostics, and pack retirement accepts an independent successor that omits covered receipt members.
-Held archive and remaining provider custody closure stay open.
+New held-world suffixes authenticate exact business effects before leaving receipt state with its original authority. Held checkpoint reads open only business members of the authenticated manifest.
+Physical withdrawal from previously materialized archives and remaining provider custody stay open. Quiet histories depend on the ordered clock work in T4.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.

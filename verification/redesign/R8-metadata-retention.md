@@ -151,6 +151,11 @@ The old-pack grant can settle a mixed pack whose independent replay manifest omi
 M1 remains open for still-held archives, Classic remote receipt objects without exact provider disposal, active installed journal grant files, offloaded or legacy copies outside these grants, and untracked media snapshots.
 Closure needs exact custodian settlement after the successor and all such references are released.
 A captured archive's existing whole-capture settlement can run after release of its last entitlement.
-An archive that must still provide exact business history needs independent receipt custody before those receipt bytes can be withdrawn.
+Held-world suffixes verify the original certified journal interval and all placed transaction witnesses before materializing the business projection.
+The archive manifest authenticates the original transaction coordinates and the original business table batches, including detached payloads.
+The source authority keeps retry state, and the held-world copy omits retry tables, attempt identities and their acceptance witnesses.
+An exact published checkpoint used for an owned held read verifies the original manifest digest and opens only its business members.
+Full checkpoint restores still require their complete replay inventory.
+Retiring a receipt-only checkpoint member or an earlier mixed suffix requires its original custodian and a grant that accounts for those recovery entitlements.
 A quiet history still needs ordered receipt-clock progress to trigger collection.
 Early erasure of associated metadata enters the same copy-settlement path as expiry.

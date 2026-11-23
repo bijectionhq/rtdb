@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 use super::{
     ArchiveKey, CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
-    unavailable, verified_archive, verify_cut,
+    unavailable, verified_held_archive, verify_cut,
 };
-use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, require_chain};
+use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, extend_payload, require_chain};
 use super::stage::{RegionPublication, with_region};
 use crate::{
     admin::{administration_stream, update_installation},
@@ -105,7 +105,7 @@ pub(super) async fn read_base_catalog(
     bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
     io: Arc<IoRegion>,
 ) -> Result<(BlockCatalog, Arc<dyn ArchiveKey>)> {
-    let (base, cipher) = verified_archive(bucket.clone(), point, manifest, keys, io).await?;
+    let (base, cipher) = verified_held_archive(bucket.clone(), point, manifest, keys, io).await?;
     let root = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let root_object = base.objects.iter().find(|object| object.name == root.as_str())
         .ok_or_else(|| inconsistent("The suffix capture omitted its root catalog"))?;
@@ -210,16 +210,54 @@ pub(crate) async fn capture(
                             let segment = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
                             rtdb_logkeeper::verify_certified_range(&segment, &entries)?;
                             cipher.open_page(&mut entries)?;
-                            artifact.put_segment(&entries, &mut chain).await?;
-                            for entry in entries {
-                                let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
-                                if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                            let held = pin.custody == CheckpointSuffixCustody::World;
+                            let mut detached = Vec::new();
+                            for entry in &mut entries {
+                                let Some(envelope) = progress.admit(entry, pin)? else {
+                                    if held {
+                                        // The original digest and ordering remain authenticated.
+                                        // Fenced frames do not contribute any replay effects.
+                                        let mut envelope = ReplicaFrame::decode(&entry.payload)?
+                                            .into_envelope().ok_or_else(suffix_unavailable)?;
+                                        envelope.message = ReplicaBody::NoOp(NoOp { src_msg_id: None });
+                                        entry.payload = envelope.encode().into();
+                                    }
+                                    continue;
+                                };
+                                let (mut resolved, payload) = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
                                     let (resolved, payload) = payloads.resolve_verified(entry.lsn, &envelope).await?;
-                                    progress.apply(resolved, pin, |_| Ok(()))?;
-                                    artifact.put_payload(entry.lsn, &payload.bytes, &mut chain).await?;
+                                    (resolved, Some(payload))
                                 } else {
-                                    progress.apply(envelope, pin, |_| Ok(()))?;
+                                    (envelope, None)
+                                };
+                                if held {
+                                    if let ReplicaBody::ResolvedTx(message) = &mut resolved.message {
+                                        rtdb_replication::project_held_replica(
+                                            message, progress.tx, BlockIndex(progress.replay.installed.block), memory,
+                                        )?;
+                                    }
                                 }
+                                if let Some(payload) = payload {
+                                    let projected;
+                                    let body = if held {
+                                        projected = resolved.encode();
+                                        entry.payload = resolved.offloaded(
+                                            CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(pin.checkpoint.block),
+                                            "archive".into(), &projected,
+                                        ).encode().into();
+                                        projected.as_slice()
+                                    } else {
+                                        payload.bytes.as_ref()
+                                    };
+                                    detached.push((entry.lsn, artifact.write_payload(entry.lsn, body).await?));
+                                } else if held && matches!(&resolved.message, ReplicaBody::ResolvedTx(_)) {
+                                    entry.payload = resolved.encode().into();
+                                }
+                                progress.apply(resolved, pin, |_| Ok(()))?;
+                            }
+                            artifact.put_segment(&entries, &mut chain).await?;
+                            for (offset, digest) in detached {
+                                extend_payload(&mut chain, offset, &digest);
                             }
                         }
                         progress.finish(pin)?;
@@ -301,7 +339,10 @@ pub(super) async fn apply_archived(
             } else {
                 envelope
             };
-            progress.apply(envelope, pin, |message| recovered.apply_archived_transaction(message, memory))?;
+            progress.apply(envelope, pin, |message| match pin.custody {
+                CheckpointSuffixCustody::World => recovered.apply_held_transaction(message, memory),
+                _ => recovered.apply_archived_transaction(message, memory),
+            })?;
         }
     }
     progress.finish(pin)?;
@@ -328,9 +369,13 @@ fn suffix_artifact<'a>(
     identity.expires_at_ms = 0;
     identity.writer_epoch = 0;
     identity.archive_sha256 = None;
+    let (version, domain): (_, &'static [u8]) = match pin.custody {
+        CheckpointSuffixCustody::Capture => ("v2", b"RTDB checkpoint suffix segments v2\0"),
+        _ => ("v3", b"RTDB held business suffix segments v3\0"),
+    };
     ReplicaArtifact::new(
-        bucket, cipher, format!("{}/v2", archive_prefix(deployment, suffix, pin)),
-        encode(&(stream, identity))?, b"RTDB checkpoint suffix segments v2\0",
+        bucket, cipher, format!("{}/{version}", archive_prefix(deployment, suffix, pin)),
+        encode(&(stream, identity))?, domain,
     )
 }
 
