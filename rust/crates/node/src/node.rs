@@ -642,11 +642,25 @@ impl Node {
         let seed = authority.map(|authority| authority.scope().issue());
         let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?
             .with_placed_seed(seed);
-        let (source, submitted_at) = match replay {
+        let (mut source, submitted_at) = match replay {
             Some((replay, submitted_at)) => (source.with_replay_submission(replay), Some(submitted_at)),
             None => (source, None),
         };
+        let prepared_clock = cancellation.run_until_cancelled(
+            source.prepare_proposal_generation(|| database.snapshot(), &database.resolve)
+        ).await.ok_or_else(cancelled)??;
         let payload = source.encode()?.into_bytes();
+        drop(source);
+        if let Some(reading) = prepared_clock {
+            let delay = reading.0.saturating_sub(self.now().0);
+            if delay > 1_000_000 {
+                return Err(Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"));
+            }
+            if delay > 0 {
+                let wait = tokio::time::sleep(std::time::Duration::from_micros(delay as u64));
+                cancellation.run_until_cancelled(wait).await.ok_or_else(cancelled)?;
+            }
+        }
         let submitted_bytes = payload.len() as u64;
         let append_time = submitted_at.unwrap_or_else(|| self.now());
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, append_time)).await.ok_or_else(cancelled)??;

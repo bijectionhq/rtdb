@@ -64,6 +64,8 @@ pub struct SourceTransaction {
     pub options: SubmitOptions,
     pub(crate) guard: Option<SourceGuard>,
     placed_seed: Option<PlacedAttemptSeed>,
+    pub(crate) prepared_landing: Option<crate::resolver::PreparedLanding>,
+    pub(crate) landing_footprint: Option<RetainedBytes>,
     pub(crate) memory: Arc<MemoryBudget>,
     _reservation: Arc<MemoryReservation>,
 }
@@ -128,6 +130,10 @@ impl SourceTransaction {
         Ok(())
     }
 
+    pub fn requires_durable_predecessor(&self) -> bool {
+        self.prepared_landing.is_some() || self.uses_staging_deadline()
+    }
+
     pub fn uses_staging_deadline(&self) -> bool {
         self.operations.iter().any(|operation| matches!(operation,
             Operation::Public(TxOp::OwnedDeadline { recheck_at_staging: true, .. })))
@@ -189,7 +195,7 @@ impl SourceTransaction {
             bytes = bytes.checked_add(text).and_then(|size| size.checked_add(ids)).and_then(|size| size.checked_add(table.map_or(0, |table| table.schema.capacity() + table.table.capacity()))).and_then(|size| size.checked_add(256)).ok_or_else(overflow)?;
         }
         let reservation = memory.reserve(bytes)?;
-        Ok(Self { operations, options, guard: None, placed_seed: None, memory: Arc::clone(memory), _reservation: reservation })
+        Ok(Self { operations, options, guard: None, placed_seed: None, prepared_landing: None, landing_footprint: None, memory: Arc::clone(memory), _reservation: reservation })
     }
 
     pub fn with_idempotency_guard(mut self, submitted_at: Timestamp, after_bootstrap: bool) -> Self {
@@ -233,6 +239,12 @@ impl SourceTransaction {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => decode_placed_seed(tx)?,
             _ => None,
         };
+        let prepared_landing = match message {
+            SourceMessage::Protobuf(SourceBody::Tx(tx)) => tx.prepared_landing.as_ref()
+                .map(|generation| crate::resolver::PreparedLanding::decode(generation, tx.tx_ops.as_deref(), memory))
+                .transpose()?,
+            _ => None,
+        };
         let (pages, mut options, guard, legacy, abort_on_legacy_resolver) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
                 let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
@@ -274,7 +286,7 @@ impl SourceTransaction {
             _ => return Err(invalid("Source message is not a transaction")),
         };
         if pages.is_empty() && !legacy {
-            if guard.is_some() { return Err(invalid("A guarded transaction requires an operations batch")); }
+            if guard.is_some() || prepared_landing.is_some() { return Err(invalid("A guarded transaction requires an operations batch")); }
             let mut transaction = Self::from_operations(Vec::new(), options, memory)?;
             transaction.placed_seed = placed_seed;
             return Ok(transaction);
@@ -297,19 +309,7 @@ impl SourceTransaction {
             let metadata = optional_cell(first.batch(), "user-metadata", 0)?;
             if !matches!(metadata, Value::Null | Value::Undefined) { options.user_metadata = Some(UserMetadata::new(metadata, memory)?); }
         }
-        let mut reader = SourceOperationReader { memory, parsed_fields, layouts: BTreeMap::new() };
-        let mut operations = Vec::new();
-        for page in &pages {
-            let batch = page.batch();
-            let column = batch.column(batch.schema().index_of("tx-ops").map_err(|error| invalid(error.to_string()))?);
-            let array: ArrayRef = if legacy {
-                let list = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Legacy tx-ops is not a list"))?;
-                list.value(0)
-            } else { Arc::clone(column) };
-            let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
-            let source_bytes = page.reservation().bytes();
-            for row in 0..union.len() { operations.push(reader.operation(union, row, source_bytes)?); }
-        }
+        let mut operations = decode_operation_pages(&pages, legacy, memory, parsed_fields)?;
         if abort_on_legacy_resolver || matches!(guard, Some(SourceGuard::Bounded(_))) {
             if !matches!(operations.first(), Some(Operation::Public(TxOp::Sql { sql, args: None })) if sql == LEGACY_REPLAY_ABORT) {
                 return Err(invalid("Replay submission has no legacy resolver assertion"));
@@ -324,6 +324,7 @@ impl SourceTransaction {
         }
         let mut transaction = Self::from_operations(operations, options, memory)?;
         transaction.guard = guard;
+        transaction.prepared_landing = prepared_landing;
         transaction.placed_seed = placed_seed;
         Ok(transaction)
     }
@@ -354,6 +355,19 @@ impl SourceTransaction {
         Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
+    pub(crate) fn encode_landing_footprint(&self) -> Result<RetainedBytes> {
+        let batch = self.operation_batch(None, SourcePurpose::Log)?;
+        crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)
+    }
+
+    pub(crate) fn decode_landing_footprint(&self, footprint: &[u8]) -> Result<Self> {
+        let pages = crate::ipc::decode(footprint, &self.memory)?;
+        let mut scratch = self.memory.reserve(4096)?;
+        let scratch = Arc::get_mut(&mut scratch).expect("source decoding owns its reservation");
+        let operations = decode_operation_pages(&pages, false, &self.memory, scratch)?;
+        Self::from_operations(operations, self.options.clone(), &self.memory)
+    }
+
     pub fn encode(&self) -> Result<RetainedBytes> {
         let bounded = BoundedRetry::from_metadata(self.options.user_metadata.as_ref())?;
         let attached = match &self.guard { Some(SourceGuard::Bounded(retry)) => Some(*retry), _ => None };
@@ -363,8 +377,13 @@ impl SourceTransaction {
         let prefix = matches!(self.guard, Some(SourceGuard::Replay(_) | SourceGuard::Bounded(_))).then(|| {
             Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
         });
-        let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
-        let bytes = crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?;
+        let bytes = match &self.landing_footprint {
+            Some(footprint) => footprint.clone(),
+            None => {
+                let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
+                crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?
+            }
+        };
         let metadata = self.options.user_metadata.as_ref().map(|metadata| encode_metadata(metadata, &self.memory)).transpose()?;
         let body_size = self.options.default_tz.capacity().checked_add(self.options.user.as_ref().map_or(0, String::capacity)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let _body_reservation = self.memory.reserve(body_size)?;
@@ -388,6 +407,10 @@ impl SourceTransaction {
         };
         let (tx_ops, _tx_ops_reservation) = bytes.into_parts();
         let (user_metadata, _user_metadata_reservation) = metadata.map(RetainedBytes::into_parts).unzip();
+        let prepared_landing = self.prepared_landing.as_ref()
+            .map(|generation| generation.encode(&tx_ops, &self.memory))
+            .transpose()?;
+        let (prepared_landing, _prepared_charge) = prepared_landing.unzip();
         let tx = rtdb_format::generated::xtdb::log::proto::Tx {
             tx_ops: Some(tx_ops), system_time_micros: self.options.system_time.map(|time| time.0),
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
@@ -396,6 +419,7 @@ impl SourceTransaction {
             replay_submission,
             bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec()),
+            prepared_landing,
         };
         let wire = rtdb_format::generated::xtdb::log::proto::SourceLogMessage { message: Some(SourceBody::Tx(tx)) };
         let reservation = self.memory.reserve(wire.encoded_len().checked_add(128).ok_or_else(overflow)?)?;
@@ -481,6 +505,25 @@ impl SourceTransaction {
         let batch = RecordBatch::try_new(schema, vec![union]).map_err(|error| invalid(error.to_string()))?;
         arrays.finish(batch)
     }
+}
+
+fn decode_operation_pages(
+    pages: &[OwnedBatch], legacy: bool, memory: &Arc<MemoryBudget>, parsed_fields: &mut MemoryReservation,
+) -> Result<Vec<Operation>> {
+    let mut reader = SourceOperationReader { memory, parsed_fields, layouts: BTreeMap::new() };
+    let mut operations = Vec::new();
+    for page in pages {
+        let batch = page.batch();
+        let column = batch.column(batch.schema().index_of("tx-ops").map_err(|error| invalid(error.to_string()))?);
+        let array: ArrayRef = if legacy {
+            let list = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| invalid("Legacy tx-ops is not a list"))?;
+            list.value(0)
+        } else { Arc::clone(column) };
+        let union = array.as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Transaction operations are not a union"))?;
+        let source_bytes = page.reservation().bytes();
+        for row in 0..union.len() { operations.push(reader.operation(union, row, source_bytes)?); }
+    }
+    Ok(operations)
 }
 
 fn decode_placed_seed(tx: &rtdb_format::generated::xtdb::log::proto::Tx) -> Result<Option<PlacedAttemptSeed>> {

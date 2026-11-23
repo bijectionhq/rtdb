@@ -121,9 +121,7 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
                     worlds::HostedEffects::ProposalClose if !(4..=7).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved Proposal close lacks its bounded custody and receipt effects")),
-                    worlds::HostedEffects::ProposalLanding if controls.iter()
-                        .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>() != 3 =>
-                        return Err(invalid("Resolved Proposal landing requires its replay head, receipt and proof")),
+                    worlds::HostedEffects::ProposalLanding => verify_proposal_landing_controls(&controls, memory)?,
                     worlds::HostedEffects::RequiredReplacements if controls.is_empty() =>
                         return Err(invalid("Resolved control-only retained fork has no hosted replacements")),
                     worlds::HostedEffects::RetainedRelease if !(1..=2).contains(
@@ -279,6 +277,32 @@ fn read_placed_outcome(
         return Err(mismatch());
     }
     Ok((proof, decode))
+}
+
+fn verify_proposal_landing_controls(
+    controls: &[(&TableRef, &TableWrite)], memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    use crate::hosted_control::{MAX_PROPOSAL_LAND_TASKS, proposal_landing_replacements};
+
+    let mismatch = || invalid("Resolved Proposal landing differs from its exact control inventory");
+    let [(table, write)] = controls else { return Err(mismatch()); };
+    if table.schema != "public" || table.table != "bj_fact_root_admission" {
+        return Err(mismatch());
+    }
+    let batch = write.batch().filter(|batch| batch.len() <= MAX_PROPOSAL_LAND_TASKS + 8).ok_or_else(mismatch)?;
+    let bytes = batch.arrow().get_array_memory_size().checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(8192)).ok_or_else(mismatch)?;
+    let _charge = memory.reserve(bytes)?;
+    let mut ids = Vec::new();
+    for index in 0..batch.len() {
+        let StoredOperation::Put(mut row) = batch.view().read_event(index)?.operation else { return Err(mismatch()); };
+        let Some(Value::Utf8(id)) = row.remove("_id") else { return Err(mismatch()); };
+        ids.push(id);
+    }
+    if !proposal_landing_replacements(ids.iter().map(String::as_str)) {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 fn verify_hosted_controls(

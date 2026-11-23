@@ -576,6 +576,19 @@ impl StagedWrite {
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
 
+    /// Attach sealed application tables to the order-assigned transaction metadata.
+    /// Their system clock and predecessor were fixed before the source ID was assigned.
+    pub fn install_prepared_generation(&mut self, prepared: Self) -> Result<()> {
+        if prepared.predecessor != self.predecessor || prepared.block_index != self.block_index
+            || prepared.tx_key.system_time != self.tx_key.system_time
+            || prepared.tables.keys().any(|table| self.tables.contains_key(table))
+        {
+            return Err(invalid("Prepared generation differs from the ordered transaction"));
+        }
+        self.tables.extend(prepared.tables);
+        Ok(())
+    }
+
     pub fn assign_event_origins(mut self, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let commit = rtdb_types::EventOrigin::new_commit();
         let block = self.block_index;

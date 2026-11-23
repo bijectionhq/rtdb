@@ -19,6 +19,10 @@
 --   Resolution and apply never interleave, so a transaction is never half-applied.
 --   Staging, ownership and the durability handles: live-index.allium. The role lifecycle, the claim and the term: log-processor-lifecycle.allium.
 --
+-- A native hosted Proposal source record carries immutable table batches prepared by the submitter against its authenticated installed cut.
+-- Source resolution admits that generation at the same durable predecessor and offered clock and adds order-assigned metadata.
+-- Replica read-back remains the visibility fence for the one selected success or refusal transaction.
+
 -- Two heads, two homes — callers choose:
 --   RESOLVED head (on the resolver): the highest transaction resolved, and so staged.
 --     Drives resolution — the next external-source tx_id, system-time smoothing, read-your-writes.

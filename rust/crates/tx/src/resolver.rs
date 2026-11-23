@@ -23,6 +23,8 @@ use crate::values::{BoundArgumentRow, IngestMode, plain_scalar_field};
 use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
+mod prepared_landing;
+pub(crate) use prepared_landing::PreparedLanding;
 mod constraint_receipt;
 mod retry;
 mod retention;
@@ -287,7 +289,7 @@ impl TxResolver {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
-        if request.uses_staging_deadline() && !self.queue.is_empty() {
+        if request.requires_durable_predecessor() && !self.queue.is_empty() {
             return Err(Anomaly::fault("rtdb.tx/strict-predecessor", "A strict source transaction requires a durable predecessor"));
         }
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
@@ -373,6 +375,8 @@ impl TxResolver {
             _ => None,
         });
         let mut constraint_failed = false;
+        let mut prepared_writes = None;
+        let mut settled = false;
         let mut outcome = if let Some(error) = slot_time.err().or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
@@ -397,6 +401,17 @@ impl TxResolver {
         } else if staging_deadline.is_some() && (attempt.is_none() || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
             || request.guard.is_some() || request.idempotency_key().is_some()) {
             Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
+        } else if let Some(generation) = request.prepared_landing.take() {
+            if request.guard.is_some() || request.options.user_metadata.is_some() || request.options.system_time.is_some() {
+                return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
+            }
+            generation.choose(&base, key, slot, primary, refusal, attempt.map(PlacedAttempt::scope), context)
+                .map(|(writes, refused)| {
+                    prepared_writes = Some(writes);
+                    settled = refused;
+                })
+        } else if prepared_landing::is_landing(primary) {
+            Err(Anomaly::incorrect("rtdb.owned/prepared-generation-required", "Proposal landing requires a prepared generation"))
         } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay, receipt_time).await {
             Err(error)
         } else {
@@ -450,21 +465,9 @@ impl TxResolver {
             }
             let evaluated = has_owned_operations && outcome.is_ok();
             if evaluated {
-                outcome = tx.finish_owned_unique().await;
-            }
-            if outcome.is_ok() {
+                outcome = tx.finish_owned_effects(primary).await;
+            } else if outcome.is_ok() {
                 outcome = tx.finish_owned_capacity().await;
-            }
-            if outcome.is_ok() {
-                if let Some(replay) = &tx.hosted_replay {
-                    outcome = replay.require_constraints_matched().and_then(|()| replay.require_expiries_matched());
-                }
-            }
-            if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_final_constraints(primary).await;
-            }
-            if has_owned_operations && outcome.is_ok() {
-                outcome = tx.check_spatial_readiness(primary).await;
             }
             constraint_failed = evaluated && outcome.as_ref().err().is_some_and(constraint_receipt::may_settle);
             if outcome.is_ok() {
@@ -479,25 +482,11 @@ impl TxResolver {
                 (None, None) => Ok(()),
             })
         };
-        let mut settled = false;
         if constraint_failed && !refusal.is_empty() {
             drop(tx);
             tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
             tx.trace_parent = span.as_ref().map(|span| span.context());
-            let _checks = context.memory.reserve(
-                (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
-                    .ok_or_else(overflow)?,
-            )?;
-            let reads_worlds = primary.iter().any(|op| matches!(op,
-                Operation::Public(TxOp::OwnedCheckWorldPurge { .. }
-                    | TxOp::OwnedCheckWorldScope { clock: Some(_), .. })
-            ));
-            let operations = primary.iter().filter(constraint_receipt::shared_check)
-                .filter(|op| reads_worlds || !matches!(op,
-                    Operation::Public(TxOp::OwnedCheckWorldScope { clock: None, .. })
-                ))
-                .chain(refusal).cloned().collect::<Vec<_>>();
-            outcome = tx.apply_constraint_refusal(&operations, attempt.map(PlacedAttempt::scope)).await;
+            outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
         }
         let result = match outcome {
@@ -516,7 +505,7 @@ impl TxResolver {
             attempt, retirement: context.placed_receipt_retirement,
         });
         let selected = if settled { refusal } else { primary };
-        let mut resolved = tx.finish_source(result, input, log_time, clock, selected).await?;
+        let mut resolved = tx.finish_source(result, input, log_time, clock, selected, prepared_writes).await?;
         if resolved.result().committed() && let Some((until, journal_before)) = staging_deadline
             && let Err(error) = resolved.prepare_inline_replica(writer.as_ref(), until, journal_before, &context.memory)
         {
@@ -525,7 +514,7 @@ impl TxResolver {
             if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
             let tx = OpenTransaction::new(base, key, &request.options, context)?;
             let result = TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) };
-            resolved = tx.finish_source(result, input, log_time, clock, &[]).await?;
+            resolved = tx.finish_source(result, input, log_time, clock, &[], None).await?;
         }
         context.check_cancelled()?;
         self.stage_resolved(resolved)
@@ -686,7 +675,7 @@ impl<'a> OpenTransaction<'a> {
 
     async fn finish_source(
         mut self, result: TransactionResult, input: ResolvedInput, log_time: Timestamp,
-        clock: retention::RetentionClock, selected: &[Operation],
+        clock: retention::RetentionClock, selected: &[Operation], prepared: Option<StagedWrite>,
     ) -> Result<ResolvedTx> {
         let options = self.options;
         self.write_result(&result, options.user_metadata.as_ref(), Some(log_time), clock.time)?;
@@ -700,7 +689,22 @@ impl<'a> OpenTransaction<'a> {
             let archive_replay = result.committed() && self.hosted_replay.is_some();
             self.write_attempt_outcome(attempt, log_time, controls, worlds, archive_replay)?;
         }
-        ResolvedTx::new(self.buffer.stage()?, result, input, None, None, self.context)
+        let mut writes = self.buffer.stage()?;
+        if let Some(prepared) = prepared {
+            writes.install_prepared_generation(prepared)?;
+        }
+        ResolvedTx::new(writes, result, input, None, None, self.context)
+    }
+
+    async fn finish_owned_effects(&mut self, operations: &[Operation]) -> Result<()> {
+        self.finish_owned_unique().await?;
+        self.finish_owned_capacity().await?;
+        if let Some(replay) = &self.hosted_replay {
+            replay.require_constraints_matched()?;
+            replay.require_expiries_matched()?;
+        }
+        self.check_final_constraints(operations).await?;
+        self.check_spatial_readiness(operations).await
     }
 
     /// Constraint checks interpret mutations at their authored valid time.
@@ -1435,11 +1439,26 @@ impl<'a> OpenTransaction<'a> {
         self.buffer.append_batch(&catalog, batch)
     }
 
-    async fn apply_constraint_refusal(
+    async fn apply_selected_refusal(
         &mut self,
-        operations: &[Operation],
+        primary: &[Operation],
+        refusal: &[Operation],
         scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> Result<()> {
+        let _checks = self.context.memory.reserve(
+            (primary.len() + refusal.len()).checked_mul(std::mem::size_of::<Operation>() + 128)
+                .ok_or_else(overflow)?,
+        )?;
+        let reads_worlds = primary.iter().any(|op| matches!(op,
+            Operation::Public(TxOp::OwnedCheckWorldPurge { .. }
+                | TxOp::OwnedCheckWorldScope { clock: Some(_), .. })
+        ));
+        let operations = primary.iter().filter(constraint_receipt::shared_check)
+            .filter(|op| reads_worlds || !matches!(op,
+                Operation::Public(TxOp::OwnedCheckWorldScope { clock: None, .. })
+            ))
+            .chain(refusal).cloned().collect::<Vec<_>>();
+        let operations = operations.as_slice();
         self.check_owned_preconditions(operations, scope, false).await?;
         for operation in operations {
             self.context.check_cancelled()?;

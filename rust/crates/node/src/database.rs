@@ -38,6 +38,7 @@ pub struct Database {
     read_only: bool,
     pub(crate) partition: Arc<PartitionState>,
     pub(crate) storage: Arc<BufferPool>,
+    pub(crate) resolve: Arc<ResolveContext>,
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
@@ -371,7 +372,7 @@ impl DatabaseFactory {
             replication_options.may_lead &= !read_only;
             replication_options.external_source = configuration.external_source.is_some();
             replication_options.assertion_interval = assertion_interval(configuration.log.as_ref(), replication_options.assertion_interval);
-            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
+            let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, Arc::clone(&resolve), effects, cancellation.clone())?;
             let snapshots: Arc<dyn SnapshotSource> = partition.clone();
             let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
                 self.artefact_kinds.iter().map(|kind| {
@@ -432,7 +433,7 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage,
+            let database = Arc::new(Database { protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),

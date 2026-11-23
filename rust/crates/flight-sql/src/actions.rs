@@ -184,8 +184,9 @@ impl Service {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::DECIDE_WORLD_CUT_V1).await?)])
                 }
-                crate::owned_actions::DECIDE_HELD_WORLDS_V1 => {
-                    Ok(vec![Ok(self.decide_held_worlds_action(&call, &action.body).await?)])
+                crate::owned_actions::DECIDE_HELD_WORLDS_V1 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V1 => {
+                    Ok(vec![Ok(self.decide_held_worlds_action(&call, &action.body,
+                        action.r#type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V1).await?)])
                 }
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {

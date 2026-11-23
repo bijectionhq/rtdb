@@ -815,7 +815,13 @@ RTDB fills these from the selected source reading before checking archived and l
 The fact payload retains the authored expression for landing.
 Each changed entity must supply the complete-key point at its finite valid start and a local timeline frontier over the same inherited relation and pin.
 The ordered writer enforces the inherited bounded-period schema and admits one assertion or tombstone per complete entity key.
-Root kind 6 lands a reviewed Proposal under the original live Root and Proposal holds.
+`rtdb.owned.SwitchPreparedProposal.v1` uses the same frame with Root kind 6 and an offered clock.
+It accepts one reviewed Proposal under the original live Root and Proposal holds.
+The submitting node evaluates its complete footprint and materializes immutable table batches against the exact installed predecessor.
+The replica order selects the generation only at that predecessor and clock.
+It publishes the prepared Root effects, Proposal drop and durable receipts with task reservations in one transaction.
+A prepared constraint refusal publishes only its attempt and paired receipts.
+The prepared generation is bounded to 16 MiB and is carried in the private source record.
 The assigned-clock landing may carry signed Root count limits.
 The hosted owner adds the guarded membership delta of later reviewed roots to each original maximum and the receiver checks the resulting limit against the final Root population.
 Its acceptance-valid writes may replace the same complete key in order after the first checked create or replacement.

@@ -1340,7 +1340,7 @@ impl ReplicationDriver {
                 let source = SourceInput { position, log_time: metadata.timestamp, work, _decode_charge: decode_charge };
                 // Keep this position as the source head until every previously queued replica
                 // write has been read back. In particular, none can still be offloading a body.
-                if matches!(&source.work, SourceWork::Resolve(request) if request.uses_staging_deadline())
+                if matches!(&source.work, SourceWork::Resolve(request) if request.requires_durable_predecessor())
                     && !leader.drained_for_strict_source()
                 {
                     leader.waiting_strict_source = Some(source);
