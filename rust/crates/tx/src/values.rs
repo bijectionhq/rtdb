@@ -1292,7 +1292,7 @@ pub enum TxOp {
     OwnedDeclarePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String> },
     HostedControl(crate::HostedControlWrite),
     HostedConstraintRefusal,
-    OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<Timestamp> },
+    OwnedDeadline { until: Timestamp, recheck_at_staging: bool, journal_before: Option<rtdb_types::TimedJournalCutoff> },
     OwnedCheckWorldScope { scope: rtdb_types::PlacedAttemptScope, clock: Option<rtdb_types::WorldClockLimit> },
     OwnedForkWorld {
         record: StructFields<Value>, previous: Option<rtdb_types::Iid>, sibling: Option<rtdb_types::Iid>,

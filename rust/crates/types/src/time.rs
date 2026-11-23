@@ -34,6 +34,25 @@ impl From<Timestamp> for Instant {
     }
 }
 
+/// Exclusive journal cutoff bound to the exact clock certificate that authorized it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedJournalCutoff {
+    before: Timestamp,
+    certificate_sha256: [u8; 32],
+}
+
+impl TimedJournalCutoff {
+    pub fn new(before: Timestamp, certificate_sha256: [u8; 32]) -> Result<Self> {
+        if before.0 <= 0 || certificate_sha256 == [0; 32] {
+            return Err(Anomaly::incorrect("rtdb.owned/timed-journal-cutoff", "A timed journal cutoff needs a positive time and exact certificate digest"));
+        }
+        Ok(Self { before, certificate_sha256 })
+    }
+
+    pub fn before(self) -> Timestamp { self.before }
+    pub fn certificate_sha256(self) -> [u8; 32] { self.certificate_sha256 }
+}
+
 impl Timestamp {
     pub const MIN: Self = Self(i64::MIN);
     pub const MAX: Self = Self(i64::MAX);

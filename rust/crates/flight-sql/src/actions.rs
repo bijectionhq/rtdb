@@ -46,7 +46,7 @@ impl Service {
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V3 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_DECIDING_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_STAGED_V5 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_STAGED_V6 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),

@@ -1970,6 +1970,7 @@ pub struct AuditAcceptanceQuorum {
     pub replica_digest: String,
     pub required_replica_quorum: usize,
     pub original_replica_stream: Option<String>,
+    pub clock_certificate_sha256: Option<String>,
     pub original_journals: Vec<String>,
     pub required_original_quorum: Option<u64>,
     pub acceptance: AuditAcceptanceStage,
@@ -2040,6 +2041,9 @@ pub async fn audit_acceptance_quorum(
         authority, incarnation, log_epoch, replica_stream: proof.stream, replica_digest: proof.digest,
         required_replica_quorum: stream.write_quorum,
         original_replica_stream: entry.timed_origin.as_ref().map(|origin| origin.stream.clone()),
+        clock_certificate_sha256: entry.timed_origin.as_ref().map(|origin| {
+            origin.clock_certificate_sha256.iter().map(|byte| format!("{byte:02x}")).collect()
+        }),
         original_journals, required_original_quorum,
         acceptance: AuditAcceptanceStage {
             replica_offset: offset, source_position: stage.source_position.0, term: term.0,

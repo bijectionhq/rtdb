@@ -106,7 +106,7 @@ pub struct ResolvedTx {
     external_token: Option<Vec<u8>>,
     db_op: Option<DbOp>,
     inline_replica: Option<OwnedReplicaBody>,
-    journal_before: Option<Timestamp>,
+    journal_before: Option<rtdb_types::TimedJournalCutoff>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -127,12 +127,12 @@ impl ResolvedTx {
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
     pub fn inline_replica_body(&self) -> Option<&ReplicaBody> { self.inline_replica.as_ref().map(OwnedReplicaBody::body) }
-    pub fn journal_before(&self) -> Option<Timestamp> { self.journal_before }
+    pub fn journal_before(&self) -> Option<rtdb_types::TimedJournalCutoff> { self.journal_before }
     pub fn staging_clock_upper(&self) -> Option<Timestamp> {
         self.inline_replica.as_ref()?.acceptance_stage()?.clock_upper_micros.map(Timestamp)
     }
 
-    fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, journal_before: Option<Timestamp>, memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn prepare_inline_replica(&mut self, writer: Option<&WriterPublication<'_>>, until: Timestamp, journal_before: Option<rtdb_types::TimedJournalCutoff>, memory: &Arc<MemoryBudget>) -> Result<()> {
         let (writer, maximum) = if journal_before.is_some() {
             writer.and_then(|writer| writer.maximum_timed_original_bytes.map(|maximum| (writer, maximum)))
                 .ok_or_else(|| Anomaly::unsupported(

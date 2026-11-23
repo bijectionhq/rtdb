@@ -42,6 +42,7 @@ impl RetainedChain {
         if let Some(origin) = &entry.timed_origin {
             link.update(b"rtdb.logkeeper/timed-original-ensemble\0");
             link.update(origin.fingerprint());
+            link.update(&origin.clock_certificate_sha256);
         }
         self.0 = link.finalize();
     }

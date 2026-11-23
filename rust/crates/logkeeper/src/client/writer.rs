@@ -620,8 +620,9 @@ impl Writer {
         let (timestamp, guarded_before, timed_origin) = match time {
             AppendTime::Ordinary(timestamp) => (timestamp, None, None),
             AppendTime::Guarded(guard) => {
-                let before = guard.journal_before().map(|before| before.0);
-                let origin = before.map(|_| self.ensemble.timed_origin());
+                let cutoff = guard.journal_before();
+                let before = cutoff.map(|cutoff| cutoff.before().0);
+                let origin = cutoff.map(|cutoff| self.ensemble.timed_origin(cutoff.certificate_sha256()));
                 (guard.sample()?, before, origin)
             }
         };
@@ -1036,7 +1037,7 @@ mod tests {
             ("move-recovered-tail", 2, 0, Some(i64::MAX), 0),
         ] {
             let ensemble = Ensemble::new(StreamConfig { servers: endpoints[..3].to_vec(), stream: stream.to_owned(), write_quorum: 2, maximum_message_bytes: 1024 });
-            let timed_origin = guarded_before.map(|_| ensemble.timed_origin());
+            let timed_origin = guarded_before.map(|_| ensemble.timed_origin([7; 32]));
             let entry = Entry { lsn: 0, epoch: 1, timestamp: 1, payload: Bytes::from_static(b"guarded"), guarded: true, guarded_before, timed_origin };
             for server in 0..3 {
                 deposed_by(1, ensemble.overwrite(server, 1, 0, Vec::new(), true).await.unwrap()).unwrap();

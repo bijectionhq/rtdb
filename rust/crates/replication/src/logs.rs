@@ -163,7 +163,7 @@ impl PartitionLogs {
         self.replica.maximum_timed_original_append_bytes()
     }
     pub(crate) async fn enqueue_replica_with(&self, envelope: &ReplicaEnvelope, block: BlockIndex, clock: impl Fn() -> Timestamp + Send + Sync,
-        allow_offload: bool, journal_before: Option<Timestamp>, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
+        allow_offload: bool, journal_before: Option<rtdb_types::TimedJournalCutoff>, before_enqueue: impl FnOnce(&[u8]) -> Result<()>) -> Result<ReplicaReceipt> {
         let stage = match &envelope.message {
             ReplicaBody::ResolvedTx(tx) => tx.checked_acceptance_stage()?,
             _ => None,

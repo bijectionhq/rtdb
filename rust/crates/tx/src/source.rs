@@ -738,9 +738,10 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging, journal_before }) => {
             body.insert("until".into(), Value::I64(until.0));
             if let Some(before) = journal_before {
-                if !*recheck_at_staging || until.0 <= 0 || before < until { return Err(invalid("Invalid physical journal deadline")); }
-                body.insert("journal_before".into(), Value::I64(before.0));
-                "rtdb-owned-physical-deadline-v1"
+                if !*recheck_at_staging || until.0 <= 0 || before.before() < *until { return Err(invalid("Invalid physical journal deadline")); }
+                body.insert("journal_before".into(), Value::I64(before.before().0));
+                body.insert("clock_certificate_sha256".into(), Value::Binary(before.certificate_sha256().to_vec()));
+                "rtdb-owned-physical-deadline-v2"
             } else if *recheck_at_staging { "rtdb-owned-staging-deadline-v1" } else { "rtdb-owned-deadline-v1" }
         }
         Operation::Public(TxOp::OwnedCheck { relation, id, valid_at, expected }) => {
@@ -1896,12 +1897,16 @@ impl SourceOperationReader<'_> {
                 }
                 TxOp::HostedConstraintRefusal
             }
-            "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" | "rtdb-owned-physical-deadline-v1" => {
+            "rtdb-owned-deadline-v1" | "rtdb-owned-staging-deadline-v1" | "rtdb-owned-physical-deadline-v2" => {
                 let Value::I64(until) = value("until")? else { return Err(invalid("Owned deadline is not a microsecond timestamp")); };
-                let journal_before = if name == "rtdb-owned-physical-deadline-v1" {
-                    let Value::I64(before) = value("journal_before")? else { return Err(invalid("Missing physical journal deadline")); };
+                let journal_before = if name == "rtdb-owned-physical-deadline-v2" {
+                    let (Value::I64(before), Value::Binary(certificate)) =
+                        (value("journal_before")?, value("clock_certificate_sha256")?) else {
+                        return Err(invalid("Missing physical journal deadline or clock certificate"));
+                    };
                     if until <= 0 || before < until { return Err(invalid("Invalid physical journal deadline")); }
-                    Some(Timestamp(before))
+                    let certificate = certificate.as_slice().try_into().map_err(|_| invalid("Invalid clock certificate digest length"))?;
+                    Some(rtdb_types::TimedJournalCutoff::new(Timestamp(before), certificate)?)
                 } else { None };
                 TxOp::OwnedDeadline { until: Timestamp(until), recheck_at_staging: name != "rtdb-owned-deadline-v1", journal_before }
             }

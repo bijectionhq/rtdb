@@ -441,7 +441,7 @@ fn incomplete(ensemble: &Ensemble, server: usize, position: i64) -> Anomaly {
 
 #[cfg(test)]
 mod tests {
-    use super::{JournalSyncObservation, quorum_overlap, timely_original_sync_upper};
+    use super::{JournalDigest, JournalSyncObservation, RetainedChain, quorum_overlap, timely_original_sync_upper, verify_certified_range};
     use crate::protocol::{Entry, TimedJournalOrigin};
 
     #[test]
@@ -451,6 +451,7 @@ mod tests {
             lsn: 0, epoch: 1, guarded: true, guarded_before: Some(100),
             timed_origin: Some(TimedJournalOrigin {
                 journals: (1..=3).map(journal).collect(), write_quorum: 2, stream: "original".to_owned(),
+                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]),
             }),
             ..Default::default()
         };
@@ -461,6 +462,28 @@ mod tests {
         assert_eq!(timely_original_sync_upper(&entry, &observations), None);
         observations.push(sample(3, 99));
         assert_eq!(timely_original_sync_upper(&entry, &observations), Some(99));
+    }
+
+    #[test]
+    fn certified_timed_record_rejects_a_different_clock_certificate_at_the_same_cutoff() {
+        let mut entry = Entry {
+            lsn: 0, epoch: 1, timestamp: 70, guarded: true, guarded_before: Some(100),
+            timed_origin: Some(TimedJournalOrigin {
+                journals: (1..=3).map(|id| uuid::Uuid::from_u128(id).to_string()).collect(),
+                write_quorum: 2,
+                stream: "original".to_owned(),
+                clock_certificate_sha256: bytes::Bytes::from_static(&[7; 32]),
+            }),
+            ..Default::default()
+        };
+        let mut chain = RetainedChain::new("copy", 0);
+        chain.append(&entry);
+        let proof = JournalDigest { stream: "copy".to_owned(), interval: [0, 0], digest: chain.digest() };
+        assert!(verify_certified_range(&proof, std::slice::from_ref(&entry)).is_ok());
+
+        entry.timed_origin.as_mut().unwrap().clock_certificate_sha256 = bytes::Bytes::from_static(&[8; 32]);
+        assert!(entry.valid_guard());
+        assert!(verify_certified_range(&proof, &[entry]).is_err());
     }
 
     #[test]

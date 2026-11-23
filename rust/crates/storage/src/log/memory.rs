@@ -233,7 +233,8 @@ mod tests {
     async fn a_staging_clock_cannot_certify_an_original_durable_quorum() {
         let log = MemoryLog::new(1024);
         let clock = || Timestamp(10);
-        let timed = GuardedAppend::new(&clock, Timestamp(10), Timestamp(20), Some(Timestamp(25)));
+        let cutoff = rtdb_types::TimedJournalCutoff::new(Timestamp(25), [7; 32]).unwrap();
+        let timed = GuardedAppend::new(&clock, Timestamp(10), Timestamp(20), Some(cutoff));
         assert!(log.maximum_guarded_append_bytes().is_some());
         assert!(log.maximum_timed_original_append_bytes().is_none());
         assert!(matches!(

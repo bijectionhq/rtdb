@@ -81,13 +81,14 @@ impl Ensemble {
             && self.config.servers.iter().all(|server| server.journal().is_some())
     }
 
-    pub fn timed_origin(&self) -> crate::protocol::TimedJournalOrigin {
+    pub fn timed_origin(&self, certificate: [u8; 32]) -> crate::protocol::TimedJournalOrigin {
         let mut journals: Vec<_> = self.config.servers.iter().map(|server| {
             server.journal().expect("guarded ensemble identity").to_owned()
         }).collect();
         journals.sort_unstable();
         crate::protocol::TimedJournalOrigin {
             journals, write_quorum: self.config.write_quorum as u64, stream: self.stream(),
+            clock_certificate_sha256: Bytes::copy_from_slice(&certificate),
         }
     }
 

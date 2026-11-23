@@ -25,20 +25,20 @@ pub struct GuardedAppend<'a> {
     clock: &'a (dyn Fn() -> Timestamp + Sync),
     staged_upper: Timestamp,
     cutoff: Timestamp,
-    journal_before: Option<Timestamp>,
+    journal_before: Option<rtdb_types::TimedJournalCutoff>,
 }
 
 impl<'a> GuardedAppend<'a> {
-    pub fn new(clock: &'a (dyn Fn() -> Timestamp + Sync), staged_upper: Timestamp, cutoff: Timestamp, journal_before: Option<Timestamp>) -> Self {
+    pub fn new(clock: &'a (dyn Fn() -> Timestamp + Sync), staged_upper: Timestamp, cutoff: Timestamp, journal_before: Option<rtdb_types::TimedJournalCutoff>) -> Self {
         Self { clock, staged_upper, cutoff, journal_before }
     }
 
-    pub fn journal_before(&self) -> Option<Timestamp> { self.journal_before }
+    pub fn journal_before(&self) -> Option<rtdb_types::TimedJournalCutoff> { self.journal_before }
 
     pub fn sample(self) -> Result<Timestamp> {
         let now = (self.clock)();
         let upper = now.0.checked_add(1).map(Timestamp);
-        if self.journal_before.is_some_and(|before| before < self.cutoff)
+        if self.journal_before.is_some_and(|before| before.before() < self.cutoff)
             || upper.is_none_or(|upper| upper.0 <= 0 || upper < self.staged_upper || upper >= self.cutoff)
         {
             return Err(Error::GuardedAppendCutoff);

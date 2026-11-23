@@ -49,12 +49,15 @@ pub struct TimedJournalOrigin {
     pub write_quorum: u64,
     #[prost(string, tag = "3")]
     pub stream: String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub clock_certificate_sha256: Bytes,
 }
 
 impl TimedJournalOrigin {
     pub(crate) fn valid(&self) -> bool {
         let count = self.journals.len() as u64;
-        !self.stream.is_empty() && count / 2 < self.write_quorum && self.write_quorum <= count
+        self.clock_certificate_sha256.len() == 32 && self.clock_certificate_sha256.as_ref() != &[0; 32]
+            && !self.stream.is_empty() && count / 2 < self.write_quorum && self.write_quorum <= count
             && self.journals.windows(2).all(|pair| pair[0] < pair[1])
             && self.journals.iter().all(|id| rtdb_types::valid_journal_identity(id))
     }

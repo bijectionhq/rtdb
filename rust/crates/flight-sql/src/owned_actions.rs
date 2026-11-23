@@ -68,7 +68,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
 pub(crate) const COMMIT_HOSTED_DECIDING_V2: &str = "rtdb.owned.CommitHostedDeciding.v2";
-pub(crate) const COMMIT_HOSTED_STAGED_V5: &str = "rtdb.owned.CommitHostedStaged.v5";
+pub(crate) const COMMIT_HOSTED_STAGED_V6: &str = "rtdb.owned.CommitHostedStaged.v6";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_HOSTED_WORLD_READS_V3: &str = "rtdb.owned.CommitHostedWorldReads.v3";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
@@ -1010,8 +1010,10 @@ impl Service {
         let (journal_before, body) = if recheck_at_staging {
             let (before, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing physical journal deadline"))?;
             let before = Timestamp(i64::from_be_bytes(*before));
+            let (certificate, body) = body.split_first_chunk::<32>().ok_or_else(|| invalid("Missing clock certificate digest"))?;
             if deadline.0 <= 0 || before < deadline { return Err(invalid("Invalid physical journal deadline")); }
-            (Some(before), body)
+            let cutoff = rtdb_types::TimedJournalCutoff::new(before, *certificate).map_err(status)?;
+            (Some(cutoff), body)
         } else { (None, body) };
         let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
         let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)

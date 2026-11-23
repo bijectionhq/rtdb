@@ -1262,7 +1262,7 @@ async fn hosted_control_replacement_and_owned_facts_abort_together() {
     let physical = TxOp::OwnedDeadline {
         until: Timestamp(200),
         recheck_at_staging: true,
-        journal_before: Some(Timestamp(220)),
+        journal_before: Some(rtdb_types::TimedJournalCutoff::new(Timestamp(220), [7; 32]).unwrap()),
     };
     let refused = staging_only.resolve_source_for_writer(
         state.snapshot(), SourcePosition(6), Timestamp(106),

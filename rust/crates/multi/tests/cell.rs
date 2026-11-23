@@ -546,7 +546,8 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     }
     let clock = || Timestamp(124);
     let journal_cutoff = Timestamp(i64::MAX);
-    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, Some(journal_cutoff)))
+    let physical = rtdb_types::TimedJournalCutoff::new(journal_cutoff, [7; 32]).unwrap();
+    let durable = writer.enqueue_guarded(body.encode().into(), GuardedAppend::new(&clock, staging, cutoff, Some(physical)))
         .await.unwrap().durable().await.unwrap();
     assert_eq!(durable.offset, LogOffset(0));
     drop(writer);
@@ -558,6 +559,7 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
     assert_eq!(report.replica_stream, scope);
     assert_eq!(report.required_replica_quorum, 2);
     assert_eq!(report.required_original_quorum, Some(2));
+    assert_eq!(report.clock_certificate_sha256, Some("07".repeat(32)));
     assert_eq!(report.original_replica_stream.as_deref(), Some(scope.as_str()));
     let mut roster: Vec<_> = stream.servers.iter().map(|server| server.journal().unwrap().to_owned()).collect();
     roster.sort_unstable();

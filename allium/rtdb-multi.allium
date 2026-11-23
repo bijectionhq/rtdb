@@ -501,6 +501,7 @@ contract LogService {
         -- It persists the sample with that exact retained entry before replying.
         -- Compaction preserves the sample and a replacement or copied entry starts without one.
         -- A physically bounded append records its exclusive journal cutoff in the entry. A sample at or above that cutoff can never vote, including during recovery.
+        -- Timed acceptance retains the digest of the exact receiver clock certificate with the cutoff. Recovery and the exact-record audit preserve that identity.
         -- The raw record binds its original physical stream, distinct journal identities and quorum size across moves and archives.
         -- Current placement agreement establishes exact retained bytes. Only matching, timely samples from the recorded original quorum establish the sync bound, under the installed clock bounds.
 
