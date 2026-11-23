@@ -832,7 +832,7 @@ pub async fn read_owned_world_clock_revision(
         let Value::I64(reading) = rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0)? else {
             return Err(unavailable());
         };
-        if reading > revision.0 { return Err(unavailable()); }
+        if !(Timestamp::MIN.0 < reading && reading < Timestamp::MAX.0) { return Err(unavailable()); }
         clock = Some((Timestamp(reading), revision));
     }
     Ok(clock)
@@ -873,7 +873,7 @@ pub async fn read_archived_held_clock(
             && source.basis.system_time < system)
         .ok_or_else(unavailable)?;
     let (reading, _) = read_owned_world_clock_revision(at, owner, world).await?
-        .filter(|(reading, revision)| *revision == system && *reading > source.initial_clock())
+        .filter(|(reading, revision)| *revision == system && source.admits_clock_publication(*reading, *revision))
         .ok_or_else(unavailable)?;
     Ok(ArchivedHeldClock { world, pin: source.pin, media_end, system, reading })
 }
@@ -887,7 +887,7 @@ pub async fn select_owned_world_clock(
     let cap = context.current_time.as_micros()?;
     let Some((latest, publication)) = read_owned_world_clock_revision(Arc::clone(context), owner, world).await?
     else { return Ok(None); };
-    if !(floor < publication && publication <= cap && initial < latest && latest <= publication) {
+    if !(floor < publication && publication <= cap && initial < latest) {
         return Err(unavailable());
     }
     if latest <= requested {
@@ -903,7 +903,7 @@ pub async fn select_owned_world_clock(
         let probe = context.with_owned_system_cut(mid, &context.cancellation)?;
         match read_owned_world_clock_revision(probe, owner, world).await? {
             Some((reading, revision)) => {
-                if !(floor < revision && revision <= mid && initial < reading && reading < latest && reading <= revision)
+                if !(floor < revision && revision <= mid && initial < reading && reading < latest)
                     || selected.is_some_and(|(prior, prior_reading)| revision < prior || reading < prior_reading
                         || (revision == prior) != (reading == prior_reading))
                 {

@@ -1454,6 +1454,8 @@ rule ConsumeIntake {
 -- One hosted validation can combine covered Root points and ranges, held world witnesses and individual world clock bounds. Each world remains bound to its original pin and placement.
 -- Ordinary world publications may include independent read-only worlds under the same ordered guard. Data witnesses and clocks of the observers are checked before any publication is applied.
 -- Every publication carries the original held parent pin. An ordinary overlay or explicit clock advance can order from that standing and its expected clock without reading a user fact.
+-- A held reading may exceed the physical publication timestamp.
+-- The physical timestamp bounds archive access and retention leases, and the held reading governs the world's effective time.
 -- A valid-time window on the child combines boundaries from both retained cuts and resolves each slice by the same point rule.
 -- The child pages the merged identities of both cuts, applying the same tombstone rule before emitting a candidate.
 -- The child seeks both retained orders for a declared path only when its definition agrees across the two cuts.

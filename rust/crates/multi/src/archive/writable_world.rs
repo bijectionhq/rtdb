@@ -1031,7 +1031,7 @@ async fn open_world(
         return Err(OwnedWorld::unavailable());
     }
     let clock = snapshot.world_application_clock(world.id).await?;
-    if clock.is_some_and(|clock| !world.mode.is_writable() || clock <= world.initial_clock() || clock > snapshot.present().system_time) {
+    if clock.is_some_and(|clock| !world.admits_clock_publication(clock, snapshot.present().system_time)) {
         return Err(OwnedWorld::unavailable());
     }
     Ok(OpenWorld {

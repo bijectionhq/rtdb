@@ -1589,8 +1589,7 @@ impl OwnedReadSession {
         let (clock, publication) = rtdb_query::read_owned_world_clock_revision(context, &self.owner, world.id)
             .await?.ok_or_else(unavailable)?;
         // The clock row is private and appears only after its ordered publication is applied.
-        // Held clocks can lag their physical revision. Proposal clocks may also lag after replay.
-        if &registration != world || publication != system || clock <= world.initial_clock() || clock > system {
+        if &registration != world || publication != system || !world.admits_clock_publication(clock, system) {
             return Err(unavailable());
         }
         self.check_relations(relations)?;

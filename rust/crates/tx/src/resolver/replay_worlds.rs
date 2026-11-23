@@ -210,7 +210,7 @@ impl OpenTransaction<'_> {
                     rtdb_query::read_owned_world_clock(Arc::clone(context), owner, id).await?;
                 let clock_admitted = match world.mode {
                     WorldClockMode::Proposal => clock == logical,
-                    WorldClockMode::Held { .. } => clock <= logical,
+                    WorldClockMode::Held { .. } => world.admits_clock_publication(clock, self.tx_key().system_time),
                     WorldClockMode::Retained => false,
                 };
                 if world.dropped

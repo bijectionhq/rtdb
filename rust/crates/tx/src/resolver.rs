@@ -2030,9 +2030,9 @@ impl<'a> OpenTransaction<'a> {
                 _ => return Err(OwnedWorld::unavailable()),
             })
         };
-        if next.is_some_and(|next| next <= head || next > self.tx_key().system_time) {
+        if next.is_some_and(|next| next <= head || !record.admits_clock_publication(next, self.tx_key().system_time)) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/clock-bound",
-                "The world clock advance must increase the held clock and stay within ordered present"));
+                "A world publication requires a strictly increasing finite reading"));
         }
 
         self.reserve_owned_attempt(attempt, fingerprint).await?;

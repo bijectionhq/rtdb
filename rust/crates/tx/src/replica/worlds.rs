@@ -261,8 +261,10 @@ pub(super) fn verify(
                 let (Some(Value::Uuid(world)), Some(Value::I64(clock))) = (row.get("_id"), row.get("clock"))
                 else { return Err(mismatch()); };
                 let world = Iid(*world);
-                if row.len() != 2 || *clock <= Timestamp::MIN.0 || *clock > key.system_time.0
-                    || !matches!(worlds.get(&world), Some(Kind::Overlay | Kind::ProposalOverlay | Kind::Clock))
+                let clock_kind = worlds.get(&world);
+                if row.len() != 2 || !(Timestamp::MIN.0 < *clock && *clock < Timestamp::MAX.0)
+                    || !matches!(clock_kind, Some(Kind::Overlay | Kind::ProposalOverlay | Kind::Clock))
+                    || (clock_kind == Some(&Kind::ProposalOverlay) && *clock > key.system_time.0)
                     || !clocks.insert(world)
                 {
                     return Err(mismatch());

@@ -157,6 +157,14 @@ impl OwnedWorld {
         }
     }
 
+    pub fn admits_clock_publication(&self, reading: Timestamp, revision: Timestamp) -> bool {
+        self.initial_clock() < reading && reading < Timestamp::MAX && match self.mode {
+            WorldClockMode::Held { .. } => true,
+            WorldClockMode::Proposal => reading <= revision,
+            WorldClockMode::Retained => false,
+        }
+    }
+
     pub fn is_held_root_fork(&self) -> bool {
         self.ancestor.is_none()
             && self.parent_publication == Some(self.basis.system_time)
@@ -278,7 +286,7 @@ impl OwnedWorld {
                 if world == *id || *pin != *id || mode != WorldClockMode::Retained
                     || basis.tx_id.0 <= *tx_id || basis.system_time.0 <= *time
                     || basis.system_time.0 >= *until || system.0 <= *time || system > basis.system_time
-                    || logical <= inherited || logical > system
+                    || logical <= inherited || logical == Timestamp::MAX
                     || source_root.tx_id.0 < 0 || source_root.system_time.0 <= 0 || source_root.system_time.0 > *time
                 {
                     return Err(Self::unavailable());
@@ -507,6 +515,11 @@ mod tests {
             id: Iid([3; 16]), pin: Iid([3; 16]), until: Timestamp(200),
             mode: WorldClockMode::Retained, ..source.clone()
         };
+        assert!(source.admits_clock_publication(Timestamp(150), Timestamp(140)));
+        assert!(!source.admits_clock_publication(Timestamp(120), Timestamp(140)));
+        assert!(!source.admits_clock_publication(Timestamp::MAX, Timestamp(140)));
+        let proposal = OwnedWorld { mode: WorldClockMode::Proposal, ..source.clone() };
+        assert!(!proposal.admits_clock_publication(Timestamp(150), Timestamp(140)));
         assert!(!source.is_held_root_fork());
         let exact = OwnedWorld { mode: WorldClockMode::Held { start: source.basis.system_time }, ..source.clone() };
         assert!(OwnedWorld::from_record(&exact.record())?.is_held_root_fork());
