@@ -22,7 +22,7 @@ pub struct AppliedReadFloor {
 
 impl AppliedReadFloor {
     pub fn new(history: uuid::Uuid, mut transactions: Vec<TransactionKey>) -> Result<Self> {
-        if history.is_nil() || !(1..=3).contains(&transactions.len())
+        if history.is_nil() || !(1..=4).contains(&transactions.len())
             || transactions.iter().any(|key| key.tx_id.0 < 0)
         {
             return Err(Anomaly::incorrect("rtdb.owned/applied-floor", "Invalid applied read history or transaction floor"));

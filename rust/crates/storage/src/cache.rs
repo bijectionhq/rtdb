@@ -246,6 +246,7 @@ impl BufferPool {
     }
 
     pub fn retained_bytes(&self) -> usize { self.budget.retained_bytes() }
+    pub fn budget(&self) -> &Arc<CacheBudget> { &self.budget }
 
     /// Bytes charged to this pool, including decoded views and outstanding read leases.
     pub fn pool_retained_bytes(&self) -> usize { self.memory.used_bytes() }

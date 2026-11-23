@@ -73,7 +73,7 @@ pub use owned_relation::{
     read_owned_change_entry, read_owned_fixed_range_changes, read_owned_fixed_range_rule, read_owned_lifetime_floor, read_owned_lifetime_floor_table, read_owned_relation_schema, read_owned_schema_catalog, read_owned_world, read_owned_world_clock, read_owned_world_clock_revision,
 };
 pub use owned_relation::{
-    open_owned_lifetime_point, open_owned_point_with_position_mask, open_owned_valid_during_with_position_mask,
+    open_owned_lifetime_point, open_owned_point_with_position_mask, open_owned_valid_during_with_position_mask, open_owned_world_constraint_projection,
     owned_row_lifetime, read_owned_point_revision,
 };
 

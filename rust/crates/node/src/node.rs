@@ -48,6 +48,7 @@ pub struct NodeServices {
     /// Where a read-only database's compactor sends what it produced, to be published by the database's writer elsewhere.
     /// Absent, a read-only database runs no compactor.
     pub compaction_relay: Option<Arc<dyn crate::database::CompactionRelay>>,
+    pub world_constraints: Option<Arc<dyn rtdb_tx::WorldConstraintArchive>>,
     /// Asked before every query whether this node may still serve its database: a linearizable read waits on it, and a deposed holder is refused.
     pub read_fence: Option<Arc<dyn ReadFence>>,
     /// Splits a placed database's large scans into fragments other nodes read; absent, every scan reads its tries here.
@@ -83,7 +84,7 @@ impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
         let search = default_search();
         Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None,
-            compaction_relay: None, read_fence: None, scan_fragmenter: None,
+            compaction_relay: None, world_constraints: None, read_fence: None, scan_fragmenter: None,
             artefact_kinds: search.artefact_kinds, scan_accelerators: search.scan_accelerators }
     }
 }
@@ -191,7 +192,7 @@ impl Node {
         services.scan_accelerators.insert(0, Arc::new(crate::ordered_index::OrderedIndexAccelerator));
         let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
             resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
-            external_sources: services.external_sources, compaction_relay: services.compaction_relay, compaction_slots, clock: services.clock, artefact_kinds: services.artefact_kinds,
+            external_sources: services.external_sources, compaction_relay: services.compaction_relay, world_constraints: services.world_constraints, compaction_slots, clock: services.clock, artefact_kinds: services.artefact_kinds,
             accelerators: Arc::from(if options.scan_acceleration { services.scan_accelerators } else { Vec::new() }), options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let placement_slots = catalog.is_placed().then(|| Arc::new(Semaphore::new(MAXIMUM_PLACED_OPENS)));

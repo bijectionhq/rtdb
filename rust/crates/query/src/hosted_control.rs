@@ -13,6 +13,7 @@ use crate::{
 pub struct HostedControlPoint {
     pub row: Option<(OwnedBatch, Timestamp)>,
     pub schema: Arc<RuntimeSchema>,
+    pub receipt_tx_id: Option<i64>,
 }
 
 /// Exhaust one exact ordinary control cell over its installed epoch interval.
@@ -39,6 +40,11 @@ pub async fn read_hosted_control_point(
     };
     let table_binding = context.catalog.table(&catalog)?.ok_or_else(unavailable)?;
     let mut columns = vec!["_valid_from", "_valid_to"];
+    let stamped_receipt = include_payload && table.table == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE
+        && table_binding.columns.contains_key(rtdb_types::HOSTED_RECEIPT_TX_ID);
+    if stamped_receipt {
+        columns.push(rtdb_types::HOSTED_RECEIPT_TX_ID);
+    }
     if include_payload {
         for name in table_binding
             .columns
@@ -65,6 +71,7 @@ pub async fn read_hosted_control_point(
     .ok_or_else(unavailable)?;
     let schema = cursor.retained_runtime_schema();
     let mut row = None;
+    let mut receipt_tx_id = None;
     while let Some(batch) = cursor.next_batch().await? {
         let data = batch.batch();
         if data.num_rows() == 0 {
@@ -92,10 +99,17 @@ pub async fn read_hosted_control_point(
             return Err(unavailable());
         }
         let revision = owned_row_revision(data, 0, id, &context.memory)?;
+        if stamped_receipt {
+            receipt_tx_id = match column(rtdb_types::HOSTED_RECEIPT_TX_ID)? {
+                Value::I64(id) if id >= 0 => Some(id),
+                Value::Null | Value::Undefined => None,
+                _ => return Err(unavailable()),
+            };
+        }
         row = Some((batch, revision));
     }
     context.check_cancelled()?;
-    Ok(HostedControlPoint { row, schema })
+    Ok(HostedControlPoint { row, schema, receipt_tx_id })
 }
 
 fn unavailable() -> Anomaly {
