@@ -384,7 +384,7 @@ impl HeldCheckpointWorld {
     ) -> Result<Option<Timestamp>> {
         self.check()?;
         if !(1..=32).contains(&relations.len()) || relations.iter().collect::<std::collections::BTreeSet<_>>().len() != relations.len()
-            || requested >= self.parent_basis().system_time
+            || requested > self.parent_basis().system_time
         {
             return Err(OwnedWorld::unavailable());
         }
@@ -410,7 +410,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, system: Timestamp,
     ) -> Result<Option<WorldFact>> {
         self.check_relation(relation)?;
-        if system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+        if system > self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
         let schema = self.historical_parent_schema(relation)?;
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
@@ -438,7 +438,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, system: Timestamp,
     ) -> Result<(Vec<(Interval, Timestamp)>, OwnedWorldWitness)> {
         self.check_relation(relation)?;
-        if valid.is_empty() || system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+        if valid.is_empty() || system > self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
         let schema = self.historical_parent_schema(relation)?.clone();
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
@@ -458,7 +458,7 @@ impl HeldCheckpointWorld {
         selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
     ) -> Result<[Option<WorldFact>; 2]> {
         self.check_relation(relation)?;
-        if before.next()? != group || group > selected || selected >= self.parent_basis().system_time {
+        if before.next()? != group || group > selected || selected > self.parent_basis().system_time {
             return Err(OwnedWorld::unavailable());
         }
         let schema = self.historical_parent_schema(relation)?.clone();
@@ -482,7 +482,7 @@ impl HeldCheckpointWorld {
         through: Timestamp, limit: usize, reverse: bool,
     ) -> Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)> {
         self.check_relation(relation)?;
-        if after > through || through > selected || selected >= self.parent_basis().system_time {
+        if after > through || through > selected || selected > self.parent_basis().system_time {
             return Err(OwnedWorld::unavailable());
         }
         let schema = self.historical_parent_schema(relation)?.clone();
@@ -504,7 +504,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, id: &EntityId, selected: Timestamp, request: rtdb_node::OwnedVersionRequest,
     ) -> Result<(rtdb_flight_sql::WorldParentVersions, OwnedWorldWitness)> {
         self.check_relation(relation)?;
-        if selected >= self.parent_basis().system_time || request.system.upper() > selected.next()? {
+        if selected > self.parent_basis().system_time || request.system.upper() > selected.next()? {
             return Err(OwnedWorld::unavailable());
         }
         let schema = self.historical_parent_schema(relation)?.clone();
@@ -688,7 +688,7 @@ impl HeldCheckpointWorld {
         };
         let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect::<Vec<_>>();
         let parent_at = if let Some(system) = parent_at {
-            if system >= self.parent_basis().system_time || frontiers.iter().any(|frontier| *frontier != 0) {
+            if system > self.parent_basis().system_time || frontiers.iter().any(|frontier| *frontier != 0) {
                 return Err(OwnedWorld::unavailable());
             }
             let schemas = partitions.iter().map(|(relation, _)| {
@@ -921,7 +921,7 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.relation_release_guard([&relation])?;
         let (witness, earlier) = if let Some(system) = system {
             let schema = self.historical_parent_schema(&relation)?;
-            if system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+            if system > self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
             let witness = self.open.snapshot.world_parent_witness(self.open.record.id, &relation).await?;
             if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
             (witness, Some((system, schema.clone())))
@@ -1112,7 +1112,7 @@ impl HeldCheckpointWorld {
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         Interval::at(valid)?;
-        if !(1..=128).contains(&limit) || system >= self.parent_basis().system_time {
+        if !(1..=128).contains(&limit) || system > self.parent_basis().system_time {
             return Err(OwnedWorld::unavailable());
         }
         let schema = self.historical_parent_schema(relation)?.clone();
@@ -1302,7 +1302,7 @@ async fn historical_parent_context(
 ) -> Result<Option<(Arc<rtdb_query::QueryContext>, Timestamp)>> {
     let unavailable = OwnedWorld::unavailable;
     let parent = context.current_time.as_micros()?;
-    if requested >= parent { return Err(unavailable()); }
+    if requested > parent { return Err(unavailable()); }
     check_archive_coverage(&context, owner, schemas.iter().map(|(relation, _)| (relation, 0)))?;
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(unavailable()); };
@@ -1320,9 +1320,14 @@ async fn historical_parent_context(
     let requested_context = context.with_owned_system_cut(requested, &context.cancellation)?;
     let Some(selected) = rtdb_query::read_owned_root_publication(Arc::clone(&requested_context), owner).await? else {
         requested_context.check_cancelled()?;
+        if requested == parent { return Err(unavailable()); }
         return Ok(None);
     };
-    if selected > requested { return Err(unavailable()); }
+    // The pinned physical position is eligible only if it was itself an
+    // application publication. A later checkpoint cannot stand in for it.
+    if selected > requested || (requested == parent && selected != parent) {
+        return Err(unavailable());
+    }
     require_parent_journal(&context, owner, &publication, selected).await?;
     let capped = context.with_owned_system_cut(selected, &context.cancellation)?;
     for (relation, expected) in schemas {
