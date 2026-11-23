@@ -2700,6 +2700,33 @@ rule HostedCheckpointCapture {
             RetainAndReturnExactCheckpointAndManifestDigest(authority, capture_id)
 }
 
+rule PrepareCheckpointCaptureDiscard {
+    -- A preparation names one capture in its original archive authority.
+    -- It closes further admission while admitted storage regions retain provider access through drain.
+    -- The capture and its dependent suffixes share one archived media key.
+    when: AuthenticatedCaptureDiscard(authority, capture)
+
+    requires: OriginalArchiveAuthority(authority, capture)
+              and NoRetainedWorldOrRepairDependsOn(capture)
+              and NoLiveSuffixPinDependsOn(capture)
+
+    ensures:
+        CommitCaptureAdmissionFence(capture)
+        RetainCaptureDiscardPreparation(capture)
+}
+
+rule SettleCheckpointCaptureDiscard {
+    when: CheckpointCaptureDiscardContinued(capture)
+
+    requires: CaptureAdmissionFenced(capture)
+              and AdmittedCaptureRegionsDrained(capture)
+
+    ensures:
+        ObserveCaptureKeyVaultWithdrawal(capture)
+        if ArchiveProviderInventoryEmpty(capture):
+            RetainCaptureDiscardCompletion(capture)
+}
+
 rule HostedCheckpointRecovery {
     when: AuthenticatedRecoveryRestore(authority, name, capture_id, manifest_digest)
 

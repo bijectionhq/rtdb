@@ -36,7 +36,8 @@ pub(crate) async fn retire_capture(
     capture: Uuid,
     manifest: Option<&str>,
 ) -> Result<CheckpointCaptureRetirement> {
-    retire_capture_inner(directory, installation, storage, archive, keys, capture, manifest, false).await
+    prepare_capture_retirement(directory, installation, archive, capture, manifest).await?;
+    finish_capture_retirement(directory, storage, keys, &installation.id, capture).await
 }
 
 pub(crate) fn obsolete_fork_input(record: &DeploymentRecord, capture: Uuid) -> bool {
@@ -144,87 +145,111 @@ pub(crate) async fn retire_obsolete_fork_input(
         .ok_or_else(|| unavailable("The automatic fork input remains retained"))?;
     let archive: CellStorage = serde_json::from_str(&registration.archive)
         .map_err(|_| inconsistent("Invalid retained automatic capture custody"))?;
-    retire_capture_inner(
-        directory, record, storage, &archive, keys, capture, registration.manifest_sha256.as_deref(), true,
+    prepare_capture_retirement_with_intent(
+        directory, record, &archive, capture, registration.manifest_sha256.as_deref(), true,
     ).await?;
+    finish_capture_retirement(directory, storage, keys, &record.id, capture).await?;
     Ok(())
 }
 
-async fn retire_capture_inner(
+pub(crate) async fn prepare_capture_retirement(
     directory: &dyn Directory,
     installation: &DeploymentRecord,
-    storage: &CellStorage,
     archive: &CellStorage,
-    keys: &dyn KeyService,
+    capture: Uuid,
+    manifest: Option<&str>,
+) -> Result<CheckpointCaptureRetirement> {
+    prepare_capture_retirement_with_intent(directory, installation, archive, capture, manifest, false).await
+}
+
+async fn prepare_capture_retirement_with_intent(
+    directory: &dyn Directory,
+    installation: &DeploymentRecord,
+    archive: &CellStorage,
     capture: Uuid,
     manifest: Option<&str>,
     require_obsolete_fork: bool,
 ) -> Result<CheckpointCaptureRetirement> {
     let archive = archive_binding(archive)?;
-    if let Some(prior) = installation.checkpoint_capture_retirements.get(&capture) {
-        require_same_release(prior, &archive, manifest)?;
-        if prior.observed_empty_at_ms.is_some() {
-            return Ok(prior.clone());
+    let accepted = update_installation(directory, &installation.id, |record| {
+        let sampled_at = now_ms();
+        if let Some(prior) = record.checkpoint_capture_retirements.get(&capture) {
+            return require_same_release(prior, &archive, manifest);
         }
-    } else {
-        update_installation(directory, &installation.id, |record| {
-            if let Some(prior) = record.checkpoint_capture_retirements.get(&capture) {
-                return require_same_release(prior, &archive, manifest);
-            }
-            if require_obsolete_fork && !obsolete_fork_input(record, capture) {
-                return Err(unavailable("The automatic fork input remains retained"));
-            }
-            require_capture_open(record, capture)?;
-            if record.checkpoint_suffix_pins.values().any(|pin| {
-                pin.capture == capture && pin.expires_at_ms > now_ms()
-            }) {
-                return Err(inconsistent("A live suffix pin retains this checkpoint capture"));
-            }
-            if record.checkpoint_worlds.values().any(|world| {
-                world.capture == capture && world.until.0 > now_ms().saturating_mul(1000)
-            }) {
-                return Err(inconsistent("A live world retains this checkpoint capture"));
-            }
+        if require_obsolete_fork && !obsolete_fork_input(record, capture) {
+            return Err(unavailable("The automatic fork input remains retained"));
+        }
+        require_capture_open(record, capture)?;
+        if record.checkpoint_suffix_pins.values().any(|pin| {
+            pin.capture == capture && pin.expires_at_ms > sampled_at
+        }) {
+            return Err(inconsistent("A live suffix pin retains this checkpoint capture"));
+        }
+        if record.checkpoint_worlds.values().any(|world| {
+            world.capture == capture && world.until.0 > sampled_at.saturating_mul(1000)
+        }) {
+            return Err(inconsistent("A live world retains this checkpoint capture"));
+        }
 
-            if record
-                .checkpoint_recovery
-                .as_ref()
-                .is_some_and(|repair| repair.operation == capture)
-                && (record.lifecycle != Lifecycle::Deleted || record.disposal.is_none())
-            {
-                return Err(inconsistent(
-                    "The serving history still depends on this capture",
-                ));
-            }
-            let registration = record.checkpoint_captures.get(&capture);
-            if registration.is_some_and(|capture| capture.world_replay.is_some())
-                && record.lifecycle != Lifecycle::Deleted
-            {
-                return Err(inconsistent("A held restore still requires the replay parent base"));
-            }
-            let retained = registration.and_then(|value| value.manifest_sha256.as_deref());
-            if registration.is_some_and(|value| value.archive != archive)
-                || manifest.is_some_and(|expected| retained != Some(expected))
-            {
-                return Err(inconsistent(
-                    "The release names another archived checkpoint",
-                ));
-            }
-            record.checkpoint_capture_retirements.insert(
-                capture,
-                CheckpointCaptureRetirement {
-                    archive: archive.clone(),
-                    manifest_sha256: retained.map(str::to_owned),
-                    authorized_at_ms: now_ms(),
-                    key_withdrawn_at_ms: None,
-                    observed_empty_at_ms: None,
-                },
-            );
-            Ok(())
-        })
-        .await?;
-    }
-    finish_capture_retirement(directory, storage, keys, &installation.id, capture).await
+        if record
+            .checkpoint_recovery
+            .as_ref()
+            .is_some_and(|repair| repair.operation == capture)
+            && (record.lifecycle != Lifecycle::Deleted || record.disposal.is_none())
+        {
+            return Err(inconsistent(
+                "The serving history still depends on this capture",
+            ));
+        }
+        let registration = record.checkpoint_captures.get(&capture);
+        if registration.is_some_and(|capture| capture.world_replay.is_some())
+            && record.lifecycle != Lifecycle::Deleted
+        {
+            return Err(inconsistent("A held restore still requires the replay parent base"));
+        }
+        let retained = registration.and_then(|value| value.manifest_sha256.as_deref());
+        if registration.is_some_and(|value| value.archive != archive)
+            || manifest.is_some_and(|expected| retained != Some(expected))
+        {
+            return Err(inconsistent(
+                "The release names another archived checkpoint",
+            ));
+        }
+        record.checkpoint_capture_retirements.insert(
+            capture,
+            CheckpointCaptureRetirement {
+                archive: archive.clone(),
+                manifest_sha256: retained.map(str::to_owned),
+                authorized_at_ms: sampled_at,
+                key_withdrawn_at_ms: None,
+                observed_empty_at_ms: None,
+            },
+        );
+        Ok(())
+    })
+    .await?;
+    retirement_receipt(&accepted, &archive, capture, manifest)
+}
+
+pub(crate) fn capture_retirement_receipt(
+    installation: &DeploymentRecord,
+    archive: &CellStorage,
+    capture: Uuid,
+    manifest: Option<&str>,
+) -> Result<CheckpointCaptureRetirement> {
+    retirement_receipt(installation, &archive_binding(archive)?, capture, manifest)
+}
+
+fn retirement_receipt(
+    installation: &DeploymentRecord,
+    archive: &str,
+    capture: Uuid,
+    manifest: Option<&str>,
+) -> Result<CheckpointCaptureRetirement> {
+    let retained = installation.checkpoint_capture_retirements.get(&capture)
+        .ok_or_else(|| inconsistent("The checkpoint capture has no discard preparation"))?;
+    require_same_release(retained, archive, manifest)?;
+    Ok(retained.clone())
 }
 
 fn require_same_release(
@@ -274,16 +299,23 @@ pub(crate) async fn finish_capture_retirement(
             return Err(unavailable("The capture still has admitted archive I/O"));
         }
     }
-    let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
-    if record
-        .checkpoint_captures
-        .get(&capture)
-        .is_some_and(|value| value.media_bound)
-    {
-        let point = capture_point(&record, deployment, capture, &accepted.archive)?;
-        keys.destroy(&archive_key_id(&point)).await?;
-    }
-    let withdrawn_at = now_ms().max(accepted.authorized_at_ms);
+    let withdrawn_at = if let Some(withdrawn) = accepted.key_withdrawn_at_ms {
+        withdrawn
+    } else {
+        let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
+        if record.checkpoint_captures.get(&capture).is_some_and(|value| value.media_bound) {
+            let point = capture_point(&record, deployment, capture, &accepted.archive)?;
+            keys.destroy(&archive_key_id(&point)).await?;
+        }
+        let withdrawn = now_ms().max(accepted.authorized_at_ms);
+        let current = update_installation(directory, id, |current| {
+            let retirement = checked_retirement(current, capture, &accepted)?;
+            retirement.key_withdrawn_at_ms.get_or_insert(withdrawn);
+            Ok(())
+        }).await?;
+        current.checkpoint_capture_retirements[&capture].key_withdrawn_at_ms
+            .expect("the accepted retirement records withdrawal")
+    };
     let archive: CellStorage = serde_json::from_str(&accepted.archive)
         .map_err(|_| inconsistent("Invalid retained capture custody"))?;
     let prefix = key(&format!("checkpoint-captures/{id}/{capture}"))?;
@@ -297,17 +329,7 @@ pub(crate) async fn finish_capture_retirement(
         current
             .checkpoint_suffix_pins
             .retain(|_, pin| pin.capture != capture);
-        let retirement = current
-            .checkpoint_capture_retirements
-            .get_mut(&capture)
-            .filter(|value| value.authorized_at_ms == accepted.authorized_at_ms)
-            .ok_or_else(|| inconsistent("The physical release lost its capture fence"))?;
-        require_same_release(
-            retirement,
-            &accepted.archive,
-            accepted.manifest_sha256.as_deref(),
-        )?;
-        retirement.key_withdrawn_at_ms.get_or_insert(withdrawn_at);
+        let retirement = checked_retirement(current, capture, &accepted)?;
         retirement
             .observed_empty_at_ms
             .get_or_insert_with(|| now_ms().max(withdrawn_at));
@@ -319,6 +341,20 @@ pub(crate) async fn finish_capture_retirement(
         .get(&capture)
         .cloned()
         .ok_or_else(|| inconsistent("The capture lost its physical release receipt"))
+}
+
+fn checked_retirement<'a>(
+    current: &'a mut DeploymentRecord,
+    capture: Uuid,
+    accepted: &CheckpointCaptureRetirement,
+) -> Result<&'a mut CheckpointCaptureRetirement> {
+    current.checkpoint_capture_retirements.get_mut(&capture)
+        .filter(|value| {
+            value.authorized_at_ms == accepted.authorized_at_ms
+                && value.archive == accepted.archive
+                && value.manifest_sha256 == accepted.manifest_sha256
+        })
+        .ok_or_else(|| inconsistent("The physical release lost its capture fence"))
 }
 
 async fn purge_archive_prefix(archive: &CellStorage, prefix: &ObjectKey) -> Result<()> {

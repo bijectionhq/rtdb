@@ -177,14 +177,19 @@ witness and exact manifest, and verifies every object under the capture's
 media key. The receipt binds the supplied observation ID to the original
 capture point and digest.
 
-`discard_checkpoint_capture` installs a permanent release for one capture
-ID in its original cell. It can close an unattempted ID and prevents a late
-capture from creating archive state. Physical retirement waits for the
-recorded capture and repair readers, withdraws only the archive key, and
-purges the capture's versions and unfinished uploads. The release receipt
-and authority witness remain available. The serving installation keeps
-its own key and placement. A capture used by the current repair still
-belongs to the serving closure and cannot be discarded independently.
+The authenticated recovery service splits independent checkpoint capture discard into `prepare_checkpoint_capture_discard`, `checkpoint_capture_discard_status`, and `settle_checkpoint_capture_discard`.
+Each request uses the original deployment and capture selectors, with an optional exact manifest digest.
+Preparation durably closes new archive admissions and returns `capture_discard_prepared` with the time that fence was accepted.
+Existing storage regions keep their archive through provider drain.
+A caller can then settle the same preparation.
+Settlement records withdrawal from the archive key vault before physical cleanup and returns `capture_discarded` only after it observes the archive inventory empty.
+Status observes the stored receipt, including a withdrawal that has settled while physical cleanup is pending.
+The combined `discard_checkpoint_capture` action accepts and settles the same durable preparation.
+A preparation with `deadline_ms` returns `capture_discard_deadline_unsupported` before changing custody because the installed key services lack an enforced revocation deadline for outstanding grants.
+The selected custody domain covers the capture and its dependent archive suffixes.
+Serving history and independently keyed exports have separate custody.
+The recorded vault withdrawal is an observation of that vault's tombstone.
+A capture used by the current repair still belongs to the serving closure and cannot be discarded independently.
 
 The recovery owner calls `rtdb-multi schedule-recovery-disposal --id UUID`
 after the installation's serving receipt exists and recovery holds end.
