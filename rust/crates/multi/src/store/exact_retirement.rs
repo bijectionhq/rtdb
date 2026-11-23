@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release, recovery_covers_release};
 use crate::checkpoint_retention::checkpoint_pack_collectable;
 use crate::keys::KeyService;
-use crate::packing::{block_pack, observe_pack_index, pack_block};
+use crate::packing::{PackIndex, block_pack, observe_pack_index, pack_block};
 use crate::reference::{Base, References, stores};
 
 mod receipts;
@@ -32,7 +32,7 @@ impl ReleaseWitness {
     fn target_name(&self) -> Option<&str> {
         if self.replica.is_some() { return Some(&self.record.key); }
         match self.pack.as_deref() {
-            Some(pack) if self.version.is_some() && self.record.trie_floor.is_none()
+            Some(pack) if (self.version.is_some() || self.terminal.is_some()) && self.record.trie_floor.is_none()
                 && pack_block(pack).is_some()
                 && checkpoint_metadata_block(&self.record.key).is_some() => Some(pack),
             None if self.record.trie_floor.is_some() => Some(&self.record.key),
@@ -63,7 +63,7 @@ async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Optio
     let (record, replica, version, terminal, pack) = match stored {
         StoredRelease::Replica { replica, version } => (replica.record.clone(), Some(replica), Some(version), None, None),
         StoredRelease::Exact { record, version, pack } => (record, None, Some(version), None, pack),
-        StoredRelease::Terminal { record, terminal } => (record, None, None, Some(terminal), None),
+        StoredRelease::Terminal { record, terminal, pack } => (record, None, None, Some(terminal), pack),
         StoredRelease::Path(record) => (record, None, None, None, None),
     };
     Ok(Some(ReleaseWitness { record, replica, version, terminal, pack, release_version: observed.version }))
@@ -77,6 +77,10 @@ pub(super) trait RetirementProvider: Send + Sync {
     async fn erase(&self, key: &ObjectKey, version: &PhysicalObjectVersion) -> Result<()>;
 
     async fn terminal_targets(&self, _: &ObjectKey, _: &ObjectKey, _: &TerminalObjectPublication) -> Result<Option<[S3TombstoneTarget; 2]>> {
+        Ok(None)
+    }
+
+    async fn terminal_pack_index(&self, _: &ObjectKey, _: Option<&TerminalObjectPublication>) -> Result<Option<PackIndex>> {
         Ok(None)
     }
 
@@ -101,6 +105,11 @@ impl RetirementProvider for rtdb_s3::VersionedInventory {
 
     async fn terminal_targets(&self, key: &ObjectKey, release: &ObjectKey, publication: &TerminalObjectPublication) -> Result<Option<[S3TombstoneTarget; 2]>> {
         self.terminal_release_targets(key, release, publication).await
+    }
+
+    async fn terminal_pack_index(&self, key: &ObjectKey, expected: Option<&TerminalObjectPublication>) -> Result<Option<PackIndex>> {
+        let Some(provider) = self.enrolled_terminal_retirement().await? else { return Ok(None); };
+        super::replay_retirement::terminal_pack_index(&provider, key, expected).await
     }
 
     async fn retire_tombstones(&self, journal: &TombstoneJournal<'_>, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
@@ -140,8 +149,15 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
         }
         let mut receipts = None;
         let mut checked = BTreeSet::new();
+        let mut checked_terminal = BTreeSet::new();
         for (marker, target, witness) in &eligible {
             let work = if let Some(publication) = &witness.terminal {
+                if witness.pack.is_some()
+                    && (!checked_terminal.insert((target.clone(), publication.etag.clone()))
+                        || pack_release_bound(bucket, provider, target, witness, &markers, threshold).await?.is_none())
+                {
+                    continue;
+                }
                 let Some([data_tombstone, release_tombstone]) = provider.terminal_targets(target, marker, publication).await? else { continue; };
                 RetirementWork::Tombstones { deployment: candidate.id.clone(), target: target.to_string(), release: marker.to_string(), data_tombstone, release_tombstone }
             } else {
@@ -295,11 +311,16 @@ pub(super) async fn settle(directory: &dyn Directory, lineage: &str, deployment:
 // publication can cover a member, and each member must be checkpoint metadata.
 async fn pack_release_bound(bucket: &dyn ObjectStore, provider: &dyn RetirementProvider,
     target: &ObjectKey, witness: &ReleaseWitness, markers: &ObjectKey, threshold: i64) -> Result<Option<PackReadiness>> {
-    let Some(version) = witness.version.as_ref() else { return Err(changed()); };
-    let index = match observe_pack_index(bucket, target).await {
-        Ok(index) if index.version.as_ref() == Some(version) => index.value,
-        Ok(_) | Err(Error::MissingObject(_)) => return Ok(provider.absent(target, version).await?.then_some(PackReadiness::AlreadyAbsent)),
-        Err(error) => return Err(error.into()),
+    let index = if let Some(publication) = &witness.terminal {
+        let Some(index) = provider.terminal_pack_index(target, Some(publication)).await? else { return Ok(None); };
+        index
+    } else {
+        let Some(version) = witness.version.as_ref() else { return Err(changed()); };
+        match observe_pack_index(bucket, target).await {
+            Ok(index) if index.version.as_ref() == Some(version) => index.value,
+            Ok(_) | Err(Error::MissingObject(_)) => return Ok(provider.absent(target, version).await?.then_some(PackReadiness::AlreadyAbsent)),
+            Err(error) => return Err(error.into()),
+        }
     };
     if !index.entries.contains_key(&witness.record.key) { return Ok(None); }
     let mut uncovered = BTreeSet::new();
@@ -316,8 +337,8 @@ async fn pack_release_bound(bucket: &dyn ObjectStore, provider: &dyn RetirementP
     if !uncovered.is_empty() {
         for marker in bucket.list(Some(markers)).await? {
             let Some(member) = read_release(bucket, &marker.key).await? else { continue; };
-            if member.target_name() == Some(pack) && member.version == witness.version
-                && member.release_version.is_some() && member.record.released_at_ms <= threshold
+            if member.target_name() == Some(pack) && member.version == witness.version && member.terminal == witness.terminal
+                && (member.release_version.is_some() || member.terminal.is_some()) && member.record.released_at_ms <= threshold
             {
                 uncovered.remove(&member.record.key);
                 if uncovered.is_empty() { break; }
@@ -364,7 +385,9 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         }
         RetirementWork::Tombstones { deployment, data_tombstone, release_tombstone, .. } => {
             let Some(publication) = &witness.terminal else { return Ok(None); };
-            if witness.record.trie_floor.as_ref().is_none_or(|floor| floor.object_namespace != publication.allocation) {
+            if witness.pack.is_none()
+                && witness.record.trie_floor.as_ref().is_none_or(|floor| floor.object_namespace != publication.allocation)
+            {
                 return Ok(None);
             }
             let Some([data, marker]) = provider.terminal_targets(target, release, publication).await? else { return Ok(None); };
@@ -404,10 +427,16 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         if !checkpoint_pack_collectable(block, youngest, Some(checkpoint.block), None) { return Ok(None); }
         let catalog = block_key(BlockIndex(checkpoint.block))?;
         let successor = ObjectKey::new(format!("{store}/{}", block_pack(&catalog)))?;
-        match observe_pack_index(bucket, &successor).await {
-            Ok(index) if index.version.is_some() && index.value.entries.contains_key(&catalog) => {},
-            Ok(_) | Err(Error::MissingObject(_)) => return Ok(None),
-            Err(error) => return Err(error.into()),
+        if witness.terminal.is_some() {
+            if provider.terminal_pack_index(&successor, None).await?.is_none_or(|index| !index.entries.contains_key(&catalog)) {
+                return Ok(None);
+            }
+        } else {
+            match observe_pack_index(bucket, &successor).await {
+                Ok(index) if index.version.is_some() && index.value.entries.contains_key(&catalog) => {},
+                Ok(_) | Err(Error::MissingObject(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
         }
         observed_successor = Some(checkpoint);
     }
@@ -429,6 +458,11 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
             return Err(Anomaly::new(AnomalyCategory::Busy, ARCHIVE_SOURCE_HELD, "An admitted archive copy retains this publication"));
         }
         if let Some(PackReadiness::Covered { block, youngest }) = pack {
+            if let Some(publication) = &witness.terminal
+                && record.storage_namespaces.is_none_or(|namespaces| namespaces.objects != publication.allocation)
+            {
+                return Err(changed());
+            }
             let oldest = record.storage_regions.values().filter_map(StorageRegion::checkpoint_metadata_from).min();
             if record.checkpoint != observed_successor
                 || !checkpoint_pack_collectable(block, youngest, record.checkpoint.map(|checkpoint| checkpoint.block), oldest)
@@ -1021,6 +1055,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_metadata_pack_requires_every_member_of_the_same_publication() {
+        use rtdb_directory::Checkpoint;
+        use rtdb_types::S3TombstoneCondition;
+
+        struct Provider<'a> {
+            bucket: &'a MemoryStore,
+            pack: ObjectKey,
+            publication: TerminalObjectPublication,
+        }
+        #[async_trait]
+        impl RetirementProvider for Provider<'_> {
+            async fn available(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<bool> { unreachable!() }
+            async fn absent(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<bool> { unreachable!() }
+            async fn erase(&self, _: &ObjectKey, _: &PhysicalObjectVersion) -> Result<()> { unreachable!() }
+            async fn terminal_pack_index(&self, key: &ObjectKey, expected: Option<&TerminalObjectPublication>) -> Result<Option<PackIndex>> {
+                if expected.is_some_and(|expected| key != &self.pack || expected != &self.publication) {
+                    return Ok(None);
+                }
+                Ok(Some(observe_pack_index(self.bucket, key).await?.value))
+            }
+            async fn terminal_targets(&self, key: &ObjectKey, release: &ObjectKey, publication: &TerminalObjectPublication)
+                -> Result<Option<[S3TombstoneTarget; 2]>>
+            {
+                Ok((key == &self.pack && publication == &self.publication).then(|| {
+                    let target = |key, etag| S3TombstoneTarget {
+                        namespace: publication.namespace.clone(), key, condition: S3TombstoneCondition::Matches(etag),
+                    };
+                    [target(publication.key.clone(), publication.etag.clone()), target(release.to_string(), r#""release""#.into())]
+                }))
+            }
+            async fn retire_tombstones(&self, _: &TombstoneJournal<'_>, objects: [(&ObjectKey, &S3TombstoneTarget); 2]) -> Result<()> {
+                for (key, _) in objects { self.bucket.delete(key).await?; }
+                Ok(())
+            }
+        }
+
+        let directory = MemoryDirectory::new();
+        let bucket = MemoryStore::default();
+        let allocation = Uuid::new_v4();
+        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
+        owner.storage_namespaces = Some(StorageNamespaces { objects: allocation, keys: [0; 32] });
+        owner.checkpoint = Some(Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([1; 32]) });
+        let owner = directory.create_deployment(owner).await.unwrap();
+        let store = format!("{}/v06", owner.storage_prefix());
+        let full = |relative| ObjectKey::new(format!("{store}/{relative}")).unwrap();
+        let pack = "~packs/b00.pack";
+        let older = full(pack);
+        let newer = full("~packs/b01.pack");
+        let catalog = "blocks/b00.binpb";
+        let table = "tables/t/blocks/b00.binpb";
+        let contents = |members: &[&str]| crate::packing::encode_pack(
+            &members.iter().map(|name| (name.to_string(), Bytes::from_static(b"metadata"))).collect(), Vec::new(), 0,
+        ).0;
+        bucket.put(&older, contents(&[catalog, table])).await.unwrap();
+        bucket.put(&newer, contents(&["blocks/b01.binpb"])).await.unwrap();
+        let publication = TerminalObjectPublication {
+            namespace: S3ObjectNamespace { bucket: "cell".into(), region: None, endpoint: None },
+            allocation, key: older.to_string(), etag: r#""pack""#.into(),
+        };
+        let provider = Provider { bucket: &bucket, pack: older.clone(), publication: publication.clone() };
+        let marker = |member: &str, terminal: TerminalObjectPublication| serde_json::to_vec(&StoredRelease::Terminal {
+            record: super::super::GarbageRecord { key: member.into(), released_at_ms: 0, trie_floor: None },
+            terminal, pack: Some(pack.into()),
+        }).unwrap().into();
+        bucket.put(&full("~garbage/root"), marker(catalog, publication.clone())).await.unwrap();
+        bucket.put(&full("~garbage/stale"), marker(table, TerminalObjectPublication { etag: r#""stale""#.into(), ..publication.clone() })).await.unwrap();
+        let pass = || reap(directory.as_ref(), &bucket, &provider, &owner, 0, None, None);
+        pass().await.unwrap();
+        assert!(bucket.head(&older).await.is_ok());
+
+        bucket.put(&full("~garbage/table"), marker(table, publication)).await.unwrap();
+        let reader = Uuid::new_v4();
+        crate::admin::update_installation(directory.as_ref(), &owner.id, |current| {
+            current.storage_regions.insert(reader, StorageRegion::Local {
+                archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: false,
+                checkpoint_metadata_from: Some(0), checkpoint_replay_from: None,
+            });
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(pass().await.unwrap_err().code, changed().code);
+        assert!(bucket.head(&older).await.is_ok());
+        super::super::release_region(directory.as_ref(), &owner.id, reader, false).await.unwrap();
+        pass().await.unwrap();
+        assert!(matches!(bucket.head(&older).await, Err(Error::MissingObject(_))));
+        assert!(bucket.head(&newer).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn the_remote_reaper_keeps_its_exact_reservation_until_both_versions_settle() {
         let data = tempfile::tempdir().unwrap();
         MemoryDirectory::initialize(data.path()).unwrap();
@@ -1275,6 +1397,7 @@ mod tests {
         let witness = StoredRelease::Terminal {
             record: super::super::GarbageRecord { key: logical.into(), released_at_ms: 0, trie_floor: Some(floor) },
             terminal: publication,
+            pack: None,
         };
         bucket.put(&object, Bytes::from_static(b"original")).await.unwrap();
         bucket.put(&marker, serde_json::to_vec(&witness).unwrap().into()).await.unwrap();

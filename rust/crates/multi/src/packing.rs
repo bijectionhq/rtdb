@@ -17,7 +17,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, StoredObject};
-use rtdb_types::PhysicalObjectVersion;
+use rtdb_types::{PhysicalObjectPublication, PhysicalObjectVersion};
 use serde::{Deserialize, Serialize};
 
 mod extent;
@@ -366,7 +366,7 @@ impl PackingStore {
     }
 
     /// Observes the owned publication named by this member's admitted index.
-    pub(crate) async fn retirement_pack(&self, member: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PhysicalObjectVersion)>> {
+    pub(crate) async fn retirement_pack(&self, member: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PhysicalObjectPublication)>> {
         let Some(location) = self.locate(member).await? else { return Ok(None); };
         if pack_block(location.pack.as_str()).is_none() { return Ok(None); }
         let location = match self.observe_location(member, location).await {
@@ -374,9 +374,11 @@ impl PackingStore {
             Err(Error::MissingObject(_)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let Some(version) = location.version else { return Ok(None); };
-        let owned = self.inner.retirement_version(&location.pack).await?;
-        Ok((owned.as_ref() == Some(version.as_ref())).then(|| (location.pack, (*version).clone())))
+        let publication = self.inner.retirement_publication(&location.pack).await?;
+        Ok(publication.filter(|publication| match publication {
+            PhysicalObjectPublication::Version(version) => location.version.as_deref() == Some(version),
+            PhysicalObjectPublication::Terminal(_) => location.version.is_none(),
+        }).map(|publication| (location.pack, publication)))
     }
 
     async fn read_packed(&self, object: &ObjectKey, location: LocatedEntry, read: PackRead) -> rtdb_storage::Result<ObjectObservation<Bytes>> {

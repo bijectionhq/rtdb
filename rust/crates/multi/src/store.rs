@@ -1291,6 +1291,8 @@ enum StoredRelease {
     Terminal {
         record: GarbageRecord,
         terminal: rtdb_types::TerminalObjectPublication,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pack: Option<String>,
     },
     Path(GarbageRecord),
 }
@@ -1363,7 +1365,7 @@ impl GarbageStore {
             .map_err(|error| Error::Task(error.to_string()))?;
         let release = match (version, terminal) {
             (Some(version), _) => StoredRelease::Exact { record, version: version.clone(), pack: pack.map(ObjectKey::to_string) },
-            (None, Some(terminal)) => StoredRelease::Terminal { record, terminal: terminal.clone() },
+            (None, Some(terminal)) => StoredRelease::Terminal { record, terminal: terminal.clone(), pack: pack.map(ObjectKey::to_string) },
             (None, None) => StoredRelease::Path(record),
         };
         self.inner.put(&name, Bytes::from(serde_json::to_vec(&release).expect("a record serializes"))).await?;
@@ -1504,9 +1506,14 @@ impl ObjectStore for GarbageStore {
         }
         if checkpoint_metadata_block(key.as_str()).is_some()
             && let Some(packing) = &self.packing
-            && let Some((pack, version)) = packing.retirement_pack(key).await?
+            && let Some((pack, publication)) = packing.retirement_pack(key).await?
         {
-            return self.write_release_record(key, None, Some(&version), Some(&pack), None).await;
+            return match publication {
+                rtdb_types::PhysicalObjectPublication::Version(version) =>
+                    self.write_release_record(key, None, Some(&version), Some(&pack), None).await,
+                rtdb_types::PhysicalObjectPublication::Terminal(terminal) =>
+                    self.write_release_record(key, None, None, Some(&pack), Some(&terminal)).await,
+            };
         }
         self.write_release(key, None, None).await
     }

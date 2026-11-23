@@ -1896,7 +1896,9 @@ rule ReapUnreachable {
     -- Owned hosted payloads and markers wait for provider retirement authority.
     -- An S3 loose-file release with an installed publication witness records the exact provider version.
     -- A retired logical search run carries its provider publication and the installed catalog floor before a hosted release can be recorded.
-    -- A hosted pack is erased by exact version after the indexed members of that same version each have a mature release.
+    -- Every indexed member of a hosted pack needs a mature release for the same publication.
+    -- A versioned pack is erased by its exact version.
+    -- An enrolled terminal pack is replaced by a conditional tombstone after an entity-tag-bound index read.
     -- Only checkpoint metadata may be covered by this pack collector. A newer published pack must be present in the same store.
     -- The owner CAS checks the pack's block and the greatest covered metadata block against its current checkpoint and holds.
     -- An exact absence observation permits residual member release markers to settle while a replacement pack remains available.
