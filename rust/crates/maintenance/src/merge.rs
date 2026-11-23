@@ -512,7 +512,7 @@ mod tests {
     use super::*;
     use rtdb_format::data::StoredOperation;
     use rtdb_format::data::{StoredEvent, build_event_batch};
-    use rtdb_types::Iid;
+    use rtdb_types::{Iid, Value};
 
     struct WholeInput(bytes::Bytes);
 
@@ -571,7 +571,7 @@ mod tests {
             entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
             valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
         });
-        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, false, false, &config, &memory).unwrap();
+        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, false, false, false, &config, &memory).unwrap();
         spill.write(&page(&events), vec![], &None, &config, &memory).unwrap();
         spill.finish(&config).unwrap();
         layout::normalize(&spill, &None, &config, &memory, &data, &metadata, &CancellationToken::new()).unwrap();
@@ -658,7 +658,7 @@ mod tests {
         let (normalized, _charges) = resolve_same_time(&page(&[redacted.clone(), earlier.clone()]), &memory).unwrap();
         assert_eq!(normalized.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [redacted.header(), earlier.header()]);
         let mut spill = MergeFile::new(
-            directory.path().join("merge.arrow"), None, false, &[], &None, true, true, true, &config, &memory,
+            directory.path().join("merge.arrow"), None, false, &[], &None, true, true, false, true, &config, &memory,
         ).unwrap();
         spill.write(&normalized[..1], vec![], &None, &config, &memory).unwrap();
         spill.write(&normalized[1..], vec![], &None, &config, &memory).unwrap();
