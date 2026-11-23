@@ -82,7 +82,7 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Bytes => { let bytes = match value { Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => bytes, _ => return Err(incompatible(ty, value)) }; if binary { bytes.clone() } else { let mut output = String::from("\\x"); for byte in bytes { use std::fmt::Write; write!(&mut output, "{byte:02x}").map_err(invalid)?; } output.into_bytes() } }
         PgType::Uuid => { let Value::Uuid(bytes) = value else { return Err(incompatible(ty, value)); }; if binary { bytes.to_vec() } else { uuid::Uuid::from_bytes(*bytes).to_string().into_bytes() } }
         PgType::Oid | PgType::RegClass | PgType::RegProc => { let number = match value { Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) | Value::I32(value) => *value as u32, _ => return Err(incompatible(ty, value)) }; number.to_string().into_bytes() }
-        PgType::Int4s | PgType::Int8s | PgType::Texts => array_write(ty, format, value, environment)?,
+        PgType::Int4s | PgType::Int8s | PgType::Texts | PgType::Float4s | PgType::Float8s => array_write(ty, format, value, environment)?,
         PgType::Json | PgType::JsonLd => { let mut output = String::new(); json(value, ty == PgType::JsonLd, &mut output, 0)?; output.into_bytes() }
         PgType::Transit => rtdb_format::transit::encode_json(&to_transit(value)?)?,
         PgType::Jsonb => return Err(unsupported(ty, "writer")),
@@ -117,6 +117,8 @@ fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironme
     array_payload(ty, format, values.iter(), |element, value| {
         match value.as_ref() {
             Value::Null | Value::Undefined => Ok(None),
+            Value::F32(value) if element == PgType::Float4 => Ok(Some(float4_bytes(format, *value))),
+            Value::F64(value) if element == PgType::Float8 => Ok(Some(float8_bytes(format, *value))),
             value => encode_value(element, format, value, env).map(Some),
         }
     })
@@ -126,9 +128,14 @@ fn array_payload<T>(
     ty: PgType, format: Format, cells: impl ExactSizeIterator<Item = T>,
     mut encode: impl FnMut(PgType, T) -> Result<Option<Vec<u8>>>,
 ) -> Result<Vec<u8>> {
-    let element = match ty { PgType::Int4s => PgType::Int4, PgType::Int8s => PgType::Int8, _ => PgType::Text };
+    let element = PgType::from_oid(ty.descriptor().element_oid.expect("array type has an element OID")).expect("known element type");
+    let floats = matches!(ty, PgType::Float4s | PgType::Float8s);
     if format == Format::Binary {
         let mut output = Vec::new();
+        if floats && cells.len() == 0 {
+            for field in [0, 0, element.descriptor().oid] { output.extend_from_slice(&field.to_be_bytes()); }
+            return Ok(output);
+        }
         for field in [1, 0, element.descriptor().oid, i32::try_from(cells.len()).map_err(invalid)?, 1] {
             output.extend_from_slice(&field.to_be_bytes());
         }
@@ -137,7 +144,8 @@ fn array_payload<T>(
                 output.extend_from_slice(&i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes());
                 output.extend_from_slice(&bytes);
             } else {
-                if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); }
+                if floats { output[4..8].copy_from_slice(&1i32.to_be_bytes()); }
+                else if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); }
                 output.extend_from_slice(&(-1i32).to_be_bytes());
             }
         }
@@ -167,6 +175,12 @@ fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> {
     rtdb_format::temporal_text::interval_parts(value).ok_or_else(|| incompatible(PgType::Interval, value))
 }
 fn decimal_text(value: &rtdb_types::DecimalValue) -> String { rtdb_expr::decimal_text(value) }
+fn float4_bytes(format: Format, value: f32) -> Vec<u8> {
+    match format { Format::Binary => value.to_be_bytes().to_vec(), Format::Text => rtdb_types::java_f32_text(value).into_bytes() }
+}
+fn float8_bytes(format: Format, value: f64) -> Vec<u8> {
+    match format { Format::Binary => value.to_be_bytes().to_vec(), Format::Text => rtdb_types::java_f64_text(value).into_bytes() }
+}
 fn float_text(value: f64, single: Option<f32>) -> String {
     single.map_or_else(|| rtdb_types::java_f64_text(value), rtdb_types::java_f32_text)
 }

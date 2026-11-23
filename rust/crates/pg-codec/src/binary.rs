@@ -20,6 +20,7 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
         PgType::Interval => { let nanoseconds = input.i64()?.checked_mul(1000).ok_or_else(|| invalid("Interval overflow"))?; let days = input.i32()?; let months = input.i32()?; if nanoseconds == 0 && days == 0 { Value::IntervalYearMonth(months) } else { Value::IntervalMonthDayMicro { months, days, nanoseconds } } },
         PgType::Bytes => Value::Binary(bytes.to_vec()),
         PgType::Uuid => Value::Uuid(input.take(16)?.try_into().map_err(invalid)?),
+        PgType::Float4s | PgType::Float8s => return crate::float_array::read_value(ty, crate::Format::Binary, bytes),
         PgType::Int4s | PgType::Int8s | PgType::Texts => array_read(ty, &mut input)?,
         PgType::Jsonb => { if input.take(1)?[0] != 1 { return Err(Anomaly::incorrect("xtdb.pgwire/unsupported-jsonb-version", "Unsupported binary jsonb version")); } return crate::text::read_text(114, std::str::from_utf8(input.0).map_err(invalid)?); },
         PgType::Json | PgType::JsonLd | PgType::Transit | PgType::TsTzRange => return crate::text::read_text(ty.descriptor().oid as u32, std::str::from_utf8(bytes).map_err(invalid)?),

@@ -32,6 +32,23 @@ pub(crate) fn cast(
     }))
 }
 
+/// Casts a bound Arrow list through the same floating-point component kernel used by expressions.
+pub fn cast_bound_float_list(
+    cell: rtdb_columnar::ArrowCell<'_>, target: &LogicalType, allocation: &crate::EvaluationScope,
+) -> Result<Option<rtdb_types::Value>> {
+    use rtdb_types::ListKind;
+
+    let target = match target { LogicalType::Maybe(target) => target.as_ref(), target => target };
+    let LogicalType::List { kind: ListKind::List, element } = target else { return Ok(None); };
+    if !matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_))) || cell.is_null()? {
+        return Ok(None);
+    }
+    let Some((field, values, range)) = cell.sequence_range() else { return Ok(None); };
+    let values = values.slice(range.start, range.len());
+    cast(field, values.as_ref(), &CastTarget::fixed(element.as_ref().clone()), |bytes| allocation.reserve(bytes))
+        .map(|value| value.map(rtdb_types::Value::List))
+}
+
 pub(crate) fn packed(list: &ListValue) -> Option<(Arc<Field>, ArrayRef)> {
     match list.view() {
         ListView::Values(_) => None,

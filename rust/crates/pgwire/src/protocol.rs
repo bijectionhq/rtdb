@@ -4,12 +4,20 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, ReplaySubmissionPermit, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
-use rtdb_query::QueryCursor;
+use rtdb_query::{BoundParameters, QueryCursor};
+use rtdb_tx::SqlArguments;
 use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use crate::{GATEWAY_KEY_CONFIRM_KIND, GATEWAY_KEY_KIND, GATEWAY_NAMED_PARSE_KIND, GATEWAY_REPLAY_PERMIT_KIND, GATEWAY_SESSION_STATE_TAG, GATEWAY_SETTINGS_KIND, GATEWAY_SQL_PREPARE_KIND, GatewayReplayMode, GatewayReplayPermit, ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
+
+fn bind_control_arguments(arguments: Option<&SqlArguments>, memory: &Arc<MemoryBudget>) -> Result<Option<BoundParameters>> {
+    arguments.map(|args| {
+        let batch = args.single_arrow_page().expect("portal owns one Arrow argument page");
+        BoundParameters::from_arrow(batch.clone(), 0, args.execution_types().collect(), memory)
+    }).transpose()
+}
 
 fn replay_requires_autocommit() -> Anomaly {
     Anomaly::unsupported("rtdb.pgwire/replay-command", "Automatic replay requires a single autocommit statement without transaction controls")
@@ -54,7 +62,7 @@ struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, types: Vec<
 enum PortalState { Query(QueryPortal), Ready }
 struct Portal {
     prepared: Arc<Prepared>,
-    arguments: Vec<Value>,
+    arguments: Option<SqlArguments>,
     columns: Option<Vec<Column>>,
     state: PortalState,
     cancellation: CancellationToken,
@@ -222,32 +230,54 @@ impl ProtocolSession {
                 let count = usize::from(input.short()?);
                 if matches!(prepared.ordinary_kind(), Some(PreparedKind::Dml(_))) && count != prepared.oids.len() { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
                 let charge_slots = count + 2;
-                let bytes = count.checked_mul(std::mem::size_of::<Value>())
+                let slot_bytes = std::mem::size_of::<arrow_schema::Field>() + std::mem::size_of::<arrow_array::ArrayRef>() + 32;
+                let bytes = count.checked_mul(slot_bytes)
                     .and_then(|bytes| bytes.checked_add(charge_slots.checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())?))
                     .and_then(|bytes| bytes.checked_add(name.len()))
                     .and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| protocol("Portal argument slots are too large"))?;
                 let storage = self.node.memory().reserve(bytes)?;
-                let mut arguments = Vec::new();
-                arguments.try_reserve_exact(count).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+                let mut fields = Vec::<arrow_schema::Field>::new();
+                let mut columns = Vec::<arrow_array::ArrayRef>::new();
                 let mut charges = Vec::new();
-                charges.try_reserve_exact(charge_slots).map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+                for reserve in [fields.try_reserve_exact(count), columns.try_reserve_exact(count), charges.try_reserve_exact(charge_slots)] {
+                    reserve.map_err(|cause| Anomaly::incorrect("rtdb/allocation-failed", cause.to_string()))?;
+                }
                 for index in 0..count {
-                    let length = input.integer()?; if length == -1 { arguments.push(Value::Null); continue; }
+                    let length = input.integer()?;
+                    let name = format!("?_{index}");
+                    if length == -1 {
+                        let ty = prepared.oids.get(index).and_then(|oid| PgType::from_oid(*oid))
+                            .filter(|ty| matches!(ty, PgType::Float4s | PgType::Float8s))
+                            .and_then(PgType::logical_type).map(rtdb_types::LogicalType::maybe).unwrap_or(rtdb_types::LogicalType::Null);
+                        let field = rtdb_columnar::to_field(&name, &ty)?;
+                        columns.push(arrow_array::new_null_array(field.data_type(), 1));
+                        fields.push(field);
+                        continue;
+                    }
                     let bytes = input.take(usize::try_from(length).map_err(|_| protocol("Negative argument length"))?)?;
                     let oid = *prepared.oids.get(index).ok_or_else(|| protocol("Argument count differs from parameter OIDs"))?;
                     if oid == 0 && matches!(prepared.ordinary_kind(), Some(PreparedKind::Dml(_))) { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
                     let ty = PgType::from_oid(oid).ok_or_else(|| Anomaly::unsupported("xtdb.pgwire/unsupported-param-type", format!("Unsupported param type OID {oid}")))?;
                     let format = item_format(&formats, count, index)?;
-                    let decoded = rtdb_pg_codec::decode(ty, format, bytes, self.node.memory()).map_err(|error| invalid_argument(error, index, format))?;
-                    let (value, charge) = decoded.into_parts(); arguments.push(value); charges.push(charge);
+                    let (field, column, charge) = rtdb_pg_codec::decode_argument(&name, ty, format, bytes, self.node.memory())
+                        .map_err(|error| invalid_argument(error, index, format))?;
+                    fields.push(field);
+                    columns.push(column);
+                    charges.push(charge);
                 }
                 let requires_exact_arity = matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(_) | PreparedKind::CopyOut(..)))
                     || matches!(prepared.control(), Some(ControlStatement::Execute { .. }));
                 if requires_exact_arity && count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
                 let count = usize::from(input.short()?); let result_formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?; input.end()?;
                 if name.is_empty() { self.portals.remove(name); } else if self.portals.contains_key(name) { return Err(protocol("Named portals must be explicit closed before they can be redefined")); }
-                charges.push(Arc::clone(&frame.charge));
-                let mut portal = self.bind(prepared, arguments, charges, &result_formats).await?;
+                let arguments = if columns.is_empty() { None } else {
+                    let batch = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+                        .map_err(|error| protocol(error.to_string()))?;
+                    Some(OwnedBatch::new(batch, self.node.memory())?)
+                };
+                drop(charges);
+                let arguments = arguments.map(|batch| SqlArguments::from_canonical_arrow_row(batch, self.node.memory())).transpose()?;
+                let mut portal = self.bind(prepared, arguments, vec![Arc::clone(&frame.charge)], &result_formats).await?;
                 portal._bind_storage = Some(storage);
                 self.portals.insert(name.to_owned(), portal); writer.empty(b'2').await?;
             }
@@ -445,7 +475,7 @@ impl ProtocolSession {
         Ok(())
     }
 
-    async fn bind(&mut self, prepared: Arc<Prepared>, arguments: Vec<Value>, mut charges: Vec<Arc<MemoryReservation>>, formats: &[Format]) -> Result<Portal> {
+    async fn bind(&mut self, prepared: Arc<Prepared>, arguments: Option<SqlArguments>, mut charges: Vec<Arc<MemoryReservation>>, formats: &[Format]) -> Result<Portal> {
         let token = self.token();
         let bound = prepared.columns.as_deref().unwrap_or_default().iter().try_fold(8192usize, |bytes, column| bytes.checked_add(column.name.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Portal descriptors are too large")))?;
         charges.push(self.node.memory().reserve(bound)?);
@@ -457,24 +487,49 @@ impl ProtocolSession {
                 if self.session.state().is_read_write() { return Err(protocol("COPY TO requires a read transaction")); }
                 let _active = self.cancellations.enter(&token);
                 let context = self.session.query_context_with(&token, true).await?;
-                let types = portal.arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
-                Some(token.run_until_cancelled(query.open_query_columns_typed(context, std::mem::take(&mut portal.arguments), &types))
-                    .await.ok_or_else(cancelled)??)
+                let arguments = portal.arguments.take();
+                Some(token.run_until_cancelled(async {
+                    if let Some(args) = arguments {
+                        let page = args.single_arrow_page().expect("portal owns one Arrow argument page");
+                        query.try_open_query_arrow(context, page, args.types()).await?.ok_or_else(|| protocol("Portal arguments have no rows"))
+                    } else {
+                        query.open_query_columns_typed(context, Vec::new(), &[]).await
+                    }
+                }).await.ok_or_else(cancelled)??)
             },
             (Some(PreparedKind::Query(query)), _) => {
                 let _active = self.cancellations.enter(&token);
                 let checked = !self.session.state().is_read_write();
                 let context = self.session.query_context_with(&token, checked).await?;
-                Some(token.run_until_cancelled(query.open_query(context, std::mem::take(&mut portal.arguments))).await.ok_or_else(cancelled)?
-                    .map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
+                let arguments = portal.arguments.take();
+                Some(token.run_until_cancelled(async {
+                    if let Some(args) = arguments {
+                        let page = args.single_arrow_page().expect("portal owns one Arrow argument page");
+                        query.open_query_arrow_rows(context, page, args.types()).await
+                    } else {
+                        query.open_query(context, Vec::new()).await
+                    }
+                }).await.ok_or_else(cancelled)?.map_err(|error| if token.is_cancelled() { cancelled() } else { error })?)
             },
-            (_, Some(statement @ ControlStatement::Show { .. })) => match self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? { ControlResult::Rows(cursor) => Some(cursor), _ => return Err(protocol("SHOW did not produce rows")) },
+            (_, Some(statement @ ControlStatement::Show { .. })) => {
+                let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
+                match self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options).await? {
+                    ControlResult::Rows(cursor) => Some(cursor),
+                    _ => return Err(protocol("SHOW did not produce rows")),
+                }
+            },
             (_, Some(statement @ ControlStatement::Execute { .. })) => {
-                let ControlResult::Execute { name, arguments, reservation, allocation: _allocation } = self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? else { return Err(protocol("EXECUTE did not produce arguments")); };
+                let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
+                let ControlResult::ExecuteArrow { name, arguments, allocation: _allocation } =
+                    self.session.execute_control_arrow_with(statement, args.as_ref(), &token, control_options).await?
+                else { return Err(protocol("EXECUTE did not produce arguments")); };
                 let inner = Arc::clone(&self.statements.get(&name).ok_or_else(|| protocol("no prepared statement"))?.prepared);
                 if !matches!(inner.ordinary_kind(), Some(PreparedKind::Query(_) | PreparedKind::Dml(_))) { return Err(Anomaly::unsupported("xtdb.pgwire/unsupported-execute", "EXECUTE only supports a prepared query or DML statement")); }
-                if matches!(inner.ordinary_kind(), Some(PreparedKind::Query(_))) && arguments.len() != inner.oids.len() { return Err(protocol("EXECUTE argument count differs from prepared statement")); }
-                return Box::pin(self.bind(inner, arguments, vec![reservation], formats)).await;
+                if matches!(inner.ordinary_kind(), Some(PreparedKind::Query(_))) && arguments.batch().num_columns() != inner.oids.len() { return Err(protocol("EXECUTE argument count differs from prepared statement")); }
+                let arguments = if arguments.batch().num_columns() == 0 { None } else {
+                    Some(SqlArguments::from_canonical_arrow_row(arguments, self.node.memory())?)
+                };
+                return Box::pin(self.bind(inner, arguments, Vec::new(), formats)).await;
             }
             _ => None,
         };
@@ -535,10 +590,7 @@ impl ProtocolSession {
                 if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "DML is not allowed on the READ ONLY server")); }
                 if self.session.state().is_read_only() { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-tx", "DML is not allowed in a READ ONLY transaction").with_context("query", source.into())); }
                 self.begin_implicit(Some(false))?;
-                let bound = portal.arguments.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(|| protocol("DML arguments are too large")))?;
-                let _arguments = self.node.memory().reserve(bound)?;
-                let args = if portal.arguments.is_empty() { None } else { Some(rtdb_tx::SqlArguments::from_rows(vec![portal.arguments.clone()], self.node.memory())?) };
-                self.session.state_mut().execute_operation(statement.dml_operation(args)?).await?;
+                self.session.state_mut().execute_operation(statement.dml_operation(portal.arguments.clone())?).await?;
                 if commit_dml_before_reply { self.commit(permit).await?; }
                 match statement.ordered_index_command_tag() {
                     Some(tag) => writer.string(b'C', tag).await,
@@ -549,7 +601,8 @@ impl ProtocolSession {
                 let statement = control.statement();
                 let _sample = matches!(statement, ControlStatement::Commit(_)).then(|| rtdb_plan::ExecutionSample::new(self.node.execution_observer(), rtdb_plan::ExecutionTimer::PgwireTransaction));
                 let options = self.control_options();
-                let result = self.session.execute_control_with(statement, &portal.arguments, &portal.cancellation, options).await;
+                let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
+                let result = self.session.execute_control_arrow_with(statement, args.as_ref(), &portal.cancellation, options).await;
                 if matches!(statement, ControlStatement::Commit(_) | ControlStatement::Rollback) && self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
                 match result? {
                     ControlResult::Command { tag, parameter_status, allocation: _allocation, .. } => {
@@ -576,7 +629,8 @@ impl ProtocolSession {
     async fn execute_sql_prepare<W: AsyncWrite + Unpin>(
         &mut self, syntax: &SqlPrepareSyntax, portal: &mut Portal, writer: &mut Writer<W>,
     ) -> Result<()> {
-        let _allocation = self.session.admit_frontend_prepare(&portal.arguments, &portal.cancellation).await?;
+        let args = bind_control_arguments(portal.arguments.as_ref(), self.node.memory())?;
+        let _allocation = self.session.admit_frontend_prepare_arrow(args.as_ref(), &portal.cancellation).await?;
         let memory = Arc::clone(self.node.memory());
         let prepared = self.prepare_sql_child(syntax.child(&memory)?, None).await?;
         self.install_sql_prepare(Cow::Borrowed(syntax.name()), syntax.source(), prepared, writer).await
@@ -746,7 +800,7 @@ impl ProtocolSession {
         };
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
-        let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
+        let mut portal = self.bind(prepared, None, Vec::new(), &[]).await?;
         if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
         self.execute(&mut portal, 0, commit_dml_before_reply, permit, writer).await
     }
@@ -1508,8 +1562,9 @@ mod tests {
 
         frontend.message(&frame, &mut writer).await.unwrap();
         let portal = frontend.portals.get("candidate").unwrap();
-        assert_eq!(portal.arguments.len(), usize::from(count));
-        assert!(portal.arguments.iter().all(|argument| matches!(argument, Value::Null)));
+        let arguments = portal.arguments.as_ref().unwrap().single_arrow_page().unwrap().batch();
+        assert_eq!(arguments.num_columns(), usize::from(count));
+        assert!(arguments.columns().iter().all(|argument| argument.data_type() == &arrow_schema::DataType::Null));
         assert!(memory.used_bytes() >= before + usize::from(count) * std::mem::size_of::<Value>());
         frontend.portals.clear();
         assert_eq!(memory.used_bytes(), before);
@@ -1687,7 +1742,7 @@ mod tests {
         let old = frontend.prepare_client("SET TIME ZONE 'Europe/Paris'", Vec::new(), None).await.unwrap();
         let old_statement = Arc::downgrade(&old);
         frontend.register_statement(Cow::Borrowed("zone"), Arc::clone(&old)).unwrap();
-        let portal = frontend.bind(old, Vec::new(), Vec::new(), &[]).await.unwrap();
+        let portal = frontend.bind(old, None, Vec::new(), &[]).await.unwrap();
         let old_name_bytes = frontend.statements["zone"]._reservation.bytes();
         let retained = memory.used_bytes();
 
@@ -1753,7 +1808,7 @@ mod tests {
 
         let prepared = Arc::clone(&frontend.statements["wire"].prepared);
         let wrapper = Arc::downgrade(&prepared);
-        let mut portal = frontend.bind(prepared, Vec::new(), Vec::new(), &[]).await.unwrap();
+        let mut portal = frontend.bind(prepared, None, Vec::new(), &[]).await.unwrap();
         let retained = memory.used_bytes();
         let argument_scope = frontend.session.admit_frontend_prepare(&[], &portal.cancellation).await.unwrap();
         let arguments = memory.used_bytes() - retained;
@@ -1786,5 +1841,56 @@ mod tests {
         assert_eq!(memory.used_bytes(), baseline);
         drop(frontend);
         driver.close_without_run().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use std::sync::Arc;
+    use rtdb_columnar::{MemoryBudget, OwnedBatch};
+    use rtdb_pg_codec::Format;
+    use rtdb_tx::{SourceTransaction, SqlArguments, SubmitOptions, TxOp};
+    use rtdb_types::PgType;
+
+    #[test]
+    fn canonical_pgwire_arguments_keep_legacy_sql_log_bytes() {
+        let memory = MemoryBudget::new(16 << 20);
+        let nan = 0x7fa0_0001u32.to_be_bytes();
+        let inputs = [
+            (PgType::Int8, Format::Text, b"42".as_slice()),
+            (PgType::Float4, Format::Binary, nan.as_slice()),
+            (PgType::Int4s, Format::Text, b"{4,NULL,8}".as_slice()),
+            (PgType::Numeric, Format::Text, b"1.25".as_slice()),
+            (PgType::Json, Format::Text, br#"{"value":[1.5,null,2.5]}"#.as_slice()),
+        ];
+        let mut values = Vec::new();
+        let mut fields = Vec::new();
+        let mut arrays = Vec::new();
+        for (index, (ty, format, payload)) in inputs.into_iter().enumerate() {
+            let decoded = rtdb_pg_codec::decode(ty, format, payload, &memory).unwrap();
+            values.push(decoded.into_parts().0);
+            let (field, array, _) = rtdb_pg_codec::decode_argument(&format!("?_{index}"), ty, format, payload, &memory).unwrap();
+            fields.push(field);
+            arrays.push(array);
+        }
+        let batch = arrow_array::RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays).unwrap();
+        let typed = SqlArguments::from_canonical_arrow_row(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+        let rows = SqlArguments::from_rows(vec![values], &memory).unwrap();
+        let encode = |sql: &str, args| {
+            SourceTransaction::new(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }], SubmitOptions::default(), &memory)
+                .unwrap().encode().unwrap()
+        };
+        let sql = "UPDATE docs SET v = $2 WHERE _id = $1";
+        assert_eq!(encode(sql, typed.clone()).as_slice(), encode(sql, rows.clone()).as_slice());
+        let (mut typed_pair, mut row_pair) = (typed.clone(), rows.clone());
+        typed_pair.append(typed.clone()).unwrap();
+        row_pair.append(rows.clone()).unwrap();
+        assert_eq!(encode(sql, typed_pair).as_slice(), encode(sql, row_pair).as_slice());
+        let submission = |args| {
+            let sql = "INSERT INTO docs (_id, vector) VALUES ($1, $3)";
+            rtdb_tx::prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
+                SubmitOptions::default(), "xtdb", &memory).unwrap().encode().unwrap()
+        };
+        assert_eq!(submission(typed).as_slice(), submission(rows).as_slice());
     }
 }

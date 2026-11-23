@@ -4,7 +4,7 @@ use arrow_schema::Schema;
 use bytes::Bytes;
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
-use rtdb_query::{QueryContext, QueryCursor};
+use rtdb_query::{BoundParameters, QueryContext, QueryCursor};
 use rtdb_tx::SqlArguments;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
@@ -116,7 +116,7 @@ impl Service {
         let options = options(native);
         if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             if control_schema(control.statement()).map_err(status)?.is_some() { return Err(invalid("executeUpdate does not support queries")); }
-            return execute_control_update(native, control.statement(), arguments.as_ref(), &token).await;
+            return execute_control_update(native, control.statement(), arguments.as_ref(), &token, self.memory()).await;
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
@@ -135,7 +135,8 @@ impl Service {
         let (context, schema, input) = if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             let Some(schema) = control_schema(control.statement()).map_err(status)? else {
                 let arguments = params.as_ref().map(|params| params.arguments(self.memory())).transpose()?;
-                execute_control_update(&mut native, control.statement(), arguments.as_ref(), &token).await?;
+                execute_control_update(&mut native, control.statement(), arguments.as_ref(), &token, self.memory()).await?;
+                drop(control);
                 return self.empty_update_info();
             };
             let output = native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions {
@@ -229,10 +230,16 @@ impl Service {
         let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
     }
 }
-async fn execute_control_update(native: &mut NativeSession, control: &ControlStatement, arguments: Option<&SqlArguments>, token: &CancellationToken) -> Result<(), Status> {
-    let params = arguments.and_then(|arguments| arguments.rows().next()).transpose().map_err(status)?;
-    let params = params.as_deref().unwrap_or_default();
-    match native.execute_control_with(control, params, token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
+async fn execute_control_update(native: &mut NativeSession, control: &ControlStatement, arguments: Option<&SqlArguments>, token: &CancellationToken, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<(), Status> {
+    let options = ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false };
+    let result = if let Some(arguments) = arguments && let Some(page) = arguments.first_arrow_page() {
+        let params = BoundParameters::from_arrow(page.clone(), 0, arguments.execution_types().collect(), memory).map_err(status)?;
+        native.execute_control_arrow_with(control, Some(&params), token, options).await
+    } else {
+        let params = arguments.and_then(|arguments| arguments.rows().next()).transpose().map_err(status)?;
+        native.execute_control_with(control, params.as_deref().unwrap_or_default(), token, options).await
+    };
+    match result.map_err(status)? {
         ControlResult::Command { .. } => Ok(()),
         _ => Err(invalid("Statement is not supported by Flight SQL executeUpdate")),
     }

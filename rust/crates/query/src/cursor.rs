@@ -151,6 +151,14 @@ impl PreparedQuery {
         measured_open(retention, open).await
     }
 
+    pub async fn execute_arrow_column_rows(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
+        let retention = Arc::clone(&context);
+        let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
+            Box::pin(self.open_arrow(context, batch, row, types, text, Batching::ColumnRows))
+        });
+        measured_open(retention, open).await
+    }
+
     pub fn is_parameter_projection(&self) -> bool {
         if !matches!(self.output, QueryOutput::Rows) || self.settings.as_ref() != &rtdb_plan::QuerySettings::default()
             || self.required_parameter_count == 0 { return false; }

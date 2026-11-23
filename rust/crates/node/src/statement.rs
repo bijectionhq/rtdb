@@ -192,19 +192,30 @@ impl PreparedSql {
     }
 
     pub async fn try_open_query_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<Option<QueryCursor>> {
-        if arguments.batch().num_rows() == 0 || !self.0.options.parameter_types.is_empty() { return Ok(None); }
+        if arguments.batch().num_rows() == 0 { return Ok(None); }
         if arguments.batch().num_columns() != self.parameter_count() {
             return Err(parameter_error("Argument count differs from the prepared statement"));
         }
         if let Some(cursor) = self.try_open_parameter_projection(Arc::clone(&context), arguments, types).await? {
             return Ok(Some(cursor));
         }
+        self.open_arrow(context, arguments, types, true).await.map(Some)
+    }
+
+    pub async fn open_query_arrow_rows(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType]) -> Result<QueryCursor> {
+        self.open_arrow(context, arguments, types, false).await
+    }
+
+    async fn open_arrow(&self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], columnar: bool) -> Result<QueryCursor> {
+        if arguments.batch().num_columns() != self.parameter_count() {
+            return Err(parameter_error("Argument count differs from the prepared statement"));
+        }
         let arguments = if arguments.batch().num_rows() == 1 {
             arguments.clone()
         } else {
             match arguments.select(&Selection::Indices(vec![0])) {
                 Ok(row) => row,
-                Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+                Err(error) if error.code == "rtdb/memory-budget-exceeded" => arguments.slice(0, 1)?,
                 Err(error) => return Err(error),
             }
         };
@@ -221,11 +232,60 @@ impl PreparedSql {
         } else {
             context.reopen_sql_snapshot(selector, rtdb_expr::Parameters::Values(&[])).await?
         };
+        let arguments = self.cast_arrow_arguments(arguments, types, &context)?;
         let query = deep(self.source(), || self.bind(&context, types, true))?;
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
-        let cursor = query.execute_arrow_columns(context, arguments, 0, types, Some(self.source())).await?;
+        let cursor = if columnar {
+            query.execute_arrow_columns(context, arguments, 0, types, Some(self.source())).await?
+        } else {
+            query.execute_arrow_column_rows(context, arguments, 0, types, Some(self.source())).await?
+        };
         if self.0.policy == ResultSignaturePolicy::PostgreSql { self.check_signature(cursor.runtime_schema())?; }
-        Ok(Some(cursor))
+        Ok(cursor)
+    }
+
+    fn cast_arrow_arguments(&self, arguments: OwnedBatch, types: &[LogicalType], context: &QueryContext) -> Result<OwnedBatch> {
+        use arrow_array::RecordBatch;
+        use rtdb_columnar::ArrowCell;
+
+        let mut replacement = None;
+        for (&index, declared) in &self.0.options.parameter_types {
+            let batch = arguments.batch();
+            let source = types.get(index).ok_or_else(|| parameter_error("Parameter field count differs from the prepared statement"))?;
+            let target = rtdb_columnar::execution_type(declared);
+            if rtdb_columnar::execution_type(source).maybe() == target.clone().maybe() { continue; }
+            let array = batch.column(index);
+            let field = batch.schema_ref().field(index);
+            let cell = ArrowCell { field, array: array.as_ref(), row: 0 };
+            if cell.is_null()? { continue; }
+            let (fields, arrays, allocation) = match &mut replacement {
+                Some(replacement) => replacement,
+                None => {
+                    let allocation = rtdb_expr::EvaluationScope::new(&context.memory)?;
+                    allocation.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+                    replacement.insert((batch.schema_ref().fields().to_vec(), batch.columns().to_vec(), allocation))
+                }
+            };
+            let value = match rtdb_expr::cast_bound_float_list(cell, &target, allocation)? {
+                Some(value) => value,
+                None => {
+                    allocation.reserve(rtdb_columnar::estimate_read_cell_bytes(field, array.as_ref(), 0)?)?;
+                    let value = rtdb_columnar::read_execution_value_as(source, field, array.as_ref(), 0)?;
+                    let value = rtdb_expr::cast(&value, &target, &context.timezone)?;
+                    allocation.reserve(value.retained_bytes()?)?;
+                    value
+                }
+            };
+            let logical = value.logical_type();
+            let values = std::slice::from_ref(&value);
+            allocation.reserve(rtdb_columnar::estimate_builder_bytes(&logical, values)?)?;
+            arrays[index] = rtdb_columnar::copy_array(&logical, values)?;
+            fields[index] = Arc::new(rtdb_columnar::to_field(field.name(), &logical)?);
+        }
+        let Some((fields, arrays, _allocation)) = replacement else { return Ok(arguments); };
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays)
+            .map_err(|error| parameter_error(&error.to_string()))?;
+        OwnedBatch::new(batch, &context.memory)
     }
 
     /// Uses the first Arrow parameter row directly when the query only projects parameters.

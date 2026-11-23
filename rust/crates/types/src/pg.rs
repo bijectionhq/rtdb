@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 pub enum PgType {
     Default, Null, Int8, Int4, Int2, Float4, Float8, Bool, Text, VarChar, Numeric,
     Timestamp, TimestampTz, Date, Time, Interval, Duration, TsTzRange, Bytes,
-    Int4s, Int8s, Texts, Uuid, Keyword, Oid, RegClass, RegProc, Json, JsonLd, Jsonb, Transit,
+    Int4s, Int8s, Texts, Uuid, Keyword, Oid, RegClass, RegProc, Json, JsonLd, Jsonb, Transit, Float4s, Float8s,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +39,7 @@ impl PgType {
         Self::VarChar, Self::Numeric, Self::Timestamp, Self::TimestampTz, Self::Date, Self::Time,
         Self::Interval, Self::Duration, Self::TsTzRange, Self::Bytes, Self::Int4s, Self::Int8s,
         Self::Texts, Self::Uuid, Self::Keyword, Self::Oid, Self::RegClass, Self::RegProc,
-        Self::Json, Self::Jsonb, Self::Transit,
+        Self::Json, Self::Jsonb, Self::Transit, Self::Float4s, Self::Float8s,
     ];
 
     pub fn descriptor(self) -> PgTypeDescriptor {
@@ -65,6 +65,8 @@ impl PgType {
             Self::Bytes => ("bytea", 17, -1, 'U', "byteasend", "bytearecv"),
             Self::Int4s => ("_int4", 1007, -1, 'A', "array_send", "array_recv"),
             Self::Int8s => ("_int8", 1016, -1, 'A', "array_send", "array_recv"),
+            Self::Float4s => ("_float4", 1021, -1, 'A', "array_send", "array_recv"),
+            Self::Float8s => ("_float8", 1022, -1, 'A', "array_send", "array_recv"),
             Self::Texts => ("_text", 1009, -1, 'A', "array_send", "array_recv"),
             Self::Uuid => ("uuid", 2950, 16, 'U', "uuid_send", "uuid_recv"),
             Self::Keyword => ("keyword", 11111, -1, 'S', "keywordsend", "keywordrecv"),
@@ -76,10 +78,10 @@ impl PgType {
             Self::Transit => ("transit", 16384, -1, 'U', "transit_send", "transit_recv"),
         };
         PgTypeDescriptor { name, oid, length, category, send, receive,
-            array_oid: match self { Self::Int8 => Some(1016), Self::Int4 => Some(1007), Self::Text => Some(1009), _ => None },
-            element_oid: match self { Self::Int4s => Some(23), Self::Int8s => Some(20), Self::Texts => Some(25), _ => None },
-            input: match self { Self::Int4s | Self::Int8s | Self::Texts => Some("array_in"), Self::Uuid => Some("uuid_in"), _ => None },
-            output: match self { Self::Int4s | Self::Int8s | Self::Texts => Some("array_out"), Self::Uuid => Some("uuid_out"), _ => None },
+            array_oid: match self { Self::Int8 => Some(1016), Self::Int4 => Some(1007), Self::Text => Some(1009), Self::Float4 => Some(1021), Self::Float8 => Some(1022), _ => None },
+            element_oid: match self { Self::Int4s => Some(23), Self::Int8s => Some(20), Self::Texts => Some(25), Self::Float4s => Some(700), Self::Float8s => Some(701), _ => None },
+            input: match self { Self::Int4s | Self::Int8s | Self::Texts | Self::Float4s | Self::Float8s => Some("array_in"), Self::Uuid => Some("uuid_in"), _ => None },
+            output: match self { Self::Int4s | Self::Int8s | Self::Texts | Self::Float4s | Self::Float8s => Some("array_out"), Self::Uuid => Some("uuid_out"), _ => None },
         }
     }
 
@@ -105,6 +107,8 @@ impl PgType {
             Self::Interval => S::IntervalMonthDayMicro, Self::Duration => S::Duration(TimeUnit::Microsecond),
             Self::TsTzRange => return Some(LogicalType::List { kind: ListKind::TimestampTzRange, element: Box::new(Self::TimestampTz.logical_type()?) }),
             Self::Bytes => S::Binary,
+            Self::Float4s => return Some(LogicalType::list(Self::Float4.logical_type()?.maybe())),
+            Self::Float8s => return Some(LogicalType::list(Self::Float8.logical_type()?.maybe())),
             Self::Int4s | Self::Int8s | Self::Texts => return Some(LogicalType::list(match self {
                 Self::Int4s => Self::Int4, Self::Int8s => Self::Int8, _ => Self::Text,
             }.logical_type()?)),
@@ -123,6 +127,7 @@ impl PgType {
         Ok(if types.iter().all(|ty| matches!(ty, Self::Int2 | Self::Int4 | Self::Int8)) { Self::Int8 }
             else if types.iter().all(|ty| matches!(ty, Self::Float4 | Self::Float8)) { Self::Float8 }
             else if types.iter().all(|ty| matches!(ty, Self::Int4s | Self::Int8s)) { Self::Int8s }
+            else if types.iter().all(|ty| matches!(ty, Self::Float4s | Self::Float8s)) { Self::Float8s }
             else { Self::Default })
     }
 
@@ -134,7 +139,11 @@ impl PgType {
             L::List { kind: ListKind::TimestampTzRange, .. } => Self::TsTzRange,
             L::List { kind: ListKind::List | ListKind::FixedSizeList(_), element } => {
                 let element = match element.as_ref() { L::Maybe(element) => element.as_ref(), element => element };
-                match element { L::Scalar(S::I32 | S::U32) => Self::Int4s, L::Scalar(S::I64 | S::U64) => Self::Int8s, L::Scalar(S::Utf8) => Self::Texts, _ => Self::Default }
+                match element { L::Scalar(S::I32 | S::U32) => Self::Int4s, L::Scalar(S::I64 | S::U64) => Self::Int8s, L::Scalar(S::Utf8) => Self::Texts,
+                    L::Scalar(S::F32) => Self::Float4s, L::Scalar(S::F64) => Self::Float8s,
+                    L::Union(_) if element.legs().iter().all(|leg| matches!(leg, L::Null | L::Scalar(S::F32 | S::F64))) => Self::Float8s,
+                    _ => Self::Default,
+                }
             }
             L::List { .. } | L::Struct(_) | L::RunEndEncoded { .. } => Self::Default,
             L::Maybe(_) | L::Union(_) => return Self::from_logical(ty),
@@ -158,12 +167,12 @@ impl PgType {
             Self::Null | Self::Text => "text", Self::Int8 => "bigint", Self::Int4 => "integer", Self::Int2 => "smallint",
             Self::Float4 => "real", Self::Float8 => "double precision", Self::Bool => "boolean", Self::VarChar => "character varying",
             Self::Timestamp => "timestamp without time zone", Self::TimestampTz => "timestamp with time zone", Self::Time => "time without time zone",
-            Self::TsTzRange => "tstzrange", Self::Int4s => "integer[]", Self::Int8s => "bigint[]", Self::Texts => "text[]",
+            Self::TsTzRange => "tstzrange", Self::Int4s => "integer[]", Self::Int8s => "bigint[]", Self::Texts => "text[]", Self::Float4s => "real[]", Self::Float8s => "double precision[]",
             _ => self.descriptor().name,
         }
     }
     pub fn data_type(self) -> &'static str {
-        match self { Self::Int4s | Self::Int8s | Self::Texts => "ARRAY", Self::Default | Self::Duration | Self::Keyword | Self::Transit => "USER-DEFINED", _ => self.format_name() }
+        match self { Self::Int4s | Self::Int8s | Self::Texts | Self::Float4s | Self::Float8s => "ARRAY", Self::Default | Self::Duration | Self::Keyword | Self::Transit => "USER-DEFINED", _ => self.format_name() }
     }
     pub fn format_type(self, modifier: i32) -> String {
         if modifier < 0 { return self.format_name().into(); }

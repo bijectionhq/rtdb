@@ -22,7 +22,8 @@ impl SqlArguments {
                 })
             })?;
             let column = if let [(_, chunk)] = self.chunks.as_slice()
-                && matches!(chunk.as_ref(), ArgumentChunk::Rows { .. })
+                && matches!(chunk.as_ref(), ArgumentChunk::Rows { .. }
+                    | ArgumentChunk::Arrow { source_layout: SourceArgumentLayout::CanonicalRow, .. })
                 && let [(array, _)] = vectors.as_slice() {
                 output.column(array.get_array_memory_size(), || Ok(Arc::clone(array)))?
             } else { output.column(bound, || {
@@ -52,6 +53,10 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
             let field = batch.schema_ref().field(position);
             let array = batch.column(position);
             let source = &types[position];
+            // A decoded row already has the writer's masked bytes, which are included in the source digest.
+            if *source_layout == SourceArgumentLayout::CanonicalRow && source == ty && field.data_type() == target.data_type() {
+                return Ok((Arc::clone(array), None));
+            }
             if (*source_layout == SourceArgumentLayout::Uploaded || canonical_argument_field(field))
                 && can_copy_argument(source) && source.join(ty) == *ty {
                 validate_argument_uris(field, array.as_ref())?;

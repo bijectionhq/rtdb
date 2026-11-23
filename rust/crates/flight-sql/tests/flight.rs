@@ -2625,3 +2625,20 @@ async fn catalog_actions_are_absent_when_owner_actions_are_disabled() {
     }
     running.stop().await;
 }
+
+#[tokio::test]
+async fn prepared_control_uses_the_first_uploaded_arrow_parameter_row() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let control = client.prepare("SET TIME ZONE CASE WHEN CARDINALITY(?) = 3 THEN 'Europe/Paris' ELSE 'UTC' END", None).await;
+    let list = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
+        Some([Some(-0.0), None, Some(1.25)]),
+        None,
+    ]);
+    let batch = RecordBatch::try_from_iter([("vector", Arc::new(list) as arrow_array::ArrayRef)]).unwrap();
+    client.upload(CommandPreparedStatementUpdate { prepared_statement_handle: control.prepared_statement_handle }, vec![batch]).await;
+    let rows = client.query("SHOW TIME ZONE").await;
+    let timezone = rows[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(timezone.value(0), "Europe/Paris");
+    running.stop().await;
+}

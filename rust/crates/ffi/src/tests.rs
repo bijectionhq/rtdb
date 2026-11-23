@@ -939,3 +939,23 @@ fn arrow_transit_rows_keep_the_last_value_of_a_duplicate_column_name() {
         assert_eq!(output, transit::encode_row(&expected).unwrap());
     }
 }
+
+#[test]
+fn adbc_set_reaches_a_bound_arrow_list_with_null_components() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let handle = native.statement("SET TIME ZONE CASE WHEN CARDINALITY(?) = 3 THEN 'Europe/Paris' ELSE 'UTC' END");
+    let statement = handles::statement(handle).unwrap();
+    let token = handles::cancellation(operation, &statement.session).unwrap();
+    statement.prepare(&token).unwrap();
+    let values = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
+        Some([Some(-0.0), None, Some(1.25)]),
+    ]);
+    let batch = RecordBatch::try_from_iter([("", Arc::new(values) as arrow_array::ArrayRef)]).unwrap();
+    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+    statement.bind(unsafe { arrow::import_arguments(&mut array, &mut schema, statement.session.region.memory()) }.unwrap()).unwrap();
+    assert_eq!(statement.update(&token).unwrap(), -1);
+    let show = native.statement("SHOW TIME ZONE");
+    assert_eq!(native.query_value(show, operation), rtdb_types::Value::Utf8("Europe/Paris".into()));
+}

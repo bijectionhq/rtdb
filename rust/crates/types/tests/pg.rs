@@ -56,3 +56,17 @@ fn information_schema_type_edn_preserves_nullable_and_nested_layouts() {
     assert_eq!(L::Nothing.to_edn().unwrap(), ":nothing");
     assert_eq!(L::Struct(StructFields::from([("a".into(), L::Scalar(S::Utf8))])).to_edn().unwrap(), "[:struct {\"a\" :utf8}]");
 }
+
+#[test]
+fn float_array_descriptors_and_result_inference_keep_each_width() {
+    for (scalar, array, oid, pg_oid) in [(S::F32, P::Float4s, 700, 1021), (S::F64, P::Float8s, 701, 1022)] {
+        assert_eq!(P::from_oid(pg_oid), Some(array));
+        assert_eq!(P::from_oid(oid).unwrap().descriptor().array_oid, Some(pg_oid));
+        assert_eq!(array.descriptor().element_oid, Some(oid));
+        assert_eq!(array.logical_type(), Some(L::list(L::Scalar(scalar.clone()).maybe())));
+        let fixed = L::List { kind: rtdb_types::ListKind::FixedSizeList(3), element: Box::new(L::Scalar(scalar).maybe()) };
+        assert_eq!(P::from_logical(&fixed.maybe()).unwrap(), array);
+    }
+    let mixed = L::list(L::from_legs([L::Scalar(S::F32), L::Null, L::Scalar(S::F64)]));
+    assert_eq!(P::from_logical(&mixed).unwrap(), P::Float8s);
+}

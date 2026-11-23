@@ -1739,3 +1739,67 @@ async fn arrow_copy_vectors_rank_after_flush_for_both_ipc_formats() {
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn float_array_bind_round_trips_through_queries_and_dml() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+
+    let binary = [1, 1, 700, 3, 1, 4, i32::MIN, -1, 4, 0x7fa0_0042]
+        .into_iter().flat_map(i32::to_be_bytes).collect::<Vec<_>>();
+    for (statement, sql, oid, input_format, output_format, payload, result) in [
+        ("float4", "SELECT $1 AS value", 1021, 1u16, 1u16, Some(binary.as_slice()), Some(binary.clone())),
+        ("float8", "SELECT $1 AS value", 1022, 0, 0, Some(b"{-0,NULL,Infinity}".as_slice()), Some(b"{-0.0,NULL,Infinity}".to_vec())),
+        ("empty", "SELECT $1 AS value", 1022, 0, 0, Some(b"{}".as_slice()), Some(b"{}".to_vec())),
+        ("null", "SELECT $1 AS value", 1021, 0, 0, None, None),
+        ("insert", "INSERT INTO vectors (_id, value) VALUES (1, $1)", 1021, 1, 0, Some(binary.as_slice()), None),
+    ] {
+        client.parse(statement, sql, &[oid]).await;
+        let mut bind = cstring(statement);
+        bind.extend_from_slice(&cstring(statement));
+        for size in [1u16, input_format, 1] { bind.extend_from_slice(&size.to_be_bytes()); }
+        match payload {
+            Some(bytes) => {
+                bind.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                bind.extend_from_slice(bytes);
+            }
+            None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
+        bind.extend_from_slice(&1u16.to_be_bytes());
+        bind.extend_from_slice(&output_format.to_be_bytes());
+        client.send(b'B', &bind).await;
+        client.execute(statement, 0).await;
+        client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        if statement == "insert" {
+            assert_eq!(tags(&frames), b"12CZ", "{frames:?}");
+        } else {
+            assert_eq!(tags(&frames), b"12DCZ", "{frames:?}");
+            assert_eq!(rows(&frames), vec![vec![result]]);
+        }
+    }
+
+    assert_eq!(tags(&client.query("PREPARE bound AS INSERT INTO vectors (_id, value) VALUES (2, $1)").await), b"CZ");
+    client.parse("rebind", "EXECUTE bound ($1)", &[1021]).await;
+    let mut bind = cstring("rebind");
+    bind.extend_from_slice(&cstring("rebind"));
+    bind.extend_from_slice(&[0, 1, 0, 1, 0, 1]);
+    bind.extend_from_slice(&(binary.len() as i32).to_be_bytes());
+    bind.extend_from_slice(&binary);
+    bind.extend_from_slice(&[0, 1, 0, 1]);
+    client.send(b'B', &bind).await;
+    client.execute("rebind", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12CZ", "{frames:?}");
+
+    client.parse("stored", "SELECT value FROM vectors ORDER BY _id", &[]).await;
+    client.bind_formats("stored", "stored", &[1]).await;
+    client.execute("stored", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12DDCZ", "{frames:?}");
+    assert_eq!(rows(&frames), vec![vec![Some(binary.clone())], vec![Some(binary)]]);
+    drop(client);
+    running.stop().await;
+}

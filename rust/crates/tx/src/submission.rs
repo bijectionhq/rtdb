@@ -82,12 +82,18 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let mut count = 0; expr.visit(&mut |expr| { if let rtdb_plan::Expr::Parameter { index, .. } = expr { count = count.max(index + 1); } }); count
     }).max().unwrap_or(0));
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
-    if matches!(plan.kind, StaticMutationKind::Put) && let Some(pages) = args.and_then(SqlArguments::uniform_arrow_pages) {
+    if matches!(plan.kind, StaticMutationKind::Put) && let Some(args) = args && let Some(pages) = args.uniform_arrow_pages() {
+        let canonical_row = args.has_single_canonical_arrow_row();
         let projected = if plan.input.schema().fields().iter().any(|field| valid_time_column(&field.name)) {
-            projected_timed_puts(&plan.input, &pages, &plan.table.table, &options.default_tz, &scope, memory)
+            projected_timed_puts(&plan.input, &pages, canonical_row, &plan.table.table, &options.default_tz, &scope, memory)
         } else {
-            projected_arrow_documents(&plan.input, &pages, memory).map(|documents| documents.map(|documents| {
-                vec![Operation::Public(TxOp::PutArrowDocs { table: plan.table.table.clone(), documents })]
+            projected_arrow_documents(&plan.input, &pages, canonical_row, memory).map(|documents| documents.map(|documents| {
+                let table = plan.table.table.clone();
+                if canonical_row {
+                    vec![Operation::PutReplayArrow { table, documents, iids: None, valid_from: None, valid_to: None }]
+                } else {
+                    vec![Operation::Public(TxOp::PutArrowDocs { table, documents })]
+                }
             }))
         };
         match projected {
@@ -230,7 +236,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
 fn valid_time_column(name: &str) -> bool { matches!(name, "_valid_from" | "_valid_to") }
 
 fn projected_timed_puts(
-    input: &Relation, pages: &[&RecordBatch], table: &rtdb_types::TableRef, timezone: &str,
+    input: &Relation, pages: &[&RecordBatch], canonical_row: bool, table: &rtdb_types::TableRef, timezone: &str,
     scope: &rtdb_expr::EvaluationScope, memory: &Arc<MemoryBudget>,
 ) -> Result<Option<Vec<Operation>>> {
     let Some(first) = pages.first() else { return Ok(None); };
@@ -306,7 +312,8 @@ fn projected_timed_puts(
     let mut columns = Vec::with_capacity(expressions.len());
     for (position, expression) in expressions.iter().enumerate() {
         if let Some((index, field)) = data.remove(&position) {
-            columns.push(selected_argument_column(pages, index, &field, &cells, memory)?);
+            columns.push(if canonical_row { Arc::clone(first.column(index)) }
+                else { selected_argument_column(pages, index, &field, &cells, memory)? });
             fields.push(field);
         } else {
             let times = bounds.remove(&position).expect("each bound has a column");
@@ -322,7 +329,7 @@ fn projected_timed_puts(
     let reader = documents.id_reader()?;
     let iids = (0..batch.num_rows()).map(|row| documents.iid(row, reader.as_ref(), memory)).collect::<Result<Vec<_>>>();
     let Ok(iids) = iids else { return Ok(None); };
-    Ok(Some(vec![Operation::PutReplayArrow { table: table.clone(), documents, iids: Some(iids), valid_from: None, valid_to: None }]))
+    Ok(Some(vec![Operation::PutReplayArrow { table: table.clone(), documents, iids: (!canonical_row).then_some(iids), valid_from: None, valid_to: None }]))
 }
 
 fn selected_argument_column(
@@ -341,7 +348,7 @@ fn selected_argument_column(
     rtdb_columnar::retain_array(column, &reservation)
 }
 
-fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
+fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], canonical_row: bool, memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
     let Some(first) = pages.first() else { return Ok(None); };
     let RelationNode::Rename { input: values, expressions, .. } = input.node() else { return Ok(None); };
     let RelationNode::Values { rows } = values.node() else { return Ok(None); };
@@ -374,7 +381,8 @@ fn projected_arrow_documents(input: &Relation, pages: &[&RecordBatch], memory: &
     let mut columns = Vec::with_capacity(expressions.len());
     for (name, field, index) in projection().flatten() {
         fields.push(field.as_ref().clone().with_name(name));
-        columns.push(canonical_argument_column(pages, index, memory)?);
+        columns.push(if canonical_row { Arc::clone(first.column(index)) }
+            else { canonical_argument_column(pages, index, memory)? });
     }
     let projection = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
         .map_err(|error| Anomaly::fault("rtdb.tx/static-plan", error.to_string()))?;
@@ -952,4 +960,28 @@ fn static_patch_records_selects_the_vector_child_of_a_bound_arrow_record() {
     let arrow = submit(arguments);
     assert_eq!(arrow.encode().unwrap().as_slice(), row.encode().unwrap().as_slice());
     assert_eq!(arrow.body_digest().unwrap(), row.body_digest().unwrap());
+}
+
+#[test]
+fn canonical_arrow_row_keeps_legacy_sql_receipt_digests() {
+    let memory = MemoryBudget::new(16 << 20);
+    let values = vec![Value::I64(42), Value::list(vec![Value::I32(4), Value::Null, Value::I32(8)])];
+    let fields = values.iter().enumerate().map(|(index, value)| {
+        rtdb_columnar::to_field(&format!("?_{index}"), &value.logical_type()).unwrap()
+    }).collect::<Vec<_>>();
+    let columns = values.iter().map(|value| {
+        rtdb_columnar::copy_array(&value.logical_type(), std::slice::from_ref(value)).unwrap()
+    }).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap();
+    let arrow = SqlArguments::from_canonical_arrow_row(rtdb_columnar::OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+    let rows = SqlArguments::from_rows(vec![values], &memory).unwrap();
+    for sql in ["UPDATE docs SET vector = $2 WHERE _id = $1", "INSERT INTO docs (_id, vector) VALUES ($1, $2)"] {
+        let prepare = |args| prepare_submission(
+            vec![TxOp::Sql { sql: sql.into(), args: Some(args) }],
+            SubmitOptions::default(), "xtdb", &memory,
+        ).unwrap();
+        let actual = prepare(arrow.clone());
+        let expected = prepare(rows.clone());
+        assert_eq!(actual.body_digest().unwrap(), expected.body_digest().unwrap(), "{sql}");
+    }
 }

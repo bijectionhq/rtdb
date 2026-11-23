@@ -412,6 +412,8 @@ variant TxMessage : SourceMessage {
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
     -- The encoder transfers uniquely owned Arrow IPC payloads into their protobuf fields with their allocation reservations.
     -- Embedded ADBC SQL arguments use canonical source fields and preserve their declared types and row order.
+    -- Pgwire SQL arguments are admitted as an Arrow row with canonical source fields and buffers.
+    -- A static projection from a single canonical argument row retains those buffers in its source document fields.
     -- Canonical float vector arguments retain Arrow positions across nullable vectors, nullable components, and compatible dense unions.
     -- Canonical argument encoding uses the logical types of the selected float union legs.
     -- Canonical argument gathering applies the row writer's layouts when combining Arrow and row arguments.

@@ -89,3 +89,17 @@ The platform capture uses the Rust standard library's process environment snapsh
 
 The Registry dead-letter producer captures one create timestamp before native queue admission and carries it through every enqueue retry.
 The source metadata wait and its effect on the append timestamp require the live sender integration.
+
+
+== PostgreSQL floating-point arrays
+
+The native PostgreSQL server accepts `float4[]` (OID 1021) and `float8[]` (OID 1022) Bind parameters in text and binary format.
+Each parameter maps to an Arrow list of 32-bit or 64-bit floats.
+Parameters can be SQL NULL, empty arrays, or one-dimensional arrays with NULL elements.
+RTDB maps elements by position and emits arrays with one-based bounds.
+Bind rejects multidimensional arrays.
+
+A result with a known floating-point list type uses the corresponding PostgreSQL array type in its row description.
+Fixed-size lists use the same result mapping as variable-length lists.
+A list containing both float widths maps to `float8[]`.
+An untyped result can still use the session's configured fallback format.

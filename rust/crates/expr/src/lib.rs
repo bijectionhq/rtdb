@@ -2,6 +2,7 @@ mod cast;
 mod float_list_cast;
 mod list_cast;
 mod scalar_list_cast;
+pub use float_list_cast::cast_bound_float_list;
 mod compare;
 mod ordered;
 mod evaluate;

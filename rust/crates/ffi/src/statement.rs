@@ -4,7 +4,7 @@ use arrow_schema::Schema as ArrowSchema;
 use rtdb_columnar::{DeclaredBatch, MemoryReservation, OwnedBatch, conform_batch};
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
-use rtdb_query::QueryCursor;
+use rtdb_query::{BoundParameters, QueryCursor};
 use rtdb_sql::{AdmittedControl, parse_admitted_control_in};
 use rtdb_tx::{Documents, SqlArguments, TxOp};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Value};
@@ -166,7 +166,7 @@ impl StatementHandle {
                     let prepared = prepared.as_ref().ok_or_else(not_prepared)?;
                     check_argument_row_count(args)?;
                     if let Some(args) = args
-                        && let Some(page) = args.single_arrow_page()
+                        && let Some(page) = args.first_arrow_page()
                         && let Some(cursor) = prepared.try_open_query_arrow(Arc::clone(&context), page, args.types()).await? {
                         return Ok(cursor);
                     }
@@ -176,7 +176,7 @@ impl StatementHandle {
                 Source::Show { statement: control, prepared } => {
                     if !*prepared && args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
                     *prepared = true;
-                    match session.execute_control_with(control.statement(), &[], token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
+                    match session.execute_control_arrow_with(control.statement(), None, token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
                         ControlResult::Rows(cursor) => Ok(cursor),
                         _ => Err(Anomaly::incorrect("xtdb/not-a-query", "Statement does not produce rows")),
                     }
@@ -205,8 +205,18 @@ impl StatementHandle {
                     Ok(-1)
                 }
                 Source::Set(control) => {
-                    let values = argument_row(state.bound.as_ref().map(|bound| &bound.arguments), self.session.region.memory())?;
-                    match session.execute_control_with(control.statement(), &values.0, token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false }).await? {
+                    let args = state.bound.as_ref().map(|bound| &bound.arguments);
+                    check_argument_row_count(args)?;
+                    let memory = self.session.region.memory();
+                    let options = ControlExecutionOptions { frontend: ControlFrontend::Adbc, implicit_transaction: false };
+                    let result = if let Some(args) = args && let Some(page) = args.first_arrow_page() {
+                        let parameters = BoundParameters::from_arrow(page.clone(), 0, args.execution_types().collect(), memory)?;
+                        session.execute_control_arrow_with(control.statement(), Some(&parameters), token, options).await?
+                    } else {
+                        let (values, _reservation) = argument_row(args, memory)?;
+                        session.execute_control_with(control.statement(), &values, token, options).await?
+                    };
+                    match result {
                         ControlResult::Command { .. } => Ok(-1), _ => Err(Anomaly::incorrect("xtdb.adbc/not-an-update", "Statement is not an update")),
                     }
                 }

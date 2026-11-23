@@ -61,11 +61,14 @@ pub fn encode_arrow(
         };
         return settle(bytes, reservation);
     }
-    if matches!(ty, PgType::Int4s | PgType::Int8s | PgType::Texts)
+    if matches!(ty, PgType::Int4s | PgType::Int8s | PgType::Texts | PgType::Float4s | PgType::Float8s)
         && matches!(cell.sequence_kind(), Some(ListKind::List | ListKind::FixedSizeList(_)))
         && let Some(values) = cell.sequence()
     {
-        let bound = cell.payload_bytes()?.checked_mul(16).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
+        let element_bytes = if matches!(ty, PgType::Float4s | PgType::Float8s) {
+            values.len().checked_mul(64).ok_or_else(size_error)?
+        } else { 0 };
+        let bound = cell.payload_bytes()?.checked_mul(16).and_then(|bytes| bytes.checked_add(element_bytes)).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(size_error)?;
         let reservation = memory.reserve(bound)?;
         let bytes = array_payload(ty, format, values, |element, cell| {
             let cell = cell.physical()?;
@@ -75,6 +78,17 @@ pub fn encode_arrow(
             }
             if element == PgType::Text && let Some(text) = cell.utf8() {
                 return Ok(Some(text.as_bytes().to_vec()));
+            }
+            if cell.field.metadata().is_empty() {
+                match (element, cell.field.data_type()) {
+                    (PgType::Float4, DataType::Float32) =>
+                        return Ok(Some(float4_bytes(format, cell.array.as_primitive::<Float32Type>().value(cell.row)))),
+                    (PgType::Float8, DataType::Float32) =>
+                        return Ok(Some(float8_bytes(format, f64::from(cell.array.as_primitive::<Float32Type>().value(cell.row))))),
+                    (PgType::Float8, DataType::Float64) =>
+                        return Ok(Some(float8_bytes(format, cell.array.as_primitive::<Float64Type>().value(cell.row)))),
+                    _ => {}
+                }
             }
             encode_value(element, format, &read_leaf(cell)?, environment).map(Some)
         })?;

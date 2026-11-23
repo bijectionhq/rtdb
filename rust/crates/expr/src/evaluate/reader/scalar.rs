@@ -76,6 +76,11 @@ fn emitted_type_at(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalTyp
         Expr::Parameter { index,data_type } => {
             if let Some(ty) = frame.context.parameter_types.and_then(|types| types.get(*index)) { retained_type(ty,frame)? }
             else if *data_type == LogicalType::Nothing {
+                if let Some(cell) = frame.context.parameters.arrow_cell(*index)
+                    && (cell.is_null()? || cell.float_list_span().is_some()) {
+                    frame.context.reserve(cell.observed_type_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
+                    return Ok(rtdb_columnar::execution_type(&cell.observed_type()?));
+                }
                 let value = frame.context.parameters.get(*index)?.ok_or_else(||Anomaly::incorrect("xtdb/missing-parameter",format!("Missing parameter ${}",index + 1)))?;
                 frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;
                 value.logical_type()

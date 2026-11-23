@@ -1220,7 +1220,7 @@ enum ArgumentChunk {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SourceArgumentLayout { Uploaded, Canonical }
+enum SourceArgumentLayout { Uploaded, Canonical, CanonicalRow }
 
 impl ArgumentChunk {
     fn len(&self) -> usize {
@@ -1313,6 +1313,14 @@ impl SqlArguments {
     pub fn from_arrow_with_canonical_source(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
         Self::arrow(batch, SourceArgumentLayout::Canonical, memory)
     }
+    /// Retains a single argument row built with the source row writer's canonical fields and buffers.
+    pub fn from_canonical_arrow_row(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if batch.batch().num_rows() != 1 {
+            return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", "Expected one canonical SQL argument row"));
+        }
+        Self::arrow(batch, SourceArgumentLayout::CanonicalRow, memory)
+    }
+
     fn arrow(batch: OwnedBatch, source_layout: SourceArgumentLayout, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = batch.batch().schema();
         let schema_reservation = memory.reserve(rtdb_format::ipc::schema_translation_bound(&schema)?)?;
@@ -1343,6 +1351,14 @@ impl SqlArguments {
             _ => None,
         }
     }
+    /// Returns the Arrow page holding the first argument row, if that row was bound as Arrow.
+    pub fn first_arrow_page(&self) -> Option<&OwnedBatch> {
+        match self.chunks.iter().map(|(_, chunk)| chunk.as_ref()).find(|chunk| chunk.len() != 0)? {
+            ArgumentChunk::Arrow { batch, .. } => Some(batch),
+            ArgumentChunk::Rows { .. } => None,
+        }
+    }
+
     /// Builds one document operation from a stream bound as uniformly typed Arrow pages.
     pub fn ingest_documents(&self, memory: &Arc<MemoryBudget>) -> Result<Option<ArrowDocuments>> {
         let _pages = memory.reserve(self.chunks.len().checked_mul(2 * std::mem::size_of::<&RecordBatch>()).ok_or_else(overflow)?)?;
@@ -1399,6 +1415,11 @@ impl SqlArguments {
         }).collect::<Option<Vec<_>>>()?;
         let first = pages.first()?.schema_ref();
         pages.iter().all(|page| page.schema_ref() == first).then_some(pages)
+    }
+
+    pub(crate) fn has_single_canonical_arrow_row(&self) -> bool {
+        matches!(self.chunks.as_slice(), [(_, chunk)] if
+            matches!(chunk.as_ref(), ArgumentChunk::Arrow { source_layout: SourceArgumentLayout::CanonicalRow, .. }))
     }
 
     pub(crate) fn retains_uploaded_source_layout(&self) -> bool {

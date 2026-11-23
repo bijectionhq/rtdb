@@ -1292,3 +1292,30 @@ async fn an_inner_join_whose_left_input_exceeds_the_build_limit_builds_its_right
     let expected = expected.into_iter().map(|(name, (count, sum))| vec![Value::Utf8(name), Value::I64(count), Value::I64(sum)]).collect::<Vec<_>>();
     assert_eq!(rows, expected);
 }
+
+#[tokio::test]
+async fn declared_preparation_casts_a_bound_fixed_float_list_column() {
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, cast::AsArray, types::Float64Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use rtdb_columnar::OwnedBatch;
+
+    let memory = MemoryBudget::new(16 << 20);
+    let context = context(None, &memory);
+    let item = Arc::new(Field::new("$data$", DataType::Float32, false));
+    let vector = FixedSizeListArray::new(item, 2, Arc::new(Float32Array::from(vec![-0.0, f32::MIN_POSITIVE])), None);
+    let field = Field::new("vector", vector.data_type().clone(), false);
+    let ty = rtdb_columnar::from_field(&field).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(vector)]).unwrap();
+    let batch = OwnedBatch::new(batch, &memory).unwrap();
+    let options = PrepareOptions {
+        parameter_types: BTreeMap::from([(0, LogicalType::list(LogicalType::Scalar(ScalarType::F64)))]),
+        ..Default::default()
+    };
+    let query = PreparedSql::prepare("SELECT $1 AS vector", &context, options, ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = query.try_open_query_arrow(context, &batch, &[ty]).await.unwrap().unwrap();
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    let vector = result.batch().column(0).as_list::<i32>().value(0);
+    let values = vector.as_primitive::<Float64Type>();
+    assert_eq!(values.value(0).to_bits(), (-0.0f64).to_bits());
+    assert_eq!(values.value(1).to_bits(), f64::from(f32::MIN_POSITIVE).to_bits());
+}

@@ -31,7 +31,7 @@ pub fn read_text_column<'a>(oid: u32, count: usize, mut cell: impl FnMut(usize) 
             builder.append_option(text.as_deref());
             Ok(())
         })?,
-        oid if PgType::from_oid(oid as i32).is_none() || matches!(oid, 25 | 1042 | 1043) => {
+        oid if PgType::from_oid(oid as i32).is_none() || matches!(oid, 25 | 1042 | 1043 | 1021 | 1022) => {
             let mut builder = StringBuilder::with_capacity(count, 0);
             for row in 0..count { builder.append_option(cell(row)?); }
             Arc::new(builder.finish())

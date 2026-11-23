@@ -37,8 +37,8 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
     })
 }
 fn parse_boolean(text: &str) -> Result<bool> { Ok(match text.trim().to_ascii_lowercase().as_str() { "tr" | "yes" | "tru" | "true" | "on" | "ye" | "t" | "y" | "1" => true, "f" | "fa" | "fal" | "fals" | "false" | "no" | "n" | "off" | "0" => false, _ => return Err(invalid("Invalid PostgreSQL boolean")) }) }
-fn float32(text: &str) -> Result<f32> { Ok(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }) }
-fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
+pub(crate) fn float32(text: &str) -> Result<f32> { Ok(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }) }
+pub(crate) fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
 pub(crate) fn decimal(text: &str) -> Result<Value> {
     let decimal = rtdb_expr::parse_decimal(text).map_err(invalid)?;
     let (coefficient, scale) = decimal.as_bigint_and_exponent();
@@ -57,7 +57,11 @@ fn timestamp(text: &str) -> Result<Value> {
     let Value::Timestamp { value, unit, timezone: Some(zone) } = rtdb_types::parse_sql_timestamp_literal(text)? else { return Err(invalid("Zoned timestamp requires an offset or region")); };
     Ok(Value::Timestamp { value, unit, timezone: Some(rtdb_expr::normalize_timezone(&zone)?) })
 }
-fn visit_array<'a>(text: &'a str, mut visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {
+fn visit_array<'a>(text: &'a str, visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {
+    visit_array_elements(text, false, visit)
+}
+
+pub(crate) fn visit_array_elements<'a>(text: &'a str, strict_quotes: bool, mut visit: impl FnMut(Option<std::borrow::Cow<'a, str>>) -> Result<()>) -> Result<()> {
     use std::borrow::Cow;
 
     let text = text.trim();
@@ -69,6 +73,7 @@ fn visit_array<'a>(text: &'a str, mut visit: impl FnMut(Option<std::borrow::Cow<
     let mut decoded: Option<String> = None;
     let mut quoted = false;
     let mut escaped = false;
+    let mut after_quote = false;
     let finish = |from: usize, end: usize, copied: usize, decoded: Option<String>| {
         if let Some(mut decoded) = decoded {
             decoded.push_str(&inner[copied..end]);
@@ -83,16 +88,21 @@ fn visit_array<'a>(text: &'a str, mut visit: impl FnMut(Option<std::borrow::Cow<
             continue;
         }
         match character {
+            _ if strict_quotes && after_quote && character != ',' && !character.is_whitespace() =>
+                return Err(invalid("Invalid PostgreSQL array element after closing quote")),
+            '"' if strict_quotes && !quoted && (decoded.is_some() || !inner[start..index].trim().is_empty()) =>
+                return Err(invalid("Invalid quote in PostgreSQL array element")),
             '\\' | '"' => {
                 let buffer = decoded.get_or_insert_with(String::new);
                 buffer.push_str(&inner[copied..index]);
                 copied = index + 1;
-                if character == '"' { quoted = !quoted; } else { escaped = true; }
+                if character == '"' { quoted = !quoted; after_quote = !quoted; } else { escaped = true; }
             }
             ',' if !quoted => {
                 visit(finish(start, index, copied, decoded.take()))?;
                 start = index + 1;
                 copied = start;
+                after_quote = false;
             }
             '{' | '}' if !quoted => return Err(invalid("Nested PostgreSQL arrays are unsupported by the pinned type reader")),
             _ => {}
