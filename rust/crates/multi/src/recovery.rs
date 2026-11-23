@@ -586,13 +586,13 @@ impl RecoveryService {
                     source: Some((request.authority, request.capture, self.org.clone())),
                     transfer_only: true,
                 };
-                let sealed = archive::issue_checkpoint_transfer(
+                let sealed = Box::pin(archive::issue_checkpoint_transfer(
                     Arc::clone(&directory), &self.storage, &self.archive, self.keys.as_ref(),
                     selector.clone(), self.hosted_task.clone(),
-                ).await?;
-                let activation = archive::activate_checkpoint_transfer_target(
+                )).await?;
+                let activation = Box::pin(archive::activate_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
-                ).await?;
+                )).await?;
                 let terminal = activation.replica.bootstrap.terminal;
                 if terminal != sealed {
                     return Err(Anomaly::incorrect(
@@ -630,9 +630,9 @@ impl RecoveryService {
                     source: Some((request.authority, request.capture, self.org.clone())),
                     transfer_only: true,
                 };
-                let terminal = archive::issue_checkpoint_transfer(
+                let terminal = Box::pin(archive::issue_checkpoint_transfer(
                     directory, &self.storage, &self.archive, self.keys.as_ref(), selector, self.hosted_task.clone(),
-                ).await?;
+                )).await?;
                 Ok(Reply::TransferSourceSealed { terminal })
             },
             Action::ActivateCheckpointTransferTarget {
@@ -650,9 +650,9 @@ impl RecoveryService {
                     source: Some((request.authority, request.capture, self.org.clone())),
                     transfer_only: true,
                 };
-                let activation = archive::activate_checkpoint_transfer_target(
+                let activation = Box::pin(archive::activate_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
-                ).await?;
+                )).await?;
                 Ok(Reply::TransferTargetActivated { activation })
             },
             Action::SeedCheckpointTransferTarget {
@@ -670,9 +670,9 @@ impl RecoveryService {
                     source: Some((request.authority, request.capture, self.org.clone())),
                     transfer_only: true,
                 };
-                let replica = archive::seed_checkpoint_transfer_target(
+                let replica = Box::pin(archive::seed_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
-                ).await?;
+                )).await?;
                 Ok(Reply::TransferTargetSeeded { replica })
             },
             Action::VerifyCheckpointTransferTarget {
@@ -690,9 +690,9 @@ impl RecoveryService {
                     source: Some((request.authority, request.capture, self.org.clone())),
                     transfer_only: true,
                 };
-                let bootstrap = archive::verify_checkpoint_transfer_target(
+                let bootstrap = Box::pin(archive::verify_checkpoint_transfer_target(
                     directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
-                ).await?;
+                )).await?;
                 Ok(Reply::TransferTargetVerified { bootstrap })
             },
             Action::InspectCheckpointStageOwnedRelations {
