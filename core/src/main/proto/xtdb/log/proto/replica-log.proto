@@ -73,4 +73,5 @@ message OversizedMessage {
     int32 storage_epoch = 2;
     int64 block_index = 3;
     string payload_id = 4;
+    bytes payload_sha256 = 5;
 }

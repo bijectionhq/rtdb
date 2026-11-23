@@ -1,4 +1,5 @@
 use prost::Message;
+use sha2::{Digest, Sha256};
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, Term, TermSequence};
 
 use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
@@ -162,6 +163,20 @@ impl ReplicaEnvelope {
         self
     }
 
+    pub fn offloaded(&self, version: StorageVersion, epoch: StorageEpoch, block: BlockIndex, payload_id: String, bytes: &[u8]) -> Self {
+        Self {
+            term: self.term,
+            term_sequence: self.term_sequence,
+            message: ReplicaBody::OversizedMessage(crate::log::proto::OversizedMessage {
+                storage_version: Some(version.0),
+                storage_epoch: Some(epoch.0),
+                block_index: Some(block.0),
+                payload_id: Some(payload_id),
+                payload_sha256: Some(Sha256::digest(bytes).to_vec()),
+            }),
+        }
+    }
+
     /// The caller admits the envelope's term before reading the returned payload key.
     pub fn oversized_payload(&self, version: StorageVersion, epoch: StorageEpoch) -> Result<Option<String>> {
         let ReplicaBody::OversizedMessage(message) = &self.message else { return Ok(None) };
@@ -182,8 +197,13 @@ impl ReplicaEnvelope {
 
     /// Checks the fetched record against the already-admitted envelope without admitting it a second time.
     pub fn unwrap_payload(&self, bytes: &[u8]) -> Result<Self> {
-        if !matches!(self.message, ReplicaBody::OversizedMessage(_)) {
+        let ReplicaBody::OversizedMessage(reference) = &self.message else {
             return Err(invalid("Only an oversized envelope has an external payload"));
+        };
+        if let Some(expected) = &reference.payload_sha256
+            && expected.as_slice() != Sha256::digest(bytes).as_slice()
+        {
+            return Err(Anomaly::fault("rtdb.format/oversized-payload-mismatch", "Oversized payload bytes differ from their replica reference"));
         }
         let payload = Self::decode(bytes)?.ok_or_else(|| invalid("Oversized payload has no replica message"))?;
         if payload.term != self.term || payload.term_sequence != self.term_sequence {

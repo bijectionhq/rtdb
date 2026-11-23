@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key, log::proto};
+use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, SourceMessage}, keys::oversized_key};
 use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
@@ -137,9 +137,9 @@ impl PartitionLogs {
             Ok(receipt) => receipt,
             Err(StorageError::MessageTooLarge { .. }) => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
-                self.store.put(&ObjectKey::new(oversized_key(block, &payload_id)?)?, payload).await?;
-                let proxy = ReplicaEnvelope { term: envelope.term, term_sequence: envelope.term_sequence,
-                    message: ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(self.storage_version.0), storage_epoch: Some(self.storage_epoch.0), block_index: Some(block.0), payload_id: Some(payload_id) }) };
+                let key = ObjectKey::new(oversized_key(block, &payload_id)?)?;
+                let proxy = envelope.offloaded(self.storage_version, self.storage_epoch, block, payload_id, &payload);
+                self.store.put(&key, payload).await?;
                 let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
                 self.replica.enqueue(payload, now).await?
             }

@@ -583,6 +583,7 @@ variant OversizedMessage : ReplicaMessage {
     -- term_id and term_seq on the envelope are the DECLINED message's, so read-side fencing decides without fetching the payload.
     -- Readers resolve it as the record is read, ahead of both the pending-block hold and the staleness check: an offloaded upload closes a block, and one left unresolved would be held behind the block it closes.
     -- block_index is the block the standing-in record lands in — the open one, not the last completed — because block-gc.allium collects on it.
+    -- New references authenticate the exact encoded body with SHA-256; older references still verify the decoded term and sequence.
     storage_version: Integer
     storage_epoch: Integer
     block_index: Integer

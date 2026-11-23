@@ -742,7 +742,7 @@ async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_pay
     fixture.driver.consume(record).await.unwrap();
     assert_eq!(fixture.driver.fence.position(), TermPosition::Expecting(TermSequence(1)));
     fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
-    let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()) });
+    let missing = ReplicaBody::OversizedMessage(proto::OversizedMessage { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("missing".into()), payload_sha256: None });
     fixture.driver.consume(raw(2, 1, 1, missing)).await.unwrap();
     assert_eq!(fixture.driver.read_position, rtdb_types::ReplicaPosition(2));
 }
@@ -1952,11 +1952,11 @@ async fn confirmed_append_cannot_publish_without_its_staged_head() {
 async fn own_oversized_readback_checks_the_stored_transaction_bytes() {
     let substitutions: [Option<(&str, fn(&mut ReplicaEnvelope))>; 3] = [
         None,
-        Some(("xtdb.indexer/leader-read-back-mismatch", |frame| {
+        Some(("rtdb.format/oversized-payload-mismatch", |frame| {
             let ReplicaBody::ResolvedTx(message) = &mut frame.message else { panic!("expected a stored transaction"); };
             message.table_data.insert("public/forged".into(), vec![1, 2, 3]);
         })),
-        Some(("rtdb.format/oversized-term-mismatch", |frame| {
+        Some(("rtdb.format/oversized-payload-mismatch", |frame| {
             frame.term_sequence = Some(frame.term_sequence.unwrap().next().unwrap());
         })),
     ];

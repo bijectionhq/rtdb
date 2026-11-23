@@ -13,7 +13,7 @@ fn every_message_kind_carries_its_term_position_through_the_codec() {
         ReplicaBody::BlockUploaded(pb::BlockUploaded { storage_version: Some(1), storage_epoch: Some(0), block_index: Some(0), latest_processed_msg_id: Some(1), ..Default::default() }),
         ReplicaBody::NoOp(pb::NoOp::default()),
         ReplicaBody::TriesDeleted(pb::TriesDeleted { table_name: Some("public/foo".into()), trie_keys: vec!["trie".into()] }),
-        ReplicaBody::OversizedMessage(pb::OversizedMessage { storage_version: Some(1), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("payload".into()) }),
+        ReplicaBody::OversizedMessage(pb::OversizedMessage { storage_version: Some(1), storage_epoch: Some(0), block_index: Some(0), payload_id: Some("payload".into()), payload_sha256: None }),
         ReplicaBody::ArtefactsAdded(pb::ArtefactsAdded { storage_version: Some(1), storage_epoch: Some(0), table_name: Some("public/foo".into()), source_msg_id: Some(1),
             entries: vec![pb::ArtefactEntry { trie_key: Some("l01-rc-b00".into()), record: Some(pb::ArtefactRecord { kind: Some("search".into()), definition_id: Some("docs_body".into()), definition_version: Some(1), stats: Some(vec![1, 2]), scope: None, file_size: None, published_version: None }) }] }),
     ];
@@ -62,7 +62,7 @@ fn the_catalog_reads_back_the_boundary_term_position_from_the_block() {
 #[test]
 fn an_oversized_payload_cannot_replace_an_admitted_term_or_sequence() {
     let envelope = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(4)), message: ReplicaBody::OversizedMessage(pb::OversizedMessage {
-        storage_version: Some(6), storage_epoch: Some(0), block_index: Some(1), payload_id: Some("uuid".into()),
+        storage_version: Some(6), storage_epoch: Some(0), block_index: Some(1), payload_id: Some("uuid".into()), payload_sha256: None,
     }) };
     let payload = ReplicaEnvelope { term: Term(4), term_sequence: Some(TermSequence(4)), message: ReplicaBody::NoOp(pb::NoOp::default()) };
     assert_eq!(envelope.unwrap_payload(&payload.encode()).unwrap_err().code, "rtdb.format/oversized-term-mismatch");
