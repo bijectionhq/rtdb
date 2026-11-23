@@ -2747,39 +2747,6 @@ impl NativeSession {
         self.state.execute_tx(ops, Default::default()).await
     }
 
-    pub async fn validate_owned_world(
-        &mut self, record: &rtdb_types::OwnedWorld, checks: Vec<OwnedWorldWitness>,
-        controls: Vec<rtdb_tx::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>,
-    ) -> Result<TransactionResult> {
-        let unavailable = rtdb_types::OwnedWorld::unavailable;
-        let count = controls.len().saturating_add(checks.len().saturating_mul(2)).saturating_add(2);
-        if checks.len() > 128 || (checks.is_empty() && clock.is_none()) || controls.is_empty() || count > 4096
-            || controls.iter().any(|control| !control.is_check())
-            || clock.is_some_and(|clock| clock.world != record.id || clock.pin != record.pin)
-        {
-            return Err(unavailable());
-        }
-        let scope = self.placed_history()?.ok_or_else(unavailable)?;
-        let now = self.service.node.now();
-        let mut until = deadline.min(record.until);
-        for check in &checks {
-            if check.world != record.id || check.pin != record.pin
-                || check.relation.world() != Some(record.id) || scope != check.scope || now >= check.until
-            {
-                return Err(unavailable());
-            }
-            until = until.min(check.until);
-        }
-        if now >= until { return Err(unavailable()); }
-        let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
-        let mut ops = Vec::with_capacity(count);
-        ops.push(TxOp::owned_deadline(until));
-        ops.push(TxOp::OwnedCheckWorldScope { scope, clock });
-        ops.extend(controls.into_iter().map(TxOp::HostedControl));
-        Self::append_world_checks(&mut ops, checks);
-        self.state.execute_tx(ops, Default::default()).await
-    }
-
     pub async fn commit_owned_world_batch(
         &mut self, sections: Vec<(Timestamp, OwnedWorldSection)>,
         root: OwnedRootSection, fingerprint: [u8; 32],
@@ -2927,6 +2894,7 @@ impl NativeSession {
 
     pub fn append_hosted_world_read_checks(
         &self, ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>,
+        clocks: Vec<(rtdb_types::WorldClockLimit, Timestamp)>,
     ) -> Result<()> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let Some(TxOp::OwnedDeadline { until, .. }) = ops.first_mut() else {
@@ -2942,10 +2910,23 @@ impl NativeSession {
             worlds.insert(check.world);
             *until = (*until).min(check.until);
         }
+        let mut bounds = std::collections::BTreeMap::<_, rtdb_types::WorldClockLimit>::new();
+        for (clock, expires) in clocks {
+            worlds.insert(clock.world);
+            *until = (*until).min(expires);
+            let bound = bounds.entry(clock.world).or_insert(clock);
+            if bound.pin != clock.pin {
+                return Err(unavailable());
+            }
+            bound.before = bound.before.min(clock.before);
+        }
         if !(1..=8).contains(&worlds.len()) || checks.len() > 8 * 128 || now >= *until {
             return Err(unavailable());
         }
         ops.push(TxOp::OwnedCheckWorldScope { scope, clock: None });
+        ops.extend(bounds.into_values().map(|clock| TxOp::OwnedCheckWorldScope {
+            scope, clock: Some(clock),
+        }));
         Self::append_world_checks(ops, checks);
         Ok(())
     }

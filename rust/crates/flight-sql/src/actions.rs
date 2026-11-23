@@ -39,9 +39,9 @@ impl Service {
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V2 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_DECIDING_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::COMMIT_HOSTED_STAGED_V1 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_WORLD_READS_V3 => Ok(vec![Ok(self.commit_hosted_world_reads_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_DECIDING_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::COMMIT_HOSTED_STAGED_V2 => Ok(vec![Ok(self.commit_hosted_flagged_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::COMMIT_HOSTED_V1 => Ok(vec![Ok(self.commit_hosted_controls_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
@@ -138,7 +138,6 @@ impl Service {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::PUBLISH_WORLD_CUT_V2).await?)])
                 }
-                crate::owned_actions::COMMIT_WORLD_V4 => Ok(vec![Ok(self.validate_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_HELD_WORLDS_V4 => Ok(vec![Ok(self.commit_world_batch_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_OWNED_V1 => Ok(vec![Ok(self.read_owned_action(&call, &action.body).await?)]),
                 "BeginTransaction" => {

@@ -84,7 +84,7 @@ mod writable_world;
 pub(crate) use writable_world::prepare_checkpoint_world_overlay;
 pub(crate) use writable_world::{finish_checkpoint_replay_parents, prepare_checkpoint_replay_parent};
 pub(crate) use writable_world::retain_replayed_checkpoint_world;
-pub(crate) use writable_world::{commit_checkpoint_world_batch, validate_checkpoint_world, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
+pub(crate) use writable_world::{commit_checkpoint_world_batch, fork_checkpoint_world_selected, HeldCheckpointWorld, WorldArchive, open_held_checkpoint_world};
 pub(crate) use writable_world::{WorldFact, WorldPoint};
 pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWorld, read_checkpoint_owned_point};
 pub(crate) use retirement::{finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, retire_world_suffix};

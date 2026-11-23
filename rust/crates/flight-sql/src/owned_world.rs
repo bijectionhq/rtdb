@@ -28,7 +28,6 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
 
     fn open_world_read<'a>(&'a self, call: WorldCall<'a>, world: Uuid) -> BoxFuture<'a, Result<Box<dyn OwnedWorldRead>>>;
     fn fork_world_checked<'a>(&'a self, call: WorldCall<'a>, capture: Uuid, suffix: Option<Uuid>, until: Timestamp, fork: rtdb_node::OwnedWorldFork) -> BoxFuture<'a, Result<(Uuid, TransactionKey)>>;
-    fn validate_world<'a>(&'a self, call: WorldCall<'a>, world: Uuid, checks: Vec<OwnedWorldWitness>, controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp, clock: Option<rtdb_types::WorldClockLimit>) -> BoxFuture<'a, Result<TransactionKey>>;
     fn commit_world_batch<'a>(
         &'a self, call: WorldCall<'a>, sections: Vec<rtdb_node::OwnedWorldSection>,
         root: rtdb_node::OwnedRootSection, fingerprint: [u8; 32],

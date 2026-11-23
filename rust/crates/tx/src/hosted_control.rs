@@ -523,6 +523,7 @@ pub(crate) fn hosted_root_world_reads(operations: &[crate::source::Operation]) -
 
     let mut scopes = 0;
     let mut guards = 0;
+    let mut clocks = 0;
     let mut hosted = false;
     let mut preceding_guard = None;
     for operation in operations {
@@ -533,8 +534,12 @@ pub(crate) fn hosted_root_world_reads(operations: &[crate::source::Operation]) -
                 guards += 1;
                 Some(relation)
             },
-            Operation::Public(TxOp::OwnedCheckWorldScope { .. }) => {
-                scopes += 1;
+            Operation::Public(TxOp::OwnedCheckWorldScope { clock, .. }) => {
+                if clock.is_some() {
+                    clocks += 1;
+                } else {
+                    scopes += 1;
+                }
                 None
             },
             Operation::Public(TxOp::HostedControl(_)) => {
@@ -557,7 +562,7 @@ pub(crate) fn hosted_root_world_reads(operations: &[crate::source::Operation]) -
         };
         preceding_guard = guard;
     }
-    hosted && scopes == 1 && guards > 0
+    hosted && scopes == 1 && clocks <= 8 && (guards != 0 || clocks != 0)
 }
 
 /// A retained drop can settle a bounded set of existing owner rows.
@@ -745,6 +750,32 @@ mod world_read_tests {
     use super::*;
     use crate::{TxOp, source::Operation};
     use rtdb_types::Iid;
+
+    #[test]
+    fn hosted_world_reads_require_placement_for_clock_only_batches() -> Result<()> {
+        let scope = PlacedAttemptScope::new("hosted-clock-batch", 1)?;
+        let owner = HostedControlWrite::check(
+            OwnedRelation::new("bj_owner")?, scope, Some(Timestamp(1)),
+            StructFields::from([("_id".into(), Value::Utf8("installed".into()))]),
+        )?;
+        let clock = |line| TxOp::OwnedCheckWorldScope {
+            scope,
+            clock: Some(rtdb_types::WorldClockLimit {
+                world: Iid([line; 16]), pin: Iid([line; 16]), before: Timestamp(7),
+            }),
+        };
+        let mut operations = [
+            TxOp::owned_deadline(Timestamp(8)),
+            TxOp::HostedControl(owner),
+            TxOp::OwnedCheckWorldScope { scope, clock: None },
+            clock(1),
+            clock(2),
+        ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        assert!(hosted_root_world_reads(&operations));
+        operations.remove(2);
+        assert!(!hosted_root_world_reads(&operations));
+        Ok(())
+    }
 
     #[test]
     fn hosted_world_reads_admit_root_writes_with_guarded_world_points() -> Result<()> {
