@@ -8,7 +8,7 @@ pub use rtdb_directory::DeletionRecord;
 use rtdb_directory::{Cas, CellMedia, CellResidence, CellTransfer, CellTransferIntent, PreparedCellTransfer, RetiredResidence, DeletionFacts, DeploymentRecord, DisposalReceipt, DeletionObservation, DeletionInventory, ServingInventory, Directory, ForkPreparation, ForkPublication, Lifecycle, LineageChange, MemberId, MemberPool, MemberRecord, MemberRole, MemberState, PlacementMove, StorageNamespaces, effective_holder, now_ms};
 use rtdb_format::{catalog::BlockCatalog, keys::block_key};
 use rtdb_logkeeper::StreamConfig;
-use rtdb_storage::log::Log;
+use rtdb_storage::{ObjectStore, log::Log};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, JournalEndpoint, Result, StorageEpoch};
 use tokio_util::sync::CancellationToken;
 
