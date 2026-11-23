@@ -1,0 +1,165 @@
+{
+  "summary": "The sealed stage admits only an absent pair or an ordered journal cutoff with an exact nonzero digest, and audit matches both frame fields against the sealed decision.",
+  "flags": ["--no-external-by-default", "--verify-module", "stage_journal", "--verify-module", "journal_evidence", "--verify-module", "laws"],
+  "min_verified_functions": 6,
+  "controls": {
+    "accept_partial_stage": {
+      "defect": "A cutoff or digest on its own is treated as an untimed stage.",
+      "mutate": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "find": "        (None, None) => Ok(None),\n        (Some(before), Some(certificate)) if before >= stage_cutoff => {",
+        "replace": "        (None, _) | (_, None) => Ok(None),\n        (Some(before), Some(certificate)) if before >= stage_cutoff => {"
+      }],
+      "expect": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "function": "checked_journal_fields",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "accept_earlier_journal_cutoff": {
+      "defect": "The journal cutoff may precede the stage cutoff.",
+      "mutate": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "find": "        (Some(before), Some(certificate)) if before >= stage_cutoff => {",
+        "replace": "        (Some(before), Some(certificate)) if before >= stage_cutoff || certificate.len() == 32 => {"
+      }],
+      "expect": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "function": "checked_journal_fields",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "reject_equal_journal_cutoff": {
+      "defect": "A journal cutoff equal to the stage cutoff is refused.",
+      "mutate": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "find": "        (Some(before), Some(certificate)) if before >= stage_cutoff => {",
+        "replace": "        (Some(before), Some(certificate)) if before > stage_cutoff => {"
+      }],
+      "expect": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "function": "checked_journal_fields",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "accept_wrong_digest_width": {
+      "defect": "A digest may contain fewer or more than 32 bytes.",
+      "mutate": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "find": "            if certificate.len() != 32 {",
+        "replace": "            if certificate.len() < 31 {"
+      }],
+      "expect": [{
+        "file": "rust/crates/format/src/stage_journal.rs",
+        "function": "checked_journal_fields",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "accept_zero_digest": {
+      "defect": "The constructor admits an all-zero digest.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "    before > 0 && !same_digest(certificate, &zero)\n",
+        "replace": "    before > 0\n"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "function": "valid_journal_cutoff",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "accept_zero_journal_cutoff": {
+      "defect": "The constructor admits a cutoff at zero.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "    before > 0 && !same_digest(certificate, &zero)\n",
+        "replace": "    before >= 0 && !same_digest(certificate, &zero)\n"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "function": "valid_journal_cutoff",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "ignore_frame_cutoff": {
+      "defect": "Audit accepts a frame with a different cutoff.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "            before == other_before && same_digest(&digest, other_digest),",
+        "replace": "            same_digest(&digest, other_digest),"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "function": "journal_frame_matches",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "ignore_frame_digest": {
+      "defect": "Audit accepts a frame with a different digest.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "            before == other_before && same_digest(&digest, other_digest),",
+        "replace": "            before == other_before,"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "function": "journal_frame_matches",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "accept_timed_frame_for_untimed_stage": {
+      "defect": "Audit accepts timed frame evidence against an untimed stage.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "        (None, None) => true,\n        (Some((before, digest)), Some((other_before, other_digest))) =>\n            before == other_before && same_digest",
+        "replace": "        (None, _) => true,\n        (Some((before, digest)), Some((other_before, other_digest))) =>\n            before == other_before && same_digest"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "function": "journal_frame_matches",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 5
+    },
+    "skip_last_digest_byte": {
+      "defect": "A frame digest can differ at its last byte.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "    while index < 32 {",
+        "replace": "    while index < 31 {"
+      }],
+      "expect": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "function": "same_digest",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 5
+    },
+    "refuse_writer_pair_with_weakened_contract": {
+      "defect": "Audit and its local contract both refuse the writer's unchanged pair.",
+      "mutate": [{
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "            before == other_before && same_digest(&digest, other_digest),",
+        "replace": "            before < other_before && same_digest(&digest, other_digest),"
+      }, {
+        "file": "rust/crates/types/src/journal_evidence.rs",
+        "find": "            before == other_before && digest@ == other_digest@,",
+        "replace": "            before < other_before && digest@ == other_digest@,"
+      }],
+      "expect": [{
+        "file": "verification/verus/sealed_stage_audit/laws.rs",
+        "function": "the_audit_accepts_the_writers_sealed_pair",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 5
+    }
+  }
+}

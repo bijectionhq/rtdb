@@ -55,6 +55,17 @@ The writer seals the cutoff and digest in the record's acceptance stage and deri
 The timed acceptance audit requires the frame to repeat the sealed pair and returns the envelope digest with the original voter evidence.
 Archive capture records the original stream's digest of each timed entry before opening its payload, so a resealed checkpoint transfer still names the entry its original voters hold.
 `verification/multi/lean/TimedEvidenceAudit.lean` proves both rules: the audit reports only the sealed clock evidence, and a resealed copy names its exact original voters while an original append cannot carry a digest.
+
+**Proof checked on 2026-11-23.** Verus 0.2026.11.20.9da409b verified six items and rejected all eleven controls in [`verification/verus/sealed_stage_audit`](../../verification/verus/sealed_stage_audit/area.json), each at its intended check.
+The checked Rust decisions require both journal fields or neither, a positive journal cutoff at or above the stage cutoff, and a 32-byte digest with at least one nonzero byte.
+Audit accepts equal optional pairs, comparing the cutoff and every byte of the digest, and the checked round trip accepts a writer's unchanged timed pair.
+
+**Source inspection.** The resolver writes both fields from one typed cutoff, `enqueue_replica_with` hands the decoded stage's journal evidence to `GuardedAppend`, and Logkeeper derives the journal frame from it.
+The audit calls the checked comparison on the sealed and framed pairs, then takes its reported cutoff and digest from the sealed pair.
+Logkeeper validates the raw frame's paired fields on append and recovery.
+The Verus correspondence relies on byte preservation in Rust's slice-to-array conversion, Protobuf encoding and deployment sealing, and on exact record selection and digest binding by the certified-range reader.
+Receiver certificate verification, clock bounds, and quorum durability remain premises.
+
 Source inspection places the Logkeeper sample under the writer lock after encryption and payload copying, before advancing the log position or sending a replica request.
 The ordered journal and memory log use the same check under their append locks and support only guards without a journal cutoff.
 The live upper sample is the clock reading plus one microsecond.

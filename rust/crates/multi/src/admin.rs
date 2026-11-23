@@ -2113,7 +2113,7 @@ pub async fn audit_acceptance_quorum(
     // repeat the sealed stage, so the reported clock evidence is the writer's own decision.
     let sealed = stage.journal.map(|cutoff| (cutoff.before().0, cutoff.certificate_sha256()));
     let framed = entry.guarded_before.zip(entry.timed_origin.as_ref().map(|origin| &origin.clock_certificate_sha256[..]));
-    if sealed.as_ref().map(|(before, certificate)| (*before, certificate.as_slice())) != framed {
+    if !rtdb_types::journal_frame_matches(sealed, framed) {
         return Err(Anomaly::fault("rtdb.multi/acceptance-audit-clock-evidence",
             "The journal frame does not repeat the sealed cutoff and clock certificate"));
     }

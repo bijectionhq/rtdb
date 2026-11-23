@@ -6,6 +6,7 @@ pub mod config;
 pub mod data;
 pub mod diagnostics;
 pub mod envelope;
+mod stage_journal;
 pub mod search_manifest;
 pub mod entity_history;
 pub mod hll;

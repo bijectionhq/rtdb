@@ -1,4 +1,4 @@
-use crate::{Anomaly, BlockIndex, Iid, Result, Timestamp, interval_step};
+use crate::{Anomaly, BlockIndex, Iid, Result, Timestamp, interval_step, journal_evidence::valid_journal_cutoff};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -43,7 +43,7 @@ pub struct TimedJournalCutoff {
 
 impl TimedJournalCutoff {
     pub fn new(before: Timestamp, certificate_sha256: [u8; 32]) -> Result<Self> {
-        if before.0 <= 0 || certificate_sha256 == [0; 32] {
+        if !valid_journal_cutoff(before.0, &certificate_sha256) {
             return Err(Anomaly::incorrect("rtdb.owned/timed-journal-cutoff", "A timed journal cutoff needs a positive time and exact certificate digest"));
         }
         Ok(Self { before, certificate_sha256 })

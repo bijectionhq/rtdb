@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use rtdb_types::{Anomaly, BlockIndex, PhysicalObjectVersion, PlacedAttempt, Result, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::generated::xtdb::log::proto::{ReplicaLogMessage, SourceLogMessage};
+use crate::stage_journal::{InvalidStageJournal, checked_journal_fields};
 use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
 
 const ADMITTED_OFFLOAD_STORAGE: i32 = -1;
@@ -173,14 +174,15 @@ impl crate::log::proto::ResolvedTx {
         {
             return Err(invalid("Strict acceptance stage does not match a committed placed transaction"));
         }
-        let journal = match (stage.journal_cutoff_micros, stage.clock_certificate_sha256.as_deref()) {
-            (None, None) => None,
-            (Some(before), Some(certificate)) if before >= cutoff => {
+        let journal = checked_journal_fields(cutoff, stage.journal_cutoff_micros, stage.clock_certificate_sha256.as_deref())
+            .map_err(|error| invalid(match error {
+                InvalidStageJournal::Incomplete => "Strict acceptance stage has an incomplete journal cutoff",
+                InvalidStageJournal::DigestLength => "Invalid clock certificate digest length",
+            }))?
+            .map(|(before, certificate)| {
                 let certificate = certificate.try_into().map_err(|_| invalid("Invalid clock certificate digest length"))?;
-                Some(rtdb_types::TimedJournalCutoff::new(Timestamp(before), certificate)?)
-            }
-            _ => return Err(invalid("Strict acceptance stage has an incomplete journal cutoff")),
-        };
+                rtdb_types::TimedJournalCutoff::new(Timestamp(before), certificate)
+            }).transpose()?;
         Ok(Some(AcceptanceStageWitness {
             source_position: SourcePosition(source), ordered_at: Timestamp(ordered_at),
             clock_upper: Timestamp(upper), cutoff: Timestamp(cutoff), journal,
