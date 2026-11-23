@@ -100,6 +100,8 @@ Current reads of `xt.txs.user_metadata` select the payload at the installed rece
 Bounded collection emits exact logical erase events for expired metadata, application receipts and private replay markers.
 The collector retains a legacy key's predecessors while a newer interval of that key is still active.
 Formerly embedded metadata and metadata from external writers lack the new source admission record and need migration.
+Old readers omit newly separated metadata until they support the retained projection.
+Arbitrary user metadata has no typed association with another storage unit, so early privacy erasure of such an association still needs an explicit data contract.
 For a placed deployment enrolled in the versioned outcome format, each frame carries its exact current outcome and at most 128 distinct older erasures per collection step.
 An operator confirms format support in every eligible serving and recovery image and parks the deployment before pinning a compatible engine.
 Check `rtdb-multi --build-info` for `placed_receipt_retirement: true`.

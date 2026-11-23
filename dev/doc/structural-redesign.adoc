@@ -132,7 +132,8 @@ Full recovery closures, compactor reset, terminal pack coverage and live provide
 
 |8
 |Transaction metadata retention.
-|Planned
+|Ordered receipt expiry, historical transaction projection and native logical collection.
+Physical copy closure remains open.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
@@ -148,6 +149,14 @@ The checkpoint carries that witness into recovery.
 The SQL connection issues a provisional receipt for asynchronous submission and exchanges it for a causal token after verifying the installed outcome.
 Synchronous commits issue the causal token alongside the verified outcome.
 A frozen attachment can confirm a token from the verified checkpoint it loaded.
+A receipt stops redeeming when the installed source-log clock reaches its cutoff.
+The applied prefix continues to serve as a causal token.
+For a parked deployment, an operator who has qualified every eligible serving and recovery image can pin a compatible engine and run `rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME`.
+The engine reports support as `placed_receipt_retirement: true` in `rtdb-multi --build-info`.
+The next activation writes the versioned outcome format, including ordered collection of expired outcome rows.
+The deployment remains pinned to a compatible release.
+Later logical erasure leaves physical copies subject to the exact custody of their source logs, replica logs, checkpoints and archives.
+See link:../../verification/redesign/R8-metadata-retention.md[receipt retention and custody].
 Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
 An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
 The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.
