@@ -2195,10 +2195,13 @@ impl NativeSession {
                     || root.publication.as_ref().is_none_or(|root| {
                         if root.attempt != sections[0].1.attempt { return true; }
                         let mut facts = root.writes.iter().filter(|op| !rtdb_tx::is_proposal_landing_frontier(op));
-                        if matches!(facts.clone().next(), Some(TxOp::OwnedInsertDocs {
-                            relation, documents, valid_from: None, valid_to: None,
-                        }) if relation.is_root_data() && documents.rows().len() == 1)
-                            && facts.clone().count() == 1 {
+                        if let Some(fact) = facts.clone().next()
+                            && facts.clone().count() == 1
+                            && (rtdb_tx::is_proposal_landing_period(fact)
+                                || matches!(fact, TxOp::OwnedInsertDocs {
+                                    relation, documents, valid_from: None, valid_to: None,
+                                } if relation.is_root_data() && documents.rows().len() == 1))
+                        {
                             return false;
                         }
                         let mut rows = 0usize;

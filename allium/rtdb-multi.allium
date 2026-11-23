@@ -1365,6 +1365,7 @@ rule ConsumeIntake {
 -- A hosted bounded-period Proposal assertion carries the original complete-entity point at its finite valid start and a local timeline frontier for the same world relation and pin.
 -- The ordered resolver admits one assertion or tombstone per complete entity key under the inherited bounded-period schema and settles its existing hosted controls with the overlay.
 -- A reviewed Proposal landing checks the exact Root and Proposal points, writes the Root effects, and retires the Proposal in one ordered transaction.
+-- A landing of one finite period replacement checks both points at its valid start and validates the Root relation and local Proposal timeline frontiers before ordering the reviewed extent.
 -- The same order advances the Root head and the public table frontiers carried by the placed writer, and settles the replay head, landing receipt, and proof locator.
 -- The placed owner may select the existing certified archive from its Directory and reopens it to compare the held transaction or its exact application publication before ordering.
 -- A fork of the held application publication compares the same Root head in the ordered source transaction.
