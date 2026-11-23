@@ -9,6 +9,9 @@ pub(crate) struct OwnedPage { rows: std::vec::IntoIter<OwnedRow>, _reservation: 
 impl OwnedPage {
     pub fn len(&self) -> usize { self.rows.len() }
     pub fn rows(&self) -> &[OwnedRow] { self.rows.as_slice() }
+    pub fn retained_bytes(&self) -> usize {
+        self.rows().iter().fold(self._reservation.bytes(), |bytes, row| bytes.saturating_add(row.bytes()))
+    }
     pub fn next(&mut self) -> Option<OwnedRow> { self.rows.next() }
 }
 

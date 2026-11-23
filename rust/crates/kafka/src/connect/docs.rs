@@ -174,8 +174,7 @@ mod tests {
         for millis in [i64::MIN,i64::MAX] {
             let mut date = convert_with_schema(super::super::data::date_value(millis),Some(&logical("Date"))).unwrap();
             assert_eq!(date.date_days(),Some(millis.div_euclid(86_400_000)));
-            date.admit_object_dates();
-            assert_eq!(date,Value::DateDay(millis.div_euclid(86_400_000) as i32));
+            assert_eq!(date.admit_object_dates().unwrap_err().code, "xtdb/date-out-of-range");
             assert!(convert_with_schema(super::super::data::date_value(millis),Some(&logical("Timestamp"))).is_err());
         }
     }

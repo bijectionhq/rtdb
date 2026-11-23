@@ -51,5 +51,8 @@ entity Checkpoint {
 -- Every page reachable from a checkpoint uses that checkpoint's scope. Page addresses within the scope retain their source block.
 -- After the replacement checkpoint is published, collection releases older scopes and preserves pages staged in newer scopes.
 -- Data compaction preserves input events and changes no ordered-index checkpoint.
+-- A millisecond date key uses the UTC day containing its value, including for negative milliseconds.
+-- Date32 and Date64 values on the same day use the same epoch-day key.
 -- The layout version participates in every definition's derived address.
+-- Older postings with truncating Date64 keys are bypassed while the new layout is built.
 -- Replacing a layout retires the former address with the same storage fences as a dropped definition.

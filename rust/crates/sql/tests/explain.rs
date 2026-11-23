@@ -195,7 +195,9 @@ async fn api_test_explain_analyze_counts_production_pages_and_subtracts_direct_c
         let children = rows[index + 1..].iter().take_while(|child| depth(child) > depth(row)).filter(|child| depth(child) == depth(row) + 2);
         assert_eq!(duration(&row["self_time"]), duration(&row["total_time"]) - children.map(|child| duration(&child["total_time"])).sum::<i64>());
     }
-    assert!(rows.windows(2).all(|rows| rows[0]["peak_memory_bytes"] == rows[1]["peak_memory_bytes"]));
+    assert!(rows.windows(2).all(|rows| rows[0]["query_peak_memory_bytes"] == rows[1]["query_peak_memory_bytes"]));
+    assert!(rows.iter().all(|row| matches!((&row["peak_memory_bytes"], &row["query_peak_memory_bytes"]),
+        (Value::I64(op_peak), Value::I64(query_peak)) if op_peak < query_peak)));
     assert_eq!(context.memory.used_bytes(), 0);
 }
 
@@ -246,7 +248,7 @@ async fn materialized_reference_opens_before_limit_and_shares_one_replay_across_
     let tables = rows.iter().filter(|row| row["op"] == op("table")).collect::<Vec<_>>();
     assert_eq!(tables.len(), 1);
     assert_eq!(tables[0]["row_count"], Value::I64(2));
-    assert!(context.spill_peak_bytes() > 0);
+    assert_eq!(context.spill_peak_bytes(), 0);
     assert_eq!(context.spill_bytes(), 0);
     assert_eq!(context.memory.used_bytes(), 0);
 }
@@ -263,7 +265,7 @@ async fn canceled_analyze_open_and_spill_failure_release_partial_materialization
     assert_eq!(context.memory.used_bytes(), 0);
 
     let base = self::context(1);
-    let context = QueryContext::new(base.catalog.clone(), Arc::clone(&base.memory), Timestamp(0), "UTC", QueryOptions { spill_limit_bytes: 1, ..Default::default() }, &CancellationToken::new()).unwrap();
+    let context = QueryContext::new(base.catalog.clone(), Arc::clone(&base.memory), Timestamp(0), "UTC", QueryOptions { spill_limit_bytes: 1, materialized_spill_rows: 0, ..Default::default() }, &CancellationToken::new()).unwrap();
     assert!(self::query(&context, "WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c").await.is_err());
     assert_eq!(context.spill_bytes(), 0);
     assert_eq!(context.memory.used_bytes(), 0);

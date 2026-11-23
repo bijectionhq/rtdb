@@ -67,16 +67,14 @@ impl Value {
     /// Preserves calendar days and unit, using physical storage only when that representation is lossless.
     /// Wide values remain calendar objects until an explicit object or expression admission boundary.
     pub fn calendar_date(date: CivilDate, unit: DateUnit) -> Self {
-        match unit {
-            DateUnit::Day => i32::try_from(date.epoch_day()).map(Self::DateDay).unwrap_or_else(|_| Self::Date(CalendarDate::new(date, unit))),
-            DateUnit::Millisecond => date.epoch_day().checked_mul(86_400_000).map(Self::DateMilli).unwrap_or_else(|| Self::Date(CalendarDate::new(date, unit))),
-        }
+        let date = CalendarDate::new(date, unit);
+        date.physical_value().unwrap_or(Self::Date(date))
     }
 
     /// Returns epoch days for calendar objects and physical date cells.
-    /// Millisecond storage truncates toward zero, matching the reference vector reader.
+    /// A millisecond value resolves to the UTC calendar day containing it.
     pub fn date_days(&self) -> Option<i64> {
-        match self { Self::Date(value) => Some(value.date().epoch_day()), Self::DateDay(days) => Some(i64::from(*days)), Self::DateMilli(millis) => Some(millis / 86_400_000), _ => None }
+        match self { Self::Date(value) => Some(value.date().epoch_day()), Self::DateDay(days) => Some(i64::from(*days)), Self::DateMilli(millis) => Some(millis.div_euclid(crate::java_date::MILLIS_PER_DAY)), _ => None }
     }
 
     /// Admits calendar objects in a completed expression result, recursively and without allocation.
@@ -92,26 +90,25 @@ impl Value {
         Ok(())
     }
 
-    /// Admits calendar objects recursively using the vector object writer's narrowing rules.
-    /// This consumes no allocations; day storage truncates to i32 and millisecond storage wraps.
-    pub fn admit_object_dates(&mut self) {
+    /// Checks physical date ranges recursively at a vector object-writer boundary.
+    pub fn admit_object_dates(&mut self) -> Result<()> {
         match self {
-            Self::Date(value) => *self = value.object_value(),
-            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => values.iter_mut().for_each(Self::admit_object_dates),
-            Self::Struct(fields) => fields.values_mut().for_each(Self::admit_object_dates),
-            Self::Map { entries, .. } => for (key, value) in entries { key.admit_object_dates(); value.admit_object_dates(); },
+            Self::Date(value) => *self = value.object_value()?,
+            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => values.iter_mut().try_for_each(Self::admit_object_dates)?,
+            Self::Struct(fields) => fields.values_mut().try_for_each(Self::admit_object_dates)?,
+            Self::Map { entries, .. } => for (key, value) in entries { key.admit_object_dates()?; value.admit_object_dates()?; },
             _ => (),
         }
+        Ok(())
     }
 
     /// Applies one typed ValueBox write without traversing collection readers.
     /// Day values check signed32 narrowing; millisecond dates retain epoch days until Arrow output.
-    /// Physical millisecond input drops its sub-day component using the vector's truncating day read.
+    /// Physical millisecond cells retain their raw storage value.
     /// An out-of-range day returns an overflow anomaly without changing the value; this allocates no storage.
     pub fn admit_box_date(&mut self) -> Result<()> {
         match self {
             Self::Date(value) if value.unit() == DateUnit::Day => *self = value.expression_value()?,
-            Self::DateMilli(millis) => *millis = (*millis / 86_400_000) * 86_400_000,
             _ => (),
         }
         Ok(())

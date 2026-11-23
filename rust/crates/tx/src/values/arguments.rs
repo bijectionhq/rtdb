@@ -68,7 +68,7 @@ fn argument_vector(chunk: &ArgumentChunk, position: usize, target: &Field, ty: &
             let _decoded = memory.reserve(bound)?;
             let cells = (0..batch.num_rows()).map(|row| {
                 let mut cell = read_value_as(source, field, array.as_ref(), row)?;
-                cell.admit_object_dates();
+                cell.admit_object_dates()?;
                 Ok(cell)
             }).collect::<Result<Vec<_>>>()?;
             let bound = estimate_builder_bytes_refs(ty, &cells)?;

@@ -26,9 +26,12 @@ struct Running { node: Node, node_task: JoinHandle<Result<()>>, server: ServerHa
 impl Running {
     async fn start(config: ServerConfig, password: Option<&str>) -> Self { Self::start_with(config, AuthConfig::SingleRootUser { password: password.map(Secret::new) }).await }
     async fn start_with(config: ServerConfig, authentication: AuthConfig) -> Self {
+        Self::start_with_tracer(config, authentication, None).await
+    }
+    async fn start_with_tracer(config: ServerConfig, authentication: AuthConfig, tracer: Option<Arc<dyn rtdb_plan::Tracer>>) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(TickClock(AtomicI64::new(1_000_000)));
         let auth = Authenticator::open(authentication, MemoryBudget::new(64 << 20), Arc::clone(&clock), Arc::new(NoHttp)).await.unwrap();
-        let services = NodeServices { clock, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
+        let services = NodeServices { clock, tracer, ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics)) };
         let mut options = NodeOptions::default(); options.automatic_compaction = false; options.automatic_gc = false;
         options.replication.assertion_interval = Duration::from_millis(1); options.replication.election_seed = 1;
         let (node, driver) = Node::open(options, services).await.unwrap(); let node_task = tokio::spawn(driver.run());
@@ -45,8 +48,17 @@ impl Running {
 struct Client { stream: TcpStream, process: i32 }
 impl Client {
     async fn connect(server: &ServerHandle, password: Option<&str>) -> Self {
+        Self::connect_named(server, password, None).await
+    }
+    async fn connect_named(server: &ServerHandle, password: Option<&str>, name: Option<&str>) -> Self {
         let mut stream = TcpStream::connect(server.address()).await.unwrap();
-        let mut bytes = 196608i32.to_be_bytes().to_vec(); bytes.extend_from_slice(b"user\0xtdb\0database\0xtdb\0\0");
+        let mut bytes = 196608i32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"user\0xtdb\0database\0xtdb\0");
+        if let Some(name) = name {
+            bytes.extend_from_slice(b"application_name\0");
+            bytes.extend_from_slice(&cstring(name));
+        }
+        bytes.push(0);
         stream.write_i32((bytes.len() + 4) as i32).await.unwrap(); stream.write_all(&bytes).await.unwrap();
         let mut client = Self { stream, process: 0 };
         loop {
@@ -71,7 +83,17 @@ impl Client {
     async fn through(&mut self, end: u8) -> Vec<(u8, Vec<u8>)> { let mut result = Vec::new(); loop { let frame = self.receive().await; let done = frame.0 == end; result.push(frame); if done { return result; } } }
     async fn query(&mut self, sql: &str) -> Vec<(u8, Vec<u8>)> { self.send(b'Q', &cstring(sql)).await; self.through(b'Z').await }
     async fn parse(&mut self, name: &str, sql: &str, oids: &[i32]) { let mut bytes = cstring(name); bytes.extend_from_slice(&cstring(sql)); bytes.extend_from_slice(&(oids.len() as u16).to_be_bytes()); for oid in oids { bytes.extend_from_slice(&oid.to_be_bytes()); } self.send(b'P', &bytes).await; }
-    async fn bind(&mut self, portal: &str, statement: &str) { let mut bytes = cstring(portal); bytes.extend_from_slice(&cstring(statement)); bytes.extend_from_slice(&[0; 6]); self.send(b'B', &bytes).await; }
+    async fn bind(&mut self, portal: &str, statement: &str) {
+        self.bind_formats(portal, statement, &[]).await;
+    }
+    async fn bind_formats(&mut self, portal: &str, statement: &str, formats: &[u16]) {
+        let mut bytes = cstring(portal);
+        bytes.extend_from_slice(&cstring(statement));
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&(formats.len() as u16).to_be_bytes());
+        for format in formats { bytes.extend_from_slice(&format.to_be_bytes()); }
+        self.send(b'B', &bytes).await;
+    }
     async fn execute(&mut self, portal: &str, rows: i32) { let mut bytes = cstring(portal); bytes.extend_from_slice(&rows.to_be_bytes()); self.send(b'E', &bytes).await; }
 }
 fn cstring(text: &str) -> Vec<u8> { let mut bytes = text.as_bytes().to_vec(); bytes.push(0); bytes }
@@ -93,6 +115,72 @@ fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
         let count = u16::from_be_bytes(bytes[..2].try_into().unwrap()); let mut offset = 2;
         (0..count).map(|_| { let length = i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()); offset += 4; if length < 0 { None } else { let value = bytes[offset..offset + length as usize].to_vec(); offset += length as usize; Some(value) } }).collect()
     }).collect()
+}
+
+#[tokio::test]
+async fn date64_arrow_copy_can_be_read_as_binary_postgres_dates() {
+    use arrow_array::{ArrayRef, Date64Array, Int64Array, RecordBatch};
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let batch = RecordBatch::try_from_iter([
+        ("_id", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef),
+        ("d", Arc::new(Date64Array::from(vec![Some(-1), Some(86_400_000), None])) as ArrayRef),
+    ]).unwrap();
+    let mut ipc = Vec::new();
+    {
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+    client.send(b'Q', &cstring("COPY dates FROM STDIN WITH (FORMAT 'arrow-stream')")).await;
+    assert_eq!(client.receive().await.0, b'G');
+    client.send(b'd', &ipc).await;
+    client.send(b'c', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"CZ");
+
+    client.parse("dates", "SELECT d FROM dates ORDER BY _id", &[]).await;
+    client.bind_formats("dates", "dates", &[1]).await;
+    client.execute("dates", 0).await;
+    client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12DDDCZ");
+    assert_eq!(rows(&frames), [vec![Some((-10_958i32).to_be_bytes().to_vec())], vec![Some((-10_956i32).to_be_bytes().to_vec())], vec![None]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn query_spans_follow_pgwire_application_name_across_entry_points() {
+    let (recorder, mut receiver) = rtdb_metrics::TraceRecorder::new(MemoryBudget::new(8 << 20), 128, true, false).unwrap();
+    let running = Running::start_with_tracer(ServerConfig::default(), AuthConfig::SingleRootUser { password: None }, Some(recorder.clone())).await;
+    let mut default_client = Client::connect(&running.server, None).await;
+    assert_eq!(rows(&default_client.query("SELECT 101 AS app_probe").await), [vec![Some(b"101".to_vec())]]);
+    let mut client = Client::connect_named(&running.server, None, Some("startup-app")).await;
+    assert_eq!(rows(&client.query("SELECT 102 AS app_probe").await), [vec![Some(b"102".to_vec())]]);
+    assert_eq!(tags(&client.query("SET application_name = 'live-app'").await), b"SCZ");
+    client.parse("app", "SELECT 103 AS app_probe", &[]).await;
+    client.bind("app", "app").await;
+    client.execute("app", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(rows(&client.through(b'Z').await), [vec![Some(b"103".to_vec())]]);
+    assert!(!tags(&client.query("DISCARD ALL").await).contains(&b'E'));
+    assert_eq!(rows(&client.query("SELECT 104 AS app_probe").await), [vec![Some(b"104".to_vec())]]);
+    drop((default_client, client));
+    running.stop().await;
+    recorder.close();
+
+    let mut names = std::collections::BTreeMap::new();
+    while let Some(span) = receiver.next().await {
+        if span.name == "xtdb.query" {
+            let attrs: std::collections::BTreeMap<_, _> = span.attributes().collect();
+            if let (Some(text), Some(app)) = (attrs.get("query.text"), attrs.get("application.name")) {
+                names.insert((*text).to_owned(), (*app).to_owned());
+            }
+        }
+    }
+    for (n, app) in [(101, "XTDB PGWire"), (102, "startup-app"), (103, "live-app"), (104, "live-app")] {
+        assert_eq!(names.get(&format!("SELECT {n} AS app_probe")).map(String::as_str), Some(app));
+    }
 }
 
 #[tokio::test]

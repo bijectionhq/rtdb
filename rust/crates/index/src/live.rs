@@ -586,7 +586,7 @@ impl TransactionBuffer {
             return Err(invalid("The transaction event has the wrong physical entity-key layout"));
         }
         if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
-        if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().for_each(Value::admit_object_dates); }
+        if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().try_for_each(Value::admit_object_dates)?; }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
         let bytes = document_bytes.checked_add(event.entity_key.as_ref().map_or(0, |key| key.len()))
             .and_then(|bytes| bytes.checked_add(4096)).and_then(|bytes| bytes.checked_add(table.schema.len())).and_then(|bytes| bytes.checked_add(table.table.len()))

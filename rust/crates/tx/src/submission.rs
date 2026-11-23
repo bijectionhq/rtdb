@@ -98,7 +98,7 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         let bound = parameter_bytes.checked_mul(expression_count.checked_add(8).ok_or_else(overflow)?).and_then(|bytes| bytes.checked_add(sql.len().checked_mul(128)?)).ok_or_else(overflow)?;
         let _evaluation = memory.reserve(bound)?;
         let mut parameters = parameters.to_vec();
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        parameters.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
         let temporal = match valid_time {
             TemporalFilter::Default => (None, None),
@@ -193,7 +193,7 @@ fn projected_timed_puts(
                 let array = page.column(*index).as_ref();
                 row_scope.reserve(rtdb_columnar::estimate_read_cell_bytes(schema.field(*index), array, row)?)?;
                 let mut value = reader.read(array, row)?;
-                rtdb_columnar::admit_execution_value(&mut value);
+                rtdb_columnar::admit_execution_value(&mut value)?;
                 parameters[*index] = value;
             }
             let context = EvalContext { parameters: rtdb_expr::Parameters::Values(&parameters), parameter_types: None, current_time: Timestamp(0).into(),

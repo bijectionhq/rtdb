@@ -480,9 +480,13 @@ impl Session {
         self.rollback_tx()
     }
     pub fn reset(&mut self) -> Result<()> {
+        self.reset_for_frontend(false)
+    }
+
+    pub(crate) fn reset_for_frontend(&mut self, retain_application_name: bool) -> Result<()> {
         self.ensure_open()?;
         if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/discard-in-tx", "DISCARD ALL cannot run inside a transaction block")); }
-        self.parameters.clear();
+        self.parameters.retain(|name, _| retain_application_name && name == "application_name");
         self.timezone = self.initial_timezone.clone();
         self.replace_await_token(None);
         self.default_access_mode = None;

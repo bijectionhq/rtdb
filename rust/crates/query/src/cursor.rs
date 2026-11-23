@@ -310,7 +310,7 @@ impl PreparedQuery {
         })?;
         let temporary = context.memory.reserve(bound)?;
         let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
-        parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        parameters.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&parameters))?;
         self.open_bound(context, schema, text, batching, move |memory| {
             let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);

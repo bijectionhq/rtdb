@@ -121,7 +121,7 @@ fn text(value: &Value, nested: bool) -> Result<String> {
         Value::Keyword(value) => format!(":{}", value.as_str()),
         Value::Uuid(value) => uuid::Uuid::from_bytes(*value).to_string(), Value::Uri(value) => value.clone(),
         Value::DateDay(day) => rtdb_types::CivilDate::from_epoch_day(i64::from(*day))?.to_string(),
-        Value::DateMilli(value) => rtdb_types::CivilDate::from_epoch_day(value / 86_400_000)?.to_string(),
+        Value::DateMilli(value) => rtdb_types::CivilDate::from_epoch_day(value.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY))?.to_string(),
         Value::Time { value, unit, .. } => {
             let nanos = nanos(*value, *unit);
             if !(0..86_400_000_000_000).contains(&nanos) { return Err(unsupported()); }

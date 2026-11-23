@@ -99,6 +99,7 @@ async fn tracing_cursor_parentage_counts_actual_operator_and_output_pages() {
     assert!(root.attributes().any(|(name, value)| name == "query.peak_memory_bytes" && value.parse::<usize>().unwrap() > 0));
     assert!(output.attributes().any(|attribute| attribute == ("cursor.page_count", "2")));
     assert!(table.attributes().any(|attribute| attribute == ("cursor.page_count", "1")));
+    assert!(table.attributes().any(|(name, value)| name == "cursor.peak_memory_bytes" && value.parse::<usize>().unwrap() > 0));
     assert!(!table.attributes().any(|(name, _)| name == "cursor.pull_count"));
     assert!(spans.iter().all(|span| span.ended >= span.started));
 }
@@ -394,17 +395,26 @@ async fn filtered_array_and_vec_aggregate_groups_promote_output_nullability() {
 }
 
 #[tokio::test]
-async fn min_max_missing_setters_fail_before_filtering_but_empty_input_keeps_null() {
-    for (ty, value) in [(scalar(ScalarType::I8), Value::I8(1)), (scalar(ScalarType::I16), Value::I16(1)),
-        (scalar(ScalarType::Time { unit: rtdb_types::TimeUnit::Microsecond, bit_width: 64 }), Value::Time { value: 1, unit: rtdb_types::TimeUnit::Microsecond, bit_width: 64 })] {
-        for function in [AggregateFunction::Min, AggregateFunction::Max] {
-            let input = values(0, "v", ty.clone(), vec![value.clone()]);
-            let mut expression = agg(1, function.clone(), Some(input.schema().fields()[0].expression()), ty.clone().maybe());
-            expression.filter = Some(Expr::Literal(Value::Bool(false)));
-            assert_eq!(collect(aggregate(input, vec![], vec![expression]), query_context(Default::default())).await.unwrap_err().code, "rtdb.query/min-max-setter");
-            let input = values(0, "v", ty.clone(), vec![]);
-            let expression = agg(1, function, Some(input.schema().fields()[0].expression()), ty.clone().maybe());
-            assert_eq!(collect(aggregate(input, vec![], vec![expression]), query_context(Default::default())).await.unwrap(), [vec![Value::Null]]);
+async fn min_max_preserve_narrow_integer_and_time_types() {
+    use rtdb_types::TimeUnit;
+    let time = |value, unit, bit_width| Value::Time { value, unit, bit_width };
+    for (small, large) in [
+        (Value::I8(-7), Value::I8(9)), (Value::I16(-257), Value::I16(1300)),
+        (time(1, TimeUnit::Second, 32), time(7, TimeUnit::Second, 32)),
+        (time(1, TimeUnit::Millisecond, 32), time(7000, TimeUnit::Millisecond, 32)),
+        (time(1, TimeUnit::Microsecond, 64), time(7000, TimeUnit::Microsecond, 64)),
+        (time(1, TimeUnit::Nanosecond, 64), time(7000, TimeUnit::Nanosecond, 64)),
+    ] {
+        let ty = small.logical_type().maybe();
+        for (function, expected) in [(AggregateFunction::Min, small.clone()), (AggregateFunction::Max, large.clone())] {
+            for filtered in [false, true] {
+                let input = values(0, "v", ty.clone(), vec![large.clone(), Value::Null, small.clone()]);
+                let mut expression = agg(1, function.clone(), Some(input.schema().fields()[0].expression()), ty.clone());
+                if filtered { expression.filter = Some(Expr::Literal(Value::Bool(false))); }
+                let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
+                let output = collect(aggregate(input, vec![], vec![expression]), context).await.unwrap();
+                assert_eq!(output, [vec![if filtered { Value::Null } else { expected.clone() }]]);
+            }
         }
     }
 }

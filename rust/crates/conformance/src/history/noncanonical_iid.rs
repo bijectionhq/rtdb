@@ -176,7 +176,7 @@ async fn check_pushdown(node: &Node, sql: &str, table: &str, column: &str, expec
     let rows = query_rows(node, &format!("EXPLAIN ANALYZE {sql}"), i64::MAX).await?;
     let source = Value::Utf8(format!("public.{table}"));
     let bytes = rows.iter().find_map(|row| match row.as_slice() {
-        [_, Value::Keyword(op), attributes, _, _, _, _, _, Value::Transit(bytes), _]
+        [_, Value::Keyword(op), attributes, _, _, _, _, _, Value::Transit(bytes), ..]
             if op.as_str() == "scan" && attributes.field("scan_source") == Some(&source) => Some(bytes),
         _ => None,
     }).ok_or("Expected pushdowns for the probe scan")?;

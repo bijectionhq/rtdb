@@ -136,18 +136,20 @@ impl CalendarDate {
     pub fn date(self) -> CivilDate { self.date }
     pub fn unit(self) -> DateUnit { self.unit }
 
-    /// Applies the reference object writer's signed32 truncation or wrapping millisecond multiplication.
-    pub fn object_value(self) -> crate::Value {
-        match self.unit { DateUnit::Day => crate::Value::DateDay(self.date.epoch_day() as i32), DateUnit::Millisecond => crate::Value::DateMilli(self.date.epoch_day().wrapping_mul(86_400_000)) }
+    pub(crate) fn physical_value(self) -> Option<crate::Value> {
+        let days = self.date.epoch_day();
+        match self.unit {
+            DateUnit::Day => i32::try_from(days).ok().map(crate::Value::DateDay),
+            DateUnit::Millisecond => days.checked_mul(crate::java_date::MILLIS_PER_DAY).map(crate::Value::DateMilli),
+        }
     }
 
-    /// Applies generated expression-output narrowing: checked signed32 days or wrapping millisecond multiplication.
-    /// A day outside signed32 returns `xtdb.expression/overflow-error`.
+    pub fn object_value(self) -> Result<crate::Value> {
+        self.physical_value().ok_or_else(|| Anomaly::incorrect("xtdb/date-out-of-range", format!("Date {} is outside the range of its Arrow date type", self.date)))
+    }
+
     pub fn expression_value(self) -> Result<crate::Value> {
-        match self.unit {
-            DateUnit::Day => Ok(crate::Value::DateDay(i32::try_from(self.date.epoch_day()).map_err(|_| Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error"))?)),
-            DateUnit::Millisecond => Ok(crate::Value::DateMilli(self.date.epoch_day().wrapping_mul(86_400_000))),
-        }
+        self.physical_value().ok_or_else(|| Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error"))
     }
 }
 

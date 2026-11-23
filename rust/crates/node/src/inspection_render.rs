@@ -57,7 +57,7 @@ pub(crate) fn render(value: &Value) -> Result<String> {
         Value::Decimal(value) => decimal(value),
         Value::Date(value) => format!("#time/date {}", quoted(&value.date().to_string())),
         Value::DateDay(days) => format!("#time/date {}", quoted(&date(i64::from(*days)))),
-        Value::DateMilli(millis) => format!("#time/date {}", quoted(&date(millis / 86_400_000))),
+        Value::DateMilli(millis) => format!("#time/date {}", quoted(&date(millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)))),
         Value::Time { value, unit, .. } => format!("#time/time {}", quoted(&time(nanos(*value, *unit), false))),
         Value::Timestamp { value, unit, timezone } => {
             let nanos = nanos(*value, *unit);
@@ -173,8 +173,8 @@ mod tests {
         assert_eq!(operation(&value).unwrap(), "#xt/tagged [:put-docs {:xt/id 1, :foo-bar/baz-qux \"v\"}]");
         assert_eq!(instant(-1), "#time/instant \"1969-12-31T23:59:59.999999Z\"");
         assert_eq!(instant(0), "#time/instant \"1970-01-01T00:00:00Z\"");
-        assert_eq!(render(&Value::DateMilli(-1)).unwrap(), "#time/date \"1970-01-01\"");
-        assert_eq!(render(&Value::DateMilli(-86_400_001)).unwrap(), "#time/date \"1969-12-31\"");
+        assert_eq!(render(&Value::DateMilli(-1)).unwrap(), "#time/date \"1969-12-31\"");
+        assert_eq!(render(&Value::DateMilli(-86_400_001)).unwrap(), "#time/date \"1969-12-30\"");
         assert_eq!(render(&Value::Time { value: 0, unit: TimeUnit::Microsecond, bit_width: 64 }).unwrap(), "#time/time \"00:00\"");
         assert_eq!(render(&Value::TimestampTzRange { lower: 0, upper: i64::MAX }).unwrap(), "#xt/tstz-range [#time/zoned-date-time \"1970-01-01T00:00Z[UTC]\" nil]");
         assert_eq!(render(&Value::F32(0.1)).unwrap(), "0.1");

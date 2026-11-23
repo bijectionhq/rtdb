@@ -49,6 +49,12 @@ pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
 }
 
 impl NativeSession {
+    pub(crate) fn instrument_query_context(&self, context: Arc<QueryContext>) -> Arc<QueryContext> {
+        context.with_observer(crate::SessionService::execution_observer(self.service.as_ref()))
+            .with_tracer(self.service.node.tracer(), None)
+            .with_application_name(self.state.parameter("application_name"))
+    }
+
     /// `cancellation` must descend from `state().cancellation()`; dropping preparation never pins a bare BEGIN.
     pub async fn prepare_context(&mut self, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         self.prepare_context_with_timezone(None, cancellation).await
@@ -59,7 +65,7 @@ impl NativeSession {
         cancellation.run_until_cancelled(async {
             let mut basis = self.state.prepare_basis().await?;
             if let Some(timezone) = timezone { basis.timezone = rtdb_expr::normalize_timezone(timezone)?; }
-            Ok(self.service.query_context(self.state.database(), &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -68,7 +74,7 @@ impl NativeSession {
     pub async fn prepare_context_for(&mut self, database: &str, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             let basis = self.state.prepare_basis().await?;
-            Ok(self.service.query_context(database, &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.instrument_query_context(self.service.query_context(database, &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -77,7 +83,7 @@ impl NativeSession {
     pub async fn query_context_for(&mut self, database: &str, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             let basis = self.state.read_basis().await?;
-            Ok(self.service.query_context(database, &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.instrument_query_context(self.service.query_context(database, &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -86,7 +92,7 @@ impl NativeSession {
     pub async fn query_context_at(&mut self, basis: &crate::QueryBasis, cancellation: &CancellationToken) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             self.state.prepare_basis().await?;
-            Ok(self.service.query_context(self.state.database(), basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.instrument_query_context(self.service.query_context(self.state.database(), basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -95,7 +101,7 @@ impl NativeSession {
     pub async fn query_context_with(&mut self, cancellation: &CancellationToken, checked: bool) -> Result<Arc<QueryContext>> {
         cancellation.run_until_cancelled(async {
             let basis = if checked { self.state.read_basis().await? } else { self.state.unchecked_read_basis().await? };
-            Ok(self.service.query_context(self.state.database(), &basis, cancellation).await?.with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None))
+            Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?))
         }).await.ok_or_else(cancelled)?
     }
 
@@ -145,7 +151,7 @@ impl NativeSession {
         if arguments.len() < statement.parameter_count() { return Err(Anomaly::incorrect("xtdb/missing-parameter", "Control statement has fewer parameters than its expressions")); }
         let allocation = self.admit_control_arguments(arguments)?;
         let mut admitted_arguments = arguments.to_vec();
-        admitted_arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        admitted_arguments.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         let arguments = admitted_arguments.as_slice();
         let needs_catalog = match statement {
             ControlStatement::Begin(options) | ControlStatement::SetTransaction(options) => options.expressions().iter().any(|expr| control_requires_catalog(expr, arguments)),
@@ -205,7 +211,9 @@ impl NativeSession {
             }
             ControlStatement::SetRole => Ok(command("SET ROLE", allocation)),
             ControlStatement::Discard(target) => {
-                if *target == DiscardTarget::All { self.state.reset()?; }
+                if *target == DiscardTarget::All {
+                    self.state.reset_for_frontend(options.frontend == ControlFrontend::PostgreSql)?;
+                }
                 Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
             ControlStatement::Show { name } => {
@@ -275,8 +283,7 @@ impl NativeSession {
 
     async fn show(&mut self, name: &str, checked: bool, hosted_history: Option<String>, cancellation: &CancellationToken) -> Result<QueryCursor> {
         let basis = if checked { self.state.read_basis().await? } else { self.state.inspection_basis()? };
-        let context = self.service.query_context(self.state.database(), &basis, cancellation).await?
-            .with_observer(crate::SessionService::execution_observer(self.service.as_ref())).with_tracer(self.service.node.tracer(), None);
+        let context = self.instrument_query_context(self.service.query_context(self.state.database(), &basis, cancellation).await?);
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
         if let Some(token) = if name == "latest_submitted_tx" { self.state.last_submitted_await_token() } else { self.state.effective_await_token() } { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }

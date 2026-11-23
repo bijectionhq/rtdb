@@ -4,7 +4,7 @@ use std::time::SystemTime;
 pub struct SpanContext { pub trace_id: [u8; 16], pub span_id: [u8; 8] }
 
 #[derive(Clone, Copy, Debug)]
-pub enum TraceValue<'a> { Text(&'a str), Integer(i64), Unsigned(u64) }
+pub enum TraceValue<'a> { Text(&'a str), Integer(i64), Unsigned(u64), Boolean(bool) }
 
 /// An owned span ends once when dropped; attributes are copied before each call returns.
 /// `end_at` sets the recorded end instant and does not release the span's owned data.

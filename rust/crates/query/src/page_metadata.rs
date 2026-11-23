@@ -3,7 +3,7 @@
 
 use rtdb_format::{bloom::BloomFilter, metadata::LeafStatistics};
 use rtdb_plan::{BinaryOp, Expr, Scan, Schema};
-use rtdb_types::{Result, Value};
+use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use crate::context::Execution;
 
 #[derive(Clone, Copy)]
@@ -15,7 +15,7 @@ pub(crate) enum PageTest {
     All(Vec<PageTest>),
     Any(Vec<PageTest>),
     /// `op(column's flavour extremum, value)` over the page's double-valued bounds.
-    Bound { column: String, flavour: &'static str, extremum: Extremum, op: BinaryOp, value: f64 },
+    Bound { column: String, flavour: &'static str, extremum: Extremum, op: BinaryOp, value: f64, may_have_legacy_date64: bool },
     Bloom { column: String, value: Value },
     Presence { column: String, leg: &'static str },
 }
@@ -36,7 +36,7 @@ impl PageTest {
                 Ok(if *op == BinaryOp::And { Self::all(vec![left, right]) } else { Self::any(vec![left, right]) })
             }
             BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
-                let column = |expr: &Expr| match expr { Expr::Column { id, .. } => scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.clone()), _ => None };
+                let column = |expr: &Expr| match expr { Expr::Column { id, .. } => scan.columns.iter().find(|field| field.id == *id), _ => None };
                 let constant = |expr: &Expr| matches!(expr, Expr::Literal(_) | Expr::Parameter { .. });
                 let (column, value, column_first) = match (column(left), column(right)) {
                     (Some(column), None) if constant(right) => (column, right, true),
@@ -44,16 +44,17 @@ impl PageTest {
                     _ => return Ok(Self::Always),
                 };
                 let value = execution.evaluate(&execution.scope()?, value, &Schema::default(), &[]).await?;
-                Ok(Self::comparison(*op, column, value, column_first))
+                let may_have_legacy_date64 = may_have_date64(&column.data_type);
+                Ok(Self::comparison(*op, column.name.clone(), value, column_first, may_have_legacy_date64))
             }
             _ => Ok(Self::Always),
         }
     }
 
-    fn comparison(op: BinaryOp, column: String, value: Value, column_first: bool) -> Self {
+    fn comparison(op: BinaryOp, column: String, value: Value, column_first: bool, may_have_legacy_date64: bool) -> Self {
         use {BinaryOp as B, Extremum::*};
         let bound = |extremum, op| match meta_double(&value) {
-            Some((flavour, value)) => Self::Bound { column: column.clone(), flavour, extremum, op, value },
+            Some((flavour, value)) => Self::Bound { column: column.clone(), flavour, extremum, op, value, may_have_legacy_date64 },
             None => Self::Always,
         };
         match (op, column_first) {
@@ -84,10 +85,17 @@ impl PageTest {
             Self::Always => true,
             Self::All(tests) => { for test in tests { if !test.matches(columns)? { return Ok(false); } } true }
             Self::Any(tests) => { for test in tests { if test.matches(columns)? { return Ok(true); } } false }
-            Self::Bound { column: name, flavour, extremum, op, value } => {
+            Self::Bound { column: name, flavour, extremum, op, value, may_have_legacy_date64 } => {
                 let key = match extremum { Extremum::Min => "min", Extremum::Max => "max" };
                 match columns.root_column(name).and_then(|column| column.bound(flavour, key)) {
-                    Some(bound) => match op { BinaryOp::Lt => bound < *value, BinaryOp::LtEq => bound <= *value, BinaryOp::Gt => bound > *value, _ => bound >= *value },
+                    Some(bound) => {
+                        // Legacy Date64 extrema rounded partial pre-epoch days toward zero.
+                        let bound = if *may_have_legacy_date64 && *flavour == "date-times"
+                            && matches!(extremum, Extremum::Min) && bound <= 0.0 {
+                            bound - 86_400.0
+                        } else { bound };
+                        match op { BinaryOp::Lt => bound < *value, BinaryOp::LtEq => bound <= *value, BinaryOp::Gt => bound > *value, _ => bound >= *value }
+                    }
                     _ => false,
                 }
             }
@@ -103,6 +111,15 @@ impl PageTest {
     }
 }
 
+pub(crate) fn may_have_date64(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::Scalar(ScalarType::DateMilli) => true,
+        LogicalType::Maybe(value) | LogicalType::RunEndEncoded { value, .. } => may_have_date64(value),
+        LogicalType::Union(legs) => legs.iter().any(may_have_date64),
+        _ => false,
+    }
+}
+
 /// The reference's `_meta_double`: the flavour column a value's bounds live in, and the value on that column's scale.
 fn meta_double(value: &Value) -> Option<(&'static str, f64)> {
     let per_second = |unit: rtdb_types::TimeUnit| unit.units_per_second() as f64;
@@ -110,7 +127,7 @@ fn meta_double(value: &Value) -> Option<(&'static str, f64)> {
         Value::I8(v) => ("numbers", f64::from(*v)), Value::I16(v) => ("numbers", f64::from(*v)), Value::I32(v) => ("numbers", f64::from(*v)),
         Value::I64(v) => ("numbers", *v as f64), Value::F32(v) => ("numbers", f64::from(*v)), Value::F64(v) => ("numbers", *v),
         Value::Timestamp { value, unit, .. } => ("date-times", *value as f64 / per_second(*unit)),
-        Value::Date(_) | Value::DateDay(_) => ("date-times", value.date_days()? as f64 * 86_400.0),
+        Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => ("date-times", value.date_days()? as f64 * 86_400.0),
         Value::Time { value, unit, .. } => ("times-of-day", *value as f64 / per_second(*unit)),
         Value::Duration { value, unit } => ("durations", *value as f64 / per_second(*unit)),
         _ => return None,
@@ -121,4 +138,32 @@ fn is_bytes(value: &Value) -> bool {
 }
 fn presence_leg(value: &Value) -> Option<&'static str> {
     match value { Value::Bool(_) => Some("bool"), Value::Transit(_) => Some("transit"), _ => None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::metadata::LeafColumns;
+    use rtdb_types::StructFields;
+
+    #[test]
+    fn previous_date64_statistics_keep_pre_epoch_partial_days_eligible() {
+        let page = LeafColumns::new(vec![Value::Struct(StructFields::from([
+            ("col-name".into(), Value::Utf8("d".into())),
+            ("root-col?".into(), Value::Bool(true)),
+            ("date-times".into(), Value::Struct(StructFields::from([
+                ("min".into(), Value::F64(0.0)),
+                ("max".into(), Value::F64(0.0)),
+            ]))),
+        ]))]);
+        let stats = page.statistics().unwrap();
+        let matches = |date, compatibility| {
+            PageTest::comparison(BinaryOp::Eq, "d".into(), date, true, compatibility)
+                .matches(&stats).unwrap()
+        };
+        assert!(matches(Value::DateDay(-1), true));
+        assert!(!matches(Value::DateDay(-1), false));
+        assert!(!matches(Value::DateDay(-2), true));
+        assert!(!matches(Value::DateDay(1), true));
+    }
 }

@@ -25,7 +25,7 @@ fn emitted_number(value: &Value,allocation: &crate::EvaluationScope) -> Result<O
         Value::I8(value) => Number::Byte(*value), Value::I16(value) => Number::Short(*value),
         Value::I32(value) | Value::DateDay(value) => Number::Int(*value),
         Value::I64(value) => Number::Long(*value),
-        Value::DateMilli(value) => Number::Long(*value / 86_400_000),
+        Value::DateMilli(value) => Number::Long(value.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
         Value::Time { value, .. } | Value::Timestamp { value, .. } | Value::Duration { value, .. } => Number::Long(*value),
         Value::F32(value) => Number::Float(*value), Value::F64(value) => Number::Double(*value),
         Value::Decimal(value) => {

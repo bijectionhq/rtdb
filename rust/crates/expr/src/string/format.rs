@@ -109,7 +109,7 @@ fn resolve(value: &Value, context: &EvalContext<'_>) -> Result<Option<String>> {
         Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => value.to_string(),
         Value::Date(value) => value.date().epoch_day().to_string(),
         Value::DateDay(value) => value.to_string(),
-        Value::DateMilli(value) => (value / 86_400_000).to_string(),
+        Value::DateMilli(value) => (value.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)).to_string(),
         Value::Timestamp { value, .. } | Value::Time { value, .. } | Value::Duration { value, .. } => value.to_string(),
         Value::Binary(value) | Value::FixedSizeBinary(value) => String::from_utf8_lossy(value).into_owned(),
         Value::Transit(bytes) => {

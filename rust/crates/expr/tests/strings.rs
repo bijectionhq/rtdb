@@ -90,14 +90,14 @@ fn reader_text_keeps_nested_extension_and_transit_forms() {
 #[test]
 fn temporal_text_casts_keep_java_spelling_and_format_reads_primitive_units() {
     use rtdb_types::TimeUnit as U;
-    assert_eq!(call("str", &[V::DateMilli(-1)]), text("1970-01-01"));
-    assert_eq!(call("str", &[V::DateMilli(-86_400_001)]), text("1969-12-31"));
-    assert_eq!(call("str", &[V::List(vec![V::DateMilli(-1)])]), text("[#time/date \"1970-01-01\"]"));
+    assert_eq!(call("str", &[V::DateMilli(-1)]), text("1969-12-31"));
+    assert_eq!(call("str", &[V::DateMilli(-86_400_001)]), text("1969-12-30"));
+    assert_eq!(call("str", &[V::List(vec![V::DateMilli(-1)])]), text("[#time/date \"1969-12-31\"]"));
     assert_eq!(call("str", &[V::Timestamp { value: 1, unit: U::Nanosecond, timezone: None }]), text("1970-01-01T00:00:00.000000001"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("UTC".into()) }]), text("1970-01-01T00:00Z[UTC]"));
     assert_eq!(call("str", &[V::Timestamp { value: 0, unit: U::Second, timezone: Some("+02:30".into()) }]), text("1970-01-01T02:30+02:30"));
     assert_eq!(call("str", &[V::Time { value: 1, unit: U::Millisecond, bit_width: 32 }]), text("00:00:00.001"));
-    assert_eq!(call("format", &[text("%s/%s"), V::DateMilli(-86_400_001), V::Timestamp { value: 42, unit: U::Microsecond, timezone: Some("UTC".into()) }]), text("-1/42"));
+    assert_eq!(call("format", &[text("%s/%s"), V::DateMilli(-86_400_001), V::Timestamp { value: 42, unit: U::Microsecond, timezone: Some("UTC".into()) }]), text("-2/42"));
     for (value, expected) in [(V::F64(1e7), "1.0E7"), (V::F64(1e-4), "1.0E-4"), (V::F64(-0.0), "-0.0"), (V::F64(f64::INFINITY), "Infinity")] { assert_eq!(call("str", &[value]), text(expected)); }
 }
 
