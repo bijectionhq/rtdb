@@ -2453,6 +2453,8 @@ enum OwnedWorldObservation {
 impl OwnedWorldWitness {
     pub fn purge_frontier(&self) -> i64 { self.purge_frontier }
 
+    pub fn matches_scope(&self, scope: rtdb_types::PlacedAttemptScope) -> bool { self.scope == scope }
+
     pub fn is_absent_point(&self, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId) -> bool {
         self.relation.root_relation().as_ref() == Some(relation)
             && matches!(&self.observation, OwnedWorldObservation::Point { id: observed, revision: None, .. } if observed == id)
@@ -2471,6 +2473,27 @@ impl OwnedWorldWitness {
         };
         bytes.saturating_add(self.relation.name().len()).saturating_add(1024)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn world_witness_matches_only_its_original_history_and_writer_epoch() {
+    use rtdb_types::{Iid, OwnedRelation, PlacedAttemptScope};
+
+    let world = Iid([1; 16]);
+    let scope = PlacedAttemptScope::new("history-a", 1).unwrap();
+    let witness = OwnedWorldWitness {
+        world,
+        pin: Iid([2; 16]),
+        relation: OwnedRelation::new("facts").unwrap().in_world(world).unwrap(),
+        observation: OwnedWorldObservation::Relation { local_frontier: Some(0) },
+        scope,
+        until: Timestamp(42),
+        purge_frontier: 0,
+    };
+    assert!(witness.matches_scope(scope));
+    assert!(!witness.matches_scope(PlacedAttemptScope::new("history-a", 2).unwrap()));
+    assert!(!witness.matches_scope(PlacedAttemptScope::new("history-b", 1).unwrap()));
 }
 
 pub struct OwnedForkCut {
