@@ -97,10 +97,21 @@ Durable journal acknowledgments, authenticated journal identity, exact digest eq
 The raw timed entry binds the original stream, journal identities and quorum size across moves and archives.
 The audit reports current quorum agreement separately from the original quorum's sync bound.
 It can read a retained original sample matching the certified entry even when that journal lacks a local commit marker.
-The sync bound is the original quorum's order statistic among distinct samples below the stored cutoff.
-It remains absent if the required original samples are unavailable.
-It also reports the audit process's rounded clock immediately after establishing quorum agreement.
+Each journal in the recorded original roster contributes its earliest positive original sample strictly below the stored cutoff.
+The sync bound is the recorded write-quorum-th smallest of those samples and is absent when fewer journals qualify.
+The audit also reports its process's rounded clock immediately after establishing quorum agreement.
 The audit time includes probe latency and requires bounded clock uncertainty when compared with the writer's sample.
+
+**Proof checked on 2026-11-23.**
+Verus 0.2026.11.20.9da409b checked 11 items in the [original sync audit area](../../verification/verus/original_sync_audit/area.json) over the shipped Logkeeper decisions.
+The bound proof covers arbitrary observations for a valid recorded roster and quorum, including duplicate journal replies and ties between different journals.
+The lookup proofs check exact reply coordinates, original sample admission, and selection of the carried digest for a resealed entry.
+All 17 controls failed at their expected laws, covering foreign and duplicate votes, equal and late cutoffs, a later sample from the same journal, a weaker quorum, omitted ordering, copy and nonpositive votes, mismatched reply and lookup coordinates, lost carried digest, and missing server sample.
+
+**Source inspection.**
+The client supplies the certified entry's roster, quorum and cutoff to the bound calculation and probes original journals using authenticated endpoint identities.
+The server computes the retained digest from the selected entry in the requested original stream.
+The proof takes journal identity and sample provenance, the retained chain's binding to exact bytes, the validity of the recorded origin, and the installed physical clock bounds as premises.
 
 The installed audience Flight gateway discovers its existing holder with its own DynamoDB client.
 It reads the exact deployment and that deployment's member by key and dials the configured audience port on the member's advertised host.

@@ -527,9 +527,14 @@ contract LogService {
         -- A present journal cutoff is positive and at least the stage cutoff, and its digest has 32 bytes with at least one nonzero byte.
         -- The writer derives the guarded append's clock evidence from the sealed stage.
         -- Recovery preserves that evidence, and the exact-record audit accepts a frame only when its clock evidence equals the sealed stage's evidence.
-        -- An original append carries no original entry digest. A copy whose payload is resealed records the original stream's digest of the exact appended entry, so the audit can still find the original voters.
+        -- An original append carries no original entry digest.
+        -- A resealed copy carries the original stream's digest of the exact appended entry.
         -- The raw record binds its original physical stream, distinct journal identities and quorum size across moves and archives.
-        -- Current placement agreement establishes exact retained bytes. Only matching, timely samples from the recorded original quorum establish the sync bound, under the installed clock bounds.
+        -- Current placement agreement establishes the exact retained entry.
+        -- An original observation lookup addresses the original stream and position and requires the digest of its exact original entry.
+        -- Each journal in the recorded original roster contributes its earliest positive original sample strictly below the recorded cutoff for that entry.
+        -- The sync bound is the recorded write-quorum-th smallest of those per-journal samples, and is absent if fewer journals qualify.
+        -- Its physical interpretation depends on the installed journal clock bounds.
 
     @invariant TimedAppendRequiresProviderSupport
         -- A request with a journal cutoff can stage an accepting record only if its installed provider can enforce timed original quorum durability during append and recovery.

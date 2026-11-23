@@ -1,15 +1,32 @@
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::{multiset::Multiset, relations::{sorted_by, total_ordering}, seq_lib::lemma_sorted_unique};
+
+#[cfg(not(verus_keep_ghost))]
 use std::collections::BTreeMap;
+#[cfg(not(verus_keep_ghost))]
 use std::time::Duration;
 
+#[cfg(not(verus_keep_ghost))]
 use futures::stream::{FuturesUnordered, StreamExt};
+#[cfg(not(verus_keep_ghost))]
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
+#[cfg(not(verus_keep_ghost))]
 use super::ensemble::{Ensemble, MAXIMUM_BATCH_ENTRIES};
+#[cfg(not(verus_keep_ghost))]
 use super::{JournalEndpoint, StreamConfig, validate};
+#[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
-use crate::protocol::{Entry, before_guarded_cutoff};
+#[cfg(not(verus_keep_ghost))]
+use crate::protocol::Entry;
+#[cfg(not(verus_keep_ghost))]
 use crate::server::JournalDigest;
 
+#[cfg(not(verus_keep_ghost))]
 /// Fingerprints of the same committed range on all responding members of an ensemble.
 #[derive(Debug, Default)]
 pub struct RetainedAudit {
@@ -19,12 +36,210 @@ pub struct RetainedAudit {
     pub unavailable: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug)]
+#[cfg_attr(not(verus_keep_ghost), derive(Clone, Debug))]
 pub struct JournalSyncObservation {
     pub journal: String,
     pub synced_clock_upper_micros: i64,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(matches =>
+    ensures matches == (through == offset && digest@ =~= expected_digest@),
+))]
+fn exact_audit_page(offset: i64, through: i64, digest: &[u8], expected_digest: &[u8]) -> bool {
+    through == offset && digest == expected_digest
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(matches =>
+    ensures matches == (reported_origin@ =~= origin@ && reported_cutoff == cutoff),
+))]
+fn matching_original_origin(
+    reported_origin: &[u8], origin: &[u8], reported_cutoff: Option<i64>, cutoff: Option<i64>,
+) -> bool {
+    reported_origin == origin && reported_cutoff == cutoff
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    ensures result == match (original_append, sample) {
+        (Some(true), Some(upper)) => if upper > 0 { Ok(Some(upper)) } else { Err(()) },
+        _ => Ok(None),
+    },
+))]
+fn original_page_sample(original_append: Option<bool>, sample: Option<i64>) -> std::result::Result<Option<i64>, ()> {
+    if original_append != Some(true) { return Ok(None); }
+    match sample {
+        Some(upper) if upper <= 0 => Err(()),
+        _ => Ok(sample),
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    requires rehash.requires(()),
+    ensures match result {
+        Some(digest) => if carried@.len() == 0 { rehash.ensures((), digest) }
+            else { carried@.len() == 32 && digest@ == carried@ },
+        None => carried@.len() != 0 && carried@.len() != 32,
+    },
+))]
+fn original_digest_to_probe<F: FnOnce() -> [u8; 32]>(carried: &[u8], rehash: F) -> Option<[u8; 32]> {
+    if carried.is_empty() { return Some(rehash()); }
+    if carried.len() != 32 { return None; }
+    let mut digest = [0; 32];
+    digest.copy_from_slice(carried);
+    Some(digest)
+}
+
+#[cfg(verus_keep_ghost)]
+verus! {
+broadcast use vstd::seq_lib::group_seq_properties;
+
+spec fn qualifies(journal: Seq<char>, observation: JournalSyncObservation, cutoff: i64) -> bool {
+    observation.journal@ == journal && 0 < observation.synced_clock_upper_micros < cutoff
+}
+
+spec fn is_earliest_sample(
+    journal: Seq<char>, observations: Seq<JournalSyncObservation>, cutoff: i64, seen: int,
+    earliest: Option<i64>,
+) -> bool {
+    &&& forall |i: int| 0 <= i < seen && #[trigger] qualifies(journal, observations[i], cutoff)
+        ==> earliest.is_some() && earliest.unwrap() <= observations[i].synced_clock_upper_micros
+    &&& match earliest {
+        None => true,
+        Some(best) => exists |i: int| 0 <= i < seen && #[trigger] qualifies(journal, observations[i], cutoff)
+            && observations[i].synced_clock_upper_micros == best,
+    }
+}
+
+spec fn earliest_vote(journal: Seq<char>, observations: Seq<JournalSyncObservation>, cutoff: i64) -> Option<i64> {
+    choose |earliest: Option<i64>| is_earliest_sample(journal, observations, cutoff, observations.len() as int, earliest)
+}
+
+spec fn recorded_votes(
+    roster: Seq<String>, observations: Seq<JournalSyncObservation>, cutoff: i64, seen: nat,
+) -> Multiset<i64>
+    decreases seen,
+{
+    if seen == 0 {
+        Multiset::empty()
+    } else {
+        let preceding = recorded_votes(roster, observations, cutoff, (seen - 1) as nat);
+        match earliest_vote(roster[seen - 1]@, observations, cutoff) {
+            Some(sample) => preceding.insert(sample),
+            None => preceding,
+        }
+    }
+}
+
+spec fn ordered_recorded_votes(
+    ordered: Seq<i64>, roster: Seq<String>, observations: Seq<JournalSyncObservation>, cutoff: i64,
+) -> bool {
+    sorted_by(ordered, |a: i64, b: i64| a <= b)
+        && ordered.to_multiset() == recorded_votes(roster, observations, cutoff, roster.len())
+}
+
+spec fn quorum_sample(ordered: Seq<i64>, write_quorum: usize) -> Option<i64> {
+    if 0 < write_quorum <= ordered.len() { Some(ordered[write_quorum - 1]) } else { None }
+}
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    ensures result == if qualifies(journal@, *observation, cutoff) {
+        Some(observation.synced_clock_upper_micros)
+    } else { None },
+))]
+fn qualifying_sample(journal: &str, observation: &JournalSyncObservation, cutoff: i64) -> Option<i64> {
+    let upper = observation.synced_clock_upper_micros;
+    if observation.journal.as_str() == journal && 0 < upper && upper < cutoff { Some(upper) } else { None }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    ensures result == earliest_vote(journal@, observations@, cutoff),
+))]
+fn earliest_sample(journal: &str, observations: &[JournalSyncObservation], cutoff: i64) -> Option<i64> {
+    let mut earliest = None;
+    let mut i = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            0 <= i <= observations@.len(),
+            is_earliest_sample(journal@, observations@, cutoff, i as int, earliest),
+        decreases observations@.len() - i,
+    ))]
+    while i < observations.len() {
+        if let Some(sample) = qualifying_sample(journal, &observations[i], cutoff) {
+            if match earliest { None => true, Some(best) => sample < best } {
+                earliest = Some(sample);
+            }
+        }
+        i += 1;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        let chosen = earliest_vote(journal@, observations@, cutoff);
+        assert(is_earliest_sample(journal@, observations@, cutoff, observations@.len() as int, chosen));
+        if let Some(sample) = earliest {
+            let i = choose |i: int| 0 <= i < observations@.len()
+                && #[trigger] qualifies(journal@, observations@[i], cutoff)
+                && observations@[i].synced_clock_upper_micros == sample;
+            assert(qualifies(journal@, observations@[i], cutoff));
+            assert(chosen.is_some() && chosen.unwrap() <= sample);
+        }
+        if let Some(sample) = chosen {
+            let i = choose |i: int| 0 <= i < observations@.len()
+                && #[trigger] qualifies(journal@, observations@[i], cutoff)
+                && observations@[i].synced_clock_upper_micros == sample;
+            assert(qualifies(journal@, observations@[i], cutoff));
+            assert(earliest.is_some() && earliest.unwrap() <= sample);
+        }
+    }
+    earliest
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    requires
+        roster@.map_values(|journal: String| journal@).no_duplicates(),
+        0 < write_quorum <= roster@.len(),
+    ensures
+        exists |ordered: Seq<i64>| #[trigger] ordered_recorded_votes(ordered, roster@, observations@, cutoff)
+            && result == quorum_sample(ordered, write_quorum),
+        forall |ordered: Seq<i64>| #[trigger] ordered_recorded_votes(ordered, roster@, observations@, cutoff)
+            ==> result == quorum_sample(ordered, write_quorum),
+))]
+fn recorded_sync_bound(
+    roster: &[String], observations: &[JournalSyncObservation], cutoff: i64, write_quorum: usize,
+) -> Option<i64> {
+    let mut samples = Vec::new();
+    let mut i = 0;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(samples@ =~= Seq::<i64>::empty());
+        assert(recorded_votes(roster@, observations@, cutoff, 0) == Multiset::<i64>::empty());
+    }
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            0 <= i <= roster@.len(),
+            samples@.to_multiset() == recorded_votes(roster@, observations@, cutoff, i as nat),
+        decreases roster@.len() - i,
+    ))]
+    while i < roster.len() {
+        if let Some(sample) = earliest_sample(roster[i].as_str(), observations, cutoff) {
+            samples.push(sample);
+        }
+        i += 1;
+    }
+    samples.sort_unstable();
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(ordered_recorded_votes(samples@, roster@, observations@, cutoff));
+        let precedes = |a: i64, b: i64| a <= b;
+        assert(total_ordering(precedes));
+        assert forall |ordered: Seq<i64>| #[trigger] ordered_recorded_votes(ordered, roster@, observations@, cutoff)
+            implies ordered == samples@ by {
+            lemma_sorted_unique(ordered, samples@, precedes);
+        }
+    }
+    if samples.len() < write_quorum { None } else { Some(samples[write_quorum - 1]) }
+}
+
+#[cfg(not(verus_keep_ghost))]
 /// Verify one committed entry and collect the original append's retained sync observations.
 pub async fn certify_observed_entry(
     config: &StreamConfig, offset: i64,
@@ -52,15 +267,14 @@ pub async fn certify_observed_entry(
         };
         let digest: [u8; 32] = page.digest.as_ref().try_into()
             .map_err(|_| Anomaly::fault("rtdb.logkeeper/audit-proof", "A replica returned an invalid digest"))?;
-        if page.through_lsn != offset || agreed.is_some_and(|expected| expected != digest) {
+        if !exact_audit_page(offset, page.through_lsn, &digest, agreed.as_ref().unwrap_or(&digest)) {
             return Err(Anomaly::fault("rtdb.logkeeper/audit-divergence", "Replicas disagree on the exact committed entry"));
         }
         agreed = Some(digest);
         agreeing += 1;
-        if page.original_append == Some(true) && let Some(synced_clock_upper_micros) = page.synced_clock_upper_micros {
-            if synced_clock_upper_micros <= 0 {
-                return Err(Anomaly::fault("rtdb.logkeeper/sync-observation-clock", "A journal returned an invalid sync sample"));
-            }
+        let sample = original_page_sample(page.original_append, page.synced_clock_upper_micros)
+            .map_err(|()| Anomaly::fault("rtdb.logkeeper/sync-observation-clock", "A journal returned an invalid sync sample"))?;
+        if let Some(synced_clock_upper_micros) = sample {
             observations.push(JournalSyncObservation {
                 journal: config.servers[server].journal().expect("validated journal identities").to_owned(),
                 synced_clock_upper_micros,
@@ -72,6 +286,7 @@ pub async fn certify_observed_entry(
     Ok((JournalDigest::from_digest_bytes(config.stream.clone(), [offset, offset], digest), observations))
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Read the retained observations of the original voters for an already certified timed entry.
 pub async fn original_sync_observations(
     certificate: &JournalDigest, entry: &Entry, endpoints: Vec<JournalEndpoint>, maximum_message_bytes: usize,
@@ -105,10 +320,9 @@ pub async fn original_sync_observations(
     let mut observations = Vec::new();
     while let Some((server, reply)) = pending.next().await {
         let Ok(page) = reply else { continue };
-        if page.through_lsn == offset && page.digest.as_ref() == digest.as_slice()
-            && page.timed_origin_identity.as_ref() == origin_identity.as_slice()
-            && page.guarded_before == entry.guarded_before && page.original_append == Some(true)
-            && let Some(synced_clock_upper_micros) = page.synced_clock_upper_micros.filter(|sample| *sample > 0)
+        if exact_audit_page(offset, page.through_lsn, &page.digest, &digest)
+            && matching_original_origin(&page.timed_origin_identity, &origin_identity, page.guarded_before, entry.guarded_before)
+            && let Ok(Some(synced_clock_upper_micros)) = original_page_sample(page.original_append, page.synced_clock_upper_micros)
         {
             observations.push(JournalSyncObservation {
                 journal: ensemble.config.servers[server].journal().expect("filtered original identities").to_owned(),
@@ -119,18 +333,19 @@ pub async fn original_sync_observations(
     Ok(observations)
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// The original stream's digest of this timed entry: computed from the original append's
 /// exact bytes, or carried by a copy whose payload was resealed.
 fn original_entry_digest(entry: &Entry) -> Option<[u8; 32]> {
     let origin = entry.timed_origin.as_ref()?;
-    if !origin.original_entry_sha256.is_empty() {
-        return origin.original_entry_sha256.as_ref().try_into().ok();
-    }
-    let mut original = RetainedChain::new(&origin.stream, entry.lsn);
-    original.append(entry);
-    Some(original.bytes())
+    original_digest_to_probe(&origin.original_entry_sha256, || {
+        let mut original = RetainedChain::new(&origin.stream, entry.lsn);
+        original.append(entry);
+        original.bytes()
+    })
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Before replacing a timed entry's payload, retain the digest its original voters hold.
 /// Call it on the exact bytes read from the installation's replica stream.
 pub fn retain_original_entry_digest(entry: &mut Entry) {
@@ -141,23 +356,15 @@ pub fn retain_original_entry_digest(entry: &mut Entry) {
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// The original quorum's earliest qualifying upper bound, if it can be recovered.
 pub fn timely_original_sync_upper(entry: &Entry, observations: &[JournalSyncObservation]) -> Option<i64> {
     let cutoff = entry.guarded_before?;
     let origin = entry.timed_origin.as_ref().filter(|_| entry.valid_guard())?;
-    let mut by_journal = BTreeMap::<&str, i64>::new();
-    for observation in observations {
-        let journal = observation.journal.as_str();
-        let sample = observation.synced_clock_upper_micros;
-        if before_guarded_cutoff(sample, Some(cutoff)) && origin.journals.binary_search_by(|id| id.as_str().cmp(journal)).is_ok() {
-            by_journal.entry(journal).and_modify(|stored| *stored = (*stored).min(sample)).or_insert(sample);
-        }
-    }
-    let mut samples: Vec<_> = by_journal.into_values().collect();
-    samples.sort_unstable();
-    samples.get(origin.write_quorum as usize - 1).copied()
+    recorded_sync_bound(&origin.journals, observations, cutoff, origin.write_quorum as usize)
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Compares independently read replicas without appending, sealing or advancing their commit positions.
 pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
     validate(config)?;
@@ -196,6 +403,7 @@ pub async fn audit_retained(config: &StreamConfig) -> Result<RetainedAudit> {
     Ok(audit)
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Obtains agreement from a durable write quorum for the committed interval ending at `through`.
 /// A supplied prefix must belong to the same stream and adjoin the interval to hash.
 pub async fn certify_committed_prefix(config: &StreamConfig, through: i64, prefix: Option<&JournalDigest>) -> Result<JournalDigest> {
@@ -249,6 +457,7 @@ pub async fn certify_committed_prefix(config: &StreamConfig, through: i64, prefi
     Ok(JournalDigest { stream: config.stream.clone(), interval: [start, through], digest })
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Certifies exactly this retained interval, seeded at its first offset.
 pub async fn certify_committed_range(config: &StreamConfig, first: i64, through: i64) -> Result<JournalDigest> {
     validate(config)?;
@@ -280,10 +489,12 @@ pub async fn certify_committed_range(config: &StreamConfig, first: i64, through:
     Ok(JournalDigest { stream: config.stream.clone(), interval: [first, through], digest })
 }
 
+#[cfg(not(verus_keep_ghost))]
 fn range_unavailable() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.logkeeper/retained-range-unavailable", "The exact committed interval is unavailable")
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// A bounded cursor through an immutable committed interval. Pages are
 /// provisional until the final raw history digest matches the certificate.
 pub struct CertifiedRangeReader {
@@ -294,6 +505,7 @@ pub struct CertifiedRangeReader {
     preferred: usize,
 }
 
+#[cfg(not(verus_keep_ghost))]
 impl CertifiedRangeReader {
     pub fn new(config: &StreamConfig, certificate: &JournalDigest) -> Result<Self> {
         validate(config)?;
@@ -345,6 +557,7 @@ impl CertifiedRangeReader {
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Reads one complete retained copy whose raw bytes match the exact-range certificate.
 pub async fn copy_certified_range(
     config: &StreamConfig, certificate: &JournalDigest, maximum_bytes: usize, maximum_entries: usize,
@@ -385,6 +598,7 @@ pub async fn copy_certified_range(
     Err(range_unavailable())
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Rechecks archived records against their exact interval in the original replica stream.
 pub fn verify_certified_range(certificate: &JournalDigest, entries: &[crate::protocol::Entry]) -> Result<()> {
     let [first, through] = certificate.interval;
@@ -404,6 +618,7 @@ pub fn verify_certified_range(certificate: &JournalDigest, entries: &[crate::pro
     Ok(())
 }
 
+#[cfg(not(verus_keep_ghost))]
 async fn durable_chain(ensemble: &Ensemble, server: usize, mut from: i64, through: i64, mut preceding_digest: Option<[u8; 32]>) -> Result<String> {
     loop {
         let page = ensemble.digest_page(server, from, through, preceding_digest).await?;
@@ -419,6 +634,7 @@ async fn durable_chain(ensemble: &Ensemble, server: usize, mut from: i64, throug
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 fn quorum_overlap(windows: &[(usize, [i64; 2])], quorum: usize) -> Option<[i64; 2]> {
     let index = quorum.checked_sub(1)?;
     let mut ends: Vec<_> = windows.iter().map(|(_, [_, end])| *end).collect();
@@ -434,6 +650,7 @@ fn quorum_overlap(windows: &[(usize, [i64; 2])], quorum: usize) -> Option<[i64; 
     None
 }
 
+#[cfg(not(verus_keep_ghost))]
 async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> Result<String> {
     let mut chain = RetainedChain::new(&ensemble.config.stream, first);
     let mut next = first;
@@ -455,11 +672,12 @@ async fn chain(ensemble: &Ensemble, server: usize, first: i64, through: i64) -> 
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 fn incomplete(ensemble: &Ensemble, server: usize, position: i64) -> Anomaly {
         Anomaly::fault("rtdb.logkeeper/audit-gap", format!("Replica {} omitted committed position {position}", ensemble.config.servers[server].address()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(verus_keep_ghost)))]
 mod tests {
     use super::{JournalDigest, JournalSyncObservation, RetainedChain, quorum_overlap, timely_original_sync_upper, verify_certified_range};
     use crate::protocol::{Entry, TimedJournalOrigin};

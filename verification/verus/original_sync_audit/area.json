@@ -1,0 +1,311 @@
+{
+  "summary": "The audit bounds original quorum sync by the recorded roster, cutoff and write quorum, using digest-bound original samples.",
+  "flags": [
+    "--edition",
+    "2024",
+    "--no-external-by-default",
+    "--verify-module",
+    "audit",
+    "--verify-module",
+    "store",
+    "--triggers-mode",
+    "silent"
+  ],
+  "min_verified_functions": 11,
+  "controls": {
+    "foreign-voter": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "observation.journal.as_str() == journal && 0 < upper",
+          "replace": "0 < upper"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "qualifying_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "duplicate-voter": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "            samples.push(sample);",
+          "replace": "            samples.push(sample);\n            samples.push(sample);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "recorded_sync_bound",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "equality-at-cutoff": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "upper < cutoff { Some(upper)",
+          "replace": "upper <= cutoff { Some(upper)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "qualifying_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "accept-late-sample": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": " && upper < cutoff { Some(upper)",
+          "replace": " { Some(upper)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "qualifying_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "choose-later-duplicate": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "Some(best) => sample < best",
+          "replace": "Some(best) => sample > best"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "earliest_sample",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "weaker-threshold": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "samples.len() < write_quorum { None } else { Some(samples[write_quorum - 1]) }",
+          "replace": "samples.len() < write_quorum.saturating_sub(1) { None } else { samples.get(write_quorum.saturating_sub(2)).copied() }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "recorded_sync_bound",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "recorded_sync_bound",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "skip-ordering": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "    samples.sort_unstable();\n    #[cfg(verus_keep_ghost)]",
+          "replace": "    #[cfg(verus_keep_ghost)]"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "recorded_sync_bound",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "copy-voting": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "if original_append != Some(true)",
+          "replace": "if original_append.is_none()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "original_page_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "nonpositive-vote": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "Some(upper) if upper <= 0 => Err(())",
+          "replace": "Some(upper) if upper < 0 => Err(())"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "original_page_sample",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "wrong-client-offset": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "through == offset && digest == expected_digest",
+          "replace": "digest == expected_digest"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "exact_audit_page",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "wrong-client-digest": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "through == offset && digest == expected_digest",
+          "replace": "through == offset"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "exact_audit_page",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "wrong-origin-roster": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "reported_origin == origin && reported_cutoff == cutoff",
+          "replace": "reported_cutoff == cutoff"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "matching_original_origin",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "wrong-origin-cutoff": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "reported_origin == origin && reported_cutoff == cutoff",
+          "replace": "reported_origin == origin"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "matching_original_origin",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "rehash-resealed-copy": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "find": "if carried.is_empty() { return Some(rehash()); }",
+          "replace": "if carried.is_empty() || carried.len() == 32 { return Some(rehash()); }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/audit.rs",
+          "function": "original_digest_to_probe",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "wrong-server-digest": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/store.rs",
+          "find": "sample.is_some() && retained_digest == certified_digest && match",
+          "replace": "sample.is_some() && match"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/store.rs",
+          "function": "original_lookup_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "wrong-server-stream": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/store.rs",
+          "find": "Some(stream) => stream == requested_stream,",
+          "replace": "Some(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/store.rs",
+          "function": "original_lookup_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "missing-original-sample": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/server/store.rs",
+          "find": "sample.is_some() && retained_digest == certified_digest && match",
+          "replace": "retained_digest == certified_digest && match"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/server/store.rs",
+          "function": "original_lookup_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    }
+  }
+}

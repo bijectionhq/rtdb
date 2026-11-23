@@ -1,25 +1,64 @@
 //! Every stream a server holds, and the order in which their mutations reach the journal.
 
+#![allow(unexpected_cfgs)]
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg_attr(verus_keep_ghost, verus_spec(matches =>
+    ensures matches == (certified_digest@ =~= retained_digest@
+        && sample.is_some()
+        && match origin_stream { Some(stream) => stream@ == requested_stream@, None => false }),
+))]
+fn original_lookup_matches(
+    certified_digest: &[u8], retained_digest: &[u8], sample: Option<i64>,
+    origin_stream: Option<&str>, requested_stream: &str,
+) -> bool {
+    sample.is_some() && retained_digest == certified_digest && match origin_stream {
+        Some(stream) => stream == requested_stream,
+        None => false,
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
 use super::journal::{Captured, Journal, ObservedAppend, Recovered, Work, Write};
+#[cfg(not(verus_keep_ghost))]
 use super::payload::{Item, Source, Stored};
+#[cfg(not(verus_keep_ghost))]
 use super::state::{Decision, StreamState, Window, WriterAuthority};
+#[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
+#[cfg(not(verus_keep_ghost))]
 use crate::protocol::{AuthorityConfirmed, DigestPage, LogletCheck, Refused, Entries, Entry, Failed, MAXIMUM_FRAME_BYTES, PageDigest, RequestBody, ResponseBody};
+#[cfg(not(verus_keep_ghost))]
 use bytes::Bytes;
+#[cfg(not(verus_keep_ghost))]
 use parking_lot::Mutex;
+#[cfg(not(verus_keep_ghost))]
 use std::collections::HashMap;
+#[cfg(not(verus_keep_ghost))]
 use std::sync::{Arc, OnceLock};
+#[cfg(not(verus_keep_ghost))]
 use std::time::Duration;
+#[cfg(not(verus_keep_ghost))]
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+#[cfg(not(verus_keep_ghost))]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(verus_keep_ghost))]
 const COMPACTION_SLACK_BYTES: u64 = 1 << 20;
+#[cfg(not(verus_keep_ghost))]
 const PENDING_WRITE_BYTES: usize = MAXIMUM_FRAME_BYTES + 1024;
+#[cfg(not(verus_keep_ghost))]
 const MINIMUM_WRITE_CHARGE: usize = 1024;
+#[cfg(not(verus_keep_ghost))]
 const DIGEST_PAGE_ENTRIES: usize = 1024;
+#[cfg(not(verus_keep_ghost))]
 const DIGEST_PAGE_BYTES: usize = 4 << 20;
+#[cfg(not(verus_keep_ghost))]
 const CONCURRENT_DIGEST_PAGES: usize = 2;
 
+#[cfg(not(verus_keep_ghost))]
 /// A stream's state; a stream with no waiting reader owns no task and no timer.
 pub(crate) struct Slot {
     /// Names the stream in the journal's records.
@@ -31,6 +70,7 @@ pub(crate) struct Slot {
     pub progressed: Notify,
 }
 
+#[cfg(not(verus_keep_ghost))]
 impl Slot {
     pub fn new(id: u64, name: String, state: StreamState<Stored>) -> Self {
         let authority = Arc::new(Mutex::new(AuthorityProjection {
@@ -44,12 +84,14 @@ impl Slot {
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 struct AuthorityProjection {
     accepted: WriterAuthority,
     revision: Option<u64>,
     durable_revision: u64,
 }
 
+#[cfg(not(verus_keep_ghost))]
 impl AuthorityProjection {
     fn record(&mut self, authority: WriterAuthority) -> Option<u64> {
         self.accepted = authority;
@@ -67,6 +109,7 @@ impl AuthorityProjection {
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 pub(crate) struct Store {
     journal: Arc<Journal>,
     streams: Mutex<HashMap<String, Arc<Slot>>>,
@@ -76,14 +119,17 @@ pub(crate) struct Store {
     digest_pages: Semaphore,
 }
 
+#[cfg(not(verus_keep_ghost))]
 pub(crate) enum Outcome {
     Now(ResponseBody),
     /// The reply, to be sent once the journal reports the decision durable.
     Durable(oneshot::Receiver<Result<(), String>>, ResponseBody),
 }
 
+#[cfg(not(verus_keep_ghost))]
 type Compaction = oneshot::Receiver<Result<(), String>>;
 
+#[cfg(not(verus_keep_ghost))]
 impl Store {
     pub fn new(journal: Arc<Journal>, recovered: Vec<Recovered>, queue: mpsc::UnboundedSender<Work>) -> Self {
         let streams: HashMap<_, _> = recovered.into_iter().map(|stream| {
@@ -360,15 +406,18 @@ impl Store {
             }
             let digest = chain.bytes();
             let timed_origin = exact.then_some(last.timed_origin.as_ref()).flatten();
-            if lookup_original && (timed_origin.is_none_or(|origin| origin.stream != page.stream)
-                || digest.as_slice() != page.certified_entry_digest.as_ref())
+            let synced_clock_upper_micros = observation.as_ref().and_then(|sample| sample.get().copied());
+            if lookup_original && !original_lookup_matches(
+                &page.certified_entry_digest, &digest, synced_clock_upper_micros,
+                timed_origin.map(|origin| origin.stream.as_str()), &page.stream,
+            )
             {
                 return failed("this journal does not hold the certified original");
             }
             ResponseBody::PageDigest(PageDigest { through_lsn: last.lsn,
                 digest: Bytes::copy_from_slice(&digest),
                 original_append: (exact && last.guarded).then_some(observation.is_some()),
-                synced_clock_upper_micros: observation.and_then(|sample| sample.get().copied()),
+                synced_clock_upper_micros,
                 guarded_before: exact.then_some(last.guarded_before).flatten(),
                 timed_origin_identity: timed_origin.map_or_else(Bytes::new, |origin| Bytes::copy_from_slice(&origin.fingerprint())),
             })
@@ -405,9 +454,11 @@ impl Store {
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 /// Entries selected under their stream's lock, some of whose payloads may still have to be read from the segments.
 pub(crate) struct Selected(Window<Item>);
 
+#[cfg(not(verus_keep_ghost))]
 impl Selected {
     /// The reply, if every payload is already in hand.
     pub fn ready(self) -> std::result::Result<ResponseBody, Selected> {
@@ -421,9 +472,10 @@ impl Selected {
     }
 }
 
+#[cfg(not(verus_keep_ghost))]
 pub(crate) fn failed(message: impl Into<String>) -> ResponseBody { ResponseBody::Failed(Failed { message: message.into() }) }
 
-#[cfg(test)]
+#[cfg(all(test, not(verus_keep_ghost)))]
 mod tests {
     use super::*;
     use crate::protocol::{Check, DropStream, Overwrite};
