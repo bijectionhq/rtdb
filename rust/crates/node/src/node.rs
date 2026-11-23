@@ -2615,7 +2615,7 @@ impl NativeSession {
         }
         let (created, expiry) = held.resolve_expiry_nomination(&relation, &id, nomination, scope, deadline).await?;
         self.state.execute_tx(vec![
-            TxOp::OwnedDeadline { until: deadline },
+            TxOp::owned_deadline(deadline),
             TxOp::OwnedSweepExpired { relation, id, created, expiry, scope },
         ], Default::default()).await
     }
@@ -2702,7 +2702,7 @@ impl NativeSession {
         }
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
-        ops.push(TxOp::OwnedDeadline { until });
+        ops.push(TxOp::owned_deadline(until));
         if let Some(section) = fork.root {
             ops.extend(section.checks);
             ops.extend(section.publication.into_iter().flat_map(|root| root.writes));
@@ -2746,7 +2746,7 @@ impl NativeSession {
         if now >= until { return Err(unavailable()); }
         let _operations = self.service.node.memory().reserve(count * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(count);
-        ops.push(TxOp::OwnedDeadline { until });
+        ops.push(TxOp::owned_deadline(until));
         ops.push(TxOp::OwnedCheckWorldScope { scope });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         Self::append_world_checks(&mut ops, checks);
@@ -2868,7 +2868,7 @@ impl NativeSession {
         if effects > 4096 || now >= until { return Err(unavailable()); }
         let _operations = self.service.node.memory().reserve(effects * (std::mem::size_of::<TxOp>() + 512))?;
         let mut ops = Vec::with_capacity(effects);
-        ops.push(TxOp::OwnedDeadline { until });
+        ops.push(TxOp::owned_deadline(until));
         ops.push(TxOp::OwnedCheckWorldScope { scope });
         ops.extend(controls.into_iter().map(TxOp::HostedControl));
         ops.extend(root.checks);
@@ -2902,7 +2902,7 @@ impl NativeSession {
         &self, ops: &mut Vec<TxOp>, checks: Vec<OwnedWorldWitness>,
     ) -> Result<()> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        let Some(TxOp::OwnedDeadline { until }) = ops.first_mut() else {
+        let Some(TxOp::OwnedDeadline { until, .. }) = ops.first_mut() else {
             return Err(unavailable());
         };
         let scope = self.placed_history()?.ok_or_else(unavailable)?;

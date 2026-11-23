@@ -42,6 +42,7 @@ pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const COMMIT_HOSTED_COUNTED_V2: &str = "rtdb.owned.CommitHostedCounted.v2";
 pub(crate) const COMMIT_HOSTED_DECIDING_V1: &str = "rtdb.owned.CommitHostedDeciding.v1";
+pub(crate) const COMMIT_HOSTED_STAGED_V1: &str = "rtdb.owned.CommitHostedStaged.v1";
 pub(crate) const COMMIT_HOSTED_V1: &str = "rtdb.owned.CommitHosted.v1";
 pub(crate) const COMMIT_HOSTED_WORLD_READS_V2: &str = "rtdb.owned.CommitHostedWorldReads.v2";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
@@ -716,7 +717,7 @@ impl Service {
     }
 
     pub(crate) async fn commit_hosted_controls_action(&self, call: &Call, body: &[u8], counted: bool) -> Result<ActionResult, Status> {
-        self.commit_hosted_with_reads(call, body, counted, Vec::new(), None).await
+        self.commit_hosted_with_reads(call, body, counted, Vec::new(), None, false).await
     }
 
     pub(crate) async fn commit_hosted_world_reads_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -728,7 +729,7 @@ impl Service {
             _ => return Err(invalid("Invalid hosted root commit kind")),
         };
         let (worlds, body) = self.hosted_world_read_prefix(call, body)?;
-        self.commit_hosted_with_reads(call, body, counted, worlds, None).await
+        self.commit_hosted_with_reads(call, body, counted, worlds, None, false).await
     }
 
     fn hosted_world_read_prefix<'a>(
@@ -760,31 +761,37 @@ impl Service {
         Ok((worlds, body))
     }
 
-    pub(crate) async fn commit_hosted_deciding_action(
-        &self, call: &Call, body: &[u8],
+    pub(crate) async fn commit_hosted_flagged_action(
+        &self, call: &Call, body: &[u8], recheck_at_staging: bool,
     ) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
         let ([flags], body) = body.split_first_chunk::<1>()
-            .ok_or_else(|| invalid("Missing hosted constraint decision flags"))?;
-        if *flags & !0b11 != 0 {
-            return Err(invalid("Invalid hosted constraint decision flags"));
+            .ok_or_else(|| invalid("Missing hosted commit flags"))?;
+        let allowed = if recheck_at_staging { 0b111 } else { 0b11 };
+        if *flags & !allowed != 0 {
+            return Err(invalid("Invalid hosted commit flags"));
         }
         let counted = *flags & 1 != 0;
-        let (length, body) = body.split_first_chunk::<4>()
-            .ok_or_else(|| invalid("Missing hosted refusal length"))?;
-        let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
-            .ok_or_else(|| invalid("Truncated hosted refusal"))?;
+        let (refusal, primary) = if !recheck_at_staging || *flags & 0b100 != 0 {
+            let (length, body) = body.split_first_chunk::<4>()
+                .ok_or_else(|| invalid("Missing hosted refusal length"))?;
+            let (refusal, primary) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+                .ok_or_else(|| invalid("Truncated hosted refusal"))?;
+            (Some(refusal), primary)
+        } else {
+            (None, body)
+        };
         let (worlds, primary) = if *flags & 0b10 != 0 {
             self.hosted_world_read_prefix(call, primary)?
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, primary, counted, worlds, Some(refusal)).await
+        self.commit_hosted_with_reads(call, primary, counted, worlds, refusal, recheck_at_staging).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
-        refusal: Option<&[u8]>,
+        refusal: Option<&[u8]>, recheck_at_staging: bool,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
@@ -813,10 +820,13 @@ impl Service {
         let world_ops = world_checks * 2 + usize::from(world_checks != 0);
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(world_ops + conditions.len())
             .ok_or_else(|| invalid("Hosted conditions exceed the commit limit"))?;
-        let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging }];
         writes.extend(conditions);
         let (controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
         let replay = rtdb_tx::hosted_replay_controls(controls.iter()).map_err(status)?.is_some();
+        if recheck_at_staging && (replay || controls.iter().all(rtdb_tx::HostedControlWrite::is_check)) {
+            return Err(invalid("A staging deadline requires a live hosted control replacement"));
+        }
         if replay {
             for (held, _) in &witnesses {
                 held.snapshot.require_unscoped_root().map_err(status)?;
@@ -926,7 +936,7 @@ impl Service {
             CommitFormat::Grouped | CommitFormat::Ordered => MAX_GROUPED_COMMIT_ROWS.checked_sub(conditions.len())
                 .ok_or_else(|| invalid("Owned conditions exceed the commit limit"))?,
         };
-        let mut writes = vec![TxOp::OwnedDeadline { until: deadline }];
+        let mut writes = vec![TxOp::owned_deadline(deadline)];
         writes.extend(conditions);
         let effects = if erase_allowed { CommitEffects::Replay } else { CommitEffects::Facts };
         let _rows = self.decode_owned_commit_groups(call, groups, &mut writes, &mut rows_left, effects)?;

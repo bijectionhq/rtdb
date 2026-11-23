@@ -1155,10 +1155,11 @@ impl ReplicationDriver {
                 let request = if skipped { None } else { Some(SourceTransaction::decode(&message, &self.resolve.memory)?) };
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
+                let clock = Arc::clone(&self.clock);
                 leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
                     let _decoded_reservation = _decoded_reservation;
                     let result = match request {
-                        Some(request) => resolver.resolve_source(durable, position, metadata.timestamp, request, &context).await,
+                        Some(request) => resolver.resolve_source_with_clock(durable, position, metadata.timestamp, request, &context, Some(clock.as_ref())).await,
                         None => async {
                             let digits = position.0.to_string();
                             let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;

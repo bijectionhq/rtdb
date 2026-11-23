@@ -762,7 +762,7 @@ mod world_read_tests {
             relation: branch.clone(), pin: Iid([2; 16]), frontier: 0, local_frontier: None,
         };
         let mut operations = [
-            TxOp::OwnedDeadline { until: Timestamp(8) },
+            TxOp::owned_deadline(Timestamp(8)),
             TxOp::HostedControl(owner),
             TxOp::OwnedDelete { relation: root, id: id.clone(), valid_from: None, valid_to: None },
             TxOp::OwnedCheckWorldScope { scope },
@@ -916,7 +916,7 @@ mod retained_release_tests {
         };
         let world = Iid([1; 16]);
         let mut operations = [
-            TxOp::OwnedDeadline { until: Timestamp(8) },
+            TxOp::owned_deadline(Timestamp(8)),
             TxOp::OwnedCheckWorldScope { scope },
             TxOp::HostedControl(check),
             TxOp::HostedControl(replacement(Some(Timestamp(2)))?),

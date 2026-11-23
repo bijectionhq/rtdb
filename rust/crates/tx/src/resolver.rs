@@ -187,6 +187,12 @@ impl TxResolver {
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        self.resolve_source_with_clock(durable, position, log_time, request, context, None).await
+    }
+
+    pub async fn resolve_source_with_clock(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext,
+        clock: Option<&(dyn Fn() -> Timestamp + Send + Sync)>,
+    ) -> Result<Arc<ResolvedTx>> {
         let _sample = rtdb_plan::ExecutionSample::new(context.execution_observer.clone(), rtdb_plan::ExecutionTimer::TxOp);
         let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
@@ -225,6 +231,10 @@ impl TxResolver {
             Ok((primary, refusal)) => (primary, refusal, None),
             Err(error) => (request.operations.as_slice(), &[][..], Some(error)),
         };
+        let staging_deadline = primary.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging: true }) => Some(*until),
+            _ => None,
+        });
         let mut constraint_failed = false;
         let mut outcome = if let Some(error) = plan_error {
             Err(error)
@@ -244,6 +254,9 @@ impl TxResolver {
             Err(Anomaly::incorrect("rtdb/ordered-system-time", "specified system-time precedes the source-log timestamp")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
                 .with_context("log-time", transit::to_json_value(&T::instant(log_time.into())?)?))
+        } else if staging_deadline.is_some() && (attempt.is_none() || attempt.map(PlacedAttempt::scope) != context.owned_witness_scope
+            || request.guard.is_some() || request.idempotency_key().is_some()) {
+            Err(Anomaly::incorrect("rtdb.owned/staging-deadline", "A staging deadline requires a fresh placed source attempt"))
         } else if let Some(replay) = replay && let Err(error) = tx.check_replay_marker(replay).await {
             Err(error)
         } else {
@@ -329,6 +342,14 @@ impl TxResolver {
                 .chain(refusal).cloned().collect::<Vec<_>>();
             outcome = tx.apply_constraint_refusal(&operations, attempt.map(PlacedAttempt::scope)).await;
             settled = outcome.is_ok();
+        }
+        if outcome.is_ok() && let Some(until) = staging_deadline {
+            // The unpublished candidate, including a possible constraint receipt, can still be
+            // discarded here. Later resolutions may depend on it only after it is staged.
+            // Round the sampled clock up because its microsecond coordinate was truncated.
+            if clock.is_none_or(|clock| clock().0.checked_add(1).is_none_or(|upper| upper >= until.0)) {
+                outcome = Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before staging"));
+            }
         }
         let result = match outcome {
             Ok(()) => TransactionResult::Committed { tx_key: key },
@@ -1054,7 +1075,7 @@ impl<'a> OpenTransaction<'a> {
         }))?;
         let mut deadline = None;
         for operation in operations {
-            if let Operation::Public(TxOp::OwnedDeadline { until }) = operation {
+            if let Operation::Public(TxOp::OwnedDeadline { until, .. }) = operation {
                 if deadline.replace(*until).is_some() {
                     return Err(Anomaly::incorrect("rtdb.owned/duplicate-deadline", "An owned transaction may supply at most one deadline"));
                 }

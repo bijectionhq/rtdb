@@ -786,7 +786,7 @@ async fn owned_prefix_capacity_checks_atomic_final_membership() {
         insert(&other, 1, vec![7, 1]),
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(outcome.committed(), "{:?}", outcome.error());
-    let deadline = || TxOp::OwnedDeadline { until: Timestamp::MAX };
+    let deadline = || TxOp::owned_deadline(Timestamp::MAX);
     let count = |prefix, at_most| TxOp::OwnedCheckCapacity {
         relation: relation.clone(), column: "canonical".into(), prefix, at_most,
     };
