@@ -2,13 +2,15 @@
 //! Only shapes whose results match the scalar evaluator exactly are lowered: the declared result type of each node is
 //! kept by casting its operands, arithmetic is checked, and a batch whose evaluation fails, or meets a zero divisor,
 //! is left to the evaluator so that the evaluator raises its own error.
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::{cast::AsArray, types::{ArrowPrimitiveType, Float64Type, Int64Type}};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion_common::ScalarValue;
+use datafusion_common::arrow::compute::kernels::arity::try_binary;
 use datafusion_common::config::ConfigOptions;
-use datafusion_expr::{ColumnarValue, Operator};
+use datafusion_expr::{ColumnarValue, Operator, ScalarUDF, Volatility, create_udf};
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr, expressions as df};
 use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
@@ -20,13 +22,31 @@ fn arrow_type(logical: &LogicalType) -> Option<(ScalarType, DataType)> {
     let scalar = match logical { LogicalType::Scalar(scalar) => scalar, LogicalType::Maybe(inner) => return arrow_type(inner), _ => return None };
     let data_type = match scalar {
         ScalarType::I8 => DataType::Int8, ScalarType::I16 => DataType::Int16, ScalarType::I32 => DataType::Int32, ScalarType::I64 => DataType::Int64,
-        ScalarType::F64 => DataType::Float64, ScalarType::Utf8 => DataType::Utf8, ScalarType::Bool => DataType::Boolean,
+        ScalarType::F32 => DataType::Float32, ScalarType::F64 => DataType::Float64,
+        ScalarType::Utf8 => DataType::Utf8, ScalarType::Bool => DataType::Boolean,
         _ => return None,
     };
     Some((scalar.clone(), data_type))
 }
 
 fn integer(data_type: &DataType) -> bool { matches!(data_type, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) }
+
+fn modulo_function<T: ArrowPrimitiveType>(compute: fn(T::Native, T::Native) -> Result<T::Native>) -> Arc<ScalarUDF> {
+    let data_type = T::DATA_TYPE;
+    Arc::new(create_udf("xtdb_mod", vec![data_type.clone(), data_type.clone()], data_type, Volatility::Immutable, Arc::new(move |args| {
+        let arrays = ColumnarValue::values_to_arrays(args)?;
+        let result = try_binary::<_, _, _, T>(arrays[0].as_primitive::<T>(), arrays[1].as_primitive::<T>(), |left, right| {
+            compute(left, right).map_err(|error| ArrowError::ComputeError(error.to_string()))
+        })?;
+        if args.iter().all(|argument| matches!(argument, ColumnarValue::Scalar(_))) {
+            return Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&result, 0)?));
+        }
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    })))
+}
+
+static SIGNED_MODULO: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| modulo_function::<Int64Type>(rtdb_expr::signed_modulo));
+static FLOAT_MODULO: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| modulo_function::<Float64Type>(rtdb_expr::float_modulo));
 
 /// The input columns an expression reads, in the order the lowered expression addresses them.
 struct Inputs<'a> {
@@ -75,7 +95,8 @@ fn literal(value: &Value, expected: &DataType) -> Option<ScalarValue> {
     Some(match (value, expected) {
         (Value::I8(v), DataType::Int8) => ScalarValue::Int8(Some(*v)), (Value::I16(v), DataType::Int16) => ScalarValue::Int16(Some(*v)),
         (Value::I32(v), DataType::Int32) => ScalarValue::Int32(Some(*v)), (Value::I64(v), DataType::Int64) => ScalarValue::Int64(Some(*v)),
-        (Value::F64(v), DataType::Float64) => ScalarValue::Float64(Some(*v)), (Value::Utf8(v), DataType::Utf8) => ScalarValue::Utf8(Some(v.clone())),
+        (Value::F32(v), DataType::Float32) => ScalarValue::Float32(Some(*v)), (Value::F64(v), DataType::Float64) => ScalarValue::Float64(Some(*v)),
+        (Value::Utf8(v), DataType::Utf8) => ScalarValue::Utf8(Some(v.clone())),
         (Value::Bool(v), DataType::Boolean) => ScalarValue::Boolean(Some(*v)),
         _ => return None,
     })
@@ -95,7 +116,7 @@ impl Lowering<'_> {
                         literal(value, &data_type)?
                     } else {
                         let cell = self.parameters.arrow_cell(*index)?;
-                        if !(integer(&data_type) || matches!(data_type, DataType::Boolean | DataType::Float64))
+                        if !(integer(&data_type) || matches!(data_type, DataType::Boolean | DataType::Float32 | DataType::Float64))
                             || cell.array.data_type() != &data_type || !cell.field.metadata().is_empty() {
                             return None;
                         }
@@ -111,6 +132,7 @@ impl Lowering<'_> {
                 let op = match op { BinaryOp::Add => Operator::Plus, BinaryOp::Subtract => Operator::Minus, BinaryOp::Multiply => Operator::Multiply, _ => { self.divisors.push(Arc::clone(&right)); Operator::Divide } };
                 Arc::new(df::BinaryExpr::new(left, op, right).with_fail_on_overflow(true))
             }
+            Expr::Binary { op: BinaryOp::Modulo, left, right } => self.modulo(left, right, &data_type)?,
             Expr::Binary { op: op @ (BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } => {
                 // Floats compare by IEEE in the evaluator but by total order in Arrow, so only exact domains are lowered.
                 let (_, left_type) = arrow_type(&left.data_type())?;
@@ -160,6 +182,10 @@ impl Lowering<'_> {
                 let otherwise = self.cast_to(otherwise, &data_type)?;
                 Arc::new(df::CaseExpr::try_new(None, whens, Some(otherwise)).ok()?)
             }
+            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("mod") => {
+                let [left, right] = args.as_slice() else { return None; };
+                self.modulo(left, right, &data_type)?
+            }
             Expr::Call { name, args, .. } if args.len() == 1 => {
                 let function = match (name.to_ascii_lowercase().as_str(), &data_type) {
                     ("upper", DataType::Utf8) => datafusion_functions::string::upper(),
@@ -185,8 +211,21 @@ impl Lowering<'_> {
     fn cast_to(&mut self, expr: &Expr, target: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
         let (lowered, data_type) = self.lower(expr)?;
         if &data_type == target { return Some(lowered); }
-        let exact = integer(&data_type) && (integer(target) && widens(&data_type, target) || *target == DataType::Float64);
+        let exact = integer(&data_type) && (integer(target) && widens(&data_type, target) || *target == DataType::Float64)
+            || data_type == DataType::Float32 && *target == DataType::Float64;
         exact.then(|| Arc::new(df::CastExpr::new(lowered, target.clone(), Some(datafusion_common::arrow::compute::CastOptions { safe: false, ..Default::default() }))) as Arc<dyn PhysicalExpr>)
+    }
+
+    fn modulo(&mut self, left: &Expr, right: &Expr, result_type: &DataType) -> Option<Arc<dyn PhysicalExpr>> {
+        let (function, input_type) = if integer(result_type) { (Arc::clone(&SIGNED_MODULO), DataType::Int64) }
+            else if matches!(result_type, DataType::Float32 | DataType::Float64) { (Arc::clone(&FLOAT_MODULO), DataType::Float64) }
+            else { return None; };
+        let arguments = vec![self.cast_to(left, &input_type)?, self.cast_to(right, &input_type)?];
+        let index = self.functions.len();
+        self.functions.push((function, arguments, index));
+        let (call, _) = self.function(index, input_type.clone())?;
+        if *result_type == input_type { return Some(call); }
+        Some(Arc::new(df::CastExpr::new(call, result_type.clone(), Some(datafusion_common::arrow::compute::CastOptions { safe: false, ..Default::default() }))))
     }
 
     /// A function call over the inputs gathered so far, built against their schema.
@@ -218,7 +257,7 @@ fn lowerable_at(expr: &Expr, remaining: Option<usize>) -> bool {
     match expr {
         Expr::Parameter { .. } if remaining.is_some() => true,
         Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_) => arrow_type(&expr.data_type()).is_some(),
-        Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
+        Expr::Binary { op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo | BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
             | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or, left, right } => lower(left) && lower(right),
         Expr::Unary { op: UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Negate, expr } => lower(expr),
         Expr::Cast { expr, target: CastTarget::Fixed(_) } => lower(expr),
@@ -228,6 +267,7 @@ fn lowerable_at(expr: &Expr, remaining: Option<usize>) -> bool {
                 matches!(arg, Expr::Column { .. } | Expr::Parameter { .. } | Expr::Literal(_)) && lower(arg)
             }
             ("upper" | "lower" | "length" | "character_length" | "char_length" | "abs", [arg]) => lower(arg),
+            ("mod", [left, right]) => lower(left) && lower(right),
             _ => false,
         },
         _ => false,
@@ -331,6 +371,36 @@ mod tests {
     use rtdb_columnar::MemoryBudget;
     use rtdb_plan::{ColumnId, Field};
     use rtdb_types::Timestamp;
+
+    #[test]
+    fn modulo_projects_primitive_arrow_cells_and_feeds_an_integer_predicate() {
+        let memory = MemoryBudget::new(1 << 20);
+        for (ty, rows, divisor, expected) in [
+            (ScalarType::I8, vec![Value::I8(i8::MIN), Value::I8(-7), Value::Null], Value::I8(3), vec![Value::I8(1), Value::I8(2), Value::Null]),
+            (ScalarType::I16, vec![Value::I16(-7), Value::I16(7)], Value::I16(-3), vec![Value::I16(-1), Value::I16(-2)]),
+            (ScalarType::I32, vec![Value::I32(-7)], Value::I32(3), vec![Value::I32(2)]),
+            (ScalarType::I64, vec![Value::I64(i64::MIN)], Value::I64(-1), vec![Value::I64(0)]),
+            (ScalarType::F32, vec![Value::F32(-7.5), Value::Null], Value::I8(3), vec![Value::F32(1.5), Value::Null]),
+            (ScalarType::F64, vec![Value::F64(7.5), Value::F64(1e30)], Value::F64(3.0), vec![Value::F64(1.5), Value::F64(0.0)]),
+        ] {
+            let field = field(0, ty);
+            let schema = Schema::new(vec![field.clone()]).unwrap();
+            let arrow_field = Arc::new(rtdb_columnar::to_field("v", &field.data_type).unwrap());
+            let array = rtdb_columnar::build_array(&field.data_type, &rows).unwrap();
+            let column = Column::Arrow { array, field: arrow_field, logical: Some(field.data_type.clone()) };
+            let batch = ColumnBatch::settled(vec![column], rows.len(), memory.reserve(0).unwrap()).unwrap();
+            let args = vec![field.expression(), Expr::Literal(divisor)];
+            let result_type = rtdb_expr::function_type("mod", &args.iter().map(Expr::data_type).collect::<Vec<_>>()).unwrap();
+            let function = Expr::Call { name: "mod".into(), args, return_type: result_type };
+            let parameters = rtdb_expr::Parameters::Values(&[]);
+            let output = super::column(&function, &schema, &batch, parameters).expect("Expected primitive Arrow MOD");
+            for (row, value) in expected.iter().enumerate() { assert_eq!(&output.value(row).unwrap(), value); }
+            if matches!(expected[0], Value::I8(_)) {
+                let predicate = Expr::binary(BinaryOp::Gt, function, Expr::Literal(Value::I8(1)));
+                assert_eq!(truth(&predicate, &schema, &batch, parameters).unwrap(), [Some(false), Some(true), None]);
+            }
+        }
+    }
 
     struct Random(u64);
     impl Random {

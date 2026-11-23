@@ -107,7 +107,7 @@ impl Documents {
         if names.len() != columns.len() || rows.iter().any(|row| row.keys().any(|name| !names.contains(name.as_str()))) {
             return Err(Anomaly::incorrect("rtdb.tx/document-schema", "Document columns must be unique and cover every field in every row"));
         }
-        for row in &mut rows { row.values_mut().for_each(Value::admit_object_dates); }
+        for row in &mut rows { row.values_mut().try_for_each(Value::admit_object_dates)?; }
         Ok(Self(Arc::new(DocumentBatch { rows, layout: DocumentLayout::Submitted(columns), exact_presence: true, _reservation: reservation })))
     }
 
@@ -166,7 +166,7 @@ impl Documents {
             for ((field, column), reader) in children() {
                 let mut value = if bottom(field) { Value::Undefined } else { reader.read(column.as_ref(), row)? };
                 if preserve_null(field) || !matches!(value, Value::Null) {
-                    value.admit_object_dates();
+                    value.admit_object_dates()?;
                     document.insert(field.name().clone(), value);
                 }
             }
@@ -902,7 +902,7 @@ pub struct UserMetadata { value: Arc<Value>, _reservation: Arc<MemoryReservation
 impl UserMetadata {
     pub fn new(mut value: Value, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if !matches!(value, Value::Struct(_)) { return Err(Anomaly::incorrect("xtdb/invalid-user-metadata", "Transaction metadata must be a document")); }
-        value.admit_object_dates();
+        value.admit_object_dates()?;
         let reservation = memory.reserve(value.retained_bytes()?.checked_add(128).ok_or_else(overflow)?)?;
         Ok(Self { value: Arc::new(value), _reservation: reservation })
     }
@@ -949,7 +949,7 @@ impl ArgumentChunk {
                 let mut values = types.iter().zip(columns()).map(|(ty, (field, column))| {
                     rtdb_columnar::read_value_as(ty, field, column.as_ref(), index)
                 }).collect::<Result<Vec<_>>>()?;
-                values.iter_mut().for_each(Value::admit_object_dates);
+                values.iter_mut().try_for_each(Value::admit_object_dates)?;
                 Ok(ArgumentRow { values: Cow::Owned(values), _reservation: Some(reservation) })
             }
         }
@@ -998,7 +998,7 @@ impl SqlArguments {
     pub fn new(types: Vec<LogicalType>, mut rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         for ty in &types { ty.validate()?; }
         if rows.iter().any(|row| row.len() != types.len()) { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", "Argument rows have different widths")); }
-        for row in &mut rows { row.iter_mut().for_each(Value::admit_object_dates); }
+        for row in &mut rows { row.iter_mut().try_for_each(Value::admit_object_dates)?; }
         let mut bytes = rows.capacity().checked_mul(std::mem::size_of::<Vec<Value>>()).ok_or_else(overflow)?;
         for row in &rows {
             bytes = bytes.checked_add(row.capacity().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?).ok_or_else(overflow)?;

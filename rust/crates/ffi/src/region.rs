@@ -64,6 +64,11 @@ impl EmbeddedRegion {
 }
 impl Drop for EmbeddedRegion { fn drop(&mut self) { let _ = self.close(); } }
 
+pub(crate) fn with_query_stack<T>(query: impl FnOnce() -> T) -> T {
+    // The host may have used most of its thread stack before the native planner starts.
+    stacker::maybe_grow(2 << 20, rtdb_node::WORKER_STACK_BYTES, query)
+}
+
 pub(crate) struct DatabaseHandle(pub Arc<EmbeddedRegion>);
 impl Drop for DatabaseHandle { fn drop(&mut self) { let _ = self.0.close(); } }
 fn blocking_caller() -> Result<()> {

@@ -29,9 +29,7 @@ fn date_vector_outputs_apply_their_distinct_narrowing_rules() {
     let date = CivilDate::from_epoch_day(i64::MAX / 86_400_000).unwrap();
     let millis = date.epoch_day() * 86_400_000;
     let mut result = arithmetic(BinaryOp::Add, &V::DateMilli(millis), &V::IntervalYearMonth(12)).unwrap();
-    result.admit_expression_dates().unwrap();
-    assert_eq!(result,
-        V::DateMilli(date.plus_months(12).unwrap().epoch_day().wrapping_mul(86_400_000)));
+    assert_eq!(result.admit_expression_dates().unwrap_err().code, "xtdb.expression/overflow-error");
 }
 
 fn text(expression: Expr) -> Expr { Expr::Cast { expr: Box::new(expression), target: CastTarget::Fixed(target(ScalarType::Utf8)) } }
