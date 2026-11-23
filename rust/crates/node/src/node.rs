@@ -1319,20 +1319,8 @@ impl OwnedReadSession {
         &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], system: Timestamp,
     ) -> Result<Timestamp> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        self.require_unscoped_root()?;
-        self.admit_read().await?;
-        if !(1..=32).contains(&relations.len()) || !world.mode.is_writable() || world.dropped
-            || relations.iter().any(|relation| !relation.is_root_data() || world.schemas.relation(relation)
-                .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
-            || system <= world.basis.system_time
-            || system > self.present.system_time
-        {
-            return Err(unavailable());
-        }
-        let (current, _schema) = self.world_registration(world.id).await?.ok_or_else(unavailable)?;
-        if &current != world { return Err(unavailable()); }
-        self.world_merged_changes(world.id, relations, system, system, 1).await?;
-        let context = self.guard_context(Arc::clone(&self.context), relations)?;
+        if system <= world.basis.system_time { return Err(unavailable()); }
+        let context = self.admit_world_accepted_scope(world, relations, system).await?;
         let context = context.with_owned_system_cut(system, &context.cancellation)?;
         let (registration, _schema) = rtdb_query::read_owned_world(Arc::clone(&context), &self.owner, world.id)
             .await?.ok_or_else(unavailable)?;
@@ -1345,6 +1333,93 @@ impl OwnedReadSession {
         }
         self.check_relations(relations)?;
         Ok(clock)
+    }
+
+    /// Seek the protected clock history by logical reading, independently of physical order time.
+    pub async fn select_world_accepted_scope(
+        &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], requested: Timestamp,
+    ) -> Result<Option<(Timestamp, Timestamp)>> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let context = self.admit_world_accepted_scope(world, relations, self.present.system_time).await?;
+        let Some((clock, publication)) = rtdb_query::read_owned_world_clock_revision(
+            Arc::clone(&context), &self.owner, world.id,
+        ).await? else {
+            self.admit_world_accepted_scope(world, relations, world.basis.system_time).await?;
+            return Ok(None);
+        };
+        if !(world.basis.system_time < publication && publication <= self.present.system_time
+            && world.initial_clock() < clock && clock <= publication)
+        {
+            return Err(unavailable());
+        }
+        if clock <= requested {
+            let confirmed = self.certify_world_accepted_scope(world, relations, publication).await?;
+            if confirmed != clock { return Err(unavailable()); }
+            return Ok(Some((publication, confirmed)));
+        }
+
+        // Clock records have all-time validity, can only increase in ordered
+        // publication/replay, and cannot be erased through the ordinary owner.
+        // A capped full-ID point read gives the predecessor at a physical cut.
+        let mut lo = i128::from(world.basis.system_time.0);
+        let mut hi = i128::from(publication.0);
+        let mut selected = None;
+        while hi - lo > 1 {
+            self.check()?;
+            let mid = Timestamp((lo + (hi - lo) / 2) as i64);
+            let probe = context.with_owned_system_cut(mid, &context.cancellation)?;
+            let predecessor = rtdb_query::read_owned_world_clock_revision(probe, &self.owner, world.id).await?;
+            match predecessor {
+                Some((reading, revision)) => {
+                    if !(world.basis.system_time < revision && revision <= mid
+                        && world.initial_clock() < reading && reading < clock && reading <= revision)
+                        || selected.is_some_and(|(prior, prior_reading)| {
+                            revision < prior || reading < prior_reading
+                                || (revision == prior) != (reading == prior_reading)
+                        })
+                    {
+                        return Err(unavailable());
+                    }
+                    if reading <= requested {
+                        selected = Some((revision, reading));
+                        lo = i128::from(mid.0);
+                    } else {
+                        let upper = i128::from(revision.0);
+                        if upper <= lo { return Err(unavailable()); }
+                        hi = upper;
+                    }
+                }
+                None if selected.is_none() => lo = i128::from(mid.0),
+                None => return Err(unavailable()),
+            }
+        }
+        if let Some((system, reading)) = selected {
+            let confirmed = self.certify_world_accepted_scope(world, relations, system).await?;
+            if confirmed != reading { return Err(unavailable()); }
+            Ok(Some((system, confirmed)))
+        } else {
+            self.admit_world_accepted_scope(world, relations, world.basis.system_time).await?;
+            Ok(None)
+        }
+    }
+
+    async fn admit_world_accepted_scope(
+        &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], system: Timestamp,
+    ) -> Result<Arc<QueryContext>> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        self.require_unscoped_root()?;
+        self.admit_read().await?;
+        if !(1..=32).contains(&relations.len()) || !world.mode.is_writable() || world.dropped
+            || relations.iter().any(|relation| !relation.is_root_data() || world.schemas.relation(relation)
+                .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+            || system < world.basis.system_time || system > self.present.system_time
+        {
+            return Err(unavailable());
+        }
+        let (current, _schema) = self.world_registration(world.id).await?.ok_or_else(unavailable)?;
+        if &current != world { return Err(unavailable()); }
+        self.world_merged_changes(world.id, relations, system, system, 1).await?;
+        self.guard_context(Arc::clone(&self.context), relations)
     }
 
     pub async fn world_application_clock(&self, world: rtdb_types::Iid) -> Result<Option<Timestamp>> {
