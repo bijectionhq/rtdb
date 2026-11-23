@@ -12,7 +12,7 @@ use super::WorldReadmission;
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP3";
+const MAGIC: &[u8] = b"BJWP4";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]

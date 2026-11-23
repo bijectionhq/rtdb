@@ -270,7 +270,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     }
     let ancestor = rtdb_directory::CheckpointWorldAncestor {
         world: Uuid::from_bytes(world.0), pin: Uuid::from_bytes(pin.0), capture, suffix,
-        manifest_sha256: manifest.clone(), basis, logical,
+        manifest_sha256: manifest.clone(), basis, source_root: original.basis, logical,
     };
     let binding = CheckpointWorldRetention {
         world: child, ancestor: Some(ancestor), owner: owner.clone(),
@@ -468,6 +468,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
                     .await?.ok_or_else(unavailable)?;
                 let clock = rtdb_query::read_owned_world_clock_revision(context, owner, source_world).await?;
                 if record.dropped || record.pin.0 != original.pin || record.ancestor.is_some()
+                    || record.basis != original.source_root
                     || !matches!(record.mode, WorldClockMode::Held { .. }) || &record.schemas != schemas
                     || clock != Some((original.logical, basis.system_time))
                 {
@@ -478,7 +479,8 @@ pub(crate) async fn retain_replayed_checkpoint_world(
         ).await?;
         Some(rtdb_directory::CheckpointWorldAncestor {
             world: Uuid::from_bytes(original.world), pin: Uuid::from_bytes(original.pin),
-            capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis, logical: original.logical,
+            capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis,
+            source_root: original.source_root, logical: original.logical,
         })
     } else {
         None
@@ -591,6 +593,7 @@ fn world_ancestor(retained: &CheckpointWorldRetention) -> Option<rtdb_types::Own
         suffix: *ancestor.suffix.as_bytes(),
         manifest: ancestor.manifest_sha256.clone(),
         basis: ancestor.basis,
+        source_root: ancestor.source_root,
         logical: ancestor.logical,
     })
 }
