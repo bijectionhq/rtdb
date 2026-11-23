@@ -19,8 +19,8 @@ mod archive;
 mod assertion;
 mod journal;
 mod unit;
-pub use unit::{UnitOperation, UnitOutput, UnitSlot};
-pub(crate) use unit::{UnitLedger, UnitScope};
+pub use unit::{UnitOperation, UnitOutput, UnitScope, UnitSlot};
+pub(crate) use unit::UnitLedger;
 pub use assertion::{AssertionEnvelope, AssertionKeyService, AssertionStage};
 pub use journal::JournalKey;
 pub use archive::ArchiveKey;
@@ -85,6 +85,9 @@ pub trait KeyService: Send + Sync {
         Err(unit::unsupported())
     }
 
+    async fn withdraw_unit_scope(&self, _scope: UnitScope, _io: &Arc<IoRegion>) -> Result<()> {
+        Err(unit::unsupported())
+    }
 
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
         self.key(&key.id()).await.map(|_| ())
@@ -378,6 +381,10 @@ impl KeyService for LocalKeyService {
 
     async fn withdraw_unit_key(&self, slot: UnitSlot, io: &Arc<IoRegion>) -> Result<()> {
         self.withdraw_local_unit(slot, io).await
+    }
+
+    async fn withdraw_unit_scope(&self, scope: UnitScope, io: &Arc<IoRegion>) -> Result<()> {
+        self.withdraw_local_scope(scope, io).await
     }
 
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {

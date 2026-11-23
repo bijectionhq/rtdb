@@ -52,10 +52,12 @@ The local vault serializes enrollment and withdrawal against key use, and the S3
 Both providers retain irreversible slot tombstones.
 The checkpoint manifest inventories the published members and seals under its own slot.
 Checkpoint preparation copies verified plaintext into the destination allocation before publication, so the successor can open without obtaining the writer's object keys.
-Ordinary installed checkpoint retirement withdraws the manifest's member and preparation slots, then withdraws the manifest slot.
+Local retirement fences the exact vault namespace, drains key operations, and withdraws the entire slot census before removing checkpoint or serving-prefix ciphertext.
+The census includes slots created by interrupted writes.
+S3 checkpoint retirement withdraws the manifest's member and preparation slots, then withdraws the manifest slot.
 
 Directory-managed Multi objects and several archive and transfer paths still use coarser keys or share encrypted bytes.
-Classic storage, complete serving-prefix and abandoned-write inventory, and deployment-wide collection of installed unit slots remain open.
+Classic storage, complete S3 serving-prefix and abandoned-write inventory, and deployment-wide collection of installed unit slots remain open.
 Provider verification includes ranged reads, object naming, lost create replies, redundant compaction jobs, independent-copy isolation, cache fencing, and nonce uniqueness.
 
 [Current cipher](../../rust/crates/multi/src/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

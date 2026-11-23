@@ -692,8 +692,9 @@ impl Placement {
     pub(crate) async fn retire_serving_prefixes(
         &self,
         storage: &crate::deployment::CellStorage,
+        keys: &Arc<dyn KeyService>,
     ) -> Result<Vec<(u64, prefix_retirement::Outcome)>> {
-        prefix_retirement::retire(self, storage).await
+        prefix_retirement::retire(self, storage, keys).await
     }
 
     async fn pin_root(&self, source: Hold, tasks: &TaskTracker) -> Result<Arc<Held>> {

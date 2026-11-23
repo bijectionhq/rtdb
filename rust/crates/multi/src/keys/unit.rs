@@ -1,7 +1,10 @@
 //! Key slots for immutable units in installed storage.
 
 use std::{
+    fs::{self, File},
+    io::ErrorKind,
     ops::Range,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,10 +19,11 @@ use crate::cipher::Cipher;
 use super::{FramedObject, KEY_BYTES, KeyService, LocalKeyService, journal::key_error};
 
 pub(super) const SLOT_PREFIX: &str = "unit-";
+const NAMESPACE_CLOSED: &[u8] = b"RTDB-unit-namespace-closed-v1";
 pub(super) const OPERATION_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
-pub(crate) struct UnitScope([u8; 32]);
+pub struct UnitScope([u8; 32]);
 
 impl UnitScope {
     pub(crate) fn new(
@@ -39,13 +43,16 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
+    fn namespace(self) -> String {
+        format!("{SLOT_PREFIX}{}", hex(&self.0))
+    }
+
     fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
-        UnitSlot(format!(
-            "{SLOT_PREFIX}{}-{}",
-            hex(&self.0),
-            hex(name.as_ref())
-        ))
+        UnitSlot {
+            scope: self,
+            name: hex(name.as_ref()),
+        }
     }
 }
 
@@ -58,11 +65,14 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-pub struct UnitSlot(String);
+pub struct UnitSlot {
+    scope: UnitScope,
+    name: String,
+}
 
 impl UnitSlot {
-    pub(super) fn id(&self) -> &str {
-        &self.0
+    pub(super) fn id(&self) -> String {
+        format!("{}-{}", self.scope.namespace(), self.name)
     }
 }
 
@@ -172,6 +182,10 @@ impl UnitLedger {
         result
     }
 
+    pub(crate) async fn withdraw_scope(&self) -> Result<()> {
+        self.keys.withdraw_unit_scope(self.scope, &self.io).await
+    }
+
     pub(crate) async fn withdraw(&self, name: &ObjectKey) -> Result<()> {
         self.keys
             .withdraw_unit_key(self.scope.slot(name), &self.io)
@@ -208,6 +222,15 @@ pub(super) fn with_material<T>(
     result
 }
 
+fn local_scope_closed(path: &Path) -> Result<bool> {
+    match fs::read(path) {
+        Ok(marker) if marker == NAMESPACE_CLOSED => Ok(true),
+        Ok(_) => Err(super::malformed()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(super::io(error)),
+    }
+}
+
 impl LocalKeyService {
     pub(super) async fn use_local_unit(
         &self,
@@ -221,7 +244,20 @@ impl LocalKeyService {
         let result = io
             .run_blocking(move || {
                 let vault = service.archive_vault().map_err(key_error)?;
-                let path = vault.path(slot.id()).map_err(key_error)?;
+                let scope = vault.path(&slot.scope.namespace()).map_err(key_error)?;
+                let _gate = File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(scope.with_extension("lock"))
+                    .map_err(super::io)
+                    .map_err(key_error)?;
+                _gate.lock_shared().map_err(super::io).map_err(key_error)?;
+                if local_scope_closed(&scope).map_err(key_error)? {
+                    return Err(Error::ErasedUnderView);
+                }
+                let path = vault.path(&slot.id()).map_err(key_error)?;
                 let _lock = vault.lock_key(&path).map_err(key_error)?;
                 if Instant::now() >= deadline {
                     return Err(expired());
@@ -238,6 +274,49 @@ impl LocalKeyService {
         result
     }
 
+    pub(super) async fn withdraw_local_scope(
+        &self,
+        scope: UnitScope,
+        io: &Arc<IoRegion>,
+    ) -> Result<()> {
+        let service = self.clone();
+        io.run_blocking(move || {
+            let complete = || {
+                let vault = service.archive_vault()?;
+                let namespace = scope.namespace();
+                let marker = vault.path(&namespace)?;
+                let _gate = vault.lock_key(&marker)?;
+                if !local_scope_closed(&marker)? {
+                    vault.publish(&marker, NAMESPACE_CLOSED)?;
+                }
+                let prefix = format!("{namespace}-");
+                let mut slots = std::collections::BTreeSet::new();
+                for entry in fs::read_dir(&vault.directory).map_err(super::io)? {
+                    let entry = entry.map_err(super::io)?;
+                    let path = entry.path();
+                    let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    let Some(unit) = id.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if unit.len() == 64 && unit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        slots.insert(vault.path(id)?);
+                    }
+                }
+                // The namespace lock excludes provisioning while the vault
+                // reconciles slots, including slots with only a pending write.
+                for path in slots {
+                    let _lock = vault.lock_key(&path)?;
+                    super::archive::withdraw_locked(&vault, &path)?;
+                }
+                vault.sync_directory()
+            };
+            Ok(complete())
+        })
+        .await?
+    }
+
     pub(super) async fn withdraw_local_unit(
         &self,
         slot: UnitSlot,
@@ -247,7 +326,9 @@ impl LocalKeyService {
         io.run_blocking(move || {
             let complete = || {
                 let vault = service.archive_vault()?;
-                let path = vault.path(slot.id())?;
+                let scope = vault.path(&slot.scope.namespace())?;
+                let _gate = vault.lock_key(&scope)?;
+                let path = vault.path(&slot.id())?;
                 let _lock = vault.lock_key(&path)?;
                 super::archive::withdraw_locked(&vault, &path)
             };
@@ -311,6 +392,22 @@ mod tests {
             Err(Error::ErasedUnderView)
         ));
         assert_eq!(reopened.get(&survivor).await?, body);
+        assert_eq!(successor.get(&erased).await?, body);
+
+        let orphan = ObjectKey::new("unpublished")?;
+        original_ledger
+            .operate(&orphan, UnitOperation::Seal(body.clone()))
+            .await?;
+        original_ledger.withdraw_scope().await?;
+        original_ledger.withdraw_scope().await?;
+        assert!(matches!(
+            reopened.get(&survivor).await,
+            Err(Error::ErasedUnderView)
+        ));
+        assert!(matches!(
+            reopened.put(&orphan, body.clone()).await,
+            Err(Error::ErasedUnderView)
+        ));
         assert_eq!(successor.get(&erased).await?, body);
         Ok(())
     }

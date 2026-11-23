@@ -508,6 +508,7 @@ contract LogService {
         -- Checkpoint preparation seals the manifest and copied members under new slots scoped to the allocation.
         -- A selected checkpoint opens against its exact manifest and the allocation's own slots.
         -- Checkpoint retirement closes the original selection and withdraws its listed key dependencies after its existing holds drain.
+        -- Local checkpoint and serving-prefix retirement fence their key namespace and withdraw every slot in it, including slots from abandoned writes, before removing ciphertext.
         -- Serving storage releases bodies only within a journal-issued serving lease.
         -- A detached replica object reader uses the lease captured at its admission for cryptography.
 

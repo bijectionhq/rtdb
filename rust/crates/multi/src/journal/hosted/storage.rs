@@ -280,7 +280,7 @@ fn source_prefix(
     )
 }
 
-fn serving_ledger(
+pub(super) fn serving_ledger(
     keys: Arc<dyn KeyService>,
     installed: Placement,
     provider: [u8; 32],

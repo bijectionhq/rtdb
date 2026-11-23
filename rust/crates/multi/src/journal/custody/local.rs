@@ -174,32 +174,12 @@ impl Allocation<'_> {
         self.mark("closed", manifest).await
     }
 
-    pub(super) async fn settle_keys(&self, manifest: Fingerprint) -> Result<()> {
-        self.mark("keys-settled", manifest).await
-    }
-
     async fn mark(&self, name: &str, manifest: Fingerprint) -> Result<()> {
         self.state
             .put(&ObjectKey::new(name)?, Bytes::copy_from_slice(&manifest))
             .await?;
         self.sync_scope().await?;
         Ok(())
-    }
-
-    pub(super) async fn require_keys_settled(&self, manifest: Fingerprint) -> Result<bool> {
-        match self.state.get_fresh(&ObjectKey::new("keys-settled")?).await {
-            Ok(marker)
-                if marker.as_ref() == manifest.as_slice()
-                    && self.require_disposition(manifest).await? =>
-            {
-                Ok(true)
-            }
-            Ok(_) => Err(invalid(
-                "The settled keys belong to a different checkpoint disposition",
-            )),
-            Err(Error::MissingObject(_)) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
     }
 
     pub(super) async fn retire(&self) -> Result<()> {
@@ -290,9 +270,7 @@ mod tests {
         assert!(!retirement.require_disposition(digest).await.unwrap());
         retirement.close(digest).await.unwrap();
         let ledger = UnitLedger::new(keys, key_scope, retirement.region());
-        ledger.withdraw(&key).await.unwrap();
-        retirement.settle_keys(digest).await.unwrap();
-        assert!(retirement.require_keys_settled(digest).await.unwrap());
+        ledger.withdraw_scope().await.unwrap();
         retirement.retire().await.unwrap();
         assert!(!volume.path().join(scope).exists());
         assert!(retirement.require_disposition(digest).await.unwrap());

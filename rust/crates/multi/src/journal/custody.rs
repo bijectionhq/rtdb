@@ -483,18 +483,12 @@ impl CheckpointCustody {
         let scope = self.allocation(chosen.custody);
         let allocation = local.acquire(&scope, true).await?;
         let ledger = self.ledger(chosen.custody, allocation.region());
-        if !allocation.require_keys_settled(chosen.manifest).await? {
-            allocation.require_disposition(chosen.manifest).await?;
+        if !allocation.require_disposition(chosen.manifest).await? {
             let reader = allocation.read_store(ledger.clone())?;
-            let selected = self.read_manifest(reader.as_ref(), chosen).await?;
+            self.read_manifest(reader.as_ref(), chosen).await?;
             allocation.close(chosen.manifest).await?;
-            for logical in selected.members.keys() {
-                ledger.withdraw(&self.member(chosen.custody, &ObjectKey::new(logical.as_str())?)?).await?;
-            }
-            ledger.withdraw(&self.intent(chosen.custody)?).await?;
-            allocation.settle_keys(chosen.manifest).await?;
         }
-        ledger.withdraw(&self.manifest(chosen.custody)?).await?;
+        ledger.withdraw_scope().await?;
         allocation.retire().await?;
         self.disposition(chosen)
     }
