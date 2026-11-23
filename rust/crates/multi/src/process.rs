@@ -66,6 +66,11 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
+    let audience = settings.configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
+    if audience != settings.agent.audience_journal_port.is_some() || settings.agent.audience_journal_port == Some(0) {
+        return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
+            "An audience Flight listener and its read-only journal port must be installed together"));
+    }
     if let Some(archive) = &settings.agent.world_archive {
         crate::archive::require_independent_world_archive(&settings.agent.storage, archive)?;
     }
@@ -262,6 +267,7 @@ fn stopped_agent() -> Anomaly {
 
 pub struct LogkeeperSettings {
     pub listen: SocketAddr,
+    pub authority: Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>,
     /// Stable DNS name of the disk, so ensembles can still reach it after a process restart.
     pub advertise_host: Option<String>,
     pub data_dir: PathBuf,
@@ -282,6 +288,13 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     let listener = TcpListener::bind(settings.listen).await.map_err(io)?;
     let address = listener.local_addr().map_err(io)?;
     let endpoint = advertised(address, settings.advertise_host.as_deref())?;
+    let authority = if let Some((listen, profile)) = settings.authority {
+        if !settings.fsync {
+            return Err(Anomaly::incorrect("rtdb.multi/audience-authority", "The audience journal requires fsync"));
+        }
+        let socket = TcpListener::bind(listen).await.map_err(io)?;
+        Some(rtdb_logkeeper::AuthorityListener { socket, source: profile.source(), connections: profile.permits() })
+    } else { None };
     let (journal, identity) = rtdb_logkeeper::PreparedJournal::open_for_member(rtdb_logkeeper::ServerOptions {
         data_dir: settings.data_dir,
         fsync: settings.fsync,
@@ -296,7 +309,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
     }, MemberId(identity), settings.advertise_host.is_some(), settings.lease).await?;
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    tasks.spawn(journal.serve(listener, cancellation.clone()));
+    tasks.spawn(journal.serve_with_authority(listener, authority, cancellation.clone()));
     { let lease = Arc::clone(&lease); let cancellation = cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     Ok(RunningLogkeeper { address, lease, cancellation, tasks })
 }
@@ -356,6 +369,7 @@ mod tests {
         let directory = rtdb_directory::MemoryDirectory::new();
         let data = tempfile::tempdir().unwrap();
         let settings = || LogkeeperSettings {
+            authority: None,
             listen: "127.0.0.1:0".parse().unwrap(),
             advertise_host: None,
             data_dir: data.path().to_owned(),
@@ -386,6 +400,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let empty = tempfile::tempdir().unwrap();
         let settings = |path: &std::path::Path, listen| LogkeeperSettings {
+            authority: None,
             listen,
             advertise_host: Some("keeper.test.internal".into()),
             data_dir: path.to_owned(),

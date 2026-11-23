@@ -616,6 +616,40 @@ impl Writer {
         }
     }
 
+    /// Confirms the durable epoch on a fresh quorum without submitting disk or append work.
+    pub async fn confirm_authority(&self, port: u16) -> Result<()> {
+        let still_open = || match &*self.tip.borrow() {
+            Tip::Open(_) => Ok(()),
+            Tip::Deposed { promised } => Err(Error::Deposed { epoch: self.epoch, promised: *promised }),
+        };
+        still_open()?;
+        let quorum = self.ensemble.config.write_quorum;
+        if quorum <= self.ensemble.len() - quorum {
+            return Err(Error::Remote {
+                key: self.ensemble.config.stream.clone(),
+                message: "durable writer authority requires an intersecting write quorum".into(),
+            });
+        }
+        let mut replies: FuturesUnordered<_> = (0..self.ensemble.len())
+            .map(|server| self.ensemble.confirm_authority(server, self.epoch, port)).collect();
+        let mut confirmed = 0;
+        while let Some(reply) = replies.next().await {
+            match reply {
+                Ok(None) => {
+                    confirmed += 1;
+                    if confirmed == quorum { return still_open(); }
+                }
+                Ok(Some(promised)) if promised > self.epoch => {
+                    self.depose(&mut self.state.lock(), promised);
+                    return Err(Error::Deposed { epoch: self.epoch, promised });
+                }
+                _ => {}
+            }
+            if confirmed + replies.len() < quorum { break; }
+        }
+        Err(Error::Remote { key: self.ensemble.config.stream.clone(), message: "a write quorum did not confirm durable writer authority".into() })
+    }
+
     fn join_confirmation(self: &Arc<Self>, pipeline: &mut Pipeline) -> watch::Receiver<Option<Confirmation>> {
         match &mut pipeline.confirming {
             Some(confirming) => confirming.next.get_or_insert_with(Round::new).outcome.subscribe(),

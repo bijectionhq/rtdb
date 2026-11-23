@@ -14,7 +14,7 @@ pub use client::{CertifiedRangeReader, CopyFrom, Loglet, QuorumLog, RetainedAudi
 pub use protocol::Entry as ArchivedReplicaEntry;
 pub use local::LocalListener;
 pub use rtdb_types::JournalEndpoint;
-pub use server::{JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
+pub use server::{AuthorityListener, JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
 
 /// The pure pieces `rtdb-simulation` drives directly: one stream's server state machine, the recovery planning rules, and the messages they exchange.
 /// Not API: they change with the protocol.

@@ -129,6 +129,7 @@ pub(crate) struct Work {
     pub write: Write,
     pub done: oneshot::Sender<std::result::Result<(), String>>,
     pub _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub authority_revision: Option<u64>,
 }
 
 /// The segment being appended to; touched only by the journal's rounds.
@@ -798,7 +799,12 @@ pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mp
                 let mut released = false;
                 for work in works {
                     match &work.write {
-                        Write::Events(_, events) => released |= events.iter().any(|event| matches!(event, Event::Trim(_) | Event::Drop(_))),
+                        Write::Events(slot, events) => {
+                            if let Some(revision) = work.authority_revision {
+                                slot.publish_authority_revision(revision);
+                            }
+                            released |= events.iter().any(|event| matches!(event, Event::Trim(_) | Event::Drop(_)));
+                        }
                         Write::Compact(_) => released = false,
                     }
                     let _ = work.done.send(Ok(()));
@@ -826,14 +832,14 @@ mod tests {
 
     fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
 
-    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None } }
+    fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None, authority_revision: None } }
 
     fn slot(journal: &Journal, name: &str) -> Arc<Slot> {
-        Arc::new(Slot { id: journal.allocate_id(), name: name.into(), state: Default::default(), progressed: Default::default() })
+        Arc::new(Slot::new(journal.allocate_id(), name.into(), StreamState::default()))
     }
 
     fn recovered_slots(recovered: Vec<Recovered>) -> BTreeMap<String, Arc<Slot>> {
-        recovered.into_iter().map(|stream| (stream.name.clone(), Arc::new(Slot { id: stream.id, name: stream.name, state: Mutex::new(stream.state), progressed: Default::default() }))).collect()
+        recovered.into_iter().map(|stream| (stream.name.clone(), Arc::new(Slot::new(stream.id, stream.name, stream.state)))).collect()
     }
 
     /// Decides on the slot's own state and writes the decision as one round, as the store and the journal task do.

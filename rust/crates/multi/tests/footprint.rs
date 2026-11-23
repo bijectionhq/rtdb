@@ -23,6 +23,7 @@ async fn the_resident_cost_of_an_idle_deployment() {
     let mut logkeepers = Vec::new();
     for index in 0..3 {
         logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
+            authority: None,
             advertise_host: None,
             listen: "127.0.0.1:0".parse().unwrap(), data_dir: data.path().join(format!("lk{index}")), fsync: false, cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES, availability_zone: format!("z{index}"), lease: lease.clone(),
         }).await.unwrap());
@@ -102,6 +103,7 @@ async fn a_node_can_retain_one_hundred_thousand_idle_placements() {
     let mut logkeepers = Vec::new();
     for index in 0..3 {
         logkeepers.push(process::start_logkeeper(Arc::clone(&directory), process::LogkeeperSettings {
+            authority: None,
             advertise_host: None, listen: "127.0.0.1:0".parse().unwrap(),
             data_dir: data.path().join(format!("lk{index}")), fsync: true,
             cache_bytes: rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES, availability_zone: format!("z{index}"), lease: lease.clone(),

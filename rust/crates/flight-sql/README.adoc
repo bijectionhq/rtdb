@@ -270,7 +270,7 @@ The handle admits held point, historical point and hosted control reads and appl
 This operation establishes a data cut. Its ordered time does not give the current physical clock or establish live write authority.
 
 On a placed cell, install the same `--flight-audience UUID/TURNS` on every Flight gateway and holder and bind a separate `--flight-audience-listen ADDR` on each.
-The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v6` on the audience gateway during its handshake.
+The authenticated hosted owner sends the installed value as `x-rtdb-audience-flight-v7` on the audience gateway during its handshake.
 The gateway and holder must acknowledge the exact source and turn count. Ordinary and audience routes are accepted on their own listeners.
 The dedicated path has its own TCP acceptance, connection limits, calls, backend HTTP/2 connection pool and holder session slots.
 The connection, call and session limits set aside two permits per turn plus two for preparation and cleanup.
@@ -280,8 +280,11 @@ A delayed open with an earlier or repeated generation cannot displace the replac
 The audience handshake and subsequent actions use the reserved admission.
 The gateway resolves the placement at handshake, then forwards authenticated session actions to the sealed holder address.
 For each audience data action the holder checks the live member, current deployment and epoch, recovered checkpoint and exact attached database.
-Applied acquisition and confirmation also confirm journal leadership on that holder. Closing a local hold or session only releases resources.
-The directory, journal quorum, network, object storage, and scheduler still have service obligations.
+Applied acquisition and confirmation also check journal leadership on the holder's configured `--audience-journal-port`.
+Each logkeeper serves this port with `--audience-authority UUID/TURNS` and `--audience-authority-listen ADDR`.
+The connection and frame sizes are bounded. Each success confirms the exact journal, replica stream, active ensemble and durable writer epoch.
+A pending fence change refuses immediately until it is durable. Ordinary append and history-read queues do not carry these authority checks.
+Closing a local hold or session only releases resources. The directory, journal quorum, network, object storage, and scheduler still have service obligations.
 
 Before its first open, a reserved session must call `rtdb.owned.PrepareAppliedRead.v1`. The body is the same source and exact transaction floor as an applied open, without the generation. The action returns an empty stream after registering the captured catalog in the directory.
 The registration is session-bound and expires after 180 monotonic seconds. A read or confirmation shares it only for a catalog at or after the registered cut in the same attachment, storage version, storage epoch and replica epoch.

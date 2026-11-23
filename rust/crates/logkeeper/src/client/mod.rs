@@ -342,6 +342,16 @@ impl QuorumLog {
             confirmed = writer.confirm_leadership() => confirmed.map_err(Into::into),
         }
     }
+
+    /// Confirms only the active epoch, using the installed read-only journal port.
+    pub async fn confirm_authority(&self, port: u16) -> rtdb_types::Result<()> {
+        self.shared.check_open()?;
+        let Role::Writer(writer) = &self.shared.role else { return Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream)).into()) };
+        tokio::select! {
+            _ = self.shared.cancellation.cancelled() => Err(Error::Closed("shutdown".into()).into()),
+            confirmed = writer.confirm_authority(port) => confirmed.map_err(Into::into),
+        }
+    }
 }
 
 fn record(entry: crate::protocol::Entry) -> LogRecord {

@@ -22,8 +22,8 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-standalone --state PATH --name NAME --id UUID\n\
        rtdb-multi standalone --state PATH --name NAME --id UUID --certificate FILE --private-key FILE --password-file FILE --ready-file FILE [--parent-stdin]\n\
        rtdb-multi directory --state PATH --listen ADDR\n\
-       rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync]\n\
-       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
+       rtdb-multi node --directory DIR --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway --directory DIR --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
@@ -99,11 +99,11 @@ impl Arguments {
     fn address(&self, name: &str, default: &str) -> Result<SocketAddr> {
         self.optional(name).unwrap_or(default).parse().map_err(|_| usage(format!("--{name} must be HOST:PORT")))
     }
-    fn audience_flight(&self) -> Result<Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>> {
-        if !self.present("flight-audience") && !self.present("flight-audience-listen") { return Ok(None); }
-        let address = self.required("flight-audience-listen")?.parse()
-            .map_err(|_| usage("--flight-audience-listen must be HOST:PORT".into()))?;
-        let audience = rtdb_flight_sql::AudienceFlightConfig::parse(self.required("flight-audience")?)?;
+    fn audience_listener(&self, profile: &str, listen: &str) -> Result<Option<(SocketAddr, rtdb_flight_sql::AudienceFlightConfig)>> {
+        if !self.present(profile) && !self.present(listen) { return Ok(None); }
+        let address = self.required(listen)?.parse()
+            .map_err(|_| usage(format!("--{listen} must be HOST:PORT")))?;
+        let audience = rtdb_flight_sql::AudienceFlightConfig::parse(self.required(profile)?)?;
         Ok(Some((address, audience)))
     }
     fn number<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
@@ -374,6 +374,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "logkeeper" => {
             let directory = directory(arguments.required("directory")?).await?;
             let logkeeper = process::start_logkeeper(directory, process::LogkeeperSettings {
+                authority: arguments.audience_listener("audience-authority", "audience-authority-listen")?,
                 advertise_host: arguments.optional("advertise-host").map(str::to_owned),
                 listen: arguments.address("listen", "127.0.0.1:0")?, data_dir: PathBuf::from(arguments.required("data")?), fsync: !arguments.present("no-fsync"),
                 cache_bytes: arguments.number("cache-bytes", rtdb_logkeeper::ServerOptions::DEFAULT_CACHE_BYTES)?,
@@ -388,11 +389,17 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 Some(path) => NodeConfiguration::from_yaml(&std::fs::read_to_string(path).map_err(io)?)?,
                 None => NodeConfiguration::from_yaml("server:\n  port: 0\n")?,
             };
-            if let Some(audience) = arguments.audience_flight()? {
+            if let Some(audience) = arguments.audience_listener("flight-audience", "flight-audience-listen")? {
                 configuration.flight_sql.as_mut().filter(|flight| flight.port >= 0)
                     .ok_or_else(|| usage("--flight-audience requires a Flight SQL configuration".into()))?.audience = Some(audience);
             }
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
+            if configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some()) {
+                agent.audience_journal_port = Some(arguments.required("audience-journal-port")?.parse::<u16>().ok()
+                    .filter(|port| *port != 0).ok_or_else(|| usage("--audience-journal-port must be a positive port".into()))?);
+            } else if arguments.present("audience-journal-port") {
+                return Err(usage("--audience-journal-port requires the node's audience Flight listener".into()));
+            }
             agent.world_archive = arguments.optional("archive-root").map(CellStorage::parse).transpose()?;
             if arguments.present("s3-write-role") {
                 let sts_endpoint = if arguments.present("sts-endpoint") { Some(arguments.required("sts-endpoint")?.to_owned()) } else { None };
@@ -473,7 +480,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     None => std::future::pending().await,
                 }
             };
-            let audience = if let Some((address, audience)) = arguments.audience_flight()? {
+            let audience = if let Some((address, audience)) = arguments.audience_listener("flight-audience", "flight-audience-listen")? {
                 let listener = tokio::net::TcpListener::bind(address).await.map_err(io)?;
                 eprintln!("Audience Flight gateway listening on {}", listener.local_addr().map_err(io)?);
                 Some((listener, audience))
