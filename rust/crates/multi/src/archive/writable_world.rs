@@ -654,6 +654,54 @@ pub(crate) async fn fork_checkpoint_world_selected(
         .await?
         .ok_or_else(OwnedWorld::unavailable)?;
     admit_session(session, &source, &owner)?;
+    if let Some((world, pin)) = fork.cut.retained_parent() {
+        let unavailable = OwnedWorld::unavailable;
+        let child = Uuid::from_bytes(fork.world.0);
+        let source_pin = Uuid::from_bytes(pin.0);
+        if !capture.is_nil() || suffix.is_some() || child.is_nil() || fork.world != fork.pin
+            || until <= now() || fork.cut.until() <= now()
+            || session.placed_history()? != Some(fork.cut.scope())
+        {
+            return Err(unavailable());
+        }
+        let opened = open_world(directory.as_ref(), archive, session, deployment_id, Uuid::from_bytes(world.0)).await?;
+        if opened.record.pin != pin || !fork.cut.matches_basis(opened.record.basis)
+            || source.checkpoint_worlds.get(&source_pin) != Some(&opened.retained)
+        {
+            return Err(unavailable());
+        }
+        opened.snapshot.check_overlay_standing(&opened.record).await?;
+        let retained = opened.retained.clone();
+        let binding = CheckpointWorldRetention {
+            world: child, until, mode: WorldClockMode::Retained, ..retained.clone()
+        };
+        let registration = world_record(child, &binding, opened.record.schemas.clone());
+        if !opened.record.can_retain_parent(&registration) { return Err(unavailable()); }
+        drop(opened);
+        update_installation(directory.as_ref(), &deployment, |current| {
+            let active = now();
+            if active >= fork.cut.until() || active >= until
+                || current.incarnation != source.incarnation || current.log_epoch != source.log_epoch
+                || PlacedAttemptScope::new(&current.stream("replica"), current.epoch)? != fork.cut.scope()
+                || current.checkpoint_worlds.get(&source_pin) != Some(&retained)
+            {
+                return Err(unavailable());
+            }
+            admit_world_media(current, archive, deployment_id, &binding)?;
+            current.checkpoint_worlds.retain(|_, world| world.until > active);
+            if let Some(prior) = current.checkpoint_worlds.get(&child) {
+                return if prior == &binding { Ok(()) } else { Err(unavailable()) };
+            }
+            if current.checkpoint_worlds.len() >= MAX_RETAINED_WORLDS { return Err(unavailable()); }
+            current.checkpoint_worlds.insert(child, binding.clone());
+            Ok(())
+        }).await?;
+        let outcome = session.register_owned_world_checked(&registration, fork).await?;
+        if !outcome.committed() {
+            return Err(outcome.error().cloned().unwrap_or_else(unavailable));
+        }
+        return Ok((child, outcome.tx_key()));
+    }
     if let Some((world, pin, logical)) = fork.cut.overlay() {
         let unavailable = OwnedWorld::unavailable;
         let child = Uuid::from_bytes(fork.world.0);

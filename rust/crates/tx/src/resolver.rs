@@ -1505,22 +1505,27 @@ impl<'a> OpenTransaction<'a> {
                         {
                             return Err(unavailable());
                         }
-                        if let Some(ancestor) = &world.ancestor {
+                        if let Some((source_id, source_pin)) = overlay_source {
                             if with_root || previous.is_some() || sibling.is_some()
-                                || ancestor.basis.system_time >= self.tx_key().system_time
-                                || ancestor.basis.tx_id >= self.tx_key().tx_id
+                                || world.ancestor.as_ref().is_some_and(|ancestor|
+                                    ancestor.basis.system_time >= self.tx_key().system_time
+                                        || ancestor.basis.tx_id >= self.tx_key().tx_id)
                             {
                                 return Err(unavailable());
                             }
-                            let (source_id, source_pin) = overlay_source.ok_or_else(unavailable)?;
                             let base = self.buffer.base_snapshot();
                             let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-                            let (source, _charge) = rtdb_query::read_owned_world(context, owner, source_id)
+                            let (source, _charge) = rtdb_query::read_owned_world(context, owner, *source_id)
                                 .await?.ok_or_else(unavailable)?;
-                            if source.pin != source_pin || !source.can_retain_overlay(&world) {
+                            let admits_child = if world.ancestor.is_some() {
+                                source.can_retain_overlay(&world)
+                            } else {
+                                source.can_retain_parent(&world)
+                            };
+                            if source.pin != *source_pin || !admits_child {
                                 return Err(unavailable());
                             }
-                        } else if overlay_source.is_some() {
+                        } else if world.ancestor.is_some() {
                             return Err(unavailable());
                         }
                         if let Some(previous) = previous {

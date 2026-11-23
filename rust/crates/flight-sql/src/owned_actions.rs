@@ -234,7 +234,7 @@ pub(crate) const HELD_WORLD_AT_PREFLIGHT_V1: &str = "rtdb.owned.PreflightHeldWor
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V2: &str = "rtdb.owned.PublishHeldWorldRetention.v2";
+pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V3: &str = "rtdb.owned.PublishHeldWorldRetention.v3";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const PUBLISH_WORLD_CUT_V2: &str = "rtdb.owned.PublishWorldCut.v2";
 pub(crate) const COMMIT_HELD_WORLDS_V6: &str = "rtdb.owned.CommitHeldWorlds.v6";
@@ -2629,7 +2629,7 @@ impl Service {
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
         let scope = session.placed_history().map_err(status)?.ok_or_else(unsupported)?;
-        let cut = held.snapshot.prepare_overlay_cut(scope, system).await.map_err(status)?;
+        let cut = held.snapshot.retained_child_cut(scope, system).await.map_err(status)?;
         let charge = call.reserve(4096)?;
         let prepared = host.prepare_world_overlay(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
@@ -3049,7 +3049,7 @@ impl Service {
         }
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let scope = self.hosted_control_scope(call).await?;
-        let cut = held.snapshot.prepare_overlay_cut(scope, Timestamp(i64::from_be_bytes(*system))).await.map_err(status)?;
+        let cut = held.snapshot.retained_child_cut(scope, Timestamp(i64::from_be_bytes(*system))).await.map_err(status)?;
         let policy = self.hosted_control_policy(call)?;
         let groups = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
