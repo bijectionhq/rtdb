@@ -162,7 +162,7 @@ type Client = Box<dyn Transport>;
 async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken,
                     heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, frame_memory: Arc<MemoryBudget>, connection_index: usize) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
-    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.as_ref()));
+    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.clone()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
     let Some((mut client, mut startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
     let selector = startup.parameters.get("database");
@@ -343,7 +343,7 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
         if router.deployment.as_deref().is_some_and(|id| Uuid::parse_str(id).ok() != Some(installed.deployment)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
         }
-        let (server, worker, epoch) = route_ordered(name, installed, options, async |worker, probe| {
+        let (server, worker, epoch) = route_ordered(name, installed, options, |worker, probe| async move {
             connect_serving(&worker.pgwire, &worker.control, probe, options).await
         }).await?;
         return Ok((server, Some(worker.control), epoch, installed.deployment.to_string()));
@@ -419,12 +419,15 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
-pub(crate) async fn route_ordered<T>(
+pub(crate) async fn route_ordered<T, Open>(
     name: &str,
     installed: &crate::journal::hosted::GatewayPlacement,
     options: &GatewayOptions,
-    open: impl AsyncFn(&crate::journal::hosted::WorkerEndpoint, Option<u64>) -> Result<T>,
-) -> Result<(T, crate::journal::hosted::WorkerEndpoint, u64)> {
+    open: impl Fn(crate::journal::hosted::WorkerEndpoint, Option<u64>) -> Open + Send,
+) -> Result<(T, crate::journal::hosted::WorkerEndpoint, u64)>
+where
+    Open: Future<Output = Result<T>> + Send,
+{
     let view = installed.journal.route().await?;
     let incumbent = view.writer.grant.map(|grant| grant.enrollment);
     let predecessor = control::OrderedPredecessor { epoch: view.writer.epoch, enrollment: incumbent };
@@ -449,7 +452,7 @@ pub(crate) async fn route_ordered<T>(
                     return Err(Anomaly::new(AnomalyCategory::Conflict, control::CLAIM_CONTENDED,
                         "The installed journal selected a different writer"));
                 }
-                match open(worker, probe).await {
+                match open(worker.clone(), probe).await {
                     Ok(frontend) => return Ok((frontend, worker.clone(), epoch)),
                     Err(error) => refused = Some(error),
                 }
@@ -555,7 +558,7 @@ pub(crate) async fn probe_pgwire(address: &str, timeout: Duration, serving_probe
 }
 
 /// Returns None for a cancel request, which this gateway does not forward.
-async fn read_startup(mut client: Client, tls: Option<&Arc<rustls::ServerConfig>>) -> Result<Option<(Client, Startup)>> {
+async fn read_startup(mut client: Client, tls: Option<Arc<rustls::ServerConfig>>) -> Result<Option<(Client, Startup)>> {
     let mut encrypted = false;
     loop {
         let length = client.read_i32().await.map_err(io)?;
@@ -566,7 +569,7 @@ async fn read_startup(mut client: Client, tls: Option<&Arc<rustls::ServerConfig>
         let code = i32::from_be_bytes(body[..4].try_into().expect("four bytes"));
         match code {
             SSL_REQUEST if length == 8 => {
-                if let Some(tls) = tls.filter(|_| !encrypted) {
+                if let Some(tls) = tls.as_ref().filter(|_| !encrypted) {
                     client.write_all(b"S").await.map_err(io)?;
                     client = Box::new(TlsAcceptor::from(Arc::clone(tls)).accept(client).await.map_err(io)?);
                     encrypted = true;
@@ -754,11 +757,11 @@ mod tests {
 
         let (mut socket, server) = tokio::io::duplex(4096);
         socket.write_all(&message).await.unwrap();
-        assert!(read_startup(Box::new(server), Some(&tls)).await.unwrap().is_none());
+        assert!(read_startup(Box::new(server), Some(Arc::clone(&tls))).await.unwrap().is_none());
         assert_eq!(socket.read_u8().await.unwrap(), b'E');
 
         let (mut socket, server) = tokio::io::duplex(4096);
-        let read = tokio::spawn(async move { read_startup(Box::new(server), Some(&tls)).await.unwrap().unwrap().1 });
+        let read = tokio::spawn(async move { read_startup(Box::new(server), Some(tls)).await.unwrap().unwrap().1 });
         socket.write_i32(8).await.unwrap();
         socket.write_i32(SSL_REQUEST).await.unwrap();
         assert_eq!(socket.read_u8().await.unwrap(), b'S');

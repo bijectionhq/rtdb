@@ -179,7 +179,7 @@ impl Router {
             if self.audience.is_some() || installation.is_some_and(|id| id != installed.deployment) {
                 return Err(Status::not_found("No matching installed Flight SQL deployment"));
             }
-            let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, async |worker, _| {
+            let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, |worker, _| async move {
                 let reply = control::call(&worker.control, &control::Request::FlightEndpoint { audience: false },
                     self.timeout, &self.control).await?;
                 match reply {
@@ -263,7 +263,7 @@ impl Router {
         let deployment = self.deployments.as_ref().map(|deployments| {
             deployments.admit(name).ok_or_else(|| Status::resource_exhausted("This deployment has reached its Flight SQL call limit"))
         }).transpose()?;
-        let routing = async {
+        let routing = async move {
             match route {
                 Some(route) => {
                     if let Some(selector) = selector {

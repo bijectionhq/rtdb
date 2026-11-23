@@ -107,7 +107,7 @@ impl RemoteStorageFactory for StoreFactory {
             (Some(opened.store), BlockDiscovery::AtPublished(published))
         };
         let bucket = self.storage.bucket(Arc::clone(&io)).await?;
-        let prefix = source_prefix(placement, grant, root);
+        let prefix = source_prefix(&placement, grant, root);
         let writer = match (&self.storage, &self.scoped_writes) {
             (CellStorage::S3 { config }, Some(scoped)) => {
                 let authorization: Arc<dyn rtdb_s3::WriteAuthorization> = scope.clone();
