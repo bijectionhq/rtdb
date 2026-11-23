@@ -54,6 +54,7 @@ replica provider must retain this pair through original-journal recovery.
 The writer seals the cutoff and digest in the record's acceptance stage and derives the guarded journal frame from that stage.
 The timed acceptance audit requires the frame to repeat the sealed pair and returns the envelope digest with the original voter evidence.
 Archive capture records the original stream's digest of each timed entry before opening its payload, so a resealed checkpoint transfer still names the entry its original voters hold.
+`verification/multi/lean/TimedEvidenceAudit.lean` proves both rules: the audit reports only the sealed clock evidence, and a resealed copy names its exact original voters while an original append cannot carry a digest.
 The provider samples under the journal writer lock after encryption and payload copying, before assigning the offset or sending a replica request.
 For a strict placed acceptance, `rtdb-multi audit-acceptance` reads one replica offset for the exact installation, incarnation and log epoch.
 It requires a matching write quorum, checks the sealed record against that quorum's digest, and exports the original staging sample, cutoff and append timestamp.

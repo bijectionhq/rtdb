@@ -1730,6 +1730,26 @@ def verify_logkeeper(args, scratch):
     }
     verify_lean_model(args, scratch, models / "TerminalJournal.lean", "logkeeper-retirement", retirement_controls, 5)
 
+    evidence_controls = {
+        "report-the-frame": (
+            "if framed = sealed then some sealed else none",
+            "some framed",
+            ["reported_evidence_is_the_sealed_decision", "a_substituted_frame_is_refused", "timed_evidence_program"],
+        ),
+        "reseal-without-capture": (
+            "def retain (entry : Entry) : Entry := { entry with carried := some (originalDigest entry) }",
+            "def retain (entry : Entry) : Entry := entry",
+            ["a_resealed_copy_still_names_its_original_voters", "successive_transfers_keep_the_first_original"],
+        ),
+        "admit-a-carried-original": (
+            "def admitsOriginal (entry : Entry) : Bool := entry.carried.isNone",
+            "def admitsOriginal (entry : Entry) : Bool := true",
+            ["an_admitted_original_holds_its_own_link", "a_resealed_copy_still_names_its_original_voters",
+             "successive_transfers_keep_the_first_original", "resealing_without_capture_loses_the_original_voters"],
+        ),
+    }
+    verify_lean_model(args, scratch, models / "TimedEvidenceAudit.lean", "logkeeper-timed-evidence", evidence_controls, 9)
+
 
 def verify_generation_retention(args, scratch):
     path = Path("verification/lean/GenerationRetention.lean")
