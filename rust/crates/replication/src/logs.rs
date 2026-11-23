@@ -238,7 +238,12 @@ impl PartitionLogs {
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
             .then(|| fingerprint(&record.payload));
-        let oversized_delivery = matches!(&envelope.message, ReplicaBody::OversizedMessage(_)).then_some(record);
+        let oversized = matches!(&envelope.message, ReplicaBody::OversizedMessage(_));
+        if oversized && self.replica.requires_replica_payload_permit() && record.replica_objects.is_none() {
+            return Err(Anomaly::fault("rtdb.replication/oversized-delivery",
+                "The hosted replica returned a pointer without its payload permit"));
+        }
+        let oversized_delivery = oversized.then_some(record);
         Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.

@@ -473,6 +473,7 @@ fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Res
 
 #[async_trait]
 impl Log for SealedLog {
+    fn requires_replica_payload_permit(&self) -> bool { self.recovery.is_some() }
     fn requires_checkpoint_digest(&self) -> bool { self.inner.requires_checkpoint_digest() }
     fn needs_published_recovery_checkpoint(&self) -> bool {
         self.recovery.is_some() || self.inner.needs_published_recovery_checkpoint()

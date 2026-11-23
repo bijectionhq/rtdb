@@ -596,6 +596,7 @@ impl AsRef<[u8]> for Delivery {
 
 #[async_trait]
 impl Log for JournalLog {
+    fn requires_replica_payload_permit(&self) -> bool { true }
     fn needs_published_recovery_checkpoint(&self) -> bool { true }
 
     async fn confirms_recovery_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
