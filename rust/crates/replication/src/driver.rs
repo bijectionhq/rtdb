@@ -631,6 +631,10 @@ impl ReplicationDriver {
         let source_tail = if self.pending_block.is_some() { None } else { Some(self.logs.source_tail(progress.source_position).await?) };
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
+        let pump = match self.resolve.execution_observer.clone() {
+            Some(observer) => pump.with_durable_commit_observer(move |lag| observer.record_durable_commit_lag(lag)),
+            None => pump,
+        };
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
         let recovery_write = self.next_recovery_write().await?;
         let produce_inherited = recovery_write.is_none() && self.pending_block.is_some();
