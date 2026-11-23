@@ -600,7 +600,12 @@ Success returns the standard transaction-key Arrow row.
 
 === Reading owned relation changes
 
-`rtdb.owned.ReadHeldChanges.v2` takes the 16 raw held-handle bytes, a relation prefix, a signed 64-bit big-endian exclusive system time in microseconds, and an unsigned 16-bit big-endian maximum of 1–128 groups.
+`rtdb.owned.ReadHeldChanges.v3` takes the 16 raw held-handle bytes, a relation prefix, a signed 64-bit big-endian exclusive system time in microseconds, and an unsigned 16-bit big-endian maximum of 1–128 source groups.
+For a regional read, append two signed 64-bit big-endian valid-time endpoints and two complete typed identity bounds, each prefixed with an unsigned 16-bit big-endian byte count.
+Both intervals are half-open.
+Use signed minimum and maximum for open valid-time endpoints and a zero byte count for an open identity bound.
+Identity bounds follow complete typed handle order, with a limit of 4096 bytes each.
+Regional pages retain intersecting touches in their original commit order and can omit whole groups.
 The first tracked mutation installs a feed floor and its first group in the same ordered transaction.
 A relation with zero events is covered through the held present.
 A request that crosses untracked relation events or encounters a missing journal group is refused.
@@ -612,7 +617,8 @@ A group records the relation's committed mutations in their original order.
 Writes exceeding the 1 MiB retained-value budget for a relation's group abort.
 A page stops before its next whole group if that group would exceed the 8 MiB retained-value budget.
 The `rtdb.owned.present_micros` schema metadata identifies the held cut.
-The `rtdb.owned.change_coverage_micros` metadata is the last returned group time if the page stopped early, or the held present when the relation is covered through the cut.
+The `rtdb.owned.change_coverage_micros` metadata is the last examined group time if the page stopped early, or the held present when the relation is covered through the cut.
+This cursor can advance on an empty regional page.
 Use the coverage time as the next exclusive system time.
 An empty page carries only the response schema and terminator.
 Revisions are dense within the authenticated owner's relation, and each returned system time belongs to a commit with a change on that relation.

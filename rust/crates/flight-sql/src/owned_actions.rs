@@ -19,7 +19,7 @@ use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{HeldSpatialNearest, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedRelativePeriod, TxOp};
-use rtdb_types::{EntityId, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{EntityId, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -2896,9 +2896,22 @@ impl Service {
         let (relation, cursor) = split_relation(request)?;
         let (after, rest) = cursor.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change read has no system time"))?;
         let (limit, tail) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned change read has no group limit"))?;
-        if !tail.is_empty() { return Err(invalid("Owned change read has trailing bytes")); }
-        let page = held.snapshot.changes(&relation, Timestamp(i64::from_be_bytes(*after)), usize::from(u16::from_be_bytes(*limit)))
-            .await.map_err(status)?;
+        let after = Timestamp(i64::from_be_bytes(*after));
+        let limit = usize::from(u16::from_be_bytes(*limit));
+        let page = if tail.is_empty() {
+            held.snapshot.changes(&relation, after, limit).await
+        } else {
+            let (from, tail) = tail.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change region has no valid start"))?;
+            let (to, tail) = tail.split_first_chunk::<8>().ok_or_else(|| invalid("Owned change region has no valid end"))?;
+            let (lower, tail) = count_component(tail, 4096)?;
+            let (upper, tail) = count_component(tail, 4096)?;
+            if !tail.is_empty() { return Err(invalid("Owned change region has trailing bytes")); }
+            let valid = Interval::from_micros(i64::from_be_bytes(*from), i64::from_be_bytes(*to)).map_err(status)?;
+            let _bounds = call.reserve(8192 + lower.len() + upper.len())?;
+            let bound = |bytes: &[u8]| (!bytes.is_empty()).then(|| EntityId::from_handle_bytes(bytes)).transpose().map_err(status);
+            let (lower, upper) = (bound(lower)?, bound(upper)?);
+            held.snapshot.changes_in_region(&relation, after, limit, lower.as_ref(), upper.as_ref(), valid).await
+        }.map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
         held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
         Ok(reply)

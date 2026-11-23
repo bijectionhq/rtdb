@@ -143,6 +143,27 @@ impl OwnedReadSession {
         })
     }
 
+    /// Filters a covered journal page by complete identity and valid-time overlap.
+    /// The cursor advances over examined source groups even when all their touches are outside the region.
+    pub async fn changes_in_region(
+        &self, relation: &OwnedRelation, after: Timestamp, limit: usize,
+        lower: Option<&EntityId>, upper: Option<&EntityId>, valid: Interval,
+    ) -> Result<OwnedChangePage> {
+        if valid.is_empty() || lower.zip(upper).is_some_and(|(lower, upper)| lower >= upper) {
+            return Err(Anomaly::incorrect("rtdb.owned/change-region", "A change region requires nonempty identity and valid-time bounds"));
+        }
+        let mut page = self.changes(relation, after, limit).await?;
+        page.groups.retain_mut(|group| {
+            group.touches.retain(|touch| {
+                lower.is_none_or(|lower| &touch.id >= lower)
+                    && upper.is_none_or(|upper| &touch.id < upper)
+                    && touch.valid.intersects(valid)
+            });
+            !group.touches.is_empty()
+        });
+        Ok(page)
+    }
+
     /// A bounded diagnostic page, not authority to sweep or advance a floor.
     pub async fn expired_candidate_page(
         &self, relation: &OwnedRelation, after: Timestamp, groups: usize,
