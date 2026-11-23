@@ -252,12 +252,11 @@ impl ObjectStore for RemoteStore {
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { objects.head(&key).await }).await
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { objects.head(&key).await }).await
     }
     async fn observe_head(&self, key: &ObjectKey) -> Result<ObjectObservation<StoredObject>> {
-        let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
-        self.io.run_async(async move {
+        let namespace = self.version_namespace.clone();
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
             let path = objects.path(&key);
             let metadata = objects.metadata(&key).await?;
             Ok(ObjectObservation {
@@ -268,9 +267,7 @@ impl ObjectStore for RemoteStore {
     }
     async fn retirement_version(&self, key: &ObjectKey) -> Result<Option<PhysicalObjectVersion>> {
         let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
-        let objects = self.objects.clone();
-        let key = key.clone();
-        self.io.run_async(async move {
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
             let path = objects.path(&key);
             let metadata = match objects.metadata(&key).await {
                 Ok(metadata) => metadata,
@@ -285,8 +282,7 @@ impl ObjectStore for RemoteStore {
             return Ok(self.retirement_version(key).await?.map(PhysicalObjectPublication::Version));
         };
         let Some(namespace) = self.version_namespace.clone() else { return Ok(None); };
-        let (objects, key) = (self.objects.clone(), key.clone());
-        self.io.run_async(async move {
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
             let metadata = match objects.metadata(&key).await {
                 Ok(metadata) => metadata,
                 Err(Error::MissingObject(_)) => return Ok(None),
@@ -296,19 +292,17 @@ impl ObjectStore for RemoteStore {
         }).await
     }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { objects.get(&key).await }).await
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { objects.get(&key).await }).await
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
         Ok(self.observe_fresh_exact(key, length).await?.value)
     }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<ObjectObservation<Bytes>> {
-        let (objects, key, namespace) = (self.objects.clone(), key.clone(), self.version_namespace.clone());
-        self.io.run_async(async move { objects.observe_exact(&key, length, namespace.as_deref()).await }).await
+        let namespace = self.version_namespace.clone();
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { objects.observe_exact(&key, length, namespace.as_deref()).await }).await
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { objects.get_range(&key, range).await }).await
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { objects.get_range(&key, range).await }).await
     }
     async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<ObjectObservation<Bytes>> {
         let Some(namespace) = self.version_namespace.clone() else {
@@ -321,8 +315,7 @@ impl ObjectStore for RemoteStore {
             }
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: observed.value.size });
         }
-        let (objects, key) = (self.objects.clone(), key.clone());
-        self.io.run_async(async move {
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
             let path = objects.path(&key);
             let length = usize::try_from(range.end - range.start)
                 .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
@@ -348,8 +341,7 @@ impl ObjectStore for RemoteStore {
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
-        let (objects, key) = (Arc::clone(&self.objects), key.clone());
-        self.io.run_async(async move { reservation.finish(objects.get_range(&key, range).await?) }).await
+        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { reservation.finish(objects.get_range(&key, range).await?) }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         self.put_with_publication(key, bytes).await.map(drop)
@@ -398,8 +390,7 @@ impl ObjectStore for RemoteStore {
     }
     async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { self.copy_to(source, self, destination).await }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
-        let (objects, directory) = (Arc::clone(&self.objects), directory.cloned());
-        self.io.run_async(async move { objects.list(directory.as_ref()).await }).await
+        self.io.read_async(self.objects.clone(), directory.cloned(), |objects, directory| async move { objects.list(directory.as_ref()).await }).await
     }
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         if self.cell {

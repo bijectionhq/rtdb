@@ -603,18 +603,18 @@ impl ObjectStore for LocalStore {
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || {
-            let file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            let path = root.join(key.as_str());
+            let file = open_object(&path, key)?;
             let size = file.metadata().map_err(|error| Error::io(&path, error))?.len();
-            Ok(StoredObject { key, size })
+            Ok(StoredObject { key: key.clone(), size })
         }).await
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || {
-            let mut file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            let path = root.join(key.as_str());
+            let mut file = open_object(&path, key)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
             Ok(Bytes::from(bytes))
@@ -622,35 +622,38 @@ impl ObjectStore for LocalStore {
     }
 
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || {
-            let mut file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            let path = root.join(key.as_str());
+            let mut file = open_object(&path, key)?;
             if file.metadata().map_err(|error| Error::io(&path, error))?.len() != length as u64 {
-                return Err(wrong_size(&key, length));
+                return Err(wrong_size(key, length));
             }
             let mut bytes = vec![0; length];
             file.read_exact(&mut bytes).map_err(|error| Error::io(&path, error))?;
             if file.read(&mut [0]).map_err(|error| Error::io(&path, error))? != 0 {
-                return Err(wrong_size(&key, length));
+                return Err(wrong_size(key, length));
             }
             Ok(Bytes::from(bytes))
         }).await
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || read_local_range(&path, &key, range)).await
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            read_local_range(&root.join(key.as_str()), key, range)
+        }).await
     }
 
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            reservation.finish(read_local_range(&root.join(key.as_str()), key, range)?)
+        }).await
     }
 
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || map_range(LocalFile::new(open_object(&path, &key)?, None), &key, range, reservation)).await
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            map_range(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None), key, range, reservation)
+        }).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
@@ -688,9 +691,7 @@ impl ObjectStore for LocalStore {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
-        let root = self.root.clone();
-        let directory = directory.cloned();
-        self.io.run(move || {
+        self.io.read(self.root.clone(), directory.cloned(), |root, directory| {
             fn visit(root: &Path, path: &Path, result: &mut Vec<StoredObject>) -> Result<()> {
                 let metadata = match fs::symlink_metadata(path) {
                     Ok(metadata) => metadata,
@@ -712,9 +713,9 @@ impl ObjectStore for LocalStore {
                 }
                 Ok(())
             }
-            let start = directory.as_ref().map_or_else(|| root.as_ref().clone(), |key| root.join(key.as_str()));
+            let start = directory.as_ref().map_or_else(|| root.clone(), |key| root.join(key.as_str()));
             let mut result = Vec::new();
-            visit(&root, &start, &mut result)?;
+            visit(root, &start, &mut result)?;
             result.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(result)
         }).await
@@ -722,8 +723,9 @@ impl ObjectStore for LocalStore {
 
     /// A local object is never rewritten under its key, and an open file outlives a delete, so the file is the object for as long as it is held.
     async fn local_file(&self, key: &ObjectKey) -> Result<Option<LocalFile>> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || Ok(Some(LocalFile::new(open_object(&path, &key)?, None)))).await
+        self.io.read(self.root.clone(), key.clone(), |root, key| {
+            Ok(Some(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None)))
+        }).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {

@@ -195,6 +195,36 @@ impl IoRegion {
     pub async fn run_blocking<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         self.run(work).await
     }
+    /// The provider admits one raw read under the opened residence and its exact target.
+    /// The caller can supply a catalog or recovery view for dependencies between requests.
+    pub(crate) async fn read<T, O, A>(
+        &self, owner: Arc<O>, target: A, work: impl FnOnce(&O, &A) -> Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        O: Send + Sync + 'static,
+        A: Send + Sync + 'static,
+    {
+        let selection = Arc::new((owner, target));
+        let view = HeldView::recovery(selection.clone());
+        Self::reading(view, self.run(move || work(&selection.0, &selection.1))).await
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn read_async<T, O, A, F>(
+        &self, owner: Arc<O>, target: A, work: impl FnOnce(Arc<O>, A) -> F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        O: Send + Sync + 'static,
+        A: Clone + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let selection = Arc::new((owner, target));
+        let work = work(selection.0.clone(), selection.1.clone());
+        Self::reading(HeldView::recovery(selection), self.run_async(work)).await
+    }
+
     pub(crate) async fn run<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         let operation = self.admit()?;
         Self::run_admitted(operation, work).await
@@ -264,6 +294,35 @@ mod tests {
     }
     impl Drop for HeldDrop {
         fn drop(&mut self) { self.entered.take().unwrap().send(()).unwrap(); self.release.recv().unwrap(); }
+    }
+
+    #[tokio::test]
+    async fn raw_read_retains_its_opened_provider_and_exact_target_after_cancellation() {
+        let region = IoRegion::new();
+        let owner = Arc::new(String::from("root"));
+        let ownership = Arc::downgrade(&owner);
+        let key = crate::ObjectKey::new("blocks/b00.binpb").unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let read = {
+            let region = region.clone();
+            tokio::spawn(async move {
+                region.read(owner, key, move |root, key| {
+                    assert_eq!(root.as_str(), "root");
+                    assert_eq!(key.as_str(), "blocks/b00.binpb");
+                    entered.send(()).unwrap();
+                    finished.recv().unwrap();
+                    Ok(())
+                }).await
+            })
+        };
+        started.await.unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        assert!(ownership.upgrade().is_some());
+        finish.send(()).unwrap();
+        region.close_and_wait().await;
+        assert!(ownership.upgrade().is_none());
     }
 
     #[tokio::test]
