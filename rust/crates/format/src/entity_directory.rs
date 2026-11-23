@@ -174,6 +174,7 @@ impl LogicalEvent {
             EventOp::Put => 0,
             EventOp::Delete => 1,
             EventOp::Erase => 2,
+            EventOp::Redacted => 3,
         });
         if let Some((trie, page, row)) = &self.payload_hint {
             value.extend(page.to_be_bytes());
@@ -219,6 +220,7 @@ impl LogicalEvent {
         let op = match (frontier, value[48]) {
             (false, 0) => EventOp::Put,
             (false, 1) => EventOp::Delete,
+            (false, 3) => EventOp::Redacted,
             (true, 2) => EventOp::Erase,
             _ => return Err(invalid("Unknown directory event operation")),
         };

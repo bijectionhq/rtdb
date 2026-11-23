@@ -2026,6 +2026,7 @@ impl PartitionScan {
 
     async fn buffer_task(&mut self, task: ResolvedScanTask) -> Result<()> {
         let ResolvedScanTask { selected, groups, batches, reservation, _group_reservations } = task;
+        let keyed = self.scan.table.name.table.is_owned_event_data();
         for (group, rows) in groups.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
             let metadata = self.retained_transaction_metadata(rows, &batches).await?;
             let page = &self.pages.entries[selected[group]].source;
