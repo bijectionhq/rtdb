@@ -256,7 +256,7 @@ pub async fn certify_observed_entry(
             (server, ensemble.digest_page(server, offset, offset, None).await.map_err(Anomaly::from))
         }
     }).collect::<FuturesUnordered<_>>();
-    let mut agreed = None;
+    let mut agreed: Option<[u8; 32]> = None;
     let mut agreeing = 0;
     let mut observations = Vec::new();
     while let Some((server, response)) = responses.next().await {
