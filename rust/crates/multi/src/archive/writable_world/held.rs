@@ -90,6 +90,15 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<Timestamp>>,
     },
+    ParentScheduleAt {
+        relation: OwnedRelation,
+        id: EntityId,
+        system: Timestamp,
+        valid: Interval,
+        schema: rtdb_types::OwnedSchema,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<Vec<(Interval, Timestamp)>>>,
+    },
     ParentPointAt {
         system: Timestamp,
         point: ArchivePoint,
@@ -115,6 +124,7 @@ enum ArchiveRead {
         offset: usize,
         limit: usize,
         valid: Timestamp,
+        parent_at: Option<(Timestamp, Vec<(OwnedRelation, rtdb_types::OwnedSchema)>)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_node::OwnedSearchPage>>,
     },
@@ -149,6 +159,7 @@ enum ArchiveRead {
         at: Timestamp,
         after: Option<String>,
         fetch: usize,
+        earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_query::OwnedIdentityCandidates>>,
     },
@@ -390,6 +401,26 @@ impl HeldCheckpointWorld {
         Ok(fact)
     }
 
+    pub async fn parent_schedule_at(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, system: Timestamp,
+    ) -> Result<(Vec<(Interval, Timestamp)>, OwnedWorldWitness)> {
+        self.check_relation(relation)?;
+        if valid.is_empty() || system >= self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
+        let schema = self.historical_parent_schema(relation)?.clone();
+        let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+        if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let guard = self.open.snapshot.parent_point_release_guard(relation, id, system).await?;
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentScheduleAt {
+            relation: relation.clone(), id: id.clone(), system, valid, schema, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let schedule = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        guard()?;
+        self.check_relation(relation)?;
+        Ok((schedule, witness))
+    }
+
     fn historical_parent_schema(&self, relation: &OwnedRelation) -> Result<&rtdb_types::OwnedSchema> {
         self.open.record.schemas.relation(relation)
             .filter(|schema| relation.is_root_data() && !schema.has_opaque_columns() && schema.lifetime_micros().is_none())
@@ -502,19 +533,26 @@ impl HeldCheckpointWorld {
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
-        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None).await
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, None).await
     }
 
     pub async fn ranked_search_at(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp, parent_only: bool,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
-        self.ranked_search_on_cut(partitions, query, offset, limit, valid, Some((system, parent_only))).await
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, Some((system, parent_only)), None).await
+    }
+
+    pub async fn ranked_search_parent_at(
+        &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
+        valid: Timestamp, system: Timestamp,
+    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+        self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, Some(system)).await
     }
 
     async fn ranked_search_on_cut(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp, earlier: Option<(Timestamp, bool)>,
+        valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
     ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
@@ -536,7 +574,7 @@ impl HeldCheckpointWorld {
             self.require_accepted_archive_scope(&relations).await?;
         }
         let guard = self.open.snapshot.relation_release_guard(partitions.iter().map(|(relation, _)| relation))?;
-        let witnesses = if earlier.is_some() {
+        let witnesses = if earlier.is_some() || parent_at.is_some() {
             let mut witnesses = Vec::with_capacity(partitions.len());
             for (relation, _) in &partitions {
                 witnesses.push(self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?);
@@ -548,8 +586,18 @@ impl HeldCheckpointWorld {
             ).await?
         };
         let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect::<Vec<_>>();
+        let parent_at = if let Some(system) = parent_at {
+            if system >= self.parent_basis().system_time || frontiers.iter().any(|frontier| *frontier != 0) {
+                return Err(OwnedWorld::unavailable());
+            }
+            let schemas = partitions.iter().map(|(relation, _)| {
+                Ok((relation.clone(), self.historical_parent_schema(relation)?.clone()))
+            }).collect::<Result<Vec<_>>>()?;
+            Some((system, schemas))
+        } else { None };
+        let historical = parent_at.is_some();
         let writable = self.clock_mode().is_writable();
-        let use_overlay = writable && !earlier.is_some_and(|(_, parent_only)| parent_only);
+        let use_overlay = writable && !historical && !earlier.is_some_and(|(_, parent_only)| parent_only);
         let columns = if use_overlay || earlier.is_some() {
             self.search_columns(&partitions, &frontiers, &guard).await?
         } else {
@@ -564,12 +612,12 @@ impl HeldCheckpointWorld {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
             partitions: partitions.clone(), frontiers, query: query.clone(), overlay,
-            offset, limit, valid, guard: Arc::clone(&guard), reply,
+            offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
             .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = match page {
-            Err(error) if earlier.is_none() && writable && error.code == "rtdb.owned/search-uncovered" => {
+            Err(error) if !historical && earlier.is_none() && writable && error.code == "rtdb.owned/search-uncovered" => {
                 self.rank_visible_documents(&partitions, &columns, &query, offset, limit, valid, &guard).await?
             }
             other => other?,
@@ -946,7 +994,7 @@ impl HeldCheckpointWorld {
             let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
             self.require_overlay_coverage(relation, &witness).await?;
             self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
-            let parent = self.archive_identity_candidates(relation, valid, after, limit + 1).await?;
+            let parent = self.archive_identity_candidates(relation, valid, after, limit + 1, None).await?;
             for key in &parent.keys {
                 let id = EntityId::String(key.clone());
                 self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
@@ -958,12 +1006,32 @@ impl HeldCheckpointWorld {
         self.identity_page_on_cut(relation, valid, after, limit, Some(&cut)).await
     }
 
+    pub async fn parent_identity_page_at(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize, system: Timestamp,
+    ) -> Result<WorldIdentityPage> {
+        self.check_relation(relation)?;
+        Interval::at(valid)?;
+        if !(1..=128).contains(&limit) || system >= self.parent_basis().system_time {
+            return Err(OwnedWorld::unavailable());
+        }
+        let schema = self.historical_parent_schema(relation)?.clone();
+        let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+        if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let candidates = self.archive_identity_candidates(relation, valid, after, limit + 1, Some((system, schema))).await?;
+        for key in &candidates.keys {
+            let id = EntityId::String(key.clone());
+            self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
+        }
+        self.finish_overlay_identities(relation, candidates, limit)
+    }
+
     async fn archive_identity_candidates(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, fetch: usize,
+        earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Identities {
-            relation: relation.clone(), at: valid, after: after.map(str::to_owned), fetch,
+            relation: relation.clone(), at: valid, after: after.map(str::to_owned), fetch, earlier,
             guard: self.open.snapshot.relation_release_guard([relation])?, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
@@ -991,7 +1059,7 @@ impl HeldCheckpointWorld {
             } else {
                 self.open.snapshot.world_identity_candidates(self.open.record.id, relation, valid, after, FETCH).await?
             };
-            let parent = self.archive_identity_candidates(relation, valid, after, FETCH).await?;
+            let parent = self.archive_identity_candidates(relation, valid, after, FETCH, None).await?;
 
             // A full input page can have unseen keys beyond its last key.
             let through = [
@@ -1115,6 +1183,15 @@ fn check_archive_coverage<'a>(
         }
     }
     Ok(())
+}
+
+async fn exact_historical_parent_context(
+    context: Arc<rtdb_query::QueryContext>, owner: &str, system: Timestamp,
+    schemas: &[(OwnedRelation, rtdb_types::OwnedSchema)],
+) -> Result<Arc<rtdb_query::QueryContext>> {
+    let (context, selected) = historical_parent_context(context, owner, system, schemas).await?;
+    if selected != system { return Err(OwnedWorld::unavailable()); }
+    Ok(context)
 }
 
 async fn historical_parent_context(
@@ -1302,6 +1379,40 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
+                                ArchiveRead::ParentScheduleAt { relation, id, system, valid, schema, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        let schemas = [(relation.clone(), schema)];
+                                        let context = exact_historical_parent_context(
+                                            Arc::clone(&context).with_owned_read_guard(guard), &owner, system, &schemas,
+                                        ).await?;
+                                        let cursor = rtdb_query::open_owned_valid_boundaries(
+                                            Arc::clone(&context), &owner, &relation, &id, valid, system,
+                                        ).await?;
+                                        let boundaries = read_boundaries(cursor, valid).await?;
+                                        let mut schedule = Vec::with_capacity(boundaries.len() / 2);
+                                        for span in boundaries.chunks_exact(2) {
+                                            let interval = Interval::new(span[0], span[1])?;
+                                            let batches = read_checkpoint_point_in_context(
+                                                Arc::clone(&context), CheckpointPoint {
+                                                    owner: &owner, relation: &relation, id: &id, valid: Some(Interval::at(span[0])?),
+                                                }, None,
+                                            ).await?;
+                                            let fact = decode_point(batches.unwrap_or_default(), &id, memory, None)?
+                                                .filter(|fact| fact.revision <= system).ok_or_else(OwnedWorld::unavailable)?;
+                                            schemas[0].1.validate_row(&fact.row)?;
+                                            schedule.push((interval, fact.revision));
+                                        }
+                                        context.check_cancelled()?;
+                                        Ok(schedule)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = read => result,
+                                    };
+                                    let _ = reply.send(response);
+                                }
                                 ArchiveRead::ParentPointAt { system, point } => {
                                     let ArchivePoint { relation, id, valid, guard, expected_schema, mut reply, .. } = point;
                                     let read = async {
@@ -1309,8 +1420,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let schema = expected_schema.ok_or_else(OwnedWorld::unavailable)?;
                                         let context = Arc::clone(&context).with_owned_read_guard(guard);
                                         let schemas = [(relation.clone(), schema)];
-                                        let (context, selected) = historical_parent_context(context, &owner, system, &schemas).await?;
-                                        if selected != system { return Err(OwnedWorld::unavailable()); }
+                                        let context = exact_historical_parent_context(context, &owner, system, &schemas).await?;
                                         let batches = read_checkpoint_point_in_context(context, CheckpointPoint {
                                             owner: &owner, relation: &relation, id: &id, valid: Some(valid),
                                         }, None).await?;
@@ -1383,12 +1493,15 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Search { partitions, frontiers, query, overlay, offset, limit, valid, guard, mut reply } => {
+                                ArchiveRead::Search { partitions, frontiers, query, overlay, offset, limit, valid, parent_at, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
                                             partitions.iter().map(|(relation, _)| relation).zip(frontiers))?;
                                         let scoped = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let scoped = if let Some((system, schemas)) = parent_at {
+                                            exact_historical_parent_context(scoped, &owner, system, &schemas).await?
+                                        } else { scoped };
                                         let page = rtdb_node::rank_owned_overlay_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)
@@ -1429,9 +1542,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         let context = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
                                         let context = if let Some((system, schema)) = earlier {
                                             let schemas = [(relation.clone(), schema)];
-                                            let (context, selected) = historical_parent_context(context, &owner, system, &schemas).await?;
-                                            if selected != system { return Err(OwnedWorld::unavailable()); }
-                                            context
+                                            exact_historical_parent_context(context, &owner, system, &schemas).await?
                                         } else { context };
                                         let (lower, upper) = (lower.as_ref(), upper.as_ref());
                                         let result = match read {
@@ -1485,11 +1596,15 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     let _ = reply.send(response);
                                 }
-                                ArchiveRead::Identities { relation, at, after, fetch, guard, mut reply } => {
+                                ArchiveRead::Identities { relation, at, after, fetch, earlier, guard, mut reply } => {
                                     let read = async {
                                         require_relation_purge_history(&context, &owner)?;
-                                        rtdb_query::owned_identity_candidates(
-                                            Arc::clone(&context).with_owned_read_guard(guard), &owner, &relation, parent_time,
+                                        let scoped = Arc::clone(&context).with_owned_read_guard(guard);
+                                        let (scoped, system) = if let Some((system, schema)) = earlier {
+                                            let schemas = [(relation.clone(), schema)];
+                                            (exact_historical_parent_context(scoped, &owner, system, &schemas).await?, system)
+                                        } else { (scoped, parent_time) };
+                                        rtdb_query::owned_identity_candidates(scoped, &owner, &relation, system,
                                             at, after.as_deref(), fetch,
                                         ).await
                                     };
