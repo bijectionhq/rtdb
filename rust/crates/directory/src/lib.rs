@@ -643,6 +643,8 @@ pub struct StoragePublication {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointCapture {
     pub archive: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_namespace: Option<[u8; 32]>,
     pub incarnation: u64,
     pub log_epoch: i32,
     pub checkpoint: Checkpoint,

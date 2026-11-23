@@ -976,6 +976,7 @@ mod tests {
         let manifest = URL_SAFE_NO_PAD.encode([0xd; 32]);
         installation.checkpoint_captures.insert(capture, rtdb_directory::CheckpointCapture {
             archive: serde_json::to_string(&service.archive).unwrap(),
+            key_namespace: Some(keys.namespace_id().await.unwrap()),
             incarnation: installation.incarnation,
             log_epoch: installation.log_epoch,
             checkpoint: point,
@@ -1028,6 +1029,14 @@ mod tests {
         assert_eq!(keys.existing(&archive_key_id).await.unwrap(), original);
 
         drop(witness);
+        let other_vault = crate::keys::LocalKeyService::new(temporary.path().join("other-vault")).unwrap();
+        let wrong_vault_key = other_vault.key(&archive_key_id).await.unwrap();
+        assert!(archive::finish_capture_retirement(
+            directory.as_ref(), &service.storage, &other_vault, &authority.to_string(), capture,
+        ).await.is_err());
+        assert_eq!(other_vault.existing(&archive_key_id).await.unwrap(), wrong_vault_key);
+        assert_eq!(keys.existing(&archive_key_id).await.unwrap(), original);
+        assert!(matches!(run(status.clone()).await, Reply::CaptureDiscardPrepared { key_withdrawn_at_ms: None, .. }));
         let CellStorage::Local { root } = &service.archive else { unreachable!() };
         std::fs::write(root, b"unavailable archive path").unwrap();
         assert!(matches!(run(settle.clone()).await, Reply::Deferred));

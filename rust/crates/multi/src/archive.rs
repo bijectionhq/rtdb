@@ -722,6 +722,15 @@ async fn archive_key(keys: &dyn KeyService, point: &CapturePoint) -> Result<[u8;
         .ok_or_else(|| unavailable("The checkpoint archive key is unavailable"))
 }
 
+async fn require_archive_key_authority(keys: &dyn KeyService, registered: &CheckpointCapture) -> Result<()> {
+    if let Some(expected) = registered.key_namespace
+        && keys.namespace_id().await? != expected
+    {
+        return Err(unavailable("The configured vault is not the original checkpoint key authority"));
+    }
+    Ok(())
+}
+
 fn archive_witness(deployment: Uuid, operation: Uuid) -> Result<ObjectKey> {
     key(&format!("checkpoint-authorities/{deployment}/{operation}.json")).map_err(Into::into)
 }
@@ -1039,6 +1048,7 @@ async fn capture_checkpoint(
     if !local && hosted_task.is_none() {
         return Err(inconsistent("Remote checkpoint capture requires its installed ECS task"));
     }
+    let key_namespace = keys.namespace_id().await?;
     let witness = if local { keys.hold_local_storage_region(region)? } else { None };
     let witnessed = witness.is_some();
     let mut io = IoRegion::new().child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
@@ -1066,6 +1076,7 @@ async fn capture_checkpoint(
         };
         if let Some(registered) = record.checkpoint_captures.get(&operation) {
             if registered.archive != binding || registered.incarnation != record.incarnation
+                || registered.key_namespace.is_some_and(|original| original != key_namespace)
                 || registered.log_epoch != record.log_epoch
                 || registered.automatic_fork != automatic_fork || registered.world_replay != world_replay
             {
@@ -1096,6 +1107,7 @@ async fn capture_checkpoint(
             }
             record.checkpoint_captures.insert(operation, CheckpointCapture {
                 archive: binding.clone(),
+                key_namespace: Some(key_namespace),
                 incarnation: record.incarnation,
                 log_epoch: record.log_epoch,
                 checkpoint,
@@ -1874,6 +1886,7 @@ pub async fn finish_retirement(
             .is_some_and(|release| release.observed_empty_at_ms.is_some()) {
             continue;
         }
+        require_archive_key_authority(keys, registration).await?;
         let archive: CellStorage = serde_json::from_str(&registration.archive)
             .map_err(|_| inconsistent("Invalid retained archive binding"))?;
         if !matches!(archive, CellStorage::Local { .. }) {
@@ -2176,6 +2189,7 @@ mod tests {
         let operation = Uuid::new_v4();
         record.checkpoint_captures.insert(operation, CheckpointCapture {
             archive: archive_binding(&archive)?,
+            key_namespace: None,
             incarnation: record.incarnation,
             log_epoch: record.log_epoch,
             checkpoint,
@@ -2295,6 +2309,7 @@ mod tests {
             operation,
             CheckpointCapture {
                 archive: archive_binding(&archive)?,
+                key_namespace: None,
                 incarnation: record.incarnation,
                 log_epoch: record.log_epoch,
                 checkpoint: Checkpoint {

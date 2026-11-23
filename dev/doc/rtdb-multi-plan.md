@@ -188,6 +188,8 @@ The combined `discard_checkpoint_capture` action accepts and settles the same du
 A preparation with `deadline_ms` returns `capture_discard_deadline_unsupported` before changing custody because the installed key services lack an enforced revocation deadline for outstanding grants.
 The selected custody domain covers the capture and its dependent archive suffixes.
 Serving history and independently keyed exports have separate custody.
+New captures bind their original vault identity before any key or archive data publication.
+Settlement checks that identity before withdrawing the capture key.
 The recorded vault withdrawal is an observation of that vault's tombstone.
 A capture used by the current repair still belongs to the serving closure and cannot be discarded independently.
 

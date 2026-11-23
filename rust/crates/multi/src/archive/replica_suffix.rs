@@ -1075,6 +1075,7 @@ mod custody_tests {
             expires_at_ms: now_ms() + 60_000, archive_sha256: None,
         };
         record.checkpoint_captures.insert(capture, CheckpointCapture {
+            key_namespace: None,
             archive: super::super::archive_binding(&archive)?,
             incarnation: record.incarnation, log_epoch: record.log_epoch, checkpoint,
             automatic_fork: false, world_replay: None, media_bound: true, manifest_sha256: Some(pin.manifest_sha256.clone()), remote_disposal: None,

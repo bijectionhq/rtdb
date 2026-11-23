@@ -2696,6 +2696,7 @@ rule HostedCheckpointCapture {
             ReturnOriginalCaptureReceipt(authority, capture_id)
         else:
             RegisterAndVerifyCheckpointArchive(authority, capture_id, ConfiguredArchive)
+            BindOriginalArchiveKeyAuthority(authority, capture_id)
             SealArchiveWithCaptureKey(authority, capture_id)
             RetainAndReturnExactCheckpointAndManifestDigest(authority, capture_id)
 }
@@ -2720,6 +2721,7 @@ rule SettleCheckpointCaptureDiscard {
 
     requires: CaptureAdmissionFenced(capture)
               and AdmittedCaptureRegionsDrained(capture)
+              and OriginalCaptureKeyVaultAvailable(capture)
 
     ensures:
         ObserveCaptureKeyVaultWithdrawal(capture)

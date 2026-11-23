@@ -8,7 +8,7 @@ use rtdb_storage::{IoRegion, ObjectKey};
 use rtdb_types::Result;
 use uuid::Uuid;
 
-use super::{archive_binding, archive_key_id, capture_point, inconsistent, key, unavailable};
+use super::{archive_binding, archive_key_id, capture_point, inconsistent, key, require_archive_key_authority, unavailable};
 use crate::{
     admin::update_installation, deployment::CellStorage, keys::KeyService,
     store::reconcile_storage_regions,
@@ -302,13 +302,19 @@ pub(crate) async fn finish_capture_retirement(
     let withdrawn_at = if let Some(withdrawn) = accepted.key_withdrawn_at_ms {
         withdrawn
     } else {
-        let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
-        if record.checkpoint_captures.get(&capture).is_some_and(|value| value.media_bound) {
+        if let Some(registration) = record.checkpoint_captures.get(&capture).filter(|value| value.media_bound) {
+            require_archive_key_authority(keys, registration).await?;
+            let deployment = Uuid::parse_str(id).map_err(|_| inconsistent("Invalid capture owner"))?;
             let point = capture_point(&record, deployment, capture, &accepted.archive)?;
             keys.destroy(&archive_key_id(&point)).await?;
         }
         let withdrawn = now_ms().max(accepted.authorized_at_ms);
         let current = update_installation(directory, id, |current| {
+            if pending(current)
+                || current.checkpoint_captures.get(&capture) != record.checkpoint_captures.get(&capture)
+            {
+                return Err(inconsistent("The closed capture changed before recording vault withdrawal"));
+            }
             let retirement = checked_retirement(current, capture, &accepted)?;
             retirement.key_withdrawn_at_ms.get_or_insert(withdrawn);
             Ok(())
@@ -433,6 +439,7 @@ mod tests {
             capture,
             CheckpointCapture {
                 archive: archive_binding(&archive)?,
+                key_namespace: None,
                 incarnation: record.incarnation,
                 log_epoch: record.log_epoch,
                 checkpoint,
