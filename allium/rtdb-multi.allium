@@ -1520,6 +1520,7 @@ rule ConsumeIntake {
 -- The Held overlay archive keeps its original world, pin, logical publication and source Root coordinate even when the source Held world is dropped or its Root pin is relocated.
 -- An explicit retained Root position uses that original Root archive under the child's frame and exact schema and purge guards.
 -- Held overlay assertion history reads only exact accepted journal groups in the bounded archived region and resolves them against the same pinned Root.
+-- A change journal touch for a positioned owned event carries that event's ordinal within its publication.
 -- Ordered history opens the two images around the same accepted Held group and checks that the requested path generation covers both cuts.
 -- An earlier effective read uses a certified Held clock publication inside the retained overlay cap and the same pinned Root.
 -- A retained descendant can select that earlier publication while independently retaining the same physical archive suffix.

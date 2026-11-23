@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use crate::{Anomaly, EntityId, Interval, Result, StructFields, Timestamp, Value};
 
 pub const OWNED_CHANGE_GROUP_BYTES: usize = 1024 * 1024;
@@ -17,6 +19,7 @@ pub struct OwnedChange {
     pub id: EntityId,
     pub kind: OwnedChangeKind,
     pub valid: Interval,
+    pub assertion_ordinal: Option<NonZeroU32>,
 }
 
 impl OwnedChange {
@@ -48,6 +51,9 @@ impl OwnedChange {
         if let OwnedChangeKind::Expired(lifetime) = self.kind {
             fields.insert("created_micros".into(), Value::I64(lifetime.lower().0));
             fields.insert("expiry_micros".into(), Value::I64(lifetime.upper().0));
+        }
+        if let Some(ordinal) = self.assertion_ordinal {
+            fields.insert("assertion_ordinal".into(), Value::I64(i64::from(ordinal.get())));
         }
         Value::Struct(fields)
     }
@@ -82,10 +88,19 @@ impl OwnedChange {
             _ => return Err(change_feed_uncovered()),
         };
         let valid = Interval::new(Timestamp(*from), to).map_err(|_| change_feed_uncovered())?;
+        let ordinal = fields.get("assertion_ordinal");
+        let assertion_ordinal = match ordinal {
+            None | Some(Value::Null | Value::Undefined) => None,
+            Some(Value::I64(ordinal)) => Some(
+                u32::try_from(*ordinal).ok().and_then(NonZeroU32::new).ok_or_else(change_feed_uncovered)?,
+            ),
+            _ => return Err(change_feed_uncovered()),
+        };
+        let fields_len = fields.len() - usize::from(ordinal.is_some());
         let shape = if matches!(kind, OwnedChangeKind::Expired(_)) {
-            fields.len() == 6
+            fields_len == 6
         } else {
-            fields.len() == 4 || (fields.len() == 6
+            fields_len == 4 || (fields_len == 6
                 && ["created_micros", "expiry_micros"].iter().all(|name|
                     matches!(fields.get(*name), Some(Value::Null | Value::Undefined))))
         };
@@ -94,7 +109,7 @@ impl OwnedChange {
         {
             return Err(change_feed_uncovered());
         }
-        Ok(Self { id, kind, valid })
+        Ok(Self { id, kind, valid, assertion_ordinal })
     }
 }
 

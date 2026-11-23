@@ -4658,5 +4658,6 @@ fn owned_touches_type() -> rtdb_types::LogicalType {
         ("valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
         ("created_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
         ("expiry_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
+        ("assertion_ordinal".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
     ])))
 }

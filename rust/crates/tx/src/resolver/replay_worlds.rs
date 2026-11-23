@@ -269,8 +269,8 @@ impl OpenTransaction<'_> {
             } else {
                 (WorldShadow::Deleted, OwnedChangeKind::Delete)
             };
-            self.buffer.append(
-                relation.table(owner),
+            let position = self.buffer.append_to(
+                &relation.table(owner),
                 StoredEvent {
                     origin: None,
                     commit_position: 0,
@@ -282,7 +282,7 @@ impl OpenTransaction<'_> {
                     recency: None,
                 },
             )?;
-            self.record_owned_change(&relation, shadow.id, change, shadow.valid, Ok(None))?;
+            self.record_owned_change(&relation, shadow.id, change, shadow.valid, position, Ok(None))?;
         }
         Ok(())
     }

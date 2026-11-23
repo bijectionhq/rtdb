@@ -1,5 +1,6 @@
 use rtdb_types::{OrderedSet, StructFields};
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock, Weak};
 
 use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
@@ -821,9 +822,9 @@ impl TransactionBuffer {
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
         self.append(table, StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
-    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event) }
+    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event).map(drop) }
     /// As `append`, copying the table reference only for the table's first write.
-    pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<()> {
+    pub fn append_to(&mut self, table: &TableRef, mut event: StoredEvent) -> Result<Option<NonZeroU32>> {
         if event.entity_key.is_some() != table.is_owned_event_data() {
             return Err(invalid("The transaction event has the wrong physical entity-key layout"));
         }
@@ -846,7 +847,7 @@ impl TransactionBuffer {
         let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         pending.events.push(event);
         pending.reservations.push(reservation);
-        Ok(())
+        Ok(position.and_then(NonZeroU32::new))
     }
     fn next_owned_position(&self, table: &TableRef) -> Result<Option<u32>> {
         Ok(if table.is_owned_event_data() {
@@ -875,7 +876,7 @@ impl TransactionBuffer {
     pub fn append_owned_put(
         &mut self, table: &TableRef, content: arrow_array::ArrayRef, mut header: EventHeader,
         key: &[u8], source_bytes: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<Option<NonZeroU32>> {
         if !table.is_owned_event_data() || header.commit_position != 0 {
             return Err(invalid("An owned Arrow put requires a governed table and an unassigned position"));
         }
@@ -886,7 +887,7 @@ impl TransactionBuffer {
         let batch = keyed_put_batch(content, &[header], keys, source_bytes, &self.budget)?;
         self.append_batch_inner(table, batch)?;
         if let Some(position) = position { self.consume_owned_position(position); }
-        Ok(())
+        Ok(position.and_then(NonZeroU32::new))
     }
 
     pub fn append_batch(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
@@ -1209,13 +1210,17 @@ mod chunk_tests {
             ("location", Arc::new(arrow_array::BinaryArray::from_iter_values([b"location"]))),
         ]).unwrap();
         let header = EventHeader { commit_position: 0, iid: id.iid(), system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put };
-        transaction.append_owned_put(&table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None).unwrap();
-        transaction.append_to(&table, StoredEvent {
+        let put = transaction.append_owned_put(
+            &table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None,
+        ).unwrap();
+        let delete = transaction.append_to(&table, StoredEvent {
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: key.system_time, valid_time: Interval::ALL,
             operation: StoredOperation::Delete, recency: None,
         }).unwrap();
+        assert_eq!(put, NonZeroU32::new(3));
+        assert_eq!(delete, NonZeroU32::new(7));
         let staged = transaction.stage().unwrap();
         let batch = staged.tables()[&table].batch().unwrap();
         let first = batch.view().read_event(0).unwrap();

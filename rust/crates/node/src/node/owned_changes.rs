@@ -1187,6 +1187,7 @@ fn filtered_relation_page_keeps_the_examined_world_boundary() {
                     id: EntityId::String("fact".into()),
                     kind: rtdb_types::OwnedChangeKind::Put,
                     valid,
+                    assertion_ordinal: None,
                 }],
             }],
         }],
