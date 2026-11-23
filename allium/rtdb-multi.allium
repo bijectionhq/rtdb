@@ -518,7 +518,10 @@ contract LogService {
         -- A guarded record's durable frame records whether it was originally appended here or copied.
         -- A journal samples its clock after the durable sync containing an original guarded append.
         -- It persists the sample with that exact retained entry before replying.
-        -- Compaction preserves the sample and a replacement or copied entry starts without one.
+        -- A journal refuses to overwrite a locally original guarded entry with a copy at the same LSN and entry epoch, even when its sample is absent.
+        -- Compaction and replay preserve the local origin marker and any persisted sample of each retained entry.
+        -- A copy placed into a journal, including by a move or overwrite, starts without a local sample.
+        -- An exact guarded-entry report carries the journal's local origin marker.
         -- A physically bounded append records its exclusive journal cutoff in the entry. A sample at or above that cutoff can never vote, including during recovery.
         -- The sealed acceptance stage carries the journal cutoff and the digest of the exact receiver clock certificate together, or omits both.
         -- A present journal cutoff is positive and at least the stage cutoff, and its digest has 32 bytes with at least one nonzero byte.

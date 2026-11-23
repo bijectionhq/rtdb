@@ -2103,6 +2103,37 @@ TLA_CASES = (
     ("PhysicalJournalQuorum", "physical-journal-quorum-rebound-witness",
      ("INVARIANTS DistinctVoteIdentities OnlyAdmittedJournalsVote IntersectsPriorWrite",
       "INVARIANT NeverConfirmsWithUnaffectedQuorum"), "NeverConfirmsWithUnaffectedQuorum"),
+    ("JournalProvenance", "journal-provenance", None, None),
+    ("JournalProvenance", "journal-provenance-overwrites-observed-original",
+     ('Mutation = "none"', 'Mutation = "overwrite_observed"'), "action:OverwriteProtectsObservedOriginal"),
+    ("JournalProvenance", "journal-provenance-compaction-drops-provenance",
+     ('Mutation = "none"', 'Mutation = "compact_drops_provenance"'), "action:CompactionPreservesEvidence"),
+    ("JournalProvenance", "journal-provenance-compaction-drops-sample",
+     ('Mutation = "none"', 'Mutation = "compact_drops_sample"'), "action:CompactionPreservesEvidence"),
+    ("JournalProvenance", "journal-provenance-replay-drops-provenance",
+     ('Mutation = "none"', 'Mutation = "replay_drops_provenance"'), "action:ReplayRestoresEvidence"),
+    ("JournalProvenance", "journal-provenance-replay-drops-sample",
+     ('Mutation = "none"', 'Mutation = "replay_drops_sample"'), "action:ReplayRestoresEvidence"),
+    ("JournalProvenance", "journal-provenance-samples-copy",
+     ('Mutation = "none"', 'Mutation = "sample_copy"'), "action:NewSamplesHaveOriginalSync"),
+    ("JournalProvenance", "journal-provenance-imports-move-sample",
+     ('Mutation = "none"', 'Mutation = "import_move_sample"'), "action:NewSamplesHaveOriginalSync"),
+    ("JournalProvenance", "journal-provenance-resamples-replayed-original",
+     ('Mutation = "none"', 'Mutation = "resample_replayed_original"'), "action:NewSamplesHaveOriginalSync"),
+    ("JournalProvenance", "journal-provenance-reports-copy-as-original",
+     ('Mutation = "none"', 'Mutation = "report_copy_as_original"'), "ReportsMatchLocalEvidence"),
+    ("JournalProvenance", "journal-provenance-reports-sample-after-compacted-replay-witness",
+     ("INVARIANT ReportsMatchLocalEvidence", "INVARIANTS ReportsMatchLocalEvidence NeverReportsSampleAfterCompactedReplay"),
+     "NeverReportsSampleAfterCompactedReplay"),
+    ("JournalProvenance", "journal-provenance-reports-interrupted-original-witness",
+     ("INVARIANT ReportsMatchLocalEvidence", "INVARIANTS ReportsMatchLocalEvidence NeverReportsInterruptedOriginalAfterCompactedReplay"),
+     "NeverReportsInterruptedOriginalAfterCompactedReplay"),
+    ("JournalProvenance", "journal-provenance-reports-moved-copy-witness",
+     ("INVARIANT ReportsMatchLocalEvidence", "INVARIANTS ReportsMatchLocalEvidence NeverReportsMovedCopyAfterCompactedReplay"),
+     "NeverReportsMovedCopyAfterCompactedReplay"),
+    ("JournalProvenance", "journal-provenance-reports-replacement-witness",
+     ("INVARIANT ReportsMatchLocalEvidence", "INVARIANTS ReportsMatchLocalEvidence NeverReportsReplacementOfSampledOriginal"),
+     "NeverReportsReplacementOfSampledOriginal"),
     ("PlacedServingAuthority", "placed-serving-authority", None, None),
     ("PlacedServingAuthority", "placed-receipt-reused-intake",
      ('Mutation = "none"', 'Mutation = "reuse_slot"'), "ReceiptNamesTheAttempt"),
@@ -3156,12 +3187,13 @@ def verify_tla(args, scratch):
         config = clone_file(Path(f"verification/tla/{config_name}.cfg"), directory)
         if mutation:
             replace_once(config, *mutation)
-        log = run_case(
-            [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
-             "-workers", "2", "-metadir", str(directory / "states"), "-noGenerateSpecTE",
-             "-config", config.name, f"{module}.tla"],
-            config.parent, args.evidence, case,
-        )
+        with tempfile.TemporaryDirectory(prefix="states-", dir=directory) as metadir:
+            log = run_case(
+                [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
+                 "-workers", "2", "-metadir", metadir, "-noGenerateSpecTE",
+                 "-config", config.name, f"{module}.tla"],
+                config.parent, args.evidence, case,
+            )
         if invariant:
             if invariant.startswith("temporal:"):
                 message = f"Temporal property {invariant.removeprefix('temporal:')} was violated"

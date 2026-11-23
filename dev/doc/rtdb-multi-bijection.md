@@ -113,6 +113,25 @@ Source inspection ties vacancy to an acquired semaphore permit, retry to lookup 
 The checked bound applies to one installed holder reservation and assumes those runtime ownership and serialization rules, the sampled catalog, and authenticated identity comparisons.
 Cross-holder placement and the time for provider I/O to drain require their own evidence.
 
+#### Journal provenance evidence
+
+On 2026-11-23, TLC 2026.11.19.180144 (`bc1b506`) exhausted 19,954 distinct states of [`JournalProvenance`](../../verification/tla/JournalProvenance.tla) for one journal stream, two retained entries, three writer epochs and two sample values.
+It checked five safety laws covering original-only sync observation, refusal to replace a local original at the same LSN and entry epoch, preservation through compaction, restoration on replay, and exact reports of local provenance and samples.
+Nine mutations failed their named laws.
+They bypassed overwrite protection, dropped provenance or the sample during compaction or replay, sampled a copy locally, imported its remote sample, resampled a replayed original, or reported a copy as original.
+Three witnesses report from a compacted base after restart and cover a sampled original, an original whose frame survived a crash before its sample was persisted, and a moved copy without a sample.
+A fourth reports a later-epoch replacement without the superseded original's sample.
+
+Source inspection ties the local marker to `Store::mutate`, which calls `track_sync` for the admitted `AppendObserved` and queues that observation with the append.
+`StreamState::overwrite` checks for the observation slot at the matching LSN and entry epoch, including an empty slot before sampling or after a restart.
+`Journal::flush` writes the origin marker with the append, then persists an observation after the append sync only while the same held entry owns the observation slot.
+`Journal::compact` writes both pieces of evidence to the new base and `Journal::moved` changes payload locations.
+`Replay::segment` restores the slot from the frame's origin marker and fills it from the observation frame, and `Store::digest_page` projects both into the exact reply.
+A transfer into another journal uses the copy path with the receiving journal's own provenance.
+
+The model assumes valid framing, successful durable publication of the modeled writes and bases, exact entry identification, and the surrounding authority and digest-read admission checks.
+It abstracts the first frame sync and the second observation sync as separate transitions and takes filesystem recovery, clock bounds, cutoff enforcement and quorum selection as premises.
+
 ### Query from the application
 
 Funrun reads through the Conductor at the transaction's basis, served from the holder's tail and cache.

@@ -166,6 +166,9 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Its bounds admit two pending outcomes and four timestamps. TLC exhausts the model and Apalache checks the order law through eight transitions.
 * `tla/CacheGeneration.tla` models the cache pathname ownership race independently from the shared artefact reference counts.
 * `tla/ReadBack.tla` separates append, record delivery, apply, and acknowledgement across a crash and restart.
+* `tla/JournalProvenance.tla` checks guarded-entry provenance and sync samples in one journal stream through append, transfer, overwrite, compaction and replay.
+  On 2026-11-23 TLC 2026.11.19.180144 exhausted 19,954 distinct states with two retained entries, three writer epochs and two sample values across five safety laws, nine mutation controls and four reachability witnesses.
+  The link:../dev/doc/rtdb-multi-bijection.md#journal-provenance-evidence[production correspondence] describes the inspected Rust paths and the model's premises.
 * `tla/Checkpoint.tla` separates durable object publication, lost replies, listing, and log replay across a restart.
   It checks one root and three dependencies with finite failures, including early publication, loss of an acknowledged dependency, and log trimming followed by a listing omission.
   It compares an acknowledged pending copy with a copy whose completion is checked.
