@@ -13,6 +13,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use ordered_logkeeper::ordered::{Grant, Placement};
 use prost_types::Any;
+use rtdb_format::trie_retirement::InstalledRetirement;
 use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_replication::{BlockDiscovery, PublishedCheckpoint};
 use rtdb_storage::{
@@ -20,7 +21,10 @@ use rtdb_storage::{
     log::ReplicaObjectScope,
     object_store::{ObjectReadAllocation, ReadReservation, RetainedBytes, StoredObject},
 };
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result};
+use rtdb_types::{
+    Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectPublication, PhysicalObjectVersion,
+    ReplicaPosition, Result,
+};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
@@ -529,6 +533,31 @@ impl ServingStore {
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    fn defers_trie_releases(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    fn releases_receipt_l0(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    // Settlement still belongs to the recovery dependency owner. The active
+    // writer can only authenticate the installed removal and queue its files.
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
+        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        let writer = self.authorize(receipt).await?;
+        if self.get_fresh_exact(receipt, contents.len()).await? != contents {
+            return Err(invalid("The installed grant trie release differs from its stored receipt"));
+        }
+        let mut files = installed.files().iter().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.release_order());
+        for file in files {
+            let key = ObjectKey::new(&file.key)?;
+            writer.reclamation.enqueue(self.upper.as_ref(), self.lower.as_deref(), &key).await?;
+        }
+        Ok(true)
+    }
+
     fn queues_offloaded_payload_reclamation(&self) -> bool {
         self.writer.is_some()
     }
@@ -556,6 +585,14 @@ impl ObjectStore for ServingStore {
         key: &ObjectKey,
     ) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         self.read(key, |store| store.observe_head(key)).await
+    }
+
+    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+        self.read(key, |store| store.retirement_version(key)).await
+    }
+
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
+        self.read(key, |store| store.retirement_publication(key)).await
     }
 
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
@@ -629,23 +666,30 @@ impl ObjectStore for ServingStore {
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        self.put_with_publication(key, bytes).await.map(drop)
+    }
+
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
         self.authorize(key).await?;
         if let Some(lower) = self.inherited(key).await? {
-            return if lower.get_fresh_exact(key, bytes.len()).await? == bytes {
-                Ok(())
-            } else {
-                Err(Error::ConflictingObject(key.to_string()))
-            };
+            if lower.get_fresh_exact(key, bytes.len()).await? != bytes {
+                return Err(Error::ConflictingObject(key.to_string()));
+            }
+            return lower.retirement_publication(key).await;
         }
-        self.upper.put(key, bytes).await
+        self.upper.put_with_publication(key, bytes).await
     }
 
     async fn put_file(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<()> {
+        self.put_file_with_publication(key, path).await.map(drop)
+    }
+
+    async fn put_file_with_publication(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
         self.authorize(key).await?;
         if self.inherited(key).await?.is_some() {
             return Err(Error::ConflictingObject(key.to_string()));
         }
-        self.upper.put_file(key, path).await
+        self.upper.put_file_with_publication(key, path).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {

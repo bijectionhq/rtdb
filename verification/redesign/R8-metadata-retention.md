@@ -154,6 +154,10 @@ Classic streamed file publication also settles the private staging version after
 A legacy object without original publication evidence in a versioned bucket remains pending.
 Other Classic providers lack this version-bound settlement.
 
+Maintenance on an active installed grant records receipt L0 publication identities and sends files from its installed trie-removal receipt to the existing reclamation queue.
+An inherited member remains the responsibility of its original grant.
+Queue admission permits no provider effect. Active file settlement needs the exact recovery-dependency fence to consume the queued identity.
+
 M1 remains open for prior still-held archives, unbound Classic remote objects, active installed journal grant files, detached or legacy copies outside these grants, and untracked media snapshots.
 Closure needs exact custodian settlement after the successor and all such references are released.
 A captured archive's existing whole-capture settlement can run after release of its last entitlement.
