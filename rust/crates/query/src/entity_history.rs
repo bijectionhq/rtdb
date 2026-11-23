@@ -62,6 +62,7 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
     let entry = request.snapshot.table_entry(table);
     let mut reads = futures::stream::FuturesOrdered::new();
     let mut count = 0usize;
+    let mut retained_keys = 0usize;
     let mut identities = BTreeMap::<Iid, Option<Vec<u8>>>::new();
     loop {
         while reads.len() < 8 {
@@ -70,12 +71,18 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
             let record = trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION);
             reads.push_back(async move {
                 if request.cancellation.is_cancelled() { return Err(cancelled()); }
-                // A trie written before table history, or whose history build failed, is read from its primary pages for these keys alone.
+                let mut rows = Vec::new();
+                let mut reservation = request.memory.reserve(4096)?;
+                let mut key_bytes = 0usize;
+                let mut visit = |event, key: Option<&[u8]>| {
+                    key_bytes = key_bytes.saturating_add(key.map_or(0, <[u8]>::len));
+                    charge_history(&mut reservation, rows.len() + 1, key_bytes)?;
+                    rows.push((event, key.map(<[u8]>::to_vec)));
+                    Ok(true)
+                };
                 let Some(record) = record else {
-                    let events = crate::scan::primary_point_events(request, &table.slug, &trie.key, Some(keys), usize::MAX).await?
-                        .expect("an unlimited primary read completes");
-                    let reservation = request.memory.reserve(4096usize.saturating_add(events.len().saturating_mul(384)))?;
-                    return Ok::<_, Anomaly>((events.into_iter().map(|event| (event, None)).collect::<Vec<_>>(), reservation));
+                    crate::scan::primary_point_events(request, &table.slug, &trie.key, Some(keys), usize::MAX, visit).await?;
+                    return Ok::<_, Anomaly>((rows, reservation, key_bytes));
                 };
                 let root = HistoryRoot::decode(record.stats(), record.file_size())?;
                 let key = ObjectKey::new(table.slug.recorded_artefact_key(&trie.key, record)?)?;
@@ -83,31 +90,27 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
                 let directory = file.read(root.range()).await?;
                 let _directory = request.memory.reserve(directory.as_slice().len().saturating_mul(2).saturating_add(4096))?;
                 let ranges = entity_history::ranges(directory.as_slice(), root, entity_history::owner(&table.slug, &trie.key), Some(keys))?;
-                let mut rows = Vec::new();
-                let mut reservation = request.memory.reserve(1024)?;
                 for range in ranges {
                     if request.cancellation.is_cancelled() { return Err(cancelled()); }
                     let bytes = file.read(range.range()).await?;
                     let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
                     let page = range.read(bytes.as_slice())?;
                     for row in page.rows(keys) {
-                        let lease = Arc::get_mut(&mut reservation).expect("unpublished history rows own their reservation");
-                        let needed = 4096usize.saturating_add((rows.len() + 1).saturating_mul(384));
-                        if needed > lease.bytes() { lease.grow_to(needed.max(lease.bytes().saturating_mul(2)))?; }
                         let (header, origin) = page.event(row)?;
-                        rows.push((LocatedHistoryEvent { header, origin, witness: None,
+                        visit(LocatedHistoryEvent { header, origin, witness: None,
                             location: SearchRowLocation::Persisted { trie: trie.key.clone(), page: range.page, row: range.first_row + row as u32 } },
-                            page.entity_key(row).map(<[u8]>::to_vec)));
+                            page.entity_key(row))?;
                     }
                 }
-                Ok((rows, reservation))
+                Ok((rows, reservation, key_bytes))
             }.boxed());
         }
-        let Some((rows, _held)) = reads.try_next().await? else { break; };
+        let Some((rows, _held, key_bytes)) = reads.try_next().await? else { break; };
         count = count.saturating_add(rows.len());
-        charge_rows(&mut charge, count)?;
+        retained_keys = retained_keys.saturating_add(key_bytes);
+        charge_history(&mut charge, count, retained_keys)?;
         for (row, key) in rows {
-            if key.is_some() && !same_identity(&mut identities, row.header.iid, key) { return Ok(None); }
+            if !same_identity(&mut identities, row.header.iid, key) { return Ok(None); }
             histories.entry(row.header.iid).or_default().push(row);
         }
     }
@@ -118,8 +121,12 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
                 let (header, source) = located?;
                 audience_work::scan_items(1)?;
                 count = count.saturating_add(1);
-                charge_rows(&mut charge, count)?;
-                let origin = source.batch.view().origin(source.row)?;
+                let batch = source.batch.view();
+                let key = batch.entity_key(source.row)?;
+                retained_keys = retained_keys.saturating_add(key.map_or(0, <[u8]>::len));
+                charge_history(&mut charge, count, retained_keys)?;
+                if !same_identity(&mut identities, header.iid, key.map(<[u8]>::to_vec)) { return Ok(None); }
+                let origin = batch.origin(source.row)?;
                 histories.entry(iid).or_default().push(LocatedHistoryEvent { header, origin, witness: None, location: SearchRowLocation::Live(source) });
             }
         }
@@ -136,9 +143,9 @@ fn same_identity(identities: &mut BTreeMap<Iid, Option<Vec<u8>>>, iid: Iid, key:
     }
 }
 
-fn charge_rows(charge: &mut Arc<rtdb_types::MemoryReservation>, count: usize) -> Result<()> {
+fn charge_history(charge: &mut Arc<rtdb_types::MemoryReservation>, count: usize, key_bytes: usize) -> Result<()> {
     let lease = Arc::get_mut(charge).expect("unpublished histories own their reservation");
-    let needed = 4096usize.saturating_add(count.saturating_mul(384));
+    let needed = 4096usize.saturating_add(count.saturating_mul(384)).saturating_add(key_bytes);
     if needed > lease.bytes() { lease.grow_to(needed.max(lease.bytes().saturating_mul(2)))?; }
     Ok(())
 }
@@ -167,8 +174,23 @@ async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types
     for trie in request.snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == TrieState::Live) {
         if trie.key.level() == 0 && covered.contains(&trie.key.block_index()) { continue; }
         if scope.is_some_and(|keys| !keys.iter().any(|&key| contains(trie.key.part(), key))) { continue; }
-        let budget = limit.saturating_mul(32).saturating_sub(inspected);
-        let events = match trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION) {
+        let budget = limit.saturating_mul(32);
+        let mut nominate = |header: rtdb_types::EventHeader, origin: Option<rtdb_types::EventOrigin>| -> Result<bool> {
+            if header.op != rtdb_types::EventOp::Put || header.system_from >= request.bounds.system_time.upper()
+                || header.valid_time.lower() >= request.bounds.valid_time.upper()
+                || header.valid_time.upper() <= request.bounds.valid_time.lower()
+                || scope.is_some_and(|keys| !keys.contains(&header.iid))
+                || (trie.key.level() != 0 && origin.is_some_and(|origin| covered.contains(&origin.source_block()))) {
+                return Ok(true);
+            }
+            if !iids.contains(&header.iid) {
+                if iids.len() == limit { return Ok(false); }
+                charge_history(&mut charge, iids.len() + 1, 0)?;
+                iids.insert(header.iid);
+            }
+            Ok(true)
+        };
+        match trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION) {
             Some(record) => {
                 let key = ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?;
                 let root = HistoryRoot::decode(record.stats(), record.file_size())?;
@@ -176,36 +198,23 @@ async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types
                 let directory = file.read(root.range()).await?;
                 let _directory = request.memory.reserve(directory.as_slice().len().saturating_mul(2).saturating_add(4096))?;
                 let ranges = entity_history::ranges(directory.as_slice(), root, entity_history::owner(&entry.slug, &trie.key), scope)?;
-                let mut events = Vec::new();
                 for range in ranges {
                     if request.cancellation.is_cancelled() { return Err(cancelled()); }
                     inspected = inspected.saturating_add(range.rows as usize);
-                    if inspected > limit.saturating_mul(32) { return Ok(None); }
+                    if inspected > budget { return Ok(None); }
                     let bytes = file.read(range.range()).await?;
                     let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
                     let page = range.read(bytes.as_slice())?;
-                    for row in 0..range.rows as usize { events.push(page.event(row)?); }
+                    for row in 0..range.rows as usize {
+                        let (header, origin) = page.event(row)?;
+                        if !nominate(header, origin)? { return Ok(None); }
+                    }
                 }
-                events
             }
-            // A trie without table history nominates from its primary pages, within the same inspection budget.
             None => {
-                let Some(events) = crate::scan::primary_point_events(request, &entry.slug, &trie.key, scope, budget).await? else { return Ok(None); };
-                inspected = inspected.saturating_add(events.len());
-                events.into_iter().map(|event| (event.header, event.origin)).collect()
-            }
-        };
-        for (header, origin) in events {
-            if header.op != rtdb_types::EventOp::Put || header.system_from >= request.bounds.system_time.upper()
-                || header.valid_time.lower() >= request.bounds.valid_time.upper()
-                || header.valid_time.upper() <= request.bounds.valid_time.lower()
-                || scope.is_some_and(|keys| !keys.contains(&header.iid))
-                || (trie.key.level() != 0 && origin.is_some_and(|origin| covered.contains(&origin.source_block()))) {
-                continue;
-            }
-            if iids.insert(header.iid) {
-                if iids.len() > limit { return Ok(None); }
-                charge_rows(&mut charge, iids.len())?;
+                let Some(rows) = crate::scan::primary_point_events(request, &entry.slug, &trie.key, scope, budget.saturating_sub(inspected),
+                    |event, _| nominate(event.header, event.origin)).await? else { return Ok(None); };
+                inspected = inspected.saturating_add(rows);
             }
         }
     }

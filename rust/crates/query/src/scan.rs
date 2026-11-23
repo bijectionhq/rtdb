@@ -168,7 +168,8 @@ async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<
 /// `None` once more than `max_rows` rows would be inspected.
 pub(crate) async fn primary_point_events(
     request: &crate::ScanRequest<'_>, slug: &TableSlug, trie: &TrieKey, keys: Option<&BTreeSet<Iid>>, max_rows: usize,
-) -> Result<Option<Vec<crate::LocatedHistoryEvent<()>>>> {
+    mut visit: impl FnMut(crate::LocatedHistoryEvent<()>, Option<&[u8]>) -> Result<bool>,
+) -> Result<Option<usize>> {
     let memory = request.memory;
     let metadata_key = ObjectKey::new(slug.metadata_key(trie))?;
     let (metadata, _metadata) = read_metadata(request.storage, &metadata_key, memory).await?;
@@ -189,7 +190,6 @@ pub(crate) async fn primary_point_events(
         }
     }
     let mut file = DataFile { storage: Arc::clone(request.storage), key: ObjectKey::new(slug.data_key(trie))?, metadata: metadata_key, opened: None };
-    let mut events = Vec::new();
     let mut inspected = 0usize;
     for page in pages {
         if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
@@ -205,17 +205,18 @@ pub(crate) async fn primary_point_events(
         };
         inspected = inspected.saturating_add(batch.len());
         if inspected > max_rows { return Ok(None); }
+        audience_work::scan_items(batch.len())?;
         let page = u32::try_from(page).map_err(|error| invalid("point-page", error))?;
         for row in 0..batch.len() {
             let iid = batch.iid(row)?;
             if keys.is_some_and(|keys| !keys.contains(&iid)) { continue; }
-            audience_work::scan_items(1)?;
-            events.push(crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
+            let event = crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
                 location: crate::SearchRowLocation::Persisted { trie: trie.clone(), page,
-                    row: u32::try_from(row).map_err(|error| invalid("point-row", error))? } });
+                    row: u32::try_from(row).map_err(|error| invalid("point-row", error))? } };
+            if !visit(event, batch.entity_key(row)?)? { return Ok(None); }
         }
     }
-    Ok(Some(events))
+    Ok(Some(inspected))
 }
 
 fn point_cancelled() -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Primary point read cancelled") }
@@ -2909,6 +2910,69 @@ mod tests {
         assert!(cursor.next_batch().await.unwrap().is_none());
         let counts = cursor.scan_counts().unwrap();
         assert_eq!((counts.files_used, counts.pages_used, counts.rows_read), (0, 1, 1), "the point path reads one page and opens no scan");
+    }
+
+    #[tokio::test]
+    async fn primary_points_keep_the_recorded_keys_of_colliding_rows() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let value = state.value();
+        let entry = value.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(value.live().block_index()).unwrap();
+        let mut first = events[0].clone();
+        first.entity_key = Some(vec![1].into());
+        let mut second = first.clone();
+        second.entity_key = Some(vec![2].into());
+        second.system_from = Timestamp(75);
+        let puts = value.live().tables()[&table].column_types().clone();
+        let page = build_event_batch(&[first, second], Some(puts), None).unwrap();
+        let data = write_file(page.schema().as_ref(), &[page]).unwrap();
+        let key = ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+        store.delete(&key).await.unwrap();
+        store.put(&key, data.into()).await.unwrap();
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let snapshot = value.snapshot();
+        let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot,
+            storage: &storage, canonical_entity_iids: false, shared_rank: None, counts: Default::default() };
+        let point = Interval::at(Timestamp(150)).unwrap();
+        let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
+            bounds: TemporalBounds { valid_time: point, system_time: point }, memory: &memory,
+            current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+            constants: &crate::accelerate::ExecutionConstants(&execution), verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+        let keys = [events[0].iid].into();
+        let mut recorded = Vec::new();
+        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(&keys), usize::MAX, |_, key| {
+            recorded.push(key.unwrap().to_vec());
+            Ok(true)
+        }).await.unwrap(), Some(2));
+        assert_eq!(recorded, [vec![1], vec![2]]);
+        assert!(crate::table_point_rows(&request, &keys).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_gap_read_charges_the_page_and_counts_filtered_primary_rows() {
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let value = state.value();
+        let entry = value.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(value.live().block_index()).unwrap();
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let snapshot = value.snapshot();
+        let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot,
+            storage: &storage, canonical_entity_iids: false, shared_rank: None, counts: Default::default() };
+        let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
+            bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
+            current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+            constants: &crate::accelerate::ExecutionConstants(&execution), verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+        let before = memory.used_bytes();
+        let mut visited = Vec::new();
+        assert_eq!(primary_point_events(&request, &entry.slug, &trie, None, 2, |event, _| {
+            assert!(memory.used_bytes() > before);
+            if event.header.iid == events[0].iid { visited.push(event.header.iid); }
+            Ok(true)
+        }).await.unwrap(), None);
+        assert_eq!(visited, [events[0].iid]);
+        assert_eq!(memory.used_bytes(), before);
     }
 
     #[tokio::test]
