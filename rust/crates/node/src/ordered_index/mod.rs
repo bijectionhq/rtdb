@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use accelerate::{OrderedIndexAccelerator, RowBounds};
 pub(crate) use maintenance::OrderedIndexMaintenance;
-pub(crate) use usage::Inventory;
+pub(crate) use usage::{Inventory, owned_file_bytes};
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
 const PAGE_LAYOUT_VERSION: u8 = 9;
