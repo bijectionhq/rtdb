@@ -149,6 +149,7 @@ pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
 pub(crate) const OPEN_OWNED_READ_V2: &str = "rtdb.owned.OpenRead.v2";
 pub(crate) const HELD_OWNED_POINT_V1: &str = "rtdb.owned.ReadHeldPoint.v1";
 pub(crate) const HELD_OWNED_POINT_V2: &str = "rtdb.owned.ReadHeldPoint.v2";
+pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_WORLD_VALID_V1: &str = "rtdb.owned.ReadHeldWorldValidDuring.v1";
@@ -1014,6 +1015,35 @@ impl Service {
         let reply = self.finish_owned_point(system, valid, &id, cursor, None).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
+    }
+
+    pub(crate) async fn held_owned_path_touch_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned path touch has no held read handle"))?;
+        let (group, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned path touch has no group time"))?;
+        let group = Timestamp(i64::from_be_bytes(*group));
+        let before = Timestamp(group.0.checked_sub(1).ok_or_else(|| invalid("Owned path touch has no preceding cut"))?);
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, request) = split_relation(request)?;
+        let (path, arrow_bytes) = split_relation(request)?;
+        let batch = request_batch(call, arrow_bytes)?;
+        let batch = batch.batch();
+        if batch.num_columns() != 2 || batch.num_rows() != 1 {
+            return Err(invalid("Owned path touch requires one identity and valid instant"));
+        }
+        let (id, _identity) = point_identity(call, batch)?;
+        let valid = history_request_endpoint(batch, "valid_micros")?;
+        let columns = held.snapshot.path_touch_columns(&relation, &path, &id, before, group, valid).await.map_err(status)?;
+        let mut replies = Vec::with_capacity(2);
+        for system in [before, group] {
+            let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
+            let reply = self.finish_owned_point_inner(system, valid, &id, cursor, None, Some(&columns)).await?;
+            replies.push(Ok(reply));
+        }
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(replies)
     }
 
     pub(crate) async fn held_owned_valid_during_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2607,6 +2637,13 @@ impl Service {
     }
 
     async fn finish_owned_point(&self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>) -> Result<ActionResult, Status> {
+        self.finish_owned_point_inner(present, valid, id, result, lifetime, None).await
+    }
+
+    async fn finish_owned_point_inner(
+        &self, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
+        lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
+    ) -> Result<ActionResult, Status> {
         let Some(mut cursor) = result else {
             return self.owned_point_reply(&Schema::empty(), None, present, valid, None);
         };
@@ -2627,7 +2664,14 @@ impl Service {
                 }
                 Ok(expires)
             }).transpose()?;
-            let projected = if until.is_some() {
+            let projected = if let Some(path_columns) = path_columns {
+                let schema = batch.batch().schema_ref();
+                let mut fields = vec![schema.index_of("_id").map_err(arrow)?];
+                for name in path_columns.iter().filter(|name| name.as_str() != "_id") {
+                    fields.push(schema.index_of(name).map_err(arrow)?);
+                }
+                Some(batch.batch().project(&fields).map_err(arrow)?)
+            } else if until.is_some() {
                 let fields = batch.batch().schema_ref().fields().iter().enumerate()
                     .filter(|(_, field)| !matches!(field.name().as_str(), "_valid_from" | "_valid_to"))
                     .map(|(index, _)| index).collect::<Vec<_>>();
@@ -2640,7 +2684,8 @@ impl Service {
             }
             Ok(reply)
         } else {
-            let schema = wire::plan_schema(cursor.runtime_schema(), self.memory())?;
+            let schema = if path_columns.is_some() { Schema::empty() }
+                else { wire::plan_schema(cursor.runtime_schema(), self.memory())? };
             self.owned_point_reply(&schema, None, present, valid, None)
         }
     }
@@ -2719,7 +2764,7 @@ fn point_request(
 }
 
 fn point_identity(call: &Call, batch: &RecordBatch) -> Result<(EntityId, Arc<MemoryReservation>), Status> {
-    let (column, field) = batch.schema_ref().column_with_name("_id").expect("validated _id");
+    let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(|| invalid("Owned point has no _id field"))?;
     let values = batch.column(column).as_ref();
     let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, 0).map_err(status)?)?)?;
     let id = rtdb_columnar::read_execution_value(field, values, 0).map_err(status)?.entity_id().map_err(status)?;

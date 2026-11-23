@@ -248,6 +248,28 @@ impl OwnedReadSession {
         self.merged_change_journals(relations, after, through, limit, false).await
     }
 
+    /// Admits an exact ordinary journal touch and returns its stable declared path projection.
+    pub async fn path_touch_columns(
+        &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
+        before: Timestamp, group: Timestamp, valid: Timestamp,
+    ) -> Result<Vec<String>> {
+        if before.next()? != group || self.lifetime_point_policy(relation).await?.is_some() {
+            return Err(change_feed_uncovered());
+        }
+        let page = self.merged_changes_at(std::slice::from_ref(relation), before, group, 1).await?;
+        let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
+        let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
+        if commit.revision != group || changes.relation != *relation || !changes.touches.iter().any(|touch| {
+            touch.id == *id && touch.valid.lower() <= valid && valid < touch.valid.upper()
+                && matches!(touch.kind, rtdb_types::OwnedChangeKind::Put | rtdb_types::OwnedChangeKind::Delete)
+        }) {
+            return Err(change_feed_uncovered());
+        }
+        let prior = self.ordered_root_context(relation, before).await?;
+        let accepted = self.ordered_root_context(relation, group).await?;
+        crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await
+    }
+
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {
         self.relation_release_guard_for(relations, true)?()
     }

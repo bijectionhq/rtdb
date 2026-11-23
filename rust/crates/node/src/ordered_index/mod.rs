@@ -393,6 +393,20 @@ async fn owned_projection(
     Ok(OwnedProjection { fields, empty })
 }
 
+pub(crate) async fn stable_owned_path_columns(
+    before: &Arc<QueryContext>,
+    after: &Arc<QueryContext>,
+    owner: &str,
+    relation: &rtdb_types::OwnedRelation,
+    path: &rtdb_types::OwnedRelation,
+) -> Result<Vec<String>> {
+    let definition = owned_definition(before, owner, relation, path).await?;
+    if definition != owned_definition(after, owner, relation, path).await? {
+        return Err(uncovered_owned_range());
+    }
+    Ok(definition.columns)
+}
+
 async fn owned_definition(
     context: &Arc<QueryContext>,
     owner: &str,
