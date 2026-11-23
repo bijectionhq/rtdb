@@ -84,7 +84,9 @@ impl KafkaLog {
         let (access, driver) = if options.read_only { (Access::ReadOnly, None) } else {
             if let Some(configured) = configuration.overridden_acks() { observer.warning(KafkaWarning::AcknowledgementsOverridden { configured: configured.into() }); }
             let producer = configuration.prepare(Role::Producer)?.open(|configuration| {
-                producer_config(&configuration, &options, observer.as_ref()).create_with_context(driver::DeliveryContext { progress: Arc::clone(&progress), topic: options.topic.clone() })
+                producer_config(&configuration, &options, observer.as_ref(), keys.is_some()).create_with_context(driver::DeliveryContext {
+                    progress: Arc::clone(&progress), topic: options.topic.clone(), keys: keys.clone(),
+                })
             })
                 .map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
             let (queue, receiver) = mpsc::channel(options.queue_capacity);
@@ -94,6 +96,26 @@ impl KafkaLog {
             (access, Some(KafkaLogDriver::new(producer, receiver, Arc::clone(&progress), options.clone(), bytes, records)))
         };
         Ok(OpenedKafkaLog { log: Arc::new(Self { configuration, options, progress, access, keys, topic_id }), driver })
+    }
+
+    pub async fn settle_classic_prefix(&self) -> Result<bool> {
+        let (Some(keys), Some(expected)) = (&self.keys, self.topic_id) else { return Ok(true); };
+        let admin = self.configuration.prepare(Role::Admin)?.open(|configuration|
+            configuration.create::<AdminClient<DefaultClientContext>>()
+        ).map_err(|error| transport_error(&self.options.topic, error))?;
+        let options = AdminOptions::new().request_timeout(Some(self.options.request_timeout));
+        let topic = &self.options.topic;
+        let before = admin.topic_id(topic, &options).await.map_err(|error| transport_error(topic, error))?;
+        if before != expected {
+            return Err(Anomaly::incorrect("xtdb.kafka/topic-identity", "The opened Kafka topic ownership changed"));
+        }
+        let consumer = consumer(&self.configuration, &self.options)?;
+        let (low, _) = consumer.fetch_watermarks(topic, 0, self.options.request_timeout).map_err(|error| transport_error(topic, error))?;
+        let after = admin.topic_id(topic, &options).await.map_err(|error| transport_error(topic, error))?;
+        if after != expected {
+            return Err(Anomaly::incorrect("xtdb.kafka/topic-identity", "The Kafka floor belongs to another topic"));
+        }
+        Ok(keys.retire_kafka_before(low).await?)
     }
 
     pub fn topic_id(&self) -> Option<[u8; 16]> {
@@ -107,12 +129,15 @@ fn client_config(properties: &BTreeMap<String, String>) -> ClientConfig {
     config
 }
 
-fn producer_config(configuration: &ClientConfig, options: &KafkaLogOptions, observer: &dyn KafkaObserver) -> ClientConfig {
+fn producer_config(configuration: &ClientConfig, options: &KafkaLogOptions, observer: &dyn KafkaObserver, sealed: bool) -> ClientConfig {
     if let Some(value) = configuration.get("acks").filter(|value| *value != "all" && *value != "-1") {
         observer.warning(KafkaWarning::AcknowledgementsOverridden { configured: value.into() });
     }
     let properties = configuration.config_map().iter().map(|(name, value)| (name.clone(), value.clone())).collect();
     let mut properties = producer_properties(&properties, options.pipelined);
+    if sealed {
+        properties.insert("enable.idempotence".into(), "true".into());
+    }
     if properties.get("enable.idempotence").is_some_and(|value| value == "false") { observer.warning(KafkaWarning::IdempotenceDisabled); }
     properties.insert("queue.buffering.max.messages".into(), options.queue_capacity.to_string());
     properties.insert("queue.buffering.max.kbytes".into(), options.queued_bytes.div_ceil(1024).to_string());

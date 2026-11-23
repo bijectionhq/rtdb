@@ -106,7 +106,7 @@ impl KafkaTail {
         let payload = Bytes::copy_from_slice(self.pending_message()?.as_borrowed().payload().ok_or_else(|| self.tombstone())?);
         let payload = match &self.keys {
             Some(keys) => {
-                let open = keys.open_kafka_record(payload);
+                let open = keys.open_kafka_publication(head.metadata.offset.0, payload);
                 match &reservation {
                     Some(reservation) => reservation.retaining_io(open).await?,
                     None => open.await?,

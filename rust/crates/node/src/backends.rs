@@ -109,6 +109,28 @@ impl crate::LogFactory for KafkaFactory {
         }
 
         let mut drivers = Vec::new();
+        for (log, writable) in [(&source.log, !access.source_read_only()), (&replica.log, !access.replica_read_only())] {
+            if !writable { continue; }
+            let log = Arc::clone(log);
+            let token = cancellation.clone();
+            drivers.push(async move {
+                loop {
+                    if token.is_cancelled() { return Ok(()); }
+                    let delay = match log.settle_classic_prefix().await {
+                        Ok(true) => 30,
+                        Ok(false) => 1,
+                        Err(error) => {
+                            eprintln!("Kafka prefix custody settlement failed: {}", error.code);
+                            30
+                        }
+                    };
+                    tokio::select! {
+                        _ = token.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => (),
+                    }
+                }
+            }.boxed());
+        }
         for driver in source.driver.into_iter().chain(replica.driver) {
             let token = cancellation.clone();
             drivers.push(async move { driver.run(token).await.map_err(Into::into) }.boxed());

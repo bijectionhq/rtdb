@@ -2,19 +2,29 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use bytes::Bytes;
 use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext, PurgeConfig}};
-use rtdb_storage::{Error, Result, log::LogMetadata};
+use rtdb_storage::{Error, Result, log::LogMetadata, sealing::ClassicObjectKeys};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use crate::{ConfiguredLogClient, KafkaLogOptions, Progress, metadata, transport_error};
 
 pub(crate) struct Delivery { pub reply: oneshot::Sender<Result<LogMetadata>>, pub _allocation: Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)> }
 pub(crate) struct Queued { pub payload: Bytes, pub accepted: oneshot::Sender<Result<()>>, pub completion: Box<Delivery> }
-pub(crate) struct DeliveryContext { pub progress: Arc<Progress>, pub topic: String }
+pub(crate) struct DeliveryContext { pub progress: Arc<Progress>, pub topic: String, pub keys: Option<Arc<ClassicObjectKeys>> }
 impl ClientContext for DeliveryContext {}
 impl ProducerContext for DeliveryContext {
     type DeliveryOpaque = Box<Delivery>;
     fn delivery(&self, result: &DeliveryResult<'_>, completion: Self::DeliveryOpaque) {
-        let result = match result { Ok(message) => metadata(message, &self.topic), Err((error, _)) => Err(transport_error(&self.topic, error.clone())) };
+        let result = match result {
+            Ok(message) => metadata(message, &self.topic).and_then(|metadata| {
+                if let Some(keys) = &self.keys {
+                    let frame = rdkafka::Message::payload(message)
+                        .ok_or_else(|| Error::Task("Kafka acknowledged a missing sealed frame".into()))?;
+                    keys.record_kafka_publication(metadata.offset.0, frame)?;
+                }
+                Ok(metadata)
+            }),
+            Err((error, _)) => Err(transport_error(&self.topic, error.clone())),
+        };
         if let Ok(metadata) = &result { self.progress.advance(metadata.offset.0); }
         let _ = completion.reply.send(result);
     }
